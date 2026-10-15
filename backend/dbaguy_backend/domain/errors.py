@@ -59,6 +59,13 @@ class SecretStoreError(DomainError):
     status = 500
 
 
+class ProfileStoreError(DomainError):
+    """profiles.json cannot be read, moved aside or written."""
+
+    code = "profile_store_error"
+    status = 500
+
+
 class QueryFailed(DomainError):
     code = "query_failed"
     status = 400
