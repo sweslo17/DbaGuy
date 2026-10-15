@@ -16,6 +16,7 @@ from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
 from ...domain.profiles import AnyProfile, Engine, ServerProfile, ServerProfileDraft, SslConfig
 from ...domain.schema import SchemaSnapshot
 from ...sql.dialects import Dialect
+from ...sql.splitter import split
 from ..base import (
     AdapterCapabilities,
     DatabaseAdapter,
@@ -448,11 +449,16 @@ class PostgresConnection(DatabaseConnection):
         state = self._conn.info.parameter_status(_READ_ONLY_GUC)
         if state == "on":
             return
+        self._conn.execute(_READ_ONLY_SESSION)
         if state == "off":
             logger.warning("Read-only connection: default_transaction_read_only was turned off; restored")
-        self._conn.execute(_READ_ONLY_SESSION)
 
     def run(self, sql: str) -> StatementResult:
+        if self._read_only and len(split(sql, Dialect.POSTGRES)) > 1:
+            # A script could switch the default off and commit between statements, which no per-call check can see.
+            raise StatementError(
+                "Read-only connections run one statement at a time", code="read_only_single_statement"
+            )
         if _uses_client_copy(sql):
             raise StatementError(_UNSUPPORTED_COPY, code="unsupported_copy")
         try:

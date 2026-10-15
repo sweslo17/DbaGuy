@@ -374,3 +374,26 @@ def test_writable_connection_does_not_re_assert_read_only():
         assert conn._conn.info.parameter_status("default_transaction_read_only") == "off"  # nothing restored it
     finally:
         conn.close()
+
+
+@requires_pg
+def test_read_only_connection_runs_one_statement_at_a_time():
+    conn = PostgresAdapter().open(make_pg_profile(read_only=True), Endpoint(PG_HOST, PG_PORT), PG_PASSWORD, None)
+    try:
+        # One call that would switch the default off and commit between statements: refused before anything runs.
+        script = (
+            "SELECT query_to_xml('select set_config(''default_transaction_read_only'',''off'',false)',"
+            " false, false, ''); COMMIT; CREATE TEMP TABLE oos1 (id int)"
+        )
+        with pytest.raises(StatementError) as exc:
+            conn.run(script)
+        assert exc.value.code == "read_only_single_statement"
+        assert conn._conn.info.parameter_status("default_transaction_read_only") == "on"
+        result = conn.run("SELECT to_regclass('oos1')")
+        assert result.fetch(1) == [[None]]  # the CREATE never ran
+        result.close()
+        result = conn.run("SELECT 1;")  # one statement with a trailing semicolon still runs
+        assert result.fetch(1) == [[1]]
+        result.close()
+    finally:
+        conn.close()
