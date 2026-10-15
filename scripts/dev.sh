@@ -2,7 +2,7 @@
 # Start the backend (auto-reload) plus the Tauri dev app, or the web UI with --web.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PORT=8765
+PORT="${DBAGUY_DEV_PORT:-18765}"
 TOKEN=dev-token
 
 cleanup() {
@@ -20,7 +20,7 @@ BACKEND_PID=$!
 
 cd "$ROOT"
 if [[ "${1:-}" == "--web" ]]; then
-  npm run dev
+  VITE_BACKEND_URL="http://127.0.0.1:$PORT" VITE_BACKEND_TOKEN=$TOKEN npm run dev
 else
   DBAGUY_DEV_BACKEND_URL="http://127.0.0.1:$PORT" DBAGUY_DEV_BACKEND_TOKEN=$TOKEN npm run tauri dev
 fi

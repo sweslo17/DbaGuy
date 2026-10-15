@@ -20,7 +20,7 @@ export function getBackendInfo(): Promise<BackendInfo> {
           token: r.token,
         }))
       : Promise.resolve({
-          baseUrl: import.meta.env.VITE_BACKEND_URL ?? "http://127.0.0.1:8765",
+          baseUrl: import.meta.env.VITE_BACKEND_URL ?? "http://127.0.0.1:18765",
           token: import.meta.env.VITE_BACKEND_TOKEN ?? "dev-token",
         });
     cached.catch(() => {
