@@ -8,6 +8,7 @@ from sqlglot import exp
 
 from .dialects import SQLGLOT_NAME, Dialect
 from .lexer import TokenKind, tokenize
+from .splitter import split
 
 # sqlglot warns "'<sql text>' contains unsupported syntax" whenever it falls back to a Command, which is routine here
 # (CALL, LOCK, REPLACE INTO, ...) and would put statement text into the log above DEBUG.
@@ -49,6 +50,15 @@ _KEYWORD_KIND: dict[str, StatementKind] = {
     ),
 }
 _DML = (exp.Insert, exp.Update, exp.Delete, exp.Merge)
+# Least to most cautious: when a script mixes kinds, the strictest one decides (unknown is the most cautious).
+_SEVERITY = (
+    StatementKind.READ,
+    StatementKind.TRANSACTION,
+    StatementKind.SESSION,
+    StatementKind.WRITE,
+    StatementKind.DDL,
+    StatementKind.UNKNOWN,
+)
 _ANALYZE = ("ANALYZE", "ANALYSE")  # PostgreSQL accepts both spellings; EXPLAIN ANALYZE really executes the statement
 
 
@@ -106,9 +116,14 @@ def _explain_inner(sql: str, dialect: Dialect) -> str | None:
 
 
 def _unfiltered_dml(node: exp.Expression) -> list[str]:
-    """Dangerous reasons for every UPDATE/DELETE without WHERE in `node`, including ones inside CTEs."""
+    """Dangerous reasons for every UPDATE/DELETE without WHERE in `node`, including ones inside CTEs.
+
+    The UPDATE action of MERGE ... WHEN MATCHED is modelled as an exp.Update without WHERE; it is not a statement.
+    """
     reasons: list[str] = []
     for child in node.walk():
+        if isinstance(child.parent, exp.When):
+            continue
         if isinstance(child, exp.Update) and not child.args.get("where"):
             reasons.append("update_without_where")
         elif isinstance(child, exp.Delete) and not child.args.get("where"):
@@ -136,7 +151,7 @@ def _from_expression(node: exp.Expression) -> Classification | None:
         if node.find(exp.Into):  # SELECT ... INTO creates a table
             return Classification(kind=StatementKind.DDL)
         writes = any(isinstance(child, _DML) for child in node.walk())
-        locks = bool(node.args.get("locks"))
+        locks = node.find(exp.Lock) is not None  # FOR UPDATE/SHARE, also inside a CTE or subquery
         if writes or locks:
             return Classification(kind=StatementKind.WRITE, dangerous_reasons=_unfiltered_dml(node))
         return Classification(kind=StatementKind.READ)
@@ -155,11 +170,29 @@ def _parse_single(sql: str, dialect: Dialect) -> exp.Expression | None:
     return parsed[0]
 
 
-def classify(sql: str, dialect: Dialect) -> Classification:
-    """Kind of one statement plus the reasons it is dangerous. Never raises; unknown syntax is `unknown`."""
+def _classify_statement(sql: str, dialect: Dialect) -> Classification:
     while (inner := _explain_inner(sql, dialect)) is not None:  # EXPLAIN ANALYZE runs the statement it explains
         sql = inner
     node = _parse_single(sql, dialect)
     if node is not None and (result := _from_expression(node)) is not None:
         return result
     return _lexical(sql, dialect)
+
+
+def _combine(results: list[Classification]) -> Classification:
+    return Classification(
+        kind=max((r.kind for r in results), key=_SEVERITY.index),
+        dangerous_reasons=list(dict.fromkeys(reason for r in results for reason in r.dangerous_reasons)),
+    )
+
+
+def classify(sql: str, dialect: Dialect) -> Classification:
+    """Kind of the statement plus the reasons it is dangerous. Never raises; unknown syntax is `unknown`.
+
+    Text holding several statements is classified statement by statement and combined (strictest kind, union of
+    reasons), so a dangerous statement cannot hide behind a harmless first one.
+    """
+    spans = split(sql, dialect)
+    if len(spans) > 1:
+        return _combine([_classify_statement(span.text, dialect) for span in spans])
+    return _classify_statement(sql, dialect)
