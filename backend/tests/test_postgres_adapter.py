@@ -1,12 +1,14 @@
 import threading
 import time
 
+import psycopg
 import pytest
+from loguru import logger
 
 from dbaguy_backend.adapters.base import Endpoint, StatementCancelled, StatementError
 from dbaguy_backend.adapters.postgres.adapter import PostgresAdapter
-from dbaguy_backend.domain.errors import ConnectionFailed
-from tests.support import PG_HOST, PG_PASSWORD, PG_PORT, make_pg_profile, requires_pg
+from dbaguy_backend.domain.errors import ConnectionFailed, ValidationFailed
+from tests.support import PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, make_pg_profile, requires_pg
 
 pytestmark = requires_pg
 
@@ -134,3 +136,76 @@ def test_parse_url():
     assert draft.ssl.mode == "require"
     assert draft.options == {"connect_timeout": "5"}
     assert parsed.password == "p@ss"
+
+
+def _terminate_backend(pid: int) -> None:
+    with psycopg.connect(
+        host=PG_HOST, port=PG_PORT, user=PG_USER, password=PG_PASSWORD, dbname="postgres", autocommit=True
+    ) as admin:
+        admin.execute("SELECT pg_terminate_backend(%s)", (pid,))
+        for _ in range(50):  # wait until the server has really dropped it
+            if admin.execute("SELECT count(*) FROM pg_stat_activity WHERE pid = %s", (pid,)).fetchone()[0] == 0:
+                return
+            time.sleep(0.1)
+    raise AssertionError("backend did not terminate")
+
+
+def test_dead_connection_raises_statement_errors(conn):
+    result = conn.run("SELECT pg_backend_pid()")
+    pid = result.fetch(1)[0][0]
+    result.close()
+    _terminate_backend(pid)
+    for _ in range(2):  # the first call sees the server shutdown, later ones a closed connection
+        with pytest.raises(StatementError) as info:
+            conn.run("SELECT 1").fetch(1)
+        assert info.value.code == "connection_lost"
+        assert "lost" in info.value.message
+    with pytest.raises(StatementError) as info:
+        conn.run("CREATE TEMP TABLE after_death (id int)")  # buffered path
+    assert info.value.code == "connection_lost"
+    assert not conn.in_transaction()
+
+
+def test_parse_url_lifts_connection_keys_out_of_options():
+    parsed = PostgresAdapter().parse_url("postgres://u@good/db?host=attacker&password=x&connect_timeout=5")
+    assert parsed.profile.host == "good"
+    assert parsed.profile.username == "u"
+    assert parsed.password == "x"
+    assert parsed.profile.options == {"connect_timeout": "5"}
+
+
+def test_parse_url_query_fills_missing_parts_and_drops_reserved_keys():
+    url = "postgres://good?user=bob&port=6000&dbname=d&hostaddr=203.0.113.1&service=s&passfile=/p&sslpassword=y&application_name=a"
+    parsed = PostgresAdapter().parse_url(url)
+    draft = parsed.profile
+    assert (draft.host, draft.port, draft.database, draft.username) == ("good", 6000, "d", "bob")
+    assert draft.options == {"application_name": "a"}
+    assert parsed.password is None
+    assert PostgresAdapter().parse_url("postgres:///db?host=socket-host").profile.host == "socket-host"
+    with pytest.raises(ValidationFailed, match="host"):
+        PostgresAdapter().parse_url("postgres:///db")
+    with pytest.raises(ValidationFailed, match="port"):
+        PostgresAdapter().parse_url("postgres://good?port=abc")
+
+
+def test_profile_options_cannot_redirect_or_override_the_connection():
+    reserved = {
+        "host": "attacker.invalid", "hostaddr": "203.0.113.1", "port": "1", "dbname": "analytics", "user": "nobody",
+        "password": "wrong-secret", "service": "nope", "passfile": "/nonexistent/passfile", "sslpassword": "ssl-secret",
+    }
+    messages: list[str] = []
+    sink = logger.add(messages.append, level="WARNING", format="{message}")
+    try:
+        connection = PostgresAdapter().open(
+            make_pg_profile(options={**reserved, "connect_timeout": "5"}), Endpoint(PG_HOST, PG_PORT), PG_PASSWORD, None
+        )
+    finally:
+        logger.remove(sink)
+    try:
+        info = connection.server_info()
+        assert (info.current_database, info.current_user) == ("dbaguy", PG_USER)
+    finally:
+        connection.close()
+    warning = "\n".join(messages)
+    assert all(key in warning for key in reserved)  # names are logged ...
+    assert not any(value in warning for value in ("attacker.invalid", "wrong-secret", "ssl-secret", "/nonexistent"))  # ... values never

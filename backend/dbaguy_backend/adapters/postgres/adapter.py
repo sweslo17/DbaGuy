@@ -1,6 +1,7 @@
 import os
 import re
 from collections import deque
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlparse
 
@@ -32,6 +33,23 @@ _ROW_KEYWORDS = frozenset({"select", "with", "values", "table", "show", "explain
 _RETURNING = re.compile(r"\breturning\b", re.IGNORECASE)
 _STREAM_CHUNK = 200
 _SSL_QUERY_KEYS = {"sslmode": "mode", "sslrootcert": "ca_file", "sslcert": "cert_file", "sslkey": "key_file"}
+_URL_CONNECTION_KEYS = ("user", "password", "host", "port", "dbname")  # query-string spellings of URL parts
+# libpq keys that pick the target or carry secrets: they come from the profile fields and the keychain,
+# never from free-form `options` (they could redirect the connection or leak a password into profiles.json).
+_RESERVED_OPTION_KEYS = frozenset(
+    {*_URL_CONNECTION_KEYS, "hostaddr", "service", "passfile", "sslpassword"}
+)
+_DEFAULT_CONNECT_PARAMS: dict[str, Any] = {
+    "connect_timeout": 10,
+    "application_name": "DbaGuy",
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 3,
+}
+_CONNECTION_LOST = "connection_lost"
+# SQLSTATEs that mean the server dropped us: connection exceptions and admin/crash shutdown.
+_CONNECTION_LOST_STATES = frozenset({"57P01", "57P02", "57P03"})
 
 # libpq's chunked streaming uses the extended protocol, which accepts one statement per query.
 _MULTI_STATEMENT_ERROR = "cannot insert multiple commands into a prepared statement"
@@ -46,10 +64,21 @@ LIMIT 20000
 """
 
 
+def _is_connection_lost(exc: psycopg.Error) -> bool:
+    """True when the connection is gone (no SQLSTATE means the failure happened client side or on the socket)."""
+    if not isinstance(exc, psycopg.OperationalError):
+        return False
+    sqlstate = exc.diag.sqlstate
+    return sqlstate is None or sqlstate.startswith("08") or sqlstate in _CONNECTION_LOST_STATES
+
+
 def translate_error(exc: psycopg.Error, sql: str) -> StatementError:
     diag = exc.diag
     if isinstance(exc, psycopg.errors.QueryCanceled):
         return StatementCancelled(diag.message_primary or "Query cancelled")
+    if _is_connection_lost(exc):
+        reason = (diag.message_primary or str(exc)).strip()
+        return StatementError(f"Connection to the server was lost: {reason}", code=_CONNECTION_LOST)
     message = diag.message_primary or str(exc).strip()
     if diag.message_detail:
         message += f"\nDETAIL: {diag.message_detail}"
@@ -69,6 +98,21 @@ def _is_multi_statement_rejection(exc: StatementError) -> bool:
 
 def _likely_returns_rows(sql: str) -> bool:
     return first_keyword(sql) in _ROW_KEYWORDS or bool(_RETURNING.search(sql))
+
+
+def _without_reserved_options(options: Mapping[str, str]) -> dict[str, str]:
+    kept = {key: value for key, value in options.items() if key.lower() not in _RESERVED_OPTION_KEYS}
+    if len(kept) != len(options):
+        ignored = ", ".join(sorted(set(options) - set(kept)))
+        logger.warning("Ignoring reserved PostgreSQL connection options: {}", ignored)  # names only, never values
+    return kept
+
+
+def _port_from_query(value: str) -> int:
+    try:
+        return int(value)
+    except ValueError:
+        raise ValidationFailed(f"Invalid port '{value}' in the PostgreSQL URL") from None
 
 
 def _ssl_params(ssl: SslConfig) -> dict[str, str]:
@@ -270,20 +314,23 @@ class PostgresConnection(DatabaseConnection):
         cursor = self._user_cursor()
         try:
             cursor.execute(sql)
-        except psycopg.Error as exc:
+        except psycopg.Error:
             cursor.close()
-            raise translate_error(exc, sql) from exc
+            raise
         return _BufferedResult(self, cursor, sql)
 
     def run(self, sql: str) -> StatementResult:
-        if _likely_returns_rows(sql):
-            try:
-                return _StreamResult(self, self._user_cursor(), sql)  # closes its cursor when it fails
-            except StatementError as exc:
-                if not _is_multi_statement_rejection(exc):
-                    raise
-                logger.debug("Script has several statements and cannot be streamed; running it buffered")
-        return self._run_buffered(sql)
+        try:
+            if _likely_returns_rows(sql):
+                try:
+                    return _StreamResult(self, self._user_cursor(), sql)  # closes its cursor when it fails
+                except StatementError as exc:
+                    if not _is_multi_statement_rejection(exc):
+                        raise
+                    logger.debug("Script has several statements and cannot be streamed; running it buffered")
+            return self._run_buffered(sql)
+        except psycopg.Error as exc:  # e.g. creating a cursor on a dead connection
+            raise translate_error(exc, sql) from exc
 
     def in_transaction(self) -> bool:
         return self._conn.info.transaction_status in (pq.TransactionStatus.INTRANS, pq.TransactionStatus.INERROR)
@@ -306,42 +353,44 @@ class PostgresAdapter(DatabaseAdapter):
 
     def parse_url(self, url: str) -> ParsedUrl:
         parsed = urlparse(url)
-        if not parsed.hostname:
-            raise ValidationFailed("A PostgreSQL URL needs a host, e.g. postgres://user@host:5432/db")
         query = dict(parse_qsl(parsed.query))
         ssl_fields = {_SSL_QUERY_KEYS[k]: query.pop(k) for k in list(query) if k in _SSL_QUERY_KEYS}
-        database = unquote(parsed.path.lstrip("/")) or None
+        # Query-string spellings of the URL parts fill in what the URL itself leaves empty.
+        part = {key: query.pop(key, None) or None for key in _URL_CONNECTION_KEYS}
+        host = parsed.hostname or part["host"]
+        if not host:
+            raise ValidationFailed("A PostgreSQL URL needs a host, e.g. postgres://user@host:5432/db")
+        database = unquote(parsed.path.lstrip("/")) or part["dbname"]
+        username = unquote(parsed.username) if parsed.username else part["user"]
+        password = unquote(parsed.password) if parsed.password else part["password"]
+        port = parsed.port or (_port_from_query(part["port"]) if part["port"] else None)
         draft = ServerProfileDraft(
             engine="postgres",
-            name=f"{parsed.hostname}/{database}" if database else parsed.hostname,
-            host=parsed.hostname,
-            port=parsed.port,
+            name=f"{host}/{database}" if database else host,
+            host=host,
+            port=port,
             database=database,
-            username=unquote(parsed.username) if parsed.username else None,
+            username=username,
             ssl=SslConfig(**ssl_fields),
-            options=query,
+            options=_without_reserved_options(query),
         )
-        return ParsedUrl(profile=draft, password=unquote(parsed.password) if parsed.password else None)
+        return ParsedUrl(profile=draft, password=password)
 
     def open(
         self, profile: AnyProfile, endpoint: Endpoint | None, password: str | None, database: str | None
     ) -> DatabaseConnection:
         if not isinstance(profile, ServerProfile) or endpoint is None:
             raise ValidationFailed("Not a PostgreSQL server profile")
+        # Free-form options only override the defaults; everything that picks the target comes last and wins.
         params: dict[str, Any] = {
+            **_DEFAULT_CONNECT_PARAMS,
+            **_without_reserved_options(profile.options),
+            **_ssl_params(profile.ssl),
             "host": endpoint.tls_server_name or endpoint.host,
             "port": endpoint.port,
             "dbname": database or profile.database or "postgres",
             "user": profile.username,
             "password": password,
-            "connect_timeout": 10,
-            "application_name": "DbaGuy",
-            "keepalives": 1,
-            "keepalives_idle": 30,
-            "keepalives_interval": 10,
-            "keepalives_count": 3,
-            **_ssl_params(profile.ssl),
-            **profile.options,
         }
         if endpoint.tls_server_name:
             params["hostaddr"] = endpoint.host  # tunnelled: connect locally, verify TLS against the real host

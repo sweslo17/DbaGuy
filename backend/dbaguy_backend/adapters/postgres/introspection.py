@@ -36,6 +36,8 @@ _FOLDER_ORDER = (
 _RELKIND_BY_FOLDER = {Folder.VIEWS: ("v", NodeKind.VIEW), Folder.MATERIALIZED_VIEWS: ("m", NodeKind.MATERIALIZED_VIEW),
                       Folder.SEQUENCES: ("S", NodeKind.SEQUENCE)}
 _TYPE_LABEL = {"e": "enum", "d": "domain", "c": "composite"}
+_HAS_FOLDERS = (NodeKind.TABLE, NodeKind.PARTITION, NodeKind.VIEW, NodeKind.MATERIALIZED_VIEW)
+_CAN_PARTITION = (NodeKind.TABLE, NodeKind.PARTITION)
 
 _COLUMNS_SQL = """
 SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, pg_get_expr(d.adbin, d.adrelid),
@@ -112,11 +114,11 @@ def list_children(conn: psycopg.Connection, path: list[PathSegment]) -> list[Obj
         return [make_node(path, NodeKind.FOLDER, f, has_children=True) for f, n in zip(_FOLDER_ORDER, row) if n]
     if len(rel) == 2:
         return _schema_objects(conn, path, schema, _folder(rel[1]))
-    if len(rel) == 3:
-        return _object_folders(conn, path, schema, rel[2])
-    if len(rel) == 4:
-        return _object_children(conn, path, schema, rel[2], _folder(rel[3]))
-    return []
+    # Below the schema folders the path alternates object, folder, object, ... (partitions nest to any depth).
+    last = rel[-1]
+    if last.kind == NodeKind.FOLDER:
+        return _object_children(conn, path, schema, rel[-2], _folder(last))
+    return _object_folders(conn, path, schema, last)
 
 
 def _schema_objects(conn: psycopg.Connection, path: list[PathSegment], schema: str, folder: Folder) -> list[ObjectNode]:
@@ -163,7 +165,7 @@ def _schema_objects(conn: psycopg.Connection, path: list[PathSegment], schema: s
 
 
 def _object_folders(conn: psycopg.Connection, path: list[PathSegment], schema: str, obj: PathSegment) -> list[ObjectNode]:
-    if obj.kind not in (NodeKind.TABLE, NodeKind.VIEW, NodeKind.MATERIALIZED_VIEW):
+    if obj.kind not in _HAS_FOLDERS:
         return []
     oid = relation_oid(conn, qualified_pg(schema, obj.name))
     indexes, triggers, partitions = conn.execute(
@@ -177,7 +179,7 @@ def _object_folders(conn: psycopg.Connection, path: list[PathSegment], schema: s
         folders.append(Folder.INDEXES)
     if triggers:
         folders.append(Folder.TRIGGERS)
-    if partitions and obj.kind == NodeKind.TABLE:
+    if partitions and obj.kind in _CAN_PARTITION:
         folders.append(Folder.PARTITIONS)
     return [make_node(path, NodeKind.FOLDER, f, has_children=True) for f in folders]
 
@@ -206,9 +208,13 @@ def _object_children(
         return [make_node(path, NodeKind.TRIGGER, name, has_children=False) for (name,) in rows]
     if folder == Folder.PARTITIONS:
         rows = conn.execute(
-            "SELECT c.relname, pg_get_expr(c.relpartbound, c.oid) FROM pg_inherits h JOIN pg_class c ON c.oid = h.inhrelid "
-            "WHERE h.inhparent = %(oid)s ORDER BY c.relname",
+            "SELECT c.relname, pg_get_expr(c.relpartbound, c.oid), c.relkind = 'p' "
+            "FROM pg_inherits h JOIN pg_class c ON c.oid = h.inhrelid WHERE h.inhparent = %(oid)s ORDER BY c.relname",
             {"oid": oid},
         )
-        return [make_node(path, NodeKind.PARTITION, name, has_children=False, detail=bound) for name, bound in rows]
+        # a partition that is itself partitioned can be expanded further
+        return [
+            make_node(path, NodeKind.PARTITION, name, has_children=is_partitioned, detail=bound)
+            for name, bound, is_partitioned in rows
+        ]
     return []

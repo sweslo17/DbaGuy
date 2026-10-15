@@ -124,3 +124,37 @@ def test_other_object_ddl(conn):
 def test_unknown_folder_is_a_validation_error(conn, path):
     with pytest.raises(ValidationFailed, match="bogus"):
         conn.list_children(path)
+
+
+@pytest.fixture
+def sub_partitions(conn):
+    def run(sql):
+        conn.run(sql).close()
+
+    run("DROP SCHEMA IF EXISTS pytest_subpart CASCADE")
+    run(
+        "CREATE SCHEMA pytest_subpart;"
+        "CREATE TABLE pytest_subpart.pp (a int, b int) PARTITION BY RANGE (a);"
+        "CREATE TABLE pytest_subpart.pp1 PARTITION OF pytest_subpart.pp FOR VALUES FROM (0) TO (10) PARTITION BY LIST (b);"
+        "CREATE TABLE pytest_subpart.pp1a PARTITION OF pytest_subpart.pp1 FOR VALUES IN (1);"
+        "COMMENT ON COLUMN pytest_subpart.pp1.b IS 'declared on the sub-partition'"
+    )
+    yield schema_path("pytest_subpart", "tables", seg("table", "pp"))
+    run("DROP SCHEMA pytest_subpart CASCADE")
+
+
+def test_sub_partitioned_partitions_are_expandable_and_keep_partition_by(conn, sub_partitions):
+    [pp1] = conn.list_children([*sub_partitions, seg("folder", "partitions")])
+    assert pp1.name == "pp1" and pp1.has_children
+    ddl = conn.object_detail(pp1.path).ddl
+    assert "PARTITION OF pytest_subpart.pp\n    FOR VALUES FROM (0) TO (10) PARTITION BY LIST (b);" in ddl
+    assert names(conn.list_children(pp1.path)) == ["columns", "partitions"]
+    [pp1a] = conn.list_children([*pp1.path, seg("folder", "partitions")])
+    assert pp1a.name == "pp1a" and not pp1a.has_children
+    assert "PARTITION OF pytest_subpart.pp1" in conn.object_detail(pp1a.path).ddl
+    assert "PARTITION BY" not in conn.object_detail(pp1a.path).ddl
+    # children and details of a nested object resolve against that object, not the top-level table
+    columns = conn.list_children([*pp1.path, seg("folder", "columns")])
+    assert names(columns) == ["a", "b"]
+    [column] = conn.object_detail([*pp1.path, seg("folder", "columns"), seg("column", "b")]).columns
+    assert column.comment == "declared on the sub-partition"

@@ -52,7 +52,8 @@ def table_ddl(conn: psycopg.Connection, schema: str, name: str) -> tuple[str, li
     columns = table_columns(conn, oid)
     blocks: list[str] = []
     if is_partition:
-        blocks.append(f"CREATE TABLE {qname} PARTITION OF {parent}\n    {bound};")
+        sub_partitioning = f" PARTITION BY {partkey}" if relkind == "p" else ""  # a partition can itself be partitioned
+        blocks.append(f"CREATE TABLE {qname} PARTITION OF {parent}\n    {bound}{sub_partitioning};")
     else:
         body = [_column_def(c) for c in columns]
         body += [f"CONSTRAINT {quote_ident_pg(n)} {d}" for n, d in conn.execute(_CONSTRAINTS_SQL, {"oid": oid})]
@@ -165,7 +166,7 @@ def object_detail(conn: psycopg.Connection, path: list[PathSegment]) -> ObjectDe
             (definition,) = _one(conn, "SELECT pg_get_indexdef(to_regclass(%(q)s))", {"q": qname}, qname)
             return ObjectDetail(**base, ddl=f"{definition};")
         case NodeKind.TRIGGER:
-            table = qualified_pg(schema, rel[2].name)
+            table = qualified_pg(schema, rel[-3].name)  # rel[-2] is the folder, rel[-3] the owning object
             (definition,) = _one(
                 conn,
                 "SELECT pg_get_triggerdef(t.oid, true) FROM pg_trigger t WHERE t.tgrelid = to_regclass(%(t)s) AND t.tgname = %(n)s",
@@ -174,7 +175,7 @@ def object_detail(conn: psycopg.Connection, path: list[PathSegment]) -> ObjectDe
             )
             return ObjectDetail(**base, ddl=f"{definition};")
         case NodeKind.COLUMN:
-            table_oid = relation_oid(conn, qualified_pg(schema, rel[2].name))
+            table_oid = relation_oid(conn, qualified_pg(schema, rel[-3].name))
             columns = [c.info() for c in table_columns(conn, table_oid) if c.name == last.name]
             if not columns:
                 raise NotFound(f"Column {last.name} not found")
