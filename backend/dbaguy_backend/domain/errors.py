@@ -62,3 +62,10 @@ class SecretStoreError(DomainError):
 class QueryFailed(DomainError):
     code = "query_failed"
     status = 400
+
+
+class PasswordRequired(ConnectionFailed):
+    """The profile does not store its password and none was unlocked this run."""
+
+    code = "password_required"
+    status = 428
