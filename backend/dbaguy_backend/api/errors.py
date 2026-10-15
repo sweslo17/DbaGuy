@@ -34,5 +34,6 @@ def register_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
+        # The client only gets a generic message: driver exceptions can carry connection details.
         logger.opt(exception=exc).error("Unhandled error on {} {}", request.method, request.url.path)
-        return JSONResponse(status_code=500, content=error_body("internal_error", str(exc) or "Internal error"))
+        return JSONResponse(status_code=500, content=error_body("internal_error", "Internal error"))

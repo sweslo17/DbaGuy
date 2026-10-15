@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
-from .api import system
+from .api import metadata, profiles, sessions, system
 from .api.errors import register_error_handlers
 from .config import Settings
 from .container import AppContainer
@@ -36,6 +36,9 @@ def create_app(settings: Settings, container: AppContainer | None = None) -> Fas
     )
     register_error_handlers(app)
     app.include_router(system.router)
+    app.include_router(profiles.router)
+    app.include_router(metadata.router)
+    app.include_router(sessions.router)
     return app
 
 

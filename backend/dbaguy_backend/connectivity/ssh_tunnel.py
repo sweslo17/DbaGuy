@@ -22,8 +22,11 @@ def write_askpass_script(directory: Path) -> Path:
     """ssh calls SSH_ASKPASS for the password; the secret only travels in the child's environment."""
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "askpass.sh"
-    path.write_text(_ASKPASS)
-    path.chmod(0o700)
+    # Atomic replace: concurrent first starts must never let ssh run a half-written script.
+    temp = directory / f".askpass.{os.getpid()}.{threading.get_ident()}.tmp"
+    temp.write_text(_ASKPASS)
+    temp.chmod(0o700)
+    temp.replace(path)
     return path
 
 
@@ -223,6 +226,8 @@ class SshTunnelManager:
         if ssh.auth == "password":
             if not password:
                 raise TunnelFailed("SSH password is required")
+            if not self._askpass.exists():
+                write_askpass_script(self._askpass.parent)
             env.update({
                 "SSH_ASKPASS": str(self._askpass),
                 "SSH_ASKPASS_REQUIRE": "force",

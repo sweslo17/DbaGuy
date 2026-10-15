@@ -46,3 +46,11 @@ def test_password_tunnel_to_postgres(tmp_path):
 def test_wrong_password_fails_with_ssh_error(tmp_path):
     with pytest.raises(TunnelFailed, match="(?i)permission denied"):
         manager(tmp_path).acquire(uuid4(), bastion(), "postgres", 5432, "wrong")
+
+
+def test_askpass_script_is_written_lazily_for_password_auth(tmp_path):
+    askpass = tmp_path / "bin" / "askpass.sh"
+    tunnels = SshTunnelManager(askpass, ssh_binary="/usr/bin/false")  # ssh exits at once: no network needed
+    with pytest.raises(TunnelFailed):
+        tunnels.acquire(uuid4(), bastion(), "postgres", 5432, "dev")
+    assert askpass.exists() and askpass.stat().st_mode & 0o700 == 0o700
