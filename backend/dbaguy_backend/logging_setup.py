@@ -23,8 +23,9 @@ class InterceptHandler(logging.Handler):
 
 
 def setup_logging(level: str, log_dir: Path | None) -> None:
+    # diagnose=False: loguru's default prints frame locals in tracebacks, which can include passwords.
     logger.remove()
-    logger.add(sys.stderr, level=level.upper(), format=_FORMAT)
+    logger.add(sys.stderr, level=level.upper(), format=_FORMAT, backtrace=False, diagnose=False)
     if log_dir is not None:
         log_dir.mkdir(parents=True, exist_ok=True)
         logger.add(
@@ -34,6 +35,8 @@ def setup_logging(level: str, log_dir: Path | None) -> None:
             rotation="10 MB",
             retention=5,
             enqueue=True,
+            backtrace=False,
+            diagnose=False,
         )
     logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"):

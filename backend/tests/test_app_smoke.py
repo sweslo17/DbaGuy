@@ -4,10 +4,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 from fastapi.testclient import TestClient
 
+from dbaguy_backend.api.deps import websocket_token_ok
 from dbaguy_backend.app import create_app
 from dbaguy_backend.config import Settings
 
@@ -32,6 +34,22 @@ def test_health_ok_with_token(tmp_path):
         response = client.get("/system/health", headers=AUTH)
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
+
+
+def test_non_ascii_token_is_rejected_as_unauthorized(tmp_path):
+    with make_client(tmp_path) as client:
+        response = client.get("/system/health", headers={"Authorization": "Bearer café".encode("utf-8")})
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_websocket_token_check_rejects_non_ascii_token():
+    settings = SimpleNamespace(token=TOKEN)
+    websocket = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(container=SimpleNamespace(settings=settings))),
+        query_params={"token": "café"},
+    )
+    assert websocket_token_ok(websocket) is False
 
 
 def test_cors_preflight_allows_tauri_origin(tmp_path):

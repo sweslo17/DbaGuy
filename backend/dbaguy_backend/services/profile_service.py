@@ -72,7 +72,14 @@ class ProfileService:
         if not profile.save_password:
             for kind in SecretKind:
                 self._secrets.delete(profile.id, kind)
+            # Unsaved passwords are never persisted; only kinds sent in this request replace the unlocked copy.
+            for kind, field in _INPUT_FIELDS:
+                if getattr(secrets, field) is not None:
+                    self._unlocked.delete(profile.id, kind)
             return
+        # Saved secrets are authoritative, so no copy unlocked earlier in this run may override them.
+        for kind in SecretKind:
+            self._unlocked.delete(profile.id, kind)
         for kind, field in _INPUT_FIELDS:
             value = getattr(secrets, field)
             if value is None:

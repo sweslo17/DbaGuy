@@ -100,3 +100,38 @@ def test_unknown_profile_id(tmp_path):
     service = ProfileService(ProfileStore(profiles_file(tmp_path)), InMemorySecretStore())
     with pytest.raises(ProfileNotFound):
         service.get(uuid4())
+
+
+def test_update_with_saved_password_replaces_unlocked_password(tmp_path):
+    service = ProfileService(ProfileStore(profiles_file(tmp_path)), InMemorySecretStore())
+    entry = service.create(ProfileUpsertRequest(profile=pg_draft(save_password=False)))
+    pid = entry.profile.id
+    service.unlock(pid, ProfileSecretsInput(password="old-pw"))
+    service.update(
+        pid,
+        ProfileUpsertRequest(profile=pg_draft(save_password=True), secrets=ProfileSecretsInput(password="new-pw")),
+    )
+    assert service.resolve_secrets(service.get(pid)).password == "new-pw"
+
+
+def test_update_with_saved_ssh_password_replaces_unlocked_ssh_password(tmp_path):
+    service = ProfileService(ProfileStore(profiles_file(tmp_path)), InMemorySecretStore())
+    entry = service.create(ProfileUpsertRequest(profile=pg_draft(save_password=False)))
+    pid = entry.profile.id
+    service.unlock(pid, ProfileSecretsInput(ssh_password="old-ssh"))
+    service.update(
+        pid,
+        ProfileUpsertRequest(
+            profile=pg_draft(save_password=True), secrets=ProfileSecretsInput(ssh_password="new-ssh")
+        ),
+    )
+    assert service.resolve_secrets(service.get(pid)).ssh_password == "new-ssh"
+
+
+def test_update_without_password_keeps_unlocked_password_for_unsaved_profile(tmp_path):
+    service = ProfileService(ProfileStore(profiles_file(tmp_path)), InMemorySecretStore())
+    entry = service.create(ProfileUpsertRequest(profile=pg_draft(save_password=False)))
+    pid = entry.profile.id
+    service.unlock(pid, ProfileSecretsInput(password="old-pw"))
+    service.update(pid, ProfileUpsertRequest(profile=pg_draft(name="B", save_password=False)))
+    assert service.resolve_secrets(service.get(pid)).password == "old-pw"
