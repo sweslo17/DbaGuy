@@ -53,3 +53,4 @@ def test_offsets_cover_the_text():
 def test_first_keyword():
     assert first_keyword("  -- c\n/* x */ with x as (select 1) select * from x", PG) == "WITH"
     assert first_keyword("", PG) == ""
+    assert first_keyword("(select 1)", PG) == ""

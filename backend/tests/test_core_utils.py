@@ -68,6 +68,7 @@ def test_quote_helpers():
 
 def test_first_keyword():
     assert first_keyword("  -- note\n /* block */ select 1") == "select"
+    assert first_keyword("/* a /* b */ c */ select 1") == "select"  # PostgreSQL nests block comments
     assert first_keyword("(select 1)") == "("
     assert first_keyword("WITH x AS (SELECT 1) SELECT * FROM x") == "with"
     assert first_keyword("") == ""

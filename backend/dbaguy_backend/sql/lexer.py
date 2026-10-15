@@ -1,4 +1,5 @@
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -37,6 +38,7 @@ _DOLLAR_TAG = re.compile(r"\$(?:[A-Za-z_\u0080-\U0010ffff][A-Za-z0-9_\u0080-\U00
 _DOLLAR_PARAM = re.compile(r"\$\d+")
 _NUMBER = re.compile(r"\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?")
 _PUNCT = {";": TokenKind.SEMI, ".": TokenKind.DOT, ",": TokenKind.COMMA, "(": TokenKind.LPAREN, ")": TokenKind.RPAREN}
+_SKIPPED = frozenset({TokenKind.SPACE, TokenKind.COMMENT})
 
 
 def _ident_start(ch: str) -> bool:
@@ -65,28 +67,23 @@ def _scan_string(text: str, i: int, backslash: bool) -> int:
     return n
 
 
-def tokenize(text: str, dialect: Dialect) -> list[Token]:
-    """Lossless tokenizer: the concatenated token texts equal the input. Never raises."""
+def _scan(text: str, dialect: Dialect) -> Iterator[Token]:
+    """Yields tokens lazily; the concatenated token texts equal the input. Never raises."""
     rules = RULES[dialect]
     quotes = dict(rules.identifier_quotes)
-    tokens: list[Token] = []
     n = len(text)
     i = 0
-
-    def add(kind: TokenKind, start: int, end: int) -> None:
-        tokens.append(Token(kind, start, end, text[start:end]))
-
     while i < n:
         ch = text[i]
         start = i
         if ch.isspace():
             while i < n and text[i].isspace():
                 i += 1
-            add(TokenKind.SPACE, start, i)
+            kind = TokenKind.SPACE
         elif text.startswith("--", i):
             j = text.find("\n", i)
             i = n if j < 0 else j
-            add(TokenKind.COMMENT, start, i)
+            kind = TokenKind.COMMENT
         elif text.startswith("/*", i):
             depth, i = 1, i + 2
             while i < n and depth:
@@ -96,10 +93,10 @@ def tokenize(text: str, dialect: Dialect) -> list[Token]:
                     depth, i = depth + 1, i + 2
                 else:
                     i += 1
-            add(TokenKind.COMMENT, start, i)
+            kind = TokenKind.COMMENT
         elif ch == "'":
             i = _scan_string(text, i, backslash=False)
-            add(TokenKind.STRING, start, i)
+            kind = TokenKind.STRING
         elif ch in quotes:
             close = quotes[ch]
             i += 1
@@ -111,38 +108,46 @@ def tokenize(text: str, dialect: Dialect) -> list[Token]:
                     i += 1
                     break
                 i += 1
-            add(TokenKind.QUOTED, start, i)
+            kind = TokenKind.QUOTED
         elif ch == "$" and rules.dollar_quotes and (param := _DOLLAR_PARAM.match(text, i)):
             i = param.end()
-            add(TokenKind.PARAM, start, i)
+            kind = TokenKind.PARAM
         elif ch == "$" and rules.dollar_quotes and (tag := _DOLLAR_TAG.match(text, i)) and not (
             i > 0 and _ident_char(text[i - 1])
         ):
             close_at = text.find(tag.group(0), tag.end())
             i = n if close_at < 0 else close_at + len(tag.group(0))
-            add(TokenKind.STRING, start, i)
+            kind = TokenKind.STRING
         elif _ident_start(ch):
             while i < n and _ident_char(text[i]):
                 i += 1
             if text[start:i] in rules.escape_string_prefixes and i < n and text[i] == "'":
                 i = _scan_string(text, i, backslash=True)
-                add(TokenKind.STRING, start, i)
+                kind = TokenKind.STRING
             else:
-                add(TokenKind.WORD, start, i)
+                kind = TokenKind.WORD
         elif ch.isdigit() or (ch == "." and i + 1 < n and text[i + 1].isdigit()):
             match = _NUMBER.match(text, i)
             i = match.end() if match else i + 1
-            add(TokenKind.NUMBER, start, i)
+            kind = TokenKind.NUMBER
         else:
             i += 1
-            add(_PUNCT.get(ch, TokenKind.OTHER), start, i)
-    return tokens
+            kind = _PUNCT.get(ch, TokenKind.OTHER)
+        yield Token(kind, start, i, text[start:i])
+
+
+def tokenize(text: str, dialect: Dialect) -> list[Token]:
+    """Lossless tokenizer: the concatenated token texts equal the input. Never raises."""
+    return list(_scan(text, dialect))
+
+
+def first_token(text: str, dialect: Dialect) -> Token | None:
+    """First token that is neither whitespace nor a comment; stops scanning there. None if there is none."""
+    return next((token for token in _scan(text, dialect) if token.kind not in _SKIPPED), None)
 
 
 def first_keyword(text: str, dialect: Dialect) -> str:
-    for token in tokenize(text, dialect):
-        if token.kind == TokenKind.WORD:
-            return token.upper
-        if token.kind not in (TokenKind.SPACE, TokenKind.COMMENT):
-            return ""
-    return ""
+    """Upper-cased text of the first token when that token is a WORD; "" otherwise
+    (empty text, "(", a quoted identifier or a string)."""
+    token = first_token(text, dialect)
+    return token.upper if token is not None and token.kind == TokenKind.WORD else ""

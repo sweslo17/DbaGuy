@@ -1,9 +1,5 @@
-import re
-
 from ..sql.dialects import PG_RESERVED, Dialect, qualified, quote_ident, quote_literal  # noqa: F401  (re-exported)
-
-_LEADING_JUNK = re.compile(r"\A(?:\s+|--[^\n]*(?:\n|\Z)|/\*.*?\*/)+", re.DOTALL)
-_FIRST_WORD = re.compile(r"[A-Za-z_]+")
+from ..sql.lexer import TokenKind, first_token
 
 
 def quote_ident_pg(name: str) -> str:
@@ -20,14 +16,11 @@ def quote_ident_sqlite(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def strip_leading_comments(sql: str) -> str:
-    return _LEADING_JUNK.sub("", sql, count=1)
-
-
 def first_keyword(sql: str) -> str:
-    """Lower-cased first keyword of a statement ("(" for a parenthesised query, "" if empty)."""
-    rest = strip_leading_comments(sql)
-    if rest.startswith("("):
+    """Lower-cased first keyword of a PostgreSQL statement ("(" for a parenthesised query, "" otherwise)."""
+    token = first_token(sql, Dialect.POSTGRES)
+    if token is None:
+        return ""
+    if token.kind == TokenKind.LPAREN:
         return "("
-    match = _FIRST_WORD.match(rest)
-    return match.group(0).lower() if match else ""
+    return token.text.lower() if token.kind == TokenKind.WORD else ""
