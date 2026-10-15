@@ -3,15 +3,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
-
-class ColumnCategory(StrEnum):
-    NUMBER = "number"
-    TEXT = "text"
-    BOOL = "bool"
-    DATETIME = "datetime"
-    BINARY = "binary"
-    JSON = "json"
-    OTHER = "other"
+from .column_category import ColumnCategory
 
 
 class ColumnMeta(BaseModel):
