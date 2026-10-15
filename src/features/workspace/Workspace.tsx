@@ -2,6 +2,7 @@ import { X } from "lucide-react";
 import { useEffect } from "react";
 import { cn } from "@/lib/cn";
 import { useWorkspace } from "@/stores/workspace";
+import { QueryConsole } from "../console/QueryConsole";
 import { ObjectDetailView } from "../explorer/ObjectDetailView";
 
 export function Workspace() {
@@ -61,7 +62,7 @@ export function Workspace() {
         {/* Tabs stay mounted while hidden so console sessions keep their state. */}
         {tabs.map((tab) => (
           <div key={tab.id} className={cn("h-full", tab.id !== activeTabId && "hidden")}>
-            {tab.kind === "object" ? <ObjectDetailView tab={tab} /> : <p className="p-4 text-muted">Console (Task 14)</p>}
+            {tab.kind === "object" ? <ObjectDetailView tab={tab} /> : <QueryConsole tab={tab} />}
           </div>
         ))}
       </div>
