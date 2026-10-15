@@ -25,7 +25,6 @@ from ..base import (
 )
 from ..positions import offset_to_line_col
 from ..sql_text import first_keyword
-from ..values import encode_row
 from . import ddl, introspection
 from .loaders import category_for_oid, configure_user_loaders
 
@@ -142,7 +141,7 @@ class _BufferedResult(StatementResult):
         if self._cursor.description is None:
             return []
         try:
-            return [encode_row(r) for r in self._cursor.fetchmany(n)]
+            return [list(r) for r in self._cursor.fetchmany(n)]
         except psycopg.Error as exc:
             raise translate_error(exc, self._sql) from exc
 
@@ -204,7 +203,7 @@ class _StreamResult(StatementResult):
             except psycopg.Error as exc:
                 self._done = True
                 raise translate_error(exc, self._sql) from exc
-        return [encode_row(r) for r in rows]
+        return [list(r) for r in rows]
 
     def affected_rows(self) -> int | None:
         return None

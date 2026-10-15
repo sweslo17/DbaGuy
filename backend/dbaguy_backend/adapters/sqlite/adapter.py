@@ -18,7 +18,6 @@ from ..base import (
     StatementError,
     StatementResult,
 )
-from ..values import encode_row
 from . import introspection
 
 _PEEK_ROWS = 200
@@ -72,7 +71,7 @@ class SqliteStatementResult(StatementResult):
                 rows.extend(self._cursor.fetchmany(n - len(rows)))
             except sqlite3.Error as exc:
                 raise _translate(exc) from exc
-        return [encode_row(r) for r in rows]
+        return [list(r) for r in rows]
 
     def affected_rows(self) -> int | None:
         if self._columns is None and self._cursor.rowcount >= 0:

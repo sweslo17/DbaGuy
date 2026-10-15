@@ -94,6 +94,16 @@ def test_metadata_and_session_over_websocket(client, sqlite_profile_id):
     assert client.delete(f"/sessions/{sid}", headers=AUTH).status_code == 204
 
 
+def test_encoded_cells_reach_the_websocket_client_unchanged(client, sqlite_profile_id):
+    sid = client.post("/sessions", json={"profile_id": sqlite_profile_id}, headers=AUTH).json()["session_id"]
+    with client.websocket_connect(f"/sessions/{sid}/ws?token={TOKEN}") as ws:
+        ws.send_json({"type": "execute", "request_id": "enc", "sql": "SELECT x'deadbeef', 9007199254740993"})
+        rows = None
+        while (event := ws.receive_json())["type"] != "finished":
+            rows = event["rows"] if event["type"] == "rows" else rows
+    assert rows == [[{"$type": "bytes", "size": 4, "preview": "deadbeef"}, "9007199254740993"]]
+
+
 def test_invalid_command_without_a_request_id_gets_an_error_but_no_finished(client, sqlite_profile_id):
     sid = client.post("/sessions", json={"profile_id": sqlite_profile_id}, headers=AUTH).json()["session_id"]
     with client.websocket_connect(f"/sessions/{sid}/ws?token={TOKEN}") as ws:

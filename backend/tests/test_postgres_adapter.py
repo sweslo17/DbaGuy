@@ -47,7 +47,8 @@ def test_stream_big_table_in_pages(conn):
 
 def test_text_first_values(conn):
     row = conn.run("SELECT huge_int, big_number, data FROM blobs").fetch(1)[0]
-    assert row == ["9007199254740993", "12345678901234567890.123456789", {"$type": "bytes", "size": 4, "preview": "deadbeef"}]
+    # Raw values after the text-first loaders: int8/numeric stay text, bytea is bytes (encoded later by the worker).
+    assert row == ["9007199254740993", "12345678901234567890.123456789", b"\xde\xad\xbe\xef"]
     profile, tags, address = conn.run("SELECT profile, tags, address FROM customers WHERE id = 1").fetch(1)[0]
     assert '"score": 12345678901234567890' in profile
     assert tags == "{math,pioneer}"

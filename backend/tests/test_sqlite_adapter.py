@@ -70,15 +70,15 @@ def test_tree_and_ddl(db_path):
         conn.close()
 
 
-def test_run_pages_and_encoding(db_path):
+def test_run_pages_and_raw_values(db_path):
     conn = open_conn(db_path)
     try:
         result = conn.run("SELECT id, title, cover, big FROM books ORDER BY id")
         assert [c.category for c in result.columns()] == ["number", "text", "binary", "number"]
         first = result.fetch(500)
         assert len(first) == 500
-        assert first[0][2] == {"$type": "bytes", "size": 2, "preview": "00ff"}
-        assert first[0][3] == str(2**60)
+        assert first[0][2] == b"\x00\xff"  # raw driver values; the session worker encodes them for the client
+        assert first[0][3] == 2**60
         assert len(result.fetch(1000)) == 700
         assert result.fetch(10) == []
         result.close()

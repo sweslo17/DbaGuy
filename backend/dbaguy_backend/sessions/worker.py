@@ -10,6 +10,7 @@ from loguru import logger
 from pydantic import BaseModel
 
 from ..adapters.base import DatabaseConnection, StatementCancelled, StatementError, StatementResult
+from ..adapters.values import encode_row
 from ..domain.errors import ConnectionFailed, SessionBusy
 from ..domain.execution import (
     AffectedEvent,
@@ -45,7 +46,7 @@ class _OpenExecution:
     index: int = 0
     sent: int = 0
     columns_sent: bool = False
-    peeked: list[list[Any]] = field(default_factory=list)
+    peeked: list[list[Any]] = field(default_factory=list)  # raw rows read ahead to detect a full page
 
 
 class SessionWorker:
@@ -330,7 +331,8 @@ class SessionWorker:
                     if len(rows) < want:
                         rows += result.fetch(want - len(rows))
                     if rows:
-                        self._send(RowsEvent(request_id=ex.request_id, index=ex.index, rows=rows))
+                        cells = [encode_row(r) for r in rows]
+                        self._send(RowsEvent(request_id=ex.request_id, index=ex.index, rows=cells))
                         ex.sent += len(rows)
                         budget -= len(rows)
                     self._send_messages(ex)

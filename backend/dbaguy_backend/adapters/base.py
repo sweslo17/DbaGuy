@@ -41,7 +41,11 @@ class StatementCancelled(StatementError):
 
 
 class StatementResult(ABC):
-    """Results of one executed statement or batch, possibly with several result sets."""
+    """Results of one executed statement or batch, possibly with several result sets.
+
+    Rows are raw driver values (after the adapter's own driver-level loading, e.g. PostgreSQL's text-first loaders);
+    the session worker turns them into JSON-safe cells with `values.encode_row` before they reach the client.
+    """
 
     @abstractmethod
     def columns(self) -> list[ColumnMeta] | None:
@@ -49,7 +53,7 @@ class StatementResult(ABC):
 
     @abstractmethod
     def fetch(self, n: int) -> list[list[Any]]:
-        """Up to n encoded rows of the current result set; fewer (or none) means exhausted."""
+        """Up to n raw rows of the current result set; fewer (or none) means exhausted."""
 
     @abstractmethod
     def affected_rows(self) -> int | None: ...

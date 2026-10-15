@@ -86,6 +86,14 @@ def test_paging_fetch_more_and_finish(setup):
     assert len(rec.of("r1", "result_set")) == 1
 
 
+def test_worker_encodes_cells_for_the_client(setup):
+    _, _, worker, rec = setup
+    sql = "SELECT x'00ff' AS b, 1152921504606846976 AS big, 1.5 AS f, NULL AS n"
+    worker.submit(ExecuteCommand(request_id="enc", sql=sql))
+    rec.wait_for(finished("enc"))
+    assert rec.of("enc", "rows")[0].rows == [[{"$type": "bytes", "size": 2, "preview": "00ff"}, "1152921504606846976", 1.5, None]]
+
+
 def test_exact_page_has_no_more(setup):
     _, _, worker, rec = setup
     worker.submit(ExecuteCommand(request_id="r2", sql="SELECT id FROM t LIMIT 500", page_size=500))
