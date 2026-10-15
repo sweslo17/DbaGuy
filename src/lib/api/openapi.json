@@ -1294,6 +1294,11 @@
             "type": "boolean",
             "title": "In Transaction"
           },
+          "transaction_failed": {
+            "type": "boolean",
+            "title": "Transaction Failed",
+            "default": false
+          },
           "cancelled": {
             "type": "boolean",
             "title": "Cancelled",

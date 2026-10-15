@@ -89,7 +89,8 @@ def test_metadata_and_session_over_websocket(client, sqlite_profile_id):
         ws.send_json({"type": "bogus", "request_id": "x"})
         assert ws.receive_json()["code"] == "invalid_command"
         assert ws.receive_json() == {
-            "type": "finished", "request_id": "x", "elapsed_ms": 0, "in_transaction": False, "cancelled": False,
+            "type": "finished", "request_id": "x", "elapsed_ms": 0, "in_transaction": False,
+            "transaction_failed": False, "cancelled": False,
         }
     assert client.delete(f"/sessions/{sid}", headers=AUTH).status_code == 204
 

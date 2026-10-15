@@ -130,6 +130,94 @@ def test_transaction_state(conn):
     assert not conn.in_transaction()
 
 
+@pytest.fixture
+def tx(conn):
+    """`conn` inside an open transaction with a temp table holding one uncommitted row."""
+    conn.run("CREATE TEMP TABLE tx_rows (id int)")
+    conn.run("BEGIN")
+    conn.run("INSERT INTO tx_rows VALUES (1)")
+    yield conn
+    if conn.in_transaction():
+        conn.run("ROLLBACK")
+
+
+def assert_transaction_healthy(conn):
+    assert conn.in_transaction() and not conn.transaction_failed()
+
+
+def committed_rows(conn) -> str:
+    conn.run("COMMIT")
+    assert not conn.in_transaction()
+    return conn.run("SELECT count(*) FROM tx_rows").fetch(1)[0][0]
+
+
+def test_closing_a_partly_read_select_inside_a_transaction_keeps_the_transaction(tx):
+    result = tx.run("SELECT g FROM generate_series(1, 5000000) g")
+    assert [c.name for c in result.columns()] == ["g"]
+    assert result.fetch(500) == [[g] for g in range(1, 501)]
+    open_cursors = tx.run("SELECT name FROM pg_cursors").fetch(10)
+    assert len([n for (n,) in open_cursors if n.startswith("dbaguy_cursor_")]) == 2  # the paused SELECT and this one
+    result.close()
+    result.close()  # idempotent
+    assert_transaction_healthy(tx)
+    assert committed_rows(tx) == "1"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 1 AS a; SELECT 2 AS b",  # several statements: DECLARE would reject the script
+        "WITH x AS (INSERT INTO tx_rows VALUES (2) RETURNING id) SELECT id FROM x",  # data-modifying WITH
+        "INSERT INTO tx_rows VALUES (3) RETURNING id",
+        "SELECT 1 AS x INTO TEMP TABLE tx_into",  # SELECT INTO is not allowed in DECLARE
+        "SHOW search_path",
+        "EXPLAIN SELECT * FROM tx_rows",
+        "VALUES (1), (2)",
+        "TABLE tx_rows",
+        "(SELECT 1) UNION ALL (SELECT 2)",
+        "SELECT * FROM tx_rows FOR UPDATE",
+        "SELECT '100%' AS pct  -- comment; with a semicolon",
+        "SELECT 1 AS one;",
+    ],
+)
+def test_statements_inside_a_transaction_never_abort_it_by_our_routing(tx, sql):
+    result = tx.run(sql)
+    while True:
+        if result.columns() is not None:
+            result.fetch(1)
+        if not result.next_result():
+            break
+    result.close()
+    assert_transaction_healthy(tx)
+
+
+def test_select_inside_a_transaction_returns_raw_values_and_zero_row_columns(tx):
+    assert tx.run("SELECT '100%' AS pct, 9007199254740993::int8 AS big").fetch(5) == [["100%", "9007199254740993"]]
+    empty = tx.run("SELECT id, label FROM big_table WHERE false")
+    assert [c.name for c in empty.columns()] == ["id", "label"] and empty.fetch(10) == []
+    empty.close()
+    assert_transaction_healthy(tx)
+
+
+def test_error_position_inside_a_transaction_is_relative_to_the_statement(tx):
+    sql = "SELECT '中文' AS a,\n  nope_column FROM big_table"
+    with pytest.raises(StatementError) as info:
+        tx.run(sql).fetch(1)
+    assert info.value.code == "42703"
+    assert (info.value.position.line, info.value.position.column) == (2, 3)
+    assert tx.transaction_failed()  # the statement's own error: PostgreSQL aborts the transaction
+
+
+def test_transaction_failed_tracks_the_aborted_state(conn):
+    assert not conn.transaction_failed()
+    conn.run("BEGIN")
+    with pytest.raises(StatementError):
+        conn.run("SELECT 1 / 0").fetch(1)
+    assert conn.in_transaction() and conn.transaction_failed()
+    conn.run("ROLLBACK")
+    assert not conn.in_transaction() and not conn.transaction_failed()
+
+
 def test_parse_url():
     parsed = PostgresAdapter().parse_url("postgresql://me:p%40ss@db.example.com:6543/app?sslmode=require&connect_timeout=5")
     draft = parsed.profile

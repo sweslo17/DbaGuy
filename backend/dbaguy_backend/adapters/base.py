@@ -68,7 +68,11 @@ class StatementResult(ABC):
 
     @abstractmethod
     def close(self) -> None:
-        """Stop early: cancel and drain anything left. Must be idempotent."""
+        """Stop early: discard anything left. Must be idempotent.
+
+        Must not change the transaction state: closing a partly read result inside the user's transaction leaves that
+        transaction open and healthy (e.g. PostgreSQL closes a cursor instead of cancelling the statement).
+        """
 
 
 class DatabaseConnection(ABC):
@@ -92,6 +96,10 @@ class DatabaseConnection(ABC):
 
     @abstractmethod
     def in_transaction(self) -> bool: ...
+
+    def transaction_failed(self) -> bool:
+        """True when the open transaction is aborted and only accepts ROLLBACK (PostgreSQL); False otherwise."""
+        return False
 
     @abstractmethod
     def cancel(self) -> None:

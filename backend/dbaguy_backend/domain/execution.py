@@ -122,6 +122,7 @@ class FinishedEvent(BaseModel):
     request_id: str
     elapsed_ms: int
     in_transaction: bool
+    transaction_failed: bool = False  # the open transaction is aborted: only ROLLBACK is accepted
     cancelled: bool = False
 
 

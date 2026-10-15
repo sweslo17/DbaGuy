@@ -1,3 +1,4 @@
+import itertools
 import os
 import re
 from collections import deque
@@ -31,6 +32,12 @@ from .loaders import category_for_oid, configure_user_loaders
 _ROW_KEYWORDS = frozenset({"select", "with", "values", "table", "show", "explain", "fetch", "("})
 _RETURNING = re.compile(r"\breturning\b", re.IGNORECASE)
 _STREAM_CHUNK = 200
+# Statements DECLARE CURSOR accepts, judged conservatively: a wrong "no" only means the result is read in full,
+# a wrong "yes" would make DECLARE fail and abort the user's transaction.
+_DECLARABLE_KEYWORDS = frozenset({"select", "values", "table", "(", "with"})
+# Data-modifying statements and SELECT ... INTO, which DECLARE rejects. Matched anywhere (literals and comments too).
+_NOT_DECLARABLE = re.compile(r"\b(?:insert|update|delete|merge|into)\b", re.IGNORECASE)
+_CURSOR_PREFIX = "dbaguy_cursor_"
 _SSL_QUERY_KEYS = {"sslmode": "mode", "sslrootcert": "ca_file", "sslcert": "cert_file", "sslkey": "key_file"}
 _URL_CONNECTION_KEYS = ("user", "password", "host", "port", "dbname")  # query-string spellings of URL parts
 # libpq keys that pick the target or carry secrets: they come from the profile fields and the keychain,
@@ -71,7 +78,8 @@ def _is_connection_lost(exc: psycopg.Error) -> bool:
     return sqlstate is None or sqlstate.startswith("08") or sqlstate in _CONNECTION_LOST_STATES
 
 
-def translate_error(exc: psycopg.Error, sql: str) -> StatementError:
+def translate_error(exc: psycopg.Error, sql: str, offset: int = 0) -> StatementError:
+    """`offset`: characters the driver sent in front of `sql` (a DECLARE prefix), removed from the error position."""
     diag = exc.diag
     if isinstance(exc, psycopg.errors.QueryCanceled):
         return StatementCancelled(diag.message_primary or "Query cancelled")
@@ -84,8 +92,8 @@ def translate_error(exc: psycopg.Error, sql: str) -> StatementError:
     if diag.message_hint:
         message += f"\nHINT: {diag.message_hint}"
     position = None
-    if diag.statement_position:
-        line, column = offset_to_line_col(sql, int(diag.statement_position))
+    if diag.statement_position and int(diag.statement_position) > offset:
+        line, column = offset_to_line_col(sql, int(diag.statement_position) - offset)
         position = ErrorPosition(line=line, column=column)
     return StatementError(message, code=diag.sqlstate, position=position)
 
@@ -97,6 +105,15 @@ def _is_multi_statement_rejection(exc: StatementError) -> bool:
 
 def _likely_returns_rows(sql: str) -> bool:
     return first_keyword(sql) in _ROW_KEYWORDS or bool(_RETURNING.search(sql))
+
+
+def _single_statement(sql: str) -> bool:
+    """No ';' before the end. Literals are not parsed, so a ';' inside one errs on the safe (buffered) side."""
+    return ";" not in sql.rstrip().rstrip(";")
+
+
+def _declarable(sql: str) -> bool:
+    return first_keyword(sql) in _DECLARABLE_KEYWORDS and not _NOT_DECLARABLE.search(sql) and _single_statement(sql)
 
 
 def _without_reserved_options(options: Mapping[str, str]) -> dict[str, str]:
@@ -226,10 +243,68 @@ class _StreamResult(StatementResult):
         self._cursor.close()
 
 
+class _CursorResult(StatementResult):
+    """Row-returning statement inside the user's transaction, read through a server-side cursor (DECLARE/FETCH).
+
+    Abandoning a stream makes psycopg cancel the statement, which aborts the surrounding transaction (COMMIT then
+    silently rolls back). close() runs CLOSE instead, which leaves the transaction exactly as it was.
+    """
+
+    def __init__(self, owner: "PostgresConnection", cursor: psycopg.ServerCursor, sql: str) -> None:
+        self._owner, self._cursor, self._sql = owner, cursor, sql
+        self._pending: list[Any] = []
+        self._done = False
+        self._closed = False
+        try:
+            cursor.execute(sql)  # DECLARE <name> CURSOR FOR <sql>, then describes the portal
+        except psycopg.Error as exc:
+            self.close()
+            # psycopg prefixes the statement with `DECLARE "<name>" CURSOR FOR `; error positions must not count it.
+            raise translate_error(exc, sql, offset=len(f'DECLARE "{cursor.name}" CURSOR FOR ')) from exc
+        desc = cursor.description
+        self._columns = owner.column_meta(desc) if desc else None
+
+    def columns(self) -> list[ColumnMeta] | None:
+        return self._columns
+
+    def fetch(self, n: int) -> list[list[Any]]:
+        while len(self._pending) < n and not self._done and self._columns is not None:
+            want = max(n - len(self._pending), _STREAM_CHUNK)  # read ahead: one FETCH per page, not per call
+            try:
+                page = self._cursor.fetchmany(want)
+            except psycopg.Error as exc:
+                self._done = True
+                raise translate_error(exc, self._sql) from exc
+            self._pending += page
+            self._done = len(page) < want
+        rows, self._pending = self._pending[:n], self._pending[n:]
+        return [list(r) for r in rows]
+
+    def affected_rows(self) -> int | None:
+        return None
+
+    def next_result(self) -> bool:
+        return False
+
+    def take_messages(self) -> list[ServerMessage]:
+        return self._owner.drain_messages()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._pending = []
+        try:
+            self._cursor.close()  # CLOSE <name>; psycopg skips it once the transaction has failed or ended
+        except psycopg.Error as exc:
+            logger.warning("Error while closing PostgreSQL cursor: {}", exc)
+
+
 class PostgresConnection(DatabaseConnection):
     def __init__(self, conn: psycopg.Connection) -> None:
         self._conn = conn
         self._messages: deque[ServerMessage] = deque(maxlen=1000)
+        self._cursor_ids = itertools.count(1)
         self._custom_types: dict[int, str] = {int(oid): name for oid, name in conn.execute(_CUSTOM_TYPES_SQL)}
         conn.add_notice_handler(self._on_notice)
 
@@ -309,6 +384,11 @@ class PostgresConnection(DatabaseConnection):
         configure_user_loaders(cursor.adapters)
         return cursor
 
+    def _server_cursor(self) -> psycopg.ServerCursor:
+        cursor = self._conn.cursor(name=f"{_CURSOR_PREFIX}{next(self._cursor_ids)}")  # unique per connection
+        configure_user_loaders(cursor.adapters)
+        return cursor
+
     def _run_buffered(self, sql: str) -> StatementResult:
         cursor = self._user_cursor()
         try:
@@ -318,21 +398,34 @@ class PostgresConnection(DatabaseConnection):
             raise
         return _BufferedResult(self, cursor, sql)
 
+    def _run_streamed(self, sql: str) -> StatementResult:
+        try:
+            return _StreamResult(self, self._user_cursor(), sql)  # closes its cursor when it fails
+        except StatementError as exc:
+            if not _is_multi_statement_rejection(exc):
+                raise
+            logger.debug("Script has several statements and cannot be streamed; running it buffered")
+        return self._run_buffered(sql)
+
     def run(self, sql: str) -> StatementResult:
         try:
             if _likely_returns_rows(sql):
-                try:
-                    return _StreamResult(self, self._user_cursor(), sql)  # closes its cursor when it fails
-                except StatementError as exc:
-                    if not _is_multi_statement_rejection(exc):
-                        raise
-                    logger.debug("Script has several statements and cannot be streamed; running it buffered")
+                status = self._conn.info.transaction_status
+                if status == pq.TransactionStatus.IDLE:
+                    return self._run_streamed(sql)  # autocommit: cancelling an abandoned stream is harmless
+                if status == pq.TransactionStatus.INTRANS and _declarable(sql):
+                    return _CursorResult(self, self._server_cursor(), sql)
+                # Anything else inside a transaction (SHOW, EXPLAIN, RETURNING, scripts…) is read in full: abandoning
+                # a stream would cancel it and abort the user's transaction.
             return self._run_buffered(sql)
         except psycopg.Error as exc:  # e.g. creating a cursor on a dead connection
             raise translate_error(exc, sql) from exc
 
     def in_transaction(self) -> bool:
         return self._conn.info.transaction_status in (pq.TransactionStatus.INTRANS, pq.TransactionStatus.INERROR)
+
+    def transaction_failed(self) -> bool:
+        return self._conn.info.transaction_status == pq.TransactionStatus.INERROR
 
     def cancel(self) -> None:
         try:

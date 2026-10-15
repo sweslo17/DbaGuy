@@ -392,6 +392,11 @@ export interface components {
             /** In Transaction */
             in_transaction: boolean;
             /**
+             * Transaction Failed
+             * @default false
+             */
+            transaction_failed: boolean;
+            /**
              * Cancelled
              * @default false
              */

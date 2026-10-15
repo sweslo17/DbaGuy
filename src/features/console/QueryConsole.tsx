@@ -40,15 +40,19 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
   const editor = useRef<HTMLTextAreaElement>(null);
 
   const connectionLost = useRef(false);
+  /** The last `in_transaction` the backend reported for this console's session. */
+  const inTransaction = useRef(false);
   const connection: SocketStatus = error ? "closed" : status;
 
   useEffect(() => {
     setExecution(null); // results belong to the session that produced them
     connectionLost.current = false;
+    inTransaction.current = false; // a fresh session starts outside any transaction
     if (!socket) return;
-    return socket.subscribe((event) =>
-      setExecution((prev) => (prev && event.request_id === prev.requestId ? applyEvent(prev, event) : prev)),
-    );
+    return socket.subscribe((event) => {
+      if (event.type === "finished") inTransaction.current = event.in_transaction;
+      setExecution((prev) => (prev && event.request_id === prev.requestId ? applyEvent(prev, event) : prev));
+    });
   }, [socket]);
 
   const latestExecution = useRef(execution);
@@ -64,8 +68,10 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
     if (reconnected) connectionLost.current = false;
     if (!reconnected && !error) return;
     const orphan = latestExecution.current;
-    if (reconnected && orphan && orphan.status !== "done") {
-      socket?.send({ type: "cancel", request_id: orphan.requestId }); // otherwise it keeps blocking the next statement
+    // Cancelling it stops it from blocking the next statement, but inside a transaction a cancel would abort the
+    // whole transaction: there the request is only marked interrupted and the user decides.
+    if (reconnected && orphan && orphan.status !== "done" && !inTransaction.current) {
+      socket?.send({ type: "cancel", request_id: orphan.requestId });
     }
     setExecution((prev) => (prev ? interruptExecution(prev) : prev));
   }, [status, error, socket]);
@@ -207,8 +213,16 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
                   {execution.status === "running" && <span>Running…</span>}
                   {execution.elapsedMs !== null && <span>{execution.elapsedMs} ms</span>}
                   {execution.cancelled && <span>Cancelled</span>}
-                  {execution.inTransaction && (
-                    <span className="rounded bg-orange-500/20 px-1.5 text-orange-600 dark:text-orange-400">In transaction</span>
+                  {execution.transactionFailed ? (
+                    <span className="rounded bg-danger/15 px-1.5 font-medium text-danger">
+                      Transaction aborted — ROLLBACK required
+                    </span>
+                  ) : (
+                    execution.inTransaction && (
+                      <span className="rounded bg-orange-500/20 px-1.5 text-orange-600 dark:text-orange-400">
+                        In transaction
+                      </span>
+                    )
                   )}
                 </div>
               </div>

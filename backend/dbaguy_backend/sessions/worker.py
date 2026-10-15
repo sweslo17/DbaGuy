@@ -53,8 +53,9 @@ class SessionWorker:
     """Owns one connection and one thread; every driver call happens on that thread.
 
     Locking: `_queue_lock` guards `_closed` and every enqueue, so nothing can land behind the stop marker.
-    `_state_lock` guards `_running_request` and `_queued`; it is held across `connection.cancel()`, so a cancel can
-    never hit a statement other than the one it was meant for (the worker changes the running request under it).
+    `_state_lock` guards `_running_request`, `_cancel_requested` and `_queued`; it is held across
+    `connection.cancel()`, so a cancel can never hit a statement other than the one it was meant for (the worker
+    changes the running request under it).
     """
 
     def __init__(self, name: str, opener: Callable[[], Any]) -> None:
@@ -70,6 +71,9 @@ class SessionWorker:
         self._queue_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._running_request: str | None = None
+        # A cancel reached the running request; honoured at the next page boundary in case no driver call was in
+        # flight to interrupt (the driver then has nothing to cancel and the request would pause instead).
+        self._cancel_requested = False
         self._queued: dict[str, bool] = {}  # execute requests waiting in the queue -> cancelled before they started
         self._open_exec: _OpenExecution | None = None
         self._closed = False
@@ -135,6 +139,7 @@ class SessionWorker:
         with self._state_lock:
             if self._running_request == request_id:
                 logger.info("Cancelling request {} on {}", request_id, self.name)
+                self._cancel_requested = True
                 self._cancel_connection()
                 return
             if request_id in self._queued:
@@ -232,15 +237,21 @@ class SessionWorker:
         except Exception:
             logger.exception("Failed to deliver event on {}", self.name)
 
-    def _set_running(self, request_id: str | None) -> None:
+    def _set_running(self, request_id: str | None) -> bool:
+        """Change the running request. Returns whether a cancel had been requested for the previous one."""
         with self._state_lock:
+            cancel_requested = self._cancel_requested
             self._running_request = request_id
+            self._cancel_requested = False
+        return cancel_requested
 
-    def _in_transaction(self) -> bool:
+    def _transaction_state(self) -> tuple[bool, bool]:
+        """(in_transaction, transaction_failed); both False when the connection cannot tell (e.g. it is gone)."""
         try:
-            return self.connection.in_transaction()
+            connection = self.connection
+            return connection.in_transaction(), connection.transaction_failed()
         except Exception:
-            return False
+            return False, False
 
     def _begin_request(self, request_id: str) -> str | None:
         """Atomically leave the queue and become the running request. Returns why it must not run, if so."""
@@ -251,6 +262,7 @@ class SessionWorker:
             if self._closed:
                 return "Session closed before the query started"
             self._running_request = request_id
+            self._cancel_requested = False
         return None
 
     def _execute(self, cmd: ExecuteCommand) -> None:
@@ -282,9 +294,7 @@ class SessionWorker:
         if execution is None or execution.request_id != cmd.request_id:
             self._send(ErrorEvent(request_id=cmd.request_id, message="No open result to fetch from", code="no_open_result"))
             # Every request ends with exactly one `finished`; without it a client waiting on this request would hang.
-            self._send(FinishedEvent(
-                request_id=cmd.request_id, elapsed_ms=0, in_transaction=self._in_transaction(), cancelled=False,
-            ))
+            self._send_finished(cmd.request_id, None, cancelled=False)
             return
         self._set_running(cmd.request_id)
         try:
@@ -304,6 +314,14 @@ class SessionWorker:
         if cancelled:
             self._send(MessageEvent(request_id=request_id, severity=MessageSeverity.WARNING, text="Query cancelled"))
         self._finish(execution, cancelled=cancelled)
+
+    def _pause(self, ex: _OpenExecution) -> None:
+        """A page is full and more rows exist: pause, unless a cancel arrived that the driver had nothing to stop."""
+        # Leave the running state before any event: a cancel from now on discards instead of interrupting.
+        if self._set_running(None):
+            self._discard(ex.request_id, cancelled=True)
+            return
+        self._send(ResultSetEndEvent(request_id=ex.request_id, index=ex.index, row_count=ex.sent, has_more=True))
 
     def _discard_open(self) -> None:
         if self._open_exec is not None:
@@ -341,9 +359,8 @@ class SessionWorker:
                 else:
                     if not ex.peeked:
                         ex.peeked = result.fetch(1)
-                    if ex.peeked:  # page full and more rows exist: pause
-                        self._set_running(None)  # before the event: a cancel from now on discards instead of interrupting
-                        self._send(ResultSetEndEvent(request_id=ex.request_id, index=ex.index, row_count=ex.sent, has_more=True))
+                    if ex.peeked:  # page full and more rows exist
+                        self._pause(ex)
                         return
                 self._send(ResultSetEndEvent(request_id=ex.request_id, index=ex.index, row_count=ex.sent, has_more=False))
             self._send_messages(ex)
@@ -355,11 +372,14 @@ class SessionWorker:
             ex.peeked = []
         self._finish(ex)
 
-    def _send_finished(self, request_id: str, started: float, cancelled: bool) -> None:
+    def _send_finished(self, request_id: str, started: float | None, cancelled: bool) -> None:
+        """The one `finished` every request ends with; `started=None` for requests that never ran."""
+        in_transaction, transaction_failed = self._transaction_state()
         self._send(FinishedEvent(
             request_id=request_id,
-            elapsed_ms=int((time.monotonic() - started) * 1000),
-            in_transaction=self._in_transaction(),
+            elapsed_ms=0 if started is None else int((time.monotonic() - started) * 1000),
+            in_transaction=in_transaction,
+            transaction_failed=transaction_failed,
             cancelled=cancelled,
         ))
 

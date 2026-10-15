@@ -146,6 +146,23 @@ def test_cancelling_a_paused_result_finishes_it_as_cancelled(started_worker):
     assert conn.cancel_calls == 0  # nothing was running; the result was just closed
 
 
+def test_cancel_while_no_driver_call_is_in_flight_is_honoured_at_the_pause(started_worker):
+    # The cancel reaches the connection while the worker is between driver calls (delivering rows): the driver has
+    # nothing to interrupt, so the worker itself must stop at the pause instead of leaving the result paused.
+    recorder = HoldingRecorder(lambda e: e.type == "rows" and e.request_id == "L")
+    worker, conn, _ = started_worker(recorder)
+    execute(worker, "L", "rows 3", page_size=1)
+    assert recorder.holding.wait(5)
+    worker.cancel("L")
+    recorder.proceed.set()
+    done = recorder.wait_for(finished("L"))
+    assert done.cancelled is True
+    assert [e.text for e in recorder.of("L", "message")] == ["Query cancelled"]
+    assert not [e for e in recorder.of("L", "result_set_end") if e.has_more], "the cancelled request paused anyway"
+    execute(worker, "next", "rows 1")  # the flag must not leak into the next request
+    assert recorder.wait_for(finished("next")).cancelled is False
+
+
 def test_close_does_not_run_queued_statements_and_fails_pending_calls(started_worker):
     worker, conn, recorder = started_worker(Recorder())
     execute(worker, "A", "block")

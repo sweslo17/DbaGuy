@@ -17,6 +17,8 @@ export interface ExecutionState {
   error: { message: string; code?: string | null; position?: { line: number; column: number } | null } | null;
   elapsedMs: number | null;
   inTransaction: boolean;
+  /** The open transaction is aborted: the server only accepts ROLLBACK. */
+  transactionFailed: boolean;
   cancelled: boolean;
   /** The connection dropped mid-request: later events are ignored because some were lost. */
   interrupted: boolean;
@@ -36,6 +38,7 @@ export function newExecution(requestId: string): ExecutionState {
     error: null,
     elapsedMs: null,
     inTransaction: false,
+    transactionFailed: false,
     cancelled: false,
     interrupted: false,
   };
@@ -92,6 +95,7 @@ export function applyEvent(state: ExecutionState, event: ServerEvent): Execution
         status: "done",
         elapsedMs: event.elapsed_ms,
         inTransaction: event.in_transaction,
+        transactionFailed: event.transaction_failed,
         cancelled: event.cancelled,
         resultSets: state.resultSets.map((s) => ({ ...s, hasMore: false })),
       };
