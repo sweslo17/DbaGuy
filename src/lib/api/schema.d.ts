@@ -671,6 +671,12 @@ export interface components {
              */
             read_only: boolean;
             /**
+             * Safety
+             * @default standard
+             * @enum {string}
+             */
+            safety: "relaxed" | "standard" | "strict";
+            /**
              * Save Password
              * @default true
              */
@@ -720,6 +726,12 @@ export interface components {
              * @default false
              */
             read_only: boolean;
+            /**
+             * Safety
+             * @default standard
+             * @enum {string}
+             */
+            safety: "relaxed" | "standard" | "strict";
             /**
              * Save Password
              * @default true
@@ -789,6 +801,12 @@ export interface components {
              */
             read_only: boolean;
             /**
+             * Safety
+             * @default standard
+             * @enum {string}
+             */
+            safety: "relaxed" | "standard" | "strict";
+            /**
              * Save Password
              * @default true
              */
@@ -826,6 +844,12 @@ export interface components {
              * @default false
              */
             read_only: boolean;
+            /**
+             * Safety
+             * @default standard
+             * @enum {string}
+             */
+            safety: "relaxed" | "standard" | "strict";
             /**
              * Save Password
              * @default true

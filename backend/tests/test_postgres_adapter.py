@@ -329,3 +329,17 @@ def test_profile_options_cannot_redirect_or_override_the_connection():
     warning = "\n".join(messages)
     assert all(key in warning for key in reserved)  # names are logged ...
     assert not any(value in warning for value in ("attacker.invalid", "wrong-secret", "ssl-secret", "/nonexistent"))  # ... values never
+
+
+@requires_pg
+def test_read_only_profile_is_read_only_in_the_database():
+    conn = PostgresAdapter().open(make_pg_profile(read_only=True), Endpoint(PG_HOST, PG_PORT), PG_PASSWORD, None)
+    try:
+        result = conn.run("SHOW default_transaction_read_only")
+        assert result.fetch(1) == [["on"]]
+        result.close()
+        with pytest.raises(StatementError) as exc:
+            conn.run("CREATE TEMP TABLE ro_probe (id int)")
+        assert exc.value.code == "25006"  # read_only_sql_transaction
+    finally:
+        conn.close()

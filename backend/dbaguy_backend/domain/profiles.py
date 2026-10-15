@@ -17,6 +17,7 @@ class Engine(StrEnum):
 
 SslMode = Literal["disable", "prefer", "require", "verify-ca", "verify-full"]
 ProfileColor = Literal["none", "green", "yellow", "orange", "red", "purple"]
+SafetyLevel = Literal["relaxed", "standard", "strict"]
 SshAuth = Literal["agent_or_key", "password"]
 
 
@@ -47,6 +48,7 @@ class _ProfileCommon(BaseModel):
     folder: str = ""  # "/"-separated folder path
     color: ProfileColor = "none"
     read_only: bool = False
+    safety: SafetyLevel = "standard"
     save_password: bool = True
 
 

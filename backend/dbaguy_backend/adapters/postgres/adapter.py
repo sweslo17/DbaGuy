@@ -519,5 +519,15 @@ class PostgresAdapter(DatabaseAdapter):
             conn = psycopg.connect(autocommit=True, **params)
         except psycopg.Error as exc:
             raise ConnectionFailed(str(exc).strip()) from exc
-        logger.info("Connected to PostgreSQL {}:{} db={}", params["host"], endpoint.port, params["dbname"])
+        if profile.read_only:
+            # Enforced by the server too, so a function with side effects called from a SELECT cannot write either.
+            try:
+                conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+            except psycopg.Error as exc:
+                conn.close()
+                raise ConnectionFailed(f"Could not make the connection read-only: {exc}") from exc
+        logger.info(
+            "Connected to PostgreSQL {}:{} db={}{}",
+            params["host"], endpoint.port, params["dbname"], " read_only=True" if profile.read_only else "",
+        )
         return PostgresConnection(conn)

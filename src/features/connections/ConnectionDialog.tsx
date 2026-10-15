@@ -48,7 +48,7 @@ type CommonField = "name" | "folder" | "color" | "read_only" | "save_password";
 type Feedback = { ok: boolean; text: string } | null;
 
 function emptyDraft(engine: Engine): ProfileDraft {
-  const common = { name: "", folder: "", color: "none", read_only: false, save_password: true } as const;
+  const common = { name: "", folder: "", color: "none", read_only: false, safety: "standard", save_password: true } as const;
   if (engine === "sqlite") return { ...common, engine, path: "" };
   return {
     ...common,
