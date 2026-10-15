@@ -255,6 +255,37 @@ def test_dead_connection_raises_statement_errors(conn):
     assert not conn.in_transaction()
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "COPY big_table FROM STDIN",
+        "copy (SELECT 1) to stdout with (format csv)",
+        "-- export\nCOPY big_table TO STDOUT",
+        "CREATE TEMP TABLE cp (id int); COPY cp FROM STDIN",  # a later statement of a script wedges it just the same
+    ],
+)
+def test_copy_from_stdin_or_to_stdout_is_rejected_and_the_session_keeps_working(conn, sql):
+    with pytest.raises(StatementError) as info:
+        conn.run(sql)
+    assert info.value.code == "unsupported_copy"
+    assert info.value.message == "COPY FROM STDIN / TO STDOUT is not supported in the console yet"
+    assert conn.run("SELECT 1").fetch(1) == [[1]]
+
+
+def test_server_side_copy_still_runs(conn):
+    conn.run("CREATE TEMP TABLE cp_src AS SELECT 1 AS id")
+    assert conn.run("COPY cp_src TO '/dev/null'").affected_rows() == 1  # a server-side file, not STDOUT
+
+
+def test_command_in_progress_is_not_reported_as_connection_lost(conn):
+    with pytest.raises(psycopg.ProgrammingError):
+        conn._conn.execute("COPY (SELECT 1) TO STDOUT")  # wedge the connection the way an unguarded COPY did
+    with pytest.raises(StatementError) as info:
+        conn.run("SELECT 1").fetch(1)
+    assert "another command is already in progress" in info.value.message
+    assert info.value.code != "connection_lost"  # the connection is alive, so no "Reconnect" is offered for it
+
+
 def test_parse_url_lifts_connection_keys_out_of_options():
     parsed = PostgresAdapter().parse_url("postgres://u@good/db?host=attacker&password=x&connect_timeout=5")
     assert parsed.profile.host == "good"

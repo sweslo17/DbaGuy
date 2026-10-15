@@ -38,6 +38,9 @@ _DECLARABLE_KEYWORDS = frozenset({"select", "values", "table", "(", "with"})
 # Data-modifying statements and SELECT ... INTO, which DECLARE rejects. Matched anywhere (literals and comments too).
 _NOT_DECLARABLE = re.compile(r"\b(?:insert|update|delete|merge|into)\b", re.IGNORECASE)
 _CURSOR_PREFIX = "dbaguy_cursor_"
+# COPY through the client needs psycopg's copy() API; plain execute() leaves the connection stuck in COPY mode.
+_COPY_CLIENT_STREAM = re.compile(r"\b(?:stdin|stdout)\b", re.IGNORECASE)
+_UNSUPPORTED_COPY = "COPY FROM STDIN / TO STDOUT is not supported in the console yet"
 _SSL_QUERY_KEYS = {"sslmode": "mode", "sslrootcert": "ca_file", "sslcert": "cert_file", "sslkey": "key_file"}
 _URL_CONNECTION_KEYS = ("user", "password", "host", "port", "dbname")  # query-string spellings of URL parts
 # libpq keys that pick the target or carry secrets: they come from the profile fields and the keychain,
@@ -70,20 +73,32 @@ LIMIT 20000
 """
 
 
-def _is_connection_lost(exc: psycopg.Error) -> bool:
-    """True when the connection is gone (no SQLSTATE means the failure happened client side or on the socket)."""
-    if not isinstance(exc, psycopg.OperationalError):
-        return False
+def _is_connection_lost(exc: psycopg.Error, conn: psycopg.Connection | None) -> bool:
+    """True when the connection is gone: psycopg knows it is closed/broken, or the server said it is dropping us.
+
+    A missing SQLSTATE alone proves nothing: client-side errors such as "another command is already in progress"
+    have none either, and the connection is still alive.
+    """
+    if conn is not None and (conn.closed or conn.broken):
+        return True
     sqlstate = exc.diag.sqlstate
-    return sqlstate is None or sqlstate.startswith("08") or sqlstate in _CONNECTION_LOST_STATES
+    return sqlstate is not None and (sqlstate.startswith("08") or sqlstate in _CONNECTION_LOST_STATES)
 
 
-def translate_error(exc: psycopg.Error, sql: str, offset: int = 0) -> StatementError:
-    """`offset`: characters the driver sent in front of `sql` (a DECLARE prefix), removed from the error position."""
+def _uses_client_copy(sql: str) -> bool:
+    """A statement starting with COPY that reads STDIN or writes STDOUT, anywhere in the script."""
+    return any(first_keyword(part) == "copy" and _COPY_CLIENT_STREAM.search(part) for part in sql.split(";"))
+
+
+def translate_error(
+    exc: psycopg.Error, sql: str, conn: psycopg.Connection | None = None, offset: int = 0
+) -> StatementError:
+    """`conn` tells a dropped connection from a live one; `offset`: characters the driver sent in front of `sql`
+    (a DECLARE prefix), removed from the error position."""
     diag = exc.diag
     if isinstance(exc, psycopg.errors.QueryCanceled):
         return StatementCancelled(diag.message_primary or "Query cancelled")
-    if _is_connection_lost(exc):
+    if _is_connection_lost(exc, conn):
         reason = (diag.message_primary or str(exc)).strip()
         return StatementError(f"Connection to the server was lost: {reason}", code=_CONNECTION_LOST)
     message = diag.message_primary or str(exc).strip()
@@ -160,7 +175,7 @@ class _BufferedResult(StatementResult):
         try:
             return [list(r) for r in self._cursor.fetchmany(n)]
         except psycopg.Error as exc:
-            raise translate_error(exc, self._sql) from exc
+            raise self._owner.translate_error(exc, self._sql) from exc
 
     def affected_rows(self) -> int | None:
         if self._cursor.description is None and self._cursor.rowcount >= 0:
@@ -192,13 +207,13 @@ class _StreamResult(StatementResult):
         except psycopg.ProgrammingError as exc:
             if "didn't produce a result" not in str(exc):
                 self.close()
-                raise translate_error(exc, sql) from exc
+                raise owner.translate_error(exc, sql) from exc
             first = None  # e.g. SELECT ... INTO: ran fine, returns no rows
             self._done = True
             return
         except psycopg.Error as exc:
             self.close()
-            raise translate_error(exc, sql) from exc
+            raise owner.translate_error(exc, sql) from exc
         if first is None:
             self._done = True
             self._columns = owner.describe(sql)
@@ -219,7 +234,7 @@ class _StreamResult(StatementResult):
                 self._done = True
             except psycopg.Error as exc:
                 self._done = True
-                raise translate_error(exc, self._sql) from exc
+                raise self._owner.translate_error(exc, self._sql) from exc
         return [list(r) for r in rows]
 
     def affected_rows(self) -> int | None:
@@ -260,7 +275,7 @@ class _CursorResult(StatementResult):
         except psycopg.Error as exc:
             self.close()
             # psycopg prefixes the statement with `DECLARE "<name>" CURSOR FOR `; error positions must not count it.
-            raise translate_error(exc, sql, offset=len(f'DECLARE "{cursor.name}" CURSOR FOR ')) from exc
+            raise owner.translate_error(exc, sql, offset=len(f'DECLARE "{cursor.name}" CURSOR FOR ')) from exc
         desc = cursor.description
         self._columns = owner.column_meta(desc) if desc else None
 
@@ -274,7 +289,7 @@ class _CursorResult(StatementResult):
                 page = self._cursor.fetchmany(want)
             except psycopg.Error as exc:
                 self._done = True
-                raise translate_error(exc, self._sql) from exc
+                raise self._owner.translate_error(exc, self._sql) from exc
             self._pending += page
             self._done = len(page) < want
         rows, self._pending = self._pending[:n], self._pending[n:]
@@ -311,6 +326,9 @@ class PostgresConnection(DatabaseConnection):
     def _on_notice(self, diag: psycopg.errors.Diagnostic) -> None:
         severity = MessageSeverity.WARNING if diag.severity_nonlocalized == "WARNING" else MessageSeverity.INFO
         self._messages.append(ServerMessage(severity=severity, text=diag.message_primary or ""))
+
+    def translate_error(self, exc: psycopg.Error, sql: str, offset: int = 0) -> StatementError:
+        return translate_error(exc, sql, self._conn, offset)
 
     def drain_messages(self) -> list[ServerMessage]:
         messages = list(self._messages)
@@ -408,6 +426,8 @@ class PostgresConnection(DatabaseConnection):
         return self._run_buffered(sql)
 
     def run(self, sql: str) -> StatementResult:
+        if _uses_client_copy(sql):
+            raise StatementError(_UNSUPPORTED_COPY, code="unsupported_copy")
         try:
             if _likely_returns_rows(sql):
                 status = self._conn.info.transaction_status
@@ -419,7 +439,7 @@ class PostgresConnection(DatabaseConnection):
                 # a stream would cancel it and abort the user's transaction.
             return self._run_buffered(sql)
         except psycopg.Error as exc:  # e.g. creating a cursor on a dead connection
-            raise translate_error(exc, sql) from exc
+            raise self.translate_error(exc, sql) from exc
 
     def in_transaction(self) -> bool:
         return self._conn.info.transaction_status in (pq.TransactionStatus.INTRANS, pq.TransactionStatus.INERROR)

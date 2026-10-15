@@ -12,6 +12,8 @@ import { ResultTable } from "./ResultTable";
 import { useConsoleSession } from "./useConsoleSession";
 
 const PAGE = 500;
+/** Error code of a statement whose database connection dropped: the session must be reopened. */
+const CONNECTION_LOST = "connection_lost";
 const INDENT = "  ";
 const STATUS_DOT: Record<SocketStatus, string> = { open: "bg-success", connecting: "bg-yellow-400", closed: "bg-danger" };
 
@@ -178,6 +180,11 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
                         {errorPosition.column + (errorPosition.line === 1 ? origin.column : 0)}
                         {execution.error.code ? ` · ${execution.error.code}` : ""}
                       </div>
+                    )}
+                    {execution.error.code === CONNECTION_LOST && (
+                      <Button size="sm" className="mt-2" onClick={retrySession}>
+                        Reconnect
+                      </Button>
                     )}
                   </div>
                 )}
