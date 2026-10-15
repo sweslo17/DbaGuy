@@ -11,6 +11,7 @@ from .connectivity.ssh_tunnel import SshTunnelManager
 from .services.connection_service import ConnectionService
 from .services.metadata_service import MetadataService
 from .services.profile_service import ProfileService
+from .services.schema_cache import SchemaCache
 from .sessions.manager import SessionManager
 from .storage.paths import profiles_file
 from .storage.profile_store import ProfileStore
@@ -36,6 +37,7 @@ class AppContainer:
         self.connections = ConnectionService(self.registry, self.profiles, self.tunnels)
         self.sessions = SessionManager(self.connections, self.profiles)
         self.metadata = MetadataService(self.registry, self.connections, self.profiles)
+        self.schema_cache = SchemaCache(self.metadata, self.registry, self.profiles)
         self._stop = threading.Event()
         self._housekeeper: threading.Thread | None = None
 

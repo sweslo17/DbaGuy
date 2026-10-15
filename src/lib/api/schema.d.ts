@@ -159,6 +159,43 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/metadata/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Search */
+        get: operations["search_metadata_search_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/metadata/schema/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Refresh Schema
+         * @description Forget the cached schema; the next completion or search rebuilds it.
+         */
+        post: operations["refresh_schema_metadata_schema_refresh_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sessions": {
         parameters: {
             query?: never;
@@ -501,6 +538,22 @@ export interface components {
             /** Detail */
             detail?: string | null;
         };
+        /** ObjectSearchHit */
+        ObjectSearchHit: {
+            /** Database */
+            database: string | null;
+            /** Schema Name */
+            schema_name: string;
+            /** Name */
+            name: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "table" | "view" | "materialized_view";
+            /** Path */
+            path: components["schemas"]["PathSegment"][];
+        };
         /** PathSegment */
         PathSegment: {
             /** Kind */
@@ -576,6 +629,16 @@ export interface components {
             index: number;
             /** Rows */
             rows: unknown[][];
+        };
+        /** SchemaRefreshRequest */
+        SchemaRefreshRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Database */
+            database?: string | null;
         };
         /** ServerInfo */
         ServerInfo: {
@@ -1207,6 +1270,75 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ObjectDetail"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_metadata_search_get: {
+        parameters: {
+            query: {
+                profile_id: string;
+                q?: string;
+                database?: string | null;
+                limit?: number;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ObjectSearchHit"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    refresh_schema_metadata_schema_refresh_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SchemaRefreshRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

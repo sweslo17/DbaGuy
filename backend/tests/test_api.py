@@ -2,6 +2,7 @@ import socket
 import sqlite3
 import threading
 import time
+from uuid import UUID
 
 import pytest
 import uvicorn
@@ -105,6 +106,33 @@ def test_metadata_and_session_over_websocket(client, sqlite_profile_id):
             "transaction_failed": False, "cancelled": False,
         }
     assert client.delete(f"/sessions/{sid}", headers=AUTH).status_code == 204
+
+
+def test_metadata_search_and_refresh(client, sqlite_profile_id):
+    hits = client.get("/metadata/search", params={"profile_id": sqlite_profile_id, "q": "t"}, headers=AUTH).json()
+    assert hits[0]["name"] == "t" and hits[0]["path"][-1] == {"kind": "table", "name": "t"}
+    response = client.post("/metadata/schema/refresh", json={"profile_id": sqlite_profile_id}, headers=AUTH)
+    assert response.status_code == 204
+
+
+def test_profile_changes_drop_the_cached_schema(client, sqlite_profile_id, tmp_path):
+    cache = client.app.state.container.schema_cache
+    pid = UUID(sqlite_profile_id)
+
+    def warm_up():
+        client.get("/metadata/search", params={"profile_id": sqlite_profile_id, "q": "t"}, headers=AUTH)
+        assert cache.peek(pid) is not None
+
+    warm_up()
+    body = {"profile": {"engine": "sqlite", "name": "renamed", "path": str(tmp_path / "api.db")}}
+    assert client.put(f"/profiles/{sqlite_profile_id}", json=body, headers=AUTH).status_code == 200
+    assert cache.peek(pid) is None
+    warm_up()
+    assert client.post(f"/profiles/{sqlite_profile_id}/unlock", json={"password": "x"}, headers=AUTH).status_code == 204
+    assert cache.peek(pid) is None
+    warm_up()
+    assert client.delete(f"/profiles/{sqlite_profile_id}", headers=AUTH).status_code == 204
+    assert cache.peek(pid) is None
 
 
 def test_encoded_cells_reach_the_websocket_client_unchanged(client, sqlite_profile_id):

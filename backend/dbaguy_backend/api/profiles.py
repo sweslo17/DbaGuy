@@ -17,6 +17,12 @@ from .deps import get_container, require_token
 router = APIRouter(prefix="/profiles", tags=["profiles"], dependencies=[Depends(require_token)])
 
 
+def _forget_connections_and_schema(container: AppContainer, profile_id: UUID) -> None:
+    """After a profile changed or went away: drop its metadata connections and cached schema snapshots."""
+    container.metadata.invalidate(profile_id)
+    container.schema_cache.invalidate(profile_id)
+
+
 @router.get("", response_model=list[ProfileEntry])
 def list_profiles(container: AppContainer = Depends(get_container)) -> list[ProfileEntry]:
     return container.profiles.list_entries()
@@ -32,7 +38,7 @@ def update_profile(
     profile_id: UUID, body: ProfileUpsertRequest, container: AppContainer = Depends(get_container)
 ) -> ProfileEntry:
     entry = container.profiles.update(profile_id, body)
-    container.metadata.invalidate(profile_id)
+    _forget_connections_and_schema(container, profile_id)
     return entry
 
 
@@ -40,7 +46,7 @@ def update_profile(
 def delete_profile(profile_id: UUID, container: AppContainer = Depends(get_container)) -> Response:
     container.profiles.get(profile_id)  # 404 before touching sessions
     container.sessions.close_for_profile(profile_id)
-    container.metadata.invalidate(profile_id)
+    _forget_connections_and_schema(container, profile_id)
     container.profiles.delete(profile_id)
     return Response(status_code=204)
 
@@ -50,6 +56,7 @@ def unlock_profile(
     profile_id: UUID, body: ProfileSecretsInput, container: AppContainer = Depends(get_container)
 ) -> Response:
     container.profiles.unlock(profile_id, body)
+    container.schema_cache.invalidate(profile_id)  # a remembered "password_required" must not outlive the unlock
     return Response(status_code=204)
 
 
