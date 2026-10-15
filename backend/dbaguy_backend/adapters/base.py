@@ -37,6 +37,13 @@ class StatementError(Exception):
         self.position = position
 
 
+TRANSACTION_OPEN = "transaction_open"
+
+
+def transaction_open_error() -> StatementError:
+    return StatementError("Commit or roll back the open transaction first", code=TRANSACTION_OPEN)
+
+
 class StatementCancelled(StatementError):
     def __init__(self, message: str = "Query cancelled") -> None:
         super().__init__(message, code="cancelled")
@@ -109,6 +116,22 @@ class DatabaseConnection(ABC):
     def transaction_failed(self) -> bool:
         """True when the open transaction is aborted and only accepts ROLLBACK (PostgreSQL); False otherwise."""
         return False
+
+    @abstractmethod
+    def autocommit(self) -> bool: ...
+
+    @abstractmethod
+    def set_autocommit(self, enabled: bool) -> None:
+        """Switch between auto-commit and manual commit. Raises StatementError(code="transaction_open") while a
+        transaction is open; a no-op when the mode is already `enabled`."""
+
+    @abstractmethod
+    def commit(self) -> None:
+        """Commit the open transaction; a no-op when none is open."""
+
+    @abstractmethod
+    def rollback(self) -> None:
+        """Roll back the open transaction; a no-op when none is open."""
 
     @abstractmethod
     def cancel(self) -> None:

@@ -26,6 +26,7 @@ from ..base import (
     StatementCancelled,
     StatementError,
     StatementResult,
+    transaction_open_error,
 )
 from ..positions import offset_to_line_col
 from ..sql_text import first_keyword
@@ -327,6 +328,10 @@ class PostgresConnection(DatabaseConnection):
     def __init__(self, conn: psycopg.Connection, read_only: bool = False) -> None:
         self._conn = conn
         self._read_only = read_only
+        if read_only:
+            # Manual-commit mode: psycopg's BEGIN must not depend on the session default, which a statement can turn
+            # off. (Never set False: that would force READ WRITE over a server-side read-only default.)
+            conn.read_only = True
         self._messages: deque[ServerMessage] = deque(maxlen=1000)
         self._cursor_ids = itertools.count(1)
         self._custom_types: dict[int, str] = {int(oid): name for oid, name in conn.execute(_CUSTOM_TYPES_SQL)}
@@ -465,15 +470,39 @@ class PostgresConnection(DatabaseConnection):
             self._restore_read_only()
             if _likely_returns_rows(sql):
                 status = self._conn.info.transaction_status
-                if status == pq.TransactionStatus.IDLE:
-                    return self._run_streamed(sql)  # autocommit: cancelling an abandoned stream is harmless
-                if status == pq.TransactionStatus.INTRANS and _declarable(sql):
+                if status == pq.TransactionStatus.IDLE and self._conn.autocommit:
+                    return self._run_streamed(sql)  # no transaction: cancelling an abandoned stream is harmless
+                # In a transaction, or about to open one (manual mode: psycopg begins before the first statement):
+                # never stream, abandoning a stream would cancel it and abort the user's transaction.
+                if status in (pq.TransactionStatus.IDLE, pq.TransactionStatus.INTRANS) and _declarable(sql):
                     return _CursorResult(self, self._server_cursor(), sql)
-                # Anything else inside a transaction (SHOW, EXPLAIN, RETURNING, scripts…) is read in full: abandoning
-                # a stream would cancel it and abort the user's transaction.
+                # Anything else (SHOW, EXPLAIN, RETURNING, scripts…) is read in full.
             return self._run_buffered(sql)
         except psycopg.Error as exc:  # e.g. creating a cursor on a dead connection
             raise self.translate_error(exc, sql) from exc
+
+    def autocommit(self) -> bool:
+        return self._conn.autocommit
+
+    def set_autocommit(self, enabled: bool) -> None:
+        if self._conn.autocommit == enabled:
+            return
+        if self._conn.info.transaction_status != pq.TransactionStatus.IDLE:
+            raise transaction_open_error()
+        self._conn.autocommit = enabled
+        logger.info("Auto-commit {} on PostgreSQL db={}", "on" if enabled else "off", self.current_database())
+
+    def commit(self) -> None:
+        try:
+            self._conn.commit()  # psycopg skips it when the connection is idle
+        except psycopg.Error as exc:
+            raise self.translate_error(exc, "COMMIT") from exc
+
+    def rollback(self) -> None:
+        try:
+            self._conn.rollback()
+        except psycopg.Error as exc:
+            raise self.translate_error(exc, "ROLLBACK") from exc
 
     def in_transaction(self) -> bool:
         return self._conn.info.transaction_status in (pq.TransactionStatus.INTRANS, pq.TransactionStatus.INERROR)

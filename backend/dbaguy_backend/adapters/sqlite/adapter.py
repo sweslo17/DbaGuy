@@ -19,6 +19,7 @@ from ..base import (
     StatementCancelled,
     StatementError,
     StatementResult,
+    transaction_open_error,
 )
 from . import introspection
 from . import schema as sqlite_schema
@@ -134,6 +135,30 @@ class SqliteConnection(DatabaseConnection):
 
     def in_transaction(self) -> bool:
         return self._conn.in_transaction
+
+    def autocommit(self) -> bool:
+        return self._conn.isolation_level is None
+
+    def set_autocommit(self, enabled: bool) -> None:
+        if self.autocommit() == enabled:
+            return
+        if self._conn.in_transaction:
+            raise transaction_open_error()
+        # Manual mode: the driver issues BEGIN before the first INSERT/UPDATE/DELETE/REPLACE.
+        self._conn.isolation_level = None if enabled else "DEFERRED"
+        logger.info("Auto-commit {} on SQLite database {}", "on" if enabled else "off", self._path)
+
+    def commit(self) -> None:
+        try:
+            self._conn.commit()
+        except sqlite3.Error as exc:
+            raise _translate(exc) from exc
+
+    def rollback(self) -> None:
+        try:
+            self._conn.rollback()
+        except sqlite3.Error as exc:
+            raise _translate(exc) from exc
 
     def cancel(self) -> None:
         self._conn.interrupt()
