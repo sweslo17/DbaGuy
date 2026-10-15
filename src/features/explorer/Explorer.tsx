@@ -11,7 +11,7 @@ import { cn } from "@/lib/cn";
 import { useWorkspace } from "@/stores/workspace";
 import { ConnectionDialog, ENGINE_LABELS } from "../connections/ConnectionDialog";
 import { useDeleteProfile, useProfiles } from "../connections/hooks";
-import { UnlockDialog } from "../connections/UnlockDialog";
+import { secretsNeeded, UnlockDialog, type SecretsNeeded } from "../connections/UnlockDialog";
 import { folderLabel, kindIcon } from "./kinds";
 import { nodeKeyPrefix, profileKey, useTreeRows, type Expansion, type TreeRow } from "./useTreeRows";
 
@@ -60,7 +60,7 @@ export function Explorer() {
   const [selected, setSelected] = useState<string | null>(null);
   const [dialog, setDialog] = useState<{ open: boolean; entry?: ProfileEntry }>({ open: false });
   const [toDelete, setToDelete] = useState<ProfileEntry | null>(null);
-  const [unlock, setUnlock] = useState<Profile | null>(null);
+  const [unlock, setUnlock] = useState<{ profile: Profile; needs: SecretsNeeded } | null>(null);
   const promptedErrors = useRef(new Set<string>());
   const entries = profiles.data ?? [];
   const rows = useTreeRows(entries, expanded, expansions);
@@ -105,7 +105,7 @@ export function Explorer() {
     const entry = next && entries.find((e) => e.profile.id === next.profileId);
     if (next && entry) {
       promptedErrors.current.add(next.key);
-      setUnlock(entry.profile);
+      setUnlock({ profile: entry.profile, needs: secretsNeeded(next.detail) });
     }
   }, [rows, entries, unlock]);
 
@@ -318,11 +318,12 @@ export function Explorer() {
       {unlock && (
         <UnlockDialog
           open
-          profile={unlock}
+          profile={unlock.profile}
+          needs={unlock.needs}
           onOpenChange={(open) => !open && setUnlock(null)}
           onUnlocked={() => {
             void qc.refetchQueries({
-              queryKey: ["children", unlock.id],
+              queryKey: ["children", unlock.profile.id],
               predicate: (query) => query.state.status === "error",
             });
             setUnlock(null);

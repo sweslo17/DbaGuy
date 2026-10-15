@@ -13,7 +13,7 @@ from dbaguy_backend.adapters.base import DatabaseAdapter, Endpoint
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager, write_askpass_script
 from dbaguy_backend.domain.errors import TunnelFailed
-from dbaguy_backend.domain.profiles import ConnectionTestRequest, Engine, ServerProfile, SshConfig
+from dbaguy_backend.domain.profiles import ConnectionTestRequest, Engine, ProfileUpsertRequest, ServerProfile, SshConfig
 from dbaguy_backend.services.connection_service import ConnectionService
 from dbaguy_backend.services.profile_service import ProfileService, ResolvedSecrets
 from dbaguy_backend.storage.paths import profiles_file
@@ -52,12 +52,14 @@ class RecordingAdapter(DatabaseAdapter):
 
     def __init__(self) -> None:
         self.endpoints: list[Endpoint | None] = []
+        self.passwords: list[str | None] = []
 
     def parse_url(self, url):
         raise NotImplementedError
 
     def open(self, profile, endpoint: Endpoint | None, password, database):
         self.endpoints.append(endpoint)
+        self.passwords.append(password)
         return FakeConnection()
 
 
@@ -69,7 +71,7 @@ def tunnelled_profile(**ssh) -> ServerProfile:
 def service_env(tmp_path, tunnels):
     profiles = ProfileService(ProfileStore(profiles_file(tmp_path)), InMemorySecretStore())
     adapter = RecordingAdapter()
-    return ConnectionService(AdapterRegistry([adapter]), profiles, tunnels), adapter
+    return ConnectionService(AdapterRegistry([adapter]), profiles, tunnels), adapter, profiles
 
 
 def test_stale_release_leaves_the_replacement_tunnel_alone(tmp_path, tunnels):
@@ -182,7 +184,7 @@ def test_close_all_continues_after_a_failing_stop(tunnels, monkeypatch):
 # ---- the tunnel key covers every SSH setting and the SSH password ----
 
 def test_a_session_after_an_ssh_edit_uses_a_new_tunnel(service_env, tunnels):
-    service, adapter = service_env
+    service, adapter, _ = service_env
     profile = tunnelled_profile()
     secrets = ResolvedSecrets(password="x")
     before = service.open(profile, secrets=secrets)
@@ -196,7 +198,7 @@ def test_a_session_after_an_ssh_edit_uses_a_new_tunnel(service_env, tunnels):
 
 
 def test_a_changed_ssh_password_uses_a_new_tunnel(service_env, tunnels):
-    service, adapter = service_env
+    service, adapter, _ = service_env
     profile = tunnelled_profile(auth="password")
     old = service.open(profile, secrets=ResolvedSecrets(ssh_password="old"))
     same = service.open(profile, secrets=ResolvedSecrets(ssh_password="old"))
@@ -210,7 +212,7 @@ def test_a_changed_ssh_password_uses_a_new_tunnel(service_env, tunnels):
 
 @pytest.mark.parametrize("ssh_change", [{}, {"host": "other-bastion"}, {"auth": "password"}])
 def test_connection_test_never_reuses_a_live_tunnel(service_env, tunnels, ssh_change):
-    service, adapter = service_env
+    service, adapter, _ = service_env
     profile = tunnelled_profile()
     live = service.open(profile, secrets=ResolvedSecrets(password="x"))
     draft = profile.model_dump(exclude={"id"})
@@ -264,3 +266,16 @@ def test_ssh_exits_when_the_backend_is_killed(tmp_path, fake_ssh):
             holder.kill()
         if ssh_pid is not None and process_exists(ssh_pid):
             os.kill(ssh_pid, signal.SIGKILL)  # do not leak it when the test fails
+
+
+def test_connection_test_keeps_the_stored_password_when_only_the_ssh_password_is_typed(service_env):
+    service, adapter, profiles = service_env
+    draft = {"engine": "postgres", "name": "p", "host": "target", "ssh": {**SSH.model_dump(), "auth": "password"}}
+    entry = profiles.create(
+        ProfileUpsertRequest.model_validate({"profile": draft, "secrets": {"password": "db-secret"}})
+    )
+    request = ConnectionTestRequest.model_validate(
+        {"profile": draft, "secrets": {"ssh_password": "typed"}, "existing_id": str(entry.profile.id)}
+    )
+    assert service.test(request).ok
+    assert adapter.passwords == ["db-secret"]  # the missing SSH password did not throw the stored one away

@@ -15,6 +15,8 @@ export type TreeRow =
       depth: number;
       message: string;
       code: string;
+      /** The API error's `detail` (e.g. which passwords `password_required` asks for). */
+      detail: unknown;
       profileId: string;
       retry: () => void;
     };
@@ -67,6 +69,7 @@ export function useTreeRows(
           profileId,
           message: errorMessage(err),
           code: err instanceof ApiError ? err.code : "error",
+          detail: err instanceof ApiError ? err.detail : undefined,
           retry: () => void result.refetch(),
         });
         return;

@@ -6,7 +6,7 @@ import type { SocketStatus } from "@/lib/api/session-socket";
 import { cn } from "@/lib/cn";
 import type { ConsoleTab } from "@/stores/workspace";
 import { useProfiles } from "../connections/hooks";
-import { UnlockDialog } from "../connections/UnlockDialog";
+import { secretsNeeded, UnlockDialog } from "../connections/UnlockDialog";
 import { applyEvent, interruptExecution, newExecution, type ExecutionState } from "./execution";
 import { ResultTable } from "./ResultTable";
 import { useConsoleSession } from "./useConsoleSession";
@@ -150,6 +150,7 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
         <UnlockDialog
           open={!unlockDismissed}
           profile={profile}
+          needs={secretsNeeded(error instanceof ApiError ? error.detail : undefined)}
           onOpenChange={(open) => !open && setUnlockDismissed(true)}
           onUnlocked={retrySession}
         />

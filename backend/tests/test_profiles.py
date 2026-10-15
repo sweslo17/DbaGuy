@@ -203,15 +203,61 @@ def test_service_secrets_lifecycle(tmp_path):
 
 def test_unsaved_password_requires_unlock(tmp_path):
     service = ProfileService(ProfileStore(profiles_file(tmp_path)), InMemorySecretStore())
-    entry = service.create(
-        ProfileUpsertRequest(profile=pg_draft(save_password=False), secrets=ProfileSecretsInput(password=SECRET))
-    )
+    entry = service.create(ProfileUpsertRequest(profile=pg_draft(save_password=False)))
     profile = service.get(entry.profile.id)
-    assert not entry.has_password  # never stored when save_password is False
-    with pytest.raises(PasswordRequired):
+    with pytest.raises(PasswordRequired) as info:
         service.resolve_secrets(profile)
+    assert info.value.detail == {"password": True, "ssh_password": False}
     service.unlock(profile.id, ProfileSecretsInput(password=SECRET))
     assert service.resolve_secrets(profile).password == SECRET
+
+
+def test_unsaved_passwords_typed_on_create_or_update_are_kept_for_this_run(tmp_path):
+    secrets = InMemorySecretStore()
+    service = ProfileService(ProfileStore(profiles_file(tmp_path)), secrets)
+    draft = pg_draft(save_password=False, ssh={"enabled": True, "host": "bastion", "auth": "password"})
+    typed = ProfileSecretsInput(password=SECRET, ssh_password="ssh-secret")
+    entry = service.create(ProfileUpsertRequest(profile=draft, secrets=typed))
+    pid = entry.profile.id
+    assert not entry.has_password and not entry.has_ssh_password  # never persisted when save_password is off
+    assert secrets.get(pid, SecretKind.PASSWORD) is None and secrets.get(pid, SecretKind.SSH_PASSWORD) is None
+    resolved = service.resolve_secrets(service.get(pid))  # not asked again right after typing them
+    assert (resolved.password, resolved.ssh_password) == (SECRET, "ssh-secret")
+
+    service.update(pid, ProfileUpsertRequest(profile=draft, secrets=ProfileSecretsInput(password="changed")))
+    resolved = service.resolve_secrets(service.get(pid))
+    assert (resolved.password, resolved.ssh_password) == ("changed", "ssh-secret")  # None keeps the other one
+    service.update(pid, ProfileUpsertRequest(profile=draft, secrets=ProfileSecretsInput(ssh_password="")))
+    with pytest.raises(PasswordRequired) as info:  # "" clears it
+        service.resolve_secrets(service.get(pid))
+    assert info.value.detail == {"password": False, "ssh_password": True}
+
+
+def test_missing_ssh_password_is_required_even_for_a_saved_profile(tmp_path):
+    service = ProfileService(ProfileStore(profiles_file(tmp_path)), InMemorySecretStore())
+    draft = pg_draft(ssh={"enabled": True, "host": "bastion", "auth": "password"})
+    entry = service.create(ProfileUpsertRequest(profile=draft, secrets=ProfileSecretsInput(password=SECRET)))
+    profile = service.get(entry.profile.id)
+    with pytest.raises(PasswordRequired) as info:
+        service.resolve_secrets(profile)
+    assert info.value.detail == {"password": False, "ssh_password": True}
+    service.unlock(profile.id, ProfileSecretsInput(ssh_password="ssh-secret"))
+    resolved = service.resolve_secrets(profile)
+    assert (resolved.password, resolved.ssh_password) == (SECRET, "ssh-secret")
+
+
+def test_unsaved_profile_with_ssh_password_auth_asks_for_both(tmp_path):
+    service = ProfileService(ProfileStore(profiles_file(tmp_path)), InMemorySecretStore())
+    draft = pg_draft(save_password=False, ssh={"enabled": True, "host": "bastion", "auth": "password"})
+    profile = service.get(service.create(ProfileUpsertRequest(profile=draft)).profile.id)
+    with pytest.raises(PasswordRequired) as info:
+        service.resolve_secrets(profile)
+    assert info.value.detail == {"password": True, "ssh_password": True}
+    for disabled in ({"enabled": False, "host": "bastion", "auth": "password"}, {"enabled": True, "host": "b"}):
+        other = service.update(profile.id, ProfileUpsertRequest(profile=pg_draft(save_password=False, ssh=disabled)))
+        with pytest.raises(PasswordRequired) as info:  # no SSH password needed without SSH password auth
+            service.resolve_secrets(other.profile)
+        assert info.value.detail == {"password": True, "ssh_password": False}
 
 
 def test_unknown_profile_id(tmp_path):

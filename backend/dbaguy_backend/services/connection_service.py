@@ -98,7 +98,7 @@ class ConnectionService:
         stored = ResolvedSecrets()
         if request.existing_id is not None:
             try:
-                stored = self._profiles.resolve_secrets(self._profiles.get(request.existing_id))
+                stored = self._profiles.known_secrets(self._profiles.get(request.existing_id))
             except DomainError:
                 stored = ResolvedSecrets()
         given = request.secrets

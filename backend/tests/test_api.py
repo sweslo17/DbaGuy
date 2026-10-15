@@ -53,6 +53,16 @@ def test_profile_crud_and_secret_not_on_disk(client, tmp_path):
     assert missing.status_code == 404 and missing.json()["error"]["code"] == "profile_not_found"
 
 
+def test_session_for_a_locked_profile_says_which_passwords_are_needed(client):
+    body = {"profile": {"engine": "postgres", "name": "locked", "host": "127.0.0.1", "save_password": False,
+                        "ssh": {"enabled": True, "host": "bastion", "auth": "password"}}}
+    pid = client.post("/profiles", json=body, headers=AUTH).json()["profile"]["id"]
+    response = client.post("/sessions", json={"profile_id": pid}, headers=AUTH)
+    assert response.status_code == 428
+    error = response.json()["error"]
+    assert error["code"] == "password_required" and error["detail"] == {"password": True, "ssh_password": True}
+
+
 def test_import_url_and_validation(client):
     response = client.post("/profiles/import-url", json={"url": "postgres://me:p%40ss@db:5433/app?sslmode=require"}, headers=AUTH)
     assert response.json()["profile"]["port"] == 5433 and response.json()["password"] == "p@ss"

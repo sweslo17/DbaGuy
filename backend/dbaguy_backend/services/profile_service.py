@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from ..domain.errors import PasswordRequired
-from ..domain.profiles import AnyProfile, ProfileEntry, ProfileSecretsInput, ProfileUpsertRequest
+from ..domain.profiles import AnyProfile, ProfileEntry, ProfileSecretsInput, ProfileUpsertRequest, ServerProfile
 from ..storage.profile_store import ProfileStore
 from ..storage.secret_store import InMemorySecretStore, SecretKind, SecretStore
 
@@ -15,8 +15,13 @@ class ResolvedSecrets:
     ssh_password: str | None = None
 
 
+def _uses_ssh_password(profile: AnyProfile) -> bool:
+    return isinstance(profile, ServerProfile) and profile.ssh.enabled and profile.ssh.auth == "password"
+
+
 class ProfileService:
-    """Profiles plus their secrets. Secrets go to the persistent store only when save_password is on."""
+    """Profiles plus their secrets. Secrets go to the persistent store only when save_password is on; otherwise they
+    are kept in memory for this app run (typed in the profile dialog or the unlock dialog)."""
 
     def __init__(self, store: ProfileStore, secrets: SecretStore) -> None:
         self._store = store
@@ -56,25 +61,41 @@ class ProfileService:
             if value:
                 self._unlocked.set(profile_id, kind, value)
 
-    def resolve_secrets(self, profile: AnyProfile) -> ResolvedSecrets:
+    def known_secrets(self, profile: AnyProfile) -> ResolvedSecrets:
+        """Whatever secrets are available for the profile right now, without asking for missing ones."""
+
         def lookup(kind: SecretKind) -> str | None:
             return self._unlocked.get(profile.id, kind) or (
                 self._secrets.get(profile.id, kind) if profile.save_password else None
             )
 
-        password = lookup(SecretKind.PASSWORD)
-        ssh_password = lookup(SecretKind.SSH_PASSWORD)
-        if not profile.save_password and password is None:
-            raise PasswordRequired(f"Enter the password for '{profile.name}'")
-        return ResolvedSecrets(password=password, ssh_password=ssh_password)
+        return ResolvedSecrets(password=lookup(SecretKind.PASSWORD), ssh_password=lookup(SecretKind.SSH_PASSWORD))
+
+    def resolve_secrets(self, profile: AnyProfile) -> ResolvedSecrets:
+        """The secrets needed to connect. Raises PasswordRequired, saying which ones are missing, when any is."""
+        secrets = self.known_secrets(profile)
+        needs_password = not profile.save_password and secrets.password is None
+        needs_ssh_password = _uses_ssh_password(profile) and secrets.ssh_password is None
+        if needs_password or needs_ssh_password:
+            missing = [name for name, needed in (("password", needs_password), ("SSH password", needs_ssh_password))
+                       if needed]
+            raise PasswordRequired(
+                f"Enter the {' and '.join(missing)} for '{profile.name}'",
+                detail={"password": needs_password, "ssh_password": needs_ssh_password},
+            )
+        return secrets
 
     def _apply_secrets(self, profile: AnyProfile, secrets: ProfileSecretsInput) -> None:
         if not profile.save_password:
             for kind in SecretKind:
                 self._secrets.delete(profile.id, kind)
-            # Unsaved passwords are never persisted; only kinds sent in this request replace the unlocked copy.
+            # Never persisted, but kept for this run so the user is not asked again right away.
+            # Only kinds sent in this request change: None keeps the unlocked copy, "" clears it.
             for kind, field in _INPUT_FIELDS:
-                if getattr(secrets, field) is not None:
+                value = getattr(secrets, field)
+                if value:
+                    self._unlocked.set(profile.id, kind, value)
+                elif value == "":
                     self._unlocked.delete(profile.id, kind)
             return
         # Saved secrets are authoritative, so no copy unlocked earlier in this run may override them.
