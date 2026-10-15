@@ -356,3 +356,26 @@ server → client
 | psycopg `stream()` 在 DML 或特定指令上的行為（rowcount、無法在 extended protocol 執行的指令） | 整合測試涵蓋 SELECT、DML、DDL、VACUUM 類指令；必要時依語句開頭的 keyword 改用 `execute()` |
 | PyInstaller 加上 Tauri 的巢狀簽章 | 打包任務實測；失敗時改成 build 後再用 `codesign --deep -s -` 處理 |
 | Keychain 存取在打包版跳出提示 | 已知、可接受（自用） |
+
+## 9. 實作結果（2026-10-16）
+
+量測環境：Apple Silicon、macOS 26、`npm run build:app` 產出的 `DbaGuy.app`（49 MB，ad-hoc 簽章、未公證），以 `scripts/measure-startup.sh` 量測，共 7 次。
+
+- 冷啟動到第一個 API 請求：0.77–1.34 秒（剛 build 完的第一次 1.2–1.3 秒，之後約 0.8–1.0 秒）（目標 2 秒）
+- 閒置記憶體（app + WebKit + backend）：各程序 RSS 加總約 305–310 MB（目標 300MB）。這是上限值：共用頁面被重複計算，`footprint` 量到的實際佔用加總約 150 MB。RSS 加總中有約 37 MB 是 loguru `enqueue=True` 衍生的 multiprocessing resource tracker 程序，把 `enqueue` 拿掉就能省下並少一個程序。
+- 結束行為：`osascript` 正常結束 app 後 backend 一併結束；直接對 app 送 SIGTERM 時，backend 由 stdin watchdog 自行結束（2 秒內已消失；單獨關閉 stdin 的獨立測試約 0.2 秒）。兩種情況都沒有殘留程序。
+- 測試：backend 133 項全數通過、沒有 skip；`npm run typecheck` 與 `npm run build` 通過。
+- 打包版 backend 驗證：`/system/health`、PG 測試連線、對 PG 與 SQLite 的 session 查詢（uuid、jsonb、timestamptz、numeric、bytea、中文）、metadata 樹、Keychain 讀取路徑（項目不存在，不會跳提示）都正常。
+- 未驗證：打包版 GUI 的人工操作（建立 profile、執行查詢、Keychain 允許提示）。自動化環境無法操作原生視窗，只能由 log 確認 UI 載入並連上 backend（`Health check (origin=tauri://localhost)`），留給使用者最後統一測試。
+
+### 偏離設計的地方
+
+- **SSH askpass**：不是 backend 執行檔的 `--askpass` 模式，而是由 `ssh_tunnel.write_askpass_script()` 產生的 shell script（內容只是 `printf` 一個環境變數）。因此沒有 `connectivity/askpass.py`，打包後的 backend 也不需要處理 askpass 子命令。
+- **WS 協定的 schema route**：`GET /sessions/_schema/execution`，不是 `GET /_schema/execution-events`。
+- **WS 拒絕連線**：先 `accept()` 再用 close code 4401（token 錯誤）／4404（找不到 session）關閉。未 accept 就關閉會變成 HTTP 403，瀏覽器只會看到 1006，前端無法區分原因。
+- **開發用 backend port**：固定 `18765`（`DBAGUY_DEV_PORT` 可覆寫）。
+- **前端套件**：react-resizable-panels 用 v4 的 API；TypeScript 用 `^6`。
+- **打包多了兩個步驟**（風險表中「PyInstaller 加上 Tauri 的巢狀簽章」的實測結果）：
+  - Tauri 複製 resources 時會展開 symlink，PyInstaller 的 `_internal` 因此重複了 dylib（app 從 49 MB 膨脹到 67 MB），`Python.framework` 也少了 `Resources` 與 `Versions/Current`。`scripts/finalize-app.sh` 在 `tauri build` 後把 sidecar 原樣放回並重新 ad-hoc 簽章，`npm run build:app` 會自動執行。重簽後 `codesign --verify --deep --strict` 通過。
+  - `backend/entry.py` 必須先呼叫 `multiprocessing.freeze_support()`。loguru 的 `enqueue=True` 會讓 multiprocessing 重新執行凍結後的執行檔來啟動 resource tracker，沒有這行時每個子程序都會再啟動一個 backend，造成無限遞迴產生程序。這個問題只在寫 log 檔時發生（`DBAGUY_LOG_TO_FILE=false` 的獨立測試不會重現）。
+  - 不需要額外的 hidden import：`_uuid` 與 psycopg 的 binary 實作（含 libpq 與相依 dylib）都由 PyInstaller 自動收進去，`keyring.backends.macOS` 與 `psycopg_binary` 的 hidden import 如規格所列。
