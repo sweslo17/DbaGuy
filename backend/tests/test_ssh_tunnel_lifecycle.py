@@ -1,5 +1,10 @@
 """Tunnel lifecycle races, exercised with a fake `ssh` (see tests/fake_ssh.py): no bastion needed, no fixed sleeps."""
 
+import os
+import signal
+import subprocess
+import sys
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -15,7 +20,13 @@ from dbaguy_backend.storage.paths import profiles_file
 from dbaguy_backend.storage.profile_store import ProfileStore
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
 from tests.fake_db import FakeConnection
-from tests.fake_ssh import accepts_connections, fake_ssh, run_in_thread, wait_until  # noqa: F401  (fixture)
+from tests.fake_ssh import (  # noqa: F401  (fake_ssh is a fixture)
+    accepts_connections,
+    fake_ssh,
+    process_exists,
+    run_in_thread,
+    wait_until,
+)
 
 SSH = SshConfig(enabled=True, host="fake-bastion", auth="agent_or_key")
 
@@ -213,3 +224,43 @@ def test_connection_test_never_reuses_a_live_tunnel(service_env, tunnels, ssh_ch
     assert tunnels.active_count() == 1  # the test's own tunnel is gone, the session's is untouched
     assert accepts_connections(adapter.endpoints[0].port)
     live.close()
+
+
+# ---- ssh never outlives the backend ----
+
+_TUNNEL_HOLDER = """
+import sys, time
+from pathlib import Path
+from uuid import uuid4
+from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager
+from dbaguy_backend.domain.profiles import SshConfig
+
+manager = SshTunnelManager(Path(sys.argv[1]) / "askpass.sh", ssh_binary=sys.argv[2])
+endpoint = manager.acquire(uuid4(), SshConfig(enabled=True, host="bastion"), "orphan-check", 5432, None)
+print(endpoint.port, flush=True)
+time.sleep(3600)
+"""
+
+
+def test_ssh_exits_when_the_backend_is_killed(tmp_path, fake_ssh):
+    backend_root = Path(__file__).resolve().parent.parent
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _TUNNEL_HOLDER, str(tmp_path), str(fake_ssh.binary)],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, cwd=backend_root,
+        env={**os.environ, "PYTHONPATH": str(backend_root)},
+    )
+    ssh_pid = None
+    try:
+        port = int(holder.stdout.readline())
+        ssh_pid = fake_ssh.pid("orphan-check")
+        assert accepts_connections(port)
+
+        holder.send_signal(signal.SIGKILL)  # no cleanup code runs: only the kernel closing its fds
+        holder.wait(5)
+        wait_until(lambda: not process_exists(ssh_pid), timeout=5)
+        assert not accepts_connections(port)
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+        if ssh_pid is not None and process_exists(ssh_pid):
+            os.kill(ssh_pid, signal.SIGKILL)  # do not leak it when the test fails

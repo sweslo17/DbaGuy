@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import httpx
 from fastapi.testclient import TestClient
 
+from dbaguy_backend import __main__ as backend_main
 from dbaguy_backend.api.deps import websocket_token_ok
 from dbaguy_backend.app import create_app
 from dbaguy_backend.config import Settings
@@ -95,3 +96,19 @@ def test_main_prints_ready_line_and_exits_on_stdin_close(tmp_path):
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+def test_forced_exit_closes_tunnels_first_even_if_that_fails(monkeypatch):
+    calls: list = []
+    monkeypatch.setattr(backend_main.os, "_exit", lambda code: calls.append(("exit", code)))
+    backend_main._force_exit(lambda: calls.append("tunnels"))
+    assert calls == ["tunnels", ("exit", 0)]
+
+    calls.clear()
+
+    def failing_close() -> None:
+        calls.append("tunnels")
+        raise OSError("boom")
+
+    backend_main._force_exit(failing_close)
+    assert calls == ["tunnels", ("exit", 0)]

@@ -20,6 +20,27 @@ from ..domain.profiles import SshConfig
 
 _ASKPASS = "#!/bin/sh\nprintf '%s\\n' \"$DBAGUY_ASKPASS_SECRET\"\n"
 
+# Runs ssh ("$@") under a watchdog: our stdin is a pipe whose write end only the backend holds, so it reaches EOF
+# as soon as the backend exits for any reason, SIGKILL included, and the watcher then stops ssh. ssh runs in its own
+# session (Ctrl-C in a terminal must not drop tunnels), so nothing else would. SIGTERM is forwarded to ssh, and the
+# shell exits with ssh's status as soon as ssh exits by itself, so start-up failures are seen just like before.
+_WATCHDOG = """
+exec 3<&0 </dev/null
+"$@" 3<&- &
+child=$!
+trap 'kill "$child" 2>/dev/null' HUP INT TERM
+{ read -r eof <&3; kill "$child" 2>/dev/null; } >/dev/null 2>&1 &
+watcher=$!
+exec 3<&-
+while :; do
+  wait "$child"
+  status=$?
+  kill -0 "$child" 2>/dev/null || break
+done
+kill "$watcher" 2>/dev/null
+exit "$status"
+"""
+
 
 def write_askpass_script(directory: Path) -> Path:
     """ssh calls SSH_ASKPASS for the password; the secret only travels in the child's environment."""
@@ -284,8 +305,9 @@ class SshTunnelManager:
             "Opening SSH tunnel via {} to {}:{} (local port {})", ssh.host, target_host, target_port, tunnel.local_port
         )
         process = subprocess.Popen(
-            self._command(ssh, tunnel.local_port, target_host, target_port),
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            ["/bin/sh", "-c", _WATCHDOG, "dbaguy-ssh", *self._command(ssh, tunnel.local_port, target_host, target_port)],
+            # stdin: the watchdog pipe, never written to; closing it (or our death) stops ssh.
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             env=env, start_new_session=True, text=True,
         )
         with self._lock:
@@ -323,11 +345,23 @@ class SshTunnelManager:
         with self._lock:
             tunnel.stopped = True  # a start still in flight notices this and terminates its own process
             process = tunnel.process
-        if process is None or process.poll() is not None:
+        if process is None:
             return
-        process.terminate()
         try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+            if process.poll() is None:
+                process.terminate()  # the watchdog forwards it to ssh
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        finally:
+            self._close_watchdog_pipe(process)  # EOF: the watcher stops ssh even if the shell itself was killed
+
+    @staticmethod
+    def _close_watchdog_pipe(process: subprocess.Popen) -> None:
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except OSError:
+            pass

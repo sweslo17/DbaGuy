@@ -8,6 +8,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
+/// How long `stop` waits for the backend to exit after closing its stdin before killing it. Longer than the
+/// backend's own forced-exit deadline (5 s, `backend/dbaguy_backend/__main__.py`), which closes SSH tunnels first.
+const STOP_TIMEOUT: Duration = Duration::from_secs(8);
+
 #[derive(Clone, Debug, Serialize)]
 pub struct BackendInfo {
     pub base_url: String,
@@ -159,7 +163,7 @@ impl BackendManager {
         };
         drop(stdin);
         if let Some(mut child) = child {
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + STOP_TIMEOUT;
             while Instant::now() < deadline {
                 if let Ok(Some(_)) = child.try_wait() {
                     log::info!("Backend stopped");

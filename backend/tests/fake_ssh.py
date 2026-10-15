@@ -1,7 +1,8 @@
 """A stand-in for the `ssh` binary so tunnel lifecycle tests are deterministic and need no bastion.
 
 The fake parses `-L 127.0.0.1:<port>:<host>:<port>` like ssh does and then behaves according to the target host name:
-- `<host>.started` is touched as soon as the process runs (tests wait for it instead of sleeping);
+- `<host>.started` is touched as soon as the process runs (tests wait for it instead of sleeping), and
+  `<host>.pid` holds its process id;
 - a host starting with "gated" does not listen until the file `<host>.gate` exists;
 - a host containing "fail" prints an SSH-looking error and exits 255 instead of listening;
 - any other host listens on the local port (connections queue in the backlog) until it is terminated.
@@ -23,6 +24,9 @@ import os, socket, sys, time
 args = sys.argv[1:]
 _, port, host, _ = args[args.index("-L") + 1].split(":")
 directory = os.environ["FAKE_SSH_DIR"]
+with open(os.path.join(directory, host + ".pid.tmp"), "w") as pid_file:
+    pid_file.write(str(os.getpid()))
+os.replace(os.path.join(directory, host + ".pid.tmp"), os.path.join(directory, host + ".pid"))
 open(os.path.join(directory, host + ".started"), "w").close()
 if host.startswith("gated"):
     while not os.path.exists(os.path.join(directory, host + ".gate")):
@@ -51,6 +55,20 @@ class FakeSsh:
 
     def wait_started(self, host: str, timeout: float = 5.0) -> None:
         wait_until(lambda: (self.directory / f"{host}.started").exists(), timeout)
+
+    def pid(self, host: str) -> int:
+        self.wait_started(host)
+        return int((self.directory / f"{host}.pid").read_text())
+
+
+def process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else (a recycled pid)
+    return True
 
 
 def wait_until(predicate, timeout: float = 5.0) -> None:
