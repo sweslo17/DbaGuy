@@ -106,3 +106,54 @@ def test_sqlite_snapshot_resolves_foreign_keys_without_column_names(tmp_path):
     assert (fk.columns, fk.ref_table, fk.ref_columns) == (["x", "y"], "Parent", ["a", "b"])
     [dangling] = rel(snap, "main", "dangling").foreign_keys
     assert (dangling.ref_table, dangling.ref_columns) == ("missing", [""])
+
+
+@requires_pg
+def test_postgres_snapshot_has_no_phantom_foreign_keys_for_partitions():
+    # PG clones an FK to a partitioned table onto every partition; partitions are not relations in the snapshot.
+    conn = PostgresAdapter().open(make_pg_profile(), Endpoint(PG_HOST, PG_PORT), PG_PASSWORD, None)
+    try:
+        for sql in (
+            "BEGIN",  # rolled back below: nothing is left in the shared dev database
+            "CREATE SCHEMA snap_probe",
+            "CREATE TABLE snap_probe.part (id int PRIMARY KEY) PARTITION BY RANGE (id)",
+            "CREATE TABLE snap_probe.part_1 PARTITION OF snap_probe.part FOR VALUES FROM (0) TO (100)",
+            "CREATE TABLE snap_probe.part_2 PARTITION OF snap_probe.part FOR VALUES FROM (100) TO (200)",
+            "CREATE TABLE snap_probe.child2 (pid int REFERENCES snap_probe.part (id))",
+        ):
+            conn.run(sql).close()
+        snap = conn.schema_snapshot()
+    finally:
+        conn.run("ROLLBACK").close()
+        conn.close()
+    assert [(f.ref_schema, f.ref_table, f.ref_columns) for f in rel(snap, "snap_probe", "child2").foreign_keys] == [
+        ("snap_probe", "part", ["id"])
+    ]
+    probe = next(s for s in snap.schemas if s.name == "snap_probe")
+    assert rel(snap, "snap_probe", "part").kind == "table"
+    assert [r.name for r in probe.relations] == ["child2", "part"]  # no part_1 / part_2
+
+
+def test_sqlite_snapshot_survives_a_virtual_table_with_a_missing_module(tmp_path):
+    db = tmp_path / "g.db"
+    raw = sqlite3.connect(db)
+    raw.execute("CREATE TABLE normal (id INTEGER PRIMARY KEY, name TEXT)")
+    # A virtual table whose module is not loaded cannot be created normally: write its definition directly.
+    raw.execute("PRAGMA writable_schema = ON")
+    raw.execute(
+        "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) "
+        "VALUES ('table', 'ghost', 'ghost', 0, 'CREATE VIRTUAL TABLE ghost USING nosuchmod(a)')"
+    )
+    raw.execute("PRAGMA writable_schema = OFF")
+    raw.commit()
+    raw.close()
+    profile = SqliteProfile(id=uuid4(), name="g", engine="sqlite", path=str(db))
+    conn = SqliteAdapter().open(profile, None, None, None)
+    try:
+        snap = conn.schema_snapshot()
+    finally:
+        conn.close()
+    normal = rel(snap, "main", "normal")
+    assert [c.name for c in normal.columns] == ["id", "name"] and normal.primary_key == ["id"]
+    ghost = rel(snap, "main", "ghost")
+    assert (ghost.columns, ghost.primary_key, ghost.foreign_keys) == ([], [], [])

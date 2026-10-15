@@ -43,7 +43,7 @@ JOIN pg_namespace rn ON rn.oid = rc.relnamespace
 CROSS JOIN LATERAL unnest(co.conkey, co.confkey) WITH ORDINALITY AS k(attnum, refnum, ord)
 JOIN pg_attribute a ON a.attrelid = co.conrelid AND a.attnum = k.attnum
 JOIN pg_attribute ra ON ra.attrelid = co.confrelid AND ra.attnum = k.refnum
-WHERE co.contype = 'f'
+WHERE co.contype = 'f' AND co.conparentid = 0  -- PG clones an FK to a partitioned table onto every partition
 GROUP BY n.nspname, c.relname, co.conname, rn.nspname, rc.relname
 ORDER BY n.nspname, c.relname, co.conname
 """

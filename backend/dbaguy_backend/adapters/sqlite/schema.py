@@ -18,13 +18,37 @@ def _relations(conn: sqlite3.Connection, master: str) -> dict[str, SnapshotRelat
             for name, type_ in rows}
 
 
+def _pragma_rows(
+    conn: sqlite3.Connection, what: str, batched_sql: str, one_sql: str, schema: str, names: list[str]
+) -> list[tuple]:
+    """Rows of a `pragma_*` table-valued function for many relations, as (relation name, ...) tuples.
+
+    One batched query when it works. A single broken relation (e.g. a virtual table whose module is not loaded) makes
+    SQLite fail the whole batch, so then each relation is read on its own and the broken ones are skipped.
+    """
+    try:
+        return conn.execute(batched_sql, (schema,)).fetchall()
+    except sqlite3.OperationalError as exc:
+        logger.warning("Reading {} of SQLite schema {} in one query failed ({}); reading relation by relation",
+                       what, schema, exc)
+    rows: list[tuple] = []
+    for name in names:
+        try:
+            rows.extend(conn.execute(one_sql, (name, name, schema)).fetchall())
+        except sqlite3.OperationalError as exc:
+            logger.warning("Skipping {} of SQLite relation {}.{}: {}", what, schema, name, exc)
+    return rows
+
+
 def _fill_columns(conn: sqlite3.Connection, master: str, schema: str, relations: dict[str, SnapshotRelation]) -> None:
-    primary_keys: dict[str, list[tuple[int, str]]] = {}
-    rows = conn.execute(
+    rows = _pragma_rows(
+        conn, "columns",
         f"SELECT m.name, p.name, p.type, p.pk FROM {master} m JOIN pragma_table_xinfo(m.name, ?) p "
         f"WHERE m.type IN ('table', 'view') ORDER BY m.name, p.cid",
-        (schema,),
+        "SELECT ?, p.name, p.type, p.pk FROM pragma_table_xinfo(?, ?) p ORDER BY p.cid",
+        schema, list(relations),
     )
+    primary_keys: dict[str, list[tuple[int, str]]] = {}
     for rel_name, column, type_name, pk in rows:
         if rel_name in relations:
             relations[rel_name].columns.append(SnapshotColumn(name=column, type_name=type_name or ""))
@@ -37,14 +61,16 @@ def _fill_columns(conn: sqlite3.Connection, master: str, schema: str, relations:
 def _fill_foreign_keys(
     conn: sqlite3.Connection, master: str, schema: str, relations: dict[str, SnapshotRelation]
 ) -> None:
+    rows = _pragma_rows(
+        conn, "foreign keys",
+        f'SELECT m.name, f.id, f."table", f."from", f."to" FROM {master} m '
+        f"JOIN pragma_foreign_key_list(m.name, ?) f WHERE m.type = 'table' ORDER BY m.name, f.id, f.seq",
+        'SELECT ?, f.id, f."table", f."from", f."to" FROM pragma_foreign_key_list(?, ?) f ORDER BY f.id, f.seq',
+        schema, [name for name, relation in relations.items() if relation.kind == "table"],
+    )
     by_lower_name = {name.lower(): relation for name, relation in relations.items()}  # names are case-insensitive
     foreign_keys: dict[tuple[str, int], SnapshotForeignKey] = {}
     implicit: set[tuple[str, int]] = set()  # reference the parent's primary key without naming its columns
-    rows = conn.execute(
-        f'SELECT m.name, f.id, f."table", f."from", f."to" FROM {master} m '
-        f"JOIN pragma_foreign_key_list(m.name, ?) f WHERE m.type = 'table' ORDER BY m.name, f.id, f.seq",
-        (schema,),
-    )
     for rel_name, fk_id, ref_table, column, ref_column in rows:
         if rel_name not in relations:
             continue
@@ -69,7 +95,10 @@ def _fill_foreign_keys(
 
 
 def build_snapshot(conn: sqlite3.Connection) -> SchemaSnapshot:
-    """Schema snapshot of every attached database: three queries per schema, whatever the number of tables."""
+    """Schema snapshot of every attached database: three queries per schema, whatever the number of tables.
+
+    (Plus one query per relation, only for a schema where a broken relation made the batched queries fail.)
+    """
     schemas: list[SnapshotSchema] = []
     for _, schema, _ in conn.execute("PRAGMA database_list").fetchall():
         if schema == "temp":
