@@ -1,0 +1,133 @@
+# 子專案 ① 地基：決策紀錄與待辦
+
+> 由實作過程的 ledger 整理而來（2026-10-16）。Rulings 是 Claude 代你做的決定（附「若錯了的代價」）；Deferred 是 review 找到但刻意延後的小問題，後續子專案或最後測試時可以參考。
+
+## Rulings
+
+- Ruling 1: SSH askpass is a generated shell script (`askpass.sh`) instead of the spec's "backend executable --askpass" mode — works identically in dev (python -m) and frozen builds — cost if wrong: none functional; record as a spec deviation in Task 16 results.
+- Ruling 2: WS schema route is `/sessions/_schema/execution` (spec says `/_schema/execution-events`) — cosmetic, keeps the route inside the sessions router — cost if wrong: none.
+- Ruling 3: Task 7 expected count is 13 passed, not 14 — plan typo — cost if wrong: none.
+- Ruling 4: Dispatch in units of related tasks (U1=T1+T3+T4, U2=T2, U3=T5+T6, U4=T7+T8, U5=T9+T10, U6=T11, U7=T12, U8=T13+T14, U9=T15+T16), one review per unit against all its briefs — keeps sub-project ① within the session token budget shared by 8 sub-projects — cost if wrong: larger review diffs may hide issues; the final whole-branch review on the most capable model is the backstop.
+- Ruling 5: profile_store.py uses `from __future__ import annotations` because the `list` method shadows the builtin in later annotations — plan bug, fix is minimal — cost if wrong: none.
+- Ruling 6: leave the Starlette TestClient httpx2 deprecation warning; the subagent's attempt to add the `httpx2` dev dependency was denied by the permission classifier, so it is surfaced to the user instead of added by the controller — cost if wrong: one noisy warning line in test output.
+- Ruling 7: finding (4) — add a pytest `filterwarnings` entry for that single StarletteDeprecationWarning (no new dependency, which the classifier denied); the httpx2 migration question goes to the user — cost if wrong: TestClient may need httpx2 on a future Starlette upgrade.
+- Ruling 8: typescript pinned ^6 + npm override for openapi-typescript (TS7 breaks openapi-typescript) — cost if wrong: TS7 benefits deferred.
+- Ruling 9: added @types/node + "node" in tsconfig types (vite.config imports node:url) — plan gap — cost: none.
+- Ruling 10: dev backend port moved 8765 → 18765 (8765 is taken by another app on this machine; DBAGUY_DEV_PORT override) — cost: none.
+- Ruling 11: PG multi-statement script on the stream path (42601 "cannot insert multiple commands") falls back to buffered execute — nothing executed on the failed attempt, makes the minimal console usable for scripts — cost if wrong: one extra round trip on such scripts.
+- Ruling 12: unknown PG folder name → ValidationFailed (consistent with SQLite fix) — cost: none.
+- Ruling 13: multi-statement script inside an open PG transaction still aborts the transaction (parse error) — deferred to sub-project 2, whose client-side splitter sends one statement at a time — cost if wrong: a console user running a multi-statement script inside BEGIN must ROLLBACK.
+- Ruling 14: accept the back-to-back bastion test flake (OpenSSH 10 PerSourcePenalties after the deliberate wrong-password test); disabling the penalty was flagged as a security weakening by the classifier, so the controller does not do it either — document "wait ~1 min or restart the bastion between runs" in CLAUDE.md and surface to the user — cost if wrong: occasional false failures on rapid re-runs.
+- Ruling 15: the WS handler runs every worker.submit/cancel via asyncio.to_thread (cancel may hold the worker state lock ~3 s on PG) — cost: a thread hop per command.
+- Ruling 16: unexpected-exception handler returns a generic "Internal error" message (details only in logs) — driver errors can carry connection details — cost: less detail in the UI for true bugs.
+- Ruling 17: commit trailers may name the subagent's own model (Sonnet/Haiku) instead of Opus — accurate attribution, no history rewrite — cost: none.
+- Ruling 18: fold U8 Minor 2 (⌘↵ ignores dead session) and Minor 3 (no default in applyEvent) into the Important fix — same wedge path, trivial — cost: none.
+- Ruling 19: C-1 — in-transaction row-returning statements use a named server-side cursor when DECLARE-safe, else buffered; add transaction_failed to FinishedEvent; reconnect auto-cancel only when not in a transaction; honour lost cancels at the pause boundary — cost if wrong: in-transaction big results via DECLARE/FETCH round trips.
+- Ruling 20: I-2 — ssh runs under a stdin-pipe watchdog so backend death (even SIGKILL) ends it; Rust stop timeout > Python deadline — cost: one extra tiny process per tunnel.
+- Ruling 21: fold minors "drop loguru enqueue" and "file log level follows settings (default INFO)" into the final fix wave — cost: SQL text no longer on disk by default.
+- Ruling 22: one fix dispatch on opus with the complete list (final-findings.md), then one scoped re-review — per skill.
+
+## Deferred minor findings
+
+- [U1] save_password=False + empty password can never unlock (also hits SQLite profiles)
+- [U1] ProfileService.create/delete not rolled back on Keychain failure
+- [U1] token defaults to "dev-token" when DBAGUY_TOKEN missing; host not restricted to 127.0.0.1
+- [U1] 404/405 use FastAPI's {"detail"} envelope; unhandled 500 may lack CORS headers
+- [U1] health check logs at INFO on every call (poller floods stderr)
+- [U1] setup_logging call duplicated in __main__ and create_app_from_env; deps bypass get_container
+- [U1] TEXT_LIMIT only applies to str (dict/list/str() fallback unbounded)
+- [U1] ObjectNode.kind typed str, enums absent from OpenAPI
+- [U1] _LEADING_JUNK ignores nested block comments
+- [U1] ProfileStore._load treats one bad profile as whole-file corruption; no OSError handling; 1s backup granularity
+- [U1] ready-line test uses blocking readline without timeout
+- [U1] list_entries does 2 Keychain reads per profile
+- [U1] saved-profile update with secrets=None drops an unlocked copy (profile_service.py:80-82)
+- [U1] unsaved-profile update/create with a typed password does not keep it in memory → immediate PasswordRequired (UX)
+- [U1] backtrace=False not needed; test_logging mutates global logging without teardown
+- [U1] api/errors.py handle_unexpected returns str(exc) in 500 body — driver errors may carry connection details (watch in U6)
+- [U1] create_app() alone keeps loguru default sink (diagnose=True); only entry points call setup_logging
+- [2] DBAGUY_DEV_BACKEND_URL escape hatch also active in release builds (gate with debug_assertions)
+- [2] concurrent restart_backend not serialised (possible zombie)
+- [2] exit watcher polls 500ms; try_wait Err returns silently leaving state stale
+- [2] backend stderr re-logged at INFO in shell.log (severity lost, duplicated)
+- [2] wait_ready stale last_error window during restart; no generation check
+- [2] HOME unset → relative log dir
+- [2] backend.ts catch can null a newer cache; restartBackend throws opaque error in browser mode
+- [2] ApiError lacks name; network TypeError bypasses ApiError (two error shapes)
+- [2] client.ts clientPromise needless Promise wrapper
+- [2] tsconfig "node" types leak into browser code (scope to vite.config)
+- [2] gen-api.sh truncates openapi.json before success
+- [2] dev.sh has no backend readiness/port check
+- [2] debug build embeds absolute CARGO_MANIFEST_DIR path
+- [5] pg_isready healthcheck uses unix socket (can pass during init); consider DBAGUY_REQUIRE_DEV_DB to fail instead of skip
+- [6] SQLite cancel after close raises; idle cancel with paused cursor poisons next statement (race window); cancel rolls back explicit transaction
+- [6] invalid UTF-8 TEXT fails whole query (text_factory replace)
+- [6] open() thread ownership not documented in contract (Task 9/10 open on worker thread — verify)
+- [6] parse_url sqlite:////abs path, query string dropped, sqlite:/// → "/"
+- [6] FTS5 hidden columns/shadow tables not marked system; column category from first 200 rows only
+- [6] no WARNING log on open failure / DEBUG SQL timing in adapter (worker logs SQL)
+- [6] cancel test lacks try/finally; untested branches (index/trigger/column detail, attached schemas)
+- [6] unknown folder in a middle path segment not validated; _folder() result discarded (validated twice); open() now reads sqlite_master eagerly (exclusive-lock DBs fail at open)
+- [8] pseudo-types (void) display as "oid 2278"; generated DDL depends on search_path for unqualified names
+- [7] RETURNING regex false positive on comments/literals → DML via stream (affected None)
+- [7] statement_timeout reported as user cancel (both 57014)
+- [7] using the connection while a stream is suspended hangs instead of erroring (worker discards first)
+- [7] '"char"' registry name never matched in loaders (category OTHER)
+- [8] self-referencing FK excludes standalone unique index from table DDL (restrict to contype p/u/x) — DDL replay fails
+- [8] function names containing "(" fail (carry OID instead of parsing signature)
+- [8] identity/serial sequences listed as ordinary sequences (replay conflicts)
+- [7] parse_url bad port/IPv6 raise ValueError; bad sslmode raises pydantic ValidationError
+- [7] PostgresConnection.__init__ custom-type query failure leaks connection + raw error; custom type map is a snapshot
+- [8] DDL fidelity gaps (INHERITS, collation, reloptions, owner/grants); search_path-relative qualification
+- [7] DRY: ColumnMeta construction and take_messages duplicated; dead getattr guard; %% in _SCHEMAS_SQL works by coincidence
+- [7] option deny-list not exhaustive (allow-list later); bad port in URL authority raises raw ValueError
+- [8] partition in another schema resolved against the path's first schema; server_info/list_children/object_detail raise raw psycopg errors on dead connection (MetadataService retry covers)
+- [10] MetadataService _drop by key (can close a fresh worker); SessionBusy from concurrently closed worker not retried; non-connection psycopg errors cause pointless reconnects; reap re-check
+- [10] call() timeout leaves task queued; close() can't cancel a running call(); QueryFailed("") on timeout
+- [10] _put vs close race (task after STOP never runs)
+- [10] emitter handoff gaps (event to old emitter after clear; no state replay on reattach; attached counter vs single slot)
+- [9] tunnel key ignores SSH config/password → Test reuses old tunnel; profile update keeps old tunnel
+- [10] metadata invalidate races in-flight open; close_for_profile vs create race
+- [9] ConnectionService.test / SessionManager.create pass raw psycopg errors from server_info (500)
+- [9] ssh host without "--" (option injection, defence in depth); CLI accept-new overrides stricter ssh_config; askpass secret inherited by ProxyJump child; strict stderr decoding; no join of drain thread; no wait() after kill; no WARNING on timeout
+- [10] test gaps (paused/queued cancel, close while running, emitter swap, start timeout); unused uuid4 import
+- [10] cancelled/skipped queued execute discards an earlier paused result as cancelled=False; paused cancel racing close finishes cancelled=False; unused test imports; GatedConnections belongs in fake_db.py
+- [10] a running cancel can be lost when no driver call is in flight (PG between fetches) → page pauses instead of finished(cancelled); needs per-request cancel flag checked at pause boundary
+- [10] SessionManager.attach can return a worker the reaper closes in between; MetadataService retry on SessionBusy / reap re-check
+- [9] missing ssh binary raises raw FileNotFoundError to the starting caller
+- [11] non-JSON/binary WS frame closes socket 1011 instead of invalid_command event
+- [11] import-url returns 500 for bad authority port / >200-char name (adapter ValueError / pydantic ValidationError)
+- [11] WS sender failures suppressed silently; outbox unbounded
+- [11] emit can raise RuntimeError on closed loop (logged per event)
+- [11] attach after accept outside try → DomainError reaches HTTP-only handler (AttributeError)
+- [11] delete-profile closes before delete → concurrent session can be recreated (delete first)
+- [11] 404/405 use FastAPI {"detail"} envelope (no StarletteHTTPException handler)
+- [11] container.close() blocks event loop in lifespan; housekeeper not joined
+- [11] test gaps (housekeeping loop, cancel test lacks timeout, token test samples 4 routes); ErrorEvent outbox put duplicated
+- [11] live_port test setup outside try (leak on startup failure); websockets imported in tests but only transitive dep; live_port container not closed
+- [12] port inputs render 50/50 (w-full beats w-24; cn has no tailwind-merge)
+- [12] ConnectionDialog has no initial focus (Radix auto-focus disabled)
+- [12] closing mid-save drops the error; overlay click discards dirty form
+- [12] 422 shows only "Invalid request" (port not clamped; detail not shown)
+- [12] payload values untrimmed; options parser edge cases
+- [12] SSH password sent regardless of ssh.enabled/auth; can't clear when auth != password
+- [12] password editable when save_password off (discarded on save)
+- [12] stale test result after edits; imported URL (may contain password) stays visible
+- [12] useEngines error not surfaced
+- [12] a11y gaps (labels without htmlFor, tabs without aria-controls/arrow keys)
+- [12] ConnectionDialog.tsx ~440 lines mixes helpers/components; ENGINE_LABELS exported from component file; h-7 vs 24-26px convention
+- [13] tree keydown handles bubbled events from context menu/Retry (check e.target === e.currentTarget)
+- [14] disposeSession ignores non-2xx DELETE
+- [14] loadMore uses non-functional setState
+- [13] queries for expanded-but-hidden descendants stay mounted; selection can point at a hidden row
+- [14] unlock dialog can pop from a hidden console tab; two consoles stack two dialogs
+- [14] Tab replaces selection (no undo); no cancel/discard for a paused result; results table not virtualized (sub-project 2 replaces)
+- [13] a11y (tabs not focusable, chevron no keyboard path, no aria-activedescendant); no client diagnostic logging of socket close/reconnect; unhandled rejection in reconnect timer
+- [14] late fetch_more/discard on closed worker can produce a second finished (ignored by client); Cancel enabled while socket down (queued, idempotent)
+- [15] measure-startup.sh exits 0 on TIMEOUT, no trap, cwd-relative app path, log-rotation breaks line snapshot
+- [15] finalize-app.sh lacks input guards, not atomic (rm before ditto)
+- [15] build-backend.sh assumes DEST exists; cp -R vs ditto; repeated paths
+- [16] CLAUDE.md zero-row limitation should say headers can be missing when describe fails; hardened-runtime loss not documented; RSS rounding
+- [final] ssh watchdog trap set after "$@" & (tiny TERM race); is_dead reflects shell not ssh; stale-release test kills shell (leaks fake ssh in test run)
+- [final] COPY check matches stdin/stdout in literals (server-side file names); zero-column SELECT in txn → columns None vs []
+- [final] in-txn cursors use cursor_tuple_fraction plans; non-declarable large in-txn results buffered in memory
