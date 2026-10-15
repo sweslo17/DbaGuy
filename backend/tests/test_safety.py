@@ -38,6 +38,12 @@ def test_confirmation_lets_it_run():
     "INSERT INTO t VALUES (1)", "DROP TABLE t", "SET default_transaction_read_only = off", "RESET ALL",
     "BEGIN READ WRITE", "START TRANSACTION READ WRITE", "EXPLAIN ANALYZE DELETE FROM t",
     "SELECT * FROM t FOR UPDATE", "frobnicate",
+    "SELECT set_config('default_transaction_read_only', 'off', false)",
+    "WITH x AS (SELECT 1) SELECT set_config('default_transaction_read_only','off',false)",
+    "SELECT pg_catalog.set_config('a.b', 'c', false)",
+    'SELECT "set_config"(\'a.b\',\'c\',false)',
+    "EXPLAIN ANALYZE SELECT set_config('a.b','c',false)",
+    "SELECT * FROM (SELECT set_config('a.b','c',false)) s",
 ])
 def test_read_only_blocks_everything_that_can_write(sql):
     assert decide(sql, "relaxed", read_only=True, confirmed=True) == (A.BLOCK, ["read_only"])
@@ -51,6 +57,10 @@ def test_read_only_allows_reads_and_plain_transactions(sql):
 def test_strict_read_only_runs_reads_and_confirms_transactions():
     assert decide("SELECT 1", "strict", read_only=True) == (A.RUN, [])
     assert decide("BEGIN", "strict", read_only=True) == (A.CONFIRM, ["strict_transaction"])
+
+
+def test_set_config_runs_when_the_profile_is_not_read_only():
+    assert decide("SELECT set_config('a.b', 'c', false)") == (A.RUN, [])
 
 
 def test_profiles_default_to_standard():

@@ -8,6 +8,7 @@ from ..sql.dialects import Dialect
 from ..sql.lexer import TokenKind, tokenize
 
 READ_ONLY = "read_only"
+_SET_CONFIG = "SET_CONFIG"  # a SELECT can call it to switch default_transaction_read_only off
 
 
 class GuardAction(StrEnum):
@@ -43,10 +44,14 @@ class SafetyPolicy:
 
     @staticmethod
     def _allowed_when_read_only(sql: str, classification: Classification, dialect: Dialect) -> bool:
+        tokens = tokenize(sql, dialect)
+        # set_config() can turn default_transaction_read_only off from inside a SELECT: block it wherever it appears.
+        if any(t.kind in (TokenKind.WORD, TokenKind.QUOTED) and t.upper.strip('"') == _SET_CONFIG for t in tokens):
+            return False
         if classification.kind == StatementKind.READ:
             return True
         if classification.kind == StatementKind.TRANSACTION:
-            return not any(t.kind == TokenKind.WORD and t.upper == "WRITE" for t in tokenize(sql, dialect))
+            return not any(t.kind == TokenKind.WORD and t.upper == "WRITE" for t in tokens)
         return False
 
     @staticmethod
