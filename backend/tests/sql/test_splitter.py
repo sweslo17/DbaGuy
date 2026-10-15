@@ -68,3 +68,8 @@ def test_offsets_with_cjk_and_emoji():
 
 def test_unterminated_string_swallows_rest():
     assert texts("SELECT 'abc; SELECT 2") == ["SELECT 'abc; SELECT 2"]
+
+
+def test_line_comment_ends_at_cr_in_postgres_only():
+    assert texts("SELECT 1 -- c\r; SELECT 2") == ["SELECT 1", "SELECT 2"]
+    assert texts("SELECT 1 -- c\r; SELECT 2", LITE) == ["SELECT 1"]  # in SQLite the comment runs to the next LF

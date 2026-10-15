@@ -10,7 +10,7 @@ from .dialects import Dialect, qualified, quote_ident
 from .lexer import TokenKind, tokenize
 
 _RELATION_KINDS = frozenset({NodeKind.TABLE, NodeKind.VIEW, NodeKind.MATERIALIZED_VIEW, NodeKind.PARTITION})
-_INSIGNIFICANT = frozenset({TokenKind.SPACE, TokenKind.COMMENT})
+_TRAILING = frozenset({TokenKind.SPACE, TokenKind.COMMENT, TokenKind.SEMI})
 
 
 class SortKey(BaseModel):
@@ -28,14 +28,21 @@ def relation_from_path(path: Sequence[PathSegment]) -> tuple[str | None, str]:
 
 
 def _single_expression(where: str | None, dialect: Dialect) -> str | None:
-    """The filter without trailing `;` and comments; a `;` anywhere else (outside literals) would be a second statement."""
-    text = (where or "").strip()
-    tokens = [token for token in tokenize(text, dialect) if token.kind not in _INSIGNIFICANT]
-    while tokens and tokens[-1].kind == TokenKind.SEMI:
+    """The filter rebuilt from its tokens so that it cannot leave its place in our SELECT.
+
+    - Trailing `;`, whitespace and comments are dropped; any other `;` outside literals would start a second statement.
+    - Every comment becomes one space, so what we send never depends on where the database ends a comment
+      (PostgreSQL ends `--` at CR as well as LF).
+    - An unterminated string, quoted identifier or block comment would swallow the ORDER BY appended after it: rejected.
+    """
+    tokens = tokenize(where or "", dialect)
+    if not all(token.terminated for token in tokens):
+        raise ValidationFailed("The filter has an unterminated string, quoted name or comment")
+    while tokens and tokens[-1].kind in _TRAILING:
         tokens.pop()
     if any(token.kind == TokenKind.SEMI for token in tokens):
         raise ValidationFailed("A filter must be a single expression")
-    return text[: tokens[-1].end] if tokens else None
+    return "".join(" " if token.kind == TokenKind.COMMENT else token.text for token in tokens).strip() or None
 
 
 def build_browse_select(

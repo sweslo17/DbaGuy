@@ -11,6 +11,7 @@ class Dialect(StrEnum):
 @dataclass(frozen=True)
 class LexRules:
     nested_block_comments: bool
+    line_comment_end: re.Pattern[str]  # ends a `--` comment: LF or CR (PostgreSQL), LF only (SQLite)
     dollar_quotes: bool
     escape_string_prefixes: frozenset[str]  # e.g. E'...' in PostgreSQL
     identifier_quotes: tuple[tuple[str, str], ...]  # (open, close)
@@ -19,12 +20,14 @@ class LexRules:
 
 RULES: dict[Dialect, LexRules] = {
     Dialect.POSTGRES: LexRules(
-        nested_block_comments=True, dollar_quotes=True, escape_string_prefixes=frozenset({"e", "E"}),
-        identifier_quotes=(('"', '"'),), block_bodies=frozenset({"begin_atomic"}),
+        nested_block_comments=True, line_comment_end=re.compile(r"[\n\r]"), dollar_quotes=True,
+        escape_string_prefixes=frozenset({"e", "E"}), identifier_quotes=(('"', '"'),),
+        block_bodies=frozenset({"begin_atomic"}),
     ),
     Dialect.SQLITE: LexRules(
-        nested_block_comments=False, dollar_quotes=False, escape_string_prefixes=frozenset(),
-        identifier_quotes=(('"', '"'), ("[", "]"), ("`", "`")), block_bodies=frozenset({"trigger"}),
+        nested_block_comments=False, line_comment_end=re.compile(r"\n"), dollar_quotes=False,
+        escape_string_prefixes=frozenset(), identifier_quotes=(('"', '"'), ("[", "]"), ("`", "`")),
+        block_bodies=frozenset({"trigger"}),
     ),
 }
 

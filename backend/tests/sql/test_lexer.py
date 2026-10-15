@@ -1,3 +1,5 @@
+import pytest
+
 from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.lexer import TokenKind as K
 from dbaguy_backend.sql.lexer import first_keyword, tokenize
@@ -29,6 +31,15 @@ def test_comments_nested_only_in_postgres():
     assert kinds("-- note; here\nx") == [(K.COMMENT, "-- note; here"), (K.WORD, "x")]
 
 
+def test_line_comment_ends_at_cr_in_postgres_but_only_at_lf_in_sqlite():
+    text = "SELECT 1 -- c\r; SELECT 2"
+    assert kinds(text) == [
+        (K.WORD, "SELECT"), (K.NUMBER, "1"), (K.COMMENT, "-- c"), (K.SEMI, ";"), (K.WORD, "SELECT"), (K.NUMBER, "2"),
+    ]
+    assert kinds(text, LITE)[-1] == (K.COMMENT, "-- c\r; SELECT 2")
+    assert kinds("-- c\n; x", LITE)[:2] == [(K.COMMENT, "-- c"), (K.SEMI, ";")]
+
+
 def test_dollar_quotes_and_params():
     body = "$fn$ BEGIN RETURN 1; END $fn$"
     assert kinds(f"AS {body};") == [(K.WORD, "AS"), (K.STRING, body), (K.SEMI, ";")]
@@ -41,6 +52,25 @@ def test_unterminated_constructs_do_not_raise():
     assert kinds("SELECT 'abc")[-1] == (K.STRING, "'abc")
     assert kinds("SELECT /* never closed")[-1][0] == K.COMMENT
     assert kinds("$$ open")[-1] == (K.STRING, "$$ open")
+
+
+@pytest.mark.parametrize(
+    "text, dialect",
+    [("'abc", PG), ("E'a\\'", PG), ('"abc', PG), ('"abc""', PG), ("$$ open", PG), ("$t$ x $$", PG), ("/* open", PG),
+     ("/* a /* b */", PG), ("/* open", LITE), ("[abc", LITE), ("`abc", LITE)],
+)
+def test_unterminated_tokens_are_flagged(text, dialect):
+    assert [token.terminated for token in tokenize(text, dialect)] == [False]
+
+
+@pytest.mark.parametrize(
+    "text, dialect",
+    [("'it''s'", PG), ('"we""ird"', PG), ("$$a$$", PG), ("$t$x$t$", PG), ("/* a /* b */ c */", PG), ("-- to the end", PG),
+     (r"E'a\'b'", PG), ("[a]", LITE), ("`a`", LITE), ("/* a /* b */", LITE)],
+)
+def test_closed_tokens_are_terminated(text, dialect):
+    tokens = tokenize(text, dialect)
+    assert len(tokens) == 1 and tokens[0].terminated
 
 
 def test_offsets_cover_the_text():

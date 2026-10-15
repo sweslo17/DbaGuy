@@ -28,6 +28,7 @@ class Token:
     start: int
     end: int
     text: str
+    terminated: bool = True  # False for a string, quoted identifier, dollar quote or block comment that never closes
 
     @property
     def upper(self) -> str:
@@ -49,8 +50,8 @@ def _ident_char(ch: str) -> bool:
     return ch.isalnum() or ch in "_$" or ord(ch) > 127
 
 
-def _scan_string(text: str, i: int, backslash: bool) -> int:
-    """i points at the opening quote; returns the index after the closing quote (or len(text))."""
+def _scan_string(text: str, i: int, backslash: bool) -> tuple[int, bool]:
+    """i points at the opening quote; returns (index after the closing quote or len(text), whether it closed)."""
     n = len(text)
     i += 1
     while i < n:
@@ -62,9 +63,9 @@ def _scan_string(text: str, i: int, backslash: bool) -> int:
             if i + 1 < n and text[i + 1] == "'":
                 i += 2
                 continue
-            return i + 1
+            return i + 1, True
         i += 1
-    return n
+    return n, False
 
 
 def _scan(text: str, dialect: Dialect) -> Iterator[Token]:
@@ -76,13 +77,14 @@ def _scan(text: str, dialect: Dialect) -> Iterator[Token]:
     while i < n:
         ch = text[i]
         start = i
+        terminated = True
         if ch.isspace():
             while i < n and text[i].isspace():
                 i += 1
             kind = TokenKind.SPACE
         elif text.startswith("--", i):
-            j = text.find("\n", i)
-            i = n if j < 0 else j
+            end = rules.line_comment_end.search(text, i)
+            i = n if end is None else end.start()
             kind = TokenKind.COMMENT
         elif text.startswith("/*", i):
             depth, i = 1, i + 2
@@ -93,19 +95,22 @@ def _scan(text: str, dialect: Dialect) -> Iterator[Token]:
                     depth, i = depth + 1, i + 2
                 else:
                     i += 1
+            terminated = depth == 0
             kind = TokenKind.COMMENT
         elif ch == "'":
-            i = _scan_string(text, i, backslash=False)
+            i, terminated = _scan_string(text, i, backslash=False)
             kind = TokenKind.STRING
         elif ch in quotes:
             close = quotes[ch]
             i += 1
+            terminated = False
             while i < n:
                 if text[i] == close:
                     if close != "]" and i + 1 < n and text[i + 1] == close:
                         i += 2
                         continue
                     i += 1
+                    terminated = True
                     break
                 i += 1
             kind = TokenKind.QUOTED
@@ -116,13 +121,14 @@ def _scan(text: str, dialect: Dialect) -> Iterator[Token]:
             i > 0 and _ident_char(text[i - 1])
         ):
             close_at = text.find(tag.group(0), tag.end())
+            terminated = close_at >= 0
             i = n if close_at < 0 else close_at + len(tag.group(0))
             kind = TokenKind.STRING
         elif _ident_start(ch):
             while i < n and _ident_char(text[i]):
                 i += 1
             if text[start:i] in rules.escape_string_prefixes and i < n and text[i] == "'":
-                i = _scan_string(text, i, backslash=True)
+                i, terminated = _scan_string(text, i, backslash=True)
                 kind = TokenKind.STRING
             else:
                 kind = TokenKind.WORD
@@ -133,7 +139,7 @@ def _scan(text: str, dialect: Dialect) -> Iterator[Token]:
         else:
             i += 1
             kind = _PUNCT.get(ch, TokenKind.OTHER)
-        yield Token(kind, start, i, text[start:i])
+        yield Token(kind, start, i, text[start:i], terminated)
 
 
 def tokenize(text: str, dialect: Dialect) -> list[Token]:

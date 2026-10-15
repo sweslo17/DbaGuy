@@ -113,3 +113,50 @@ def test_csv_header_survives_zero_rows_and_ragged_rows_are_rejected():
     assert fmt(F.JSON, rows=[]).text == "[\n]"
     with pytest.raises(ValidationFailed):
         fmt(F.TSV, rows=[[1, "a"]])
+
+
+NUMBERS = [FormatColumn(name=name, category=C.NUMBER) for name in ("big", "dec", "exp", "lead", "odd")]
+
+
+def test_json_writes_number_columns_as_bare_numbers_with_their_exact_text():
+    # PG loads bigint and numeric as text; "12.50" must stay 12.50, never become the float 12.5
+    rows = [["9007199254740993", "12.50", "-1.5E+3", "007", "NaN"]]
+    expected = '{"big": 9007199254740993, "dec": 12.50, "exp": -1.5E+3, "lead": "007", "odd": "NaN"}'  # 007 is not JSON
+    assert fmt(F.JSONL, rows=rows, cols=NUMBERS).text == expected
+    parsed = json.loads(fmt(F.JSON, rows=rows, cols=NUMBERS).text)
+    assert parsed == [{"big": 9007199254740993, "dec": 12.5, "exp": -1500.0, "lead": "007", "odd": "NaN"}]
+    text_column = [FormatColumn(name="t", category=C.TEXT)]
+    assert fmt(F.JSONL, rows=[["42"]], cols=text_column).text == '{"t": "42"}'
+
+
+def test_json_number_columns_from_raw_values_keep_every_digit():
+    rows = [[2**60, Decimal("12345678901234567890.50"), Decimal("1E+2"), 1, Decimal("NaN")]]
+    assert fmt(F.JSONL, rows=rows, cols=NUMBERS, source="raw").text == (
+        '{"big": 1152921504606846976, "dec": 12345678901234567890.50, "exp": 1E+2, "lead": 1, "odd": "NaN"}'
+    )
+
+
+def test_json_columns_are_embedded_as_json_and_invalid_ones_stay_strings():
+    cols = [FormatColumn(name="j", category=C.JSON)]
+    cut = {"$type": "text", "preview": '{"k":', "size": 70000, "truncated": True}
+    rows = [['{"k":[1,"x"]}'], ['{\n  "a": 1\n}'], ["not json"], ["NaN"], ['{"k": 1} x'], ["123"], ['"s"'], [None], [cut]]
+    assert fmt(F.JSONL, rows=rows, cols=cols).text.splitlines() == [
+        '{"j": {"k": [1, "x"]}}', '{"j": {"a": 1}}', '{"j": "not json"}', '{"j": "NaN"}', '{"j": "{\\"k\\": 1} x"}',
+        '{"j": 123}', '{"j": "s"}', '{"j": null}', '{"j": "{\\"k\\":…"}',
+    ]
+    assert json.loads(fmt(F.JSON, rows=rows[:1], cols=cols).text) == [{"j": {"k": [1, "x"]}}]
+
+
+def test_json_columns_keep_the_exact_numbers_inside():
+    cols = [FormatColumn(name="j", category=C.JSON)]
+    row = [['{"n": 12345678901234567890.123456789, "e": 1e2, "l": [0.10, 5]}']]
+    assert fmt(F.JSONL, rows=row, cols=cols).text == '{"j": {"n": 12345678901234567890.123456789, "e": 1E+2, "l": [0.10, 5]}}'
+    assert fmt(F.JSONL, rows=[[{"k": [1]}]], cols=cols, source="raw").text == '{"j": {"k": [1]}}'  # a driver-parsed dict
+
+
+def test_typed_json_does_not_change_the_other_formats():
+    cols = [FormatColumn(name="j", category=C.JSON), FormatColumn(name="n", category=C.NUMBER)]
+    assert fmt(F.CSV, rows=[['{"k":1}', "12.50"]], cols=cols).text == 'j,n\n"{""k"":1}",12.50\n'
+    assert fmt(F.INSERT, rows=[['{"k":1}', "12.50"]], cols=cols, table_name="t").text == (
+        "INSERT INTO t (j, n) VALUES ('{\"k\":1}', 12.50);"
+    )

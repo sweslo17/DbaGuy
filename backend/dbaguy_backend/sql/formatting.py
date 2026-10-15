@@ -12,8 +12,9 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from io import StringIO
-from typing import Any, Literal, TextIO
+from typing import Any, Literal, NoReturn, TextIO
 
 from pydantic import BaseModel
 
@@ -30,6 +31,8 @@ Source = Literal["encoded", "raw"]
 _ELLIPSIS = "…"
 _DEFAULT_TABLE = "table_name"
 _NUMERIC = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?", re.ASCII)
+# _NUMERIC without the leading zeros that JSON forbids
+_JSON_NUMBER = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?")
 _NEWLINES = re.compile(r"\r\n|\r|\n")
 _TSV_SPECIAL = frozenset('\t\n\r"')
 _BOOL_SQL = {Dialect.POSTGRES: ("TRUE", "FALSE"), Dialect.SQLITE: ("1", "0")}
@@ -111,6 +114,43 @@ def _text_cell(cell: Cell, null_text: str) -> str:
 
 def _json_cell(cell: Cell) -> Any:
     return cell if cell is None or isinstance(cell, (bool, int, float, str)) else _display(cell)
+
+
+def _reject_constant(name: str) -> NoReturn:
+    raise ValueError(f"{name} is not JSON")
+
+
+def _dump_json(node: Any) -> str:
+    """`json.dumps` for a tree parsed with `parse_float=Decimal`: decimals are written as they were read."""
+    match node:
+        case dict():
+            fields = (f"{json.dumps(key, ensure_ascii=False)}: {_dump_json(value)}" for key, value in node.items())
+            return "{" + ", ".join(fields) + "}"
+        case list():
+            return "[" + ", ".join(map(_dump_json, node)) + "]"
+        case Decimal():
+            return str(node)
+        case _:
+            return json.dumps(node, ensure_ascii=False)
+
+
+def _embedded_json(text: str) -> str | None:
+    """`text` as compact JSON with its numbers kept exactly as written; None when it is not JSON."""
+    try:
+        return _dump_json(json.loads(text, parse_float=Decimal, parse_constant=_reject_constant))
+    except (ValueError, RecursionError):
+        return None
+
+
+def _json_text(cell: Cell, column: FormatColumn) -> str:
+    """A cell as JSON. PostgreSQL loads bigint, numeric and json as text, so number and JSON columns are written as
+    what they are: a bare number with its exact digits, an embedded JSON value (a string that is not JSON stays one)."""
+    if isinstance(cell, str):
+        if column.category == ColumnCategory.NUMBER and _JSON_NUMBER.fullmatch(cell):
+            return cell
+        if column.category == ColumnCategory.JSON and (embedded := _embedded_json(cell)) is not None:
+            return embedded
+    return json.dumps(_json_cell(cell), ensure_ascii=False)
 
 
 def _truncation_warnings(count: int) -> list[str]:
@@ -255,10 +295,11 @@ class _ObjectWriter(RowWriter, ABC):
     """Formats with one JSON object per row, keyed by column name."""
 
     def _begin(self) -> None:
-        self._keys = _unique_names(self._names)
+        self._keys = [json.dumps(key, ensure_ascii=False) for key in _unique_names(self._names)]
 
     def _object(self, cells: list[Cell]) -> str:
-        return json.dumps(dict(zip(self._keys, map(_json_cell, cells))), ensure_ascii=False)
+        fields = (f"{key}: {_json_text(cell, column)}" for key, cell, column in zip(self._keys, cells, self._columns))
+        return "{" + ", ".join(fields) + "}"
 
 
 class _JsonlWriter(_ObjectWriter):
