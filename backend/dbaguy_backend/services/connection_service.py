@@ -40,11 +40,17 @@ class ConnectionService:
         self._tunnels = tunnels
 
     def open(
-        self, profile: AnyProfile, database: str | None = None, secrets: ResolvedSecrets | None = None
+        self,
+        profile: AnyProfile,
+        database: str | None = None,
+        secrets: ResolvedSecrets | None = None,
+        *,
+        share_tunnel: bool = True,
     ) -> ConnectionLease:
+        """`share_tunnel=False`: use an SSH tunnel of its own, never one that sessions are using."""
         secrets = secrets if secrets is not None else self._profiles.resolve_secrets(profile)
         adapter = self._registry.get(profile.engine)
-        endpoint, release = self._endpoint(adapter, profile, secrets)
+        endpoint, release = self._endpoint(adapter, profile, secrets, share_tunnel)
         try:
             connection = adapter.open(profile, endpoint, secrets.password, database)
         except BaseException:
@@ -53,7 +59,7 @@ class ConnectionService:
         return ConnectionLease(connection, release)
 
     def _endpoint(
-        self, adapter: DatabaseAdapter, profile: AnyProfile, secrets: ResolvedSecrets
+        self, adapter: DatabaseAdapter, profile: AnyProfile, secrets: ResolvedSecrets, share_tunnel: bool
     ) -> tuple[Endpoint | None, Callable[[], None]]:
         if not isinstance(profile, ServerProfile):
             return None, _noop
@@ -62,7 +68,9 @@ class ConnectionService:
             raise ValidationFailed("A port is required")
         if not profile.ssh.enabled:
             return Endpoint(profile.host, port), _noop
-        tunnel = self._tunnels.lease(profile.id, profile.ssh, profile.host, port, secrets.ssh_password)
+        tunnel = self._tunnels.lease(
+            profile.id, profile.ssh, profile.host, port, secrets.ssh_password, shared=share_tunnel
+        )
         return tunnel.endpoint, tunnel.release  # bound to this very tunnel, so a stale release cannot hit a replacement
 
     def test(self, request: ConnectionTestRequest) -> ConnectionTestResult:
@@ -73,7 +81,8 @@ class ConnectionService:
 
         profile = profile_from_draft(request.profile, request.existing_id or uuid4())
         try:
-            lease = self.open(profile, secrets=self._test_secrets(request))
+            # A test checks exactly the settings it was given: never through a tunnel a session already holds.
+            lease = self.open(profile, secrets=self._test_secrets(request), share_tunnel=False)
             try:
                 info = lease.connection.server_info()
             finally:

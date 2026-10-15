@@ -1,4 +1,7 @@
+import hashlib
+import hmac
 import os
+import secrets
 import socket
 import subprocess
 import threading
@@ -7,7 +10,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from loguru import logger
 
@@ -44,7 +47,18 @@ def _port_accepts(port: int) -> bool:
         return False
 
 
-_TunnelKey = tuple[UUID, str, int]
+@dataclass(frozen=True)
+class _TunnelKey:
+    """Everything a tunnel depends on: a tunnel is only shared by callers that would start the very same one."""
+
+    profile_id: UUID
+    ssh: str  # the whole SshConfig, as canonical JSON
+    password: str  # keyed fingerprint of the SSH password ("" without one); the password itself is never kept
+    target_host: str
+    target_port: int
+    nonce: str = ""  # set for a tunnel nobody else may share (connection tests)
+
+
 _WAIT_SLACK = 5.0  # extra time a waiter gives the caller that is starting the tunnel (it may also have to stop ssh)
 _MAX_ATTEMPTS = 3
 
@@ -105,24 +119,33 @@ class SshTunnelManager:
         self._ssh = ssh_binary
         self._tunnels: dict[_TunnelKey, _Tunnel] = {}
         self._lock = threading.Lock()
+        self._fingerprint_key = secrets.token_bytes(32)  # per process: fingerprints are useless outside it
 
     def lease(
-        self, profile_id: UUID, ssh: SshConfig, target_host: str, target_port: int, password: str | None
+        self,
+        profile_id: UUID,
+        ssh: SshConfig,
+        target_host: str,
+        target_port: int,
+        password: str | None,
+        shared: bool = True,
     ) -> TunnelLease:
-        """Take a reference whose release() is bound to this very tunnel."""
-        key = (profile_id, target_host, target_port)
+        """Take a reference whose release() is bound to this very tunnel. `shared=False` always starts a new one."""
+        key = self._key(profile_id, ssh, target_host, target_port, password, shared)
         tunnel = self._acquire(key, ssh, password)
         return TunnelLease(self._endpoint(tunnel, target_host), lambda: self._release(key, tunnel))
 
     def acquire(
         self, profile_id: UUID, ssh: SshConfig, target_host: str, target_port: int, password: str | None
     ) -> Endpoint:
-        key = (profile_id, target_host, target_port)
+        key = self._key(profile_id, ssh, target_host, target_port, password)
         return self._endpoint(self._acquire(key, ssh, password), target_host)
 
-    def release(self, profile_id: UUID, target_host: str, target_port: int) -> None:
-        """Release one reference of the tunnel currently registered for the key."""
-        self._release((profile_id, target_host, target_port))
+    def release(
+        self, profile_id: UUID, ssh: SshConfig, target_host: str, target_port: int, password: str | None
+    ) -> None:
+        """Release one reference of the tunnel currently registered for these settings."""
+        self._release(self._key(profile_id, ssh, target_host, target_port, password))
 
     def active_count(self) -> int:
         with self._lock:
@@ -138,12 +161,34 @@ class SshTunnelManager:
             except Exception:
                 logger.exception("Failed to stop an SSH tunnel on port {}", tunnel.local_port)
 
+    def _key(
+        self,
+        profile_id: UUID,
+        ssh: SshConfig,
+        target_host: str,
+        target_port: int,
+        password: str | None,
+        shared: bool = True,
+    ) -> _TunnelKey:
+        fingerprint = (
+            hmac.new(self._fingerprint_key, password.encode("utf-8", "surrogatepass"), hashlib.sha256).hexdigest()
+            if password
+            else ""
+        )
+        return _TunnelKey(
+            profile_id=profile_id,
+            ssh=ssh.model_dump_json(),
+            password=fingerprint,
+            target_host=target_host,
+            target_port=target_port,
+            nonce="" if shared else uuid4().hex,
+        )
+
     @staticmethod
     def _endpoint(tunnel: _Tunnel, target_host: str) -> Endpoint:
         return Endpoint(host="127.0.0.1", port=tunnel.local_port, tls_server_name=target_host)
 
     def _acquire(self, key: _TunnelKey, ssh: SshConfig, password: str | None) -> _Tunnel:
-        _, target_host, target_port = key
         for _ in range(_MAX_ATTEMPTS):
             with self._lock:
                 tunnel = self._tunnels.get(key)
@@ -176,12 +221,12 @@ class SshTunnelManager:
                 return
             del self._tunnels[key]
         self._stop(current)
-        logger.info("Closed SSH tunnel to {}:{}", key[1], key[2])
+        logger.info("Closed SSH tunnel to {}:{}", key.target_host, key.target_port)
 
     def _run_start(self, key: _TunnelKey, tunnel: _Tunnel, ssh: SshConfig, password: str | None) -> None:
         """Start ssh for a reserved tunnel (outside the lock), then wake everyone waiting on it."""
         try:
-            self._start(tunnel, ssh, key[1], key[2], password)
+            self._start(tunnel, ssh, key.target_host, key.target_port, password)
         except BaseException as exc:
             tunnel.error = exc if isinstance(exc, TunnelFailed) else TunnelFailed(f"SSH tunnel failed: {exc}")
             with self._lock:

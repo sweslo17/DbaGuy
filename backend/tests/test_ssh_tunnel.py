@@ -35,10 +35,10 @@ def test_password_tunnel_to_postgres(tmp_path):
         assert conn.run("SELECT 1").fetch(1) == [[1]]
         conn.close()
         assert tunnels.acquire(pid, bastion(), "postgres", 5432, "dev").port == endpoint.port  # shared, ref-counted
-        tunnels.release(pid, "postgres", 5432)
+        tunnels.release(pid, bastion(), "postgres", 5432, "dev")
         assert tunnels.active_count() == 1
     finally:
-        tunnels.release(pid, "postgres", 5432)
+        tunnels.release(pid, bastion(), "postgres", 5432, "dev")
     assert tunnels.active_count() == 0
 
 
