@@ -13,6 +13,11 @@ export class ApiError extends Error {
   }
 }
 
+/** The message to show for any thrown value: ApiError messages are already user-facing. */
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 const authMiddleware: Middleware = {
   async onRequest({ request }) {
     const { token } = await getBackendInfo();

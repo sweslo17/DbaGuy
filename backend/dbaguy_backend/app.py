@@ -26,7 +26,12 @@ def create_app(settings: Settings, container: AppContainer | None = None) -> Fas
             container.close()
             logger.info("Backend stopped")
 
-    app = FastAPI(title="DbaGuy Backend", version=app_version(), lifespan=lifespan)
+    app = FastAPI(
+        title="DbaGuy Backend",
+        version=app_version(),
+        lifespan=lifespan,
+        separate_input_output_schemas=False,
+    )
     app.state.container = container
     app.add_middleware(
         CORSMiddleware,
