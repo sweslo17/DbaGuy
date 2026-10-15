@@ -9,7 +9,8 @@ dist/
 # Rust / Tauri
 src-tauri/target/
 src-tauri/gen/
-src-tauri/resources/backend/
+src-tauri/resources/backend/*
+!src-tauri/resources/backend/.gitkeep
 
 # Python
 __pycache__/
@@ -26,6 +27,7 @@ backend/dist/
 .env
 .env.*
 !.env.example
+!.env.development
 
 # Logs
 *.log

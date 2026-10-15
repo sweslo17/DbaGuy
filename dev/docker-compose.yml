@@ -1,0 +1,25 @@
+name: dbaguy-dev
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: dbaguy
+      POSTGRES_PASSWORD: dbaguy
+      POSTGRES_DB: dbaguy
+    ports:
+      - "127.0.0.1:54317:5432"
+    volumes:
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbaguy -d dbaguy"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  bastion:
+    build: ./bastion
+    ports:
+      - "127.0.0.1:2222:22"
+    depends_on:
+      - postgres

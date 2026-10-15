@@ -1,0 +1,2407 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "DbaGuy Backend",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/system/health": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Health",
+        "operationId": "health_system_health_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/system/engines": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Engines",
+        "operationId": "engines_system_engines_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EngineInfo"
+                  },
+                  "title": "Response Engines System Engines Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/profiles": {
+      "get": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "List Profiles",
+        "operationId": "list_profiles_profiles_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProfileEntry"
+                  },
+                  "title": "Response List Profiles Profiles Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Create Profile",
+        "operationId": "create_profile_profiles_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileUpsertRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileEntry"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/profiles/{profile_id}": {
+      "put": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Update Profile",
+        "operationId": "update_profile_profiles__profile_id__put",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Profile Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileUpsertRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileEntry"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Delete Profile",
+        "operationId": "delete_profile_profiles__profile_id__delete",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Profile Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/profiles/{profile_id}/unlock": {
+      "post": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Unlock Profile",
+        "operationId": "unlock_profile_profiles__profile_id__unlock_post",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Profile Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileSecretsInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/profiles/import-url": {
+      "post": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Import Url",
+        "operationId": "import_url_profiles_import_url_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportUrlRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportUrlResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/profiles/test": {
+      "post": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Test Connection",
+        "operationId": "test_connection_profiles_test_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionTestRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionTestResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metadata/children": {
+      "post": {
+        "tags": [
+          "metadata"
+        ],
+        "summary": "Children",
+        "operationId": "children_metadata_children_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MetadataRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ObjectNode"
+                  },
+                  "title": "Response Children Metadata Children Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metadata/detail": {
+      "post": {
+        "tags": [
+          "metadata"
+        ],
+        "summary": "Detail",
+        "operationId": "detail_metadata_detail_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MetadataRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObjectDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions": {
+      "post": {
+        "tags": [
+          "sessions"
+        ],
+        "summary": "Create Session",
+        "operationId": "create_session_sessions_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionInfo"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions/{session_id}": {
+      "delete": {
+        "tags": [
+          "sessions"
+        ],
+        "summary": "Close Session",
+        "operationId": "close_session_sessions__session_id__delete",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions/_schema/execution": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "summary": "Execution Schema",
+        "description": "Never called; exposes the WebSocket protocol models in OpenAPI.",
+        "operationId": "execution_schema_sessions__schema_execution_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionSchema"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AffectedEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "affected",
+            "title": "Type",
+            "default": "affected"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "index": {
+            "type": "integer",
+            "title": "Index"
+          },
+          "rows": {
+            "type": "integer",
+            "title": "Rows"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "index",
+          "rows"
+        ],
+        "title": "AffectedEvent"
+      },
+      "CancelCommand": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "cancel",
+            "title": "Type",
+            "default": "cancel"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id"
+        ],
+        "title": "CancelCommand"
+      },
+      "ColumnCategory": {
+        "type": "string",
+        "enum": [
+          "number",
+          "text",
+          "bool",
+          "datetime",
+          "binary",
+          "json",
+          "other"
+        ],
+        "title": "ColumnCategory"
+      },
+      "ColumnInfo": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "type_name": {
+            "type": "string",
+            "title": "Type Name"
+          },
+          "nullable": {
+            "type": "boolean",
+            "title": "Nullable"
+          },
+          "default": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default"
+          },
+          "is_primary_key": {
+            "type": "boolean",
+            "title": "Is Primary Key",
+            "default": false
+          },
+          "comment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Comment"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "type_name",
+          "nullable"
+        ],
+        "title": "ColumnInfo"
+      },
+      "ColumnMeta": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "type_name": {
+            "type": "string",
+            "title": "Type Name"
+          },
+          "category": {
+            "$ref": "#/components/schemas/ColumnCategory"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "type_name",
+          "category"
+        ],
+        "title": "ColumnMeta"
+      },
+      "ConnectionTestRequest": {
+        "properties": {
+          "profile": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServerProfileDraft"
+              },
+              {
+                "$ref": "#/components/schemas/SqliteProfileDraft"
+              }
+            ],
+            "title": "Profile",
+            "discriminator": {
+              "propertyName": "engine",
+              "mapping": {
+                "couchbase": "#/components/schemas/ServerProfileDraft",
+                "mssql": "#/components/schemas/ServerProfileDraft",
+                "mysql": "#/components/schemas/ServerProfileDraft",
+                "postgres": "#/components/schemas/ServerProfileDraft",
+                "sqlite": "#/components/schemas/SqliteProfileDraft"
+              }
+            }
+          },
+          "secrets": {
+            "$ref": "#/components/schemas/ProfileSecretsInput"
+          },
+          "existing_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Existing Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "profile"
+        ],
+        "title": "ConnectionTestRequest"
+      },
+      "ConnectionTestResult": {
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "title": "Ok"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "server_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Server Version"
+          },
+          "elapsed_ms": {
+            "type": "integer",
+            "title": "Elapsed Ms"
+          }
+        },
+        "type": "object",
+        "required": [
+          "ok",
+          "message",
+          "elapsed_ms"
+        ],
+        "title": "ConnectionTestResult"
+      },
+      "DiscardCommand": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "discard",
+            "title": "Type",
+            "default": "discard"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id"
+        ],
+        "title": "DiscardCommand"
+      },
+      "Engine": {
+        "type": "string",
+        "enum": [
+          "postgres",
+          "mysql",
+          "mssql",
+          "couchbase",
+          "sqlite"
+        ],
+        "title": "Engine"
+      },
+      "EngineInfo": {
+        "properties": {
+          "engine": {
+            "$ref": "#/components/schemas/Engine"
+          },
+          "default_port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Port"
+          },
+          "url_schemes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Url Schemes"
+          }
+        },
+        "type": "object",
+        "required": [
+          "engine",
+          "default_port",
+          "url_schemes"
+        ],
+        "title": "EngineInfo"
+      },
+      "ErrorEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "error",
+            "title": "Type",
+            "default": "error"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "position": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorPosition"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "message"
+        ],
+        "title": "ErrorEvent"
+      },
+      "ErrorPosition": {
+        "properties": {
+          "line": {
+            "type": "integer",
+            "title": "Line"
+          },
+          "column": {
+            "type": "integer",
+            "title": "Column"
+          }
+        },
+        "type": "object",
+        "required": [
+          "line",
+          "column"
+        ],
+        "title": "ErrorPosition"
+      },
+      "ExecuteCommand": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "execute",
+            "title": "Type",
+            "default": "execute"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "sql": {
+            "type": "string",
+            "title": "Sql"
+          },
+          "page_size": {
+            "type": "integer",
+            "maximum": 10000.0,
+            "minimum": 1.0,
+            "title": "Page Size",
+            "default": 500
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "sql"
+        ],
+        "title": "ExecuteCommand"
+      },
+      "ExecutionSchema": {
+        "properties": {
+          "command": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ExecuteCommand"
+              },
+              {
+                "$ref": "#/components/schemas/FetchMoreCommand"
+              },
+              {
+                "$ref": "#/components/schemas/CancelCommand"
+              },
+              {
+                "$ref": "#/components/schemas/DiscardCommand"
+              }
+            ],
+            "title": "Command",
+            "discriminator": {
+              "propertyName": "type",
+              "mapping": {
+                "cancel": "#/components/schemas/CancelCommand",
+                "discard": "#/components/schemas/DiscardCommand",
+                "execute": "#/components/schemas/ExecuteCommand",
+                "fetch_more": "#/components/schemas/FetchMoreCommand"
+              }
+            }
+          },
+          "event": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/StartedEvent"
+              },
+              {
+                "$ref": "#/components/schemas/ResultSetEvent"
+              },
+              {
+                "$ref": "#/components/schemas/RowsEvent"
+              },
+              {
+                "$ref": "#/components/schemas/ResultSetEndEvent"
+              },
+              {
+                "$ref": "#/components/schemas/AffectedEvent"
+              },
+              {
+                "$ref": "#/components/schemas/MessageEvent"
+              },
+              {
+                "$ref": "#/components/schemas/ErrorEvent"
+              },
+              {
+                "$ref": "#/components/schemas/FinishedEvent"
+              }
+            ],
+            "title": "Event",
+            "discriminator": {
+              "propertyName": "type",
+              "mapping": {
+                "affected": "#/components/schemas/AffectedEvent",
+                "error": "#/components/schemas/ErrorEvent",
+                "finished": "#/components/schemas/FinishedEvent",
+                "message": "#/components/schemas/MessageEvent",
+                "result_set": "#/components/schemas/ResultSetEvent",
+                "result_set_end": "#/components/schemas/ResultSetEndEvent",
+                "rows": "#/components/schemas/RowsEvent",
+                "started": "#/components/schemas/StartedEvent"
+              }
+            }
+          }
+        },
+        "type": "object",
+        "required": [
+          "command",
+          "event"
+        ],
+        "title": "ExecutionSchema",
+        "description": "Exposes the WebSocket protocol in OpenAPI so the frontend types are generated."
+      },
+      "FetchMoreCommand": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "fetch_more",
+            "title": "Type",
+            "default": "fetch_more"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "count": {
+            "type": "integer",
+            "maximum": 10000.0,
+            "minimum": 1.0,
+            "title": "Count",
+            "default": 500
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id"
+        ],
+        "title": "FetchMoreCommand"
+      },
+      "FinishedEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "finished",
+            "title": "Type",
+            "default": "finished"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "elapsed_ms": {
+            "type": "integer",
+            "title": "Elapsed Ms"
+          },
+          "in_transaction": {
+            "type": "boolean",
+            "title": "In Transaction"
+          },
+          "transaction_failed": {
+            "type": "boolean",
+            "title": "Transaction Failed",
+            "default": false
+          },
+          "cancelled": {
+            "type": "boolean",
+            "title": "Cancelled",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "elapsed_ms",
+          "in_transaction"
+        ],
+        "title": "FinishedEvent"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "ok",
+            "title": "Status"
+          },
+          "version": {
+            "type": "string",
+            "title": "Version"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "version"
+        ],
+        "title": "HealthResponse"
+      },
+      "ImportUrlRequest": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "title": "Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "title": "ImportUrlRequest"
+      },
+      "ImportUrlResponse": {
+        "properties": {
+          "profile": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServerProfileDraft"
+              },
+              {
+                "$ref": "#/components/schemas/SqliteProfileDraft"
+              }
+            ],
+            "title": "Profile",
+            "discriminator": {
+              "propertyName": "engine",
+              "mapping": {
+                "couchbase": "#/components/schemas/ServerProfileDraft",
+                "mssql": "#/components/schemas/ServerProfileDraft",
+                "mysql": "#/components/schemas/ServerProfileDraft",
+                "postgres": "#/components/schemas/ServerProfileDraft",
+                "sqlite": "#/components/schemas/SqliteProfileDraft"
+              }
+            }
+          },
+          "password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Password"
+          }
+        },
+        "type": "object",
+        "required": [
+          "profile"
+        ],
+        "title": "ImportUrlResponse"
+      },
+      "MessageEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "message",
+            "title": "Type",
+            "default": "message"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/MessageSeverity"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "severity",
+          "text"
+        ],
+        "title": "MessageEvent"
+      },
+      "MessageSeverity": {
+        "type": "string",
+        "enum": [
+          "info",
+          "warning"
+        ],
+        "title": "MessageSeverity"
+      },
+      "MetadataRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "path": {
+            "items": {
+              "$ref": "#/components/schemas/PathSegment"
+            },
+            "type": "array",
+            "title": "Path"
+          }
+        },
+        "type": "object",
+        "required": [
+          "profile_id"
+        ],
+        "title": "MetadataRequest"
+      },
+      "ObjectDetail": {
+        "properties": {
+          "path": {
+            "items": {
+              "$ref": "#/components/schemas/PathSegment"
+            },
+            "type": "array",
+            "title": "Path"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "ddl": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ddl"
+          },
+          "ddl_is_generated": {
+            "type": "boolean",
+            "title": "Ddl Is Generated",
+            "default": false
+          },
+          "columns": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ColumnInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Columns"
+          },
+          "comment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Comment"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "kind",
+          "name"
+        ],
+        "title": "ObjectDetail"
+      },
+      "ObjectNode": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "path": {
+            "items": {
+              "$ref": "#/components/schemas/PathSegment"
+            },
+            "type": "array",
+            "title": "Path"
+          },
+          "has_children": {
+            "type": "boolean",
+            "title": "Has Children"
+          },
+          "system": {
+            "type": "boolean",
+            "title": "System",
+            "default": false
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind",
+          "name",
+          "path",
+          "has_children"
+        ],
+        "title": "ObjectNode"
+      },
+      "PathSegment": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind",
+          "name"
+        ],
+        "title": "PathSegment"
+      },
+      "ProfileEntry": {
+        "properties": {
+          "profile": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServerProfile"
+              },
+              {
+                "$ref": "#/components/schemas/SqliteProfile"
+              }
+            ],
+            "title": "Profile",
+            "discriminator": {
+              "propertyName": "engine",
+              "mapping": {
+                "couchbase": "#/components/schemas/ServerProfile",
+                "mssql": "#/components/schemas/ServerProfile",
+                "mysql": "#/components/schemas/ServerProfile",
+                "postgres": "#/components/schemas/ServerProfile",
+                "sqlite": "#/components/schemas/SqliteProfile"
+              }
+            }
+          },
+          "has_password": {
+            "type": "boolean",
+            "title": "Has Password"
+          },
+          "has_ssh_password": {
+            "type": "boolean",
+            "title": "Has Ssh Password"
+          }
+        },
+        "type": "object",
+        "required": [
+          "profile",
+          "has_password",
+          "has_ssh_password"
+        ],
+        "title": "ProfileEntry"
+      },
+      "ProfileSecretsInput": {
+        "properties": {
+          "password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Password"
+          },
+          "ssh_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ssh Password"
+          }
+        },
+        "type": "object",
+        "title": "ProfileSecretsInput",
+        "description": "`None` keeps the stored secret; an empty string clears it."
+      },
+      "ProfileUpsertRequest": {
+        "properties": {
+          "profile": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServerProfileDraft"
+              },
+              {
+                "$ref": "#/components/schemas/SqliteProfileDraft"
+              }
+            ],
+            "title": "Profile",
+            "discriminator": {
+              "propertyName": "engine",
+              "mapping": {
+                "couchbase": "#/components/schemas/ServerProfileDraft",
+                "mssql": "#/components/schemas/ServerProfileDraft",
+                "mysql": "#/components/schemas/ServerProfileDraft",
+                "postgres": "#/components/schemas/ServerProfileDraft",
+                "sqlite": "#/components/schemas/SqliteProfileDraft"
+              }
+            }
+          },
+          "secrets": {
+            "$ref": "#/components/schemas/ProfileSecretsInput"
+          }
+        },
+        "type": "object",
+        "required": [
+          "profile"
+        ],
+        "title": "ProfileUpsertRequest"
+      },
+      "ResultSetEndEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "result_set_end",
+            "title": "Type",
+            "default": "result_set_end"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "index": {
+            "type": "integer",
+            "title": "Index"
+          },
+          "row_count": {
+            "type": "integer",
+            "title": "Row Count"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "index",
+          "row_count",
+          "has_more"
+        ],
+        "title": "ResultSetEndEvent"
+      },
+      "ResultSetEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "result_set",
+            "title": "Type",
+            "default": "result_set"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "index": {
+            "type": "integer",
+            "title": "Index"
+          },
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnMeta"
+            },
+            "type": "array",
+            "title": "Columns"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "index",
+          "columns"
+        ],
+        "title": "ResultSetEvent"
+      },
+      "RowsEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "rows",
+            "title": "Type",
+            "default": "rows"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "index": {
+            "type": "integer",
+            "title": "Index"
+          },
+          "rows": {
+            "items": {
+              "items": {},
+              "type": "array"
+            },
+            "type": "array",
+            "title": "Rows"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "index",
+          "rows"
+        ],
+        "title": "RowsEvent"
+      },
+      "ServerInfo": {
+        "properties": {
+          "engine": {
+            "$ref": "#/components/schemas/Engine"
+          },
+          "version": {
+            "type": "string",
+            "title": "Version"
+          },
+          "current_database": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Database"
+          },
+          "current_user": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current User"
+          }
+        },
+        "type": "object",
+        "required": [
+          "engine",
+          "version"
+        ],
+        "title": "ServerInfo"
+      },
+      "ServerProfile": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Name"
+          },
+          "folder": {
+            "type": "string",
+            "title": "Folder",
+            "default": ""
+          },
+          "color": {
+            "type": "string",
+            "enum": [
+              "none",
+              "green",
+              "yellow",
+              "orange",
+              "red",
+              "purple"
+            ],
+            "title": "Color",
+            "default": "none"
+          },
+          "read_only": {
+            "type": "boolean",
+            "title": "Read Only",
+            "default": false
+          },
+          "save_password": {
+            "type": "boolean",
+            "title": "Save Password",
+            "default": true
+          },
+          "engine": {
+            "type": "string",
+            "enum": [
+              "postgres",
+              "mysql",
+              "mssql",
+              "couchbase"
+            ],
+            "title": "Engine"
+          },
+          "host": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Host"
+          },
+          "port": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 65535.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Port"
+          },
+          "database": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Database"
+          },
+          "username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Username"
+          },
+          "ssl": {
+            "$ref": "#/components/schemas/SslConfig"
+          },
+          "ssh": {
+            "$ref": "#/components/schemas/SshConfig"
+          },
+          "options": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Options"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "name",
+          "engine",
+          "host",
+          "id"
+        ],
+        "title": "ServerProfile"
+      },
+      "ServerProfileDraft": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Name"
+          },
+          "folder": {
+            "type": "string",
+            "title": "Folder",
+            "default": ""
+          },
+          "color": {
+            "type": "string",
+            "enum": [
+              "none",
+              "green",
+              "yellow",
+              "orange",
+              "red",
+              "purple"
+            ],
+            "title": "Color",
+            "default": "none"
+          },
+          "read_only": {
+            "type": "boolean",
+            "title": "Read Only",
+            "default": false
+          },
+          "save_password": {
+            "type": "boolean",
+            "title": "Save Password",
+            "default": true
+          },
+          "engine": {
+            "type": "string",
+            "enum": [
+              "postgres",
+              "mysql",
+              "mssql",
+              "couchbase"
+            ],
+            "title": "Engine"
+          },
+          "host": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Host"
+          },
+          "port": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 65535.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Port"
+          },
+          "database": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Database"
+          },
+          "username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Username"
+          },
+          "ssl": {
+            "$ref": "#/components/schemas/SslConfig"
+          },
+          "ssh": {
+            "$ref": "#/components/schemas/SshConfig"
+          },
+          "options": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Options"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "name",
+          "engine",
+          "host"
+        ],
+        "title": "ServerProfileDraft"
+      },
+      "SessionCreateRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "database": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Database"
+          }
+        },
+        "type": "object",
+        "required": [
+          "profile_id"
+        ],
+        "title": "SessionCreateRequest"
+      },
+      "SessionInfo": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "database": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Database"
+          },
+          "server": {
+            "$ref": "#/components/schemas/ServerInfo"
+          }
+        },
+        "type": "object",
+        "required": [
+          "session_id",
+          "profile_id",
+          "database",
+          "server"
+        ],
+        "title": "SessionInfo"
+      },
+      "SqliteProfile": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Name"
+          },
+          "folder": {
+            "type": "string",
+            "title": "Folder",
+            "default": ""
+          },
+          "color": {
+            "type": "string",
+            "enum": [
+              "none",
+              "green",
+              "yellow",
+              "orange",
+              "red",
+              "purple"
+            ],
+            "title": "Color",
+            "default": "none"
+          },
+          "read_only": {
+            "type": "boolean",
+            "title": "Read Only",
+            "default": false
+          },
+          "save_password": {
+            "type": "boolean",
+            "title": "Save Password",
+            "default": true
+          },
+          "engine": {
+            "type": "string",
+            "const": "sqlite",
+            "title": "Engine"
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Path"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "name",
+          "engine",
+          "path",
+          "id"
+        ],
+        "title": "SqliteProfile"
+      },
+      "SqliteProfileDraft": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Name"
+          },
+          "folder": {
+            "type": "string",
+            "title": "Folder",
+            "default": ""
+          },
+          "color": {
+            "type": "string",
+            "enum": [
+              "none",
+              "green",
+              "yellow",
+              "orange",
+              "red",
+              "purple"
+            ],
+            "title": "Color",
+            "default": "none"
+          },
+          "read_only": {
+            "type": "boolean",
+            "title": "Read Only",
+            "default": false
+          },
+          "save_password": {
+            "type": "boolean",
+            "title": "Save Password",
+            "default": true
+          },
+          "engine": {
+            "type": "string",
+            "const": "sqlite",
+            "title": "Engine"
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Path"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "name",
+          "engine",
+          "path"
+        ],
+        "title": "SqliteProfileDraft"
+      },
+      "SshConfig": {
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled",
+            "default": false
+          },
+          "host": {
+            "type": "string",
+            "title": "Host",
+            "default": ""
+          },
+          "port": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 65535.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Port"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User"
+          },
+          "identity_file": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Identity File"
+          },
+          "auth": {
+            "type": "string",
+            "enum": [
+              "agent_or_key",
+              "password"
+            ],
+            "title": "Auth",
+            "default": "agent_or_key"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "SshConfig"
+      },
+      "SslConfig": {
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "disable",
+              "prefer",
+              "require",
+              "verify-ca",
+              "verify-full"
+            ],
+            "title": "Mode",
+            "default": "prefer"
+          },
+          "ca_file": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ca File"
+          },
+          "cert_file": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cert File"
+          },
+          "key_file": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key File"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "SslConfig"
+      },
+      "StartedEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "started",
+            "title": "Type",
+            "default": "started"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id"
+        ],
+        "title": "StartedEvent"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}
