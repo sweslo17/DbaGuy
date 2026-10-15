@@ -104,10 +104,16 @@ class SqliteConnection(DatabaseConnection):
         return "main"
 
     def list_children(self, path: list[PathSegment]) -> list[ObjectNode]:
-        return introspection.list_children(self._conn, path)
+        try:
+            return introspection.list_children(self._conn, path)
+        except sqlite3.Error as exc:
+            raise _translate(exc) from exc
 
     def object_detail(self, path: list[PathSegment]) -> ObjectDetail:
-        return introspection.object_detail(self._conn, path)
+        try:
+            return introspection.object_detail(self._conn, path)
+        except sqlite3.Error as exc:
+            raise _translate(exc) from exc
 
     def run(self, sql: str) -> StatementResult:
         cursor = self._conn.cursor()
@@ -152,10 +158,14 @@ class SqliteAdapter(DatabaseAdapter):
             raise ConnectionFailed(f"SQLite file not found: {path}")
         mode = "ro" if profile.read_only else "rw"
         uri = f"file:{quote(str(path))}?mode={mode}"
+        conn: sqlite3.Connection | None = None
         try:
             conn = sqlite3.connect(uri, uri=True, isolation_level=None, check_same_thread=True)
             conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()  # fails for non-database files
         except sqlite3.Error as exc:
+            if conn is not None:
+                conn.close()
             raise ConnectionFailed(f"Cannot open {path}: {exc}") from exc
         logger.info("Opened SQLite database {} (mode={})", path, mode)
         return SqliteConnection(conn, path)

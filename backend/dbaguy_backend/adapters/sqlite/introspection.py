@@ -16,6 +16,7 @@ _KIND_OF_TYPE = {
     "index": NodeKind.INDEX,
     "trigger": NodeKind.TRIGGER,
 }
+_TYPE_OF_KIND = {kind: obj_type for obj_type, kind in _KIND_OF_TYPE.items()}
 
 
 def _master(schema: str) -> str:
@@ -24,6 +25,18 @@ def _master(schema: str) -> str:
 
 def _schemas(conn: sqlite3.Connection) -> list[str]:
     return [row[1] for row in conn.execute("PRAGMA database_list") if row[1] != "temp"]
+
+
+def _require_schema(conn: sqlite3.Connection, name: str) -> None:
+    if name not in _schemas(conn):
+        raise NotFound(f"Schema '{name}' not found")
+
+
+def _folder(name: str) -> Folder:
+    try:
+        return Folder(name)
+    except ValueError:
+        raise ValidationFailed(f"Unknown folder '{name}'") from None
 
 
 def columns(conn: sqlite3.Connection, schema: str, table: str) -> list[ColumnInfo]:
@@ -61,6 +74,9 @@ def list_children(conn: sqlite3.Connection, path: list[PathSegment]) -> list[Obj
         return [make_node(path, NodeKind.SCHEMA, s, has_children=True) for s in _schemas(conn)]
     schema = path[0].name
     last = path[-1]
+    _require_schema(conn, schema)
+    if last.kind == NodeKind.FOLDER:
+        _folder(last.name)  # unknown folder names are rejected at any depth
     if depth == 1:
         counts = dict(conn.execute(f"SELECT type, count(*) FROM {_master(schema)} GROUP BY type").fetchall())
         return [
@@ -69,7 +85,10 @@ def list_children(conn: sqlite3.Connection, path: list[PathSegment]) -> list[Obj
             if counts.get(obj_type)
         ]
     if depth == 2 and last.kind == NodeKind.FOLDER:
-        obj_type = _TYPE_FOLDERS[Folder(last.name)]
+        folder = Folder(last.name)  # validated above
+        if folder not in _TYPE_FOLDERS:
+            raise ValidationFailed(f"Folder '{folder}' is not listed at schema level")
+        obj_type = _TYPE_FOLDERS[folder]
         kind = _KIND_OF_TYPE[obj_type]
         rows = conn.execute(
             f"SELECT name, tbl_name FROM {_master(schema)} WHERE type = ? ORDER BY name", (obj_type,)
@@ -115,8 +134,12 @@ def object_detail(conn: sqlite3.Connection, path: list[PathSegment]) -> ObjectDe
     if not path:
         raise ValidationFailed("Empty path")
     schema, last = path[0].name, path[-1]
+    _require_schema(conn, schema)
     if last.kind in (NodeKind.TABLE, NodeKind.VIEW, NodeKind.INDEX, NodeKind.TRIGGER):
-        row = conn.execute(f"SELECT sql FROM {_master(schema)} WHERE name = ?", (last.name,)).fetchone()
+        row = conn.execute(
+            f"SELECT sql FROM {_master(schema)} WHERE type = ? AND name = ?",
+            (_TYPE_OF_KIND[last.kind], last.name),
+        ).fetchone()
         if row is None:
             raise NotFound(f"{last.kind} '{last.name}' not found")
         ddl = f"{row[0]};" if row[0] else None

@@ -7,7 +7,7 @@ import pytest
 
 from dbaguy_backend.adapters.base import StatementCancelled, StatementError
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
-from dbaguy_backend.domain.errors import ConnectionFailed
+from dbaguy_backend.domain.errors import ConnectionFailed, NotFound, ValidationFailed
 from dbaguy_backend.domain.metadata import PathSegment
 from dbaguy_backend.domain.profiles import SqliteProfile
 
@@ -124,3 +124,54 @@ def test_parse_url():
     parsed = SqliteAdapter().parse_url("sqlite:///Users/me/My%20App.db")
     assert parsed.profile.path == "/Users/me/My App.db"
     assert parsed.profile.name == "My App.db"
+
+
+def test_trigger_and_table_share_a_name(tmp_path):
+    path = tmp_path / "shared.db"
+    setup = sqlite3.connect(path)
+    setup.executescript("CREATE TABLE t(a); CREATE TRIGGER t AFTER INSERT ON t BEGIN SELECT 1; END;")
+    setup.close()
+    conn = open_conn(path)
+    try:
+        trigger = conn.object_detail([seg("schema", "main"), seg("folder", "triggers"), seg("trigger", "t")])
+        assert trigger.ddl.startswith("CREATE TRIGGER t")
+        table = conn.object_detail([seg("schema", "main"), seg("folder", "tables"), seg("table", "t")])
+        assert table.ddl.startswith("CREATE TABLE t")
+    finally:
+        conn.close()
+
+
+def test_non_database_file_is_rejected(tmp_path):
+    path = tmp_path / "notes.db"
+    path.write_text("this is plain text, not a database\n" * 10)
+    with pytest.raises(ConnectionFailed):
+        open_conn(path)
+
+
+def test_unknown_folder_is_validation_failed(db_path):
+    conn = open_conn(db_path)
+    try:
+        with pytest.raises(ValidationFailed):
+            conn.list_children([seg("schema", "main"), seg("folder", "bogus")])
+        with pytest.raises(ValidationFailed):
+            conn.list_children([seg("schema", "main"), seg("folder", "columns")])
+    finally:
+        conn.close()
+
+
+def test_unknown_schema_is_not_found(db_path):
+    conn = open_conn(db_path)
+    try:
+        with pytest.raises(NotFound):
+            conn.list_children([seg("schema", "nope")])
+        with pytest.raises(NotFound):
+            conn.object_detail([seg("schema", "nope"), seg("folder", "tables"), seg("table", "books")])
+    finally:
+        conn.close()
+
+
+def test_sqlite_errors_become_statement_errors(db_path):
+    conn = open_conn(db_path)
+    conn.close()
+    with pytest.raises(StatementError):
+        conn.list_children([seg("schema", "main")])
