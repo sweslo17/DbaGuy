@@ -21,7 +21,7 @@ export function getBackendInfo(): Promise<BackendInfo> {
         }))
       : Promise.resolve({
           baseUrl: import.meta.env.VITE_BACKEND_URL ?? "http://127.0.0.1:18765",
-          token: import.meta.env.VITE_BACKEND_TOKEN ?? "dev-token",
+          token: import.meta.env.VITE_BACKEND_TOKEN ?? "", // injected per run by scripts/dev.sh
         });
     cached.catch(() => {
       cached = null;

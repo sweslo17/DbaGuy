@@ -3,7 +3,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${DBAGUY_DEV_PORT:-18765}"
-TOKEN=dev-token
+# A fresh secret every run: the dev backend listens on a fixed port, so a fixed token would let any local page or
+# process drive it. It goes to the backend, to Vite (--web) and to the Tauri dev shell.
+TOKEN="$("$ROOT/backend/.venv/bin/python" -c 'import secrets; print(secrets.token_hex(32))')"
 
 cleanup() {
   if [[ -n "${BACKEND_PID:-}" ]]; then kill "$BACKEND_PID" 2>/dev/null || true; fi

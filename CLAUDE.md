@@ -60,7 +60,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
 
 測試 DB：PG `127.0.0.1:54317`（dbaguy/dbaguy，另有 `analytics` database）；SSH bastion `127.0.0.1:2222`（dev/dev，可連到 `postgres:5432`）。兩者都只綁 `127.0.0.1`。
 
-開發用 backend 固定在 port `18765`（`DBAGUY_DEV_PORT` 可覆寫），token 是 `dev-token`。
+開發用 backend 固定在 port `18765`（`DBAGUY_DEV_PORT` 可覆寫）。Token 由 `scripts/dev.sh` 每次啟動時隨機產生，傳給 backend（`DBAGUY_TOKEN`）、Vite（`VITE_BACKEND_TOKEN`）與 Tauri dev（`DBAGUY_DEV_BACKEND_TOKEN`）；`.env.development` 只放 URL，沒有固定 token。Backend 沒有 `DBAGUY_TOKEN` 會拒絕啟動（自己手動跑 uvicorn 時要自行設定），且只接受 Host 為 `127.0.0.1`／`localhost` 的請求（`TrustedHostMiddleware`）。
 
 ## 架構重點
 

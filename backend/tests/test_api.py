@@ -17,13 +17,15 @@ from dbaguy_backend.storage.secret_store import InMemorySecretStore
 
 TOKEN = "test-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+BASE_URL = "http://127.0.0.1"  # the backend only answers requests addressed to 127.0.0.1 / localhost
+WS_BASE = "ws://127.0.0.1"  # TestClient.websocket_connect ignores base_url
 
 
 @pytest.fixture
 def client(tmp_path):
     settings = Settings(token=TOKEN, data_dir=tmp_path / "data", log_to_file=False)
     container = AppContainer(settings, secret_store=InMemorySecretStore())
-    with TestClient(create_app(settings, container)) as test_client:
+    with TestClient(create_app(settings, container), base_url=BASE_URL) as test_client:
         yield test_client
 
 
@@ -87,7 +89,7 @@ def test_metadata_and_session_over_websocket(client, sqlite_profile_id):
     session = client.post("/sessions", json={"profile_id": pid}, headers=AUTH).json()
     assert session["server"]["engine"] == "sqlite"
     sid = session["session_id"]
-    with client.websocket_connect(f"/sessions/{sid}/ws?token={TOKEN}") as ws:
+    with client.websocket_connect(f"{WS_BASE}/sessions/{sid}/ws?token={TOKEN}") as ws:
         ws.send_json({"type": "execute", "request_id": "q1", "sql": "SELECT id, v FROM t ORDER BY id"})
         events = []
         while True:
@@ -107,7 +109,7 @@ def test_metadata_and_session_over_websocket(client, sqlite_profile_id):
 
 def test_encoded_cells_reach_the_websocket_client_unchanged(client, sqlite_profile_id):
     sid = client.post("/sessions", json={"profile_id": sqlite_profile_id}, headers=AUTH).json()["session_id"]
-    with client.websocket_connect(f"/sessions/{sid}/ws?token={TOKEN}") as ws:
+    with client.websocket_connect(f"{WS_BASE}/sessions/{sid}/ws?token={TOKEN}") as ws:
         ws.send_json({"type": "execute", "request_id": "enc", "sql": "SELECT x'deadbeef', 9007199254740993"})
         rows = None
         while (event := ws.receive_json())["type"] != "finished":
@@ -117,7 +119,7 @@ def test_encoded_cells_reach_the_websocket_client_unchanged(client, sqlite_profi
 
 def test_invalid_command_without_a_request_id_gets_an_error_but_no_finished(client, sqlite_profile_id):
     sid = client.post("/sessions", json={"profile_id": sqlite_profile_id}, headers=AUTH).json()["session_id"]
-    with client.websocket_connect(f"/sessions/{sid}/ws?token={TOKEN}") as ws:
+    with client.websocket_connect(f"{WS_BASE}/sessions/{sid}/ws?token={TOKEN}") as ws:
         ws.send_json({"type": "bogus"})
         assert ws.receive_json()["code"] == "invalid_command"
         ws.send_json({"type": "execute", "request_id": "q", "sql": "SELECT 1"})
@@ -126,7 +128,7 @@ def test_invalid_command_without_a_request_id_gets_an_error_but_no_finished(clie
 
 def test_command_rejected_by_a_closed_session_gets_an_error_and_finished(client, sqlite_profile_id):
     sid = client.post("/sessions", json={"profile_id": sqlite_profile_id}, headers=AUTH).json()["session_id"]
-    with client.websocket_connect(f"/sessions/{sid}/ws?token={TOKEN}") as ws:
+    with client.websocket_connect(f"{WS_BASE}/sessions/{sid}/ws?token={TOKEN}") as ws:
         client.app.state.container.sessions.worker(sid).close()  # the socket stays attached to a dead worker
         ws.send_json({"type": "execute", "request_id": "late", "sql": "SELECT 1"})
         error = ws.receive_json()
@@ -138,7 +140,7 @@ def test_command_rejected_by_a_closed_session_gets_an_error_and_finished(client,
 def test_websocket_rejects_bad_token(client, sqlite_profile_id):
     sid = client.post("/sessions", json={"profile_id": sqlite_profile_id}, headers=AUTH).json()["session_id"]
     with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect(f"/sessions/{sid}/ws?token=bad") as ws:
+        with client.websocket_connect(f"{WS_BASE}/sessions/{sid}/ws?token=bad") as ws:
             ws.receive_json()
 
 
@@ -149,12 +151,12 @@ def test_metadata_unknown_profile(client):
 
 def test_websocket_close_codes(client, sqlite_profile_id):
     with pytest.raises(WebSocketDisconnect) as unknown:
-        with client.websocket_connect(f"/sessions/nope/ws?token={TOKEN}") as ws:
+        with client.websocket_connect(f"{WS_BASE}/sessions/nope/ws?token={TOKEN}") as ws:
             ws.receive_json()
     assert unknown.value.code == 4404
     sid = client.post("/sessions", json={"profile_id": sqlite_profile_id}, headers=AUTH).json()["session_id"]
     with pytest.raises(WebSocketDisconnect) as bad_token:
-        with client.websocket_connect(f"/sessions/{sid}/ws?token=bad") as ws:
+        with client.websocket_connect(f"{WS_BASE}/sessions/{sid}/ws?token=bad") as ws:
             ws.receive_json()
     assert bad_token.value.code == 4401
 
@@ -162,7 +164,7 @@ def test_websocket_close_codes(client, sqlite_profile_id):
 def test_websocket_cancel_stops_a_running_statement(client, sqlite_profile_id):
     sid = client.post("/sessions", json={"profile_id": sqlite_profile_id}, headers=AUTH).json()["session_id"]
     endless = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c"
-    with client.websocket_connect(f"/sessions/{sid}/ws?token={TOKEN}") as ws:
+    with client.websocket_connect(f"{WS_BASE}/sessions/{sid}/ws?token={TOKEN}") as ws:
         ws.send_json({"type": "cancel", "request_id": "nothing-running"})  # unknown request: ignored, not fatal
         ws.send_json({"type": "execute", "request_id": "slow", "sql": endless})
         assert ws.receive_json()["type"] == "started"
@@ -194,7 +196,7 @@ def test_unexpected_errors_do_not_leak_details(tmp_path):
         raise RuntimeError("could not connect to host=10.0.0.5 user=admin password=hunter2")
 
     container.profiles.list_entries = boom
-    with TestClient(create_app(settings, container), raise_server_exceptions=False) as test_client:
+    with TestClient(create_app(settings, container), base_url=BASE_URL, raise_server_exceptions=False) as test_client:
         response = test_client.get("/profiles", headers=AUTH)
     assert response.status_code == 500
     assert response.json() == {"error": {"code": "internal_error", "message": "Internal error"}}

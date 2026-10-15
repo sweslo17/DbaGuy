@@ -46,7 +46,9 @@ impl BackendManager {
 
     fn start_inner(&self, app: &AppHandle) -> Result<(), String> {
         if let Ok(url) = std::env::var("DBAGUY_DEV_BACKEND_URL") {
-            let token = std::env::var("DBAGUY_DEV_BACKEND_TOKEN").unwrap_or_else(|_| "dev-token".into());
+            // scripts/dev.sh sets both; there is no fixed dev token the backend would accept.
+            let token = std::env::var("DBAGUY_DEV_BACKEND_TOKEN")
+                .map_err(|_| "DBAGUY_DEV_BACKEND_URL is set without DBAGUY_DEV_BACKEND_TOKEN".to_string())?;
             log::info!("Using external dev backend at {url}");
             self.state.lock().unwrap().info = Some(BackendInfo { base_url: url, token });
             return Ok(());

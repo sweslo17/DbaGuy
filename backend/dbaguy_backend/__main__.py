@@ -9,7 +9,7 @@ import uvicorn
 from loguru import logger
 
 from .app import create_app
-from .config import Settings
+from .config import load_settings
 from .logging_setup import setup_logging
 
 
@@ -56,7 +56,7 @@ def _watch_stdin(server: uvicorn.Server, close_tunnels: Callable[[], None]) -> N
 
 
 def main() -> None:
-    settings = Settings()
+    settings = load_settings()
     setup_logging(settings.log_level, settings.log_dir if settings.log_to_file else None)
     app = create_app(settings)
     sock = _bind(settings.host, settings.port)

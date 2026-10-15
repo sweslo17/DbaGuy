@@ -6,7 +6,7 @@ from .config import Settings
 
 
 def main() -> None:
-    app = create_app(Settings(log_to_file=False))
+    app = create_app(Settings(token="schema-only", log_to_file=False))  # never served
     json.dump(app.openapi(), sys.stdout, indent=2)
     sys.stdout.write("\n")
 

@@ -3,11 +3,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from loguru import logger
 
 from .api import metadata, profiles, sessions, system
 from .api.errors import register_error_handlers
-from .config import Settings
+from .config import Settings, load_settings
 from .container import AppContainer
 from .logging_setup import setup_logging
 from .version import app_version
@@ -39,6 +40,9 @@ def create_app(settings: Settings, container: AppContainer | None = None) -> Fas
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # Outermost: only requests addressed to the loopback name we listen on (port ignored), so a web page using DNS
+    # rebinding cannot reach the backend under its own host name.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
     register_error_handlers(app)
     app.include_router(system.router)
     app.include_router(profiles.router)
@@ -49,6 +53,6 @@ def create_app(settings: Settings, container: AppContainer | None = None) -> Fas
 
 def create_app_from_env() -> FastAPI:
     """Factory for `uvicorn --factory` in development."""
-    settings = Settings()
+    settings = load_settings()
     setup_logging(settings.log_level, settings.log_dir if settings.log_to_file else None)
     return create_app(settings)

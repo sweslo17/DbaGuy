@@ -7,20 +7,23 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
+from starlette.testclient import WebSocketDenialResponse
 
 from dbaguy_backend import __main__ as backend_main
 from dbaguy_backend.api.deps import websocket_token_ok
-from dbaguy_backend.app import create_app
+from dbaguy_backend.app import create_app, create_app_from_env
 from dbaguy_backend.config import Settings
 
 TOKEN = "test-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+BASE_URL = "http://127.0.0.1"  # the backend only answers requests addressed to 127.0.0.1 / localhost
 
 
 def make_client(tmp_path: Path) -> TestClient:
     settings = Settings(token=TOKEN, data_dir=tmp_path / "data", log_to_file=False)
-    return TestClient(create_app(settings))
+    return TestClient(create_app(settings), base_url=BASE_URL)
 
 
 def test_health_requires_token(tmp_path):
@@ -112,3 +115,46 @@ def test_forced_exit_closes_tunnels_first_even_if_that_fails(monkeypatch):
 
     backend_main._force_exit(failing_close)
     assert calls == ["tunnels", ("exit", 0)]
+
+
+def _env_without_token(tmp_path) -> dict[str, str]:
+    env = {**os.environ, "DBAGUY_LOG_TO_FILE": "false", "DBAGUY_DATA_DIR": str(tmp_path / "data")}
+    env.pop("DBAGUY_TOKEN", None)
+    return env
+
+
+def test_requests_for_a_foreign_host_are_rejected(tmp_path):
+    with make_client(tmp_path) as client:
+        assert client.get("/system/health", headers={**AUTH, "host": "evil.example"}).status_code == 400
+        assert client.get("/system/health", headers={**AUTH, "host": "localhost:18765"}).status_code == 200
+        assert client.get("/system/health", headers={**AUTH, "host": "127.0.0.1:18765"}).status_code == 200
+        with pytest.raises(WebSocketDenialResponse):
+            with client.websocket_connect(f"ws://evil.example/sessions/x/ws?token={TOKEN}"):
+                pass
+
+
+def test_starting_without_a_token_exits_non_zero(tmp_path):
+    result = subprocess.run(
+        [sys.executable, "-m", "dbaguy_backend"], env=_env_without_token(tmp_path),
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0
+    assert "DBAGUY_TOKEN" in result.stderr
+    assert result.stdout == ""  # no ready line: nothing is listening
+
+
+def test_app_factory_refuses_to_start_without_a_token(monkeypatch):
+    monkeypatch.delenv("DBAGUY_TOKEN", raising=False)
+    monkeypatch.setenv("DBAGUY_LOG_TO_FILE", "false")
+    with pytest.raises(SystemExit) as info:
+        create_app_from_env()
+    assert info.value.code not in (0, None)
+
+
+def test_openapi_dump_needs_no_token(tmp_path):
+    result = subprocess.run(
+        [sys.executable, "-m", "dbaguy_backend.openapi_dump"], env=_env_without_token(tmp_path),
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "/system/health" in json.loads(result.stdout)["paths"]
