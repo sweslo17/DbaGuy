@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import psycopg
 
-from ...domain.errors import NotFound
+from ...domain.errors import NotFound, ValidationFailed
 from ...domain.metadata import ColumnInfo, Folder, NodeKind, ObjectNode, PathSegment, make_node
 from ..sql_text import qualified_pg
 
@@ -85,6 +85,13 @@ def table_columns(conn: psycopg.Connection, oid: int) -> list[PgColumn]:
     return [PgColumn(*row) for row in conn.execute(_COLUMNS_SQL, {"oid": oid})]
 
 
+def _folder(segment: PathSegment) -> Folder:
+    try:
+        return Folder(segment.name)
+    except ValueError:
+        raise ValidationFailed(f"Unknown folder '{segment.name}'") from None
+
+
 def list_children(conn: psycopg.Connection, path: list[PathSegment]) -> list[ObjectNode]:
     if not path:
         rows = conn.execute(
@@ -104,11 +111,11 @@ def list_children(conn: psycopg.Connection, path: list[PathSegment]) -> list[Obj
             raise NotFound(f"Schema {schema} not found")
         return [make_node(path, NodeKind.FOLDER, f, has_children=True) for f, n in zip(_FOLDER_ORDER, row) if n]
     if len(rel) == 2:
-        return _schema_objects(conn, path, schema, Folder(rel[1].name))
+        return _schema_objects(conn, path, schema, _folder(rel[1]))
     if len(rel) == 3:
         return _object_folders(conn, path, schema, rel[2])
     if len(rel) == 4:
-        return _object_children(conn, path, schema, rel[2], Folder(rel[3].name))
+        return _object_children(conn, path, schema, rel[2], _folder(rel[3]))
     return []
 
 

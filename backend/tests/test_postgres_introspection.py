@@ -2,6 +2,7 @@ import pytest
 
 from dbaguy_backend.adapters.base import Endpoint
 from dbaguy_backend.adapters.postgres.adapter import PostgresAdapter
+from dbaguy_backend.domain.errors import ValidationFailed
 from dbaguy_backend.domain.metadata import PathSegment
 from tests.support import PG_HOST, PG_PASSWORD, PG_PORT, make_pg_profile, requires_pg
 
@@ -111,3 +112,15 @@ def test_other_object_ddl(conn):
     assert "EXECUTE FUNCTION sales.orders_noop()" in trigger
     index = ddl(*schema_path("sales", "tables", seg("table", "orders"), seg("folder", "indexes"), seg("index", "orders_customer_idx")))
     assert index.startswith("CREATE INDEX orders_customer_idx")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        schema_path("public", "bogus"),
+        schema_path("public", "tables", seg("table", "customers"), seg("folder", "bogus")),
+    ],
+)
+def test_unknown_folder_is_a_validation_error(conn, path):
+    with pytest.raises(ValidationFailed, match="bogus"):
+        conn.list_children(path)

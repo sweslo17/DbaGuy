@@ -73,6 +73,18 @@ def test_multiple_statements_buffered(conn):
     assert result.next_result() is False
 
 
+def test_multiple_statements_starting_with_select(conn):
+    result = conn.run("SELECT 1 AS a; SELECT 2 AS b")
+    assert [c.name for c in result.columns()] == ["a"]
+    assert result.fetch(10) == [[1]]
+    assert result.next_result() is True
+    assert [c.name for c in result.columns()] == ["b"]
+    assert result.fetch(10) == [[2]]
+    assert result.next_result() is False
+    result.close()
+    assert conn.run("SELECT 3").fetch(1) == [[3]]
+
+
 def test_zero_row_select_still_has_columns(conn):
     result = conn.run("SELECT id, label FROM big_table WHERE false")
     assert [c.name for c in result.columns()] == ["id", "label"]

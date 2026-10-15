@@ -33,6 +33,9 @@ _RETURNING = re.compile(r"\breturning\b", re.IGNORECASE)
 _STREAM_CHUNK = 200
 _SSL_QUERY_KEYS = {"sslmode": "mode", "sslrootcert": "ca_file", "sslcert": "cert_file", "sslkey": "key_file"}
 
+# libpq's chunked streaming uses the extended protocol, which accepts one statement per query.
+_MULTI_STATEMENT_ERROR = "cannot insert multiple commands into a prepared statement"
+
 _CUSTOM_TYPES_SQL = """
 SELECT t.oid, format_type(t.oid, NULL)
 FROM pg_type t
@@ -57,6 +60,11 @@ def translate_error(exc: psycopg.Error, sql: str) -> StatementError:
         line, column = offset_to_line_col(sql, int(diag.statement_position))
         position = ErrorPosition(line=line, column=column)
     return StatementError(message, code=diag.sqlstate, position=position)
+
+
+def _is_multi_statement_rejection(exc: StatementError) -> bool:
+    """The server refused a script at parse time, so nothing was executed."""
+    return exc.code == "42601" and _MULTI_STATEMENT_ERROR in exc.message
 
 
 def _likely_returns_rows(sql: str) -> bool:
@@ -253,17 +261,29 @@ class PostgresConnection(DatabaseConnection):
         self._check_database(path)
         return ddl.object_detail(self._conn, path)
 
-    def run(self, sql: str) -> StatementResult:
+    def _user_cursor(self) -> psycopg.Cursor:
         cursor = self._conn.cursor()
         configure_user_loaders(cursor.adapters)
-        if _likely_returns_rows(sql):
-            return _StreamResult(self, cursor, sql)
+        return cursor
+
+    def _run_buffered(self, sql: str) -> StatementResult:
+        cursor = self._user_cursor()
         try:
             cursor.execute(sql)
         except psycopg.Error as exc:
             cursor.close()
             raise translate_error(exc, sql) from exc
         return _BufferedResult(self, cursor, sql)
+
+    def run(self, sql: str) -> StatementResult:
+        if _likely_returns_rows(sql):
+            try:
+                return _StreamResult(self, self._user_cursor(), sql)  # closes its cursor when it fails
+            except StatementError as exc:
+                if not _is_multi_statement_rejection(exc):
+                    raise
+                logger.debug("Script has several statements and cannot be streamed; running it buffered")
+        return self._run_buffered(sql)
 
     def in_transaction(self) -> bool:
         return self._conn.info.transaction_status in (pq.TransactionStatus.INTRANS, pq.TransactionStatus.INERROR)
