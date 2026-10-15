@@ -21,9 +21,10 @@ from ..domain.profiles import SshConfig
 _ASKPASS = "#!/bin/sh\nprintf '%s\\n' \"$DBAGUY_ASKPASS_SECRET\"\n"
 
 # Runs ssh ("$@") under a watchdog: our stdin is a pipe whose write end only the backend holds, so it reaches EOF
-# as soon as the backend exits for any reason, SIGKILL included, and the watcher then stops ssh. ssh runs in its own
-# session (Ctrl-C in a terminal must not drop tunnels), so nothing else would. SIGTERM is forwarded to ssh, and the
-# shell exits with ssh's status as soon as ssh exits by itself, so start-up failures are seen just like before.
+# as soon as the backend exits for any reason, SIGKILL included, and the watcher then stops ssh. Nothing else would:
+# ssh runs in a session of its own (no controlling terminal, no signals meant for the backend's process group).
+# SIGTERM is forwarded to ssh, and the shell exits with ssh's status as soon as ssh exits by itself, so start-up
+# failures are seen just like before.
 _WATCHDOG = """
 exec 3<&0 </dev/null
 "$@" 3<&- &
