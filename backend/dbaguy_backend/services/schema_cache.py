@@ -6,8 +6,10 @@ from uuid import UUID
 
 from loguru import logger
 
+from ..adapters.base import DatabaseAdapter
 from ..adapters.registry import AdapterRegistry
 from ..domain.schema import ObjectSearchHit, SchemaSnapshot
+from ..sql.completion import SnapshotIndex
 from .metadata_service import MetadataService
 from .profile_service import ProfileService
 
@@ -18,6 +20,7 @@ _Key = tuple[UUID, str]
 class _Entry:
     snapshot: SchemaSnapshot
     built_at: float
+    index: SnapshotIndex | None = None  # built on the first index() call for this snapshot
 
 
 @dataclass
@@ -76,19 +79,32 @@ class SchemaCache:
         return entry.snapshot if entry else None
 
     def get(self, profile_id: UUID, database: str | None = None) -> SchemaSnapshot:
+        snapshot = self._snapshot(profile_id, database, wait=True)
+        assert snapshot is not None  # waiting always ends in a snapshot or an exception
+        return snapshot
+
+    def index(self, profile_id: UUID, database: str | None = None, wait: bool = True) -> SnapshotIndex | None:
+        """Completion index of the current snapshot, built once per snapshot.
+
+        With `wait=False` it returns None at once while another thread is building that snapshot, so per-keystroke
+        requests do not pile up behind a slow or unreachable server.
+        """
+        snapshot = self._snapshot(profile_id, database, wait)
+        if snapshot is None:
+            return None
         key = self._key(profile_id, database)
         with self._lock:
-            cached = self._cached(key)
-            if cached is not None:
-                return cached
-            key_lock = self._key_locks.setdefault(key, threading.Lock())
-        with key_lock:  # one build per key; other keys are not blocked
-            with self._lock:
-                cached = self._cached(key)  # whoever held the key lock before us may have just built (or failed)
-                if cached is not None:
-                    return cached
-                epoch = self._epoch
-            return self._build(key, profile_id, database, epoch)
+            entry = self._entries.get(key)
+            if entry is not None and entry.snapshot is snapshot and entry.index is not None:
+                return entry.index
+        built = SnapshotIndex(snapshot, self._adapter(profile_id).dialect)  # outside `_lock`: big schemas take a while
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry.snapshot is not snapshot:
+                return built  # invalidated or replaced meanwhile: answer this call, keep nothing
+            if entry.index is None:  # a concurrent caller may have stored one first; keep a single index
+                entry.index = built
+            return entry.index
 
     def invalidate(self, profile_id: UUID, database: str | None = None) -> None:
         """Forget the snapshot (and any remembered failure) of one database, or of every database of the profile."""
@@ -105,7 +121,7 @@ class SchemaCache:
         if not needle and not schema_needle:
             return []
         snapshot = self.get(profile_id, database)
-        adapter = self._registry.get(self._profiles.get(profile_id).engine)
+        adapter = self._adapter(profile_id)
         search_path = {name.lower(): position for position, name in enumerate(snapshot.search_path)}
         scored = []
         for schema in snapshot.schemas:
@@ -126,6 +142,31 @@ class SchemaCache:
             )
             for _, schema_name, relation in scored[:limit]
         ]
+
+    def _adapter(self, profile_id: UUID) -> DatabaseAdapter:
+        return self._registry.get(self._profiles.get(profile_id).engine)
+
+    def _snapshot(self, profile_id: UUID, database: str | None, wait: bool) -> SchemaSnapshot | None:
+        """The cached snapshot, else a build (one per key; other keys are not blocked). Without `wait`, None when
+        another thread is building this key right now."""
+        key = self._key(profile_id, database)
+        with self._lock:
+            cached = self._cached(key)
+            if cached is not None:
+                return cached
+            key_lock = self._key_locks.setdefault(key, threading.Lock())
+        if not key_lock.acquire(blocking=wait):
+            logger.debug("Schema snapshot of {} is still being built; not waiting", profile_id)
+            return None
+        try:
+            with self._lock:
+                cached = self._cached(key)  # whoever held the key lock before us may have just built (or failed)
+                if cached is not None:
+                    return cached
+                epoch = self._epoch
+            return self._build(key, profile_id, database, epoch)
+        finally:
+            key_lock.release()
 
     def _cached(self, key: _Key) -> SchemaSnapshot | None:
         """A fresh snapshot, or None when a build is due. Raises a failure that is still remembered. Hold `_lock`."""

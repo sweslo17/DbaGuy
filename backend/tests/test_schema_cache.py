@@ -13,6 +13,7 @@ from dbaguy_backend.services.connection_service import ConnectionService
 from dbaguy_backend.services.metadata_service import MetadataService
 from dbaguy_backend.services.profile_service import ProfileService
 from dbaguy_backend.services.schema_cache import SchemaCache
+from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.storage.paths import profiles_file
 from dbaguy_backend.storage.profile_store import ProfileStore
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
@@ -180,3 +181,50 @@ def test_invalidate_during_a_build_discards_that_snapshot(env, monkeypatch):
     monkeypatch.setattr(cache._metadata, "with_connection", invalidating)
     assert cache.get(pid) is not None  # the caller still gets an answer...
     assert cache.peek(pid) is None  # ...but it was built before the invalidation, so it is not kept
+
+
+def test_index_is_built_once_per_snapshot(env, monkeypatch):
+    cache, pid, _, _ = env
+    first = cache.index(pid)
+    assert first.dialect == Dialect.SQLITE and first.snapshot is cache.peek(pid)
+    assert first.resolve(None, "USERS")[1].name == "users"
+    assert cache.index(pid) is first
+    cache.invalidate(pid)
+    assert cache.index(pid) is not first  # a new snapshot gets a new index
+    real = cache._metadata.with_connection
+
+    def invalidating(*args):
+        snapshot = real(*args)
+        cache.invalidate(pid)
+        return snapshot
+
+    cache.invalidate(pid)
+    monkeypatch.setattr(cache._metadata, "with_connection", invalidating)
+    assert cache.index(pid) is not None  # a snapshot discarded by an invalidation still answers this call
+    assert cache.peek(pid) is None
+
+
+def test_index_without_waiting_skips_a_build_in_progress(env, monkeypatch):
+    cache, pid, _, _ = env
+    real = cache._metadata.with_connection
+    started, release = threading.Event(), threading.Event()
+
+    def blocked(*args):
+        started.set()
+        release.wait(5)
+        return real(*args)
+
+    monkeypatch.setattr(cache._metadata, "with_connection", blocked)
+    builder = threading.Thread(target=cache.get, args=(pid,))
+    builder.start()
+    try:
+        assert started.wait(5)
+        began = time.monotonic()
+        assert cache.index(pid, wait=False) is None
+        assert time.monotonic() - began < 0.5
+    finally:
+        release.set()
+        builder.join(5)
+    index = cache.index(pid, wait=False)
+    assert index is not None and index.snapshot is cache.peek(pid)
+    assert cache.index(pid) is index
