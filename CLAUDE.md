@@ -66,8 +66,10 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
 
 - 新增 engine：在 `adapters/<engine>/` 實作 `DatabaseAdapter` / `DatabaseConnection` / `StatementResult`，到 `container.default_registry()` 註冊；分頁、取消、事件都不用重寫。
 - WS 執行協定：`domain/execution.py`。結果分頁暫停時佔住連線；新指令會先 discard。
-- PG 採 text-first 載入（只有 bool/int2/int4/float/bytea 用原生型別），大數字與 JSON 不失真。
-- 密碼只在 Keychain；`save_password=false` 的連線用 `/profiles/{id}/unlock` 暫存在記憶體。
+- PG 採 text-first 載入（只有 bool/int2/int4/float/bytea 用原生型別），大數字與 JSON 不失真。Adapter 的 `fetch()` 回傳原始值，轉成 JSON-safe cell（`values.encode_row`）統一在 `SessionWorker` 做。
+- PG 交易中（`BEGIN` 之後）的單一 SELECT／VALUES／TABLE／WITH 走 server-side cursor（DECLARE/FETCH），提前關閉結果只會 `CLOSE`，不會取消語句而 abort 交易；其他會回傳列的語句在交易中改用 buffered。交易外照舊用 `stream()`。`finished` 事件帶 `transaction_failed`（交易已 abort，只能 ROLLBACK）。`COPY … FROM STDIN／TO STDOUT` 直接拒絕（`unsupported_copy`）。
+- 密碼只在 Keychain；`save_password=false` 的連線，在連線設定或 unlock 對話框輸入的密碼只暫存在記憶體到 app 結束。缺少的密碼（含 SSH 密碼驗證的 SSH 密碼）回 `password_required`，`detail` 指出缺哪一個。
+- SSH tunnel：ssh 跑在一個 `/bin/sh` watchdog 底下，watchdog 的 stdin 是只有 backend 持有的 pipe，backend 一結束（含 SIGKILL）ssh 就跟著結束。Tunnel 以完整 SSH 設定與 SSH 密碼指紋為 key；連線測試一律用自己的 tunnel。
 - 打包流程：`npm run build:app` = `build-backend.sh`（PyInstaller onedir → `src-tauri/resources/backend/`）→ `tauri build` → `finalize-app.sh`。
   - Tauri 複製 resources 時會把 symlink 展開，破壞 PyInstaller 的 `_internal`（重複 dylib、`Python.framework` 少了 `Resources`／`Versions/Current`），所以 `finalize-app.sh` 把 sidecar 原樣放回 `.app` 再重新 ad-hoc 簽章。
   - `backend/entry.py` 先呼叫 `multiprocessing.freeze_support()`（防護用）：multiprocessing 若要啟動輔助程序，會重新執行凍結後的執行檔，少了這行每個子程序都會再啟動一個 backend，無限遞迴。以前 loguru 的 `enqueue=True` 會觸發這件事（resource tracker），現在已不用 `enqueue`。
