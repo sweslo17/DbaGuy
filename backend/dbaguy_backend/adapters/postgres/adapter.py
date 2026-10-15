@@ -25,6 +25,7 @@ from ..base import (
 from ..positions import offset_to_line_col
 from ..sql_text import first_keyword
 from ..values import encode_row
+from . import ddl, introspection
 from .loaders import category_for_oid, configure_user_loaders
 
 _ROW_KEYWORDS = frozenset({"select", "with", "values", "table", "show", "explain", "fetch", "("})
@@ -240,11 +241,17 @@ class PostgresConnection(DatabaseConnection):
     def current_database(self) -> str | None:
         return self._conn.info.dbname
 
+    def _check_database(self, path: list[PathSegment]) -> None:
+        if path and path[0].name != self.current_database():
+            raise ValidationFailed(f"Connection is bound to database '{self.current_database()}', not '{path[0].name}'")
+
     def list_children(self, path: list[PathSegment]) -> list[ObjectNode]:
-        raise NotImplementedError  # Task 8
+        self._check_database(path)
+        return introspection.list_children(self._conn, path)
 
     def object_detail(self, path: list[PathSegment]) -> ObjectDetail:
-        raise NotImplementedError  # Task 8
+        self._check_database(path)
+        return ddl.object_detail(self._conn, path)
 
     def run(self, sql: str) -> StatementResult:
         cursor = self._conn.cursor()
