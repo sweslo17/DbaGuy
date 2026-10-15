@@ -26,6 +26,23 @@ class _Failure:
     failed_at: float
 
 
+def _is_subsequence(needle: str, text: str) -> bool:
+    """True when every character of `needle` occurs in `text`, in order (not necessarily adjacent)."""
+    remaining = iter(text)
+    return all(char in remaining for char in needle)
+
+
+def _match_rank(name: str, needle: str) -> int | None:
+    """0 exact, 1 prefix, 2 substring, 3 subsequence (fuzzy), None when `name` does not match. Both lowercase."""
+    if name == needle:
+        return 0
+    if name.startswith(needle):
+        return 1
+    if needle in name:
+        return 2
+    return 3 if _is_subsequence(needle, name) else None
+
+
 class SchemaCache:
     """Schema snapshots per (profile, database), rebuilt after `ttl_s` or on invalidation.
 
@@ -82,7 +99,7 @@ class SchemaCache:
                     del store[key]
 
     def search(self, profile_id: UUID, q: str, database: str | None = None, limit: int = 50) -> list[ObjectSearchHit]:
-        """Tables and views whose name matches `q` (or `schema.name`): exact, then prefix, then substring."""
+        """Tables and views whose name matches `q` (or `schema.name`): exact, prefix, substring, then subsequence."""
         schema_part, _, name_part = q.strip().rpartition(".")
         needle, schema_needle = name_part.strip().lower(), schema_part.strip().lower()
         if not needle and not schema_needle:
@@ -97,7 +114,7 @@ class SchemaCache:
             path_rank = search_path.get(schema.name.lower(), len(search_path))
             for relation in schema.relations:
                 name = relation.name.lower()
-                rank = 0 if name == needle else 1 if name.startswith(needle) else 2 if needle in name else None
+                rank = _match_rank(name, needle)
                 if rank is not None:
                     scored.append(((rank, schema.system, path_rank, len(name), name), schema.name, relation))
         scored.sort(key=lambda item: item[0])

@@ -89,6 +89,24 @@ def test_search_ranks_exact_before_prefix_before_substring_and_honours_limit(env
     assert {h.name for h in cache.search(pid, "main.")} == {"users", "user_roles", "orders", "role", "roles_audit"}
 
 
+def test_search_falls_back_to_a_subsequence_match(env):
+    cache, pid, db, _ = env
+    sqlite3.connect(db).executescript("CREATE TABLE xusrx (id INTEGER);")
+    assert [h.name for h in cache.search(pid, "usrrol")] == ["user_roles"]
+    assert [h.name for h in cache.search(pid, "USRROL")] == ["user_roles"]  # case-insensitive
+    assert [h.name for h in cache.search(pid, "main.usrrol")] == ["user_roles"]  # the name part is fuzzy too
+    assert cache.search(pid, "nope.usrrol") == []  # the schema part still has to be a prefix
+    # "usr" is a substring of xusrx but only a subsequence of users and user_roles: substring first, then
+    # subsequence matches shorter name first (plain alphabetical order would put xusrx last).
+    assert [h.name for h in cache.search(pid, "usr")] == ["xusrx", "users", "user_roles"]
+
+
+def test_search_needs_the_characters_in_order(env):
+    cache, pid, _, _ = env
+    assert cache.search(pid, "sru") == []  # s, r and u all occur in "users", but not in that order
+    assert cache.search(pid, "lor") == []
+
+
 def test_a_failed_build_is_not_retried_on_every_call(env, monkeypatch):
     cache, pid, _, clock = env
     calls = []
