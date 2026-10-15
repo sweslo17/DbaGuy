@@ -70,7 +70,8 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
 - 密碼只在 Keychain；`save_password=false` 的連線用 `/profiles/{id}/unlock` 暫存在記憶體。
 - 打包流程：`npm run build:app` = `build-backend.sh`（PyInstaller onedir → `src-tauri/resources/backend/`）→ `tauri build` → `finalize-app.sh`。
   - Tauri 複製 resources 時會把 symlink 展開，破壞 PyInstaller 的 `_internal`（重複 dylib、`Python.framework` 少了 `Resources`／`Versions/Current`），所以 `finalize-app.sh` 把 sidecar 原樣放回 `.app` 再重新 ad-hoc 簽章。
-  - `backend/entry.py` 必須先呼叫 `multiprocessing.freeze_support()`：loguru 的 `enqueue=True` 會讓 multiprocessing 重新執行凍結後的執行檔來啟動 resource tracker，少了這行每個子程序都會再啟動一個 backend，無限遞迴。
+  - `backend/entry.py` 先呼叫 `multiprocessing.freeze_support()`（防護用）：multiprocessing 若要啟動輔助程序，會重新執行凍結後的執行檔，少了這行每個子程序都會再啟動一個 backend，無限遞迴。以前 loguru 的 `enqueue=True` 會觸發這件事（resource tracker），現在已不用 `enqueue`。
+- Log：stderr 與 `~/Library/Logs/DbaGuy/backend.log` 都跟著 `DBAGUY_LOG_LEVEL`（預設 INFO）。SQL 文字是 DEBUG，只有明確開 DEBUG 才會寫進檔案（`scripts/dev.sh` 會開）。
 
 ## 已知限制
 
@@ -78,7 +79,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
 - pytest 設定過濾了 Starlette 的 httpx2 deprecation warning；要不要把 TestClient 改用 httpx2 尚未決定。
 - 每次重新 build 後 ad-hoc 簽章都會變，Keychain 可能再跳一次「允許存取」。App 未公證（`spctl` 會拒絕），只供本機自用。
 - PG 沒有資料列的 SELECT，欄位標題來自 describe。多語句腳本在已開啟的交易裡執行時，任一句失敗會讓整個交易 abort；client 端切句會在子專案 ② 處理。
-- 打包版量測（Apple Silicon、macOS 26）：冷啟動到第一個 API 請求約 0.8–1.3 秒；各程序 RSS 加總約 305–310 MB（上限值，共用頁面重複計算；`footprint` 實際約 150 MB）。其中 loguru `enqueue=True` 衍生的 resource tracker 程序占約 37 MB，改成不用 `enqueue` 即可省下。
+- 打包版量測（Apple Silicon、macOS 26）：冷啟動到第一個 API 請求約 0.8–1.3 秒；各程序 RSS 加總約 305–310 MB（上限值，共用頁面重複計算；`footprint` 實際約 150 MB）。這是拿掉 loguru `enqueue=True` 之前的數字：當時它衍生的 resource tracker 程序占約 37 MB，現在已沒有這個程序（尚未重新量測）。
 
 ## 進度
 

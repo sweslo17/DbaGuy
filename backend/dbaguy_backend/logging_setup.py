@@ -23,6 +23,11 @@ class InterceptHandler(logging.Handler):
 
 
 def setup_logging(level: str, log_dir: Path | None) -> None:
+    """stderr plus, with `log_dir`, a rotating backend.log, both at `level`.
+
+    The file only gets SQL text (DEBUG) when DEBUG is asked for explicitly (dev.sh does). No `enqueue`: loguru's
+    file sink is thread-safe on its own, and enqueue would start a multiprocessing resource tracker process.
+    """
     # diagnose=False: loguru's default prints frame locals in tracebacks, which can include passwords.
     logger.remove()
     logger.add(sys.stderr, level=level.upper(), format=_FORMAT, backtrace=False, diagnose=False)
@@ -30,11 +35,10 @@ def setup_logging(level: str, log_dir: Path | None) -> None:
         log_dir.mkdir(parents=True, exist_ok=True)
         logger.add(
             log_dir / "backend.log",
-            level="DEBUG",
+            level=level.upper(),
             format=_FORMAT,
             rotation="10 MB",
             retention=5,
-            enqueue=True,
             backtrace=False,
             diagnose=False,
         )
