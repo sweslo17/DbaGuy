@@ -4,6 +4,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import UUID
@@ -40,16 +41,53 @@ def _port_accepts(port: int) -> bool:
         return False
 
 
-@dataclass
+_TunnelKey = tuple[UUID, str, int]
+_WAIT_SLACK = 5.0  # extra time a waiter gives the caller that is starting the tunnel (it may also have to stop ssh)
+_MAX_ATTEMPTS = 3
+
+
+@dataclass(eq=False)  # tunnels are compared by identity: a stale holder must never affect a replacement
 class _Tunnel:
-    process: subprocess.Popen
-    local_port: int
+    local_port: int = 0
+    process: subprocess.Popen | None = None
     refcount: int = 1
+    stopped: bool = False
+    error: TunnelFailed | None = None
+    ready: threading.Event = field(default_factory=threading.Event)  # set once starting succeeded or failed
+    drain: threading.Thread | None = None
     stderr_tail: deque = field(default_factory=lambda: deque(maxlen=50))
+
+    def is_running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def is_dead(self) -> bool:
+        """Finished starting but unusable (start failed or ssh exited since)."""
+        return self.ready.is_set() and (self.error is not None or not self.is_running())
+
+
+class TunnelLease:
+    """One reference to a shared tunnel. release() is idempotent and only ever affects the tunnel it was taken from."""
+
+    def __init__(self, endpoint: Endpoint, release: Callable[[], None]) -> None:
+        self.endpoint = endpoint
+        self._release = release
+        self._lock = threading.Lock()
+        self._released = False
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._release()
 
 
 class SshTunnelManager:
-    """Local port forwards through the system `ssh` (honours ~/.ssh/config, agent, ProxyJump)."""
+    """Local port forwards through the system `ssh` (honours ~/.ssh/config, agent, ProxyJump).
+
+    The lock only guards the bookkeeping: starting ssh happens outside it, behind a per-key placeholder that other
+    callers of the same key wait on, so a slow handshake never blocks other profiles, releases or close_all.
+    """
 
     def __init__(
         self,
@@ -62,45 +100,94 @@ class SshTunnelManager:
         self._ready_timeout = ready_timeout
         self._extra = list(extra_options or [])
         self._ssh = ssh_binary
-        self._tunnels: dict[tuple[UUID, str, int], _Tunnel] = {}
+        self._tunnels: dict[_TunnelKey, _Tunnel] = {}
         self._lock = threading.Lock()
+
+    def lease(
+        self, profile_id: UUID, ssh: SshConfig, target_host: str, target_port: int, password: str | None
+    ) -> TunnelLease:
+        """Take a reference whose release() is bound to this very tunnel."""
+        key = (profile_id, target_host, target_port)
+        tunnel = self._acquire(key, ssh, password)
+        return TunnelLease(self._endpoint(tunnel, target_host), lambda: self._release(key, tunnel))
 
     def acquire(
         self, profile_id: UUID, ssh: SshConfig, target_host: str, target_port: int, password: str | None
     ) -> Endpoint:
         key = (profile_id, target_host, target_port)
-        with self._lock:
-            tunnel = self._tunnels.get(key)
-            if tunnel is not None and tunnel.process.poll() is None:
-                tunnel.refcount += 1
-            else:
-                tunnel = self._start(ssh, target_host, target_port, password)
-                self._tunnels[key] = tunnel
-            return Endpoint(host="127.0.0.1", port=tunnel.local_port, tls_server_name=target_host)
+        return self._endpoint(self._acquire(key, ssh, password), target_host)
 
     def release(self, profile_id: UUID, target_host: str, target_port: int) -> None:
-        key = (profile_id, target_host, target_port)
-        with self._lock:
-            tunnel = self._tunnels.get(key)
-            if tunnel is None:
-                return
-            tunnel.refcount -= 1
-            if tunnel.refcount > 0:
-                return
-            del self._tunnels[key]
-        self._stop(tunnel)
-        logger.info("Closed SSH tunnel to {}:{}", target_host, target_port)
+        """Release one reference of the tunnel currently registered for the key."""
+        self._release((profile_id, target_host, target_port))
 
     def active_count(self) -> int:
         with self._lock:
-            return sum(1 for t in self._tunnels.values() if t.process.poll() is None)
+            return sum(1 for t in self._tunnels.values() if t.ready.is_set() and t.error is None and t.is_running())
 
     def close_all(self) -> None:
         with self._lock:
             tunnels = list(self._tunnels.values())
             self._tunnels.clear()
         for tunnel in tunnels:
+            try:
+                self._stop(tunnel)
+            except Exception:
+                logger.exception("Failed to stop an SSH tunnel on port {}", tunnel.local_port)
+
+    @staticmethod
+    def _endpoint(tunnel: _Tunnel, target_host: str) -> Endpoint:
+        return Endpoint(host="127.0.0.1", port=tunnel.local_port, tls_server_name=target_host)
+
+    def _acquire(self, key: _TunnelKey, ssh: SshConfig, password: str | None) -> _Tunnel:
+        _, target_host, target_port = key
+        for _ in range(_MAX_ATTEMPTS):
+            with self._lock:
+                tunnel = self._tunnels.get(key)
+                starter = tunnel is None or tunnel.is_dead()
+                if starter:
+                    tunnel = self._tunnels[key] = _Tunnel()  # reserve the key; replaces a dead tunnel
+                else:
+                    tunnel.refcount += 1
+            if starter:
+                self._run_start(key, tunnel, ssh, password)
+                return tunnel
+            if not tunnel.ready.wait(self._ready_timeout + _WAIT_SLACK):
+                self._release(key, tunnel)
+                raise TunnelFailed(f"Timed out waiting for the SSH tunnel to {ssh.host}")
+            if tunnel.error is not None:
+                raise TunnelFailed(tunnel.error.message)  # the starter already removed the reservation
+            if not tunnel.is_dead():
+                return tunnel
+            self._release(key, tunnel)  # ssh exited right after the start: take over and start a fresh one
+        raise TunnelFailed(f"SSH tunnel to {ssh.host} keeps dropping")
+
+    def _release(self, key: _TunnelKey, tunnel: _Tunnel | None = None) -> None:
+        """Drop one reference. With `tunnel` given, a tunnel that was replaced meanwhile is left alone."""
+        with self._lock:
+            current = self._tunnels.get(key)
+            if current is None or (tunnel is not None and current is not tunnel):
+                return
+            current.refcount -= 1
+            if current.refcount > 0:
+                return
+            del self._tunnels[key]
+        self._stop(current)
+        logger.info("Closed SSH tunnel to {}:{}", key[1], key[2])
+
+    def _run_start(self, key: _TunnelKey, tunnel: _Tunnel, ssh: SshConfig, password: str | None) -> None:
+        """Start ssh for a reserved tunnel (outside the lock), then wake everyone waiting on it."""
+        try:
+            self._start(tunnel, ssh, key[1], key[2], password)
+        except BaseException as exc:
+            tunnel.error = exc if isinstance(exc, TunnelFailed) else TunnelFailed(f"SSH tunnel failed: {exc}")
+            with self._lock:
+                if self._tunnels.get(key) is tunnel:
+                    del self._tunnels[key]
             self._stop(tunnel)
+            tunnel.ready.set()
+            raise
+        tunnel.ready.set()
 
     def _command(self, ssh: SshConfig, local_port: int, target_host: str, target_port: int) -> list[str]:
         cmd = [
@@ -129,7 +216,7 @@ class SshTunnelManager:
         cmd.append(ssh.host)
         return cmd
 
-    def _start(self, ssh: SshConfig, target_host: str, target_port: int, password: str | None) -> _Tunnel:
+    def _start(self, tunnel: _Tunnel, ssh: SshConfig, target_host: str, target_port: int, password: str | None) -> None:
         if not ssh.host:
             raise TunnelFailed("SSH host is required")
         env = os.environ.copy()
@@ -142,31 +229,36 @@ class SshTunnelManager:
                 "DISPLAY": env.get("DISPLAY", ":0"),
                 "DBAGUY_ASKPASS_SECRET": password,
             })
-        local_port = _free_port()
-        logger.info("Opening SSH tunnel via {} to {}:{} (local port {})", ssh.host, target_host, target_port, local_port)
+        tunnel.local_port = _free_port()
+        logger.info(
+            "Opening SSH tunnel via {} to {}:{} (local port {})", ssh.host, target_host, target_port, tunnel.local_port
+        )
         process = subprocess.Popen(
-            self._command(ssh, local_port, target_host, target_port),
+            self._command(ssh, tunnel.local_port, target_host, target_port),
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             env=env, start_new_session=True, text=True,
         )
-        tunnel = _Tunnel(process=process, local_port=local_port)
-        threading.Thread(target=self._drain, args=(tunnel,), name="ssh-stderr", daemon=True).start()
+        with self._lock:
+            tunnel.process = process
+        tunnel.drain = threading.Thread(target=self._drain, args=(tunnel, process), name="ssh-stderr", daemon=True)
+        tunnel.drain.start()
         deadline = time.monotonic() + self._ready_timeout
         while time.monotonic() < deadline:
+            if tunnel.stopped:  # close_all() ran while we were starting
+                raise TunnelFailed("SSH tunnel was closed while it was starting")
             if process.poll() is not None:
-                time.sleep(0.1)  # let the drain thread read the last lines
+                tunnel.drain.join(timeout=1)  # let the drain thread read the last lines
                 logger.warning("SSH tunnel to {} failed", ssh.host)
                 raise TunnelFailed(f"SSH tunnel failed: {self._error_text(tunnel)}")
-            if _port_accepts(local_port):
-                return tunnel
+            if _port_accepts(tunnel.local_port):
+                return
             time.sleep(0.1)
-        self._stop(tunnel)
         raise TunnelFailed(f"SSH tunnel to {ssh.host} timed out: {self._error_text(tunnel)}")
 
     @staticmethod
-    def _drain(tunnel: _Tunnel) -> None:
-        assert tunnel.process.stderr is not None
-        for line in tunnel.process.stderr:
+    def _drain(tunnel: _Tunnel, process: subprocess.Popen) -> None:
+        assert process.stderr is not None
+        for line in process.stderr:
             line = line.rstrip()
             if line:
                 tunnel.stderr_tail.append(line)
@@ -174,13 +266,18 @@ class SshTunnelManager:
 
     @staticmethod
     def _error_text(tunnel: _Tunnel) -> str:
-        return "\n".join(tunnel.stderr_tail) or f"ssh exited with code {tunnel.process.returncode}"
+        returncode = tunnel.process.returncode if tunnel.process is not None else None
+        return "\n".join(tunnel.stderr_tail) or f"ssh exited with code {returncode}"
 
-    @staticmethod
-    def _stop(tunnel: _Tunnel) -> None:
-        if tunnel.process.poll() is None:
-            tunnel.process.terminate()
-            try:
-                tunnel.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                tunnel.process.kill()
+    def _stop(self, tunnel: _Tunnel) -> None:
+        with self._lock:
+            tunnel.stopped = True  # a start still in flight notices this and terminates its own process
+            process = tunnel.process
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()

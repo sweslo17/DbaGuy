@@ -105,7 +105,11 @@ class MetadataService:
                 f"meta:{profile.name}:{database or '-'}",
                 lambda: self._connections.open(profile, database, secrets),
             )
-            worker.start()
+            try:
+                worker.start()
+            except BaseException:
+                worker.close()  # never leave the thread, connection or tunnel behind
+                raise
             with self._lock:
                 self._workers[key] = _MetaEntry(worker=worker, last_used=time.monotonic())
             return worker
@@ -113,5 +117,9 @@ class MetadataService:
     def _drop(self, key: _Key) -> None:
         with self._lock:
             entry = self._workers.pop(key, None)
-        if entry is not None:
+        if entry is None:
+            return
+        try:
             entry.worker.close()
+        except Exception:
+            logger.exception("Error while closing the metadata connection of {}", key)

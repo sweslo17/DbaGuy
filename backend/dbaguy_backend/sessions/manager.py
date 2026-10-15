@@ -51,11 +51,11 @@ class SessionManager:
             f"{profile.name}:{session_id[:8]}",
             lambda: self._connections.open(profile, request.database, secrets),
         )
-        worker.start()
         try:
+            worker.start()
             server = worker.call(lambda c: c.server_info())
         except BaseException:
-            worker.close()
+            worker.close()  # whatever failed, never leave the thread, connection or tunnel behind
             raise
         info = SessionInfo(session_id=session_id, profile_id=profile.id, database=server.current_database, server=server)
         with self._lock:
@@ -91,33 +91,49 @@ class SessionManager:
         entry.worker.clear_emitter(emit)
 
     def close(self, session_id: str) -> None:
-        with self._lock:
-            entry = self._sessions.pop(session_id, None)
-        if entry is None:
+        if not self._pop_and_close(session_id):
             raise SessionNotFound(f"Session {session_id} not found")
-        entry.worker.close()
-        logger.info("Closed session {}", session_id)
 
     def close_for_profile(self, profile_id: UUID) -> None:
         with self._lock:
             ids = [sid for sid, e in self._sessions.items() if e.info.profile_id == profile_id]
         for sid in ids:
-            self.close(sid)
+            self._pop_and_close(sid)
 
     def reap_idle(self) -> int:
-        now = time.monotonic()
-        with self._lock:
-            idle = [
-                sid for sid, e in self._sessions.items()
-                if e.attached == 0 and now - e.detached_at >= self._idle_timeout
-            ]
-        for sid in idle:
-            logger.info("Closing idle session {}", sid)
-            self.close(sid)
-        return len(idle)
+        closed = 0
+        for sid in self._idle_ids():
+            if self._pop_and_close(sid, idle_only=True):
+                logger.info("Closed idle session {}", sid)
+                closed += 1
+        return closed
 
     def close_all(self) -> None:
         with self._lock:
             ids = list(self._sessions)
         for sid in ids:
-            self.close(sid)
+            self._pop_and_close(sid)
+
+    def _is_idle(self, entry: _Entry) -> bool:
+        return entry.attached == 0 and time.monotonic() - entry.detached_at >= self._idle_timeout
+
+    def _idle_ids(self) -> list[str]:
+        with self._lock:
+            return [sid for sid, e in self._sessions.items() if self._is_idle(e)]
+
+    def _pop_and_close(self, session_id: str, idle_only: bool = False) -> bool:
+        """Remove a session and close its worker. False when it is gone (or, with idle_only, no longer idle).
+
+        Never raises for a failing worker: bulk callers (reaper, profile deletion, shutdown) must reach every session.
+        """
+        with self._lock:
+            entry = self._sessions.get(session_id)
+            if entry is None or (idle_only and not self._is_idle(entry)):
+                return False
+            del self._sessions[session_id]
+        try:
+            entry.worker.close()
+        except Exception:
+            logger.exception("Error while closing session {}", session_id)
+        logger.info("Closed session {}", session_id)
+        return True

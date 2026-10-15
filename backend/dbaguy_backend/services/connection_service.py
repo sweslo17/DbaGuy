@@ -62,8 +62,8 @@ class ConnectionService:
             raise ValidationFailed("A port is required")
         if not profile.ssh.enabled:
             return Endpoint(profile.host, port), _noop
-        endpoint = self._tunnels.acquire(profile.id, profile.ssh, profile.host, port, secrets.ssh_password)
-        return endpoint, lambda: self._tunnels.release(profile.id, profile.host, port)
+        tunnel = self._tunnels.lease(profile.id, profile.ssh, profile.host, port, secrets.ssh_password)
+        return tunnel.endpoint, tunnel.release  # bound to this very tunnel, so a stale release cannot hit a replacement
 
     def test(self, request: ConnectionTestRequest) -> ConnectionTestResult:
         started = time.monotonic()

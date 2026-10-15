@@ -49,7 +49,12 @@ class _OpenExecution:
 
 
 class SessionWorker:
-    """Owns one connection and one thread; every driver call happens on that thread."""
+    """Owns one connection and one thread; every driver call happens on that thread.
+
+    Locking: `_queue_lock` guards `_closed` and every enqueue, so nothing can land behind the stop marker.
+    `_state_lock` guards `_running_request` and `_queued`; it is held across `connection.cancel()`, so a cancel can
+    never hit a statement other than the one it was meant for (the worker changes the running request under it).
+    """
 
     def __init__(self, name: str, opener: Callable[[], Any]) -> None:
         self.name = name
@@ -61,8 +66,10 @@ class SessionWorker:
         self._opened = threading.Event()
         self._emit: Emitter = _discard_event
         self._emit_lock = threading.Lock()
+        self._queue_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._running_request: str | None = None
+        self._queued: dict[str, bool] = {}  # execute requests waiting in the queue -> cancelled before they started
         self._open_exec: _OpenExecution | None = None
         self._closed = False
         self.last_activity = time.monotonic()
@@ -72,6 +79,7 @@ class SessionWorker:
     def start(self, timeout: float = 30.0) -> None:
         self._thread.start()
         if not self._opened.wait(timeout):
+            self._begin_close()  # the thread closes the connection itself as soon as the opener returns
             raise ConnectionFailed(f"Timed out opening a connection for {self.name}")
         if self._open_error is not None:
             raise self._open_error
@@ -98,6 +106,9 @@ class SessionWorker:
         def task() -> None:
             if not future.set_running_or_notify_cancel():
                 return
+            if self._closed:
+                future.set_exception(SessionBusy("Session is closed"))
+                return
             try:
                 self._discard_open()
                 future.set_result(fn(self.connection))
@@ -110,7 +121,7 @@ class SessionWorker:
     def submit(self, command: BaseModel) -> None:
         match command:
             case ExecuteCommand():
-                self._put(lambda: self._execute(command))
+                self._submit_execute(command)
             case FetchMoreCommand():
                 self._put(lambda: self._fetch_more(command))
             case DiscardCommand():
@@ -119,30 +130,63 @@ class SessionWorker:
                 self.cancel(command.request_id)
 
     def cancel(self, request_id: str) -> None:
+        """Cancel a request: stop it if it is running, skip it if it is still queued, close it if it is paused."""
         with self._state_lock:
-            running = self._running_request == request_id
-        if running:
-            logger.info("Cancelling request {} on {}", request_id, self.name)
-            self.connection.cancel()
-        else:
-            self._put(lambda: self._discard(request_id))
+            if self._running_request == request_id:
+                logger.info("Cancelling request {} on {}", request_id, self.name)
+                self._cancel_connection()
+                return
+            if request_id in self._queued:
+                logger.info("Request {} on {} cancelled before it started", request_id, self.name)
+                self._queued[request_id] = True
+                return
+        try:
+            self._put(lambda: self._discard(request_id, cancelled=True))  # a paused result, if it is the open one
+        except SessionBusy:
+            pass  # closing: the worker finishes the open result itself
 
     def close(self) -> None:
-        if self._closed:
+        if not self._begin_close():
             return
-        self._closed = True
         with self._state_lock:
-            running = self._running_request is not None
-        if running and self._lease is not None:
+            if self._running_request is not None and self._lease is not None:
+                self._cancel_connection()
+        if self._thread.ident is not None:
+            self._thread.join(timeout=10)
+            if self._thread.is_alive():
+                logger.warning("Session {} did not stop within 10s", self.name)
+
+    def _begin_close(self) -> bool:
+        """Reject new work and queue the stop marker. False when the worker is already closing."""
+        with self._queue_lock:
+            if self._closed:
+                return False
+            self._closed = True
+            self._queue.put(_STOP)
+        return True
+
+    def _cancel_connection(self) -> None:
+        try:
             self.connection.cancel()
-        self._queue.put(_STOP)
-        self._thread.join(timeout=10)
+        except Exception:
+            logger.warning("Cancel failed on {}", self.name, exc_info=True)
 
     def _put(self, task: Callable[[], None]) -> None:
-        if self._closed:
-            raise SessionBusy("Session is closed")
-        self.last_activity = time.monotonic()
-        self._queue.put(task)
+        with self._queue_lock:
+            if self._closed:
+                raise SessionBusy("Session is closed")
+            self.last_activity = time.monotonic()
+            self._queue.put(task)
+
+    def _submit_execute(self, cmd: ExecuteCommand) -> None:
+        with self._state_lock:
+            self._queued[cmd.request_id] = False
+        try:
+            self._put(lambda: self._execute(cmd))
+        except BaseException:
+            with self._state_lock:
+                self._queued.pop(cmd.request_id, None)
+            raise
 
     # ---- worker thread ----
 
@@ -151,20 +195,33 @@ class SessionWorker:
             self._lease = self._opener()
         except BaseException as exc:
             self._open_error = exc
+            with self._queue_lock:
+                self._closed = True  # nothing will ever run; reject new work and fail what was queued meanwhile
             self._opened.set()
+            self._run_queued()
             return
         self._opened.set()
+        self._run_queued()
+        self._discard_open()
+        try:
+            self._lease.close()
+        except Exception:
+            logger.exception("Error closing the connection of {}", self.name)
+        logger.info("Session {} closed", self.name)
+
+    def _run_queued(self) -> None:
+        """Run queued tasks until the stop marker; once closing, tasks only fail fast (see _execute / call)."""
         while True:
-            task = self._queue.get()
+            try:
+                task = self._queue.get(block=self._lease is not None)
+            except queue.Empty:
+                return  # the opener failed: only what was queued before the failure is left
             if task is _STOP:
-                break
+                return
             try:
                 task()
             except Exception:
                 logger.exception("Session task failed on {}", self.name)
-        self._discard_open()
-        self._lease.close()
-        logger.info("Session {} closed", self.name)
 
     def _send(self, event: BaseModel) -> None:
         with self._emit_lock:
@@ -184,11 +241,26 @@ class SessionWorker:
         except Exception:
             return False
 
+    def _begin_request(self, request_id: str) -> str | None:
+        """Atomically leave the queue and become the running request. Returns why it must not run, if so."""
+        with self._state_lock:
+            cancelled = self._queued.pop(request_id, False)
+            if cancelled:
+                return "Query cancelled before it started"
+            if self._closed:
+                return "Session closed before the query started"
+            self._running_request = request_id
+        return None
+
     def _execute(self, cmd: ExecuteCommand) -> None:
         self._discard_open()
         started = time.monotonic()
-        self._set_running(cmd.request_id)
+        skipped = self._begin_request(cmd.request_id)
         self._send(StartedEvent(request_id=cmd.request_id))
+        if skipped is not None:
+            self._send(MessageEvent(request_id=cmd.request_id, severity=MessageSeverity.WARNING, text=skipped))
+            self._send_finished(cmd.request_id, started, cancelled=True)
+            return
         logger.debug("[{}] execute {}: {}", self.name, cmd.request_id, cmd.sql[:2000])
         try:
             result = self.connection.run(cmd.sql)
@@ -204,6 +276,8 @@ class SessionWorker:
 
     def _fetch_more(self, cmd: FetchMoreCommand) -> None:
         execution = self._open_exec
+        if self._closed:
+            return  # the open result is finished when the thread stops
         if execution is None or execution.request_id != cmd.request_id:
             self._send(ErrorEvent(request_id=cmd.request_id, message="No open result to fetch from", code="no_open_result"))
             return
@@ -218,9 +292,13 @@ class SessionWorker:
         finally:
             self._set_running(None)
 
-    def _discard(self, request_id: str) -> None:
-        if self._open_exec is not None and self._open_exec.request_id == request_id:
-            self._discard_open()
+    def _discard(self, request_id: str, cancelled: bool = False) -> None:
+        execution = self._open_exec
+        if execution is None or execution.request_id != request_id:
+            return
+        if cancelled:
+            self._send(MessageEvent(request_id=request_id, severity=MessageSeverity.WARNING, text="Query cancelled"))
+        self._finish(execution, cancelled=cancelled)
 
     def _discard_open(self) -> None:
         if self._open_exec is not None:
@@ -258,6 +336,7 @@ class SessionWorker:
                     if not ex.peeked:
                         ex.peeked = result.fetch(1)
                     if ex.peeked:  # page full and more rows exist: pause
+                        self._set_running(None)  # before the event: a cancel from now on discards instead of interrupting
                         self._send(ResultSetEndEvent(request_id=ex.request_id, index=ex.index, row_count=ex.sent, has_more=True))
                         return
                 self._send(ResultSetEndEvent(request_id=ex.request_id, index=ex.index, row_count=ex.sent, has_more=False))
@@ -270,20 +349,25 @@ class SessionWorker:
             ex.peeked = []
         self._finish(ex)
 
+    def _send_finished(self, request_id: str, started: float, cancelled: bool) -> None:
+        self._send(FinishedEvent(
+            request_id=request_id,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            in_transaction=self._in_transaction(),
+            cancelled=cancelled,
+        ))
+
     def _finish(self, ex: _OpenExecution, cancelled: bool = False) -> None:
+        self._set_running(None)  # before `finished` goes out: from then on a cancel must not reach the connection
         self._open_exec = None
         try:
             ex.result.close()
         except Exception as exc:
             logger.warning("Error closing result on {}: {}", self.name, exc)
-        self._send(FinishedEvent(
-            request_id=ex.request_id,
-            elapsed_ms=int((time.monotonic() - ex.started) * 1000),
-            in_transaction=self._in_transaction(),
-            cancelled=cancelled,
-        ))
+        self._send_finished(ex.request_id, ex.started, cancelled)
 
     def _fail(self, request_id: str, started: float, exc: StatementError) -> None:
+        self._set_running(None)
         if self._open_exec is not None:
             try:
                 self._open_exec.result.close()
@@ -295,9 +379,4 @@ class SessionWorker:
             self._send(MessageEvent(request_id=request_id, severity=MessageSeverity.WARNING, text=exc.message))
         else:
             self._send(ErrorEvent(request_id=request_id, message=exc.message, code=exc.code, position=exc.position))
-        self._send(FinishedEvent(
-            request_id=request_id,
-            elapsed_ms=int((time.monotonic() - started) * 1000),
-            in_transaction=self._in_transaction(),
-            cancelled=cancelled,
-        ))
+        self._send_finished(request_id, started, cancelled)
