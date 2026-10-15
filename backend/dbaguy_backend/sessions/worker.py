@@ -280,6 +280,10 @@ class SessionWorker:
             return  # the open result is finished when the thread stops
         if execution is None or execution.request_id != cmd.request_id:
             self._send(ErrorEvent(request_id=cmd.request_id, message="No open result to fetch from", code="no_open_result"))
+            # Every request ends with exactly one `finished`; without it a client waiting on this request would hang.
+            self._send(FinishedEvent(
+                request_id=cmd.request_id, elapsed_ms=0, in_transaction=self._in_transaction(), cancelled=False,
+            ))
             return
         self._set_running(cmd.request_id)
         try:

@@ -88,7 +88,30 @@ def test_metadata_and_session_over_websocket(client, sqlite_profile_id):
         assert events[2]["rows"] == [[1, "a"], [2, "b"], [3, "c"]]
         ws.send_json({"type": "bogus", "request_id": "x"})
         assert ws.receive_json()["code"] == "invalid_command"
+        assert ws.receive_json() == {
+            "type": "finished", "request_id": "x", "elapsed_ms": 0, "in_transaction": False, "cancelled": False,
+        }
     assert client.delete(f"/sessions/{sid}", headers=AUTH).status_code == 204
+
+
+def test_invalid_command_without_a_request_id_gets_an_error_but_no_finished(client, sqlite_profile_id):
+    sid = client.post("/sessions", json={"profile_id": sqlite_profile_id}, headers=AUTH).json()["session_id"]
+    with client.websocket_connect(f"/sessions/{sid}/ws?token={TOKEN}") as ws:
+        ws.send_json({"type": "bogus"})
+        assert ws.receive_json()["code"] == "invalid_command"
+        ws.send_json({"type": "execute", "request_id": "q", "sql": "SELECT 1"})
+        assert ws.receive_json()["type"] == "started"  # nothing was queued between the error and this request
+
+
+def test_command_rejected_by_a_closed_session_gets_an_error_and_finished(client, sqlite_profile_id):
+    sid = client.post("/sessions", json={"profile_id": sqlite_profile_id}, headers=AUTH).json()["session_id"]
+    with client.websocket_connect(f"/sessions/{sid}/ws?token={TOKEN}") as ws:
+        client.app.state.container.sessions.worker(sid).close()  # the socket stays attached to a dead worker
+        ws.send_json({"type": "execute", "request_id": "late", "sql": "SELECT 1"})
+        error = ws.receive_json()
+        finished = ws.receive_json()
+    assert error["type"] == "error" and error["request_id"] == "late" and error["code"] == "session_busy"
+    assert finished["type"] == "finished" and finished["request_id"] == "late" and finished["cancelled"] is False
 
 
 def test_websocket_rejects_bad_token(client, sqlite_profile_id):

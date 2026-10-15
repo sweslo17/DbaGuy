@@ -18,7 +18,13 @@ export interface ExecutionState {
   elapsedMs: number | null;
   inTransaction: boolean;
   cancelled: boolean;
+  /** The connection dropped mid-request: later events are ignored because some were lost. */
+  interrupted: boolean;
 }
+
+export const INTERRUPTED_MESSAGE = "Connection interrupted — results may be incomplete";
+/** Error codes the backend sends for requests it never ran; the request is over even if `finished` goes missing. */
+const TERMINAL_ERROR_CODES = new Set(["no_open_result", "invalid_command"]);
 
 export function newExecution(requestId: string): ExecutionState {
   return {
@@ -31,6 +37,19 @@ export function newExecution(requestId: string): ExecutionState {
     elapsedMs: null,
     inTransaction: false,
     cancelled: false,
+    interrupted: false,
+  };
+}
+
+/** Ends a request whose `finished` can no longer arrive (socket dropped or session gone). */
+export function interruptExecution(state: ExecutionState): ExecutionState {
+  if (state.status === "done") return state;
+  return {
+    ...state,
+    status: "done",
+    interrupted: true,
+    messages: [...state.messages, { severity: "warning", text: INTERRUPTED_MESSAGE }],
+    resultSets: state.resultSets.map((s) => ({ ...s, hasMore: false })),
   };
 }
 
@@ -40,6 +59,7 @@ function updateSet(state: ExecutionState, index: number, fn: (set: ResultSetStat
 
 /** Folds one server event of this execution into its state. */
 export function applyEvent(state: ExecutionState, event: ServerEvent): ExecutionState {
+  if (state.interrupted) return state;
   switch (event.type) {
     case "started":
       return { ...state, status: "running" };
@@ -61,8 +81,11 @@ export function applyEvent(state: ExecutionState, event: ServerEvent): Execution
       return { ...state, affected: [...state.affected, { index: event.index, rows: event.rows }] };
     case "message":
       return { ...state, messages: [...state.messages, { severity: event.severity, text: event.text }] };
-    case "error":
-      return { ...state, error: { message: event.message, code: event.code, position: event.position } };
+    case "error": {
+      const error = { message: event.message, code: event.code, position: event.position };
+      const terminal = event.code != null && TERMINAL_ERROR_CODES.has(event.code);
+      return terminal ? { ...state, error, status: "done" } : { ...state, error };
+    }
     case "finished":
       return {
         ...state,
@@ -72,5 +95,7 @@ export function applyEvent(state: ExecutionState, event: ServerEvent): Execution
         cancelled: event.cancelled,
         resultSets: state.resultSets.map((s) => ({ ...s, hasMore: false })),
       };
+    default:
+      return state; // an event type this client does not know must never wipe the state
   }
 }

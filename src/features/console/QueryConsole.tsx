@@ -7,7 +7,7 @@ import { cn } from "@/lib/cn";
 import type { ConsoleTab } from "@/stores/workspace";
 import { useProfiles } from "../connections/hooks";
 import { UnlockDialog } from "../connections/UnlockDialog";
-import { applyEvent, newExecution, type ExecutionState } from "./execution";
+import { applyEvent, interruptExecution, newExecution, type ExecutionState } from "./execution";
 import { ResultTable } from "./ResultTable";
 import { useConsoleSession } from "./useConsoleSession";
 
@@ -39,17 +39,42 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
   const [unlockDismissed, setUnlockDismissed] = useState(false);
   const editor = useRef<HTMLTextAreaElement>(null);
 
+  const connectionLost = useRef(false);
+  const connection: SocketStatus = error ? "closed" : status;
+
   useEffect(() => {
     setExecution(null); // results belong to the session that produced them
+    connectionLost.current = false;
     if (!socket) return;
     return socket.subscribe((event) =>
       setExecution((prev) => (prev && event.request_id === prev.requestId ? applyEvent(prev, event) : prev)),
     );
   }, [socket]);
 
+  const latestExecution = useRef(execution);
+  useEffect(() => {
+    latestExecution.current = execution;
+  }, [execution]);
+
+  // Events sent while the socket was down are gone for good, so an unfinished request can never complete: end it
+  // when the socket is back (or when the session turns out to be gone) instead of leaving it "Running…".
+  useEffect(() => {
+    if (status === "closed") connectionLost.current = true;
+    const reconnected = status === "open" && connectionLost.current;
+    if (reconnected) connectionLost.current = false;
+    if (!reconnected && !error) return;
+    const orphan = latestExecution.current;
+    if (reconnected && orphan && orphan.status !== "done") {
+      socket?.send({ type: "cancel", request_id: orphan.requestId }); // otherwise it keeps blocking the next statement
+    }
+    setExecution((prev) => (prev ? interruptExecution(prev) : prev));
+  }, [status, error, socket]);
+
+  // Only while the socket is open: a command sent into a dropped connection would be queued and replayed late.
+  const canRun = !!socket && connection === "open" && execution?.status !== "running";
   const run = () => {
     const el = editor.current;
-    if (!socket || !el || execution?.status === "running") return;
+    if (!canRun || !el) return;
     const hasSelection = el.selectionEnd > el.selectionStart;
     const text = hasSelection ? sql.slice(el.selectionStart, el.selectionEnd) : sql;
     if (!text.trim()) return;
@@ -84,13 +109,12 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
 
   const profile = profiles.data?.find((p) => p.profile.id === tab.profileId)?.profile;
   const needsPassword = error instanceof ApiError && error.code === "password_required" && !!profile;
-  const connection: SocketStatus = error ? "closed" : status;
   const errorPosition = execution?.error?.position;
 
   return (
     <div className="flex h-full flex-col">
       <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border px-2">
-        <Button variant="primary" size="sm" onClick={run} disabled={!socket || !!error || execution?.status === "running"}>
+        <Button variant="primary" size="sm" onClick={run} disabled={!canRun}>
           Run ⌘↵
         </Button>
         <Button size="sm" onClick={cancel} disabled={execution?.status !== "running"}>
@@ -159,7 +183,7 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
                         {plural(set.rows.length, "row")}
                         {set.hasMore ? " loaded" : ""}
                       </span>
-                      {set.hasMore && execution.status === "paused" && (
+                      {set.hasMore && execution.status === "paused" && connection === "open" && (
                         <Button size="sm" onClick={loadMore}>
                           Load {PAGE} more
                         </Button>

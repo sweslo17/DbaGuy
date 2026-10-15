@@ -133,6 +133,15 @@ def test_new_execute_discards_paused_result(setup):
     assert rec.of("a", "finished")  # the paused request was finished first
 
 
+def test_fetch_more_without_an_open_result_still_finishes(setup):
+    _, _, worker, rec = setup
+    worker.submit(FetchMoreCommand(request_id="ghost", count=10))
+    done = rec.wait_for(finished("ghost"))
+    assert [e.code for e in rec.of("ghost", "error")] == ["no_open_result"]
+    assert rec.types() == ["error", "finished"]  # the error comes first, then the one `finished`
+    assert done.cancelled is False and done.in_transaction is False and done.elapsed_ms == 0
+
+
 def test_call_runs_on_worker_thread(setup):
     _, _, worker, _ = setup
     assert worker.call(lambda c: threading.current_thread().name).startswith("session-")

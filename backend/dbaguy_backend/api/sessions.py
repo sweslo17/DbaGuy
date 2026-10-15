@@ -8,7 +8,7 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from ..container import AppContainer
 from ..domain.errors import DomainError, NotFound, SessionNotFound
-from ..domain.execution import CancelCommand, ClientCommand, ErrorEvent, ExecutionSchema
+from ..domain.execution import CancelCommand, ClientCommand, ErrorEvent, ExecutionSchema, FinishedEvent
 from ..sessions.manager import SessionCreateRequest, SessionInfo
 from .deps import get_container, require_token, websocket_token_ok
 
@@ -21,6 +21,17 @@ _CLOSE_SESSION_NOT_FOUND = 4404
 async def _reject(websocket: WebSocket, code: int, reason: str) -> None:
     logger.info("WebSocket {} rejected: {} ({})", websocket.url.path, reason, code)
     await websocket.close(code=code, reason=reason)
+
+
+async def _fail_request(outbox: asyncio.Queue[dict[str, Any] | None], request_id: str, message: str, code: str) -> None:
+    """Answer a request the worker never ran: an error plus the `finished` every request must end with.
+
+    `in_transaction` is false because the connection belongs to the worker thread and may already be gone.
+    """
+    await outbox.put(ErrorEvent(request_id=request_id, message=message, code=code).model_dump(mode="json"))
+    if request_id:
+        finished = FinishedEvent(request_id=request_id, elapsed_ms=0, in_transaction=False, cancelled=False)
+        await outbox.put(finished.model_dump(mode="json"))
 
 
 @router.post("", response_model=SessionInfo, status_code=201, dependencies=[Depends(require_token)])
@@ -74,8 +85,7 @@ async def session_socket(websocket: WebSocket, session_id: str) -> None:
                 command = _COMMANDS.validate_python(raw)
             except ValidationError as exc:
                 request_id = str(raw.get("request_id", "")) if isinstance(raw, dict) else ""
-                error = ErrorEvent(request_id=request_id, message=f"Invalid command: {exc.errors()[0]['msg']}", code="invalid_command")
-                await outbox.put(error.model_dump(mode="json"))
+                await _fail_request(outbox, request_id, f"Invalid command: {exc.errors()[0]['msg']}", "invalid_command")
                 continue
             try:
                 # submit() and cancel() can wait on the worker's state lock (a cancel holds it across a PG cancel),
@@ -85,7 +95,7 @@ async def session_socket(websocket: WebSocket, session_id: str) -> None:
                 else:
                     await asyncio.to_thread(worker.submit, command)
             except DomainError as exc:
-                await outbox.put(ErrorEvent(request_id=command.request_id, message=exc.message, code=exc.code).model_dump(mode="json"))
+                await _fail_request(outbox, command.request_id, exc.message, exc.code)
     except WebSocketDisconnect:
         pass
     finally:
