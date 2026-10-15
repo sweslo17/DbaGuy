@@ -291,6 +291,11 @@ export interface components {
             /** Elapsed Ms */
             elapsed_ms: number;
         };
+        /**
+         * Dialect
+         * @enum {string}
+         */
+        Dialect: "postgres" | "sqlite";
         /** DiscardCommand */
         DiscardCommand: {
             /**
@@ -313,6 +318,7 @@ export interface components {
             default_port: number | null;
             /** Url Schemes */
             url_schemes: string[];
+            dialect: components["schemas"]["Dialect"];
         };
         /** ErrorEvent */
         ErrorEvent: {

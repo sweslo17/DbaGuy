@@ -7,6 +7,7 @@ from dbaguy_backend.adapters.base import DatabaseConnection, StatementCancelled,
 from dbaguy_backend.domain.execution import ColumnCategory, ColumnMeta, ServerMessage
 from dbaguy_backend.domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
 from dbaguy_backend.domain.profiles import Engine
+from dbaguy_backend.domain.schema import SchemaSnapshot
 
 
 class FakeResult(StatementResult):
@@ -54,6 +55,9 @@ class FakeConnection(DatabaseConnection):
         raise NotImplementedError
 
     def object_detail(self, path: list[PathSegment]) -> ObjectDetail:
+        raise NotImplementedError
+
+    def schema_snapshot(self) -> SchemaSnapshot:
         raise NotImplementedError
 
     def run(self, sql: str) -> StatementResult:

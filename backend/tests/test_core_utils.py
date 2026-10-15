@@ -12,6 +12,7 @@ from dbaguy_backend.adapters.values import MAX_SAFE_INT, TEXT_LIMIT, encode_valu
 from dbaguy_backend.domain.errors import UnsupportedEngine, ValidationFailed
 from dbaguy_backend.domain.execution import ClientCommand, ServerEvent
 from dbaguy_backend.domain.profiles import Engine, SqliteProfileDraft
+from dbaguy_backend.sql.dialects import Dialect
 from pydantic import TypeAdapter
 
 
@@ -85,6 +86,7 @@ class FakeAdapter(DatabaseAdapter):
     engine = Engine.SQLITE
     url_schemes = ("fake",)
     default_port = None
+    dialect = Dialect.SQLITE
 
     def parse_url(self, url):
         return ParsedUrl(profile=SqliteProfileDraft(engine="sqlite", name="fake", path=url))

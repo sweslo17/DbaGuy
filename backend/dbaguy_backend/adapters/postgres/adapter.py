@@ -14,6 +14,8 @@ from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import ColumnMeta, ErrorPosition, MessageSeverity, ServerMessage
 from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
 from ...domain.profiles import AnyProfile, Engine, ServerProfile, ServerProfileDraft, SslConfig
+from ...domain.schema import SchemaSnapshot
+from ...sql.dialects import Dialect
 from ..base import (
     AdapterCapabilities,
     DatabaseAdapter,
@@ -27,6 +29,7 @@ from ..base import (
 from ..positions import offset_to_line_col
 from ..sql_text import first_keyword
 from . import ddl, introspection
+from . import schema as pg_schema
 from .loaders import category_for_oid, configure_user_loaders
 
 _ROW_KEYWORDS = frozenset({"select", "with", "values", "table", "show", "explain", "fetch", "("})
@@ -397,6 +400,10 @@ class PostgresConnection(DatabaseConnection):
         self._check_database(path)
         return ddl.object_detail(self._conn, path)
 
+    def schema_snapshot(self) -> SchemaSnapshot:
+        # The connection's own (native-loader) cursors: arrays come back as lists, unlike the text-first user cursors.
+        return pg_schema.build_snapshot(self._conn)
+
     def _user_cursor(self) -> psycopg.Cursor:
         cursor = self._conn.cursor()
         configure_user_loaders(cursor.adapters)
@@ -461,6 +468,7 @@ class PostgresAdapter(DatabaseAdapter):
     engine = Engine.POSTGRES
     url_schemes = ("postgres", "postgresql")
     default_port = 5432
+    dialect = Dialect.POSTGRES
     capabilities = AdapterCapabilities(per_database_connection=True)
 
     def parse_url(self, url: str) -> ParsedUrl:

@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..sql.dialects import Dialect
+
 
 class Engine(StrEnum):
     POSTGRES = "postgres"
@@ -129,3 +131,4 @@ class EngineInfo(BaseModel):
     engine: Engine
     default_port: int | None
     url_schemes: list[str]
+    dialect: Dialect

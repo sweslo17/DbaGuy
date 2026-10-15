@@ -9,6 +9,8 @@ from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import ColumnCategory, ColumnMeta, ServerMessage
 from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
 from ...domain.profiles import AnyProfile, Engine, SqliteProfile, SqliteProfileDraft
+from ...domain.schema import SchemaSnapshot
+from ...sql.dialects import Dialect
 from ..base import (
     DatabaseAdapter,
     DatabaseConnection,
@@ -19,6 +21,7 @@ from ..base import (
     StatementResult,
 )
 from . import introspection
+from . import schema as sqlite_schema
 
 _PEEK_ROWS = 200
 
@@ -114,6 +117,12 @@ class SqliteConnection(DatabaseConnection):
         except sqlite3.Error as exc:
             raise _translate(exc) from exc
 
+    def schema_snapshot(self) -> SchemaSnapshot:
+        try:
+            return sqlite_schema.build_snapshot(self._conn)
+        except sqlite3.Error as exc:
+            raise _translate(exc) from exc
+
     def run(self, sql: str) -> StatementResult:
         cursor = self._conn.cursor()
         try:
@@ -138,6 +147,7 @@ class SqliteAdapter(DatabaseAdapter):
     engine = Engine.SQLITE
     url_schemes = ("sqlite",)
     default_port = None
+    dialect = Dialect.SQLITE
 
     def parse_url(self, url: str) -> ParsedUrl:
         parsed = urlparse(url)

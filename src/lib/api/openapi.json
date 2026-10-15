@@ -1013,6 +1013,14 @@
         ],
         "title": "ConnectionTestResult"
       },
+      "Dialect": {
+        "type": "string",
+        "enum": [
+          "postgres",
+          "sqlite"
+        ],
+        "title": "Dialect"
+      },
       "DiscardCommand": {
         "properties": {
           "type": {
@@ -1065,13 +1073,17 @@
             },
             "type": "array",
             "title": "Url Schemes"
+          },
+          "dialect": {
+            "$ref": "#/components/schemas/Dialect"
           }
         },
         "type": "object",
         "required": [
           "engine",
           "default_port",
-          "url_schemes"
+          "url_schemes",
+          "dialect"
         ],
         "title": "EngineInfo"
       },

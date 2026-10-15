@@ -3,8 +3,10 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ..domain.execution import ColumnMeta, ErrorPosition, ServerMessage
-from ..domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
+from ..domain.metadata import Folder, NodeKind, ObjectDetail, ObjectNode, PathSegment, ServerInfo, child_path
 from ..domain.profiles import AnyDraft, AnyProfile, Engine, EngineInfo
+from ..domain.schema import RelationKind, SchemaSnapshot
+from ..sql.dialects import Dialect
 
 
 @dataclass(frozen=True)
@@ -91,6 +93,13 @@ class DatabaseConnection(ABC):
     def object_detail(self, path: list[PathSegment]) -> ObjectDetail: ...
 
     @abstractmethod
+    def schema_snapshot(self) -> SchemaSnapshot:
+        """Schemas, relations, columns, PK/FK of the connection's current database.
+
+        Built with a small fixed number of queries, never one query per table.
+        """
+
+    @abstractmethod
     def run(self, sql: str) -> StatementResult:
         """Execute one statement/batch (no parameters). Raises StatementError."""
 
@@ -113,7 +122,12 @@ class DatabaseAdapter(ABC):
     engine: ClassVar[Engine]
     url_schemes: ClassVar[tuple[str, ...]]
     default_port: ClassVar[int | None]
+    dialect: ClassVar[Dialect]
     capabilities: ClassVar[AdapterCapabilities] = AdapterCapabilities()
+
+    _FOLDER_FOR_KIND: ClassVar[dict[str, str]] = {
+        "table": Folder.TABLES, "view": Folder.VIEWS, "materialized_view": Folder.MATERIALIZED_VIEWS,
+    }
 
     @abstractmethod
     def parse_url(self, url: str) -> ParsedUrl: ...
@@ -129,4 +143,16 @@ class DatabaseAdapter(ABC):
         """Open a connection. Raises ConnectionFailed."""
 
     def info(self) -> EngineInfo:
-        return EngineInfo(engine=self.engine, default_port=self.default_port, url_schemes=list(self.url_schemes))
+        return EngineInfo(
+            engine=self.engine, default_port=self.default_port, url_schemes=list(self.url_schemes),
+            dialect=self.dialect,
+        )
+
+    def relation_path(self, database: str | None, schema: str, name: str, kind: RelationKind) -> list[PathSegment]:
+        """The explorer path that opens a table/view, e.g. [database, schema, folder, <kind>:name]."""
+        path: list[PathSegment] = []
+        if self.capabilities.per_database_connection and database:
+            path = child_path(path, NodeKind.DATABASE, database)
+        path = child_path(path, NodeKind.SCHEMA, schema)
+        path = child_path(path, NodeKind.FOLDER, self._FOLDER_FOR_KIND[kind])
+        return child_path(path, kind, name)

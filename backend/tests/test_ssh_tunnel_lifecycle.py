@@ -16,6 +16,7 @@ from dbaguy_backend.domain.errors import TunnelFailed
 from dbaguy_backend.domain.profiles import ConnectionTestRequest, Engine, ProfileUpsertRequest, ServerProfile, SshConfig
 from dbaguy_backend.services.connection_service import ConnectionService
 from dbaguy_backend.services.profile_service import ProfileService, ResolvedSecrets
+from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.storage.paths import profiles_file
 from dbaguy_backend.storage.profile_store import ProfileStore
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
@@ -49,6 +50,7 @@ class RecordingAdapter(DatabaseAdapter):
     engine = Engine.POSTGRES
     url_schemes = ("postgres",)
     default_port = 5432
+    dialect = Dialect.POSTGRES
 
     def __init__(self) -> None:
         self.endpoints: list[Endpoint | None] = []
