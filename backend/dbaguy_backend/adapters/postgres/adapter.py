@@ -62,6 +62,10 @@ _DEFAULT_CONNECT_PARAMS: dict[str, Any] = {
 _CONNECTION_LOST = "connection_lost"
 # SQLSTATEs that mean the server dropped us: connection exceptions and admin/crash shutdown.
 _CONNECTION_LOST_STATES = frozenset({"57P01", "57P02", "57P03"})
+# Read-only profiles set the session default at connect and re-assert it before every statement: a SELECT can call
+# set_config() to switch the default off, whether written out, hidden in a string or inside a user function.
+_READ_ONLY_GUC = "default_transaction_read_only"
+_READ_ONLY_SESSION = "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
 
 # libpq's chunked streaming uses the extended protocol, which accepts one statement per query.
 _MULTI_STATEMENT_ERROR = "cannot insert multiple commands into a prepared statement"
@@ -319,8 +323,9 @@ class _CursorResult(StatementResult):
 
 
 class PostgresConnection(DatabaseConnection):
-    def __init__(self, conn: psycopg.Connection) -> None:
+    def __init__(self, conn: psycopg.Connection, read_only: bool = False) -> None:
         self._conn = conn
+        self._read_only = read_only
         self._messages: deque[ServerMessage] = deque(maxlen=1000)
         self._cursor_ids = itertools.count(1)
         self._custom_types: dict[int, str] = {int(oid): name for oid, name in conn.execute(_CUSTOM_TYPES_SQL)}
@@ -432,10 +437,26 @@ class PostgresConnection(DatabaseConnection):
             logger.debug("Script has several statements and cannot be streamed; running it buffered")
         return self._run_buffered(sql)
 
+    def _restore_read_only(self) -> None:
+        """Re-asserts READ ONLY when the server reports the session default as off, or reports nothing (PG < 14).
+
+        An aborted transaction is left alone: SET cannot run in it, and it can write nothing until ROLLBACK undoes
+        whatever switched the default off.
+        """
+        if not self._read_only or self.transaction_failed():
+            return
+        state = self._conn.info.parameter_status(_READ_ONLY_GUC)
+        if state == "on":
+            return
+        if state == "off":
+            logger.warning("Read-only connection: default_transaction_read_only was turned off; restored")
+        self._conn.execute(_READ_ONLY_SESSION)
+
     def run(self, sql: str) -> StatementResult:
         if _uses_client_copy(sql):
             raise StatementError(_UNSUPPORTED_COPY, code="unsupported_copy")
         try:
+            self._restore_read_only()
             if _likely_returns_rows(sql):
                 status = self._conn.info.transaction_status
                 if status == pq.TransactionStatus.IDLE:
@@ -522,7 +543,7 @@ class PostgresAdapter(DatabaseAdapter):
         if profile.read_only:
             # Enforced by the server too, so a function with side effects called from a SELECT cannot write either.
             try:
-                conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+                conn.execute(_READ_ONLY_SESSION)
             except psycopg.Error as exc:
                 conn.close()
                 raise ConnectionFailed(f"Could not make the connection read-only: {exc}") from exc
@@ -530,4 +551,4 @@ class PostgresAdapter(DatabaseAdapter):
             "Connected to PostgreSQL {}:{} db={}{}",
             params["host"], endpoint.port, params["dbname"], " read_only=True" if profile.read_only else "",
         )
-        return PostgresConnection(conn)
+        return PostgresConnection(conn, read_only=profile.read_only)

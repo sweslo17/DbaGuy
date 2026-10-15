@@ -343,3 +343,34 @@ def test_read_only_profile_is_read_only_in_the_database():
         assert exc.value.code == "25006"  # read_only_sql_transaction
     finally:
         conn.close()
+
+
+@requires_pg
+def test_read_only_connection_restores_read_only_after_set_config_hidden_in_a_string():
+    conn = PostgresAdapter().open(make_pg_profile(read_only=True), Endpoint(PG_HOST, PG_PORT), PG_PASSWORD, None)
+    try:
+        # The statement guard sees only a string literal here; the server-side check must catch the switched-off GUC.
+        result = conn.run(
+            "SELECT query_to_xml('select set_config(''default_transaction_read_only'',''off'',false)', false, false, '')"
+        )
+        result.fetch(1)
+        result.close()
+        with pytest.raises(StatementError) as exc:
+            conn.run("CREATE TEMP TABLE ro_probe2 (id int)")
+        assert exc.value.code == "25006"  # read_only_sql_transaction
+        assert conn._conn.info.parameter_status("default_transaction_read_only") == "on"
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_writable_connection_does_not_re_assert_read_only():
+    conn = PostgresAdapter().open(make_pg_profile(), Endpoint(PG_HOST, PG_PORT), PG_PASSWORD, None)
+    try:
+        result = conn.run("SELECT set_config('default_transaction_read_only', 'off', false)")
+        result.fetch(1)
+        result.close()
+        conn.run("SELECT 1").close()
+        assert conn._conn.info.parameter_status("default_transaction_read_only") == "off"  # nothing restored it
+    finally:
+        conn.close()
