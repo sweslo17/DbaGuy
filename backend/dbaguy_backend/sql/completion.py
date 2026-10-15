@@ -13,8 +13,11 @@ from loguru import logger
 from pydantic import BaseModel
 
 from ..domain.schema import RelationKind, SchemaSnapshot, SnapshotRelation, SnapshotSchema
-from .dialects import RULES, Dialect, qualified, quote_ident
+from .dialects import Dialect, qualified, quote_ident
 from .lexer import Token, TokenKind, tokenize
+from .scope import (
+    BEFORE_NAME, IDENT, Scope, ScopeRelation, enclosing_group, find_ctes, introduces_relation, scope_at, unquote,
+)
 from .splitter import split
 
 CompletionKind = Literal[
@@ -79,22 +82,11 @@ CLAUSE_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.SQLITE: (*_CLAUSES, "GLOB"),
 }
 
-# Words that introduce a relation; UPDATE does not after FOR / FOR NO KEY / ON CONFLICT DO.
-_RELATION_KEYWORDS = frozenset({"FROM", "JOIN", "UPDATE", "INTO", "TABLE"})
-_NOT_A_TABLE_UPDATE = frozenset({"FOR", "KEY", "DO"})
-_BEFORE_NAME = frozenset({"ONLY", "LATERAL", "IF", "NOT", "EXISTS"})  # FROM ONLY t, DROP TABLE IF EXISTS t
 _COLUMN_CLAUSES = frozenset(
     "SELECT WHERE HAVING SET BY RETURNING WHEN THEN ELSE CASE DISTINCT USING ON".split()
 )
-_ALIAS_STOP = frozenset(
-    """ON WHERE JOIN LEFT RIGHT INNER OUTER FULL CROSS NATURAL GROUP ORDER LIMIT OFFSET SET USING UNION EXCEPT
-    INTERSECT WINDOW HAVING VALUES RETURNING LATERAL SELECT FROM AS FOR DEFAULT WITH FETCH TABLESAMPLE WITHOUT
-    STRICT ADD ALTER DROP RENAME""".split()
-)
-_IDENT = (TokenKind.WORD, TokenKind.QUOTED)
 _SKIPPED = (TokenKind.SPACE, TokenKind.COMMENT)
 _NO_ITEMS_INSIDE = (TokenKind.STRING, TokenKind.COMMENT, TokenKind.QUOTED)
-_CLOSING_QUOTE = {opening: closing for rules in RULES.values() for opening, closing in rules.identifier_quotes}
 
 
 # --- candidates --------------------------------------------------------------------------------------------------
@@ -129,10 +121,18 @@ def _kind_word(kind: str) -> str:
     return kind.replace("_", " ")
 
 
+_CTE_SCHEMA = SnapshotSchema(name="")  # the "schema" of a CTE in a `_Resolved` pair; it never reaches the caller
+
+
+def _relation_detail(schema: SnapshotSchema, relation: SnapshotRelation) -> str:
+    return "CTE" if schema is _CTE_SCHEMA else f"{_kind_word(relation.kind)} in {schema.name}"
+
+
 def _column_candidates(dialect: Dialect, relation: SnapshotRelation) -> list[_Candidate]:
     """In table order, which is what people expect to scan."""
     return [
-        _Candidate.of(c.name, "column", f"{relation.name} · {c.type_name}", quote_ident(dialect, c.name))
+        _Candidate.of(c.name, "column", f"{relation.name} · {c.type_name}" if c.type_name else relation.name,
+                      quote_ident(dialect, c.name))
         for c in relation.columns
     ]
 
@@ -217,20 +217,11 @@ class SnapshotIndex:
         bare = resolved is not None and resolved[1] is relation
         label = relation.name if bare else f"{schema.name}.{relation.name}"
         apply = qualified(self.dialect, None if bare else schema.name, relation.name)
-        return _Candidate.of(label, relation.kind, f"{_kind_word(relation.kind)} in {schema.name}", apply,
+        return _Candidate.of(label, relation.kind, _relation_detail(schema, relation), apply,
                              _SYSTEM_BOOST if schema.system else 0)
 
 
 # --- statement and tokens ----------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class _ScopeRelation:
-    schema: str | None
-    name: str | None  # None for a subquery: only its alias is known
-    alias: str | None
-    position: int  # offset of the reference in the statement
-    group: int  # offset of the innermost "(" around the reference, -1 at the top level: a FROM and its JOINs share it
 
 
 def _statement_bounds(text: str, cursor: int, dialect: Dialect) -> tuple[int, int]:
@@ -255,16 +246,6 @@ def _significant(tokens: Iterable[Token]) -> list[Token]:
     return [token for token in tokens if token.kind not in _SKIPPED]
 
 
-def _unquote(token: Token) -> str:
-    """`"a""b"` → `a"b`, `[a b]` → `a b`, `` `a` `` → `a`; an unterminated quote yields what was typed so far."""
-    text = token.text
-    close = _CLOSING_QUOTE.get(text[:1]) if token.kind == TokenKind.QUOTED else None
-    if close is None:
-        return text
-    inner = text[1:-1] if len(text) > 1 and text.endswith(close) else text[1:]
-    return inner if close == "]" else inner.replace(close * 2, close)
-
-
 def _token_before(tokens: list[Token], offset: int) -> Token | None:
     """The token that contains `offset` or ends exactly at it (the character just typed belongs to it)."""
     return next((token for token in tokens if token.start < offset <= token.end), None)
@@ -283,174 +264,75 @@ def _inside_literal(token: Token | None, offset: int, dialect: Dialect) -> bool:
     return not _is_closed(token, dialect)
 
 
-def _matching_paren(tokens: list[Token], i: int) -> int:
-    """Index after the parenthesis that closes the one at `i` (len(tokens) when it is never closed)."""
-    depth = 0
-    for j in range(i, len(tokens)):
-        if tokens[j].kind == TokenKind.LPAREN:
-            depth += 1
-        elif tokens[j].kind == TokenKind.RPAREN:
-            depth -= 1
-            if depth == 0:
-                return j + 1
-    return len(tokens)
-
-
-def _word(tokens: list[Token], i: int) -> str:
-    return tokens[i].upper if 0 <= i < len(tokens) and tokens[i].kind == TokenKind.WORD else ""
-
-
-def _introduces_relation(tokens: list[Token], i: int) -> bool:
-    word = _word(tokens, i)
-    return word in _RELATION_KEYWORDS and not (word == "UPDATE" and _word(tokens, i - 1) in _NOT_A_TABLE_UPDATE)
-
-
-# --- scope -------------------------------------------------------------------------------------------------------
-
-
-def _read_alias(tokens: list[Token], i: int) -> tuple[str | None, int]:
-    if _word(tokens, i) == "AS":
-        i += 1
-    if i < len(tokens) and (tokens[i].kind == TokenKind.QUOTED or
-                            (tokens[i].kind == TokenKind.WORD and tokens[i].upper not in _ALIAS_STOP)):
-        return _unquote(tokens[i]), i + 1
-    return None, i
-
-
-def _read_relation(tokens: list[Token], i: int, out: list[_ScopeRelation], group: int) -> int | None:
-    """One `[ONLY] [schema.]name [(…)] [[AS] alias]` or `(subquery) [AS] alias` at `i`; returns the index after it,
-    or None when there is no relation there."""
-    while _word(tokens, i) in _BEFORE_NAME:
-        i += 1
-    if i >= len(tokens):
-        return None
-    position = tokens[i].start
-    if tokens[i].kind == TokenKind.LPAREN:
-        alias, i = _read_alias(tokens, _matching_paren(tokens, i))
-        if alias is not None:
-            out.append(_ScopeRelation(None, None, alias, position, group))
-        return i
-    if tokens[i].kind not in _IDENT or _word(tokens, i) in _ALIAS_STOP:
-        return None
-    parts = [_unquote(tokens[i])]
-    i += 1
-    while i + 1 < len(tokens) and tokens[i].kind == TokenKind.DOT and tokens[i + 1].kind in _IDENT:
-        parts.append(_unquote(tokens[i + 1]))
-        i += 2
-    if i < len(tokens) and tokens[i].kind == TokenKind.DOT:
-        return None  # `FROM sales.` is still being typed: `sales` is a schema, not a relation
-    if i < len(tokens) and tokens[i].kind == TokenKind.LPAREN:  # function arguments or an INSERT column list
-        i = _matching_paren(tokens, i)
-    alias, i = _read_alias(tokens, i)
-    out.append(_ScopeRelation(parts[-2] if len(parts) > 1 else None, parts[-1], alias, position, group))
-    return i
-
-
-def _read_relations(tokens: list[Token], i: int, out: list[_ScopeRelation], allow_list: bool, group: int) -> None:
-    """The relation(s) after FROM/JOIN/…; FROM takes a comma-separated list."""
-    while (after := _read_relation(tokens, i, out, group)) is not None:
-        if not (allow_list and after < len(tokens) and tokens[after].kind == TokenKind.COMMA):
-            return
-        i = after + 1
-
-
-def _scope(tokens: list[Token]) -> list[_ScopeRelation]:
-    """Relations referenced anywhere in the statement (subqueries and text after the cursor included)."""
-    out: list[_ScopeRelation] = []
-    open_parens: list[int] = []
-    for i, token in enumerate(tokens):
-        if token.kind == TokenKind.LPAREN:
-            open_parens.append(token.start)
-        elif token.kind == TokenKind.RPAREN and open_parens:
-            open_parens.pop()
-        elif _introduces_relation(tokens, i):
-            group = open_parens[-1] if open_parens else -1
-            _read_relations(tokens, i + 1, out, allow_list=token.upper == "FROM", group=group)
-    return out
-
-
-def _enclosing_group(before: list[Token]) -> int:
-    """The `_ScopeRelation.group` of a position after `before`."""
-    open_parens: list[int] = []
-    for token in before:
-        if token.kind == TokenKind.LPAREN:
-            open_parens.append(token.start)
-        elif token.kind == TokenKind.RPAREN and open_parens:
-            open_parens.pop()
-    return open_parens[-1] if open_parens else -1
-
-
-def _find_alias(scope: list[_ScopeRelation], name: str) -> _ScopeRelation | None:
-    lower = name.lower()
-    return next((ref for ref in scope if ref.alias is not None and ref.alias.lower() == lower), None)
-
-
-def _find_in_scope(scope: list[_ScopeRelation], name: str) -> _ScopeRelation | None:
-    """An alias first, then a relation referenced by that name."""
-    lower = name.lower()
-    by_name = (ref for ref in scope if ref.name is not None and ref.name.lower() == lower)
-    return _find_alias(scope, name) or next(by_name, None)
-
-
-def _resolve_ref(index: SnapshotIndex, ref: _ScopeRelation) -> _Resolved | None:
-    return index.resolve(ref.schema, ref.name) if ref.name is not None else None
-
-
-def _reference_name(dialect: Dialect, ref: _ScopeRelation) -> str:
-    """How the statement refers to a relation: its alias, else its own name."""
-    return quote_ident(dialect, ref.alias if ref.alias is not None else ref.name or "")
-
-
 # --- context -----------------------------------------------------------------------------------------------------
 
 
-def _context(before: list[Token]) -> _Context:
-    """Clause the cursor is in, from the last clause keyword at the cursor's parenthesis depth (AND/OR/NOT and other
-    words are passed over): "relations", "clause" (a relation was just named), "join" (right after ON), "columns"
-    (also inside an unclosed parenthesis) or "start" (no clause yet)."""
+def _context(before: list[Token]) -> tuple[_Context, str]:
+    """Clause the cursor is in, and its keyword, from the last clause keyword at the cursor's parenthesis depth
+    (AND/OR/NOT and other words are passed over): "relations", "clause" (a relation was just named), "join" (right
+    after ON), "columns" (also inside an unclosed parenthesis) or "start" (no clause yet)."""
     depth = 0
     for j in range(len(before) - 1, -1, -1):
         token = before[j]
         if token.kind == TokenKind.SEMI:
-            return "start"
+            return "start", ""
         if token.kind == TokenKind.RPAREN:
             depth += 1
         elif token.kind == TokenKind.LPAREN:
             if depth == 0:
-                return "columns"
+                return "columns", "("
             depth -= 1
         elif depth == 0 and token.kind == TokenKind.WORD:
             last = before[-1]
-            if _introduces_relation(before, j):
-                naming = last is token or last.kind == TokenKind.COMMA or last.upper in _BEFORE_NAME
-                return "relations" if naming else "clause"
+            if introduces_relation(before, j):
+                naming = last is token or last.kind == TokenKind.COMMA or last.upper in BEFORE_NAME
+                return ("relations" if naming else "clause"), token.upper
             if token.upper == "ON" and last is token:
-                return "join"
+                return "join", token.upper
             if token.upper in _COLUMN_CLAUSES:
-                return "columns"
-    return "start"
+                return "columns", token.upper
+    return "start", ""
 
 
 def _qualifier(before: list[Token]) -> list[str]:
     """`a.b.` right before the partial word → ["a", "b"]; [] when the word is not qualified."""
     parts: list[str] = []
     j = len(before) - 1
-    while j >= 1 and before[j].kind == TokenKind.DOT and before[j - 1].kind in _IDENT:
-        parts.insert(0, _unquote(before[j - 1]))
+    while j >= 1 and before[j].kind == TokenKind.DOT and before[j - 1].kind in IDENT:
+        parts.insert(0, unquote(before[j - 1]))
         j -= 2
     return parts
+
+
+# --- resolution --------------------------------------------------------------------------------------------------
+
+def _resolve_ref(index: SnapshotIndex, scope: Scope, ref: ScopeRelation) -> _Resolved | None:
+    """A CTE of the statement shadows a table of the same name, as in SQL."""
+    if ref.name is None:
+        return None
+    cte = scope.cte(ref.name) if ref.schema is None else None
+    return (_CTE_SCHEMA, cte) if cte is not None else index.resolve(ref.schema, ref.name)
+
+
+def _reference_name(dialect: Dialect, ref: ScopeRelation) -> str:
+    """How the statement refers to a relation: its alias, else its own name."""
+    return quote_ident(dialect, ref.alias if ref.alias is not None else ref.name or "")
 
 
 # --- candidate sources -------------------------------------------------------------------------------------------
 
 
-def _qualified_candidates(parts: list[str], scope: list[_ScopeRelation], index: SnapshotIndex) -> list[_Candidate]:
-    """`x.`: an alias or relation in scope → its columns; a schema → its relations; a relation → its columns."""
+def _qualified_candidates(parts: list[str], scope: Scope, index: SnapshotIndex) -> list[_Candidate]:
+    """`x.`: an alias, relation or CTE in scope → its columns; a schema → its relations; any relation → its
+    columns."""
     if len(parts) == 1:
-        ref = _find_in_scope(scope, parts[0])
+        ref = scope.find(parts[0])
         if ref is not None:
-            resolved = _resolve_ref(index, ref)
+            resolved = _resolve_ref(index, scope, ref)
             return _column_candidates(index.dialect, resolved[1]) if resolved else []
+        cte = scope.cte(parts[0])
+        if cte is not None:
+            return _column_candidates(index.dialect, cte)
         schema = index.schema(parts[0])
         if schema is not None:
             return index.relations_of(schema)
@@ -458,13 +340,18 @@ def _qualified_candidates(parts: list[str], scope: list[_ScopeRelation], index: 
     return _column_candidates(index.dialect, resolved[1]) if resolved else []
 
 
-def _scope_candidates(scope: list[_ScopeRelation], index: SnapshotIndex) -> list[_Candidate]:
+def _cte_candidates(dialect: Dialect, tokens: list[Token]) -> list[_Candidate]:
+    names = {cte.relation.name.lower(): cte.relation.name for cte in find_ctes(tokens)}
+    return _by_length(_Candidate.of(name, "table", "CTE", quote_ident(dialect, name)) for name in names.values())
+
+
+def _scope_candidates(scope: Scope, index: SnapshotIndex) -> list[_Candidate]:
     """Aliases (and unaliased relation names) of the statement, then the columns of every relation, once each."""
     names: dict[str, _Candidate] = {}
     columns: list[_Candidate] = []
     seen: set[int] = set()
-    for ref in scope:
-        resolved = _resolve_ref(index, ref)
+    for ref in scope.relations:
+        resolved = _resolve_ref(index, scope, ref)
         if ref.alias is not None:
             detail = resolved[1].name if resolved else ref.name or "subquery"
             names.setdefault(ref.alias.lower(), _Candidate.of(ref.alias, "alias", detail,
@@ -472,8 +359,7 @@ def _scope_candidates(scope: list[_ScopeRelation], index: SnapshotIndex) -> list
         elif resolved is not None:
             relation = resolved[1]
             names.setdefault(relation.name.lower(), _Candidate.of(
-                relation.name, relation.kind, f"{_kind_word(relation.kind)} in {resolved[0].name}",
-                quote_ident(index.dialect, relation.name)))
+                relation.name, relation.kind, _relation_detail(*resolved), quote_ident(index.dialect, relation.name)))
         if resolved is not None and id(resolved[1]) not in seen:
             seen.add(id(resolved[1]))
             columns.extend(_column_candidates(index.dialect, resolved[1]))
@@ -496,10 +382,11 @@ def _join_candidate(name: str, pairs: Iterable[tuple[str, str]]) -> _Candidate:
     return _Candidate(condition, "join", name, condition, _JOIN_BOOST, condition.lower())
 
 
-def _join_conditions(target: _ScopeRelation, other: _ScopeRelation, index: SnapshotIndex) -> Iterator[_Candidate]:
+def _join_conditions(target: ScopeRelation, other: ScopeRelation, scope: Scope,
+                     index: SnapshotIndex) -> Iterator[_Candidate]:
     """FKs between the relation being joined and one already in the statement, either direction; the joined
     relation's side is written first."""
-    joined, existing = _resolve_ref(index, target), _resolve_ref(index, other)
+    joined, existing = _resolve_ref(index, scope, target), _resolve_ref(index, scope, other)
     if joined is None or existing is None:
         return
     t, o = _reference_name(index.dialect, target), _reference_name(index.dialect, other)
@@ -509,17 +396,18 @@ def _join_conditions(target: _ScopeRelation, other: _ScopeRelation, index: Snaps
         yield _join_candidate(name, ((mine, theirs) for theirs, mine in pairs))
 
 
-def _join_candidates(scope: list[_ScopeRelation], before: list[Token], index: SnapshotIndex) -> list[_Candidate]:
+def _join_candidates(scope: Scope, before: list[Token], index: SnapshotIndex) -> list[_Candidate]:
     """FK join conditions for the relation just before the cursor's ON, against the relations before it in the same
     FROM (relations inside subqueries are not visible there)."""
-    offset, group = before[-1].start, _enclosing_group(before)
-    earlier = sorted((ref for ref in scope if ref.group == group and ref.position < offset), key=lambda r: r.position)
+    offset, group = before[-1].start, enclosing_group(before)
+    visible = (ref for ref in scope.relations if ref.group == group and ref.position < offset)
+    earlier = sorted(visible, key=lambda ref: ref.position)
     if not earlier:
         return []
     target = earlier[-1]
     found: dict[str, _Candidate] = {}
     for other in earlier[:-1]:
-        for candidate in _join_conditions(target, other, index):
+        for candidate in _join_conditions(target, other, scope, index):
             found.setdefault(candidate.label, candidate)
     return list(found.values())
 
@@ -528,21 +416,22 @@ def _keywords(dialect: Dialect, group: Literal["start", "clause"]) -> list[_Cand
     return _KEYWORD_CANDIDATES[(dialect, group)]
 
 
-def _candidates(before: list[Token], statement: list[Token], dialect: Dialect,
+def _candidates(before: list[Token], statement: list[Token], offset: int, dialect: Dialect,
                 index: SnapshotIndex | None) -> Iterable[_Candidate]:
-    """Everything that fits at the cursor, unfiltered. `before` are the significant tokens before the partial word,
+    """Everything that fits at `offset`, unfiltered. `before` are the significant tokens before the partial word,
     `statement` all significant tokens of the statement."""
     parts = _qualifier(before)
     if parts:
-        return _qualified_candidates(parts, _scope(statement), index) if index is not None else []
-    context = _context(before)
-    if context in ("start", "clause"):
+        return _qualified_candidates(parts, scope_at(statement, offset), index) if index is not None else []
+    context, keyword = _context(before)
+    if context == "start" or context == "clause":
         return _keywords(dialect, context)
     if index is None:
         return _keywords(dialect, "clause") if context != "relations" else []
-    if context == "relations":
-        return chain(index.relation_candidates, index.schema_candidates)
-    scope = _scope(statement)
+    if context == "relations":  # CTEs first: they win ties against schema relations
+        ctes = _cte_candidates(dialect, statement) if keyword in ("FROM", "JOIN") else []
+        return chain(ctes, index.relation_candidates, index.schema_candidates)
+    scope = scope_at(statement, offset)
     joins = _join_candidates(scope, before, index) if context == "join" else []
     return chain(joins, _scope_candidates(scope, index), index.function_candidates, _keywords(dialect, "clause"))
 
@@ -593,7 +482,7 @@ def _complete(text: str, cursor: int, dialect: Dialect, index: SnapshotIndex | N
     word_start = at.start if at is not None and at.kind == TokenKind.WORD else offset
     significant = _significant(tokens)
     before = [token for token in significant if token.end <= word_start]
-    items = _filter(_candidates(before, significant, dialect, index), text[base + word_start:cursor])
+    items = _filter(_candidates(before, significant, word_start, dialect, index), text[base + word_start:cursor])
     return CompletionResult(start=base + word_start, end=cursor, items=items)
 
 
@@ -607,29 +496,33 @@ def describe_at(text: str, cursor: int, dialect: Dialect, index: SnapshotIndex |
 
 def _identifier_at(tokens: list[Token], offset: int) -> int | None:
     """Index of the identifier under the cursor, else of the one ending right before it."""
-    under = next((j for j, t in enumerate(tokens) if t.start <= offset < t.end and t.kind in _IDENT), None)
+    under = next((j for j, t in enumerate(tokens) if t.start <= offset < t.end and t.kind in IDENT), None)
     return under if under is not None else next(
-        (j for j, t in enumerate(tokens) if t.end == offset and t.kind in _IDENT), None
+        (j for j, t in enumerate(tokens) if t.end == offset and t.kind in IDENT), None
     )
 
 
 def _describe(text: str, cursor: int, dialect: Dialect, index: SnapshotIndex) -> DescribeResult | None:
     base, end = _statement_bounds(text, cursor, dialect)
     tokens = _significant(tokenize(text[base:end], dialect))
-    j = _identifier_at(tokens, cursor - base)
+    offset = cursor - base
+    j = _identifier_at(tokens, offset)
     if j is None:
         return None
-    name = _unquote(tokens[j])
-    scope = _scope(tokens)
-    if j >= 2 and tokens[j - 1].kind == TokenKind.DOT and tokens[j - 2].kind in _IDENT:
-        left = _unquote(tokens[j - 2])
-        if _find_alias(scope, left) is not None:
+    name = unquote(tokens[j])
+    scope = scope_at(tokens, offset)
+    if j >= 2 and tokens[j - 1].kind == TokenKind.DOT and tokens[j - 2].kind in IDENT:
+        left = unquote(tokens[j - 2])
+        if scope.find_alias(left) is not None:
             return None  # `alias.column`: the identifier is a column, not a relation
         resolved = index.resolve(left, name)
+    elif (ref := scope.find(name)) is not None:
+        resolved = _resolve_ref(index, scope, ref)
     else:
-        ref = _find_in_scope(scope, name)
-        resolved = _resolve_ref(index, ref) if ref is not None else index.resolve(None, name)
-    return _describe_relation(*resolved) if resolved is not None else None
+        resolved = None if scope.cte(name) is not None else index.resolve(None, name)  # a CTE's own definition
+    if resolved is None or resolved[0] is _CTE_SCHEMA:
+        return None  # a CTE is not a database relation
+    return _describe_relation(*resolved)
 
 
 def _describe_relation(schema: SnapshotSchema, relation: SnapshotRelation) -> DescribeResult:

@@ -1,15 +1,20 @@
+import random
 import time
 from datetime import UTC, datetime
 
 import pytest
+from loguru import logger
 
 from dbaguy_backend.domain.schema import (
     SchemaSnapshot, SnapshotColumn, SnapshotForeignKey, SnapshotRelation, SnapshotSchema,
 )
-from dbaguy_backend.sql.completion import SnapshotIndex, complete, describe_at
+from dbaguy_backend.sql import completion
+from dbaguy_backend.sql.completion import (
+    CompletionResult, DescribeResult, SnapshotIndex, _complete, _describe, complete, describe_at,
+)
 from dbaguy_backend.sql.dialects import Dialect
 
-PG = Dialect.POSTGRES
+PG, LITE = Dialect.POSTGRES, Dialect.SQLITE
 
 
 def table(name, columns, pk=None, fks=None, kind="table"):
@@ -114,8 +119,11 @@ def test_without_snapshot_only_keywords():
 
 @pytest.mark.parametrize("text", ["", "(((", "'", '"', "SELECT", "SELECT * FROM", "FROM . . .", "JOIN ON ON", ";;;"])
 def test_never_raises(index, text):
-    complete(text, len(text), PG, index)
-    describe_at(text, len(text), PG, index)
+    # The unguarded cores: the public functions would turn a bug into an empty result and hide it from this test.
+    assert isinstance(_complete(text, len(text), PG, index), CompletionResult)
+    assert isinstance(_complete(text, len(text), PG, None), CompletionResult)
+    assert _describe(text, len(text), PG, index) is None or isinstance(_describe(text, len(text), PG, index),
+                                                                       DescribeResult)
 
 
 def test_describe(index):
@@ -194,3 +202,81 @@ def test_join_conditions_only_between_relations_of_the_same_from(index):
     assert joins("SELECT * FROM users u JOIN (SELECT * FROM orders) s ON |") == []  # orders is hidden in s
     assert joins("SELECT * FROM (SELECT * FROM orders) s JOIN users u ON |") == []
     assert joins("SELECT * FROM users x WHERE EXISTS (SELECT 1 FROM users u JOIN orders o ON |") == ["o.user_id = u.id"]
+
+
+def test_a_bug_degrades_to_no_items_and_is_logged_without_sql(index, monkeypatch):
+    def broken(*args):
+        raise RuntimeError("boom with SELECT secret")
+
+    monkeypatch.setattr(completion, "_statement_bounds", broken)
+    messages = []
+    sink = logger.add(messages.append, level="ERROR", format="{message}")
+    try:
+        result = complete("SELECT * FROM users", 5, PG, index)
+        described = describe_at("SELECT * FROM users", 15, PG, index)
+    finally:
+        logger.remove(sink)
+    assert result == CompletionResult(start=5, end=5, items=[]) and described is None
+    assert len(messages) == 2 and all("RuntimeError" in m for m in messages)
+    assert not any("SELECT" in m or "boom" in m for m in messages)  # neither the SQL nor the exception message
+
+
+_FUZZ_PIECES = [
+    "SELECT", "FROM", "JOIN", "ON", "WITH", "RECURSIVE", "AS", "NOT", "MATERIALIZED", "DISTINCT", "UPDATE", "FOR",
+    "INTO", "TABLE", "ONLY", "WHERE", "AND", "users", "orders", "sales", "u", "x", "id", ".", ",", "(", ")", "*", "=",
+    "'", '"', "[", "`", "--", "/*", "*/", ";", " ", "\n", "$$", "$1", "1.",
+]
+
+
+@pytest.mark.parametrize("dialect", [PG, LITE])
+def test_unguarded_cores_survive_random_token_soup(index, dialect):
+    rng = random.Random(20261016)
+    for _ in range(300):
+        text = "".join(rng.choice(_FUZZ_PIECES) for _ in range(rng.randint(0, 18)))
+        cursor = rng.randint(0, len(text))
+        _complete(text, cursor, dialect, index)
+        _complete(text, cursor, dialect, None)
+        _describe(text, cursor, dialect, index)
+
+
+# --- CTEs ---------------------------------------------------------------------------------------------------------
+
+_CTE = "WITH x AS (SELECT u.id, u.name AS full_name, count(*) n, u.email e, 1 + 2, * FROM users u) "
+
+
+def test_cte_names_after_from_rank_before_relations(index):
+    result, _ = run(_CTE + "SELECT * FROM |", index)
+    first = result.items[0]
+    assert (first.label, first.kind, first.detail) == ("x", "table", "CTE")
+    result, _ = run("WITH users_v AS (SELECT 1 AS a) SELECT * FROM us|", index)
+    assert labels(result).index("users_v") < labels(result).index("users")
+
+
+def test_cte_columns_after_its_name_or_alias(index):
+    assert labels(run(_CTE + "SELECT x.| FROM x", index)[0]) == ["id", "full_name", "n", "e"]
+    result, _ = run(_CTE + "SELECT c.| FROM x c", index)
+    assert labels(result) == ["id", "full_name", "n", "e"] and result.items[0].detail == "x"
+
+
+def test_columns_of_a_cte_in_scope_not_of_the_tables_in_its_body(index):
+    names = labels(run("WITH x AS (SELECT id FROM orders) SELECT | FROM x", index)[0])
+    assert "id" in names and "x" in names
+    assert "total" not in names and "user_id" not in names
+
+
+def test_cte_with_an_explicit_column_list(index):
+    sql = 'WITH RECURSIVE t (a, "B") AS NOT MATERIALIZED (SELECT 1, 2 UNION ALL SELECT a + 1, 2 FROM t) '
+    assert labels(run(sql + "SELECT t.| FROM t", index)[0]) == ["a", "B"]
+
+
+def test_cursor_inside_a_cte_body_sees_that_body_only(index):
+    sql = "WITH x AS (SELECT | FROM orders o), y AS (SELECT * FROM users) SELECT * FROM x"
+    names = labels(run(sql, index)[0])
+    assert {"total", "user_id", "o"} <= set(names)
+    assert "email" not in names  # users belongs to the other CTE
+
+
+def test_describe_on_a_cte_name_is_none(index):
+    sql = "WITH users AS (SELECT 1 AS a) SELECT * FROM users"
+    assert describe_at(sql, sql.rindex("users") + 1, PG, index) is None  # the CTE shadows the table
+    assert describe_at(sql, sql.index("users") + 1, PG, index) is None  # its definition
