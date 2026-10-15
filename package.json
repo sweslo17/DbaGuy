@@ -12,7 +12,7 @@
     "dev:all": "bash scripts/dev.sh",
     "dev:web": "bash scripts/dev.sh --web",
     "build:backend": "bash scripts/build-backend.sh",
-    "build:app": "bash scripts/build-backend.sh && tauri build --bundles app"
+    "build:app": "bash scripts/build-backend.sh && tauri build --bundles app && bash scripts/finalize-app.sh"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.104.3",
