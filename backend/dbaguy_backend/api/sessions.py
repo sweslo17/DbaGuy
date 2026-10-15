@@ -14,6 +14,13 @@ from .deps import get_container, require_token, websocket_token_ok
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 _COMMANDS: TypeAdapter[Any] = TypeAdapter(ClientCommand)
+_CLOSE_UNAUTHORIZED = 4401
+_CLOSE_SESSION_NOT_FOUND = 4404
+
+
+async def _reject(websocket: WebSocket, code: int, reason: str) -> None:
+    logger.info("WebSocket {} rejected: {} ({})", websocket.url.path, reason, code)
+    await websocket.close(code=code, reason=reason)
 
 
 @router.post("", response_model=SessionInfo, status_code=201, dependencies=[Depends(require_token)])
@@ -36,15 +43,17 @@ def execution_schema() -> ExecutionSchema:
 @router.websocket("/{session_id}/ws")
 async def session_socket(websocket: WebSocket, session_id: str) -> None:
     container: AppContainer = websocket.app.state.container
+    # Accept before any rejection: closing an unaccepted socket is an HTTP 403 handshake failure, which browsers
+    # report as close code 1006, so the client could never tell a bad token from an unknown session.
+    await websocket.accept()
     if not websocket_token_ok(websocket):
-        await websocket.close(code=4401)
+        await _reject(websocket, _CLOSE_UNAUTHORIZED, "Invalid token")
         return
     try:
         container.sessions.worker(session_id)
     except SessionNotFound:
-        await websocket.close(code=4404)
+        await _reject(websocket, _CLOSE_SESSION_NOT_FOUND, "Session not found")
         return
-    await websocket.accept()
     loop = asyncio.get_running_loop()
     outbox: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 

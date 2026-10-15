@@ -1,8 +1,14 @@
+import socket
 import sqlite3
+import threading
+import time
 
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
+from websockets.exceptions import ConnectionClosed
+from websockets.sync.client import connect
 
 from dbaguy_backend.app import create_app
 from dbaguy_backend.config import Settings
@@ -148,3 +154,39 @@ def test_unexpected_errors_do_not_leak_details(tmp_path):
         response = test_client.get("/profiles", headers=AUTH)
     assert response.status_code == 500
     assert response.json() == {"error": {"code": "internal_error", "message": "Internal error"}}
+
+
+@pytest.fixture
+def live_port(tmp_path):
+    """The app under a real uvicorn server: TestClient hides how a close-before-accept looks on the wire."""
+    settings = Settings(token=TOKEN, data_dir=tmp_path / "data", log_to_file=False)
+    app = create_app(settings, AppContainer(settings, secret_store=InMemorySecretStore()))
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    server = uvicorn.Server(uvicorn.Config(app, log_config=None, access_log=False))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, name="test-uvicorn", daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.started, "uvicorn did not start"
+    try:
+        yield sock.getsockname()[1]
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+        sock.close()
+        assert not thread.is_alive(), "uvicorn did not shut down"
+
+
+@pytest.mark.parametrize(
+    ("session_id", "token", "expected_code"),
+    [("anything", "bad", 4401), ("no-such-session", TOKEN, 4404)],
+    ids=["bad_token", "unknown_session"],
+)
+def test_websocket_close_codes_are_visible_to_a_real_client(live_port, session_id, token, expected_code):
+    # Closing before accept() would be an HTTP 403 handshake rejection: a browser then only sees 1006.
+    with connect(f"ws://127.0.0.1:{live_port}/sessions/{session_id}/ws?token={token}", open_timeout=2) as ws:
+        with pytest.raises(ConnectionClosed) as closed:
+            ws.recv(timeout=2)
+    assert closed.value.rcvd is not None and closed.value.rcvd.code == expected_code
