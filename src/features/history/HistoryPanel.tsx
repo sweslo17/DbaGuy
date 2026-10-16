@@ -124,7 +124,11 @@ function Preview({ entry, onClose }: { entry: HistoryEntry; onClose: () => void 
           {shortened ? `${cut(entry.sql, PREVIEW_CHARS)}…` : entry.sql}
         </pre>
         {shortened && (
-          <button type="button" className="mt-1 text-[11px] text-accent hover:underline" onClick={() => setShowAll(true)}>
+          <button
+            type="button"
+            className="mt-1 text-[11px] text-accent hover:underline"
+            onClick={() => setShowAll(true)}
+          >
             Show all ({entry.sql.length.toLocaleString()} characters)
           </button>
         )}

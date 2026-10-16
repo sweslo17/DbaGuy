@@ -34,8 +34,8 @@ export function Dialog({
   const content = useRef<HTMLDivElement>(null);
   /** What had the focus when the dialog opened; it gets it back on close (ruling R-02c-18). */
   const opener = useRef<Element | null>(null);
-  // Recorded as `open` turns true, before anything inside can take the focus: Radix's Portal mounts the content a commit
-  // later, so not even a child's `autoFocus` (the close guard's Cancel, Unlock's field) has run yet.
+  // Recorded as `open` turns true, before anything inside can take the focus: Radix's Portal mounts the content a
+  // commit later, so not even a child's `autoFocus` (the close guard's Cancel, Unlock's field) has run yet.
   useLayoutEffect(() => {
     if (open) opener.current = document.activeElement;
   }, [open]);

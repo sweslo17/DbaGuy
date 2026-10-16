@@ -104,7 +104,7 @@ const seconds = (value: number) => (value > 0 ? `${value.toLocaleString()} s` : 
  * the backend's. A typed value applies once the field is left (or on Enter); one out of range is not taken.
  */
 function TimeoutField({ seconds: value, setting, followsSetting, onChange, onDone }: TimeoutControl) {
-  /** What is being typed; null while the field shows the value. Mirrored in a ref: Enter and the blur it causes both commit. */
+  /** What is being typed (null: the field shows the value); in a ref too, as Enter and its blur both commit. */
   const [draft, setDraft] = useState<string | null>(null);
   const typed = useRef<string | null>(null);
   const edit = (text: string | null) => {
