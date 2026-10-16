@@ -1,33 +1,16 @@
-import logging
-from enum import StrEnum
+import threading
+import time
+from types import ModuleType
 
-import sqlglot
 from loguru import logger
-from pydantic import BaseModel
-from sqlglot import exp
 
-from .dialects import SQLGLOT_NAME, Dialect
-from .lexer import TokenKind, tokenize
+# The models live in the domain (the execution protocol carries them); re-exported here for the sql/ callers.
+from ..domain.classification import Classification, DangerReason, StatementKind
+from .dialects import Dialect
+from .lexer import INSIGNIFICANT, TokenKind, tokenize
 from .splitter import split
 
-# sqlglot warns "'<sql text>' contains unsupported syntax" whenever it falls back to a Command, which is routine here
-# (CALL, LOCK, REPLACE INTO, ...) and would put statement text into the log above DEBUG.
-logging.getLogger("sqlglot").setLevel(logging.CRITICAL)
-
-
-class StatementKind(StrEnum):
-    READ = "read"
-    WRITE = "write"
-    DDL = "ddl"
-    TRANSACTION = "transaction"
-    SESSION = "session"
-    UNKNOWN = "unknown"
-
-
-class Classification(BaseModel):
-    kind: StatementKind
-    dangerous_reasons: list[str] = []
-
+__all__ = ["Classification", "DangerReason", "StatementKind", "classify", "warm_up"]
 
 _KEYWORD_KIND: dict[str, StatementKind] = {
     **dict.fromkeys(
@@ -49,7 +32,6 @@ _KEYWORD_KIND: dict[str, StatementKind] = {
         StatementKind.SESSION,
     ),
 }
-_DML = (exp.Insert, exp.Update, exp.Delete, exp.Merge)
 # Least to most cautious: when a script mixes kinds, the strictest one decides (unknown is the most cautious).
 _SEVERITY = (
     StatementKind.READ,
@@ -78,19 +60,19 @@ def _lexical(sql: str, dialect: Dialect) -> Classification:
         locks = any(a == "FOR" and b in ("UPDATE", "SHARE", "NO", "KEY") for a, b in zip(words, words[1:]))
         if has_dml or locks:
             kind = StatementKind.WRITE
-    reasons: list[str] = []
+    reasons: list[DangerReason] = []
     if first == "DROP":
-        reasons.append("drop")
+        reasons.append(DangerReason.DROP)
     elif first == "TRUNCATE":
-        reasons.append("truncate")
+        reasons.append(DangerReason.TRUNCATE)
     elif first in ("UPDATE", "DELETE") and "WHERE" not in words:
-        reasons.append("update_without_where" if first == "UPDATE" else "delete_without_where")
+        reasons.append(DangerReason.UPDATE_WITHOUT_WHERE if first == "UPDATE" else DangerReason.DELETE_WITHOUT_WHERE)
     return Classification(kind=kind, dangerous_reasons=reasons)
 
 
 def _explain_inner(sql: str, dialect: Dialect) -> str | None:
     """For EXPLAIN ANALYZE ..., return the analysed statement text; None for plain EXPLAIN."""
-    tokens = [t for t in tokenize(sql, dialect) if t.kind not in (TokenKind.SPACE, TokenKind.COMMENT)]
+    tokens = [t for t in tokenize(sql, dialect) if t.kind not in INSIGNIFICANT]
     if not tokens or tokens[0].upper != "EXPLAIN":
         return None
     i, analyze = 1, False
@@ -115,67 +97,46 @@ def _explain_inner(sql: str, dialect: Dialect) -> str | None:
     return sql[tokens[i].start:]
 
 
-def _unfiltered_dml(node: exp.Expression) -> list[str]:
-    """Dangerous reasons for every UPDATE/DELETE without WHERE in `node`, including ones inside CTEs.
+_rules_lock = threading.Lock()
 
-    The UPDATE action of MERGE ... WHEN MATCHED is modelled as an exp.Update without WHERE; it is not a statement.
+
+def _sqlglot_rules() -> ModuleType:
+    """The sqlglot half of the classifier, imported on first use (sqlglot is slow to import).
+
+    One importer at a time: two threads importing sqlglot's interdependent modules at once (the start-up warm-up and
+    a first request) could see one of them half-initialised.
     """
-    reasons: list[str] = []
-    for child in node.walk():
-        if isinstance(child.parent, exp.When):
-            continue
-        if isinstance(child, exp.Update) and not child.args.get("where"):
-            reasons.append("update_without_where")
-        elif isinstance(child, exp.Delete) and not child.args.get("where"):
-            reasons.append("delete_without_where")
-    return list(dict.fromkeys(reasons))
+    with _rules_lock:
+        from . import sqlglot_rules
+    return sqlglot_rules
 
 
-def _from_expression(node: exp.Expression) -> Classification | None:
-    if isinstance(node, exp.Drop):
-        return Classification(kind=StatementKind.DDL, dangerous_reasons=["drop"])
-    if isinstance(node, exp.TruncateTable):
-        return Classification(kind=StatementKind.DDL, dangerous_reasons=["truncate"])
-    if isinstance(node, exp.Alter):
-        drops = any(isinstance(child, exp.Drop) for child in node.walk() if child is not node)
-        return Classification(kind=StatementKind.DDL, dangerous_reasons=["alter_drop"] if drops else [])
-    if isinstance(node, exp.Create):
-        return Classification(kind=StatementKind.DDL)
-    if isinstance(node, _DML):
-        return Classification(kind=StatementKind.WRITE, dangerous_reasons=_unfiltered_dml(node))
-    if isinstance(node, (exp.Transaction, exp.Commit, exp.Rollback)):
-        return Classification(kind=StatementKind.TRANSACTION)
-    if isinstance(node, (exp.Set, exp.Use)):
-        return Classification(kind=StatementKind.SESSION)
-    if isinstance(node, exp.Query):
-        if node.find(exp.Into):  # SELECT ... INTO creates a table
-            return Classification(kind=StatementKind.DDL)
-        writes = any(isinstance(child, _DML) for child in node.walk())
-        locks = node.find(exp.Lock) is not None  # FOR UPDATE/SHARE, also inside a CTE or subquery
-        if writes or locks:
-            return Classification(kind=StatementKind.WRITE, dangerous_reasons=_unfiltered_dml(node))
-        return Classification(kind=StatementKind.READ)
-    return None
+def _from_sqlglot(sql: str, dialect: Dialect) -> list[Classification | None] | None:
+    """One classification per statement sqlglot finds in `sql` (None where the syntax tree says nothing useful, e.g.
+    a Command); None when sqlglot cannot parse `sql`, so the keyword rules decide instead.
 
-
-def _parse_single(sql: str, dialect: Dialect) -> exp.Expression | None:
-    """The one statement sqlglot understands in `sql`; None when it is empty, several, a Command or unparseable."""
+    Logs the exception type only: sqlglot's messages quote the statement.
+    """
     try:
-        parsed = [e for e in sqlglot.parse(sql, read=SQLGLOT_NAME[dialect]) if e is not None]
-    except Exception as exc:  # ParseError, TokenError, RecursionError on absurd nesting, a sqlglot bug: all fall back
-        logger.debug("sqlglot could not parse the statement ({}); using the lexical fallback", type(exc).__name__)
+        rules = _sqlglot_rules()
+    except Exception as exc:  # e.g. an app bundle without sqlglot: a packaging bug, not a statement problem
+        logger.warning("sqlglot is unavailable ({}); classifying by keywords only", type(exc).__name__)
         return None
-    if len(parsed) != 1 or isinstance(parsed[0], exp.Command):
-        return None
-    return parsed[0]
+    try:
+        return [rules.classify_expression(node) for node in rules.parse(sql, dialect)]
+    except rules.EXPECTED_FAILURES as exc:
+        logger.debug("sqlglot could not parse the statement ({}); using the keyword rules", type(exc).__name__)
+    except Exception as exc:  # e.g. a dialect missing from an app bundle, or a sqlglot bug
+        logger.warning("sqlglot failed on a statement ({}); using the keyword rules", type(exc).__name__)
+    return None
 
 
 def _classify_statement(sql: str, dialect: Dialect) -> Classification:
     while (inner := _explain_inner(sql, dialect)) is not None:  # EXPLAIN ANALYZE runs the statement it explains
         sql = inner
-    node = _parse_single(sql, dialect)
-    if node is not None and (result := _from_expression(node)) is not None:
-        return result
+    found = _from_sqlglot(sql, dialect)
+    if found is not None and len(found) == 1 and found[0] is not None:
+        return found[0]
     return _lexical(sql, dialect)
 
 
@@ -196,3 +157,11 @@ def classify(sql: str, dialect: Dialect) -> Classification:
     if len(spans) > 1:
         return _combine([_classify_statement(span.text, dialect) for span in spans])
     return _classify_statement(sql, dialect)
+
+
+def warm_up() -> None:
+    """Import sqlglot and parse one statement per dialect, so the first real classification does not pay for it."""
+    started = time.perf_counter()
+    for dialect in Dialect:
+        _from_sqlglot("SELECT 1", dialect)
+    logger.debug("SQL classifier warmed up in {:.0f} ms", (time.perf_counter() - started) * 1000)

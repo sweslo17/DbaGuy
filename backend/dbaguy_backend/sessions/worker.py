@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from ..adapters.base import DatabaseConnection, StatementCancelled, StatementError, StatementResult
 from ..adapters.values import encode_row
+from ..domain.classification import Classification, StatementKind
 from ..domain.errors import ConnectionFailed, SessionBusy
 from ..domain.execution import (
     AffectedEvent,
@@ -39,7 +40,6 @@ from ..domain.execution import (
 )
 from ..domain.formats import FormatColumn, FormatKind
 from ..services.safety import GuardAction, GuardDecision
-from ..sql.classifier import Classification, StatementKind
 from ..sql.dialects import Dialect
 from ..sql.formatting import open_writer
 from ..storage.atomic_file import atomic_text_file

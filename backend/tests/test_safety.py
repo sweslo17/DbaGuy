@@ -1,5 +1,6 @@
 import pytest
 
+from dbaguy_backend.domain.classification import Classification, DangerReason, GuardReason, StatementKind
 from dbaguy_backend.domain.profiles import SqliteProfileDraft
 from dbaguy_backend.services.safety import GuardAction as A, SafetyPolicy
 from dbaguy_backend.sql.dialects import Dialect
@@ -65,3 +66,21 @@ def test_set_config_runs_when_the_profile_is_not_read_only():
 
 def test_profiles_default_to_standard():
     assert SqliteProfileDraft(engine="sqlite", name="x", path="/tmp/x.db").safety == "standard"
+
+
+def test_guard_reasons_are_the_danger_reasons_plus_the_strict_and_read_only_ones():
+    strict = {"strict_write", "strict_ddl", "strict_transaction", "strict_session", "strict_unknown"}
+    assert {r.value for r in GuardReason} == {r.value for r in DangerReason} | strict | {"read_only"}
+
+
+@pytest.mark.parametrize("kind", [k for k in StatementKind if k != StatementKind.READ])
+def test_strict_confirms_every_kind_but_read_with_a_typed_reason(kind):
+    decision = policy.decide("x", Classification(kind=kind), PG, "strict", read_only=False)
+    assert decision.action == A.CONFIRM and decision.reasons == [GuardReason(f"strict_{kind}")]
+    assert all(isinstance(reason, GuardReason) for reason in decision.reasons)
+
+
+def test_guard_reasons_are_plain_strings_on_the_wire():
+    decision = policy.check("UPDATE t SET x = 1", PG, "standard", read_only=False)
+    assert decision.model_dump(mode="json")["reasons"] == ["update_without_where"]
+    assert isinstance(decision.reasons[0], GuardReason)

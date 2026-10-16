@@ -8,6 +8,15 @@ hiddenimports = [
     "keyring.backends.macOS",
     "psycopg_binary",
     *collect_submodules("psycopg_binary"),
+    # sqlglot looks dialects up by name with importlib, which the analysis cannot follow. The classifier imports the
+    # ones it uses by name (dbaguy_backend/sql/sqlglot_rules.py); these keep them, and what they load, bundled anyway.
+    "sqlglot.dialects.postgres",
+    "sqlglot.dialects.sqlite",
+    "sqlglot.parsers.postgres",
+    "sqlglot.parsers.sqlite",
+    "sqlglot.generators.postgres",
+    "sqlglot.generators.sqlite",
+    "sqlglot.typing.postgres",
 ]
 
 a = Analysis(

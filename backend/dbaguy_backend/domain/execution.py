@@ -4,7 +4,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
-from ..sql.classifier import Classification
+from .classification import Classification, GuardReason
 from .column_category import ColumnCategory
 from .formats import FormatKind, RowFormatOptions
 
@@ -156,7 +156,7 @@ class ConfirmationRequiredEvent(BaseModel):
 
     type: Literal["confirmation_required"] = "confirmation_required"
     request_id: str
-    reasons: list[str]
+    reasons: list[GuardReason]
     classification: Classification
 
 

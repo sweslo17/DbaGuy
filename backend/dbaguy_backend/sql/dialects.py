@@ -1,11 +1,7 @@
 import re
 from dataclasses import dataclass
-from enum import StrEnum
 
-
-class Dialect(StrEnum):
-    POSTGRES = "postgres"
-    SQLITE = "sqlite"
+from ..domain.dialect import Dialect  # the key of every rule table in sql/; imported from here by the sql modules
 
 
 @dataclass(frozen=True)
@@ -30,8 +26,6 @@ RULES: dict[Dialect, LexRules] = {
         block_bodies=frozenset({"trigger"}),
     ),
 }
-
-SQLGLOT_NAME: dict[Dialect, str] = {Dialect.POSTGRES: "postgres", Dialect.SQLITE: "sqlite"}
 
 PG_RESERVED = frozenset(
     """all analyse analyze and any array as asc asymmetric authorization binary both case cast check

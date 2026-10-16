@@ -39,7 +39,8 @@ _DOLLAR_TAG = re.compile(r"\$(?:[A-Za-z_\u0080-\U0010ffff][A-Za-z0-9_\u0080-\U00
 _DOLLAR_PARAM = re.compile(r"\$\d+")
 _NUMBER = re.compile(r"\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?")
 _PUNCT = {";": TokenKind.SEMI, ".": TokenKind.DOT, ",": TokenKind.COMMA, "(": TokenKind.LPAREN, ")": TokenKind.RPAREN}
-_SKIPPED = frozenset({TokenKind.SPACE, TokenKind.COMMENT})
+# Tokens that never change what a statement means: skipped wherever statements are read word by word.
+INSIGNIFICANT = frozenset({TokenKind.SPACE, TokenKind.COMMENT})
 
 
 def _ident_start(ch: str) -> bool:
@@ -149,7 +150,7 @@ def tokenize(text: str, dialect: Dialect) -> list[Token]:
 
 def first_token(text: str, dialect: Dialect) -> Token | None:
     """First token that is neither whitespace nor a comment; stops scanning there. None if there is none."""
-    return next((token for token in _scan(text, dialect) if token.kind not in _SKIPPED), None)
+    return next((token for token in _scan(text, dialect) if token.kind not in INSIGNIFICANT), None)
 
 
 def first_keyword(text: str, dialect: Dialect) -> str:

@@ -4,7 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..sql.dialects import Dialect
+from .dialect import Dialect
 
 
 class Engine(StrEnum):

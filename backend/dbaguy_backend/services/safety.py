@@ -2,13 +2,21 @@ from enum import StrEnum
 
 from pydantic import BaseModel
 
+from ..domain.classification import Classification, GuardReason, StatementKind
 from ..domain.profiles import SafetyLevel
-from ..sql.classifier import Classification, StatementKind, classify
+from ..sql.classifier import classify
 from ..sql.dialects import Dialect
 from ..sql.lexer import TokenKind, tokenize
 
-READ_ONLY = "read_only"
 _SET_CONFIG = "SET_CONFIG"  # a SELECT can call it to switch default_transaction_read_only off
+# At the strict level every statement that is not a read is confirmed, naming its kind.
+_STRICT_REASON: dict[StatementKind, GuardReason] = {
+    StatementKind.WRITE: GuardReason.STRICT_WRITE,
+    StatementKind.DDL: GuardReason.STRICT_DDL,
+    StatementKind.TRANSACTION: GuardReason.STRICT_TRANSACTION,
+    StatementKind.SESSION: GuardReason.STRICT_SESSION,
+    StatementKind.UNKNOWN: GuardReason.STRICT_UNKNOWN,
+}
 
 
 class GuardAction(StrEnum):
@@ -19,7 +27,7 @@ class GuardAction(StrEnum):
 
 class GuardDecision(BaseModel):
     action: GuardAction
-    reasons: list[str] = []
+    reasons: list[GuardReason] = []
     classification: Classification
 
 
@@ -36,7 +44,9 @@ class SafetyPolicy:
         confirmed: bool = False,
     ) -> GuardDecision:
         if read_only and not self._allowed_when_read_only(sql, classification, dialect):
-            return GuardDecision(action=GuardAction.BLOCK, reasons=[READ_ONLY], classification=classification)
+            return GuardDecision(
+                action=GuardAction.BLOCK, reasons=[GuardReason.READ_ONLY], classification=classification
+            )
         reasons = self._confirmation_reasons(classification, level)
         if reasons and not confirmed:
             return GuardDecision(action=GuardAction.CONFIRM, reasons=reasons, classification=classification)
@@ -55,9 +65,10 @@ class SafetyPolicy:
         return False
 
     @staticmethod
-    def _confirmation_reasons(classification: Classification, level: SafetyLevel) -> list[str]:
+    def _confirmation_reasons(classification: Classification, level: SafetyLevel) -> list[GuardReason]:
         if level == "relaxed":
             return []
+        dangers = [GuardReason(reason) for reason in classification.dangerous_reasons]
         if level == "strict" and classification.kind != StatementKind.READ:
-            return list(classification.dangerous_reasons) or [f"strict_{classification.kind}"]
-        return list(classification.dangerous_reasons)
+            return dangers or [_STRICT_REASON[classification.kind]]
+        return dangers

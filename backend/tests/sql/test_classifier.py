@@ -1,9 +1,19 @@
+import json
 import logging
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import pytest
+import sqlglot
+from loguru import logger
+from sqlglot import exp
+from sqlglot.dialects.dialect import Dialect as SqlglotDialect
 
+from dbaguy_backend.domain.classification import DangerReason
 from dbaguy_backend.sql.classifier import StatementKind as K
-from dbaguy_backend.sql.classifier import classify
+from dbaguy_backend.sql.classifier import classify, warm_up
 from dbaguy_backend.sql.dialects import Dialect
 
 PG, LITE = Dialect.POSTGRES, Dialect.SQLITE
@@ -113,3 +123,88 @@ def test_sqlglot_does_not_log_statement_text(caplog):
     with caplog.at_level(logging.DEBUG):
         assert classify("CALL secret_proc('hunter2')", PG).kind == K.WRITE  # sqlglot parses CALL as a Command
     assert "hunter2" not in caplog.text
+
+
+# ---- sqlglot: dialects resolved by explicit import, failures visible (packaged app) ----
+
+def _warnings_while(action):
+    messages = []
+    sink = logger.add(lambda m: messages.append(m.record["message"]), level="WARNING")
+    try:
+        result = action()
+    finally:
+        logger.remove(sink)
+    return result, messages
+
+
+@pytest.mark.parametrize("dialect", list(Dialect))
+def test_every_dialect_parses_through_sqlglot_resolved_by_import(dialect, monkeypatch):
+    calls = []
+    real = sqlglot.parse
+
+    def spy(sql, read=None, **opts):
+        parsed = real(sql, read=read, **opts)
+        calls.append((read, parsed))
+        return parsed
+
+    monkeypatch.setattr(sqlglot, "parse", spy)
+    assert classify("SELECT 1", dialect).kind == K.READ
+    [(read, parsed)] = calls
+    # A sqlglot dialect class, not a name: sqlglot looks names up with importlib, which PyInstaller cannot follow.
+    assert isinstance(read, type) and issubclass(read, SqlglotDialect)
+    assert [type(e) for e in parsed] == [exp.Select]
+
+
+def test_dialects_survive_a_bundle_without_sqlglots_by_name_lookups():
+    # What the packaged app saw: importlib.import_module("sqlglot.dialects.postgres") raised ModuleNotFoundError.
+    code = textwrap.dedent("""
+        import importlib, json
+        real = importlib.import_module
+        def bundled_only(name, package=None):
+            if name.startswith("sqlglot.dialects.") and name != "sqlglot.dialects.dialect":
+                raise ModuleNotFoundError(f"No module named {name!r}")
+            return real(name, package)
+        importlib.import_module = bundled_only
+        from dbaguy_backend.sql.classifier import classify
+        from dbaguy_backend.sql.dialects import Dialect
+        print(json.dumps([classify("ALTER TABLE t DROP COLUMN a", d).dangerous_reasons for d in Dialect]))
+    """)
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
+                            cwd=Path(__file__).parents[2])
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [["alter_drop"]] * len(Dialect)  # parsed, not the keyword fallback
+
+
+def test_an_unexpected_sqlglot_failure_is_a_warning_naming_only_the_exception(monkeypatch):
+    def missing(*args, **kwargs):
+        raise ModuleNotFoundError("No module named 'sqlglot.dialects.postgres'")
+
+    monkeypatch.setattr(sqlglot, "parse", missing)
+    result, warnings = _warnings_while(lambda: classify("DELETE FROM secret_table", PG))
+    assert result.kind == K.WRITE and result.dangerous_reasons == ["delete_without_where"]  # the keyword fallback
+    assert len(warnings) == 1 and "ModuleNotFoundError" in warnings[0] and "secret_table" not in warnings[0]
+
+
+def test_parse_errors_stay_quiet():
+    _, warnings = _warnings_while(lambda: classify("SELECT (", PG))
+    assert warnings == []
+
+
+def test_reasons_are_typed_but_stay_plain_strings_on_the_wire():
+    result = classify("DROP TABLE a; UPDATE t SET x = 1", PG)
+    assert all(isinstance(reason, DangerReason) for reason in result.dangerous_reasons)
+    assert result.model_dump(mode="json")["dangerous_reasons"] == ["drop", "update_without_where"]
+
+
+def test_warm_up_parses_once_per_dialect_and_logs_its_duration(monkeypatch):
+    calls = []
+    real = sqlglot.parse
+    monkeypatch.setattr(sqlglot, "parse", lambda sql, read=None, **o: calls.append(read) or real(sql, read=read, **o))
+    messages = []
+    sink = logger.add(lambda m: messages.append(m.record["message"]), level="DEBUG")
+    try:
+        warm_up()
+    finally:
+        logger.remove(sink)
+    assert len(calls) == len(Dialect)
+    assert any("warmed up" in m and " ms" in m for m in messages)

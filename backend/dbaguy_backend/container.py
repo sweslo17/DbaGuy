@@ -19,6 +19,7 @@ from .services.settings_service import SettingsService
 from .services.workspace_service import WorkspaceService
 from .sessions.hooks import SessionHooksFactory
 from .sessions.manager import SessionManager
+from .sql.classifier import warm_up
 from .storage.paths import default_scripts_dir, history_file, profiles_file, settings_file, workspace_file
 from .storage.profile_store import ProfileStore
 from .storage.secret_store import KeyringSecretStore, SecretStore
@@ -58,6 +59,11 @@ class AppContainer:
     def start(self) -> None:
         self._housekeeper = threading.Thread(target=self._housekeep, name="housekeeping", daemon=True)
         self._housekeeper.start()
+        # sqlglot is imported on first use, off the start-up path; load it now, before the first statement needs it.
+        threading.Thread(
+            target=self._guarded, args=("Warming up the SQL classifier", warm_up), name="classifier-warm-up",
+            daemon=True,
+        ).start()
 
     def _housekeep(self) -> None:
         while not self._stop.wait(_HOUSEKEEPING_INTERVAL_S):

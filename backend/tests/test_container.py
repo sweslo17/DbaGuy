@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from dbaguy_backend.config import Settings
@@ -64,3 +66,19 @@ def test_start_and_close_housekeeping_thread(container):
     container.close()
     container._housekeeper.join(timeout=2)
     assert not container._housekeeper.is_alive()
+
+
+def test_start_warms_the_sql_parser_up_in_a_background_thread(container, monkeypatch):
+    ran, seen = threading.Event(), []
+
+    def warm_up() -> None:
+        seen.append(threading.current_thread())
+        ran.set()
+
+    monkeypatch.setattr("dbaguy_backend.container.warm_up", warm_up, raising=False)
+    container.start()
+    try:
+        assert ran.wait(5)
+        assert seen[0] is not threading.main_thread() and seen[0].daemon
+    finally:
+        container.close()
