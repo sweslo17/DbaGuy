@@ -3,6 +3,7 @@ import { api, errorMessage, unwrap } from "@/lib/api/client";
 import type { ColumnMeta, Dialect, FormatResult, FormatRowsRequest } from "@/lib/api/types";
 import { BYTES_PREVIEW, plainValue, type EncodedCell } from "@/lib/cells";
 import { plural } from "@/lib/format";
+import { writeClipboard } from "@/lib/native";
 import { cellCount, type Rect } from "./selection";
 
 export type CopyFormat = "tsv" | "csv" | "json" | "markdown" | "insert" | "in_list" | "column_names";
@@ -63,28 +64,6 @@ function cellsOf(rows: unknown[][], rect: Rect): unknown[][] {
 
 async function formatRows(body: FormatRowsRequest): Promise<FormatResult> {
   return unwrap(await (await api()).POST("/sql/format-rows", { body }));
-}
-
-/**
- * Puts text that may still be on its way onto the clipboard. The clipboard call starts synchronously, inside the
- * user's gesture: WebKit (the Tauri webview) only writes during one, and the formatter's round trip outlives it, so
- * the text goes in as a promise inside a ClipboardItem. Engines that take no promise there get `writeText` once the
- * text is known (Chromium writes without a gesture).
- */
-async function writeClipboard(text: Promise<string>): Promise<void> {
-  const clipboard = navigator.clipboard as Clipboard | undefined;
-  if (!clipboard) throw new Error("The clipboard is not available");
-  if (typeof ClipboardItem !== "undefined" && typeof clipboard.write === "function") {
-    const blob = text.then((value) => new Blob([value], { type: "text/plain" }));
-    blob.catch(() => undefined); // a format error is reported by the caller
-    try {
-      await clipboard.write([new ClipboardItem({ "text/plain": blob })]);
-      return;
-    } catch {
-      // No promise support, or the text failed (then `await text` below rethrows that error).
-    }
-  }
-  await clipboard.writeText(await text);
 }
 
 /**

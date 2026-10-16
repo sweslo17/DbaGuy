@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/Button";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import { pathKey, type ColumnInfo, type ObjectDetail } from "@/lib/api/types";
+import { writeClipboard } from "@/lib/native";
 import type { ObjectTab } from "@/stores/workspace";
 import { kindLabel } from "./kinds";
 
@@ -15,7 +16,7 @@ function CopyDdlButton({ ddl }: { ddl: string }) {
   useEffect(() => () => clearTimeout(timer.current), []);
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(ddl);
+      await writeClipboard(ddl);
       setResult("copied");
     } catch {
       setResult("failed"); // e.g. the webview denied clipboard access
