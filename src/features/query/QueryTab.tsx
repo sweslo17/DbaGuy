@@ -67,9 +67,17 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     onStatement: (index) => withView((v) => flashStatement(v, index)),
     onSettled: (index, execution) => withView((v) => markStatementError(v, index, execution)),
   }));
-  const timeoutS = settings.run.statement_timeout_s > 0 ? settings.run.statement_timeout_s : null;
+  // The tab's own statement timeout (ruling R-02c-20), in memory only (R-02c-1); null follows the setting, also when
+  // it changes later.
+  const [ownTimeout, setOwnTimeout] = useState<number | null>(null);
+  const timeout = ownTimeout ?? settings.run.statement_timeout_s;
+  const timeoutS = timeout > 0 ? timeout : null;
   const runner = useQueryRunner({ controller, profileId: tab.profileId, settings, timeoutS, listener });
   const { run } = runner;
+  /** The text is being split into statements for a run (a long script that was not split yet takes a moment). */
+  const [splitting, setSplitting] = useState(false);
+  /** Cancel was pressed while splitting: nothing is run. */
+  const planCancelled = useRef(false);
 
   const profile = profiles.data?.find((entry) => entry.profile.id === tab.profileId)?.profile ?? null;
   const profileName = tab.profileId === null ? null : (profile?.name ?? "…");
@@ -83,9 +91,12 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   const lastRequestId = run?.steps.findLast((step) => step.requestId !== null)?.requestId ?? null;
   const loadingMore = !running && !!lastRequestId && snapshot?.executions[lastRequestId]?.status === "running";
   const cancel = () => {
-    if (running) runner.cancel();
+    if (splitting) planCancelled.current = true;
+    else if (running || runner.checking) runner.cancel();
     else if (lastRequestId) controller?.cancel(lastRequestId);
   };
+  /** Splitting or checking the statements before a run sends any (Cancel stops it). */
+  const checking = splitting || runner.checking;
   const sessionBusy = busy(snapshot);
   // Nothing runs before the session has reported its state and taken the tab's auto-commit mode: a statement sent
   // earlier would run in the wrong mode.
@@ -150,15 +161,20 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     const current = view();
     if (!canRun || !current || dialect === null || planning.current) return;
     planning.current = true;
+    planCancelled.current = false;
     try {
       const plannedDoc = current.state.doc; // planRun reads the text before its first await
       let planned: PlannedStatement[];
+      setSplitting(true);
       try {
         planned = await planRun(current, mode, settings.run.default, dialect);
       } catch (error) {
         toast("error", `Could not split the text into statements: ${errorMessage(error)}`);
         return;
+      } finally {
+        setSplitting(false);
       }
+      if (planCancelled.current) return;
       if (planned.length) await runner.start(planned, { unchanged: () => view()?.state.doc === plannedDoc });
     } finally {
       planning.current = false;
@@ -248,11 +264,15 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   // Mounted again ("Try again" after this tab crashed): the editor starts from what it held, not from the tab's start.
   const [remembered] = useState(() => readEditorBuffer(tab.id));
 
-  const locate = (index: number, execution: ExecutionState) => {
-    const current = view();
+  // Stable (they only read the editor's ref), so the Messages rows are not rendered again on every event.
+  const locate = useCallback((index: number, execution: ExecutionState) => {
+    const current = editor.current?.view;
     return current ? errorLocation(current, index, execution) : null;
-  };
-  const jump = (index: number, execution: ExecutionState) => withView((v) => jumpToError(v, index, execution));
+  }, []);
+  const jump = useCallback((index: number, execution: ExecutionState) => {
+    const current = editor.current?.view;
+    if (current) jumpToError(current, index, execution);
+  }, []);
   const initialSelection =
     remembered?.selection ??
     tab.initialSelection ??
@@ -278,7 +298,15 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
         runDefault={settings.run.default}
         canRun={canRun}
         runBlockedReason={runBlockedReason}
-        canCancel={phase === "open" && (running || loadingMore)}
+        canCancel={phase === "open" && (running || loadingMore || checking)}
+        checking={checking}
+        timeout={{
+          seconds: timeout,
+          setting: settings.run.statement_timeout_s,
+          followsSetting: ownTimeout === null,
+          onChange: setOwnTimeout,
+          onDone: () => editor.current?.focus(),
+        }}
         onRun={() => void start("default")}
         onRunAll={() => void start("all")}
         onCancel={cancel}

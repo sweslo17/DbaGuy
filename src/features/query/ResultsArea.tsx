@@ -1,14 +1,15 @@
-import { useMemo, useState } from "react";
-import { Tabs } from "@/components/ui/Tabs";
+import { useCallback, useMemo, useState } from "react";
 import type { Dialect } from "@/lib/api/types";
-import { useHeldResult } from "../grid/useHeldResult";
+import { sameElements, useHeldResult } from "../grid/useHeldResult";
 import type { ExecutionState, ResultSetState } from "../session/execution";
 import type { SessionController, SessionPhase } from "../session/SessionController";
 import { ResultGrid } from "./ResultGrid";
+import { ResultTabStrip, type StripTab } from "./ResultTabStrip";
 import { RunMessages, type RunMessagesProps } from "./RunMessages";
-import type { RunState } from "./useQueryRunner";
+import type { RunState, RunStep } from "./useQueryRunner";
 
 const MESSAGES = "messages";
+const MESSAGES_TAB: StripTab = { value: MESSAGES, label: "Messages" };
 const TITLE_LENGTH = 30;
 
 /** One result set of the run, shown in its own tab. */
@@ -27,19 +28,36 @@ function statementTitle(sql: string): string {
   return chars.length > TITLE_LENGTH ? `${chars.slice(0, TITLE_LENGTH).join("")}…` : chars.join("");
 }
 
-function resultTabs(run: RunState | null, executions: Record<string, ExecutionState>): ResultTab[] {
-  if (!run) return [];
-  return run.steps.flatMap((step, stepIndex) => {
-    const execution = step.requestId ? executions[step.requestId] : undefined;
-    if (!execution) return [];
+const NO_TABS: ResultTab[] = [];
+
+/**
+ * An execution's result tabs, built once for each state of it: an event for another statement keeps them as they are,
+ * so the list compares element by element (`sameElements`). An execution belongs to one step of one run.
+ */
+const tabsOfExecution = new WeakMap<ExecutionState, ResultTab[]>();
+
+function executionTabs(step: RunStep, stepIndex: number, execution: ExecutionState): ResultTab[] {
+  if (!execution.resultSets.length) return NO_TABS;
+  let tabs = tabsOfExecution.get(execution);
+  if (!tabs) {
     const title = statementTitle(step.statement.sql);
-    return execution.resultSets.map((set, ordinal) => ({
+    tabs = execution.resultSets.map((set, ordinal) => ({
       key: `${stepIndex}:${set.index}`,
       label: ordinal === 0 ? title : `Result ${ordinal + 1}`,
       statementSql: step.statement.sql,
       execution,
       set,
     }));
+    tabsOfExecution.set(execution, tabs);
+  }
+  return tabs;
+}
+
+function resultTabs(run: RunState | null, executions: Record<string, ExecutionState>): ResultTab[] {
+  if (!run) return NO_TABS;
+  return run.steps.flatMap((step, stepIndex) => {
+    const execution = step.requestId ? executions[step.requestId] : undefined;
+    return execution ? executionTabs(step, stepIndex, execution) : NO_TABS;
   });
 }
 
@@ -70,9 +88,21 @@ export function ResultsArea({
   ...messages
 }: ResultsAreaProps) {
   const tabs = useMemo(() => resultTabs(run, executions), [run, executions]);
-  const held = useHeldResult(tabs.length ? tabs : null, !!run?.active);
-  const shown = held.value ?? [];
+  // Kept as it is while its elements are (an event for a statement without a result changes none).
+  const held = useHeldResult(tabs.length ? tabs : null, !!run?.active, sameElements);
+  const shown = held.value ?? NO_TABS;
+  const strip = useMemo(
+    () => shown.map((tab) => ({ value: tab.key, label: tab.label, title: tab.statementSql.slice(0, 1000) })),
+    [shown],
+  );
   const [picked, setPicked] = useState<{ runId: string; key: string } | null>(null);
+  const runId = run?.id ?? null;
+  const pick = useCallback(
+    (key: string) => {
+      if (runId !== null) setPicked({ runId, key });
+    },
+    [runId],
+  );
   /** Tabs shown at least once: only their grids are mounted (a 200-statement script mounts what is looked at). */
   const [visited, setVisited] = useState<ReadonlySet<string>>(() => new Set());
 
@@ -95,15 +125,7 @@ export function ResultsArea({
 
   return (
     <div className="flex h-full flex-col">
-      <Tabs
-        value={selected}
-        onValueChange={(key) => setPicked({ runId: run.id, key })}
-        items={[
-          ...shown.map((tab) => ({ value: tab.key, label: tab.label, title: tab.statementSql.slice(0, 1000) })),
-          { value: MESSAGES, label: "Messages" },
-        ]}
-        className="shrink-0 overflow-x-auto px-2"
-      />
+      <ResultTabStrip tabs={strip} pinned={MESSAGES_TAB} value={selected} onValueChange={pick} />
       <div className="relative min-h-0 flex-1">
         {shown.map((tab) => {
           if (tab.key !== selected && !visited.has(tab.key)) return null;

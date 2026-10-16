@@ -1,6 +1,14 @@
 import type { ReactNode } from "react";
 import { cn } from "@/lib/cn";
 
+/** A tab button's look: underlined in the accent colour while it is the selected one. */
+export function tabClass(selected: boolean): string {
+  return cn(
+    "-mb-px shrink-0 border-b-2 px-3 py-1.5 text-[12px] whitespace-nowrap outline-none focus-visible:text-accent",
+    selected ? "border-accent text-fg" : "border-transparent text-muted hover:text-fg",
+  );
+}
+
 export function Tabs<T extends string>({
   value,
   onValueChange,
@@ -24,10 +32,7 @@ export function Tabs<T extends string>({
           aria-selected={value === item.value}
           title={item.title}
           onClick={() => onValueChange(item.value)}
-          className={cn(
-            "-mb-px shrink-0 border-b-2 px-3 py-1.5 text-[12px] whitespace-nowrap outline-none focus-visible:text-accent",
-            value === item.value ? "border-accent text-fg" : "border-transparent text-muted hover:text-fg",
-          )}
+          className={tabClass(value === item.value)}
         >
           {item.label}
         </button>

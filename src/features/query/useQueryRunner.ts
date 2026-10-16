@@ -101,6 +101,8 @@ interface ActiveRun {
 export function useQueryRunner({ controller, profileId, settings, timeoutS, listener }: QueryRunnerArgs) {
   const [result, setResult] = useState<{ controller: SessionController; run: RunState } | null>(null);
   const [prompt, setPrompt] = useState<ConfirmPrompt | null>(null);
+  /** The statements are being checked (`/sql/analyze`) before any is sent: a long script takes a moment. */
+  const [checking, setChecking] = useState(false);
   const qc = useQueryClient();
   const latest = useRef({ controller, profileId, settings, timeoutS, listener });
   useLayoutEffect(() => {
@@ -132,6 +134,7 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
   const confirmUpFront = useCallback(
     async (profile: string, planned: PlannedStatement[]): Promise<Set<number> | null> => {
       let decisions: GuardDecision[];
+      setChecking(true);
       try {
         decisions = await analyze(
           profile,
@@ -140,6 +143,8 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
       } catch (error) {
         toast("error", `Could not check the statements before running them: ${errorMessage(error)}`);
         return null;
+      } finally {
+        setChecking(false);
       }
       const flagged = decisions.flatMap((decision, index) =>
         decision.action === "run" ? [] : [{ index, statement: planned[index], decision }],
@@ -251,6 +256,7 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
     [confirmUpFront, execute],
   );
 
+  /** Stops the run: the running statement is cancelled; while the statements are being checked, none is sent. */
   const cancel = useCallback(() => {
     const job = active.current;
     if (!job) return;
@@ -267,5 +273,5 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
   }, []);
 
   const run = result && result.controller === controller ? result.run : null;
-  return { run, prompt, start, cancel, stop };
+  return { run, prompt, checking, start, cancel, stop };
 }

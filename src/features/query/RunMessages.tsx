@@ -1,5 +1,6 @@
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { Ban, CircleCheck, CircleDashed, CircleMinus, CircleX, Loader2 } from "lucide-react";
-import type { ReactNode } from "react";
+import { memo, useMemo, useRef, type ReactNode } from "react";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
 import { formatDuration, plural } from "@/lib/format";
@@ -15,11 +16,14 @@ export interface ErrorLocation {
 export interface RunMessagesProps {
   run: RunState;
   executions: Record<string, ExecutionState>;
-  /** Where statement `index`'s error is in the editor, if it has one. */
+  /** Where statement `index`'s error is in the editor, if it has one. Stable, like the two below. */
   locate: (index: number, execution: ExecutionState) => ErrorLocation | null;
   onJump: (index: number, execution: ExecutionState) => void;
   onReconnect: () => void;
 }
+
+/** A statement's row before it is measured: its line and one line of details. */
+const ROW_ESTIMATE = 46;
 
 const STATUS_ICON: Record<StepStatus, ReactNode> = {
   pending: <CircleDashed size={13} className="text-muted" />,
@@ -134,40 +138,88 @@ function StepDetails({
 
 function summary(run: RunState): string {
   const total = run.steps.length;
-  const count = (status: StepStatus) => run.steps.filter((step) => step.status === status).length;
-  if (run.active) {
-    const current = run.steps.findIndex((step) => step.status === "running" || step.status === "pending");
-    return total === 1 ? "Running…" : `Running statement ${Math.max(current, 0) + 1} of ${total}…`;
-  }
-  const parts = [`${count("done") + count("error") + count("cancelled")} of ${plural(total, "statement")} run`];
-  if (count("error")) parts.push(plural(count("error"), "error"));
-  if (count("cancelled")) parts.push("cancelled");
+  const count: Record<StepStatus, number> = { pending: 0, running: 0, done: 0, error: 0, cancelled: 0, skipped: 0 };
+  let current = -1;
+  run.steps.forEach((step, index) => {
+    count[step.status] += 1;
+    if (current < 0 && (step.status === "running" || step.status === "pending")) current = index;
+  });
+  if (run.active) return total === 1 ? "Running…" : `Running statement ${Math.max(current, 0) + 1} of ${total}…`;
+  const parts = [`${count.done + count.error + count.cancelled} of ${plural(total, "statement")} run`];
+  if (count.error) parts.push(plural(count.error, "error"));
+  if (count.cancelled) parts.push("cancelled");
   if (run.finishedAt !== null) parts.push(formatDuration(run.finishedAt - run.startedAt));
   return parts.join(" · ");
 }
 
-/** The Messages tab: per statement its outcome, row counts, affected rows, notices and error (click to jump). */
-export function RunMessages({ run, executions, ...handlers }: RunMessagesProps) {
+/**
+ * One statement's outcome. It renders again only when its step or its execution changes: the runner and the session
+ * keep every other one as it was, so an event costs one row, not the whole list.
+ */
+const StepRow = memo(function StepRow({
+  index,
+  step,
+  execution,
+  handlers,
+}: {
+  index: number;
+  step: RunStep;
+  execution: ExecutionState | undefined;
+  handlers: Handlers;
+}) {
   return (
-    <div className="h-full overflow-auto text-[12px]">
-      <div className="border-b border-border px-3 py-1.5 text-muted">{summary(run)}</div>
-      <ol>
-        {run.steps.map((step, index) => {
-          const execution = step.requestId ? executions[step.requestId] : undefined;
-          return (
-            <li key={index} className="flex flex-col gap-1 border-b border-border px-3 py-1.5">
-              <div className="flex items-center gap-2">
-                <span className="shrink-0">{STATUS_ICON[step.status]}</span>
-                <span className="min-w-0 flex-1 truncate font-mono" title={step.statement.sql} data-selectable>
-                  {firstLine(step.statement.sql)}
-                </span>
-                <span className="shrink-0 text-muted">{outcome(step, execution)}</span>
-              </div>
-              <StepDetails index={index} execution={execution} {...handlers} />
-            </li>
-          );
-        })}
-      </ol>
+    <>
+      <div className="flex items-center gap-2">
+        <span className="shrink-0">{STATUS_ICON[step.status]}</span>
+        <span className="min-w-0 flex-1 truncate font-mono" title={step.statement.sql} data-selectable>
+          {firstLine(step.statement.sql)}
+        </span>
+        <span className="shrink-0 text-muted">{outcome(step, execution)}</span>
+      </div>
+      <StepDetails index={index} execution={execution} {...handlers} />
+    </>
+  );
+});
+
+/**
+ * The Messages tab: per statement its outcome, row counts, affected rows, notices and error (click to jump). Only the
+ * rows in view are rendered, so a long script stays cheap while it runs.
+ */
+export function RunMessages({ run, executions, locate, onJump, onReconnect }: RunMessagesProps) {
+  const handlers = useMemo(() => ({ locate, onJump, onReconnect }), [locate, onJump, onReconnect]);
+  const scroller = useRef<HTMLDivElement>(null);
+  const virtualizer = useVirtualizer({
+    count: run.steps.length,
+    getScrollElement: () => scroller.current,
+    estimateSize: () => ROW_ESTIMATE,
+    overscan: 8,
+  });
+  return (
+    <div className="flex h-full flex-col text-[12px]">
+      <div className="shrink-0 border-b border-border px-3 py-1.5 text-muted">{summary(run)}</div>
+      <div ref={scroller} className="min-h-0 flex-1 overflow-auto">
+        <ol className="relative" style={{ height: virtualizer.getTotalSize() }}>
+          {virtualizer.getVirtualItems().map((item) => {
+            const step = run.steps[item.index];
+            return (
+              <li
+                key={item.key}
+                ref={virtualizer.measureElement}
+                data-index={item.index}
+                className="absolute top-0 left-0 flex w-full flex-col gap-1 border-b border-border px-3 py-1.5"
+                style={{ transform: `translateY(${item.start}px)` }}
+              >
+                <StepRow
+                  index={item.index}
+                  step={step}
+                  execution={step.requestId ? executions[step.requestId] : undefined}
+                  handlers={handlers}
+                />
+              </li>
+            );
+          })}
+        </ol>
+      </div>
     </div>
   );
 }
