@@ -17,8 +17,9 @@ import { Group, Panel } from "react-resizable-panels";
 import type { MenuItem } from "@/components/ui/ContextMenu";
 import { Button } from "@/components/ui/Button";
 import type { ColumnMeta, Dialect } from "@/lib/api/types";
+import { cn } from "@/lib/cn";
 import { aggregate } from "./aggregate";
-import { HEADER_HEIGHT, ROW_HEIGHT } from "./columns";
+import { columnSignature, HEADER_HEIGHT, ROW_HEIGHT } from "./columns";
 import { copyDefault, copySelection, type CopyFormat, type CopyInput } from "./copy";
 import { ExportDialog, type ExportSource } from "./ExportDialog";
 import { GridDrawerPanel, type GridDrawer } from "./GridDrawer";
@@ -53,6 +54,11 @@ export interface DataGridProps {
   /** Rows are being fetched (the next page, or the first one). */
   loadingMore: boolean;
   onLoadMore?: () => void;
+  /**
+   * The rows belong to the previous request: they stay on screen, dimmed with a "Loading…" note, until the next one
+   * delivers its first page (`useHeldResult`); nothing more is loaded for them.
+   */
+  stale?: boolean;
   /** Dialect of the copy formats that need one (INSERT, IN list); null while unknown, and those copies refuse. */
   dialect: Dialect | null;
   /** INSERT copies target this table (table data); else a `table_name` placeholder. */
@@ -116,14 +122,18 @@ function LoadMoreFooter({ rowCount, hasMore, loading, onLoadMore }: LoadMoreFoot
  * Enter / Space open the value viewer / record view in a resizable drawer on the right, which follows the active cell.
  */
 export function DataGrid(props: DataGridProps) {
-  const { columns, rows, hasMore, loadingMore, onLoadMore, sort, onHeaderClick, ref } = props;
+  const { columns, rows, hasMore, sort, onHeaderClick, stale = false, ref } = props;
   const { dialect, tableName, onSortBy, extraCellMenu, onSelectionChange, exportSource } = props;
+  // Stale rows are only shown: nothing is loaded for them.
+  const loadingMore = props.loadingMore && !stale;
+  const onLoadMore = stale ? undefined : props.onLoadMore;
   const rootRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const focusId = useId();
-  const layout = useColumnLayout(columns, rows, !!onHeaderClick);
+  const signature = useMemo(() => columnSignature(columns), [columns]);
+  const layout = useColumnLayout(columns, signature, rows, !!onHeaderClick);
   const geometry = useGridGeometry(layout, rows.length, columns.length);
-  const { dims, selection, rect, select } = useSelectionState(columns, rows.length);
+  const { dims, selection, rect, select } = useSelectionState(signature, columns.length, rows.length);
   const [drawer, setDrawer] = useState<GridDrawer>(null);
   const [drawerWidth, setDrawerWidth] = useState(DRAWER_WIDTH);
   /** The drawer's width while it is open; kept for the next opening when it closes. */
@@ -152,12 +162,16 @@ export function DataGrid(props: DataGridProps) {
   useLayoutEffect(() => {
     columnVirtualizer.measure();
   }, [columnVirtualizer, layout.widths]);
-  // Incremental loading asks once per row count (see below); a new result starts over, at the top-left.
+  // Incremental loading asks once per row count (see below); a new result starts over, at the top. A result with
+  // other columns also starts at the left; the same columns (a sort, a refresh) keep the horizontal position.
   const requestedAt = useRef(-1);
   useLayoutEffect(() => {
     requestedAt.current = -1;
-    scrollRef.current?.scrollTo({ top: 0, left: 0 });
+    scrollRef.current?.scrollTo({ top: 0 });
   }, [columns]);
+  useLayoutEffect(() => {
+    scrollRef.current?.scrollTo({ left: 0 });
+  }, [signature]);
 
   const virtualRows = rowVirtualizer.getVirtualItems();
   const virtualColumns = columnVirtualizer.getVirtualItems();
@@ -313,7 +327,10 @@ export function DataGrid(props: DataGridProps) {
               >
                 <div
                   ref={scrollRef}
-                  className="relative min-h-0 flex-1 overflow-auto font-mono text-[12px]"
+                  className={cn(
+                    "relative min-h-0 flex-1 overflow-auto font-mono text-[12px]",
+                    stale && "opacity-50 transition-opacity delay-150",
+                  )}
                   onPointerDown={pointer.onPointerDown}
                   onPointerMove={pointer.onPointerMove}
                   onPointerUp={pointer.onPointerUp}
@@ -371,6 +388,14 @@ export function DataGrid(props: DataGridProps) {
                   </div>
                 </div>
               </GridMenu>
+              {stale && (
+                <div
+                  role="status"
+                  className="pointer-events-none absolute top-11 right-3 z-20 animate-delayed-show rounded-md border border-border bg-elevated px-2 py-0.5 font-sans text-[12px] text-muted shadow"
+                >
+                  Loading…
+                </div>
+              )}
               {/* Keyboard focus ring, drawn over the sticky header and pinned columns. */}
               <div className="pointer-events-none absolute inset-0 z-10 hidden border border-accent group-focus-visible/grid:block" />
             </div>

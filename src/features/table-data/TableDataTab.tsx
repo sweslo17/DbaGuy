@@ -11,6 +11,7 @@ import { ColumnsView, DdlView } from "../explorer/ObjectDetailView";
 import { kindLabel } from "../explorer/kinds";
 import { DataGrid } from "../grid/DataGrid";
 import type { GridSort } from "../grid/GridHeader";
+import { useHeldResult } from "../grid/useHeldResult";
 import { CONNECTION_LOST } from "../session/execution";
 import { isExporting } from "../session/SessionController";
 import { SessionError } from "../session/SessionError";
@@ -105,10 +106,13 @@ function DataView({ tab, active }: { tab: ObjectTab; active: boolean }) {
   const dialect = useDialect(tab.profileId);
   const openQuery = useWorkspace((s) => s.openQuery);
   const phase = snapshot?.phase ?? "opening";
-  const set = execution?.resultSets[0] ?? null;
+  const current = execution?.resultSets[0] ?? null;
+  // Until a sort, filter or refresh delivers its first page, the grid keeps the previous rows (and its layout), dimmed.
+  const shown = useHeldResult(current, table.pending);
+  const set = shown.value;
   const columns = set?.columns;
   const rows = set?.rows;
-  const firstPagePending = execution?.status === "running" && !set;
+  const firstPagePending = execution?.status === "running" && !current;
   // An export runs on this session: filter, sort and refresh would only wait behind it.
   const exporting = isExporting(snapshot);
 
@@ -219,6 +223,7 @@ function DataView({ tab, active }: { tab: ObjectTab; active: boolean }) {
             hasMore={set.hasMore}
             loadingMore={execution?.status === "running"}
             onLoadMore={phase === "open" ? table.loadMore : undefined}
+            stale={shown.stale}
             dialect={dialect}
             tableName={tableName}
             sort={gridSort}

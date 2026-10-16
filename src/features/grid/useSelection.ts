@@ -30,18 +30,21 @@ import {
   type SelectionMode,
 } from "./selection";
 
-/** The selection of one column list: a new result (new `columns`) starts without one; more rows only clamp it. */
-export function useSelectionState(columns: ColumnMeta[], rowCount: number) {
-  const [stored, setStored] = useState<{ columns: ColumnMeta[]; selection: GridSelection } | null>(null);
-  const dims = useMemo<Dims>(() => ({ rows: rowCount, cols: columns.length }), [rowCount, columns.length]);
+/**
+ * The selection of one column signature (`columnSignature`): a result with other columns starts without one; a
+ * re-run with the same columns and more rows only clamp it.
+ */
+export function useSelectionState(signature: string, columnCount: number, rowCount: number) {
+  const [stored, setStored] = useState<{ signature: string; selection: GridSelection } | null>(null);
+  const dims = useMemo<Dims>(() => ({ rows: rowCount, cols: columnCount }), [rowCount, columnCount]);
   const selection = useMemo(
-    () => (stored?.columns === columns ? clampSelection(stored.selection, dims) : null),
-    [stored, columns, dims],
+    () => (stored?.signature === signature ? clampSelection(stored.selection, dims) : null),
+    [stored, signature, dims],
   );
   const rect = useMemo(() => (selection ? rectOf(selection, dims) : null), [selection, dims]);
   const select = useCallback(
-    (next: GridSelection | null) => setStored(next ? { columns, selection: next } : null),
-    [columns],
+    (next: GridSelection | null) => setStored(next ? { signature, selection: next } : null),
+    [signature],
   );
   return { dims, selection, rect, select };
 }

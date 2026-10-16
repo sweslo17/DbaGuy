@@ -158,6 +158,14 @@ export function useTableData(tab: ObjectTab, active: boolean) {
     ? (data.snapshot?.executions[sentBrowse.requestId] ?? null)
     : null;
   const filter = browseJob?.filter ?? "";
+  const phase = data.snapshot?.phase;
+  // The applied browse has not delivered its first page yet (not sent yet, or running): the grid keeps the rows it
+  // shows until then.
+  const pending =
+    !!browseJob &&
+    phase !== "failed" &&
+    phase !== "closed" &&
+    (sentBrowse?.job.run !== browseJob.run || (!!execution && execution.status !== "done"));
 
   /** Builds the SELECT for `filter` and `sorts` and makes it the applied browse; a rejected filter changes nothing. */
   const browse = useCallback(
@@ -260,6 +268,7 @@ export function useTableData(tab: ObjectTab, active: boolean) {
   return {
     state,
     execution,
+    pending,
     controller: data.controller,
     snapshot: data.snapshot,
     relation,

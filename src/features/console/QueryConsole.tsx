@@ -11,6 +11,7 @@ import { isExporting, PAGE_SIZE, type SessionPhase, type SessionStateView } from
 import { SessionError } from "../session/SessionError";
 import { useSession } from "../session/useSession";
 import { DataGrid } from "../grid/DataGrid";
+import { useHeldResult } from "../grid/useHeldResult";
 
 const INDENT = "  ";
 const PHASE_DOT: Record<SessionPhase, string> = {
@@ -102,6 +103,12 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
     }
   };
 
+  // Until the new run delivers a result, the grids keep the previous one (and their layout), dimmed.
+  const results = useHeldResult(
+    execution?.resultSets.length ? execution.resultSets : null,
+    !!execution && execution.status !== "done",
+  );
+  const sets = results.value ?? [];
   const errorPosition = execution?.error?.position;
   const lastSetIndex = execution?.resultSets.at(-1)?.index;
   // A paused result keeps `hasMore` while its next page loads: the grid shows that, the status line does not.
@@ -172,14 +179,16 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
                     )}
                   </div>
                 )}
-                {execution.resultSets.map((set) => (
-                  <div key={`${execution.requestId}:${set.index}`} className="min-h-[120px] flex-1">
+                {sets.map((set) => (
+                  // Keyed by position only: running the query again keeps the grid, so its widths and pins stay.
+                  <div key={set.index} className="min-h-[120px] flex-1">
                     <DataGrid
                       columns={set.columns}
                       rows={set.rows}
                       hasMore={set.hasMore}
                       loadingMore={execution.status === "running" && set.index === lastSetIndex}
                       onLoadMore={phase === "open" ? loadMore : undefined}
+                      stale={results.stale}
                       dialect={dialect}
                       exportSource={exportSource}
                     />
@@ -188,7 +197,7 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
                 <div
                   className={cn(
                     "flex flex-col gap-1 overflow-auto px-3 py-2 empty:hidden",
-                    execution.resultSets.length > 0 ? "max-h-[35%] shrink-0" : "min-h-0 flex-1",
+                    sets.length > 0 ? "max-h-[35%] shrink-0" : "min-h-0 flex-1",
                   )}
                 >
                   {execution.affected.map((a) => (

@@ -2,9 +2,9 @@ import { useCallback, useMemo, useState, type CSSProperties } from "react";
 import type { ColumnMeta } from "@/lib/api/types";
 import { autofitWidth, canvasMeasure, estimateWidths, MIN_WIDTH, rowNumberWidth, sampledRows } from "./columns";
 
-/** What the user changed for one column list: dragged or autofitted widths, and the pinned column count. */
+/** What the user changed for one column signature: dragged or autofitted widths, and the pinned column count. */
 interface UserLayout {
-  columns: ColumnMeta[];
+  signature: string;
   widths: ReadonlyMap<number, number>;
   pinnedCount: number;
 }
@@ -23,13 +23,20 @@ export interface ColumnLayout {
   pin: (count: number) => void;
 }
 
-const fresh = (columns: ColumnMeta[]): UserLayout => ({ columns, widths: new Map(), pinnedCount: 0 });
+const fresh = (signature: string): UserLayout => ({ signature, widths: new Map(), pinnedCount: 0 });
 
 /**
  * Column widths and pinning of one mounted grid. Widths come from `estimateWidths` over the first rows and are
- * re-estimated only while those rows arrive; a new column list starts over, later pages change nothing.
+ * re-estimated only while those rows arrive (and for each new result); later pages change nothing. What the user
+ * changed belongs to the column `signature` (`columnSignature`): a re-run with the same columns keeps it, other
+ * columns start over.
  */
-export function useColumnLayout(columns: ColumnMeta[], rows: unknown[][], sortable: boolean): ColumnLayout {
+export function useColumnLayout(
+  columns: ColumnMeta[],
+  signature: string,
+  rows: unknown[][],
+  sortable: boolean,
+): ColumnLayout {
   const measure = canvasMeasure();
   const sampled = sampledRows(rows);
   const digits = String(rows.length).length;
@@ -40,8 +47,8 @@ export function useColumnLayout(columns: ColumnMeta[], rows: unknown[][], sortab
   );
   const numbersWidth = useMemo(() => rowNumberWidth(digits, measure), [digits, measure]);
 
-  const [user, setUser] = useState(() => fresh(columns));
-  const own = user.columns === columns ? user : null; // changes made for an older column list do not apply
+  const [user, setUser] = useState(() => fresh(signature));
+  const own = user.signature === signature ? user : null; // changes made for other columns do not apply
   const widths = useMemo(() => estimated.map((w, c) => own?.widths.get(c) ?? w), [estimated, own]);
   const pinnedCount = Math.min(own?.pinnedCount ?? 0, columns.length);
   const { pinnedLeft, fixedWidth } = useMemo(() => {
@@ -57,10 +64,10 @@ export function useColumnLayout(columns: ColumnMeta[], rows: unknown[][], sortab
   const change = useCallback(
     (fn: (current: UserLayout) => Partial<UserLayout>) =>
       setUser((prev) => {
-        const base = prev.columns === columns ? prev : fresh(columns);
+        const base = prev.signature === signature ? prev : fresh(signature);
         return { ...base, ...fn(base) };
       }),
-    [columns],
+    [signature],
   );
   const resize = useCallback(
     (col: number, width: number) =>

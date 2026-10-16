@@ -9,6 +9,14 @@ export const MIN_WIDTH = 60;
 export const MAX_WIDTH = 400;
 export const AUTOFIT_MAX = 600;
 
+/**
+ * The column list's identity across requests: names and types in order. A re-run that keeps it (sort, filter,
+ * refresh, the same query again) keeps the user's widths, pins and selection.
+ */
+export function columnSignature(columns: ColumnMeta[]): string {
+  return JSON.stringify(columns.map((column) => [column.name, column.type_name]));
+}
+
 /** Width in px of `text` drawn in one of the grid's fonts. */
 export type TextMeasure = (text: string, font: "cell" | "header" | "type") => number;
 
