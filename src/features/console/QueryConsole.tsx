@@ -1,21 +1,25 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useRef, useState, type KeyboardEvent } from "react";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import { Button } from "@/components/ui/Button";
 import { ApiError } from "@/lib/api/client";
-import type { SocketStatus } from "@/lib/api/session-socket";
 import { cn } from "@/lib/cn";
 import type { ConsoleTab } from "@/stores/workspace";
 import { useProfiles } from "../connections/hooks";
 import { secretsNeeded, UnlockDialog } from "../connections/UnlockDialog";
-import { applyEvent, interruptExecution, newExecution, type ExecutionState } from "./execution";
+import { PAGE_SIZE, type SessionPhase, type SessionStateView } from "../session/SessionController";
+import { useSession } from "../session/useSession";
 import { ResultTable } from "./ResultTable";
-import { useConsoleSession } from "./useConsoleSession";
 
-const PAGE = 500;
 /** Error code of a statement whose database connection dropped: the session must be reopened. */
 const CONNECTION_LOST = "connection_lost";
 const INDENT = "  ";
-const STATUS_DOT: Record<SocketStatus, string> = { open: "bg-success", connecting: "bg-yellow-400", closed: "bg-danger" };
+const PHASE_DOT: Record<SessionPhase, string> = {
+  opening: "bg-yellow-400",
+  open: "bg-success",
+  reconnecting: "bg-yellow-400",
+  failed: "bg-danger",
+  closed: "bg-danger",
+};
 
 /** Where the executed text starts inside the editor: 0-based line and 0-based column (in characters). */
 interface Origin {
@@ -32,73 +36,60 @@ function originOf(text: string, offset: number): Origin {
 
 const plural = (count: number, noun: string) => `${count.toLocaleString()} ${noun}${count === 1 ? "" : "s"}`;
 
+/** The session's transaction state, from `session_state` only. */
+function TransactionBadge({ state }: { state: SessionStateView | null }) {
+  if (state?.transactionFailed) {
+    return (
+      <span
+        className="rounded bg-danger/15 px-1.5 text-[11px] font-medium text-danger"
+        title="The transaction failed: only ROLLBACK is accepted"
+      >
+        Rollback required
+      </span>
+    );
+  }
+  if (!state?.inTransaction) return null;
+  return (
+    <span
+      className="rounded bg-orange-500/20 px-1.5 text-[11px] text-orange-600 dark:text-orange-400"
+      title="A transaction is open"
+    >
+      Transaction
+    </span>
+  );
+}
+
 export function QueryConsole({ tab }: { tab: ConsoleTab }) {
-  const { session, socket, status, error, retry } = useConsoleSession(tab.profileId, tab.database);
+  const { controller, snapshot, retry } = useSession(tab.profileId, tab.database);
   const profiles = useProfiles();
   const [sql, setSql] = useState("");
-  const [execution, setExecution] = useState<ExecutionState | null>(null);
+  const [requestId, setRequestId] = useState<string | null>(null);
   const [origin, setOrigin] = useState<Origin>(WHOLE_TEXT);
   const [unlockDismissed, setUnlockDismissed] = useState(false);
   const editor = useRef<HTMLTextAreaElement>(null);
 
-  const connectionLost = useRef(false);
-  /** The last `in_transaction` the backend reported for this console's session. */
-  const inTransaction = useRef(false);
-  const connection: SocketStatus = error ? "closed" : status;
+  const phase: SessionPhase = snapshot?.phase ?? "opening";
+  const session = snapshot?.info ?? null;
+  const error = snapshot?.error ?? null;
+  // Results belong to the session that produced them: a new session knows none of the old request ids.
+  const execution = requestId ? (snapshot?.executions[requestId] ?? null) : null;
 
-  useEffect(() => {
-    setExecution(null); // results belong to the session that produced them
-    connectionLost.current = false;
-    inTransaction.current = false; // a fresh session starts outside any transaction
-    if (!socket) return;
-    return socket.subscribe((event) => {
-      if (event.type === "session_state") return; // session-wide, not part of a request; this console ignores it
-      if (event.type === "finished") inTransaction.current = event.in_transaction;
-      setExecution((prev) => (prev && event.request_id === prev.requestId ? applyEvent(prev, event) : prev));
-    });
-  }, [socket]);
-
-  const latestExecution = useRef(execution);
-  useEffect(() => {
-    latestExecution.current = execution;
-  }, [execution]);
-
-  // Events sent while the socket was down are gone for good, so an unfinished request can never complete: end it
-  // when the socket is back (or when the session turns out to be gone) instead of leaving it "Running…".
-  useEffect(() => {
-    if (status === "closed") connectionLost.current = true;
-    const reconnected = status === "open" && connectionLost.current;
-    if (reconnected) connectionLost.current = false;
-    if (!reconnected && !error) return;
-    const orphan = latestExecution.current;
-    // Cancelling it stops it from blocking the next statement, but inside a transaction a cancel would abort the
-    // whole transaction: there the request is only marked interrupted and the user decides.
-    if (reconnected && orphan && orphan.status !== "done" && !inTransaction.current) {
-      socket?.send({ type: "cancel", request_id: orphan.requestId });
-    }
-    setExecution((prev) => (prev ? interruptExecution(prev) : prev));
-  }, [status, error, socket]);
-
-  // Only while the socket is open: a command sent into a dropped connection would be queued and replayed late.
-  const canRun = !!socket && connection === "open" && execution?.status !== "running";
+  const canRun = !!controller && phase === "open" && execution?.status !== "running";
   const run = () => {
     const el = editor.current;
-    if (!canRun || !el) return;
+    if (!canRun || !controller || !el) return;
     const hasSelection = el.selectionEnd > el.selectionStart;
     const text = hasSelection ? sql.slice(el.selectionStart, el.selectionEnd) : sql;
     if (!text.trim()) return;
     setOrigin(hasSelection ? originOf(sql, el.selectionStart) : WHOLE_TEXT);
-    const requestId = crypto.randomUUID();
-    setExecution(newExecution(requestId));
-    socket.send({ type: "execute", request_id: requestId, sql: text, page_size: PAGE, confirmed: false, history: true });
+    if (requestId) controller.forget(requestId); // only the latest result is shown: do not keep the old rows
+    setRequestId(controller.execute(text, { pageSize: PAGE_SIZE }));
   };
   const cancel = () => {
-    if (execution) socket?.send({ type: "cancel", request_id: execution.requestId });
+    if (execution) controller?.cancel(execution.requestId);
   };
   const loadMore = () => {
-    if (!execution || !socket) return;
-    setExecution({ ...execution, status: "running" });
-    socket.send({ type: "fetch_more", request_id: execution.requestId, count: PAGE });
+    if (execution) controller?.fetchMore(execution.requestId, PAGE_SIZE);
   };
   const retrySession = () => {
     setUnlockDismissed(false);
@@ -130,7 +121,8 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
           Cancel
         </Button>
         <div className="flex-1" />
-        <span className={cn("h-2 w-2 rounded-full", STATUS_DOT[connection])} title={connection} />
+        <TransactionBadge state={snapshot?.state ?? null} />
+        <span className={cn("h-2 w-2 rounded-full", PHASE_DOT[phase])} title={phase} />
         <span className="truncate text-[11px] text-muted">
           {session
             ? `${session.server.version}${session.database ? ` · ${session.database}` : ""}`
@@ -198,9 +190,9 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
                         {plural(set.rows.length, "row")}
                         {set.hasMore ? " loaded" : ""}
                       </span>
-                      {set.hasMore && execution.status === "paused" && connection === "open" && (
+                      {set.hasMore && execution.status === "paused" && phase === "open" && (
                         <Button size="sm" onClick={loadMore}>
-                          Load {PAGE} more
+                          Load {PAGE_SIZE} more
                         </Button>
                       )}
                     </div>
@@ -222,17 +214,6 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
                   {execution.status === "running" && <span>Running…</span>}
                   {execution.elapsedMs !== null && <span>{execution.elapsedMs} ms</span>}
                   {execution.cancelled && <span>Cancelled</span>}
-                  {execution.transactionFailed ? (
-                    <span className="rounded bg-danger/15 px-1.5 font-medium text-danger">
-                      Transaction aborted — ROLLBACK required
-                    </span>
-                  ) : (
-                    execution.inTransaction && (
-                      <span className="rounded bg-orange-500/20 px-1.5 text-orange-600 dark:text-orange-400">
-                        In transaction
-                      </span>
-                    )
-                  )}
                 </div>
               </div>
             )}

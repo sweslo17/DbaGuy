@@ -23,6 +23,12 @@ export type SessionInfo = S["SessionInfo"];
 export type ColumnMeta = S["ColumnMeta"];
 export type ServerEvent = S["ExecutionSchema"]["event"];
 export type ClientCommand = S["ExecutionSchema"]["command"];
+export type SessionStateEvent = S["SessionStateEvent"];
+export type GuardReason = S["GuardReason"];
+export type Classification = S["Classification"];
+export type Dialect = S["Dialect"];
+export type FormatKind = S["FormatKind"];
+export type RowFormatOptions = S["RowFormatOptions"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

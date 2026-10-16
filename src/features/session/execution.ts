@@ -1,4 +1,6 @@
-import type { ColumnMeta, ServerEvent } from "@/lib/api/types";
+import type { Classification, ColumnMeta, GuardReason, ServerEvent } from "@/lib/api/types";
+
+export type ExecutionKind = "execute" | "export" | "transaction";
 
 export interface ResultSetState {
   index: number;
@@ -8,18 +10,28 @@ export interface ResultSetState {
   hasMore: boolean;
 }
 
+/** One request on a session, folded from its server events. */
 export interface ExecutionState {
   requestId: string;
+  kind: ExecutionKind;
+  /** The statement sent; "" for transaction commands. */
+  sql: string;
   status: "running" | "paused" | "done";
   resultSets: ResultSetState[];
   affected: { index: number; rows: number }[];
   messages: { severity: string; text: string }[];
   error: { message: string; code?: string | null; position?: { line: number; column: number } | null } | null;
+  /** The guard stopped the statement: resend it with `confirmed` once the user agreed. */
+  confirmation: { reasons: GuardReason[]; classification: Classification } | null;
+  /** Rows written so far (export only). */
+  progressRows: number | null;
   elapsedMs: number | null;
-  inTransaction: boolean;
-  /** The open transaction is aborted: the server only accepts ROLLBACK. */
-  transactionFailed: boolean;
+  /** `Date.now()` when the request was created. */
+  startedAt: number;
   cancelled: boolean;
+  timedOut: boolean;
+  /** Confirmation was required: nothing ran. */
+  skipped: boolean;
   /** The connection dropped mid-request: later events are ignored because some were lost. */
   interrupted: boolean;
 }
@@ -28,18 +40,23 @@ export const INTERRUPTED_MESSAGE = "Connection interrupted — results may be in
 /** Error codes the backend sends for requests it never ran; the request is over even if `finished` goes missing. */
 const TERMINAL_ERROR_CODES = new Set(["no_open_result", "invalid_command"]);
 
-export function newExecution(requestId: string): ExecutionState {
+export function newExecution(requestId: string, kind: ExecutionKind, sql: string): ExecutionState {
   return {
     requestId,
+    kind,
+    sql,
     status: "running",
     resultSets: [],
     affected: [],
     messages: [],
     error: null,
+    confirmation: null,
+    progressRows: null,
     elapsedMs: null,
-    inTransaction: false,
-    transactionFailed: false,
+    startedAt: Date.now(),
     cancelled: false,
+    timedOut: false,
+    skipped: false,
     interrupted: false,
   };
 }
@@ -56,13 +73,14 @@ export function interruptExecution(state: ExecutionState): ExecutionState {
   };
 }
 
+/** Rebuilds only the touched result set, so appending rows stays linear in the total row count. */
 function updateSet(state: ExecutionState, index: number, fn: (set: ResultSetState) => ResultSetState): ExecutionState {
   return { ...state, resultSets: state.resultSets.map((s) => (s.index === index ? fn(s) : s)) };
 }
 
-/** Folds one server event of this execution into its state. */
+/** Folds one server event of this execution into its state. `session_state` is session-wide and never applies. */
 export function applyEvent(state: ExecutionState, event: ServerEvent): ExecutionState {
-  if (state.interrupted) return state;
+  if (state.interrupted || event.type === "session_state") return state;
   switch (event.type) {
     case "started":
       return { ...state, status: "running" };
@@ -89,14 +107,18 @@ export function applyEvent(state: ExecutionState, event: ServerEvent): Execution
       const terminal = event.code != null && TERMINAL_ERROR_CODES.has(event.code);
       return terminal ? { ...state, error, status: "done" } : { ...state, error };
     }
+    case "confirmation_required":
+      return { ...state, confirmation: { reasons: event.reasons, classification: event.classification } };
+    case "progress":
+      return { ...state, progressRows: event.rows };
     case "finished":
       return {
         ...state,
         status: "done",
         elapsedMs: event.elapsed_ms,
-        inTransaction: event.in_transaction,
-        transactionFailed: event.transaction_failed,
         cancelled: event.cancelled,
+        timedOut: event.timed_out,
+        skipped: event.skipped,
         resultSets: state.resultSets.map((s) => ({ ...s, hasMore: false })),
       };
     default:

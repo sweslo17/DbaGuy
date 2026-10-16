@@ -1,6 +1,6 @@
 import { formatCell } from "@/lib/cells";
 import { cn } from "@/lib/cn";
-import type { ResultSetState } from "./execution";
+import type { ResultSetState } from "../session/execution";
 
 export function ResultTable({ set }: { set: ResultSetState }) {
   return (
