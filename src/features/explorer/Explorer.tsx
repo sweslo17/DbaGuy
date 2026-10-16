@@ -15,6 +15,7 @@ import { useDeleteProfile, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
 import { secretsNeeded, UnlockDialog, type SecretsNeeded } from "../connections/UnlockDialog";
 import { requestCloseTab, requestDisconnectTab } from "../workspace/closeGuards";
+import { forgetExplorer } from "./explorerCache";
 import { folderLabel, kindIcon } from "./kinds";
 import { nodeKeyPrefix, profileKey, useTreeRows, type Expansion, type TreeRow } from "./useTreeRows";
 
@@ -129,8 +130,7 @@ export function Explorer() {
     setExpanded((prev) => new Set([...prev].filter((key) => !owned(key))));
     setSelected((prev) => (prev && owned(prev) ? null : prev));
     if (useWorkspace.getState().selectedProfileId === profileId) selectProfile(null);
-    qc.removeQueries({ queryKey: ["children", profileId] });
-    qc.removeQueries({ queryKey: ["detail", profileId] });
+    forgetExplorer(qc, profileId);
     // Their tabs agreed already (releaseTabs): table and object tabs close; query tabs keep their text and lose only the
     // connection.
     const { tabs, closeTab, updateTab } = useWorkspace.getState();

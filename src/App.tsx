@@ -4,11 +4,13 @@ import { useEffect, useState } from "react";
 import { AppShell } from "./app/AppShell";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Sidebar } from "./app/Sidebar";
-import { PaletteHost, togglePalette } from "./features/palette/CommandPalette";
+import { PaletteHost } from "./features/palette/CommandPalette";
+import { togglePalette } from "./features/palette/paletteStore";
 import { Workspace } from "./features/workspace/Workspace";
 import { restoreWorkspace } from "./features/workspace/workspaceSync";
 import { isDialogOpen } from "./lib/dialogs";
 import { isImeKeyEvent } from "./lib/ime";
+import { isCommandKey } from "./lib/shortcuts";
 
 /** Until the saved tabs are back: nothing renders that could open a session or write the workspace. */
 function Restoring() {
@@ -30,12 +32,11 @@ function usePaletteShortcuts(enabled: boolean) {
     if (!enabled) return;
     const onKey = (e: KeyboardEvent) => {
       if (isImeKeyEvent(e) || e.defaultPrevented) return;
-      if (!e.metaKey || e.ctrlKey || e.altKey) return;
-      // The physical key too: a non-Latin layout may not report "p".
-      if (e.code !== "KeyP" && e.key.toLowerCase() !== "p") return;
+      const commands = isCommandKey(e, "p", { shift: true });
+      if (!commands && !isCommandKey(e, "p")) return;
       e.preventDefault();
       if (isDialogOpen({ exceptPalette: true })) return;
-      togglePalette(e.shiftKey ? "commands" : "quickOpen");
+      togglePalette(commands ? "commands" : "quickOpen");
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);

@@ -9,6 +9,7 @@ import type { AppSettings } from "@/lib/api/types";
 import { isDialogOpen } from "@/lib/dialogs";
 import { isImeKeyEvent } from "@/lib/ime";
 import { canChooseFiles, chooseFolder } from "@/lib/native";
+import { isSettingsKey } from "@/lib/shortcuts";
 import { useAppSettings } from "@/stores/settings";
 import { scriptsFolderChanged } from "../scripts/useScripts";
 import {
@@ -255,8 +256,7 @@ export function SettingsDialogHost() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (isImeKeyEvent(e) || e.defaultPrevented) return;
-      if (!e.metaKey || e.ctrlKey || e.altKey || e.shiftKey || e.key !== ",") return;
+      if (isImeKeyEvent(e) || e.defaultPrevented || !isSettingsKey(e)) return;
       e.preventDefault();
       if (isDialogOpen({ exceptPalette: true })) return; // from the palette, Settings replaces it
       openSettings();

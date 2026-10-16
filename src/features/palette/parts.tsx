@@ -83,6 +83,11 @@ export interface PaletteItemProps {
   /** Unique within the palette (cmdk tracks the highlighted row by it); also what its own filter matches. */
   value: string;
   disabled?: boolean;
+  /**
+   * Not choosable yet (a row of an older search while a newer one loads): greyed, and choosing it does nothing. Unlike
+   * `disabled` it keeps its place in the keyboard order, so the highlight is still there once the row is current.
+   */
+  pending?: boolean;
   onSelect: () => void;
   icon?: LucideIcon;
   label: string;
@@ -92,13 +97,15 @@ export interface PaletteItemProps {
   hint?: ReactNode;
 }
 
-export function PaletteItem({ icon: Icon, label, detail, hint, ...item }: PaletteItemProps) {
+export function PaletteItem({ icon: Icon, label, detail, hint, pending, onSelect, ...item }: PaletteItemProps) {
   return (
     <Command.Item
       {...item}
+      onSelect={pending ? undefined : onSelect}
       className={cn(
         "flex h-7 cursor-default items-center gap-2 rounded px-2 text-[13px] outline-none",
         "data-[selected=true]:bg-accent data-[selected=true]:text-accent-fg data-[disabled=true]:opacity-40",
+        pending && "opacity-40",
       )}
     >
       {Icon && <Icon size={14} className="shrink-0 opacity-70" aria-hidden />}

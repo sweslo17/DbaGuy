@@ -1,34 +1,17 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
-import { create } from "zustand";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Dialog } from "@/components/ui/Dialog";
 import { isDialogOpen } from "@/lib/dialogs";
 import { isImeKeyEvent } from "@/lib/ime";
+import { isSettingsKey } from "@/lib/shortcuts";
 import { useAppSettings } from "@/stores/settings";
 import { useWorkspace } from "@/stores/workspace";
 import { readQueryTabActions } from "../query/tabActions";
 import { COMMANDS, SHORTCUTS, type CommandContext } from "./commands";
+import { closePalette, usePalette } from "./paletteStore";
 import { PaletteInput, PaletteItem, PaletteList, PaletteRoot, type Choose } from "./parts";
 import { QuickOpen } from "./QuickOpen";
-
-export type PaletteMode = "commands" | "quickOpen";
-
-interface PaletteState {
-  mode: PaletteMode | null;
-  /** What had the focus before the palette opened: it gets it back when the palette closes. */
-  returnFocus: Element | null;
-}
-
-const usePalette = create<PaletteState>(() => ({ mode: null, returnFocus: null }));
-
-/** ⌘⇧P / ⌘P: opens that palette, switches to it from the other one, or closes it when it is the one open. */
-export function togglePalette(mode: PaletteMode): void {
-  const { mode: current, returnFocus } = usePalette.getState();
-  if (current === mode) usePalette.setState({ mode: null });
-  else usePalette.setState({ mode, returnFocus: current ? returnFocus : document.activeElement });
-}
-
-const closePalette = () => usePalette.setState({ mode: null });
 
 /** ⌘⇧P (spec §4.10): the commands, those that cannot run now greyed out. */
 function CommandList({ choose }: { choose: Choose }) {
@@ -96,7 +79,8 @@ export function PaletteHost() {
     event.preventDefault();
     const run = pending.current;
     pending.current = null;
-    // Replaced by another dialog (⌘, from the palette): that one keeps the focus.
+    // A dialog open now replaced the palette (⌘, from it): that one keeps the focus. The palette itself counts too, which
+    // absorbs the spurious call StrictMode makes while it is still open (its double mount unmounts the focus scope).
     const { returnFocus } = usePalette.getState();
     if (!isDialogOpen() && returnFocus instanceof HTMLElement && returnFocus.isConnected) returnFocus.focus();
     run?.();
@@ -115,10 +99,13 @@ export function PaletteHost() {
       <div
         className="flex min-h-0 flex-1 flex-col"
         onKeyDown={(e) => {
-          if (e.metaKey && e.key === "," && !isImeKeyEvent(e)) closePalette();
+          if (!isImeKeyEvent(e) && isSettingsKey(e)) closePalette();
         }}
       >
-        {mode === "commands" ? <CommandList choose={choose} /> : <QuickOpen choose={choose} />}
+        {/* A palette error shows here (Escape still closes it); the next ⌘P / ⌘⇧P starts afresh. */}
+        <ErrorBoundary key={mode} name="Palette" title="The palette hit an error" recover="retry">
+          {mode === "commands" ? <CommandList choose={choose} /> : <QuickOpen choose={choose} />}
+        </ErrorBoundary>
       </div>
     </Dialog>
   );

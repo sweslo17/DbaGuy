@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, unwrap } from "@/lib/api/client";
 import type { Dialect, ProfileDraft, ProfileSecretsInput } from "@/lib/api/types";
+import { invalidateExplorer } from "../explorer/explorerCache";
 
 export const profilesKey = ["profiles"] as const;
 
@@ -40,10 +41,7 @@ export function useSaveProfile() {
     },
     onSuccess: (_, input) => {
       qc.invalidateQueries({ queryKey: profilesKey });
-      if (input.id) {
-        qc.invalidateQueries({ queryKey: ["children", input.id] });
-        qc.invalidateQueries({ queryKey: ["detail", input.id] });
-      }
+      if (input.id) void invalidateExplorer(qc, input.id);
     },
   });
 }
