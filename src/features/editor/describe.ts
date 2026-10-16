@@ -2,6 +2,7 @@ import { Prec, StateEffect, StateField, type Extension } from "@codemirror/state
 import { EditorView, keymap, showTooltip, ViewPlugin, type Tooltip, type ViewUpdate } from "@codemirror/view";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import type { DescribeResult } from "@/lib/api/types";
+import { isImeKeyEvent } from "@/lib/ime";
 import { kindLabel } from "../explorer/kinds";
 import { statementWindow } from "./statements";
 
@@ -121,7 +122,7 @@ function tooltip(popover: Popover): Tooltip {
       dom.setAttribute("role", "dialog");
       dom.tabIndex = -1; // a click inside takes the focus, so Escape still reaches it
       dom.addEventListener("keydown", (event) => {
-        if (event.key !== "Escape" || event.isComposing) return;
+        if (event.key !== "Escape" || isImeKeyEvent(event)) return;
         event.preventDefault();
         closePopover(view);
         view.focus();

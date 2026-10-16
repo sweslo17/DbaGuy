@@ -2,6 +2,7 @@ import { Loader2, Plus, X } from "lucide-react";
 import { useEffect, useMemo } from "react";
 import type { Profile } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
+import { isImeKeyEvent } from "@/lib/ime";
 import { useTabStatus } from "@/stores/tabStatus";
 import { useWorkspace, type Tab } from "@/stores/workspace";
 import { useProfiles } from "../connections/hooks";
@@ -99,7 +100,7 @@ export function Workspace() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.isComposing || e.key === "Process") return;
+      if (isImeKeyEvent(e)) return;
       if (e.metaKey && e.key === "w" && activeTabId) {
         e.preventDefault();
         // A close is being asked about (its dialog is open, maybe for another tab): never queue a second one behind it.

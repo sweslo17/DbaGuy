@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { toast } from "@/components/ui/Toast";
 import { api, ApiError, errorMessage, unwrap } from "@/lib/api/client";
@@ -55,9 +55,10 @@ const opening = new Set<string>();
 
 /**
  * Opens a script in a query tab bound to it (spec §4.7), or activates the tab that has it already. A new tab starts on
- * the connection selected in the explorer; afterwards it keeps its own (the workspace remembers it).
+ * the connection selected in the explorer; afterwards it keeps its own (the workspace remembers it). A file that is
+ * gone refreshes the tree, so its stale entry goes.
  */
-export async function openScript(path: string): Promise<void> {
+export async function openScript(path: string, qc: QueryClient): Promise<void> {
   const open = scriptTab(path);
   if (open) return useWorkspace.getState().activate(open.id);
   if (opening.has(path)) return;
@@ -71,6 +72,7 @@ export async function openScript(path: string): Promise<void> {
     console.info(`Opened script ${file.path}`);
   } catch (error) {
     toast("error", `Could not open ${path}: ${errorMessage(error)}`);
+    if (error instanceof ApiError && error.status === 404) void qc.invalidateQueries({ queryKey: scriptTreeKey });
   } finally {
     opening.delete(path);
   }
@@ -98,9 +100,9 @@ async function change(failure: string, run: () => Promise<void>, refresh: () => 
 }
 
 /**
- * The Scripts panel's changes to the folder. Each resolves to the resulting path (true for a delete) when done, or
- * null (false) after a failure, which was shown as a toast. Tabs bound to a renamed file follow it; tabs bound to a
- * deleted file keep their text, unbound.
+ * The Scripts panel's actions: `open` (see `openScript`) and the changes to the folder. Each change resolves to the
+ * resulting path (true for a delete) when done, or null (false) after a failure, which was shown as a toast. Tabs bound
+ * to a renamed file follow it; tabs bound to a deleted file keep their text, unbound.
  */
 export function useScriptActions() {
   const qc = useQueryClient();
@@ -122,7 +124,7 @@ export function useScriptActions() {
         refresh,
       );
       if (!created) return null;
-      await openScript(path);
+      await openScript(path, qc);
       return path;
     };
 
@@ -175,6 +177,8 @@ export function useScriptActions() {
         refresh,
       );
 
-    return { refresh, createFile, createFolder, rename, remove };
+    const open = (path: string) => openScript(path, qc);
+
+    return { refresh, open, createFile, createFolder, rename, remove };
   }, [qc]);
 }

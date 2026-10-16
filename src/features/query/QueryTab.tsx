@@ -111,8 +111,8 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
       ? "Wait for the running statement or export"
       : undefined;
 
-  // Closing the tab: a running export, then the run (nothing more is sent), then an open transaction, then the unsaved
-  // script (registered by the script binding below).
+  // Closing the tab: the unsaved script first (registered by the script binding below), then a running export, then
+  // the run (nothing more is sent), then an open transaction.
   const guards = useSessionGuards(controller, subject);
   useCloseGuard(tab.id, CLOSE_GUARD_ORDER.export, (intent) => guards.exportStep(intent));
   useCloseGuard(tab.id, CLOSE_GUARD_ORDER.run, () => {

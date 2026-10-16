@@ -10,10 +10,15 @@ export type CloseIntent = "close" | "disconnect";
 export type CloseGuard = (intent: CloseIntent) => Promise<boolean> | boolean;
 
 /**
- * The order a tab's guards are asked in, lowest first: a running export, then the run (no further statement is sent),
- * then an open transaction, then the unsaved script. A disconnect asks only the session's guards (below `script`).
+ * The order a tab's guards are asked in, lowest first (ruling R-02c-8): the unsaved script first, while nothing has
+ * been done yet (its Cancel must never follow a side effect), then a running export, then the run (no further
+ * statement is sent), then an open transaction. A disconnect asks only the session's guards (the tab, and so its
+ * script, stays).
  */
-export const CLOSE_GUARD_ORDER = { export: 10, run: 15, transaction: 20, script: 30 } as const;
+export const CLOSE_GUARD_ORDER = { script: 5, export: 10, run: 15, transaction: 20 } as const;
+
+/** The guards that only closing asks: losing the connection keeps the tab and its text. */
+const CLOSE_ONLY: ReadonlySet<number> = new Set([CLOSE_GUARD_ORDER.script]);
 
 interface Entry {
   order: number;
@@ -54,7 +59,7 @@ const isOpen = (tabId: string) => useWorkspace.getState().tabs.some((tab) => tab
 
 async function askGuards(tabId: string, intent: CloseIntent): Promise<boolean> {
   const entries = [...(guards.get(tabId) ?? [])]
-    .filter((entry) => intent === "close" || entry.order < CLOSE_GUARD_ORDER.script)
+    .filter((entry) => intent === "close" || !CLOSE_ONLY.has(entry.order))
     .sort((a, b) => a.order - b.order);
   for (const entry of entries) {
     if (!isOpen(tabId)) return false; // closed some other way meanwhile

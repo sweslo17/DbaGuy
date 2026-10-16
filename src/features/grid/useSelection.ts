@@ -10,6 +10,7 @@ import {
   type RefObject,
 } from "react";
 import type { ColumnMeta } from "@/lib/api/types";
+import { isImeKeyEvent } from "@/lib/ime";
 import { HEADER_HEIGHT, ROW_HEIGHT } from "./columns";
 import { cellNear, firstCellInView, hitTest, viewportPoint, type GridGeometry, type GridHit } from "./hitTest";
 import {
@@ -257,7 +258,7 @@ const isShortcut = (e: KeyboardEvent, letter: string) =>
  */
 export function gridKeyDown(e: KeyboardEvent<HTMLDivElement>, input: KeyboardSelectionInput): void {
   if (e.target !== e.currentTarget || e.altKey || e.ctrlKey) return;
-  if (e.nativeEvent.isComposing || e.key === "Process") return;
+  if (isImeKeyEvent(e)) return;
   const { scrollRef, geometry, dims, selection, rect, select, scrollToCell } = input;
   const el = scrollRef.current;
   if (!el || dims.rows === 0 || dims.cols === 0) return;

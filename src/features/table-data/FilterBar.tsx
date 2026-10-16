@@ -2,6 +2,7 @@ import { History } from "lucide-react";
 import { useState, type KeyboardEvent } from "react";
 import { DropdownMenu, type MenuItem } from "@/components/ui/ContextMenu";
 import { cn } from "@/lib/cn";
+import { isImeKeyEvent } from "@/lib/ime";
 
 interface FilterBarProps {
   /** The applied filter: the input shows it again whenever it changes, and Escape brings it back. */
@@ -32,7 +33,7 @@ export function FilterBar(props: FilterBarProps) {
   }
 
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.nativeEvent.isComposing) return; // Enter / Escape belong to the input method (e.g. Zhuyin)
+    if (isImeKeyEvent(e)) return; // Enter / Escape belong to the input method (e.g. Zhuyin)
     if (e.key === "Enter") {
       e.preventDefault();
       onApply(draft);

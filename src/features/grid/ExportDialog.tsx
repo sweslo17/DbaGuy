@@ -9,6 +9,7 @@ import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
 import type { FormatKind, RowFormatOptions } from "@/lib/api/types";
 import { plural } from "@/lib/format";
+import { isImeKeyEvent } from "@/lib/ime";
 import { canChooseFiles, chooseSavePath } from "@/lib/native";
 import { useNow } from "@/lib/useNow";
 import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
@@ -241,7 +242,7 @@ export function ExportDialog({
   };
 
   const onPathKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+    if (e.key === "Enter" && !isImeKeyEvent(e)) {
       e.preventDefault();
       start();
     }

@@ -4,6 +4,7 @@ import { Dialog } from "@/components/ui/Dialog";
 import { FieldRow, Input, Select } from "@/components/ui/Field";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
+import { isImeKeyEvent } from "@/lib/ime";
 import { baseName, joinPath, nameProblem, parentPath, stemLength, withSqlSuffix } from "@/lib/scriptPaths";
 import { scriptTab } from "@/stores/workspace";
 import { folderPaths, scriptExists, useScriptTree } from "./useScripts";
@@ -27,7 +28,7 @@ export function SaveAsDialog({
   boundPath: string | null;
   /** The name proposed for a tab without a file. */
   suggestedName: string;
-  /** Saves the tab's text to the path; resolves to the failure's message, or null once saved. */
+  /** Saves the tab's text to the path; resolves to null once saved, or to a sentence saying why it was not. */
   onSave: (path: string) => Promise<string | null>;
   onClose: () => void;
   /** Where the focus goes once the dialog has closed. */
@@ -75,7 +76,7 @@ export function SaveAsDialog({
       if (failure === null) {
         toast("success", `Saved as ${target}`);
         onClose();
-      } else toast("error", `Could not save ${target}: ${failure}`);
+      } else toast("error", failure);
     } catch (error) {
       toast("error", `Could not save ${target}: ${errorMessage(error)}`);
     } finally {
@@ -84,7 +85,7 @@ export function SaveAsDialog({
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
-    if (e.key !== "Enter" || e.nativeEvent.isComposing) return; // Enter may belong to the input method
+    if (e.key !== "Enter" || isImeKeyEvent(e)) return; // Enter may belong to the input method
     e.preventDefault();
     void submit();
   };

@@ -7,9 +7,10 @@ import { ContextMenu, type MenuItem } from "@/components/ui/ContextMenu";
 import { errorMessage } from "@/lib/api/client";
 import type { ScriptNode } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
+import { isImeKeyEvent } from "@/lib/ime";
 import { isWithin, movedPath, parentPath, stemLength } from "@/lib/scriptPaths";
 import { useWorkspace } from "@/stores/workspace";
-import { openScript, useScriptActions, useScriptTree } from "./useScripts";
+import { useScriptActions, useScriptTree } from "./useScripts";
 
 const ROW_HEIGHT = 22;
 
@@ -100,7 +101,7 @@ function NameInput({
       onDoubleClick={(e) => e.stopPropagation()}
       onKeyDown={(e) => {
         e.stopPropagation(); // not the tree's keys
-        if (e.nativeEvent.isComposing || e.key === "Process") return;
+        if (isImeKeyEvent(e)) return;
         if (e.key === "Enter") {
           e.preventDefault();
           void commit().then((ok) => !ok && input.current?.focus());
@@ -174,7 +175,7 @@ export function ScriptsPanel() {
 
   const activate = (node: ScriptNode) => {
     if (node.kind === "folder") setOpen(node.path);
-    else void openScript(node.path);
+    else void actions.open(node.path);
   };
 
   const startEditing = (next: Editing, fromMenu: boolean) => {
@@ -233,7 +234,7 @@ export function ScriptsPanel() {
   const menuFor = (node: ScriptNode): MenuItem[] => {
     const folder = folderFor(node);
     return [
-      ...(node.kind === "file" ? [{ label: "Open", onSelect: () => void openScript(node.path) }] : []),
+      ...(node.kind === "file" ? [{ label: "Open", onSelect: () => void actions.open(node.path) }] : []),
       { label: "New File…", onSelect: () => startNew("file", folder, true), separatorBefore: node.kind === "file" },
       { label: "New Folder…", onSelect: () => startNew("folder", folder, true) },
       { label: "Rename…", shortcut: "F2", onSelect: () => startRename(node, true), separatorBefore: true },
@@ -252,7 +253,7 @@ export function ScriptsPanel() {
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
-    if (e.nativeEvent.isComposing || e.key === "Process" || editing) return;
+    if (isImeKeyEvent(e) || editing) return;
     const selectable = rows.filter((row): row is Extract<Row, { type: "node" }> => row.type === "node");
     const index = selectable.findIndex((row) => row.node.path === selected);
     const node = selectable[index]?.node;

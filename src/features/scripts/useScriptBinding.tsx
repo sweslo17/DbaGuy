@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
 import { toast } from "@/components/ui/Toast";
 import { ApiError, errorMessage } from "@/lib/api/client";
+import { isImeKeyEvent } from "@/lib/ime";
 import { baseName } from "@/lib/scriptPaths";
 import { reportTabStatus } from "@/stores/tabStatus";
 import { useWorkspace, type QueryTabState } from "@/stores/workspace";
@@ -56,7 +57,7 @@ export interface ScriptBinding {
  * is never compared twice. Nothing here is React state of the tab: the dot goes through the tab status store. A
  * restored tab does not know its file's content: it is read again the first time the tab is shown; a file that is gone
  * marks the tab "file missing" (⌘S writes it again). Closing a tab with unsaved edits, a missing file or a file not read
- * yet asks Save / Discard / Cancel (after the session's guards).
+ * yet asks Save / Discard / Cancel, before the session's guards.
  */
 export function useScriptBinding({
   tab,
@@ -76,7 +77,7 @@ export function useScriptBinding({
   const mounted = useRef(false);
   /** The bound path whose file was found missing (until it is saved again). */
   const missingPath = useRef<string | null>(null);
-  const verifying = useRef<{ path: string; done: Promise<void> } | null>(null);
+  const verifying = useRef<{ path: string; done: Promise<string | null> } | null>(null);
   /** The last full comparison: the same document against the same saved text gives the same answer. */
   const lastCheck = useRef<{ doc: Text; saved: string; dirty: boolean } | null>(null);
   const lineBreak = useRef<{ saved: string; lineBreak: string } | null>(null);
@@ -141,32 +142,34 @@ export function useScriptBinding({
   };
 
   /**
-   * Reads the bound file when its content is not known (a restored tab). Resolves once it is known, found missing, or
-   * the read failed (then the tab counts as unsaved). A file known to be missing is not read again.
+   * Reads the bound file when its content is not known (a restored tab). Resolves once it is known or found missing
+   * (null), or to the reason it could not be read: the tab then counts as unsaved, and the next call reads it again. A
+   * file known to be missing is not read again.
    */
-  const verify = (): Promise<void> => {
+  const verify = (): Promise<string | null> => {
     const t = current();
-    if (!t || t.scriptPath === null || t.savedText !== null || isMissing(t)) return Promise.resolve();
+    if (!t || t.scriptPath === null || t.savedText !== null || isMissing(t)) return Promise.resolve(null);
     const path = t.scriptPath;
     if (verifying.current?.path === path) return verifying.current.done;
-    const done = (async () => {
+    const done = (async (): Promise<string | null> => {
       try {
         const file = await readScript(path, AbortSignal.timeout(READ_TIMEOUT_MS));
         const now = current();
-        if (now?.scriptPath !== path || now.savedText !== null) return; // saved, renamed or unbound meanwhile
+        if (now?.scriptPath !== path || now.savedText !== null) return null; // saved, renamed or unbound meanwhile
         useWorkspace.getState().updateTab(tabId, "query", { savedText: file.content });
         console.info(`Read script ${path} again for its restored tab`);
+        return null;
       } catch (error) {
-        if (current()?.scriptPath !== path) return;
+        if (current()?.scriptPath !== path) return null;
         if (error instanceof ApiError && error.status === 404) {
           missingPath.current = path;
           console.warn(`Script ${path} no longer exists; its tab keeps the text`);
           toast("warning", `${path} no longer exists. Its tab keeps the text; ⌘S saves it there again.`);
           reportStatus();
-        } else {
-          console.warn(`Could not read script ${path}`, error);
-          toast("warning", `Could not read ${path}: ${errorMessage(error)}. ⌘S saves the tab’s text to it.`);
+          return null;
         }
+        console.warn(`Could not read script ${path}`, error);
+        return errorMessage(error);
       } finally {
         if (verifying.current?.path === path) verifying.current = null;
       }
@@ -175,12 +178,21 @@ export function useScriptBinding({
     return done;
   };
 
-  /** Writes the editor's text to `path` and binds the tab to it; resolves to the failure's message, or null. */
+  /**
+   * Writes the editor's text to `path` and binds the tab to it; resolves to null once saved, or to a sentence saying
+   * why it was not. A restored tab's file is read first, so its line breaks (CRLF) are kept: if it cannot be read, the
+   * file is left as it is. A missing file is written again with "\n".
+   */
   const saveTo = (path: string): Promise<string | null> => {
     const run = saves.current.then(async (): Promise<string | null> => {
+      const unreadable = await verify(); // bounded by its timeout; not queued behind other saves
       const t = current();
       const text = doc();
-      if (!t || !text) return "The tab is closed";
+      if (!t || !text) return `${path} was not saved: the tab is closed`;
+      if (t.scriptPath === path && t.savedText === null && !isMissing(t)) {
+        console.warn(`Not saving script ${path}: its line breaks are unknown (${unreadable ?? "not read"})`);
+        return `Could not read ${path} to check its line endings — save cancelled (${unreadable ?? "not read"})`;
+      }
       const content = fileText(text, t.savedText !== null ? lineBreakFor(t.savedText) : "\n");
       try {
         const file = await writeScript(path, content);
@@ -200,7 +212,7 @@ export function useScriptBinding({
         return null;
       } catch (error) {
         console.warn(`Saving script ${path} failed`, error);
-        return errorMessage(error);
+        return `Could not save ${path}: ${errorMessage(error)}`;
       }
     });
     saves.current = run;
@@ -213,7 +225,7 @@ export function useScriptBinding({
     const path = current()?.scriptPath ?? null;
     if (path === null) return saveAs();
     void saveTo(path).then((failure) => {
-      if (failure !== null) toast("error", `Could not save ${path}: ${failure}`);
+      if (failure !== null) toast("error", failure);
     });
   };
 
@@ -238,15 +250,16 @@ export function useScriptBinding({
     setPrompt({ ...prompt, saving: true, error: null });
     const failure = await saveTo(prompt.path);
     if (answer.current !== settle) {
-      if (failure !== null) toast("error", `Could not save ${prompt.path}: ${failure}`); // dismissed meanwhile
+      if (failure !== null) toast("error", failure); // dismissed meanwhile
       return;
     }
     if (failure === null) return settle(true);
     setPrompt((p) => p && { ...p, saving: false, error: failure });
   };
 
-  // Closing: after the session's guards, a bound tab whose text may not be in its file asks first. A restored tab is
-  // read now if it never was, so an unchanged one closes without asking.
+  // Closing: before the session's guards do anything (Cancel here leaves the run and the transaction alone), a bound
+  // tab whose text may not be in its file asks first. A restored tab is read now if it never was, so an unchanged one
+  // closes without asking.
   useCloseGuard(tabId, CLOSE_GUARD_ORDER.script, async () => {
     await verify();
     const t = current();
@@ -275,7 +288,11 @@ export function useScriptBinding({
   useEffect(reportStatus, [tab.scriptPath, tab.savedText]);
 
   useEffect(() => {
-    if (shown && tab.scriptPath !== null && tab.savedText === null) void verify();
+    const path = tab.scriptPath;
+    if (!shown || path === null || tab.savedText !== null) return;
+    void verify().then((unreadable) => {
+      if (unreadable !== null) toast("warning", `Could not read ${path}: ${unreadable}. The tab counts as unsaved.`);
+    });
   }, [shown, tab.scriptPath, tab.savedText]);
 
   // ⌘S / ⌘⇧S while the focus is elsewhere in the tab (the editor's own keymap handles them inside it). Never the
@@ -287,7 +304,7 @@ export function useScriptBinding({
   useEffect(() => {
     if (!active) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.isComposing || e.key === "Process" || e.defaultPrevented) return;
+      if (isImeKeyEvent(e) || e.defaultPrevented) return;
       if (!e.metaKey || e.ctrlKey || e.altKey || e.key.toLowerCase() !== "s") return;
       e.preventDefault();
       if (document.querySelector('[role="dialog"][data-state="open"]')) return; // a modal dialog (Radix)
@@ -334,7 +351,7 @@ const CLOSE_MESSAGES: Record<Unsaved, (path: string) => { title: string; message
   }),
   unknown: (path) => ({
     title: `Save ${baseName(path)}?`,
-    message: `${path} could not be read, so it is not known whether the tab’s text is saved. Save writes the text to it.`,
+    message: `${path} could not be read, so it is not known whether the tab’s text is saved. Save reads it again, then writes the text.`,
   }),
 };
 
@@ -374,7 +391,7 @@ function ClosePromptDialog({
       </p>
       {prompt.error && (
         <p className="mt-2 text-[12px] whitespace-pre-wrap text-danger" data-selectable>
-          Could not save: {prompt.error}
+          {prompt.error}
         </p>
       )}
     </Dialog>
