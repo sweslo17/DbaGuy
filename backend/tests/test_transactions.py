@@ -8,7 +8,10 @@ from dbaguy_backend.adapters.postgres.adapter import PostgresAdapter
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.domain.execution import MessageSeverity, ServerMessage
 from dbaguy_backend.domain.profiles import SqliteProfile
+from dbaguy_backend.services.safety import GuardAction, SafetyPolicy
+from dbaguy_backend.sql.dialects import Dialect
 from tests.support import PG_HOST, PG_PASSWORD, PG_PORT, make_pg_profile, requires_pg
+from tests.test_safety import HARMLESS_SETTINGS
 
 
 def drain(result):
@@ -187,5 +190,20 @@ def test_postgres_typed_commit_of_an_aborted_transaction_warns_that_it_rolled_ba
         assert result.take_messages() == []
         result.close()
         assert int(scalar(conn, "SELECT count(*) FROM commit_probe")) == 1
+    finally:
+        conn.close()
+
+
+@requires_pg
+@pytest.mark.parametrize("autocommit", [True, False])
+def test_postgres_read_only_connection_runs_the_harmless_settings_and_stays_read_only(autocommit):
+    conn = PostgresAdapter().open(make_pg_profile(read_only=True), Endpoint(PG_HOST, PG_PORT), PG_PASSWORD, None)
+    try:
+        conn.set_autocommit(autocommit)
+        for sql in HARMLESS_SETTINGS:
+            assert SafetyPolicy().check(sql, Dialect.POSTGRES, "standard", read_only=True).action == GuardAction.RUN
+            drain(conn.run(sql))
+        assert scalar(conn, "SHOW transaction_read_only") == "on"
+        conn.rollback()
     finally:
         conn.close()

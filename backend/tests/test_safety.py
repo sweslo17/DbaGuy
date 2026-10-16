@@ -84,3 +84,41 @@ def test_guard_reasons_are_plain_strings_on_the_wire():
     decision = policy.check("UPDATE t SET x = 1", PG, "standard", read_only=False)
     assert decision.model_dump(mode="json")["reasons"] == ["update_without_where"]
     assert isinstance(decision.reasons[0], GuardReason)
+
+
+# ---- read-only PostgreSQL connections may still change harmless settings ----
+
+HARMLESS_SETTINGS = [
+    "SET search_path TO app, public", "SET search_path = app", 'SET "search_path" TO public', "set Search_Path to x",
+    "SET SESSION statement_timeout = '5s'", "SET LOCAL lock_timeout TO 1000",
+    "SET idle_in_transaction_session_timeout = 0", "SET timezone = 'UTC'", "SET TIME ZONE 'Asia/Taipei'",
+    "SET LOCAL TIME ZONE LOCAL", "SET SESSION TIME ZONE DEFAULT", "SET datestyle TO ISO, YMD",
+    "SET intervalstyle = 'iso_8601'", "SET work_mem = '64MB'", "SET application_name = 'report'",
+    "SET client_min_messages TO warning", "SET extra_float_digits = 3", "SET bytea_output = 'hex'",
+    "/* for the report */ SET search_path TO reporting;", "RESET search_path", "RESET statement_timeout",
+    "RESET TIME ZONE", 'RESET "work_mem"', "reset timezone",
+]
+
+
+@pytest.mark.parametrize("sql", HARMLESS_SETTINGS)
+def test_read_only_allows_harmless_postgres_settings(sql):
+    assert decide(sql, "standard", read_only=True) == (A.RUN, [])
+
+
+@pytest.mark.parametrize("sql", [
+    "SET TRANSACTION READ WRITE", "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE", "SET ROLE admin",
+    "SET SESSION AUTHORIZATION admin", "RESET ALL", "DISCARD ALL", "RESET ROLE", "RESET SESSION AUTHORIZATION",
+    "SET transaction_read_only = off", "SET default_transaction_read_only = off",
+    "SET LOCAL default_transaction_read_only TO off", "RESET default_transaction_read_only",
+    "SET session_replication_role = replica", "SET myext.search_path = x", "SET search_path FROM CURRENT",
+    "SET SCHEMA 'app'", "SET NAMES 'UTF8'", "SET search_path", "RESET", "SET TIME ZONE",
+    "SET search_path = x; SET transaction_read_only = off", "RESET search_path; RESET ALL",
+    "SET search_path = x; SELECT 1",
+])
+def test_read_only_still_blocks_every_other_setting(sql):
+    assert decide(sql, "standard", read_only=True) == (A.BLOCK, ["read_only"])
+
+
+def test_the_setting_allow_list_is_postgres_only():
+    decision = policy.check("SET search_path TO x", Dialect.SQLITE, "standard", read_only=True)
+    assert (decision.action, decision.reasons) == (A.BLOCK, ["read_only"])

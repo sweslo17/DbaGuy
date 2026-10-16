@@ -6,9 +6,17 @@ from ..domain.classification import Classification, GuardReason, StatementKind
 from ..domain.profiles import SafetyLevel
 from ..sql.classifier import classify
 from ..sql.dialects import Dialect
-from ..sql.lexer import TokenKind, tokenize
+from ..sql.lexer import INSIGNIFICANT, Token, TokenKind, tokenize
+from ..sql.splitter import split
 
 _SET_CONFIG = "SET_CONFIG"  # a SELECT can call it to switch default_transaction_read_only off
+# Settings a read-only PostgreSQL session may still change: they shape how statements run and look, never whether
+# they may write. (READ ONLY is re-asserted before every statement and a manual-mode BEGIN is READ ONLY anyway.)
+_PG_HARMLESS_SETTINGS = frozenset({
+    "search_path", "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout", "timezone",
+    "datestyle", "intervalstyle", "work_mem", "application_name", "client_min_messages", "extra_float_digits",
+    "bytea_output",
+})
 # At the strict level every statement that is not a read is confirmed, naming its kind.
 _STRICT_REASON: dict[StatementKind, GuardReason] = {
     StatementKind.WRITE: GuardReason.STRICT_WRITE,
@@ -62,6 +70,8 @@ class SafetyPolicy:
             return True
         if classification.kind == StatementKind.TRANSACTION:
             return not any(t.kind == TokenKind.WORD and t.upper == "WRITE" for t in tokens)
+        if classification.kind == StatementKind.SESSION:
+            return _harmless_pg_setting(sql, dialect)
         return False
 
     @staticmethod
@@ -72,3 +82,39 @@ class SafetyPolicy:
         if level == "strict" and classification.kind != StatementKind.READ:
             return dangers or [_STRICT_REASON[classification.kind]]
         return dangers
+
+
+def _setting_name(token: Token) -> str:
+    """A configuration parameter's name as PostgreSQL compares it: case-insensitive, quotes or not; "" if not a name."""
+    if token.kind == TokenKind.WORD:
+        return token.text.lower()
+    return token.text.strip('"').lower() if token.kind == TokenKind.QUOTED else ""
+
+
+def _harmless_pg_setting(sql: str, dialect: Dialect) -> bool:
+    """One PostgreSQL statement that changes only a harmless setting: `SET [SESSION|LOCAL] <name> {TO|=} <value>`,
+    `SET [SESSION|LOCAL] TIME ZONE <value>` or `RESET <name>`, `RESET TIME ZONE`.
+
+    Never SET TRANSACTION, SET SESSION CHARACTERISTICS, SET ROLE, SET SESSION AUTHORIZATION, RESET ALL or a setting
+    outside the list (notably transaction_read_only and default_transaction_read_only).
+    """
+    if dialect != Dialect.POSTGRES:
+        return False
+    spans = split(sql, dialect)
+    if len(spans) != 1:
+        return False
+    tokens = [t for t in tokenize(spans[0].text, dialect) if t.kind not in INSIGNIFICANT]
+    words = [t.upper if t.kind == TokenKind.WORD else "" for t in tokens]
+    if words[:1] == ["RESET"]:
+        named = len(tokens) == 2 and _setting_name(tokens[1]) in _PG_HARMLESS_SETTINGS
+        return named or words[1:] == ["TIME", "ZONE"]
+    if words[:1] != ["SET"]:
+        return False
+    rest = 2 if words[1:2] in (["SESSION"], ["LOCAL"]) else 1
+    if words[rest:rest + 2] == ["TIME", "ZONE"]:
+        return len(tokens) > rest + 2  # a value follows
+    if rest >= len(tokens) or _setting_name(tokens[rest]) not in _PG_HARMLESS_SETTINGS:
+        return False
+    assign = tokens[rest + 1] if rest + 1 < len(tokens) else None
+    assigns = assign is not None and (assign.upper == "TO" or (assign.kind == TokenKind.OTHER and assign.text == "="))
+    return assigns and len(tokens) > rest + 2  # a value follows
