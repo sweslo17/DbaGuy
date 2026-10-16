@@ -6,6 +6,7 @@ import itertools
 import json
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
@@ -67,13 +68,21 @@ def write_json_atomic(path: Path, payload: Any, error: type[DomainError]) -> Non
     write_text_atomic(path, json.dumps(payload, indent=2, ensure_ascii=False), error)
 
 
+Prune = Callable[[dict[str, Any]], dict[str, Any]]
+
+
 class JsonDocument(Generic[M]):
     """One pydantic model stored as a JSON file. Fields this build does not know survive a round trip; an unreadable
-    or invalid file is moved aside and the defaults are used. The value is read once and kept in memory."""
+    or invalid file is moved aside and the defaults are used. The value is read once and kept in memory.
 
-    def __init__(self, path: Path, model: type[M]) -> None:
+    `prune`, when given, gets the file's object before validation and may drop parts that are invalid on their own
+    (e.g. one entry of a list), so they do not cost the whole file.
+    """
+
+    def __init__(self, path: Path, model: type[M], prune: Prune | None = None) -> None:
         self._path = path
         self._model = model
+        self._prune = prune
         self._raw: dict[str, Any] = {}  # the file as found; the model's fields are laid over it when saving
         self._value: M | None = None  # None until the file was read
         self._lock = threading.Lock()
@@ -105,6 +114,8 @@ class JsonDocument(Generic[M]):
             raw = json.loads(self._path.read_text("utf-8"))
             if not isinstance(raw, dict):
                 raise ValueError("not a JSON object")
+            if self._prune is not None:
+                raw = self._prune(raw)
             value = self._model.model_validate(raw, extra="ignore")  # a newer build may add fields
         except ValidationError as exc:  # before ValueError, which it is a subclass of
             move_aside(self._path, f"invalid {error_fields(exc)}", StorageError)

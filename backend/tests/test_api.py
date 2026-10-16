@@ -289,6 +289,11 @@ def test_settings_and_workspace_api(client):
     workspace = {"version": 1, "tabs": [{"id": "t1", "kind": "query", "buffer": "SELECT '😀'"}], "active_tab_id": "t1"}
     assert client.put("/workspace", json=workspace, headers=AUTH).status_code == 204
     assert client.get("/workspace", headers=AUTH).json()["tabs"][0]["buffer"] == "SELECT '😀'"
+    object_tab = {"id": "o1", "kind": "object", "title": "orders",
+                  "object_path": [{"kind": "schema", "name": "public"}, {"kind": "table", "name": "orders"}]}
+    workspace["tabs"].append(object_tab)
+    assert client.put("/workspace", json=workspace, headers=AUTH).status_code == 204
+    assert client.get("/workspace", headers=AUTH).json()["tabs"][1]["kind"] == "object"
 
 
 def test_settings_and_workspace_reject_bad_input(client):

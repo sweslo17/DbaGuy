@@ -17,7 +17,7 @@ class WorkspaceTab(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1, max_length=100)
-    kind: Literal["query", "table"]
+    kind: Literal["query", "table", "object"]
     title: str = ""
     profile_id: UUID | None = None
     database: str | None = None

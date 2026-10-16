@@ -183,6 +183,38 @@ def test_workspace_tabs_are_validated(tab):
         WorkspaceState.model_validate({"tabs": [tab]})
 
 
+def test_workspace_keeps_object_tabs(tmp_path):
+    state = WorkspaceState.model_validate({"tabs": [{
+        "id": "o1", "kind": "object", "title": "orders",
+        "object_path": [{"kind": "schema", "name": "public"}, {"kind": "table", "name": "orders"}],
+    }]})
+    WorkspaceService(tmp_path / "workspace.json").put(state)
+    assert WorkspaceService(tmp_path / "workspace.json").get() == state
+
+
+def test_an_invalid_tab_is_dropped_alone_with_a_warning_naming_its_fields(tmp_path, logged_warnings):
+    path = tmp_path / "workspace.json"
+    path.write_text(json.dumps({"tabs": [
+        {"id": "t1", "kind": "query", "buffer": "SELECT 1"},
+        {"id": "t2", "kind": "chart", "buffer": "secret-buffer", "cursor": -5},
+        {"id": "t3", "kind": "table", "future": True},
+    ], "active_tab_id": "t1"}))
+    state = WorkspaceService(path).get()
+    assert [tab.id for tab in state.tabs] == ["t1", "t3"] and state.active_tab_id == "t1"
+    assert list(tmp_path.glob("workspace.json.corrupt-*")) == []  # the file itself is fine
+    assert len(logged_warnings) == 1
+    assert "1" in logged_warnings[0] and "kind" in logged_warnings[0] and "cursor" in logged_warnings[0]
+    assert "secret-buffer" not in logged_warnings[0] and "chart" not in logged_warnings[0]
+
+
+@pytest.mark.parametrize("content", ["{not json", "[]", '{"tabs": "nope"}', '{"version": "two", "tabs": []}'])
+def test_a_workspace_file_unreadable_as_a_whole_is_moved_aside(tmp_path, content):
+    path = tmp_path / "workspace.json"
+    path.write_text(content)
+    assert WorkspaceService(path).get() == WorkspaceState()
+    assert len(list(tmp_path.glob("workspace.json.corrupt-*"))) == 1
+
+
 @pytest.fixture
 def scripts(tmp_path):
     root = tmp_path / "scripts"
