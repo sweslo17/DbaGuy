@@ -35,6 +35,8 @@ export interface CodeEditorProps {
   initialSelection?: { anchor: number; head: number };
   /** The language mode; null → generic SQL. */
   dialect: Dialect | null;
+  /** No typing (the text can still be set through the handle). */
+  readOnly?: boolean;
   /** The text changed. Called on every keystroke, so it carries no text: read it (`getText`) only when needed. */
   onChange?: () => void;
   onSelectionChange?: (selection: { anchor: number; head: number }) => void;
@@ -66,6 +68,7 @@ export function CodeEditor({
   initialText,
   initialSelection,
   dialect,
+  readOnly = false,
   onChange,
   onSelectionChange,
   onUnmount,
@@ -76,7 +79,7 @@ export function CodeEditor({
   const viewRef = useRef<EditorView | null>(null);
   const { settings } = useAppSettings();
   const editor = settings.editor;
-  const options = useMemo(() => editorOptions(editor, dialect), [editor, dialect]);
+  const options = useMemo(() => editorOptions(editor, dialect, readOnly), [editor, dialect, readOnly]);
   // What the view is configured with now: the reconfigure effects only swap what changed since.
   const applied = useRef<{ options: EditorOptions; extensions: Extension[] }>({ options, extensions });
   const latest = useRef({ initialText, initialSelection, options, extensions, onChange, onSelectionChange, onUnmount });

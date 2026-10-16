@@ -95,11 +95,16 @@ interface WorkspaceState extends WorkspaceSnapshot {
   moveScripts: (from: string, to: string) => void;
   /**
    * The script file or folder at `path` is gone: the tabs bound to it (or to a file below it) keep their text but are
-   * no longer bound to a file. Returns their titles.
+   * no longer bound to a file. Returns their titles. A tab still waiting for its file's text must have been given it
+   * first (`loadFileText`): it would be left empty.
    */
   unbindScripts: (path: string) => string[];
-  /** The scripts folder is another one now: every tab bound to a script is unbound, as above. Returns their titles. */
-  unbindAllScripts: () => string[];
+  /**
+   * The scripts folder is another one now (rulings R-02c-12, R-02c-22). A tab still waiting for its file's text holds
+   * nothing of the user's: it is closed (its file is intact in the old folder), without asking. Every other tab bound
+   * to a script is unbound, as above. Returns their titles.
+   */
+  leaveScriptsFolder: () => { closed: string[]; unbound: string[] };
   /** Replaces the tabs with the saved workspace (startup only, before the workspace renders). */
   restore: (snapshot: WorkspaceSnapshot) => void;
 }
@@ -207,7 +212,11 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
     }));
   },
   unbindScripts: (path) => unbindTabs(boundTo(get().tabs, path)),
-  unbindAllScripts: () => unbindTabs(boundWhere(get().tabs, () => true)),
+  leaveScriptsFolder: () => {
+    const waiting = get().tabs.filter((t) => t.kind === "query" && t.scriptPath !== null && t.textFromFile);
+    for (const tab of waiting) get().closeTab(tab.id);
+    return { closed: waiting.map((t) => t.title), unbound: unbindTabs(boundWhere(get().tabs, () => true)) };
+  },
   restore: ({ tabs, activeTabId, sidebarTab }) => {
     queryCounter = Math.max(queryCounter, ...tabs.map(queryNumber));
     set({ tabs, activeTabId, sidebarTab });

@@ -130,9 +130,9 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
     [],
   );
 
-  /** The statements the user agreed to (by index), or null when nothing may run. */
+  /** The statements the user agreed to (by index), or null when nothing may run (or the run was cancelled). */
   const confirmUpFront = useCallback(
-    async (profile: string, planned: PlannedStatement[]): Promise<Set<number> | null> => {
+    async (job: ActiveRun, profile: string, planned: PlannedStatement[]): Promise<Set<number> | null> => {
       let decisions: GuardDecision[];
       setChecking(true);
       try {
@@ -149,6 +149,7 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
       const flagged = decisions.flatMap((decision, index) =>
         decision.action === "run" ? [] : [{ index, statement: planned[index], decision }],
       );
+      if (job.cancelled) return null; // cancelled while checking: no confirmation is asked for
       if (flagged.length === 0) return new Set();
       const agreed = await ask("before", flagged);
       if (!agreed || flagged.some((f) => f.decision.action === "block")) return null;
@@ -241,7 +242,7 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
       const job: ActiveRun = { controller: session, requestId: null, cancelled: false };
       active.current = job;
       try {
-        const confirmed = await confirmUpFront(profile, planned);
+        const confirmed = await confirmUpFront(job, profile, planned);
         if (!confirmed || job.cancelled) return;
         if (options.unchanged && !options.unchanged()) {
           // Typed while the statements were being checked: their offsets no longer match the text.

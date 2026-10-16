@@ -27,10 +27,13 @@ export interface EditorOptions {
   upperCaseKeywords: boolean;
   /** The language mode; null (no connection yet) is generic SQL. */
   dialect: Dialect | null;
+  /** Typing is not possible (e.g. while a script's text is being read). */
+  readOnly: boolean;
 }
 
-export function editorOptions(editor: EditorSettings, dialect: Dialect | null): EditorOptions {
+export function editorOptions(editor: EditorSettings, dialect: Dialect | null, readOnly = false): EditorOptions {
   return {
+    readOnly,
     fontSize: editor.font_size,
     tabSize: editor.tab_size,
     wordWrap: editor.word_wrap,
@@ -73,6 +76,10 @@ const LIVE_SLOTS: readonly LiveSlot[] = [
   slot(
     (o) => String(o.wordWrap),
     (o) => (o.wordWrap ? EditorView.lineWrapping : []),
+  ),
+  slot(
+    (o) => String(o.readOnly),
+    (o) => EditorState.readOnly.of(o.readOnly),
   ),
   slot(
     (o) => `${o.dialect}:${o.upperCaseKeywords}`,

@@ -28,6 +28,8 @@ export interface StatementsState {
 }
 
 const SPLIT_DELAY_MS = 150;
+/** A background split that takes longer is given up (the next change splits again), so one never stays in flight. */
+const SPLIT_TIMEOUT_MS = 10_000;
 const FLASH_MS = 300;
 
 const setStatements = StateEffect.define<{ version: number; ranges: StatementRange[] }>();
@@ -63,9 +65,9 @@ export const statementsField = StateField.define<StatementsState>({
 });
 
 /** Splits `text` with the backend splitter; offsets are relative to `text`. */
-export async function splitText(text: string, dialect: Dialect): Promise<StatementRange[]> {
+export async function splitText(text: string, dialect: Dialect, signal?: AbortSignal): Promise<StatementRange[]> {
   const client = await api();
-  const { statements } = unwrap(await client.POST("/sql/split", { body: { text, dialect } }));
+  const { statements } = unwrap(await client.POST("/sql/split", { body: { text, dialect }, signal }));
   return statements.map((s) => ({ from: s.start, to: s.end, terminatorEnd: s.terminator_end }));
 }
 
@@ -124,7 +126,7 @@ function splitter(dialect: () => Dialect | null) {
         this.inFlight = true;
         const started = performance.now();
         try {
-          const ranges = await splitText(state.doc.toString(), current);
+          const ranges = await splitText(state.doc.toString(), current, AbortSignal.timeout(SPLIT_TIMEOUT_MS));
           if (!this.destroyed) applySplit(this.view, version, ranges);
         } catch (error) {
           console.warn(`Could not split the statements: ${errorMessage(error)}`);

@@ -3,8 +3,9 @@ import { useMemo } from "react";
 import { toast } from "@/components/ui/Toast";
 import { api, ApiError, errorMessage, unwrap } from "@/lib/api/client";
 import type { ScriptFile, ScriptNode, ScriptTree } from "@/lib/api/types";
-import { baseName, joinPath, nameProblem, parentPath, withSqlSuffix } from "@/lib/scriptPaths";
-import { scriptTab, useWorkspace } from "@/stores/workspace";
+import { baseName, isWithin, joinPath, nameProblem, parentPath, withSqlSuffix } from "@/lib/scriptPaths";
+import { mountedEditor, rememberEditorBuffer } from "@/stores/editorBuffers";
+import { scriptTab, startSelection, useWorkspace, type QueryTabState } from "@/stores/workspace";
 
 /*
  * The scripts folder (spec §4.7): the backend's `/scripts` API, the tree as one shared query, and the actions the
@@ -49,16 +50,52 @@ export async function scriptExists(path: string): Promise<boolean> {
 }
 
 /**
- * The scripts folder is now another one (ruling R-02c-12): the tree is read again, and every tab bound to a script
- * keeps its text but is unbound, since its path would now name a file in the new folder (⌘S would overwrite it).
+ * A tab waiting for its file's text (restored without text of its own, ruling R-02c-21) gets `content`: known as saved
+ * first, so it is no edit (no dot), and not an undo step. Its mounted editor takes it, else the tab mounts with it.
+ */
+export function loadFileText(tab: QueryTabState, content: string): void {
+  useWorkspace.getState().updateTab(tab.id, "query", { savedText: content, textFromFile: false });
+  const selection = startSelection(tab);
+  const editor = mountedEditor(tab.id);
+  if (editor) editor.setText(content, selection);
+  else rememberEditorBuffer(tab.id, { text: content, selection: selection ?? { anchor: 0, head: 0 } });
+}
+
+/**
+ * The tabs bound at or below `path` that still wait for their file's text get it now, read from the file: deleting
+ * it must not leave them empty. Throws if one cannot be read.
+ */
+async function loadWaitingTabs(path: string): Promise<void> {
+  for (const tab of useWorkspace.getState().tabs) {
+    if (tab.kind !== "query" || !tab.textFromFile) continue;
+    if (tab.scriptPath === null || !isWithin(tab.scriptPath, path)) continue;
+    let file: ScriptFile;
+    try {
+      file = await readScript(tab.scriptPath);
+    } catch (error) {
+      throw new Error(`its open tab could not get the file's text first (${errorMessage(error)})`);
+    }
+    const now = scriptTab(file.path); // read meanwhile (its tab was shown), or typed into: nothing to give it
+    if (now?.id === tab.id && now.textFromFile) loadFileText(now, file.content);
+  }
+}
+
+/**
+ * The scripts folder is now another one (rulings R-02c-12, R-02c-22): the tree is read again. A tab bound to a script
+ * keeps its text but is unbound, since its path would now name a file in the new folder (⌘S would overwrite it); a tab
+ * still showing just its file, never read, is closed instead (the file is intact in the old folder).
  */
 export function scriptsFolderChanged(qc: QueryClient): void {
   void qc.invalidateQueries({ queryKey: scriptTreeKey });
-  const titles = useWorkspace.getState().unbindAllScripts();
-  console.info(`Scripts folder changed; unbound ${titles.length} script tab(s)`);
-  if (!titles.length) return;
-  const tabs = titles.length === 1 ? `${titles[0]} keeps its text` : `${titles.join(", ")} keep their text`;
-  toast("info", `The scripts folder changed. ${tabs}, no longer saved to a file (Save As saves to the new folder).`);
+  const { closed, unbound } = useWorkspace.getState().leaveScriptsFolder();
+  console.info(`Scripts folder changed; closed ${closed.length} and unbound ${unbound.length} script tab(s)`);
+  const parts: string[] = [];
+  if (closed.length) parts.push(`Closed ${closed.join(", ")}: unchanged, still in the old folder.`);
+  if (unbound.length) {
+    const kept = unbound.length === 1 ? `${unbound[0]} keeps its text` : `${unbound.join(", ")} keep their text`;
+    parts.push(`${kept}, no longer saved to a file (Save As saves to the new folder).`);
+  }
+  if (parts.length) toast("info", `The scripts folder changed. ${parts.join(" ")}`);
 }
 
 /** Every folder in the tree, depth first (parents before their children). */
@@ -182,6 +219,7 @@ export function useScriptActions() {
       change(
         `Could not delete ${node.path}`,
         async () => {
+          await loadWaitingTabs(node.path); // nothing is deleted if a tab cannot keep the text
           unwrap(await (await api()).DELETE("/scripts/file", { params: { query: { path: node.path } } }));
           console.info(`Deleted script ${node.path}`);
           const titles = useWorkspace.getState().unbindScripts(node.path);

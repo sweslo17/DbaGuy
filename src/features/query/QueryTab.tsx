@@ -322,12 +322,20 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
         <Group orientation="vertical">
           <Panel id="editor" defaultSize="55%" minSize="15%">
             {/* The connection's colour as the editor's top border. */}
-            <div className="h-full" style={tint ? { borderTop: `2px solid ${tint}` } : undefined}>
+            <div className="relative h-full" style={tint ? { borderTop: `2px solid ${tint}` } : undefined}>
+              {script.loading && (
+                <span
+                  className="pointer-events-none absolute top-1 right-3 z-10 animate-delayed-show text-[11px] text-muted"
+                >
+                  Loading…
+                </span>
+              )}
               <CodeEditor
                 ref={editor}
                 initialText={remembered?.text ?? tab.initialText}
                 initialSelection={initialSelection}
                 dialect={dialect}
+                readOnly={script.loading}
                 extensions={extensions}
                 onChange={() => {
                   markEdited();

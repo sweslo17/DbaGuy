@@ -11,11 +11,11 @@ import { baseName } from "@/lib/scriptPaths";
 import { fileLength, fileText, lineBreakOf } from "@/lib/scriptText";
 import { isCommandKey } from "@/lib/shortcuts";
 import { reportTabStatus } from "@/stores/tabStatus";
-import { startSelection, useWorkspace, type QueryTabState } from "@/stores/workspace";
+import { useWorkspace, type QueryTabState } from "@/stores/workspace";
 import type { CodeEditorHandle } from "../editor/CodeEditor";
 import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
 import { SaveAsDialog } from "./SaveAsDialog";
-import { readScript, scriptTreeKey, writeScript } from "./useScripts";
+import { loadFileText, readScript, scriptTreeKey, writeScript } from "./useScripts";
 
 /** Typing that keeps the length the same is compared with the file only once it pauses this long. */
 const DIRTY_CHECK_DELAY_MS = 300;
@@ -41,6 +41,8 @@ export interface ScriptBinding {
   saveAs: () => void;
   /** The editor's text changed (every keystroke: cheap). */
   docChanged: () => void;
+  /** A tab waiting for its file's text, whose first read has not ended: the editor takes no typing meanwhile. */
+  loading: boolean;
   /** The Save As and close dialogs; the tab renders them. */
   dialogs: ReactNode;
 }
@@ -82,6 +84,8 @@ export function useScriptBinding({
   const [saveAsOpen, setSaveAsOpen] = useState(false);
   const [prompt, setPrompt] = useState<ClosePrompt | null>(null);
   const answer = useRef<((close: boolean) => void) | null>(null);
+  /** A read of the file has ended (loaded, missing or unreadable): a tab waiting for its text takes typing again. */
+  const [readEnded, setReadEnded] = useState(false);
 
   /** The tab as the store has it now: what an async step finds when it resumes, not what a render saw. */
   const current = () =>
@@ -141,9 +145,10 @@ export function useScriptBinding({
   /**
    * Reads the bound file when its content is not known (a restored tab). Resolves once it is known or found missing
    * (null), or to the reason it could not be read: the tab then counts as unsaved, and the next call reads it again. A
-   * file known to be missing is not read again. A tab waiting for its file's text gets it now.
+   * file known to be missing is not read again. A tab waiting for its file's text gets it now. `quiet`: a missing file
+   * is not announced (the caller says what it means).
    */
-  const verify = (): Promise<string | null> => {
+  const verify = ({ quiet = false }: { quiet?: boolean } = {}): Promise<string | null> => {
     const t = current();
     if (!t || t.scriptPath === null || t.savedText !== null || isMissing(t)) return Promise.resolve(null);
     const path = t.scriptPath;
@@ -153,16 +158,11 @@ export function useScriptBinding({
         const file = await readScript(path, AbortSignal.timeout(READ_TIMEOUT_MS));
         const now = current();
         if (now?.scriptPath !== path || now.savedText !== null) return null; // saved, renamed or unbound meanwhile
-        const { updateTab } = useWorkspace.getState();
         if (now.textFromFile) {
-          const handle = editor.current;
-          if (!handle) return null; // its editor is gone (a crash): read again once it is back
-          // The known content first, so the text set below counts as saved (no dot); it is not an undo step either.
-          updateTab(tabId, "query", { savedText: file.content, textFromFile: false });
-          handle.setText(file.content, startSelection(now));
+          loadFileText(now, file.content);
           console.info(`Loaded script ${path} into its restored tab`);
         } else {
-          updateTab(tabId, "query", { savedText: file.content });
+          useWorkspace.getState().updateTab(tabId, "query", { savedText: file.content });
           console.info(`Read script ${path} again for its restored tab`);
         }
         return null;
@@ -171,9 +171,11 @@ export function useScriptBinding({
         if (now?.scriptPath !== path) return null;
         if (error instanceof ApiError && error.status === 404) {
           missingPath.current = path;
-          const kept = now.textFromFile ? "its tab is empty" : "its tab keeps the text";
-          console.warn(`Script ${path} no longer exists; ${kept}`);
-          toast("warning", `${path} no longer exists, so ${kept}. ⌘S saves it there again.`);
+          const message = now.textFromFile
+            ? `${path} no longer exists, so its tab is empty.`
+            : `${path} no longer exists. Its tab keeps the text; ⌘S saves it there again.`;
+          console.warn(message);
+          if (!quiet) toast("warning", message);
           reportStatus();
           return null;
         }
@@ -181,6 +183,7 @@ export function useScriptBinding({
         return errorMessage(error);
       } finally {
         if (verifying.current?.path === path) verifying.current = null;
+        setReadEnded(true);
       }
     })();
     verifying.current = { path, done };
@@ -190,14 +193,23 @@ export function useScriptBinding({
   /**
    * Writes the editor's text to `path` and binds the tab to it; resolves to null once saved, or to a sentence saying
    * why it was not. A restored tab's file is read first, so its line breaks (CRLF) are kept: if it cannot be read, the
-   * file is left as it is. A missing file is written again with "\n".
+   * file is left as it is. A missing file is written again with "\n", unless the tab only ever waited for its text.
    */
   const saveTo = (path: string): Promise<string | null> => {
     const run = saves.current.then(async (): Promise<string | null> => {
-      const unreadable = await verify(); // bounded by its timeout; not queued behind other saves
+      // A tab still waiting for its file, found missing, looks again: the file may be back (a branch switch), and
+      // writing the empty tab would truncate it.
+      const waiting = current();
+      const recheck = waiting?.scriptPath === path && waiting.textFromFile && missingPath.current === path;
+      if (recheck) missingPath.current = null;
+      const unreadable = await verify({ quiet: recheck }); // bounded by its timeout; not queued behind other saves
       const t = current();
       const text = doc();
       if (!t || !text) return `${path} was not saved: the tab is closed`;
+      if (t.scriptPath === path && t.textFromFile && isMissing(t)) {
+        console.info(`Not saving script ${path}: it no longer exists and its tab is empty`);
+        return `Nothing to save: ${path} no longer exists and its tab is empty`;
+      }
       if (t.scriptPath === path && t.savedText === null && !isMissing(t)) {
         console.warn(`Not saving script ${path}: its line breaks are unknown (${unreadable ?? "not read"})`);
         return `Could not read ${path} to check its line endings — save cancelled (${unreadable ?? "not read"})`;
@@ -353,7 +365,7 @@ export function useScriptBinding({
       )}
     </>
   );
-  return { save, saveAs, docChanged, dialogs };
+  return { save, saveAs, docChanged, loading: tab.textFromFile && !readEnded, dialogs };
 }
 
 const CLOSE_MESSAGES: Record<Unsaved, (path: string) => { title: string; message: string }> = {
