@@ -3,6 +3,7 @@ import { api, errorMessage, unwrap } from "@/lib/api/client";
 import { pathKey, type ObjectNode, type ObjectSearchHit, type Profile } from "@/lib/api/types";
 import { useWorkspace } from "@/stores/workspace";
 import { kindIcon } from "../explorer/kinds";
+import { objectSearchKey } from "./objectSearchKey";
 import { PaletteGroup, PaletteItem, PaletteNote, type Choose } from "./parts";
 
 /*
@@ -11,10 +12,6 @@ import { PaletteGroup, PaletteItem, PaletteNote, type Choose } from "./parts";
  */
 
 const OBJECT_LIMIT = 50;
-
-/** A connection's object searches, by search text (without `q`: all of them, e.g. to drop after Refresh schema). */
-export const objectSearchKey = (profileId: string | null, q?: string) =>
-  q === undefined ? ["object-search", profileId] : ["object-search", profileId, q];
 
 /**
  * The objects matching `q`, best first. Keyed by connection and text, so an older answer never replaces a newer one;

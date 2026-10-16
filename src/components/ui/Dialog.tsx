@@ -1,7 +1,7 @@
 import { Dialog as RadixDialog } from "radix-ui";
 import { useRef, type ReactNode } from "react";
 import { cn } from "@/lib/cn";
-import { PALETTE_ATTRIBUTE } from "@/lib/dialogs";
+import { isDialogOpen, PALETTE_ATTRIBUTE } from "@/lib/dialogs";
 import { isImeKeyEvent } from "@/lib/ime";
 
 export function Dialog({
@@ -20,15 +20,20 @@ export function Dialog({
   children: ReactNode;
   footer?: ReactNode;
   width?: number;
-  /** Where focus goes once the dialog has closed (call `preventDefault` to place it yourself). */
+  /**
+   * Called once the dialog has closed; `preventDefault` places the focus yourself. Otherwise it goes back to what had
+   * it when the dialog took it (when no other dialog is open by then).
+   */
   onCloseAutoFocus?: (event: Event) => void;
   /**
    * The command palette: its title is for screen readers only, its content lays itself out (a search box above a list
-   * that scrolls), and the window shortcuts that act through it still work while it is open (`isDialogOpen`).
+   * that scrolls), and ⌘P / ⌘⇧P still work while it is open (`isDialogOpen`).
    */
   palette?: boolean;
 }) {
   const content = useRef<HTMLDivElement>(null);
+  /** What had the focus when the dialog took it; it gets it back on close (ruling R-02c-18). */
+  const opener = useRef<Element | null>(null);
   return (
     <RadixDialog.Root open={open} onOpenChange={onOpenChange}>
       <RadixDialog.Portal>
@@ -43,9 +48,20 @@ export function Dialog({
           onOpenAutoFocus={(e) => {
             e.preventDefault();
             const dialog = content.current;
-            if (dialog && !dialog.contains(document.activeElement)) dialog.focus({ preventScroll: true });
+            if (!dialog || dialog.contains(document.activeElement)) return;
+            opener.current = document.activeElement;
+            dialog.focus({ preventScroll: true });
           }}
-          onCloseAutoFocus={onCloseAutoFocus}
+          // Radix would focus the trigger, and these dialogs have none: the focus would be lost on the page.
+          onCloseAutoFocus={(e) => {
+            const previous = opener.current;
+            opener.current = null;
+            onCloseAutoFocus?.(e);
+            if (e.defaultPrevented) return;
+            e.preventDefault();
+            const back = previous instanceof HTMLElement && previous !== document.body && previous.isConnected;
+            if (back && !isDialogOpen()) previous.focus({ preventScroll: true });
+          }}
           // Escape that cancels an input method's composition must not close the dialog with it.
           onEscapeKeyDown={(e) => {
             if (isImeKeyEvent(e)) e.preventDefault();

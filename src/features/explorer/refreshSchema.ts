@@ -1,6 +1,6 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { api, unwrap } from "@/lib/api/client";
-import { objectSearchKey } from "../palette/objectSearch";
+import { objectSearchKey } from "../palette/objectSearchKey";
 import { invalidateExplorer } from "./explorerCache";
 
 /**

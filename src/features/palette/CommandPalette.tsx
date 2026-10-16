@@ -8,6 +8,7 @@ import { isSettingsKey } from "@/lib/shortcuts";
 import { useAppSettings } from "@/stores/settings";
 import { useWorkspace } from "@/stores/workspace";
 import { readQueryTabActions } from "../query/tabActions";
+import { openSettings } from "../settings/SettingsDialog";
 import { COMMANDS, SHORTCUTS, type CommandContext } from "./commands";
 import { closePalette, usePalette } from "./paletteStore";
 import { PaletteInput, PaletteItem, PaletteList, PaletteRoot, type Choose } from "./parts";
@@ -79,8 +80,8 @@ export function PaletteHost() {
     event.preventDefault();
     const run = pending.current;
     pending.current = null;
-    // A dialog open now replaced the palette (⌘, from it): that one keeps the focus. The palette itself counts too, which
-    // absorbs the spurious call StrictMode makes while it is still open (its double mount unmounts the focus scope).
+    // A dialog open now replaced the palette: that one keeps the focus. The palette itself counts too, which absorbs the
+    // spurious call StrictMode makes while it is still open (its double mount unmounts the focus scope).
     const { returnFocus } = usePalette.getState();
     if (!isDialogOpen() && returnFocus instanceof HTMLElement && returnFocus.isConnected) returnFocus.focus();
     run?.();
@@ -95,11 +96,14 @@ export function PaletteHost() {
       palette
       onCloseAutoFocus={onClosed}
     >
-      {/* ⌘, from the palette: Settings (the window's handler) opens in its place. */}
+      {/* ⌘, from the palette: Settings, as its command opens it (the window's ⌘, handler is not reached). */}
       <div
         className="flex min-h-0 flex-1 flex-col"
         onKeyDown={(e) => {
-          if (!isImeKeyEvent(e) && isSettingsKey(e)) closePalette();
+          if (isImeKeyEvent(e) || !isSettingsKey(e)) return;
+          e.preventDefault();
+          e.stopPropagation();
+          choose(openSettings);
         }}
       >
         {/* A palette error shows here (Escape still closes it); the next ⌘P / ⌘⇧P starts afresh. */}

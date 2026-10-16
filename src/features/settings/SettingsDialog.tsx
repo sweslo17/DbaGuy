@@ -258,7 +258,7 @@ export function SettingsDialogHost() {
     const onKey = (e: KeyboardEvent) => {
       if (isImeKeyEvent(e) || e.defaultPrevented || !isSettingsKey(e)) return;
       e.preventDefault();
-      if (isDialogOpen({ exceptPalette: true })) return; // from the palette, Settings replaces it
+      if (isDialogOpen()) return; // the palette opens Settings itself (as its Settings command)
       openSettings();
     };
     window.addEventListener("keydown", onKey);
