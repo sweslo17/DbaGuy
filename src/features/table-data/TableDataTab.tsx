@@ -12,6 +12,7 @@ import { kindLabel } from "../explorer/kinds";
 import { DataGrid } from "../grid/DataGrid";
 import type { GridSort } from "../grid/GridHeader";
 import { CONNECTION_LOST } from "../session/execution";
+import { isExporting } from "../session/SessionController";
 import { SessionError } from "../session/SessionError";
 import { FilterBar } from "./FilterBar";
 import { addCondition, filterForValue, type Relation } from "./filterValue";
@@ -108,6 +109,8 @@ function DataView({ tab, active }: { tab: ObjectTab; active: boolean }) {
   const columns = set?.columns;
   const rows = set?.rows;
   const firstPagePending = execution?.status === "running" && !set;
+  // An export runs on this session: filter, sort and refresh would only wait behind it.
+  const exporting = isExporting(snapshot);
 
   const gridSort = useMemo<GridSort[]>(
     () =>
@@ -119,8 +122,10 @@ function DataView({ tab, active }: { tab: ObjectTab; active: boolean }) {
   );
   const tableName = useMemo(() => relation && { schema: relation.schema, name: relation.name }, [relation]);
   const onHeaderClick = useCallback(
-    (col: number, additive: boolean) => columns && toggleSort(columns[col].name, additive),
-    [columns, toggleSort],
+    (col: number, additive: boolean) => {
+      if (columns && !exporting) toggleSort(columns[col].name, additive);
+    },
+    [columns, toggleSort, exporting],
   );
   const onSortBy = useCallback(
     (col: number, descending: boolean) => columns && sortBy(columns[col].name, descending),
@@ -134,12 +139,19 @@ function DataView({ tab, active }: { tab: ObjectTab; active: boolean }) {
       return [
         {
           label: "Filter by this value",
-          disabled: !condition,
+          disabled: !condition || exporting,
           onSelect: () => condition && applyFilter(addCondition(state.filter, condition)),
         },
       ];
     },
-    [columns, rows, dialect, applyFilter, state.filter],
+    [columns, rows, dialect, applyFilter, state.filter, exporting],
+  );
+  const exportSource = useMemo(
+    () =>
+      table.controller && execution && relation
+        ? { controller: table.controller, sql: execution.sql, title: relation.name, tableName }
+        : null,
+    [table.controller, execution, relation, tableName],
   );
 
   const openInQueryTab = () => {
@@ -162,13 +174,19 @@ function DataView({ tab, active }: { tab: ObjectTab; active: boolean }) {
           onApply={applyFilter}
           onRevert={table.clearFilterError}
           onClearHistory={table.clearHistory}
+          disabled={exporting}
         />
         {firstPagePending ? (
           <Button size="sm" onClick={table.cancel} disabled={phase !== "open"}>
             Cancel
           </Button>
         ) : (
-          <Button size="sm" onClick={table.refresh} disabled={phase !== "open"} title="Run the query again">
+          <Button
+            size="sm"
+            onClick={table.refresh}
+            disabled={phase !== "open" || exporting}
+            title={exporting ? "An export is running on this session" : "Run the query again"}
+          >
             <RefreshCw size={12} /> Refresh
           </Button>
         )}
@@ -205,8 +223,9 @@ function DataView({ tab, active }: { tab: ObjectTab; active: boolean }) {
             tableName={tableName}
             sort={gridSort}
             onHeaderClick={onHeaderClick}
-            onSortBy={onSortBy}
+            onSortBy={exporting ? undefined : onSortBy}
             extraCellMenu={extraCellMenu}
+            exportSource={exportSource}
           />
         ) : (
           placeholder && <p className="p-4 text-[12px] text-muted">{placeholder}</p>

@@ -15,10 +15,13 @@ interface FilterBarProps {
   onClearHistory: () => void;
   /** The last filter was rejected: the text stays for editing. */
   invalid: boolean;
+  /** Nothing can be applied now (an export runs on the session). */
+  disabled?: boolean;
 }
 
 /** One-line WHERE input of the table data view, with its recent filters. */
-export function FilterBar({ applied, history, onApply, onRevert, onClearHistory, invalid }: FilterBarProps) {
+export function FilterBar(props: FilterBarProps) {
+  const { applied, history, onApply, onRevert, onClearHistory, invalid, disabled = false } = props;
   const [draft, setDraft] = useState(applied);
   const [shownApplied, setShownApplied] = useState(applied);
   if (applied !== shownApplied) {
@@ -41,6 +44,7 @@ export function FilterBar({ applied, history, onApply, onRevert, onClearHistory,
     ? [
         ...history.map((filter) => ({
           label: filter,
+          disabled,
           onSelect: () => {
             setDraft(filter);
             onApply(filter);
@@ -55,6 +59,7 @@ export function FilterBar({ applied, history, onApply, onRevert, onClearHistory,
       className={cn(
         "flex h-6 min-w-0 flex-1 items-center rounded-md border bg-elevated font-mono text-[12px] focus-within:border-accent",
         invalid ? "border-danger" : "border-border",
+        disabled && "opacity-60",
       )}
     >
       <span className="pr-1.5 pl-2 text-muted">WHERE</span>
@@ -65,6 +70,7 @@ export function FilterBar({ applied, history, onApply, onRevert, onClearHistory,
         spellCheck={false}
         autoCorrect="off"
         autoCapitalize="off"
+        disabled={disabled}
         aria-label="Filter (WHERE)"
         aria-invalid={invalid}
         placeholder="e.g. id > 100 AND name LIKE 'A%'  (Enter to apply)"

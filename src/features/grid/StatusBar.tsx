@@ -1,3 +1,4 @@
+import { Download } from "lucide-react";
 import { memo } from "react";
 import { plural } from "@/lib/format";
 import type { Aggregates } from "./aggregate";
@@ -8,6 +9,8 @@ interface StatusBarProps {
   hasMore: boolean;
   /** Figures of a selection of more than one cell, else null. */
   aggregates: Aggregates | null;
+  /** Opens the export dialog (shown only when set). */
+  onExport?: () => void;
 }
 
 /** Up to 15 significant digits: a double's precision, without float noise such as 0.30000000000000004. */
@@ -40,20 +43,34 @@ function Figures({ aggregates: a }: { aggregates: Aggregates }) {
   );
 }
 
-/** Under the grid: the size of the result, and the selected cell count with its numeric figures. */
-export const StatusBar = memo(function StatusBar({ rowCount, columnCount, hasMore, aggregates }: StatusBarProps) {
+/** Under the grid: the size of the result, the selected cell count with its numeric figures, and Export. */
+export const StatusBar = memo(function StatusBar(props: StatusBarProps) {
+  const { rowCount, columnCount, hasMore, aggregates, onExport } = props;
   return (
     <div className="flex h-6 shrink-0 items-center gap-4 border-y border-border px-3 text-[12px] whitespace-nowrap text-muted">
       <span className="shrink-0">
         {plural(rowCount, "row")}
         {hasMore ? " loaded" : ""} · {plural(columnCount, "column")}
       </span>
-      {aggregates && (
-        <span className="ml-auto flex min-w-0 items-center gap-4">
-          <span className="shrink-0">{plural(aggregates.cells, "cell")}</span>
-          <Figures aggregates={aggregates} />
-        </span>
-      )}
+      <span className="ml-auto flex min-w-0 items-center gap-4">
+        {aggregates && (
+          <>
+            <span className="shrink-0">{plural(aggregates.cells, "cell")}</span>
+            <Figures aggregates={aggregates} />
+          </>
+        )}
+        {onExport && (
+          <button
+            type="button"
+            className="-mr-2 flex h-5 shrink-0 items-center gap-1 rounded px-1.5 hover:bg-hover hover:text-fg"
+            title="Export the whole result to a file"
+            onClick={onExport}
+          >
+            <Download size={12} />
+            Export…
+          </button>
+        )}
+      </span>
     </div>
   );
 });

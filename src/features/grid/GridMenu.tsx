@@ -23,6 +23,8 @@ export interface GridMenuActions {
   sortBy?: (column: number, descending: boolean) => void;
   /** Items appended to a cell's menu (table data: "Filter by this value"). */
   extraCellMenu?: (row: number, column: number) => MenuItem[];
+  /** "Export…": the whole result to a file (shown only when set). */
+  openExport?: () => void;
 }
 
 /** The group starts with a separator. */
@@ -60,15 +62,16 @@ function headerItems(col: number, a: GridMenuActions): MenuItem[] {
   return items;
 }
 
-/** Copy, Copy as, the drawers; for a cell (`cell` set) also pinning and the caller's extra items. */
+/** Copy, Copy as, Export, the drawers; for a cell (`cell` set) also pinning and the caller's extra items. */
 function selectionItems(pos: CellPos | null, cell: boolean, a: GridMenuActions): MenuItem[] {
-  const { openValue, openRecord } = a;
+  const { openValue, openRecord, openExport } = a;
   const items: MenuItem[] = [
     { label: "Copy", shortcut: "⌘C", onSelect: a.copyDefault },
     {
       label: "Copy as",
       children: COPY_FORMATS.map((format) => ({ label: COPY_FORMAT_LABELS[format], onSelect: () => a.copy(format) })),
     },
+    ...(openExport ? [{ label: "Export…", onSelect: openExport }] : []),
     {
       label: "View value",
       shortcut: "↵",

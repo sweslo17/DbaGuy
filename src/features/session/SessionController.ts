@@ -56,6 +56,12 @@ export function emptySnapshot(phase: SessionPhase): SessionSnapshot {
   return { phase, info: null, error: null, state: null, executions: {}, sessionMessages: [] };
 }
 
+/** An export is still running on the session: a statement sent now would wait behind it. */
+export function isExporting(snapshot: SessionSnapshot | null): boolean {
+  if (!snapshot) return false;
+  return Object.values(snapshot.executions).some((execution) => execution.kind === "export" && unfinished(execution));
+}
+
 function disposeSession(sessionId: string): void {
   api()
     .then((client) => client.DELETE("/sessions/{session_id}", { params: { path: { session_id: sessionId } } }))

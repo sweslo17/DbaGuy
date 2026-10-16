@@ -7,7 +7,7 @@ import { plural } from "@/lib/format";
 import type { ConsoleTab } from "@/stores/workspace";
 import { useDialect } from "../connections/hooks";
 import { CONNECTION_LOST } from "../session/execution";
-import { PAGE_SIZE, type SessionPhase, type SessionStateView } from "../session/SessionController";
+import { isExporting, PAGE_SIZE, type SessionPhase, type SessionStateView } from "../session/SessionController";
 import { SessionError } from "../session/SessionError";
 import { useSession } from "../session/useSession";
 import { DataGrid } from "../grid/DataGrid";
@@ -71,7 +71,9 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
   // Results belong to the session that produced them: a new session knows none of the old request ids.
   const execution = requestId ? (snapshot?.executions[requestId] ?? null) : null;
 
-  const canRun = !!controller && phase === "open" && execution?.status !== "running";
+  // An export runs on this session: a statement sent now would only wait behind it.
+  const exporting = isExporting(snapshot);
+  const canRun = !!controller && phase === "open" && execution?.status !== "running" && !exporting;
   const run = () => {
     const el = editor.current;
     if (!canRun || !controller || !el) return;
@@ -104,11 +106,18 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
   const lastSetIndex = execution?.resultSets.at(-1)?.index;
   // A paused result keeps `hasMore` while its next page loads: the grid shows that, the status line does not.
   const running = execution?.status === "running" && !execution.resultSets.some((s) => s.hasMore);
+  const exportSource = controller && execution ? { controller, sql: execution.sql, title: tab.title } : null;
 
   return (
     <div className="flex h-full flex-col">
       <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border px-2">
-        <Button variant="primary" size="sm" onClick={run} disabled={!canRun}>
+        <Button
+          variant="primary"
+          size="sm"
+          onClick={run}
+          disabled={!canRun}
+          title={exporting ? "An export is running on this session" : undefined}
+        >
           Run ⌘↵
         </Button>
         <Button size="sm" onClick={cancel} disabled={phase !== "open" || execution?.status !== "running"}>
@@ -172,6 +181,7 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
                       loadingMore={execution.status === "running" && set.index === lastSetIndex}
                       onLoadMore={phase === "open" ? loadMore : undefined}
                       dialect={dialect}
+                      exportSource={exportSource}
                     />
                   </div>
                 ))}
