@@ -3,12 +3,7 @@ import { api, errorMessage, unwrap } from "@/lib/api/client";
 import type { PathSegment } from "@/lib/api/types";
 import type { ObjectTab } from "@/stores/workspace";
 import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
-import {
-  PAGE_SIZE,
-  type SessionController,
-  type SessionPhase,
-  type SessionSnapshot,
-} from "../session/SessionController";
+import { isExporting, PAGE_SIZE, type SessionController, type SessionSnapshot } from "../session/SessionController";
 import { useSession } from "../session/useSession";
 import { clearFilterHistory, readFilterHistory, rememberFilter } from "./filterHistory";
 import { relationOf, type Relation } from "./filterValue";
@@ -27,6 +22,11 @@ export interface TableDataState {
   requestId: string | null;
   /** browse-select (422) or execution error. */
   error: string | null;
+  /**
+   * The last filter entered was rejected (422) and is not applied: the rows still show `filter`. Cleared by applying a
+   * filter again, by Escape, or by editing the text; never by a sort or a refresh.
+   */
+  filterError: string | null;
   count: { status: "idle" | "running" | "done" | "error"; value?: number; error?: string };
 }
 
@@ -46,6 +46,8 @@ interface BrowseJob extends Job {
 interface CountJob {
   run: number;
   filter: string;
+  /** The browse run shown when the count was asked: rows fetched again after it make a finished count stale. */
+  browseRun: number;
   sql: string | null;
   error: string | null;
 }
@@ -89,24 +91,28 @@ function endRequest(controller: SessionController, requestId: string): void {
 
 /**
  * Sends `job` once the session is open — again after a retry (a new controller) — ending the request sent before it.
- * Returns the request sent last with the job it ran; it can belong to an older job until the new one is sent.
+ * While an export runs on the session the job is held, and sent when the export ends: sent now, it would only wait
+ * behind the export. Returns the request sent last with the job it ran; it can belong to an older job until the new
+ * one is sent.
  */
 function useSessionJob<J extends Job>(
   controller: SessionController | null,
-  phase: SessionPhase | undefined,
+  snapshot: SessionSnapshot | null,
   job: J | null,
 ): { requestId: string; job: J } | null {
   const sent = useRef<{ controller: SessionController; run: number; requestId: string } | null>(null);
   const [current, setCurrent] = useState<{ requestId: string; job: J } | null>(null);
+  const phase = snapshot?.phase;
+  const exporting = isExporting(snapshot);
   useEffect(() => {
-    if (!controller || phase !== "open" || !job) return;
+    if (!controller || phase !== "open" || exporting || !job) return;
     const previous = sent.current?.controller === controller ? sent.current : null;
     if (previous?.run === job.run) return;
     if (previous) endRequest(controller, previous.requestId);
     const requestId = controller.execute(job.sql, { history: false, pageSize: PAGE_SIZE });
     sent.current = { controller, run: job.run, requestId };
     setCurrent({ requestId, job });
-  }, [controller, phase, job]);
+  }, [controller, phase, exporting, job]);
   return current;
 }
 
@@ -145,15 +151,17 @@ export function useTableData(tab: ObjectTab, active: boolean) {
   const { controller: countController, snapshot: countSnapshot, retry: retryCount } = counting;
 
   const [browseJob, setBrowseJob] = useState<BrowseJob | null>(null);
+  /** The last sort or refresh could not be built. */
   const [buildError, setBuildError] = useState<string | null>(null);
+  const [filterError, setFilterError] = useState<string | null>(null);
   const [countJob, setCountJob] = useState<CountJob | null>(null);
   const [history, setHistory] = useState(() => readFilterHistory(profileId, path));
   const builds = useRef(0);
   const countRuns = useRef(0);
 
-  const sentBrowse = useSessionJob(data.controller, data.snapshot?.phase, browseJob);
+  const sentBrowse = useSessionJob(data.controller, data.snapshot, browseJob);
   const countReady = useMemo(() => (countJob?.sql ? { run: countJob.run, sql: countJob.sql } : null), [countJob]);
-  const sentCount = useSessionJob(countController, countSnapshot?.phase, countReady);
+  const sentCount = useSessionJob(countController, countSnapshot, countReady);
   const execution: ExecutionState | null = sentBrowse
     ? (data.snapshot?.executions[sentBrowse.requestId] ?? null)
     : null;
@@ -167,18 +175,24 @@ export function useTableData(tab: ObjectTab, active: boolean) {
     phase !== "closed" &&
     (sentBrowse?.job.run !== browseJob.run || (!!execution && execution.status !== "done"));
 
-  /** Builds the SELECT for `filter` and `sorts` and makes it the applied browse; a rejected filter changes nothing. */
+  /**
+   * Builds the SELECT for `filter` and `sorts` and makes it the applied browse; a rejected build changes nothing. Only
+   * a build for a newly entered filter (`newFilter`) sets or clears the filter error: a sort keeps it.
+   */
   const browse = useCallback(
-    (nextFilter: string, sorts: SortKey[]) => {
+    (nextFilter: string, sorts: SortKey[], newFilter = false) => {
       const ticket = ++builds.current;
       buildSelect(profileId, path, nextFilter, sorts, false).then(
         (sql) => {
           if (ticket !== builds.current) return;
           setBuildError(null);
+          if (newFilter) setFilterError(null);
           setBrowseJob((job) => ({ run: (job?.run ?? 0) + 1, sql, filter: nextFilter, sorts }));
         },
         (error: unknown) => {
-          if (ticket === builds.current) setBuildError(errorMessage(error));
+          if (ticket !== builds.current) return;
+          if (newFilter) setFilterError(errorMessage(error));
+          else setBuildError(errorMessage(error));
         },
       );
     },
@@ -209,8 +223,20 @@ export function useTableData(tab: ObjectTab, active: boolean) {
     dropStaleCount();
   }, [filter]);
 
+  const count = countState(countJob, filter, countSnapshot, sentCount);
+  const countRunning = count.status === "running";
+  // A count that finished before the rows were fetched again (a refresh, a sort) may be out of date: drop it once
+  // the new rows arrive. One still running is as new as they are.
+  const succeededRun = succeeded && sentBrowse ? sentBrowse.job.run : 0;
+  const dropOutdatedCount = useEffectEvent(() => {
+    if (countJob && !countRunning && succeededRun > countJob.browseRun) setCountJob(null);
+  });
+  useEffect(() => {
+    dropOutdatedCount();
+  }, [succeededRun]);
+
   const applyFilter = useCallback(
-    (text: string) => browse(text.trim(), browseJob?.sorts ?? []),
+    (text: string) => browse(text.trim(), browseJob?.sorts ?? [], true),
     [browse, browseJob?.sorts],
   );
   const toggleSort = useCallback(
@@ -221,12 +247,13 @@ export function useTableData(tab: ObjectTab, active: boolean) {
     (column: string, descending: boolean) => browse(filter, [{ column, descending }]),
     [browse, filter],
   );
-  /** Runs the applied browse again (or builds the first one if that failed). */
+  /** Runs the applied browse again (or builds the first one if that failed); a finished count is out of date. */
   const refresh = useCallback(() => {
     setBuildError(null);
+    if (!countRunning) setCountJob(null);
     if (browseJob) setBrowseJob((job) => job && { ...job, run: job.run + 1 });
     else browse("", []);
-  }, [browse, browseJob]);
+  }, [browse, browseJob, countRunning]);
   /** Stops a browse that has not delivered its first page yet. */
   const cancel = useCallback(() => {
     if (sentBrowse) data.controller?.cancel(sentBrowse.requestId);
@@ -240,7 +267,7 @@ export function useTableData(tab: ObjectTab, active: boolean) {
     setCountRequested(true);
     const run = ++countRuns.current;
     const countFilter = browseJob.filter;
-    setCountJob({ run, filter: countFilter, sql: null, error: null });
+    setCountJob({ run, filter: countFilter, browseRun: browseJob.run, sql: null, error: null });
     const settle = (patch: Partial<CountJob>) => setCountJob((job) => (job?.run === run ? { ...job, ...patch } : job));
     buildSelect(profileId, path, countFilter, [], true).then(
       (sql) => settle({ sql }),
@@ -255,15 +282,21 @@ export function useTableData(tab: ObjectTab, active: boolean) {
     clearFilterHistory(profileId, path);
     setHistory([]);
   }, [profileId, path]);
-  const clearFilterError = useCallback(() => setBuildError(null), []);
+  /** Escape (the input shows the applied filter again) or an edit: the rejected text is no longer what is shown. */
+  const clearFilterError = useCallback(() => setFilterError(null), []);
 
   const state: TableDataState = {
     filter,
     sorts: browseJob?.sorts ?? [],
     sql: browseJob?.sql ?? null,
     requestId: sentBrowse?.requestId ?? null,
-    error: buildError ?? execution?.error?.message ?? (execution?.interrupted ? INTERRUPTED_MESSAGE : null),
-    count: countState(countJob, filter, countSnapshot, sentCount),
+    error:
+      filterError ??
+      buildError ??
+      execution?.error?.message ??
+      (execution?.interrupted ? INTERRUPTED_MESSAGE : null),
+    filterError,
+    count,
   };
   return {
     state,

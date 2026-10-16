@@ -175,8 +175,9 @@ function DataView({ tab, active }: { tab: ObjectTab; active: boolean }) {
           applied={state.filter}
           history={table.history}
           invalid={!!state.error}
+          rejected={!!state.filterError}
           onApply={applyFilter}
-          onRevert={table.clearFilterError}
+          onClearError={table.clearFilterError}
           onClearHistory={table.clearHistory}
           disabled={exporting}
         />

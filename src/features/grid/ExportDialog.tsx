@@ -131,8 +131,9 @@ function OutcomeNote({ outcome }: { outcome: Outcome }) {
 /**
  * Writes the whole result behind a grid to a file (spec §3.3, §4.4): the backend runs `source.sql` again on the same
  * session and streams the raw values through the shared formatter, which also ends the grid's paused page. While the
- * export runs the dialog shows its progress and can only be left by cancelling it; an error or a cancel keeps the
- * dialog open with the settings, so the path can be changed and the export retried.
+ * export runs the dialog shows its progress and can only be left by cancelling it — or closed while the session is
+ * not connected, since the export is interrupted then anyway; an error or a cancel keeps the dialog open with the
+ * settings, so the path can be changed and the export retried.
  */
 export function ExportDialog({
   source,
@@ -154,7 +155,12 @@ export function ExportDialog({
   const [cancelling, setCancelling] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const execution = useStore(controller.store, (s) => (running ? s.executions[running.requestId] : undefined));
+  const connected = useStore(controller.store, (s) => s.phase === "open");
   const pathInput = useRef<HTMLInputElement>(null);
+  const isOpen = useRef(open);
+  useEffect(() => {
+    isOpen.current = open;
+  }, [open]);
   // After an error or a cancel the form is back: the path is what usually changes before a retry.
   useEffect(() => {
     if (outcome) pathInput.current?.focus();
@@ -197,6 +203,11 @@ export function ExportDialog({
     const settle = (next: Outcome | null) => {
       controller.forget(requestId);
       setRunning(null);
+      if (next?.kind === "error" && !isOpen.current) {
+        // Closed while disconnected: say how it ended now, not in a note waiting for the next opening.
+        toast("error", `Export failed: ${next.message}`);
+        return;
+      }
       setOutcome(next);
     };
     controller.whenDone(requestId).then(
@@ -220,9 +231,12 @@ export function ExportDialog({
     setCancelling(true);
   };
 
-  /** A running export keeps the dialog open: Escape and outside clicks do nothing, Cancel stops it. */
+  /**
+   * A running export keeps the dialog open (Escape and outside clicks do nothing, Cancel stops it) while the session is
+   * connected; without a connection Cancel cannot reach the backend and the export ends as interrupted, so it closes.
+   */
   const changeOpen = (next: boolean) => {
-    if (running) return;
+    if (running && connected) return;
     if (!next) setOutcome(null);
     onOpenChange(next);
   };
@@ -234,15 +248,18 @@ export function ExportDialog({
     }
   };
 
-  const footer = running ? (
-    <Button onClick={cancel} disabled={cancelling}>
-      {cancelling ? "Cancelling…" : "Cancel"}
-    </Button>
-  ) : (
+  // Export keeps its slot (disabled while running), so a double click on it never lands on Cancel.
+  const footer = (
     <>
-      <Button variant="ghost" onClick={() => changeOpen(false)}>
-        Close
-      </Button>
+      {running && connected ? (
+        <Button onClick={cancel} disabled={cancelling}>
+          {cancelling ? "Cancelling…" : "Cancel"}
+        </Button>
+      ) : (
+        <Button variant="ghost" onClick={() => changeOpen(false)}>
+          Close
+        </Button>
+      )}
       <Button variant="primary" onClick={start} disabled={!canStart}>
         Export
       </Button>
