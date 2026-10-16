@@ -2,7 +2,8 @@ import socket
 import sqlite3
 import threading
 import time
-from uuid import UUID
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
 
 import pytest
 import uvicorn
@@ -14,6 +15,7 @@ from websockets.sync.client import connect
 from dbaguy_backend.app import create_app
 from dbaguy_backend.config import Settings
 from dbaguy_backend.container import AppContainer
+from dbaguy_backend.domain.history import HistoryRecord
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
 
 TOKEN = "test-token"
@@ -341,3 +343,16 @@ def test_scripts_api_path_problems_are_client_errors(client, tmp_path):
     assert client.post("/scripts/folder", json={"path": ".git/new"}, headers=AUTH).status_code == 422
     assert client.put("/scripts/file", json={"path": ".git/x.sql", "content": "x"}, headers=AUTH).status_code == 422
     assert [p.name for p in (tmp_path / "data" / "scripts" / ".git").iterdir()] == []
+
+
+def test_history_api(client):
+    container = client.app.state.container
+    container.history.record(HistoryRecord(profile_id=uuid4(), profile_name="p", database=None, sql="SELECT 42",
+                                           started_at=datetime.now(UTC), elapsed_ms=1, rows=1, status="ok"))
+    page = client.get("/history", params={"q": "42"}, headers=AUTH).json()
+    assert [e["sql"] for e in page["items"]] == ["SELECT 42"]
+    assert client.delete("/history", headers=AUTH).status_code == 204
+    assert client.get("/history", headers=AUTH).json()["items"] == []
+    assert client.get("/history").status_code == 401 and client.delete("/history").status_code == 401
+    assert client.get("/history", params={"limit": 0}, headers=AUTH).status_code == 422
+    assert client.get("/history", params={"limit": 1001}, headers=AUTH).status_code == 422
