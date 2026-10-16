@@ -12,13 +12,15 @@ export const AUTOFIT_MAX = 600;
 export type TextMeasure = (text: string, font: "cell" | "header" | "type") => number;
 
 const PADDING = 17; // px-2 on both sides of a cell plus its 1 px right border
+/** Room for the sort control next to a header name (GridHeader), when the grid sorts. */
+const SORT_CONTROL = 24;
 const SAMPLE_ROWS = 100;
 const AUTOFIT_SAMPLE = 2000;
 const MEASURE_CHARS = 200; // a column is never wider than this many characters
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
-function headerWidth(column: ColumnMeta, measure: TextMeasure): number {
-  return Math.max(measure(column.name, "header"), measure(column.type_name, "type"));
+function headerWidth(column: ColumnMeta, measure: TextMeasure, sortable: boolean): number {
+  return Math.max(measure(column.name, "header") + (sortable ? SORT_CONTROL : 0), measure(column.type_name, "type"));
 }
 
 function cellWidth(value: unknown, column: ColumnMeta, measure: TextMeasure): number {
@@ -30,19 +32,30 @@ function cellWidth(value: unknown, column: ColumnMeta, measure: TextMeasure): nu
 export const sampledRows = (rows: unknown[][]) => Math.min(rows.length, SAMPLE_ROWS);
 
 /** Initial widths: header text vs. the first rows' display text, clamped to MIN_WIDTH–MAX_WIDTH. */
-export function estimateWidths(columns: ColumnMeta[], rows: unknown[][], measure: TextMeasure): number[] {
+export function estimateWidths(
+  columns: ColumnMeta[],
+  rows: unknown[][],
+  measure: TextMeasure,
+  sortable: boolean,
+): number[] {
   const sample = rows.slice(0, SAMPLE_ROWS);
   return columns.map((column, c) => {
-    let width = headerWidth(column, measure);
+    let width = headerWidth(column, measure, sortable);
     for (const row of sample) width = Math.max(width, cellWidth(row[c], column, measure));
     return clamp(Math.ceil(width) + PADDING, MIN_WIDTH, MAX_WIDTH);
   });
 }
 
 /** Width fitting the loaded rows (at most AUTOFIT_SAMPLE, evenly spaced), clamped to MIN_WIDTH–AUTOFIT_MAX. */
-export function autofitWidth(column: ColumnMeta, rows: unknown[][], col: number, measure: TextMeasure): number {
+export function autofitWidth(
+  column: ColumnMeta,
+  rows: unknown[][],
+  col: number,
+  measure: TextMeasure,
+  sortable: boolean,
+): number {
   const step = Math.max(1, Math.ceil(rows.length / AUTOFIT_SAMPLE));
-  let width = headerWidth(column, measure);
+  let width = headerWidth(column, measure, sortable);
   for (let r = 0; r < rows.length; r += step) width = Math.max(width, cellWidth(rows[r][col], column, measure));
   return clamp(Math.ceil(width) + PADDING, MIN_WIDTH, AUTOFIT_MAX);
 }

@@ -29,12 +29,15 @@ const fresh = (columns: ColumnMeta[]): UserLayout => ({ columns, widths: new Map
  * Column widths and pinning of one mounted grid. Widths come from `estimateWidths` over the first rows and are
  * re-estimated only while those rows arrive; a new column list starts over, later pages change nothing.
  */
-export function useColumnLayout(columns: ColumnMeta[], rows: unknown[][]): ColumnLayout {
+export function useColumnLayout(columns: ColumnMeta[], rows: unknown[][], sortable: boolean): ColumnLayout {
   const measure = canvasMeasure();
   const sampled = sampledRows(rows);
   const digits = String(rows.length).length;
   // `rows` is left out of the deps on purpose: only its first `sampled` rows are read, and pages are only appended.
-  const estimated = useMemo(() => estimateWidths(columns, rows, measure), [columns, sampled, measure]);
+  const estimated = useMemo(
+    () => estimateWidths(columns, rows, measure, sortable),
+    [columns, sampled, measure, sortable],
+  );
   const numbersWidth = useMemo(() => rowNumberWidth(digits, measure), [digits, measure]);
 
   const [user, setUser] = useState(() => fresh(columns));
@@ -65,8 +68,8 @@ export function useColumnLayout(columns: ColumnMeta[], rows: unknown[][]): Colum
     [change],
   );
   const autofit = useCallback(
-    (col: number) => resize(col, autofitWidth(columns[col], rows, col, measure)),
-    [columns, rows, measure, resize],
+    (col: number) => resize(col, autofitWidth(columns[col], rows, col, measure, sortable)),
+    [columns, rows, measure, sortable, resize],
   );
   const pin = useCallback(
     (count: number) => change(() => ({ pinnedCount: Math.max(0, Math.min(count, columns.length)) })),
@@ -109,6 +112,9 @@ export const columnStyle = (column: DrawnColumn): CSSProperties => ({
   left: column.left,
   marginLeft: column.offset,
 });
+
+/** The `selected` tint drawn over a cell's own background, which stays opaque for sticky cells. */
+export const SELECTED_CLASS = "bg-[image:linear-gradient(var(--color-selected),var(--color-selected))]";
 
 /** Placement and right edge of a column: pinned ones stick next to the row numbers, the last draws the freeze line. */
 export const columnClass = (column: DrawnColumn): string =>

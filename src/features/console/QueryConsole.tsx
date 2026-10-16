@@ -3,6 +3,7 @@ import { Group, Panel, Separator } from "react-resizable-panels";
 import { Button } from "@/components/ui/Button";
 import { ApiError } from "@/lib/api/client";
 import { cn } from "@/lib/cn";
+import { plural } from "@/lib/format";
 import type { ConsoleTab } from "@/stores/workspace";
 import { useDialect, useProfiles } from "../connections/hooks";
 import { secretsNeeded, UnlockDialog } from "../connections/UnlockDialog";
@@ -33,8 +34,6 @@ function originOf(text: string, offset: number): Origin {
   const lineStart = before.lastIndexOf("\n") + 1;
   return { line: before.split("\n").length - 1, column: Array.from(before.slice(lineStart)).length };
 }
-
-const plural = (count: number, noun: string) => `${count.toLocaleString()} ${noun}${count === 1 ? "" : "s"}`;
 
 /** The session's transaction state, from `session_state` only. */
 function TransactionBadge({ state }: { state: SessionStateView | null }) {
@@ -190,25 +189,19 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
                   </div>
                 )}
                 {execution.resultSets.map((set) => (
-                  <div key={`${execution.requestId}:${set.index}`} className="flex min-h-[120px] flex-1 flex-col">
-                    <div className="min-h-0 flex-1">
-                      {dialect ? (
-                        <DataGrid
-                          columns={set.columns}
-                          rows={set.rows}
-                          hasMore={set.hasMore}
-                          loadingMore={execution.status === "running" && set.index === lastSetIndex}
-                          onLoadMore={phase === "open" ? loadMore : undefined}
-                          dialect={dialect}
-                        />
-                      ) : (
-                        <div className="p-3 text-muted">Loading…</div>
-                      )}
-                    </div>
-                    <div className="flex h-6 shrink-0 items-center border-y border-border px-3 text-muted">
-                      {plural(set.rows.length, "row")}
-                      {set.hasMore ? " loaded" : ""}
-                    </div>
+                  <div key={`${execution.requestId}:${set.index}`} className="min-h-[120px] flex-1">
+                    {dialect ? (
+                      <DataGrid
+                        columns={set.columns}
+                        rows={set.rows}
+                        hasMore={set.hasMore}
+                        loadingMore={execution.status === "running" && set.index === lastSetIndex}
+                        onLoadMore={phase === "open" ? loadMore : undefined}
+                        dialect={dialect}
+                      />
+                    ) : (
+                      <div className="p-3 text-muted">Loading…</div>
+                    )}
                   </div>
                 ))}
                 <div
