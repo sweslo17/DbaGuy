@@ -3,9 +3,10 @@ from uuid import uuid4
 
 import pytest
 
-from dbaguy_backend.adapters.base import Endpoint, StatementError
+from dbaguy_backend.adapters.base import FAILED_COMMIT_MESSAGE, Endpoint, StatementError
 from dbaguy_backend.adapters.postgres.adapter import PostgresAdapter
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
+from dbaguy_backend.domain.execution import MessageSeverity, ServerMessage
 from dbaguy_backend.domain.profiles import SqliteProfile
 from tests.support import PG_HOST, PG_PASSWORD, PG_PORT, make_pg_profile, requires_pg
 
@@ -161,3 +162,30 @@ def test_postgres_set_autocommit_on_a_dead_connection_is_not_reported_as_an_open
     with pytest.raises(StatementError) as exc:
         conn.set_autocommit(False)
     assert exc.value.code != "transaction_open"
+
+
+@requires_pg
+@pytest.mark.parametrize("ending", ["COMMIT", "end", "COMMIT; SELECT 1"])
+def test_postgres_typed_commit_of_an_aborted_transaction_warns_that_it_rolled_back(ending):
+    conn = PostgresAdapter().open(make_pg_profile(), Endpoint(PG_HOST, PG_PORT), PG_PASSWORD, None)
+    try:
+        drain(conn.run("CREATE TEMP TABLE commit_probe (id int)"))  # gone with the connection
+        drain(conn.run("BEGIN"))
+        drain(conn.run("INSERT INTO commit_probe VALUES (1)"))
+        with pytest.raises(StatementError):
+            drain(conn.run("SELECT 1/0"))
+        assert conn.transaction_failed()
+        result = conn.run(ending)
+        assert result.take_messages() == [
+            ServerMessage(severity=MessageSeverity.WARNING, text=FAILED_COMMIT_MESSAGE),
+        ]
+        result.close()
+        assert not conn.in_transaction() and int(scalar(conn, "SELECT count(*) FROM commit_probe")) == 0
+        drain(conn.run("BEGIN"))  # a healthy transaction commits without the warning
+        drain(conn.run("INSERT INTO commit_probe VALUES (2)"))
+        result = conn.run(ending)
+        assert result.take_messages() == []
+        result.close()
+        assert int(scalar(conn, "SELECT count(*) FROM commit_probe")) == 1
+    finally:
+        conn.close()

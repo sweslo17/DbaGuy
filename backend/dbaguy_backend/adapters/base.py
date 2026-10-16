@@ -38,6 +38,8 @@ class StatementError(Exception):
 
 
 TRANSACTION_OPEN = "transaction_open"
+# PostgreSQL answers COMMIT of an aborted transaction with a silent ROLLBACK: said by the Commit button and a typed one.
+FAILED_COMMIT_MESSAGE = "The transaction had failed, so COMMIT rolled it back"
 
 
 def transaction_open_error() -> StatementError:

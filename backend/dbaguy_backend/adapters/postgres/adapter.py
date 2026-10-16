@@ -18,6 +18,7 @@ from ...domain.schema import SchemaSnapshot
 from ...sql.dialects import Dialect
 from ...sql.splitter import split
 from ..base import (
+    FAILED_COMMIT_MESSAGE,
     AdapterCapabilities,
     DatabaseAdapter,
     DatabaseConnection,
@@ -43,6 +44,7 @@ _DECLARABLE_KEYWORDS = frozenset({"select", "values", "table", "(", "with"})
 # Data-modifying statements and SELECT ... INTO, which DECLARE rejects. Matched anywhere (literals and comments too).
 _NOT_DECLARABLE = re.compile(r"\b(?:insert|update|delete|merge|into)\b", re.IGNORECASE)
 _CURSOR_PREFIX = "dbaguy_cursor_"
+_COMMIT_KEYWORDS = frozenset({"commit", "end"})
 # COPY through the client needs psycopg's copy() API; plain execute() leaves the connection stuck in COPY mode.
 _COPY_CLIENT_STREAM = re.compile(r"\b(?:stdin|stdout)\b", re.IGNORECASE)
 _UNSUPPORTED_COPY = "COPY FROM STDIN / TO STDOUT is not supported in the console yet"
@@ -432,6 +434,10 @@ class PostgresConnection(DatabaseConnection):
         except psycopg.Error:
             cursor.close()
             raise
+        if first_keyword(sql) in _COMMIT_KEYWORDS and cursor.statusmessage == "ROLLBACK":
+            # COMMIT of an aborted transaction is a silent ROLLBACK: say so, as the Commit button does.
+            logger.info("A typed COMMIT rolled back an aborted transaction on db={}", self.current_database())
+            self._messages.append(ServerMessage(severity=MessageSeverity.WARNING, text=FAILED_COMMIT_MESSAGE))
         return _BufferedResult(self, cursor, sql)
 
     def _run_streamed(self, sql: str) -> StatementResult:

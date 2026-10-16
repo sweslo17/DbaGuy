@@ -12,7 +12,13 @@ from typing import Any, Literal, TypeVar
 from loguru import logger
 from pydantic import BaseModel
 
-from ..adapters.base import DatabaseConnection, StatementCancelled, StatementError, StatementResult
+from ..adapters.base import (
+    FAILED_COMMIT_MESSAGE,
+    DatabaseConnection,
+    StatementCancelled,
+    StatementError,
+    StatementResult,
+)
 from ..adapters.values import encode_row
 from ..domain.classification import Classification, StatementKind
 from ..domain.errors import ConnectionFailed, SessionBusy
@@ -51,7 +57,6 @@ Emitter = Callable[[BaseModel], None]
 TransactionCommand = CommitCommand | RollbackCommand | SetAutocommitCommand
 _CHUNK = 200
 _STOP = object()
-_FAILED_COMMIT = "The transaction had failed, so COMMIT rolled it back"
 _EXPORT_CHUNK = 1000  # rows fetched, written and checked for a cancel at a time
 _PROGRESS_EVERY = 10_000  # an export reports its row count each time it passes a multiple of this
 _EXPORT_SELECT_ONLY = "Only a statement that returns rows (SELECT, WITH, VALUES…) can be exported"
@@ -693,7 +698,7 @@ class SessionWorker:
                 if failed:
                     logger.info("[{}] commit rolled back an aborted transaction", self.name)
                     self._send(MessageEvent(
-                        request_id=cmd.request_id, severity=MessageSeverity.WARNING, text=_FAILED_COMMIT,
+                        request_id=cmd.request_id, severity=MessageSeverity.WARNING, text=FAILED_COMMIT_MESSAGE,
                     ))
                     return
                 logger.info("[{}] commit", self.name)
