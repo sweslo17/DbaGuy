@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { toast } from "@/components/ui/Toast";
 import { useWorkspace } from "@/stores/workspace";
-import type { SessionController, SessionSnapshot } from "../session/SessionController";
-import { endTransaction, toastKind, type TransactionEnd } from "./transactions";
+import { busy, type SessionController, type SessionSnapshot } from "../session/SessionController";
+import { endTransaction, toastKind, type TransactionEnd } from "../session/transactions";
 
 /** How long the transaction badge pulses after a session message (idle warning, idle rollback). */
 const PULSE_MS = 3000;
@@ -20,8 +20,8 @@ export interface TransactionControlsArgs {
 /**
  * The query tab's transaction controls (spec §4.2):
  * - the tab's desired auto-commit mode is applied to its session: once the session is open and has reported its
- *   state, and again whenever the toggle changes it (sent at most once per session and value, so a failure never
- *   loops; a failure reverts the toggle);
+ *   state, and again whenever the toggle changes it (sent once per session and value until it fails; a failure
+ *   reverts the toggle to the session's real mode, so it never loops and choosing the mode again retries it);
  * - Commit / Rollback, whose warnings and errors become toasts;
  * - session messages (idle warnings, idle rollbacks) become toasts, each once, and pulse the badge for 3 s.
  */
@@ -29,6 +29,8 @@ export function useTransactionControls({ tabId, controller, snapshot, autocommit
   const updateTab = useWorkspace((s) => s.updateTab);
   const phase = snapshot?.phase ?? null;
   const state = snapshot?.state ?? null;
+  // Never queued behind a running statement: one that opens a transaction would make it fail (`transaction_open`).
+  const idle = !busy(snapshot);
   const subjectRef = useRef(subject);
   useEffect(() => {
     subjectRef.current = subject;
@@ -36,23 +38,30 @@ export function useTransactionControls({ tabId, controller, snapshot, autocommit
 
   const asked = useRef<{ controller: SessionController; value: boolean } | null>(null);
   useEffect(() => {
-    if (!controller || phase !== "open" || !state || state.inTransaction || state.autocommit === autocommit) return;
+    if (!controller || phase !== "open" || !idle || !state || state.inTransaction) return;
+    if (state.autocommit === autocommit) return;
     if (asked.current?.controller === controller && asked.current.value === autocommit) return;
     asked.current = { controller, value: autocommit };
     const requestId = controller.setAutocommit(autocommit);
+    const retryable = () => {
+      if (asked.current?.controller === controller && asked.current.value === autocommit) asked.current = null;
+    };
     controller.whenDone(requestId).then(
       (done) => {
         controller.forget(requestId);
         if (!done.error) return;
+        // The toggle goes back to what the session really does; asking for the same mode again sends it again.
+        retryable();
+        const actual = controller.store.getState().state?.autocommit ?? !autocommit;
+        updateTab(tabId, { autocommit: actual });
         toast(
           "error",
           `${subjectRef.current}: could not turn auto-commit ${autocommit ? "on" : "off"}: ${done.error.message}`,
         );
-        updateTab(tabId, { autocommit: !autocommit });
       },
-      () => undefined, // forgotten by a run that started meanwhile: its state arrives with `session_state` anyway
+      retryable, // forgotten meanwhile: the next state change asks again if the modes still differ
     );
-  }, [controller, phase, state, autocommit, tabId, updateTab]);
+  }, [controller, phase, idle, state, autocommit, tabId, updateTab]);
 
   const [pulseUntil, setPulseUntil] = useState(0);
   const seen = useRef<{ controller: SessionController | null; id: number }>({ controller: null, id: 0 });

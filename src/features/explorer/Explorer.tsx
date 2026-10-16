@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type Reac
 import { Button } from "@/components/ui/Button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ContextMenu } from "@/components/ui/ContextMenu";
+import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
 import type { Profile, ProfileEntry } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
@@ -13,6 +14,7 @@ import { ConnectionDialog, ENGINE_LABELS } from "../connections/ConnectionDialog
 import { useDeleteProfile, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
 import { secretsNeeded, UnlockDialog, type SecretsNeeded } from "../connections/UnlockDialog";
+import { requestCloseTab, requestDisconnectTab } from "../workspace/closeGuards";
 import { folderLabel, kindIcon } from "./kinds";
 import { nodeKeyPrefix, profileKey, useTreeRows, type Expansion, type TreeRow } from "./useTreeRows";
 
@@ -61,6 +63,7 @@ export function Explorer() {
   const [selected, setSelected] = useState<string | null>(null);
   const [dialog, setDialog] = useState<{ open: boolean; entry?: ProfileEntry }>({ open: false });
   const [toDelete, setToDelete] = useState<ProfileEntry | null>(null);
+  const [releasing, setReleasing] = useState(false);
   const [unlock, setUnlock] = useState<{ profile: Profile; needs: SecretsNeeded } | null>(null);
   const promptedErrors = useRef(new Set<string>());
   const entries = profiles.data ?? [];
@@ -128,12 +131,43 @@ export function Explorer() {
     if (useWorkspace.getState().selectedProfileId === profileId) selectProfile(null);
     qc.removeQueries({ queryKey: ["children", profileId] });
     qc.removeQueries({ queryKey: ["detail", profileId] });
-    // Table and object tabs close; query tabs keep their text and lose only the connection.
+    // Their tabs agreed already (releaseTabs): table and object tabs close; query tabs keep their text and lose only the
+    // connection.
     const { tabs, closeTab, updateTab } = useWorkspace.getState();
     for (const tab of tabs.filter((t) => t.profileId === profileId)) {
       if (tab.kind === "query") updateTab(tab.id, { profileId: null, database: null });
       else closeTab(tab.id);
     }
+  };
+
+  /**
+   * Before a profile is deleted, each of its tabs is asked in turn (a running export, a run, an open transaction):
+   * table and object tabs close, query tabs agree to lose their session. Any "no" keeps the profile.
+   */
+  const releaseTabs = async (profileId: string): Promise<boolean> => {
+    for (const tab of useWorkspace.getState().tabs.filter((t) => t.profileId === profileId)) {
+      const agreed = tab.kind === "query" ? await requestDisconnectTab(tab.id) : await requestCloseTab(tab.id);
+      if (!agreed && useWorkspace.getState().tabs.some((t) => t.id === tab.id)) {
+        toast("warning", `Profile not deleted — ${tab.title} is still open`);
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const deleteEntry = async (entry: ProfileEntry) => {
+    setReleasing(true);
+    try {
+      if (!(await releaseTabs(entry.profile.id))) return;
+    } finally {
+      setReleasing(false);
+    }
+    deleteProfile.mutate(entry.profile.id, {
+      onSuccess: () => {
+        forgetProfile(entry.profile.id);
+        setToDelete(null);
+      },
+    });
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
@@ -310,7 +344,7 @@ export function Explorer() {
         <ConfirmDialog
           open
           title="Delete connection"
-          pending={deleteProfile.isPending}
+          pending={deleteProfile.isPending || releasing}
           error={deleteProfile.isError ? errorMessage(deleteProfile.error) : null}
           message={`Delete "${toDelete.profile.name}"? Its saved password is removed from the Keychain.`}
           onOpenChange={(open) => {
@@ -318,14 +352,7 @@ export function Explorer() {
             deleteProfile.reset();
             setToDelete(null);
           }}
-          onConfirm={() =>
-            deleteProfile.mutate(toDelete.profile.id, {
-              onSuccess: () => {
-                forgetProfile(toDelete.profile.id);
-                setToDelete(null);
-              },
-            })
-          }
+          onConfirm={() => void deleteEntry(toDelete)}
         />
       )}
       {unlock && (

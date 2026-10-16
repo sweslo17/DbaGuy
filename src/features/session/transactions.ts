@@ -1,9 +1,12 @@
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
-import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
-import type { SessionController } from "../session/SessionController";
+import { INTERRUPTED_MESSAGE, type ExecutionState } from "./execution";
+import type { SessionController } from "./SessionController";
 
 export type TransactionEnd = "commit" | "rollback";
+
+/** Cancelling an export cancels its statement, which aborts the transaction it runs in (PostgreSQL). */
+export const EXPORT_CANCEL_ABORTS_TRANSACTION = "Cancelling the export aborts the open transaction";
 
 /** What a message's severity shows as when it becomes a toast. */
 export function toastKind(severity: string): "info" | "warning" | "error" {

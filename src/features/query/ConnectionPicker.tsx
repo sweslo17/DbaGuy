@@ -48,13 +48,13 @@ function profileItems(folder: FolderNode, current: string | null, pick: (id: str
   ];
 }
 
-/** A menu's button; Radix passes its trigger props (and ref) through `props`. */
+/** A menu's button, shrinking to a truncated name when crowded; Radix passes its trigger props (and ref) through. */
 function Trigger({ children, className, ...props }: ComponentProps<"button">) {
   return (
     <button
       type="button"
       className={cn(
-        "flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 text-[12px] outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-accent/50 disabled:opacity-50 disabled:hover:bg-transparent",
+        "flex h-6 min-w-12 items-center gap-1 rounded-md px-1.5 text-[12px] outline-none focus-visible:ring-2 focus-visible:ring-accent/50 disabled:opacity-50",
         className,
       )}
       {...props}
@@ -94,7 +94,11 @@ function DatabasePicker({
   }
   return (
     <DropdownMenu items={items} onOpenChange={setOpen} className="max-h-[60vh] max-w-[320px] overflow-y-auto">
-      <Trigger disabled={!!blockedReason} title={blockedReason ?? "Database"} className="max-w-[160px]">
+      <Trigger
+        disabled={!!blockedReason}
+        title={blockedReason ?? `Database: ${current ?? "the connection's default"}`}
+        className="max-w-[160px] enabled:hover:bg-hover"
+      >
         <Database size={12} className="shrink-0 text-muted" />
         <span className="truncate">{current ?? "Default database"}</span>
       </Trigger>
@@ -124,8 +128,8 @@ export function ConnectionPicker(props: ConnectionPickerProps) {
     database ?? session?.database ?? (profile && "database" in profile ? (profile.database ?? null) : null);
   const detail = session ? session.server.version : sessionFailed ? "Not connected" : profileId ? "Connecting…" : null;
 
-  // Its parts sit directly in the toolbar's row (`contents`): the menus keep their size and the server's version gives
-  // way first, before the transaction badge.
+  // Its parts sit directly in the toolbar's row (`contents`): when the row is crowded the server's version gives way
+  // first, then the profile and database names truncate; the transaction badge never shrinks.
   return (
     <div className="contents">
       {profileId !== null && (
@@ -134,10 +138,11 @@ export function ConnectionPicker(props: ConnectionPickerProps) {
       <DropdownMenu items={items} align="end" className="max-h-[60vh] max-w-[360px] overflow-y-auto">
         <Trigger
           disabled={!!blockedReason}
-          title={blockedReason ?? "Connection"}
+          title={blockedReason ?? (profile ? `Connection: ${profile.name}` : "Connection")}
           className={cn(
             "max-w-[180px]",
-            red && "bg-danger font-medium text-accent-fg hover:bg-danger hover:brightness-110",
+            // A red profile keeps its red chip, also while disabled.
+            red ? "bg-danger font-medium text-accent-fg enabled:hover:brightness-110" : "enabled:hover:bg-hover",
           )}
         >
           {!red && tint && <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: tint }} />}
@@ -154,8 +159,12 @@ export function ConnectionPicker(props: ConnectionPickerProps) {
           onPick={(name) => name !== currentDatabase && onChange(profileId, name)}
         />
       )}
-      {/* Basis 0: it only takes the room left over (up to its own width), so it never squeezes the badge. */}
-      {detail && <span className="max-w-max min-w-0 grow basis-0 truncate text-[11px] text-muted">{detail}</span>}
+      {/* Basis 0: it only takes the room left over (up to its own width); in a narrow toolbar it is not shown at all. */}
+      {detail && (
+        <span className="max-w-max min-w-0 grow basis-0 truncate text-[11px] text-muted @max-[50rem]:hidden">
+          {detail}
+        </span>
+      )}
     </div>
   );
 }

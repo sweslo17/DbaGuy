@@ -10,7 +10,7 @@ import { ObjectDetailView } from "../explorer/ObjectDetailView";
 import { QueryTab } from "../query/QueryTab";
 import { relationOf } from "../table-data/filterValue";
 import { TableDataTab } from "../table-data/TableDataTab";
-import { requestCloseTab } from "./closeGuards";
+import { isClosePending, requestCloseTab } from "./closeGuards";
 
 /** A tab's content: a query tab's editor, a relation's table data, or any other object's detail. */
 function TabContent({ tab, active }: { tab: Tab; active: boolean }) {
@@ -86,7 +86,8 @@ export function Workspace() {
       if (e.isComposing || e.key === "Process") return;
       if (e.metaKey && e.key === "w" && activeTabId) {
         e.preventDefault();
-        void requestCloseTab(activeTabId);
+        // A close is being asked about (its dialog is open, maybe for another tab): never queue a second one behind it.
+        if (!isClosePending()) void requestCloseTab(activeTabId);
       }
     };
     window.addEventListener("keydown", onKey);

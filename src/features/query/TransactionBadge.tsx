@@ -12,7 +12,8 @@ function clock(ms: number): string {
 
 /**
  * The session's transaction state, from `session_state` only (spec §4.2): "Transaction · 02:13" counting from the
- * server's `transaction_started_at`, or "Transaction aborted — Rollback required". The clock ticks once a second only
+ * server's `transaction_started_at`, or "Aborted — Rollback required" (the full wording in its tooltip). It never
+ * shrinks: the connection's names give way first. The clock ticks once a second only
  * while `visible`; the elapsed time is always computed from the start, never accumulated. `pulse`: a session message
  * (e.g. an idle warning) just arrived.
  */
@@ -31,12 +32,12 @@ export function TransactionBadge({
     return (
       <span
         className={cn(
-          "min-w-0 truncate rounded bg-danger/15 px-1.5 text-[11px] font-medium text-danger",
+          "shrink-0 rounded bg-danger/15 px-1.5 text-[11px] font-medium whitespace-nowrap text-danger",
           pulse && "animate-pulse",
         )}
         title="Transaction aborted — Rollback required: a statement failed inside the transaction, only ROLLBACK is accepted"
       >
-        Transaction aborted — Rollback required
+        Aborted — Rollback required
       </span>
     );
   }
@@ -45,7 +46,7 @@ export function TransactionBadge({
   return (
     <span
       className={cn(
-        "min-w-0 truncate rounded bg-warning/15 px-1.5 text-[11px] font-medium text-warning tabular-nums",
+        "shrink-0 rounded bg-warning/15 px-1.5 text-[11px] font-medium whitespace-nowrap text-warning tabular-nums",
         pulse && "animate-pulse",
       )}
       title={

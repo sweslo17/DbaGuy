@@ -17,9 +17,9 @@ import { ExportDialog } from "../grid/ExportDialog";
 import type { ExecutionState } from "../session/execution";
 import { busy, isExporting, type SessionPhase } from "../session/SessionController";
 import { SessionError } from "../session/SessionError";
+import { useSessionGuards } from "../session/SessionGuards";
 import { useSession } from "../session/useSession";
 import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
-import { useSessionGuards } from "./CloseTabGuard";
 import { ConfirmRunDialog } from "./ConfirmRunDialog";
 import { QueryToolbar } from "./QueryToolbar";
 import { ResultsArea } from "./ResultsArea";
@@ -77,13 +77,19 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     else if (lastRequestId) controller?.cancel(lastRequestId);
   };
   const sessionBusy = busy(snapshot);
-  const canRun = !!controller && phase === "open" && dialect !== null && !sessionBusy && !running;
+  // Nothing runs before the session has reported its state and taken the tab's auto-commit mode: a statement sent
+  // earlier would run in the wrong mode.
+  const modeApplied = !!snapshot?.state && snapshot.state.autocommit === tab.autocommit;
+  const canRun = !!controller && phase === "open" && modeApplied && dialect !== null && !sessionBusy && !running;
   const runBlockedReason =
     tab.profileId === null
       ? "Choose a connection first"
       : exporting
         ? "An export is running on this session"
-        : undefined;
+        : phase === "open" && !modeApplied
+          ? "Setting the auto-commit mode…"
+          : undefined;
+  const runningReason = running || sessionBusy ? "Wait for the run to finish, or cancel it" : undefined;
 
   const transaction = useTransactionControls({
     tabId: tab.id,
@@ -100,10 +106,15 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
       ? "Wait for the running statement or export"
       : undefined;
 
-  // Closing the tab: a running export, then an open transaction (Task 6 adds the unsaved script).
+  // Closing the tab: a running export, then the run (nothing more is sent), then an open transaction (Task 6 adds the
+  // unsaved script).
   const guards = useSessionGuards(controller, subject);
-  useCloseGuard(tab.id, CLOSE_GUARD_ORDER.export, () => guards.exportStep("close"));
-  useCloseGuard(tab.id, CLOSE_GUARD_ORDER.transaction, () => guards.transactionStep("close"));
+  useCloseGuard(tab.id, CLOSE_GUARD_ORDER.export, (intent) => guards.exportStep(intent));
+  useCloseGuard(tab.id, CLOSE_GUARD_ORDER.run, () => {
+    runner.stop();
+    return true;
+  });
+  useCloseGuard(tab.id, CLOSE_GUARD_ORDER.transaction, (intent) => guards.transactionStep(intent));
   useReportTabStatus(tab.id, { busy: running || sessionBusy });
 
   const switching = useRef(false);
@@ -218,6 +229,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
         onRunAll={() => void start("all")}
         onCancel={cancel}
         autocommit={tab.autocommit}
+        autocommitBlockedReason={inTransaction ? "Commit or roll back first" : runningReason}
         onAutocommitChange={transaction.setAutocommit}
         canEnd={canEnd}
         endBlockedReason={endBlockedReason}

@@ -13,12 +13,10 @@ import { canChooseFiles, chooseSavePath } from "@/lib/native";
 import { useNow } from "@/lib/useNow";
 import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
 import type { SessionController } from "../session/SessionController";
+import { EXPORT_CANCEL_ABORTS_TRANSACTION } from "../session/transactions";
 import { COPY_FORMAT_LABELS } from "./copy";
 
 type TableName = { schema: string | null; name: string };
-
-/** Cancelling an export cancels its statement, which aborts the transaction it runs in (PostgreSQL). */
-export const EXPORT_CANCEL_ABORTS_TRANSACTION = "Cancelling the export aborts the open transaction";
 
 /** What the export dialog writes: the statement behind a grid, run again in full on the grid's own session. */
 export interface ExportSource {

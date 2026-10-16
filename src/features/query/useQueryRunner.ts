@@ -245,6 +245,14 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
     if (job.requestId) job.controller.cancel(job.requestId);
   }, []);
 
+  /**
+   * Sends no further statement; the running one is left to finish (a cancel would abort an open transaction). Used
+   * once the tab is closing, so a COMMIT chosen then never commits only part of the script.
+   */
+  const stop = useCallback(() => {
+    if (active.current) active.current.cancelled = true;
+  }, []);
+
   const run = result && result.controller === controller ? result.run : null;
-  return { run, prompt, start, cancel };
+  return { run, prompt, start, cancel, stop };
 }
