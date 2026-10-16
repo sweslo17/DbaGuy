@@ -849,7 +849,8 @@ export interface components {
         };
         /**
          * SessionStateEvent
-         * @description The session's transaction state: sent right before every `finished`, on attach and after an idle rollback.
+         * @description The session's transaction state: sent right before every `finished` and every pause, on attach and after an
+         *     idle rollback.
          */
         SessionStateEvent: {
             /**

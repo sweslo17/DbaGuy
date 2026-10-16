@@ -1,6 +1,7 @@
 """Execution protocol on top of the worker: policy, timeout, transaction commands, session state, history and schema
 hooks. Driven by the fake connection so every ordering is checked deterministically."""
 
+import threading
 import time
 
 import pytest
@@ -17,6 +18,7 @@ from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks
 from dbaguy_backend.sql.classifier import Classification, StatementKind
 from dbaguy_backend.sql.dialects import Dialect
 from tests.fake_db import FakeLease
+from tests.fake_ssh import run_in_thread
 from tests.test_sessions import Recorder
 
 policy = SafetyPolicy()
@@ -206,8 +208,83 @@ def test_every_request_ends_with_session_state_then_one_finished(make_worker):
     for i, event in enumerate(rec.events):
         if event.type == "finished":
             assert i > 0 and rec.events[i - 1].type == "session_state", event.request_id
-    assert len([e for e in rec.events if e.type == "session_state"]) == len(ids)
+    # one per `finished`, plus one at the pause of "paused" (a paused result may have opened the transaction)
+    assert len([e for e in rec.events if e.type == "session_state"]) == len(ids) + 1
     assert recorded_at_finish["ok"] == ["ok"] and recorded_at_finish["error"] == ["ok", "error"]
+
+
+def test_a_cancel_during_the_policy_check_stops_the_statement_before_it_runs(make_worker):
+    checking, release, records = threading.Event(), threading.Event(), []
+
+    def slow_check(sql, confirmed):  # stands in for a slow parse of a long script
+        checking.set()
+        assert release.wait(5)
+        return ddl_aware(sql, confirmed)
+
+    worker, conn, rec = make_worker(check=slow_check, on_record=records.append)
+    worker.submit(ExecuteCommand(request_id="a", sql="rows 1"))
+    assert checking.wait(5)
+    worker.cancel("a")  # the request is running, but no driver call is in flight yet
+    release.set()
+    done = rec.wait_for(lambda e: e.type == "finished" and e.request_id == "a")
+    assert done.cancelled and conn.runs == [] and records == []
+    assert [m.text for m in rec.of("a", "message")] == ["Query cancelled"]
+    assert not run(worker, rec, "b", "rows 1").cancelled  # the cancel does not leak into the next request
+
+
+def test_a_paused_result_that_opened_the_transaction_is_reported_and_can_go_idle(make_worker):
+    worker, conn, rec = make_worker()
+    command(worker, rec, SetAutocommitCommand(request_id="m", enabled=False))
+    assert not last_state(rec).in_transaction
+    worker.submit(ExecuteCommand(request_id="a", sql="rows 50", page_size=10))  # manual mode: opens a transaction
+    pause = rec.wait_for(lambda e: e.type == "result_set_end" and e.has_more)
+    before = rec.events[next(i for i, e in enumerate(rec.events) if e is pause) - 1]
+    assert before.type == "session_state" and before.in_transaction and before.transaction_started_at is not None
+    time.sleep(0.15)
+    worker.check_idle_transaction(warn_after_s=0.1, rollback_after_s=0)
+    assert [e.text[:16] for e in rec.events if e.type == "message" and e.request_id == ""] == ["Transaction idle"]
+    late = Recorder()
+    worker.set_emitter(late)
+    worker.replay_state()
+    assert late.wait_for(lambda e: e.type == "session_state").in_transaction
+
+
+def test_a_slow_transaction_command_is_not_an_idle_transaction(make_worker):
+    worker, conn, rec = make_worker()
+    run(worker, rec, "a", "begin")
+    time.sleep(0.15)
+    committing, release = threading.Event(), threading.Event()
+    real_commit = conn.commit
+
+    def slow_commit():
+        committing.set()
+        assert release.wait(5)
+        real_commit()
+
+    conn.commit = slow_commit
+    worker.submit(CommitCommand(request_id="c"))
+    assert committing.wait(5)
+    worker.check_idle_transaction(warn_after_s=0.1, rollback_after_s=0.1)  # COMMIT in progress: not idle
+    release.set()
+    rec.wait_for(lambda e: e.type == "finished" and e.request_id == "c")
+    assert [e for e in rec.events if e.type == "message" and e.request_id == ""] == []
+    assert conn.commits == 1 and conn.rollbacks == 0
+
+
+def test_no_idle_rollback_when_a_statement_ran_between_the_check_and_the_rollback(make_worker):
+    worker, conn, rec = make_worker()
+    run(worker, rec, "a", "begin")
+    time.sleep(0.15)
+    parked, release = threading.Event(), threading.Event()
+    caller, _ = run_in_thread(lambda: worker.call(lambda c: (parked.set(), release.wait(5))))
+    assert parked.wait(5)  # the worker thread is busy; nothing below runs until it is released
+    worker.submit(ExecuteCommand(request_id="b", sql="rows 1"))  # queued first: runs before the rollback
+    worker.check_idle_transaction(warn_after_s=0, rollback_after_s=0.1)  # idle so far: queues a rollback
+    release.set()
+    caller.join(5)
+    rec.wait_for(lambda e: e.type == "finished" and e.request_id == "b")
+    worker.call(lambda c: None)  # queued behind the rollback: once it returns, the rollback task has run
+    assert conn.rollbacks == 0 and conn.tx
 
 
 def test_replay_state_sends_the_cached_state(make_worker):

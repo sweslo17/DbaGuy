@@ -141,7 +141,8 @@ class ConfirmationRequiredEvent(BaseModel):
 
 
 class SessionStateEvent(BaseModel):
-    """The session's transaction state: sent right before every `finished`, on attach and after an idle rollback."""
+    """The session's transaction state: sent right before every `finished` and every pause, on attach and after an
+    idle rollback."""
 
     type: Literal["session_state"] = "session_state"
     autocommit: bool

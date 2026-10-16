@@ -44,7 +44,8 @@ class FakeResult(StatementResult):
 class FakeConnection(DatabaseConnection):
     """`run()` words: `rows N` returns N rows; `block` waits until cancel() (then raises StatementCancelled);
     `fail MSG` raises StatementError (and aborts an open transaction, like PostgreSQL); `begin` opens a transaction;
-    anything else returns an empty result."""
+    anything else returns an empty result. In manual-commit mode (`auto` False) every statement opens a transaction
+    first, like the real adapters."""
 
     def __init__(self) -> None:
         self.runs: list[str] = []
@@ -77,6 +78,8 @@ class FakeConnection(DatabaseConnection):
         """`rows N` → N rows; `block` → waits for cancel(); `fail MSG` → StatementError; `begin` opens a
         transaction; anything else → an empty result."""
         self.runs.append(sql)
+        if not self.auto:
+            self.tx = True  # manual mode: the adapters BEGIN before the statement, even a SELECT that then pauses
         word, _, arg = sql.partition(" ")
         if word == "block":
             self.blocked.set()

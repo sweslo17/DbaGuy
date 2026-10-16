@@ -143,8 +143,8 @@ class SessionWorker:
         self._state_lock = threading.Lock()
         self._state_send_lock = threading.Lock()
         self._running_request: str | None = None
-        # A cancel reached the running request; honoured at the next page boundary in case no driver call was in
-        # flight to interrupt (the driver then has nothing to cancel and the request would pause instead).
+        # A cancel reached the running request; honoured right before run() and at the next page boundary in case no
+        # driver call was in flight to interrupt (the driver then has nothing to cancel and the request would go on).
         self._cancel_requested = False
         self._queued: dict[str, bool] = {}  # execute requests waiting in the queue -> cancelled before they started
         self._open_exec: _OpenExecution | None = None
@@ -368,6 +368,12 @@ class SessionWorker:
             self._tracker.activity(busy=request_id is not None)
         return cancel_requested
 
+    def _take_cancel_request(self) -> bool:
+        """Whether a cancel reached the running request since it started (clears it)."""
+        with self._state_lock:
+            requested, self._cancel_requested = self._cancel_requested, False
+        return requested
+
     def _begin_request(self, request_id: str) -> str | None:
         """Atomically leave the queue and become the running request. Returns why it must not run, if so."""
         with self._state_lock:
@@ -392,6 +398,10 @@ class SessionWorker:
             return
         try:
             if not self._passes_policy(req, cmd.confirmed):
+                return
+            if self._take_cancel_request():
+                # Cancelled during the policy check: the driver had nothing to interrupt, so stop here.
+                self._fail(req, StatementCancelled())
                 return
             logger.debug("[{}] execute {}: {}", self.name, cmd.request_id, cmd.sql[:2000])
             req.ran = True
@@ -484,6 +494,9 @@ class SessionWorker:
         if self._set_running(None):
             self._discard(ex.request_id, cancelled=True)
             return
+        # In manual-commit mode the statement opened a transaction that a paused result keeps open: report it now,
+        # not only at `finished`, so the client and the idle check see it.
+        self._refresh_state(began_at=ex.req.started_at)
         self._send(ResultSetEndEvent(request_id=ex.request_id, index=ex.index, row_count=ex.sent, has_more=True))
 
     def _discard_open(self) -> None:
@@ -546,6 +559,7 @@ class SessionWorker:
             self._send(MessageEvent(request_id=cmd.request_id, severity=MessageSeverity.WARNING, text=text))
             self._send_finished(cmd.request_id, 0, cancelled=True)
             return
+        self._tracker.activity(busy=True)  # a slow COMMIT is not an idle transaction
         try:
             self._run_transaction_command(cmd)
         except StatementError as exc:
@@ -554,6 +568,8 @@ class SessionWorker:
         except Exception as exc:
             logger.exception("Unexpected error in {} on {}", cmd.type, self.name)
             self._send(ErrorEvent(request_id=cmd.request_id, message=f"Internal error: {exc}"))
+        finally:
+            self._tracker.activity(busy=False)
         self._send_finished(cmd.request_id, int((time.monotonic() - started) * 1000))
 
     def _run_transaction_command(self, cmd: TransactionCommand) -> None:
