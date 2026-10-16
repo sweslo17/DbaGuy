@@ -1,17 +1,25 @@
 import { X } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { cn } from "@/lib/cn";
 import { useWorkspace, type Tab } from "@/stores/workspace";
-import { QueryConsole } from "../console/QueryConsole";
+import { useProfiles } from "../connections/hooks";
 import { ObjectDetailView } from "../explorer/ObjectDetailView";
+import { QueryTab } from "../query/QueryTab";
 import { relationOf } from "../table-data/filterValue";
 import { TableDataTab } from "../table-data/TableDataTab";
 
-/** A tab's content: a relation opens as table data, any other object as its detail, a console as a query console. */
+/** A tab's content: a query tab's editor, a relation's table data, or any other object's detail. */
 function TabContent({ tab, active }: { tab: Tab; active: boolean }) {
-  if (tab.kind === "console") return <QueryConsole tab={tab} />;
-  const relation = relationOf(tab.path);
-  return relation ? <TableDataTab tab={tab} relation={relation} active={active} /> : <ObjectDetailView tab={tab} />;
+  switch (tab.kind) {
+    case "query":
+      return <QueryTab tab={tab} active={active} />;
+    case "table": {
+      const relation = relationOf(tab.path);
+      return relation ? <TableDataTab tab={tab} relation={relation} active={active} /> : <ObjectDetailView tab={tab} />;
+    }
+    case "object":
+      return <ObjectDetailView tab={tab} />;
+  }
 }
 
 export function Workspace() {
@@ -19,10 +27,16 @@ export function Workspace() {
   const activeTabId = useWorkspace((s) => s.activeTabId);
   const activate = useWorkspace((s) => s.activate);
   const closeTab = useWorkspace((s) => s.closeTab);
+  const profiles = useProfiles();
+  const profileNames = useMemo(
+    () => new Map(profiles.data?.map((entry) => [entry.profile.id, entry.profile.name])),
+    [profiles.data],
+  );
   const active = tabs.find((t) => t.id === activeTabId) ?? null;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing || e.key === "Process") return;
       if (e.metaKey && e.key === "w" && activeTabId) {
         e.preventDefault();
         closeTab(activeTabId);
@@ -50,7 +64,9 @@ export function Workspace() {
             )}
           >
             <span className="truncate">{tab.title}</span>
-            <span className="truncate text-[11px] text-muted">{tab.subtitle}</span>
+            {tab.profileId !== null && (
+              <span className="truncate text-[11px] text-muted">{profileNames.get(tab.profileId)}</span>
+            )}
             <button
               title="Close"
               className="rounded opacity-0 hover:bg-hover group-hover:opacity-100"
@@ -68,7 +84,7 @@ export function Workspace() {
         {!active && (
           <p className="p-6 text-center text-muted">Open a table from the sidebar, or right-click a connection → New Query</p>
         )}
-        {/* Tabs stay mounted while hidden so their sessions keep their state; closing a tab unmounts it, which closes them. */}
+        {/* Tabs stay mounted while hidden so their sessions and editors keep their state; closing a tab unmounts it. */}
         {tabs.map((tab) => (
           <div key={tab.id} className={cn("h-full", tab.id !== activeTabId && "hidden")}>
             <TabContent tab={tab} active={tab.id === activeTabId} />

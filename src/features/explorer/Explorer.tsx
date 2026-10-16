@@ -89,7 +89,7 @@ export function Explorer() {
 
   const activate = (row: TreeRow) => {
     if (row.type === "node" && !CONTAINER_KINDS.has(row.node.kind)) {
-      openObject(row.profileId, row.node, row.profileName);
+      openObject(row.profileId, row.node);
     } else if (isExpandable(row)) {
       toggle(row);
     }
@@ -119,8 +119,12 @@ export function Explorer() {
     setSelected((prev) => (prev && owned(prev) ? null : prev));
     qc.removeQueries({ queryKey: ["children", profileId] });
     qc.removeQueries({ queryKey: ["detail", profileId] });
-    const { tabs, closeTab } = useWorkspace.getState();
-    tabs.filter((t) => t.profileId === profileId).forEach((t) => closeTab(t.id));
+    // Table and object tabs close; query tabs keep their text and lose only the connection.
+    const { tabs, closeTab, updateTab } = useWorkspace.getState();
+    for (const tab of tabs.filter((t) => t.profileId === profileId)) {
+      if (tab.kind === "query") updateTab(tab.id, { profileId: null, database: null });
+      else closeTab(tab.id);
+    }
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
@@ -207,7 +211,7 @@ export function Explorer() {
         return (
           <ContextMenu
             items={[
-              { label: "New Query", onSelect: () => openQuery(p.id, null, p.name) },
+              { label: "New Query", onSelect: () => openQuery(p.id, null) },
               { label: "Edit…", onSelect: () => setDialog({ open: true, entry: row.entry }) },
               { label: "Refresh", onSelect: () => void qc.invalidateQueries({ queryKey: ["children", p.id] }) },
               { label: "Delete…", onSelect: () => setToDelete(row.entry), danger: true, separatorBefore: true },

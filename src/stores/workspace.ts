@@ -1,72 +1,106 @@
 import { create } from "zustand";
 import { pathKey, type ObjectNode, type PathSegment } from "@/lib/api/types";
+import { relationOf } from "@/features/table-data/filterValue";
 
-export interface ObjectTab {
+/** A SQL editor tab with its own session. */
+export interface QueryTabState {
+  id: string;
+  kind: "query";
+  title: string;
+  /** null: no connection chosen yet (the editor works, running does not). */
+  profileId: string | null;
+  database: string | null;
+  /** The script file the tab is bound to, and its content as last saved (Task 6). */
+  scriptPath: string | null;
+  savedText: string | null;
+  /** The editor's content when the tab was created or restored. */
+  initialText: string;
+  initialCursor?: number;
+  initialSelection?: { anchor: number; head: number };
+  /** The desired auto-commit mode, applied when the session opens. */
+  autocommit: boolean;
+}
+
+/** A relation (table, view, materialized view, partition): its data, columns and DDL. */
+export interface TableTabState {
+  id: string;
+  kind: "table";
+  profileId: string;
+  path: PathSegment[];
+  title: string;
+}
+
+/** Any other database object (function, sequence, index, …): its detail page. */
+export interface ObjectTabState {
   id: string;
   kind: "object";
   profileId: string;
   path: PathSegment[];
   title: string;
-  subtitle: string;
 }
-export interface ConsoleTab {
-  id: string;
-  kind: "console";
-  profileId: string;
-  database: string | null;
-  title: string;
-  subtitle: string;
-  /** The editor's text when the tab opens (e.g. a table data tab's "Open in query tab"). */
-  initialSql?: string;
+
+export type Tab = QueryTabState | TableTabState | ObjectTabState;
+
+/** The fields of a tab that can change after it opened (never its id or kind). */
+export type TabPatch =
+  | Partial<Omit<QueryTabState, "id" | "kind">>
+  | Partial<Omit<TableTabState, "id" | "kind">>
+  | Partial<Omit<ObjectTabState, "id" | "kind">>;
+
+export interface OpenQueryOptions {
+  /** The editor's text (e.g. a table data tab's SELECT, or a script's content). */
+  text?: string;
+  /** Binds the tab to a script file; its `text` is then the saved content. */
+  scriptPath?: string;
+  title?: string;
 }
-export type Tab = ObjectTab | ConsoleTab;
 
 interface WorkspaceState {
   tabs: Tab[];
   activeTabId: string | null;
   selectedProfileId: string | null;
-  openObject: (profileId: string, node: ObjectNode, profileName: string) => void;
-  /** Opens a new query tab, its editor prefilled with `initialSql`. */
-  openQuery: (profileId: string, database: string | null, profileName: string, initialSql?: string) => void;
+  /** Opens (or activates) a relation as a table tab, any other object as an object tab. */
+  openObject: (profileId: string, node: ObjectNode) => void;
+  /** Opens a new query tab and returns its id. */
+  openQuery: (profileId: string | null, database: string | null, options?: OpenQueryOptions) => string;
   closeTab: (id: string) => void;
   activate: (id: string) => void;
+  updateTab: (id: string, patch: TabPatch) => void;
   selectProfile: (id: string | null) => void;
 }
 
-let consoleCounter = 0;
+let queryCounter = 0;
 
 export const useWorkspace = create<WorkspaceState>((set, get) => ({
   tabs: [],
   activeTabId: null,
   selectedProfileId: null,
-  openObject: (profileId, node, profileName) => {
-    const id = `object:${profileId}:${pathKey(node.path)}`;
+  openObject: (profileId, node) => {
+    const kind = relationOf(node.path) ? "table" : "object";
+    const id = `${kind}:${profileId}:${pathKey(node.path)}`;
     if (!get().tabs.some((t) => t.id === id)) {
-      const tab: ObjectTab = {
-        id,
-        kind: "object",
-        profileId,
-        path: node.path,
-        title: node.name,
-        subtitle: profileName,
-      };
+      const tab: TableTabState | ObjectTabState = { id, kind, profileId, path: node.path, title: node.name };
       set((s) => ({ tabs: [...s.tabs, tab] }));
     }
     set({ activeTabId: id });
   },
-  openQuery: (profileId, database, profileName, initialSql) => {
-    consoleCounter += 1;
-    const id = `console:${crypto.randomUUID()}`;
-    const tab: ConsoleTab = {
+  openQuery: (profileId, database, options = {}) => {
+    queryCounter += 1;
+    const id = `query:${crypto.randomUUID()}`;
+    const text = options.text ?? "";
+    const tab: QueryTabState = {
       id,
-      kind: "console",
+      kind: "query",
+      title: options.title ?? `Query ${queryCounter}`,
       profileId,
       database,
-      title: `Query ${consoleCounter}`,
-      subtitle: profileName,
-      initialSql,
+      scriptPath: options.scriptPath ?? null,
+      savedText: options.scriptPath ? text : null,
+      initialText: text,
+      autocommit: true,
     };
     set((s) => ({ tabs: [...s.tabs, tab], activeTabId: id }));
+    return id;
   },
   closeTab: (id) =>
     set((s) => {
@@ -76,5 +110,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
       return { tabs, activeTabId };
     }),
   activate: (id) => set({ activeTabId: id }),
+  updateTab: (id, patch) =>
+    set((s) => ({ tabs: s.tabs.map((t) => (t.id === id ? ({ ...t, ...patch } as Tab) : t)) })),
   selectProfile: (id) => set({ selectedProfileId: id }),
 }));

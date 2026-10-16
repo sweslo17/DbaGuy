@@ -16,8 +16,8 @@ export function useEngines() {
   });
 }
 
-/** SQL dialect of a profile's engine (copy and export formats); null until profiles and engines are loaded. */
-export function useDialect(profileId: string): Dialect | null {
+/** SQL dialect of a profile's engine; null without a profile and until profiles and engines are loaded. */
+export function useDialect(profileId: string | null): Dialect | null {
   const profiles = useProfiles();
   const engines = useEngines();
   const engine = profiles.data?.find((entry) => entry.profile.id === profileId)?.profile.engine;

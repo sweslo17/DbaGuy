@@ -5,8 +5,11 @@ import { Button } from "@/components/ui/Button";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import { pathKey, type ColumnInfo, type ObjectDetail } from "@/lib/api/types";
 import { writeClipboard } from "@/lib/native";
-import type { ObjectTab } from "@/stores/workspace";
+import type { ObjectTabState } from "@/stores/workspace";
 import { kindLabel } from "./kinds";
+
+/** The object a detail view shows: an object tab, or the table tab's Columns and DDL views. */
+type ObjectRef = Pick<ObjectTabState, "profileId" | "path">;
 
 const FEEDBACK_MS = 1500;
 
@@ -33,7 +36,7 @@ function CopyDdlButton({ ddl }: { ddl: string }) {
 }
 
 /** Loads an object's detail (`/metadata/detail`) and renders it with `children`; shows loading and errors itself. */
-function WithDetail({ tab, children }: { tab: ObjectTab; children: (detail: ObjectDetail) => ReactNode }) {
+function WithDetail({ tab, children }: { tab: ObjectRef; children: (detail: ObjectDetail) => ReactNode }) {
   const detail = useQuery({
     queryKey: ["detail", tab.profileId, pathKey(tab.path)],
     queryFn: async () =>
@@ -111,7 +114,7 @@ function DdlText({ ddl }: { ddl: string }) {
 }
 
 /** A table data tab's Columns view: the object's comment and its columns. */
-export function ColumnsView({ tab }: { tab: ObjectTab }) {
+export function ColumnsView({ tab }: { tab: ObjectRef }) {
   return (
     <WithDetail tab={tab}>
       {(d) => (
@@ -125,7 +128,7 @@ export function ColumnsView({ tab }: { tab: ObjectTab }) {
 }
 
 /** A table data tab's DDL view. */
-export function DdlView({ tab }: { tab: ObjectTab }) {
+export function DdlView({ tab }: { tab: ObjectRef }) {
   return (
     <WithDetail tab={tab}>
       {(d) =>
@@ -149,7 +152,7 @@ export function DdlView({ tab }: { tab: ObjectTab }) {
 }
 
 /** Detail tab of an object without rows (function, sequence, index, …): its comment, columns and DDL on one page. */
-export function ObjectDetailView({ tab }: { tab: ObjectTab }) {
+export function ObjectDetailView({ tab }: { tab: ObjectRef }) {
   return (
     <WithDetail tab={tab}>
       {(d) => (

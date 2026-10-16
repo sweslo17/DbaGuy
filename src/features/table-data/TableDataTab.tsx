@@ -5,7 +5,7 @@ import type { MenuItem } from "@/components/ui/ContextMenu";
 import { Tabs } from "@/components/ui/Tabs";
 import { cn } from "@/lib/cn";
 import { plural } from "@/lib/format";
-import { useWorkspace, type ObjectTab } from "@/stores/workspace";
+import { useWorkspace, type TableTabState } from "@/stores/workspace";
 import { useDialect } from "../connections/hooks";
 import { ColumnsView, DdlView } from "../explorer/ObjectDetailView";
 import { kindLabel } from "../explorer/kinds";
@@ -99,7 +99,7 @@ function SqlRow({ sql, onOpen }: { sql: string; onOpen: () => void }) {
 }
 
 /** The Data view: filter, sort, count and the paged rows of the relation, on the tab's own session. */
-function DataView({ tab, active }: { tab: ObjectTab; active: boolean }) {
+function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   const table = useTableData(tab, active);
   const { state, execution, snapshot, relation } = table;
   const { applyFilter, toggleSort, sortBy } = table;
@@ -159,7 +159,7 @@ function DataView({ tab, active }: { tab: ObjectTab; active: boolean }) {
   );
 
   const openInQueryTab = () => {
-    if (state.sql) openQuery(tab.profileId, relation?.database ?? null, tab.subtitle, state.sql);
+    if (state.sql) openQuery(tab.profileId, relation?.database ?? null, { text: state.sql });
   };
   const placeholder = (() => {
     if (phase === "failed" || state.error) return null; // shown above
@@ -250,7 +250,7 @@ function qualifiedName(relation: Relation): string {
  * mounted while another view is shown, so its rows, sort and scroll position survive; its session opens the first
  * time it is shown (`active`: this workspace tab is the current one) and closes with the tab.
  */
-export function TableDataTab({ tab, relation, active }: { tab: ObjectTab; relation: Relation; active: boolean }) {
+export function TableDataTab({ tab, relation, active }: { tab: TableTabState; relation: Relation; active: boolean }) {
   const [view, setView] = useState<View>("data");
   return (
     <div className="flex h-full flex-col">

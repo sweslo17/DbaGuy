@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import type { PathSegment } from "@/lib/api/types";
-import type { ObjectTab } from "@/stores/workspace";
+import type { TableTabState } from "@/stores/workspace";
 import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
 import { isExporting, PAGE_SIZE, type SessionController, type SessionSnapshot } from "../session/SessionController";
 import { useSession } from "../session/useSession";
@@ -139,7 +139,7 @@ function countState(
  * own session, opened the first time `active` (the Data view is shown) and kept while the tab is open. Count rows runs
  * on a second session, opened on first use (ruling R-02b-2), so the paused page keeps loading more.
  */
-export function useTableData(tab: ObjectTab, active: boolean) {
+export function useTableData(tab: TableTabState, active: boolean) {
   const { profileId, path } = tab;
   const relation: Relation | null = useMemo(() => relationOf(path), [path]);
   const database = relation?.database ?? null;

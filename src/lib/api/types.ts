@@ -32,6 +32,8 @@ export type FormatKind = S["FormatKind"];
 export type RowFormatOptions = S["RowFormatOptions"];
 export type FormatRowsRequest = S["FormatRowsRequest"];
 export type FormatResult = S["FormatResult"];
+export type AppSettings = S["AppSettings"];
+export type EditorSettings = S["EditorSettings"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

@@ -7,12 +7,12 @@ import { emptySnapshot, SessionController, type SessionSnapshot } from "./Sessio
 const NO_SESSION = createStore<SessionSnapshot>()(() => emptySnapshot("closed"));
 
 /**
- * Owns a `SessionController` for the component's lifetime (only while `enabled` is not false). The controller is
- * created in an effect and closed in its cleanup, so StrictMode's double mount opens and disposes a session cleanly.
- * `retry` closes the current controller and opens a fresh session.
+ * Owns a `SessionController` for the component's lifetime (only while `enabled` is not false and there is a
+ * profile). The controller is created in an effect and closed in its cleanup, so StrictMode's double mount opens and
+ * disposes a session cleanly. `retry` closes the current controller and opens a fresh session.
  */
 export function useSession(
-  profileId: string,
+  profileId: string | null,
   database: string | null,
   options: { enabled?: boolean } = {},
 ): { controller: SessionController | null; snapshot: SessionSnapshot | null; retry: () => void } {
@@ -21,7 +21,7 @@ export function useSession(
   const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled || profileId === null) return;
     const created = new SessionController(profileId, database);
     setController(created);
     void created.open();
