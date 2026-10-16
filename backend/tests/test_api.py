@@ -277,3 +277,53 @@ def test_websocket_close_codes_are_visible_to_a_real_client(live_port, session_i
         with pytest.raises(ConnectionClosed) as closed:
             ws.recv(timeout=2)
     assert closed.value.rcvd is not None and closed.value.rcvd.code == expected_code
+
+
+def test_settings_and_workspace_api(client):
+    settings = client.get("/settings", headers=AUTH).json()
+    assert settings["run"]["page_size"] == 500
+    settings["editor"]["vim"] = True
+    assert client.put("/settings", json=settings, headers=AUTH).json()["editor"]["vim"] is True
+    workspace = {"version": 1, "tabs": [{"id": "t1", "kind": "query", "buffer": "SELECT '😀'"}], "active_tab_id": "t1"}
+    assert client.put("/workspace", json=workspace, headers=AUTH).status_code == 204
+    assert client.get("/workspace", headers=AUTH).json()["tabs"][0]["buffer"] == "SELECT '😀'"
+
+
+def test_settings_and_workspace_reject_bad_input(client):
+    settings = client.get("/settings", headers=AUTH).json()
+    assert client.put("/settings", json={**settings, "editor": {"font_size": 999}}, headers=AUTH).status_code == 422
+    assert client.put("/settings", json={**settings, "future": 1}, headers=AUTH).status_code == 422
+    relative = client.put("/settings", json={**settings, "scripts_dir": "relative"}, headers=AUTH)
+    assert relative.status_code == 422 and relative.json()["error"]["code"] == "validation_failed"
+    assert client.put("/workspace", json={"tabs": [{"id": "", "kind": "query"}]}, headers=AUTH).status_code == 422
+    assert client.get("/settings").status_code == 401 and client.put("/workspace", json={}).status_code == 401
+
+
+def test_scripts_api(client):
+    assert client.put("/scripts/file", json={"path": "a.sql", "content": "SELECT 1"}, headers=AUTH).status_code == 200
+    assert client.get("/scripts", headers=AUTH).json()["items"][0]["path"] == "a.sql"
+    assert client.get("/scripts/file", params={"path": "a.sql"}, headers=AUTH).json()["content"] == "SELECT 1"
+    assert client.post("/scripts/rename", json={"from": "a.sql", "to": "b.sql"}, headers=AUTH).status_code == 204
+    assert client.get("/scripts/file", params={"path": "../x.sql"}, headers=AUTH).status_code == 422
+    assert client.delete("/scripts/file", params={"path": "b.sql"}, headers=AUTH).status_code == 204
+
+
+def test_scripts_api_folders_and_errors(client, tmp_path):
+    assert client.post("/scripts/folder", json={"path": "reports"}, headers=AUTH).status_code == 204
+    again = client.post("/scripts/folder", json={"path": "reports"}, headers=AUTH)
+    assert again.status_code == 409 and again.json()["error"]["code"] == "already_exists"
+    missing = client.get("/scripts/file", params={"path": "gone.sql"}, headers=AUTH)
+    assert missing.status_code == 404 and missing.json()["error"]["code"] == "not_found"
+    tree = client.get("/scripts", headers=AUTH).json()
+    assert tree["root"] == str(tmp_path / "data" / "scripts") and tree["items"][0]["kind"] == "folder"
+    assert client.post("/scripts/rename", json={"from": "a.sql"}, headers=AUTH).status_code == 422
+    assert client.post("/scripts/rename", json={"from": "a.sql", "to": "b.sql", "x": 1}, headers=AUTH).status_code == 422
+    assert client.get("/scripts").status_code == 401
+
+
+def test_scripts_follow_the_configured_folder(client, tmp_path):
+    settings = client.get("/settings", headers=AUTH).json()
+    settings["scripts_dir"] = str(tmp_path / "repo")
+    assert client.put("/settings", json=settings, headers=AUTH).status_code == 200
+    client.put("/scripts/file", json={"path": "q.sql", "content": "SELECT 2"}, headers=AUTH)
+    assert (tmp_path / "repo" / "q.sql").read_text() == "SELECT 2"

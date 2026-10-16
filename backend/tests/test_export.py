@@ -59,7 +59,7 @@ def test_export_csv_with_progress(session):
     rows = list(csv.reader(target.open(encoding="utf-8", newline="")))
     assert rows[0] == ["id", "note", "data"] and rows[1] == ["1", "n0", "0x0102"] and len(rows) == 25_001
     assert "Exported 25,000 rows" in rec.of("x", "message")[-1].text
-    assert not (tmp / "out.csv.part").exists()
+    assert sorted(p.name for p in tmp.iterdir()) == ["e.db", "out.csv"]  # no temporary file left behind
 
 
 @pytest.mark.parametrize(("sql", "fmt", "path", "code"), [
@@ -75,7 +75,7 @@ def test_export_rejections(session, monkeypatch, sql, fmt, path, code):
     target = path if path == "relative.csv" else tmp / path
     done = export(worker, rec, "r", sql, target, fmt)
     assert rec.of("r", "error")[0].code == code and not done.cancelled
-    assert [p.name for p in tmp.iterdir()] == ["e.db"]  # nothing written, not even a .part
+    assert [p.name for p in tmp.iterdir()] == ["e.db"]  # nothing written, not even a temporary file
     assert len(rec.of("r", "finished")) == 1 and rec.of("r", "progress") == []
 
 
@@ -86,7 +86,7 @@ def test_cancel_removes_the_partial_file(session):
     rec.wait_for(lambda e: e.type == "progress" and e.request_id == "c")
     worker.cancel("c")
     assert rec.wait_for(lambda e: e.type == "finished" and e.request_id == "c").cancelled
-    assert not target.exists() and not (tmp / "big.jsonl.part").exists()
+    assert [p.name for p in tmp.iterdir()] == ["e.db"]  # neither the file nor its temporary file
 
 
 def test_export_ends_a_paused_result(session):
@@ -104,7 +104,8 @@ def test_a_failed_export_leaves_no_file_and_keeps_the_one_it_would_have_replaced
     done = export(worker, rec, "f", FAILS_MID_WAY, target)
     assert rec.of("f", "error")[0].message == "integer overflow" and not done.cancelled
     assert [p.rows for p in rec.of("f", "progress")] == [10_000]
-    assert target.read_text(encoding="utf-8") == "old" and not (tmp / "keep.csv.part").exists()
+    assert target.read_text(encoding="utf-8") == "old"
+    assert sorted(p.name for p in tmp.iterdir()) == ["e.db", "keep.csv"]  # no temporary file left behind
 
 
 def test_a_successful_export_replaces_the_existing_file(session):

@@ -1,4 +1,5 @@
 import os
+import secrets
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -9,14 +10,16 @@ from loguru import logger
 
 @contextmanager
 def atomic_text_file(target: Path) -> Iterator[TextIO]:
-    """Write `target` through `<target>.part`: the finished file replaces any old one in one step, or nothing changes.
+    """Write `target` through a temporary file next to it: the finished file replaces any old one in one step, or
+    nothing changes.
 
-    Any error (including one raised by the caller's block) removes the partial file and leaves `target` as it was.
-    Opening the part is the only step that creates it, so a failure before that never deletes a file this call did
-    not write.
+    The temporary file is `.<name>.<random>.part` in the same folder (so the final rename is atomic), created
+    exclusively: two writers never share one, and a `.part` file this call did not create is never truncated or
+    deleted. Any error (including one raised by the caller's block) removes this call's partial file and leaves
+    `target` as it was.
     """
-    part = target.parent / f"{target.name}.part"
-    fp = part.open("w", encoding="utf-8", newline="")
+    part = target.parent / f".{target.name}.{secrets.token_hex(6)}.part"
+    fp = part.open("x", encoding="utf-8", newline="")
     try:
         with fp:
             yield fp

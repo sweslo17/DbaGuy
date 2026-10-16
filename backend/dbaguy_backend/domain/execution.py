@@ -49,7 +49,7 @@ class ExportCommand(BaseModel):
     request_id: str
     sql: str
     format: FormatKind
-    path: str  # absolute, in an existing folder; written as `<path>.part` first, so a failed export keeps any old file
+    path: str  # absolute, in an existing folder; written through a temporary file, so a failed export keeps any old file
     options: RowFormatOptions = RowFormatOptions()
 
 

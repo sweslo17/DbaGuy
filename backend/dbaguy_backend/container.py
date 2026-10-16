@@ -12,8 +12,11 @@ from .services.connection_service import ConnectionService
 from .services.metadata_service import MetadataService
 from .services.profile_service import ProfileService
 from .services.schema_cache import SchemaCache
+from .services.scripts_service import ScriptsService
+from .services.settings_service import SettingsService
+from .services.workspace_service import WorkspaceService
 from .sessions.manager import SessionManager
-from .storage.paths import profiles_file
+from .storage.paths import default_scripts_dir, profiles_file, settings_file, workspace_file
 from .storage.profile_store import ProfileStore
 from .storage.secret_store import KeyringSecretStore, SecretStore
 
@@ -32,8 +35,13 @@ class AppContainer:
     ) -> None:
         self.settings = settings
         self.registry = registry or default_registry()
-        self.profiles = ProfileService(ProfileStore(profiles_file(settings.data_dir)), secret_store or KeyringSecretStore())
-        self.tunnels = SshTunnelManager(settings.data_dir / "bin" / "askpass.sh")
+        data_dir = settings.data_dir
+        self.profiles = ProfileService(ProfileStore(profiles_file(data_dir)), secret_store or KeyringSecretStore())
+        # `settings` is the process Settings (token, data dir); `app_settings` is the user's preferences.
+        self.app_settings = SettingsService(settings_file(data_dir), default_scripts_dir(data_dir))
+        self.workspace = WorkspaceService(workspace_file(data_dir))
+        self.scripts = ScriptsService(self.app_settings.scripts_root)
+        self.tunnels = SshTunnelManager(data_dir / "bin" / "askpass.sh")
         self.connections = ConnectionService(self.registry, self.profiles, self.tunnels)
         self.sessions = SessionManager(self.connections, self.profiles)
         self.metadata = MetadataService(self.registry, self.connections, self.profiles)

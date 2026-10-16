@@ -951,6 +951,528 @@
           }
         }
       }
+    },
+    "/settings": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Get Settings",
+        "operationId": "get_settings_settings_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppSettings"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Update Settings",
+        "operationId": "update_settings_settings_put",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppSettings"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppSettings"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/workspace": {
+      "get": {
+        "tags": [
+          "workspace"
+        ],
+        "summary": "Get Workspace",
+        "operationId": "get_workspace_workspace_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceState"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "workspace"
+        ],
+        "summary": "Put Workspace",
+        "operationId": "put_workspace_workspace_put",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceState"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scripts": {
+      "get": {
+        "tags": [
+          "scripts"
+        ],
+        "summary": "Script Tree",
+        "operationId": "script_tree_scripts_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScriptTree"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scripts/file": {
+      "get": {
+        "tags": [
+          "scripts"
+        ],
+        "summary": "Read Script",
+        "operationId": "read_script_scripts_file_get",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Path"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScriptFile"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "scripts"
+        ],
+        "summary": "Write Script",
+        "operationId": "write_script_scripts_file_put",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScriptWrite"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScriptFile"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "scripts"
+        ],
+        "summary": "Delete Script",
+        "operationId": "delete_script_scripts_file_delete",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Path"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scripts/rename": {
+      "post": {
+        "tags": [
+          "scripts"
+        ],
+        "summary": "Rename Script",
+        "operationId": "rename_script_scripts_rename_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScriptRename"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scripts/folder": {
+      "post": {
+        "tags": [
+          "scripts"
+        ],
+        "summary": "Create Script Folder",
+        "operationId": "create_script_folder_scripts_folder_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScriptFolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -983,6 +1505,57 @@
           "rows"
         ],
         "title": "AffectedEvent"
+      },
+      "AppSettings": {
+        "properties": {
+          "editor": {
+            "$ref": "#/components/schemas/EditorSettings",
+            "default": {
+              "font_size": 13,
+              "vim": false,
+              "word_wrap": false,
+              "tab_size": 2,
+              "keyword_case": "upper"
+            }
+          },
+          "run": {
+            "$ref": "#/components/schemas/RunSettings",
+            "default": {
+              "default": "statement",
+              "continue_on_error": false,
+              "page_size": 500,
+              "statement_timeout_s": 0
+            }
+          },
+          "safety": {
+            "$ref": "#/components/schemas/SafetySettings",
+            "default": {
+              "idle_transaction_warn_minutes": 3,
+              "idle_transaction_rollback_minutes": 0
+            }
+          },
+          "notifications": {
+            "$ref": "#/components/schemas/NotificationSettings",
+            "default": {
+              "long_query_seconds": 15
+            }
+          },
+          "scripts_dir": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scripts Dir"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "AppSettings",
+        "description": "The app preferences (`settings.json`). Persisted, so a newer build's extra fields are tolerated on read and\nkept on write; input from the API stays strict."
       },
       "CancelCommand": {
         "properties": {
@@ -1264,6 +1837,46 @@
           "request_id"
         ],
         "title": "DiscardCommand"
+      },
+      "EditorSettings": {
+        "properties": {
+          "font_size": {
+            "type": "integer",
+            "maximum": 32.0,
+            "minimum": 8.0,
+            "title": "Font Size",
+            "default": 13
+          },
+          "vim": {
+            "type": "boolean",
+            "title": "Vim",
+            "default": false
+          },
+          "word_wrap": {
+            "type": "boolean",
+            "title": "Word Wrap",
+            "default": false
+          },
+          "tab_size": {
+            "type": "integer",
+            "maximum": 8.0,
+            "minimum": 1.0,
+            "title": "Tab Size",
+            "default": 2
+          },
+          "keyword_case": {
+            "type": "string",
+            "enum": [
+              "upper",
+              "preserve"
+            ],
+            "title": "Keyword Case",
+            "default": "upper"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "EditorSettings"
       },
       "Engine": {
         "type": "string",
@@ -1808,6 +2421,19 @@
         ],
         "title": "MetadataRequest"
       },
+      "NotificationSettings": {
+        "properties": {
+          "long_query_seconds": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Long Query Seconds",
+            "default": 15
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "NotificationSettings"
+      },
       "ObjectDetail": {
         "properties": {
           "path": {
@@ -2273,6 +2899,62 @@
         ],
         "title": "RowsEvent"
       },
+      "RunSettings": {
+        "properties": {
+          "default": {
+            "type": "string",
+            "enum": [
+              "statement",
+              "all"
+            ],
+            "title": "Default",
+            "default": "statement"
+          },
+          "continue_on_error": {
+            "type": "boolean",
+            "title": "Continue On Error",
+            "default": false
+          },
+          "page_size": {
+            "type": "integer",
+            "maximum": 10000.0,
+            "minimum": 1.0,
+            "title": "Page Size",
+            "default": 500
+          },
+          "statement_timeout_s": {
+            "type": "integer",
+            "maximum": 86400.0,
+            "minimum": 0.0,
+            "title": "Statement Timeout S",
+            "default": 0
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "RunSettings"
+      },
+      "SafetySettings": {
+        "properties": {
+          "idle_transaction_warn_minutes": {
+            "type": "integer",
+            "maximum": 1440.0,
+            "minimum": 0.0,
+            "title": "Idle Transaction Warn Minutes",
+            "default": 3
+          },
+          "idle_transaction_rollback_minutes": {
+            "type": "integer",
+            "maximum": 1440.0,
+            "minimum": 0.0,
+            "title": "Idle Transaction Rollback Minutes",
+            "default": 0
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "SafetySettings"
+      },
       "SchemaRefreshRequest": {
         "properties": {
           "profile_id": {
@@ -2297,6 +2979,138 @@
           "profile_id"
         ],
         "title": "SchemaRefreshRequest"
+      },
+      "ScriptFile": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "content",
+          "modified_at"
+        ],
+        "title": "ScriptFile"
+      },
+      "ScriptFolder": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "title": "ScriptFolder"
+      },
+      "ScriptNode": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "file",
+              "folder"
+            ],
+            "title": "Kind"
+          },
+          "children": {
+            "items": {
+              "$ref": "#/components/schemas/ScriptNode"
+            },
+            "type": "array",
+            "title": "Children",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "path",
+          "kind"
+        ],
+        "title": "ScriptNode"
+      },
+      "ScriptRename": {
+        "properties": {
+          "from": {
+            "type": "string",
+            "title": "From"
+          },
+          "to": {
+            "type": "string",
+            "title": "To"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "from",
+          "to"
+        ],
+        "title": "ScriptRename"
+      },
+      "ScriptTree": {
+        "properties": {
+          "root": {
+            "type": "string",
+            "title": "Root"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ScriptNode"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "root",
+          "items"
+        ],
+        "title": "ScriptTree"
+      },
+      "ScriptWrite": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "path",
+          "content"
+        ],
+        "title": "ScriptWrite"
       },
       "ServerInfo": {
         "properties": {
@@ -3000,6 +3814,27 @@
         ],
         "title": "StatementKind"
       },
+      "TextSelection": {
+        "properties": {
+          "anchor": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Anchor"
+          },
+          "head": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Head"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "anchor",
+          "head"
+        ],
+        "title": "TextSelection"
+      },
       "ValidationError": {
         "properties": {
           "loc": {
@@ -3039,6 +3874,171 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "WorkspaceState": {
+        "properties": {
+          "version": {
+            "type": "integer",
+            "title": "Version",
+            "default": 1
+          },
+          "tabs": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceTab"
+            },
+            "type": "array",
+            "title": "Tabs",
+            "default": []
+          },
+          "active_tab_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Tab Id"
+          },
+          "sidebar_tab": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sidebar Tab"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "WorkspaceState",
+        "description": "The open tabs (`workspace.json`), written whole every few seconds so that a crash loses nothing."
+      },
+      "WorkspaceTab": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "query",
+              "table"
+            ],
+            "title": "Kind"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title",
+            "default": ""
+          },
+          "profile_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Profile Id"
+          },
+          "database": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Database"
+          },
+          "script_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Script Path"
+          },
+          "object_path": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PathSegment"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Object Path"
+          },
+          "buffer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Buffer"
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cursor"
+          },
+          "selection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TextSelection"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "autocommit": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Autocommit"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "kind"
+        ],
+        "title": "WorkspaceTab"
       }
     }
   }

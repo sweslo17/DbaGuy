@@ -425,4 +425,4 @@ def test_closing_the_session_stops_a_running_export(make_worker, tmp_path):
     worker.close()
     assert time.monotonic() - started < 2
     assert [e.cancelled for e in rec.of("x", "finished")] == [True]
-    assert list(tmp_path.iterdir()) == []  # neither the file nor its .part
+    assert list(tmp_path.iterdir()) == []  # neither the file nor its temporary file

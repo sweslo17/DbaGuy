@@ -1,20 +1,18 @@
 from __future__ import annotations
 
-import itertools
 import json
-import os
 import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 from loguru import logger
-from pydantic import BaseModel, TypeAdapter, ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from ..domain.errors import ProfileNotFound, ProfileStoreError
 from ..domain.profiles import AnyDraft, AnyProfile, Profile, profile_from_draft
+from .json_files import error_fields, move_aside, overlay, write_json_atomic
 
 _PROFILE: TypeAdapter[AnyProfile] = TypeAdapter(Profile)
 
@@ -31,24 +29,6 @@ class _Entry:
 
     raw: Any
     profile: AnyProfile | None
-
-
-def _overlay(raw: dict[str, Any], model: BaseModel) -> dict[str, Any]:
-    """`model`'s fields written over `raw`, keeping the fields this build does not know (nested models too)."""
-    merged = dict(raw)
-    for name, value in model.model_dump(mode="json").items():
-        nested = getattr(model, name)
-        if isinstance(nested, BaseModel):
-            base = raw.get(name)
-            merged[name] = _overlay(base if isinstance(base, dict) else {}, nested)
-        else:
-            merged[name] = value  # plain values and free-form dicts (options) are replaced as a whole
-    return merged
-
-
-def _error_fields(exc: ValidationError) -> str:
-    """Where validation failed, as field paths only: never the values (they could be anything, e.g. a secret)."""
-    return ", ".join(sorted({".".join(str(part) for part in err["loc"]) or "<entry>" for err in exc.errors()}))
 
 
 class ProfileStore:
@@ -111,7 +91,7 @@ class ProfileStore:
         try:
             raw_entries = self._read()
         except _Unreadable as exc:
-            self._move_aside(str(exc))
+            move_aside(self._path, str(exc), ProfileStoreError)
             return []
         return [self._entry(index, raw) for index, raw in enumerate(raw_entries)]
 
@@ -141,36 +121,11 @@ class ProfileStore:
                 self._reported.add((index, profile_id))
                 logger.warning(
                     "Skipping stored profile #{} (id {}): invalid {}; it is kept in the file as it is",
-                    index, profile_id, _error_fields(exc),
+                    index, profile_id, error_fields(exc),
                 )
             return _Entry(raw, None)
 
-    def _move_aside(self, reason: str) -> None:
-        """Back the unreadable file up under a unique name, so that saving later never destroys it."""
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        backup = next(
-            candidate
-            for counter in itertools.count(1)
-            if not (candidate := self._path.with_name(f"{self._path.name}.corrupt-{stamp}-{counter}")).exists()
-        )
-        try:
-            self._path.replace(backup)
-        except OSError as exc:
-            logger.error("{} is unreadable ({}) and could not be moved aside: {}", self._path.name, reason, exc)
-            raise ProfileStoreError(
-                f"{self._path.name} is unreadable and could not be moved aside: {exc.strerror or exc}"
-            ) from exc
-        logger.error("{} is unreadable ({}); moved it to {}", self._path.name, reason, backup.name)
-
     def _save(self, entries: list[_Entry]) -> None:
-        stored = [e.raw if e.profile is None else _overlay(e.raw if isinstance(e.raw, dict) else {}, e.profile)
+        stored = [e.raw if e.profile is None else overlay(e.raw if isinstance(e.raw, dict) else {}, e.profile)
                   for e in entries]
-        payload = {"version": self.VERSION, "profiles": stored}
-        tmp = self._path.with_name(self._path.name + ".tmp")
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), "utf-8")
-            os.replace(tmp, self._path)
-        except OSError as exc:
-            logger.error("Cannot write {}: {}", self._path.name, exc)
-            raise ProfileStoreError(f"Cannot save {self._path.name}: {exc.strerror or exc}") from exc
+        write_json_atomic(self._path, {"version": self.VERSION, "profiles": stored}, ProfileStoreError)
