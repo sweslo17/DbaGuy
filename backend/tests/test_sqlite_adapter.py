@@ -126,6 +126,22 @@ def test_parse_url():
     assert parsed.profile.name == "My App.db"
 
 
+@pytest.mark.parametrize(
+    ("url", "path"),
+    [
+        ("sqlite:////Users/me/app.db", "/Users/me/app.db"),  # SQLAlchemy's absolute form
+        ("sqlite:///Users/me/app.db", "/Users/me/app.db"),
+        ("sqlite:/abs.db", "/abs.db"),
+        ("sqlite://rel.db", "rel.db"),
+        ("sqlite:rel.db", "rel.db"),
+        ("sqlite:~/app.db", "~/app.db"),
+        ("sqlite://~/app.db", "~/app.db"),
+    ],
+)
+def test_parse_url_paths(url, path):
+    assert SqliteAdapter().parse_url(url).profile.path == path
+
+
 def test_trigger_and_table_share_a_name(tmp_path):
     path = tmp_path / "shared.db"
     setup = sqlite3.connect(path)

@@ -194,8 +194,12 @@ class SqliteAdapter(DatabaseAdapter):
     dialect = Dialect.SQLITE
 
     def parse_url(self, url: str) -> ParsedUrl:
+        """`sqlite:///abs/path` and `sqlite:////abs/path` (SQLAlchemy's absolute form) are absolute paths, `sqlite://rel`
+        and `sqlite:rel` relative ones; `~` is expanded when the file is opened."""
         parsed = urlparse(url)
         path = unquote(parsed.netloc + parsed.path)
+        if path.startswith("//"):  # one root, however many slashes: `//abs` would read as a URI authority later
+            path = "/" + path.lstrip("/")
         if not path:
             raise ValidationFailed("A SQLite URL needs a file path, e.g. sqlite:///Users/me/app.db")
         name = Path(path).name or "SQLite"
