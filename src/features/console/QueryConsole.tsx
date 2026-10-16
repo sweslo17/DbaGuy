@@ -1,6 +1,7 @@
 import { useRef, useState, type KeyboardEvent } from "react";
-import { Group, Panel, Separator } from "react-resizable-panels";
+import { Group, Panel } from "react-resizable-panels";
 import { Button } from "@/components/ui/Button";
+import { PanelHandle } from "@/components/ui/PanelHandle";
 import { ApiError } from "@/lib/api/client";
 import { cn } from "@/lib/cn";
 import { plural } from "@/lib/format";
@@ -164,7 +165,7 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
               className="block h-full w-full resize-none bg-bg p-3 font-mono text-[13px] outline-none"
             />
           </Panel>
-          <Separator className="h-px bg-border outline-none data-[separator=active]:bg-accent data-[separator=hover]:bg-accent data-[separator=focus]:bg-accent" />
+          <PanelHandle orientation="vertical" />
           <Panel id="results" minSize="20%">
             {execution && (
               <div className="flex h-full flex-col text-[12px]">

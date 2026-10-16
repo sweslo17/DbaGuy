@@ -1,8 +1,9 @@
 import { toast } from "@/components/ui/Toast";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import type { ColumnMeta, Dialect, FormatResult, FormatRowsRequest } from "@/lib/api/types";
+import { BYTES_PREVIEW, plainValue, type EncodedCell } from "@/lib/cells";
 import { plural } from "@/lib/format";
-import type { Rect } from "./selection";
+import { cellCount, type Rect } from "./selection";
 
 export type CopyFormat = "tsv" | "csv" | "json" | "markdown" | "insert" | "in_list" | "column_names";
 
@@ -109,10 +110,33 @@ async function copyText(formatted: Promise<FormatResult>, success: string): Prom
   for (const warning of result.warnings) toast("warning", warning);
 }
 
+/** Copies text known on the client and toasts `success` (or the clipboard error). Never rejects. */
+export function copyPlainText(text: string, success: string): Promise<void> {
+  return copyText(Promise.resolve({ text, warnings: [] }), success);
+}
+
+/** The grid holds only the start of this value (long text, or bytes beyond the preview). */
+function isPartial(value: unknown): boolean {
+  if (value === null || typeof value !== "object") return false;
+  const cell = value as EncodedCell;
+  return cell.$type === "text" || (cell.$type === "bytes" && (cell.size ?? 0) > BYTES_PREVIEW);
+}
+
+/**
+ * Copies one cell's plain value (ruling R-02b-7): what a single-cell ⌘C and the value viewer's "Copy value" write.
+ * Never rejects.
+ */
+export function copyValue(value: unknown): Promise<void> {
+  const success = isPartial(value)
+    ? "Copied the start of a truncated value; export the result for all of it"
+    : "Copied value";
+  return copyPlainText(plainValue(value), success);
+}
+
 /** Copies the names of `columns`, tab-separated (client-side: nothing to format). */
 export function copyColumnNames(columns: ColumnMeta[]): Promise<void> {
   const text = columns.map((column) => column.name).join("\t");
-  return copyText(Promise.resolve({ text, warnings: [] }), `Copied ${plural(columns.length, "column name")}`);
+  return copyPlainText(text, `Copied ${plural(columns.length, "column name")}`);
 }
 
 /**
@@ -144,4 +168,14 @@ export async function copySelection(format: CopyFormat, input: CopyInput): Promi
     },
   };
   return copyText(formatRows(body), `Copied ${plural(rowCount, "row")} as ${COPY_FORMAT_LABELS[format]}`);
+}
+
+/**
+ * ⌘C and the menu's plain Copy: a single cell (not a whole column) copies its plain value on the client, so JSON or
+ * multi-line text pastes as itself (ruling R-02b-7); anything larger copies as TSV. Never rejects.
+ */
+export function copyDefault(input: CopyInput): Promise<void> {
+  const { rect } = input;
+  if (cellCount(rect) === 1 && !input.wholeColumns) return copyValue(input.rows[rect.top][rect.left]);
+  return copySelection("tsv", input);
 }

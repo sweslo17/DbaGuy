@@ -12,6 +12,8 @@ export interface GridMenuActions {
   /** The active cell (rows and select-all menus open the value viewer / record view on it). */
   focus: CellPos | null;
   pinnedCount: number;
+  /** "Copy": one cell copies its plain value, more cells copy as TSV. */
+  copyDefault: () => void;
   copy: (format: CopyFormat) => void;
   pin: (count: number) => void;
   /** Absent: the item shows disabled. */
@@ -62,7 +64,7 @@ function headerItems(col: number, a: GridMenuActions): MenuItem[] {
 function selectionItems(pos: CellPos | null, cell: boolean, a: GridMenuActions): MenuItem[] {
   const { openValue, openRecord } = a;
   const items: MenuItem[] = [
-    { label: "Copy", shortcut: "⌘C", onSelect: () => a.copy("tsv") },
+    { label: "Copy", shortcut: "⌘C", onSelect: a.copyDefault },
     {
       label: "Copy as",
       children: COPY_FORMATS.map((format) => ({ label: COPY_FORMAT_LABELS[format], onSelect: () => a.copy(format) })),

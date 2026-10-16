@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
+import { Group, Panel, useDefaultLayout } from "react-resizable-panels";
+import { PanelHandle } from "@/components/ui/PanelHandle";
 import { Toaster } from "@/components/ui/Toast";
 import { api, unwrap } from "@/lib/api/client";
 import { BackendBanner } from "./BackendBanner";
@@ -37,7 +38,7 @@ export function AppShell({ sidebar, workspace }: { sidebar: ReactNode; workspace
           <Panel id="sidebar" defaultSize="22%" minSize="15%" className="bg-panel">
             {sidebar}
           </Panel>
-          <Separator className="w-px bg-border outline-none data-[separator=active]:bg-accent data-[separator=hover]:bg-accent data-[separator=focus]:bg-accent" />
+          <PanelHandle orientation="horizontal" />
           <Panel id="workspace" minSize="40%" className="bg-bg">
             {workspace}
           </Panel>
