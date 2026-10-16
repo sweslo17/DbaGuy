@@ -149,6 +149,11 @@ export async function currentStatements(
  * cursor is above every statement). Ranges are sorted and do not overlap.
  */
 export function rangeAt(ranges: readonly StatementRange[], pos: number): StatementRange | null {
+  return ranges[Math.max(lastStartingAt(ranges, pos), 0)] ?? null;
+}
+
+/** Index of the last range that starts at or before `pos`; -1 when every range starts after it. */
+function lastStartingAt(ranges: readonly StatementRange[], pos: number): number {
   let low = 0;
   let high = ranges.length - 1;
   let found = -1;
@@ -159,13 +164,55 @@ export function rangeAt(ranges: readonly StatementRange[], pos: number): Stateme
       low = mid + 1;
     } else high = mid - 1;
   }
-  return ranges[Math.max(found, 0)] ?? null;
+  return found;
 }
 
 /** The statement under `pos` from the cached split (mapped through edits since); null before the first split. */
 export function statementAt(state: EditorState, pos: number): StatementRange | null {
   const ranges = state.field(statementsField, false)?.ranges;
   return ranges ? rangeAt(ranges, pos) : null;
+}
+
+/** The most text around the cursor that completion and describe send (②a contract: a window, never the script). */
+const WINDOW_LIMIT = 20_000;
+
+const isHighSurrogate = (code: number) => code >= 0xd800 && code <= 0xdbff;
+const isLowSurrogate = (code: number) => code >= 0xdc00 && code <= 0xdfff;
+
+/**
+ * The text that `/sql/complete` and `/sql/describe` get for `pos`: the statement under it (up to its `;`), else the gap
+ * between the statements around it (text typed since the last split), else (no split yet) the whole document; cut to
+ * at most 20,000 code units around `pos`. The backend finds the statement under the cursor inside it.
+ */
+export function statementWindow(state: EditorState, pos: number): { from: number; to: number } {
+  const ranges = state.field(statementsField, false)?.ranges;
+  let from = 0;
+  let to = state.doc.length;
+  if (ranges?.length) {
+    const index = lastStartingAt(ranges, pos);
+    const current = index >= 0 ? ranges[index] : null;
+    if (current && pos <= current.terminatorEnd) {
+      ({ from, terminatorEnd: to } = current);
+    } else {
+      from = current?.terminatorEnd ?? 0;
+      to = ranges[index + 1]?.from ?? state.doc.length;
+    }
+  }
+  return clampWindow(state, Math.min(from, pos), Math.max(Math.min(to, state.doc.length), pos), pos);
+}
+
+/**
+ * [from, to) cut to WINDOW_LIMIT around `pos`: half on each side, a short side's rest to the other. A cut never splits a
+ * surrogate pair (a lone surrogate cannot be sent as UTF-8).
+ */
+function clampWindow(state: EditorState, from: number, to: number, pos: number): { from: number; to: number } {
+  if (to - from <= WINDOW_LIMIT) return { from, to };
+  const half = WINDOW_LIMIT / 2;
+  let start = Math.max(from, Math.min(pos - half, to - WINDOW_LIMIT));
+  let end = Math.min(to, start + WINDOW_LIMIT);
+  if (start > from && isLowSurrogate(state.doc.sliceString(start, start + 1).charCodeAt(0))) start += 1;
+  if (end < to && isHighSurrogate(state.doc.sliceString(end - 1, end).charCodeAt(0))) end -= 1;
+  return { from: start, to: end };
 }
 
 const currentMark = Decoration.mark({ class: "cm-currentStatement" });

@@ -11,6 +11,8 @@ import { useWorkspace, type QueryTabState } from "@/stores/workspace";
 import { useDialect, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
 import { CodeEditor, type CodeEditorHandle } from "../editor/CodeEditor";
+import { sqlCompletion, type CompletionTarget } from "../editor/completion";
+import { describeOnDemand } from "../editor/describe";
 import { errorMarksExtension } from "../editor/diagnostics";
 import { currentStatementHighlight, refreshStatements, statementsExtension } from "../editor/statements";
 import { ExportDialog } from "../grid/ExportDialog";
@@ -158,9 +160,16 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   useLayoutEffect(() => {
     startRef.current = start;
   });
-  const dialectRef = useRef(dialect);
+  // What the editor's extensions read at each use (split, completion, describe), so they never need reconfiguring.
+  const target: CompletionTarget = {
+    profileId: tab.profileId,
+    database: tab.database,
+    dialect,
+    keywordCase: settings.editor.keyword_case,
+  };
+  const editorTarget = useRef(target);
   useLayoutEffect(() => {
-    dialectRef.current = dialect;
+    editorTarget.current = target;
   });
   // Handled even when nothing can run, so ⌘↵ never falls through to "insert blank line".
   const runFromKey = (mode: RunMode) => {
@@ -176,9 +185,11 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
       ]),
     ),
     placeholder("SELECT …  (⌘↵ to run)"),
-    statementsExtension({ dialect: () => dialectRef.current }),
+    statementsExtension({ dialect: () => editorTarget.current.dialect }),
     currentStatementHighlight(),
     errorMarksExtension(),
+    sqlCompletion(() => editorTarget.current),
+    describeOnDemand(() => editorTarget.current),
   ]);
 
   // The split depends on the dialect, which is known only once the profiles have loaded (or a connection is chosen).
