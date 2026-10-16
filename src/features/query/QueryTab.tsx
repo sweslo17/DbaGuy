@@ -5,6 +5,7 @@ import { Group, Panel } from "react-resizable-panels";
 import { PanelHandle } from "@/components/ui/PanelHandle";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
+import { markEdited, registerEditorBuffer } from "@/stores/editorBuffers";
 import { useAppSettings } from "@/stores/settings";
 import { useReportTabStatus } from "@/stores/tabStatus";
 import { useWorkspace, type QueryTabState } from "@/stores/workspace";
@@ -125,7 +126,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     switching.current = true;
     try {
       if (!(await guards.exportStep("switch")) || !(await guards.transactionStep("switch"))) return;
-      updateTab(tab.id, { profileId, database }); // useSession closes the old session and opens the new one
+      updateTab(tab.id, "query", { profileId, database }); // useSession closes the old session and opens the new one
     } finally {
       switching.current = false;
     }
@@ -206,6 +207,19 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     return () => cancelAnimationFrame(frame);
   }, [active]);
 
+  // The workspace writer reads the editor only when it saves: a keystroke just marks the workspace edited, so typing
+  // never re-renders the tab tree (R-02c-4). A layout effect, so that unmounting reads the editor before it goes.
+  useLayoutEffect(
+    () =>
+      registerEditorBuffer(tab.id, () => {
+        const state = editor.current?.view.state;
+        if (!state) return null;
+        const { anchor, head } = state.selection.main;
+        return { text: state.doc.toString(), selection: { anchor, head } };
+      }),
+    [tab.id],
+  );
+
   const locate = (index: number, execution: ExecutionState) => {
     const current = view();
     return current ? errorLocation(current, index, execution) : null;
@@ -261,6 +275,8 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
                 initialSelection={initialSelection}
                 dialect={dialect}
                 extensions={extensions}
+                onChange={markEdited}
+                onSelectionChange={markEdited}
               />
             </div>
           </Panel>

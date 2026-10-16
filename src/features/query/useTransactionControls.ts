@@ -37,6 +37,8 @@ export function useTransactionControls({ tabId, controller, snapshot, autocommit
   });
 
   const asked = useRef<{ controller: SessionController; value: boolean } | null>(null);
+  // Bumped when a request ended without an answer, so the effect asks again even if nothing else changed.
+  const [askAgain, setAskAgain] = useState(0);
   useEffect(() => {
     if (!controller || phase !== "open" || !idle || !state || state.inTransaction) return;
     if (state.autocommit === autocommit) return;
@@ -49,11 +51,18 @@ export function useTransactionControls({ tabId, controller, snapshot, autocommit
     controller.whenDone(requestId).then(
       (done) => {
         controller.forget(requestId);
+        if (done.interrupted) {
+          // The connection dropped before the answer (a reconnect): ask again once the session is back, or Run
+          // would wait for this mode forever.
+          retryable();
+          setAskAgain((n) => n + 1);
+          return;
+        }
         if (!done.error) return;
         // The toggle goes back to what the session really does; asking for the same mode again sends it again.
         retryable();
         const actual = controller.store.getState().state?.autocommit ?? !autocommit;
-        updateTab(tabId, { autocommit: actual });
+        updateTab(tabId, "query", { autocommit: actual });
         toast(
           "error",
           `${subjectRef.current}: could not turn auto-commit ${autocommit ? "on" : "off"}: ${done.error.message}`,
@@ -61,7 +70,7 @@ export function useTransactionControls({ tabId, controller, snapshot, autocommit
       },
       retryable, // forgotten meanwhile: the next state change asks again if the modes still differ
     );
-  }, [controller, phase, idle, state, autocommit, tabId, updateTab]);
+  }, [controller, phase, idle, state, autocommit, tabId, updateTab, askAgain]);
 
   const [pulseUntil, setPulseUntil] = useState(0);
   const seen = useRef<{ controller: SessionController | null; id: number }>({ controller: null, id: 0 });
@@ -93,6 +102,6 @@ export function useTransactionControls({ tabId, controller, snapshot, autocommit
     pulse: pulseUntil > 0,
     commit: () => end("commit"),
     rollback: () => end("rollback"),
-    setAutocommit: (enabled: boolean) => updateTab(tabId, { autocommit: enabled }),
+    setAutocommit: (enabled: boolean) => updateTab(tabId, "query", { autocommit: enabled }),
   };
 }

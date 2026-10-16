@@ -4,8 +4,12 @@ import type { Dialect, ProfileDraft, ProfileSecretsInput } from "@/lib/api/types
 
 export const profilesKey = ["profiles"] as const;
 
+export async function fetchProfiles() {
+  return unwrap(await (await api()).GET("/profiles"));
+}
+
 export function useProfiles() {
-  return useQuery({ queryKey: profilesKey, queryFn: async () => unwrap(await (await api()).GET("/profiles")) });
+  return useQuery({ queryKey: profilesKey, queryFn: fetchProfiles });
 }
 
 export function useEngines() {

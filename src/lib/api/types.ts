@@ -39,6 +39,10 @@ export type EditorSettings = S["EditorSettings"];
 export type CompletionItem = S["CompletionItem"];
 export type DescribeResult = S["DescribeResult"];
 export type DescribeColumn = S["DescribeColumn"];
+/** `workspace.json` (spec §4.8): the open tabs, as `GET`/`PUT /workspace` exchange them. */
+export type SavedWorkspace = S["WorkspaceState"];
+export type SavedTab = S["WorkspaceTab"];
+export type TextSelection = S["TextSelection"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

@@ -20,8 +20,8 @@ export interface CodeEditorProps {
   initialSelection?: { anchor: number; head: number };
   /** The language mode; null → generic SQL. */
   dialect: Dialect | null;
-  /** Called on every change; debounce it in the caller. */
-  onChange?: (text: string) => void;
+  /** The text changed. Called on every keystroke, so it carries no text: read it (`getText`) only when needed. */
+  onChange?: () => void;
   onSelectionChange?: (selection: { anchor: number; head: number }) => void;
   /**
    * Tab-specific extensions (run keymap, completion, statements, diagnostics…). They come before the base ones, so
@@ -72,7 +72,7 @@ export function CodeEditor({
       : undefined;
     const listener = EditorView.updateListener.of((update) => {
       const { onChange: changed, onSelectionChange: selected } = latest.current;
-      if (update.docChanged) changed?.(update.state.doc.toString());
+      if (update.docChanged) changed?.();
       if (update.selectionSet && selected) {
         const { anchor, head } = update.state.selection.main;
         selected({ anchor, head });

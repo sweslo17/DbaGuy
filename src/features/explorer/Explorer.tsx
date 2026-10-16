@@ -135,7 +135,7 @@ export function Explorer() {
     // connection.
     const { tabs, closeTab, updateTab } = useWorkspace.getState();
     for (const tab of tabs.filter((t) => t.profileId === profileId)) {
-      if (tab.kind === "query") updateTab(tab.id, { profileId: null, database: null });
+      if (tab.kind === "query") updateTab(tab.id, "query", { profileId: null, database: null });
       else closeTab(tab.id);
     }
   };
