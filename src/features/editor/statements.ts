@@ -182,7 +182,9 @@ const isLowSurrogate = (code: number) => code >= 0xdc00 && code <= 0xdfff;
 /**
  * The text that `/sql/complete` and `/sql/describe` get for `pos`: the statement under it (up to its `;`), else the gap
  * between the statements around it (text typed since the last split), else (no split yet) the whole document; cut to
- * at most 20,000 code units around `pos`. The backend finds the statement under the cursor inside it.
+ * at most 20,000 code units around `pos`. The backend finds the statement under the cursor inside it. As in the
+ * backend (`_statement_bounds`), an unterminated last statement owns everything after it: the split ends it before
+ * trailing whitespace, but `SELECT * FROM |` is still that statement.
  */
 export function statementWindow(state: EditorState, pos: number): { from: number; to: number } {
   const ranges = state.field(statementsField, false)?.ranges;
@@ -191,8 +193,10 @@ export function statementWindow(state: EditorState, pos: number): { from: number
   if (ranges?.length) {
     const index = lastStartingAt(ranges, pos);
     const current = index >= 0 ? ranges[index] : null;
-    if (current && pos <= current.terminatorEnd) {
-      ({ from, terminatorEnd: to } = current);
+    const unterminatedLast = index === ranges.length - 1 && current?.terminatorEnd === current?.to;
+    if (current && (pos <= current.terminatorEnd || unterminatedLast)) {
+      from = current.from;
+      to = unterminatedLast ? state.doc.length : current.terminatorEnd;
     } else {
       from = current?.terminatorEnd ?? 0;
       to = ranges[index + 1]?.from ?? state.doc.length;
