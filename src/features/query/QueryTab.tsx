@@ -8,7 +8,7 @@ import { errorMessage } from "@/lib/api/client";
 import { markEdited, readEditorBuffer, registerEditor, rememberEditorBuffer } from "@/stores/editorBuffers";
 import { useAppSettings } from "@/stores/settings";
 import { useReportTabStatus } from "@/stores/tabStatus";
-import { useWorkspace, type QueryTabState } from "@/stores/workspace";
+import { startSelection, useWorkspace, type QueryTabState } from "@/stores/workspace";
 import { useDialect, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
 import { CodeEditor, type CodeEditorHandle } from "../editor/CodeEditor";
@@ -273,10 +273,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     const current = editor.current?.view;
     if (current) jumpToError(current, index, execution);
   }, []);
-  const initialSelection =
-    remembered?.selection ??
-    tab.initialSelection ??
-    (tab.initialCursor !== undefined ? { anchor: tab.initialCursor, head: tab.initialCursor } : undefined);
+  const initialSelection = remembered?.selection ?? startSelection(tab);
   const tint = profileColor(profile?.color);
 
   return (

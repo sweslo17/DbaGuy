@@ -17,6 +17,12 @@ export interface QueryTabState {
    */
   scriptPath: string | null;
   savedText: string | null;
+  /**
+   * A restored tab whose text was its file's (ruling R-02c-21): the editor starts empty and gets the file's current
+   * content once it is read, the first time the tab is shown. Until then (or until the user types) the workspace
+   * keeps no text for it, so a file changed outside DbaGuy is never shown as unsaved edits.
+   */
+  textFromFile: boolean;
   /** The editor's content when the tab was created or restored. */
   initialText: string;
   initialCursor?: number;
@@ -46,6 +52,12 @@ export interface ObjectTabState {
 export type Tab = QueryTabState | TableTabState | ObjectTabState;
 export type TabKind = Tab["kind"];
 export type TabOf<K extends TabKind> = Extract<Tab, { kind: K }>;
+
+/** Where a query tab's cursor starts: its restored selection, else its restored cursor. */
+export function startSelection(tab: QueryTabState): { anchor: number; head: number } | undefined {
+  if (tab.initialSelection) return tab.initialSelection;
+  return tab.initialCursor === undefined ? undefined : { anchor: tab.initialCursor, head: tab.initialCursor };
+}
 
 /** The fields of a tab of kind `K` that can change after it opened (never its id or kind). */
 export type TabPatch<K extends TabKind> = Partial<Omit<TabOf<K>, "id" | "kind">>;
@@ -107,7 +119,9 @@ const boundTo = (tabs: Tab[], path: string) => boundWhere(tabs, (scriptPath) => 
 function unbindTabs(ids: Set<string>): string[] {
   if (!ids.size) return [];
   useWorkspace.setState((s) => ({
-    tabs: s.tabs.map((t) => (t.kind === "query" && ids.has(t.id) ? { ...t, scriptPath: null, savedText: null } : t)),
+    tabs: s.tabs.map((t) =>
+      t.kind === "query" && ids.has(t.id) ? { ...t, scriptPath: null, savedText: null, textFromFile: false } : t,
+    ),
   }));
   return useWorkspace
     .getState()
@@ -162,6 +176,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
       database,
       scriptPath: options.scriptPath ?? null,
       savedText: options.scriptPath ? text : null,
+      textFromFile: false,
       initialText: text,
       autocommit: true,
     };

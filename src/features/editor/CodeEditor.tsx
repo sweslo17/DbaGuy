@@ -1,4 +1,4 @@
-import { Compartment, EditorSelection, EditorState, type Extension } from "@codemirror/state";
+import { Compartment, EditorSelection, EditorState, Transaction, type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, type Ref } from "react";
 import type { Dialect } from "@/lib/api/types";
@@ -8,8 +8,12 @@ import { baseExtensions, editorOptions, reconfigureEffects, type EditorOptions }
 export interface CodeEditorHandle {
   view: EditorView;
   getText(): string;
-  /** Replaces the whole text as one undoable change. */
-  setText(text: string): void;
+  /**
+   * Replaces the whole text outside the undo history, as the editor's starting content (e.g. a script read for its
+   * restored tab): undo never goes back to the text it replaced. The selection is placed as given (clamped), else at
+   * the start, and scrolled into view.
+   */
+  setText(text: string, selection?: { anchor: number; head: number }): void;
   focus(): void;
   /** Selects [from, to) (clamped to the text) and scrolls it into view. */
   selectRange(from: number, to: number): void;
@@ -140,9 +144,18 @@ export function CodeEditor({
           return current();
         },
         getText: () => current().state.doc.toString(),
-        setText: (text) => {
+        setText: (text, selection) => {
           const view = current();
-          view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } });
+          const insert = view.state.toText(text); // its length as the editor counts it (line breaks normalised)
+          view.dispatch({
+            changes: { from: 0, to: view.state.doc.length, insert },
+            selection: EditorSelection.single(
+              clamp(selection?.anchor ?? 0, insert.length),
+              clamp(selection?.head ?? 0, insert.length),
+            ),
+            scrollIntoView: true,
+            annotations: Transaction.addToHistory.of(false),
+          });
         },
         focus: () => current().focus(),
         selectRange: (from, to) => {

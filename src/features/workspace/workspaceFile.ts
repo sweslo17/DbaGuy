@@ -1,10 +1,13 @@
 import type { SavedTab, SavedWorkspace, TextSelection } from "@/lib/api/types";
+import { matchesFile } from "@/lib/scriptText";
 import type { EditorBuffer } from "@/stores/editorBuffers";
-import type { QueryTabState, Tab, WorkspaceSnapshot } from "@/stores/workspace";
+import { startSelection, type QueryTabState, type Tab, type WorkspaceSnapshot } from "@/stores/workspace";
 
 /*
  * `workspace.json` ↔ the tab store (spec §4.8). A query tab keeps its connection, script binding, editor text,
- * cursor/selection and auto-commit mode; a table or object tab keeps its connection and object path.
+ * cursor/selection and auto-commit mode; a table or object tab keeps its connection and object path. A tab bound to a
+ * script keeps no text while it holds just what its file does (`buffer: null`, ruling R-02c-21): it is restored from
+ * the file as the file is then.
  */
 
 const WORKSPACE_VERSION = 1;
@@ -22,19 +25,28 @@ export function workspaceJson(file: SavedWorkspace): string {
   return JSON.stringify(file, (_key, value: unknown) => (typeof value === "string" ? wellFormed(value) : value));
 }
 
-/** The tab's selection as last known: its editor's, else what it was restored with. */
-function selectionOf(tab: QueryTabState, buffer: EditorBuffer | null): TextSelection | null {
-  if (buffer) return buffer.selection;
-  if (tab.initialSelection) return tab.initialSelection;
-  return tab.initialCursor === undefined ? null : { anchor: tab.initialCursor, head: tab.initialCursor };
+/** The tab's text and selection as last known: its editor's, else what it was restored with. */
+function contentOf(tab: QueryTabState, buffer: EditorBuffer | null): { text: string; selection: TextSelection | null } {
+  return buffer ?? { text: tab.initialText, selection: startSelection(tab) ?? null };
+}
+
+/**
+ * The text `workspace.json` keeps for a query tab; null for a bound tab whose text is its file's. That includes a
+ * restored one whose file is not read yet: its editor is an empty stand-in, never the user's text, whether it was
+ * never shown, is mirrored to local storage or flushed as the page goes away.
+ */
+function bufferToSave(tab: QueryTabState, text: string): string | null {
+  if (tab.scriptPath === null) return text;
+  if (tab.textFromFile) return null;
+  return tab.savedText !== null && matchesFile(text, tab.savedText) ? null : text;
 }
 
 function savedTab(tab: Tab, readBuffer: (tabId: string) => EditorBuffer | null): SavedTab {
   if (tab.kind !== "query") {
     return { id: tab.id, kind: tab.kind, title: tab.title, profile_id: tab.profileId, object_path: tab.path };
   }
-  const buffer = readBuffer(tab.id);
-  const selection = selectionOf(tab, buffer);
+  // Waiting for its file, the empty editor's cursor means nothing: the restored one is kept.
+  const { text, selection } = contentOf(tab, tab.textFromFile ? null : readBuffer(tab.id));
   return {
     id: tab.id,
     kind: "query",
@@ -42,7 +54,7 @@ function savedTab(tab: Tab, readBuffer: (tabId: string) => EditorBuffer | null):
     profile_id: tab.profileId,
     database: tab.database,
     script_path: tab.scriptPath,
-    buffer: buffer?.text ?? tab.initialText,
+    buffer: bufferToSave(tab, text),
     cursor: selection?.head ?? null,
     // Only a real range: a bare cursor is `cursor`.
     selection: selection && selection.anchor !== selection.head ? selection : null,
@@ -88,14 +100,16 @@ export function fromSavedWorkspace(saved: SavedWorkspace, profileExists: (id: st
     const connected = profileId !== null && profileExists(profileId);
     if (entry.kind === "query") {
       if (profileId !== null && !connected) detached.push(entry.title);
+      const scriptPath = entry.script_path ?? null;
       tabs.push({
         id: entry.id,
         kind: "query",
         title: entry.title || "Query",
         profileId: connected ? profileId : null,
         database: connected ? (entry.database ?? null) : null,
-        scriptPath: entry.script_path ?? null,
+        scriptPath,
         savedText: null, // unknown until the script is read again
+        textFromFile: scriptPath !== null && entry.buffer == null,
         initialText: entry.buffer ?? "",
         initialCursor: entry.cursor ?? undefined,
         initialSelection: entry.selection ?? undefined,
