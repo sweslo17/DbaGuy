@@ -47,6 +47,10 @@ export type TextSelection = S["TextSelection"];
 export type ScriptTree = S["ScriptTree"];
 export type ScriptNode = S["ScriptNode"];
 export type ScriptFile = S["ScriptFile"];
+/** The query history (spec §4.6): one executed statement, and a page of them (newest first). */
+export type HistoryEntry = S["HistoryEntry"];
+export type HistoryPage = S["HistoryPage"];
+export type HistoryStatus = HistoryEntry["status"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

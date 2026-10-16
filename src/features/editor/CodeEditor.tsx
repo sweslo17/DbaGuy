@@ -13,6 +13,11 @@ export interface CodeEditorHandle {
   focus(): void;
   /** Selects [from, to) (clamped to the text) and scrolls it into view. */
   selectRange(from: number, to: number): void;
+  /**
+   * Replaces the main selection with `text`, as is, in one undoable change (never merged with typing around it); the
+   * cursor ends after it, in view, and the editor takes the focus.
+   */
+  insert(text: string): void;
 }
 
 export interface CodeEditorProps {
@@ -125,6 +130,18 @@ export function CodeEditor({
           const view = current();
           const length = view.state.doc.length;
           view.dispatch({ selection: EditorSelection.single(clamp(from, length), clamp(to, length)), scrollIntoView: true });
+        },
+        insert: (text) => {
+          const view = current();
+          const { from, to } = view.state.selection.main;
+          const insert = view.state.toText(text); // its length as the editor counts it (line breaks normalised)
+          view.dispatch({
+            changes: { from, to, insert },
+            selection: EditorSelection.cursor(from + insert.length),
+            scrollIntoView: true,
+            userEvent: "input.paste", // its own undo step, like a paste
+          });
+          view.focus();
         },
       };
     },

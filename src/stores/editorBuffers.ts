@@ -1,3 +1,4 @@
+import type { CodeEditorHandle } from "@/features/editor/CodeEditor";
 import type { TextSelection } from "@/lib/api/types";
 
 /** A query tab's editor content, as `workspace.json` keeps it. */
@@ -6,31 +7,35 @@ export interface EditorBuffer {
   selection: TextSelection;
 }
 
-/** Reads a mounted editor; null when it cannot (the editor is already gone). */
-export type EditorBufferReader = () => EditorBuffer | null;
+/** A query tab's editor while it is mounted; null once it is gone. */
+export type MountedEditor = () => CodeEditorHandle | null;
 
 /*
- * The query tabs' editor content lives in CodeMirror, never in React state (ruling R-02c-4): a keystroke only calls
- * `markEdited`, and the workspace writer reads the text when it saves.
+ * The query tabs' mounted editors, by tab id. Their content lives in CodeMirror, never in React state (ruling
+ * R-02c-4): a keystroke only calls `markEdited`, the workspace writer reads the text when it saves, and the History
+ * panel inserts into the active tab's editor.
  */
-const readers = new Map<string, EditorBufferReader>();
+const editors = new Map<string, MountedEditor>();
 /** What an editor held when it unmounted while its tab stayed open, by tab id. */
 const lastKnown = new Map<string, EditorBuffer>();
 const editListeners = new Set<() => void>();
 
-/** Registers a mounted editor's reader; the returned function unregisters it, keeping what it held last. */
-export function registerEditorBuffer(tabId: string, read: EditorBufferReader): () => void {
-  readers.set(tabId, read);
+/** Registers a tab's mounted editor; the returned function unregisters it, keeping what it held last. */
+export function registerEditor(tabId: string, editor: MountedEditor): () => void {
+  editors.set(tabId, editor);
   return () => {
-    const final = safeRead(read);
+    const final = readMounted(editor);
     if (final) lastKnown.set(tabId, final);
-    if (readers.get(tabId) === read) readers.delete(tabId);
+    if (editors.get(tabId) === editor) editors.delete(tabId);
   };
 }
 
-function safeRead(read: EditorBufferReader): EditorBuffer | null {
+function readMounted(editor: MountedEditor): EditorBuffer | null {
   try {
-    return read();
+    const state = editor()?.view.state;
+    if (!state) return null;
+    const { anchor, head } = state.selection.main;
+    return { text: state.doc.toString(), selection: { anchor, head } };
   } catch (error) {
     console.warn("Could not read an editor's content", error);
     return null;
@@ -39,8 +44,13 @@ function safeRead(read: EditorBufferReader): EditorBuffer | null {
 
 /** The tab's editor content now: its mounted editor's, else what it held last; null if it never mounted. */
 export function readEditorBuffer(tabId: string): EditorBuffer | null {
-  const read = readers.get(tabId);
-  return (read && safeRead(read)) ?? lastKnown.get(tabId) ?? null;
+  const editor = editors.get(tabId);
+  return (editor && readMounted(editor)) ?? lastKnown.get(tabId) ?? null;
+}
+
+/** The tab's editor, if it is mounted. */
+export function mountedEditor(tabId: string): CodeEditorHandle | null {
+  return editors.get(tabId)?.() ?? null;
 }
 
 /** Drops what is kept for tabs that are no longer open. */
@@ -58,8 +68,8 @@ export function onEdited(listener: () => void): () => void {
   return () => editListeners.delete(listener);
 }
 
-// Dev only: the mounted editors' readers live here for the app's lifetime. A hot update would hand the writer an empty
-// copy (it would save stale text), so the page reloads instead; the writer's flush on unload keeps the latest text.
+// Dev only: the mounted editors live here for the app's lifetime. A hot update would hand the writer an empty copy (it
+// would save stale text), so the page reloads instead; the writer's flush on unload keeps the latest text.
 if (import.meta.hot) {
   import.meta.hot.accept();
   import.meta.hot.dispose(() => window.location.reload());

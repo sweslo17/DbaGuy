@@ -5,7 +5,7 @@ import { Group, Panel } from "react-resizable-panels";
 import { PanelHandle } from "@/components/ui/PanelHandle";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
-import { markEdited, registerEditorBuffer } from "@/stores/editorBuffers";
+import { markEdited, registerEditor } from "@/stores/editorBuffers";
 import { useAppSettings } from "@/stores/settings";
 import { useReportTabStatus } from "@/stores/tabStatus";
 import { useWorkspace, type QueryTabState } from "@/stores/workspace";
@@ -215,17 +215,9 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   }, [active]);
 
   // The workspace writer reads the editor only when it saves: a keystroke just marks the workspace edited, so typing
-  // never re-renders the tab tree (R-02c-4). A layout effect, so that unmounting reads the editor before it goes.
-  useLayoutEffect(
-    () =>
-      registerEditorBuffer(tab.id, () => {
-        const state = editor.current?.view.state;
-        if (!state) return null;
-        const { anchor, head } = state.selection.main;
-        return { text: state.doc.toString(), selection: { anchor, head } };
-      }),
-    [tab.id],
-  );
+  // never re-renders the tab tree (R-02c-4). The History panel inserts through it. A layout effect, so that unmounting
+  // reads the editor before it goes.
+  useLayoutEffect(() => registerEditor(tab.id, () => editor.current), [tab.id]);
 
   const locate = (index: number, execution: ExecutionState) => {
     const current = view();

@@ -3,6 +3,7 @@ import { Tabs } from "@/components/ui/Tabs";
 import { cn } from "@/lib/cn";
 import { useWorkspace } from "@/stores/workspace";
 import { Explorer } from "../features/explorer/Explorer";
+import { HistoryPanel } from "../features/history/HistoryPanel";
 import { ScriptsPanel } from "../features/scripts/ScriptsPanel";
 
 type SidebarView = "connections" | "scripts" | "history";
@@ -10,11 +11,7 @@ type SidebarView = "connections" | "scripts" | "history";
 const VIEWS: { value: SidebarView; label: string; render: () => ReactNode }[] = [
   { value: "connections", label: "Connections", render: () => <Explorer /> },
   { value: "scripts", label: "Scripts", render: () => <ScriptsPanel /> },
-  {
-    value: "history",
-    label: "History",
-    render: () => <p className="p-4 text-[12px] text-muted">Query history is not available yet.</p>,
-  },
+  { value: "history", label: "History", render: () => <HistoryPanel /> },
 ];
 
 const isView = (value: string | null): value is SidebarView => VIEWS.some((view) => view.value === value);

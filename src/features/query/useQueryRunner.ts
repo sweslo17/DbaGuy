@@ -1,7 +1,9 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { toast } from "@/components/ui/Toast";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import type { AppSettings, GuardDecision } from "@/lib/api/types";
+import { refreshHistory } from "../history/useHistory";
 import { CONNECTION_LOST, type ExecutionState } from "../session/execution";
 import { busy, type SessionController } from "../session/SessionController";
 import type { PlannedStatement } from "./runPlan";
@@ -97,6 +99,7 @@ interface ActiveRun {
 export function useQueryRunner({ controller, profileId, settings, timeoutS, listener }: QueryRunnerArgs) {
   const [result, setResult] = useState<{ controller: SessionController; run: RunState } | null>(null);
   const [prompt, setPrompt] = useState<ConfirmPrompt | null>(null);
+  const qc = useQueryClient();
   const latest = useRef({ controller, profileId, settings, timeoutS, listener });
   useLayoutEffect(() => {
     latest.current = { controller, profileId, settings, timeoutS, listener };
@@ -183,6 +186,7 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
       session.forgetAllExcept([]); // only this run's results are kept from now on
       publish(state);
       events?.onStart(planned);
+      let last: ExecutionState | null = null;
       for (let index = 0; index < planned.length && !job.cancelled; index += 1) {
         events?.onStatement(index);
         let execution = await send(index, confirmed.has(index));
@@ -199,6 +203,7 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
             execution = await send(index, true);
           }
         }
+        last = execution;
         const status = stepStatus(execution);
         setStep(index, { status });
         if (execution) events?.onSettled(index, execution);
@@ -211,8 +216,12 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
         active: false,
         finishedAt: Date.now(),
       });
+      // The backend records each statement in the history as it ends, before its `finished`. A paused last result
+      // ends later (read to the end, discarded or closed): the History panel refreshes again then.
+      refreshHistory(qc);
+      if (last?.status === "paused") void session.whenDone(last.requestId).then(() => refreshHistory(qc), () => {});
     },
-    [ask],
+    [ask, qc],
   );
 
   const start = useCallback(
