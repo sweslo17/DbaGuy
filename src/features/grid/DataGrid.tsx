@@ -51,6 +51,8 @@ export interface DataGridProps {
   columns: ColumnMeta[];
   rows: unknown[][];
   hasMore: boolean;
+  /** The result ended before all its rows were loaded (it was discarded while paused): the count says "(partial)". */
+  partial?: boolean;
   /** Rows are being fetched (the next page, or the first one). */
   loadingMore: boolean;
   onLoadMore?: () => void;
@@ -123,7 +125,7 @@ function LoadMoreFooter({ rowCount, hasMore, loading, onLoadMore }: LoadMoreFoot
  */
 export function DataGrid(props: DataGridProps) {
   const { columns, rows, hasMore, sort, onHeaderClick, stale = false, ref } = props;
-  const { dialect, tableName, onSortBy, extraCellMenu, onSelectionChange, exportSource } = props;
+  const { dialect, tableName, onSortBy, extraCellMenu, onSelectionChange, exportSource, partial = false } = props;
   // Stale rows are only shown: nothing is loaded for them.
   const loadingMore = props.loadingMore && !stale;
   const onLoadMore = stale ? undefined : props.onLoadMore;
@@ -422,6 +424,7 @@ export function DataGrid(props: DataGridProps) {
         rowCount={rows.length}
         columnCount={columns.length}
         hasMore={hasMore}
+        partial={partial}
         aggregates={aggregates}
         onExport={exportSource ? openExport : undefined}
       />

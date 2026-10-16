@@ -8,6 +8,7 @@ export function Dialog({
   children,
   footer,
   width = 560,
+  onCloseAutoFocus,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -15,6 +16,8 @@ export function Dialog({
   children: ReactNode;
   footer?: ReactNode;
   width?: number;
+  /** Where focus goes once the dialog has closed (call `preventDefault` to place it yourself). */
+  onCloseAutoFocus?: (event: Event) => void;
 }) {
   return (
     <RadixDialog.Root open={open} onOpenChange={onOpenChange}>
@@ -24,6 +27,7 @@ export function Dialog({
           style={{ width }}
           className="fixed left-1/2 top-[12%] flex max-h-[76vh] -translate-x-1/2 flex-col overflow-hidden rounded-xl border border-border bg-elevated shadow-2xl"
           onOpenAutoFocus={(e) => e.preventDefault()}
+          onCloseAutoFocus={onCloseAutoFocus}
         >
           <RadixDialog.Title className="border-b border-border px-4 py-2.5 text-[13px] font-semibold">
             {title}

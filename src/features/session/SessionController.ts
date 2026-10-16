@@ -62,6 +62,17 @@ export function isExporting(snapshot: SessionSnapshot | null): boolean {
   return Object.values(snapshot.executions).some((execution) => execution.kind === "export" && unfinished(execution));
 }
 
+/**
+ * The session is working: a request is running (a statement, a page being fetched, a transaction command) or an export
+ * is unfinished. A paused result does not count: the next statement simply ends it.
+ */
+export function busy(snapshot: SessionSnapshot | null): boolean {
+  if (!snapshot) return false;
+  return Object.values(snapshot.executions).some(
+    (execution) => execution.status === "running" || (execution.kind === "export" && unfinished(execution)),
+  );
+}
+
 function disposeSession(sessionId: string): void {
   api()
     .then((client) => client.DELETE("/sessions/{session_id}", { params: { path: { session_id: sessionId } } }))
@@ -181,13 +192,35 @@ export class SessionController {
     });
   }
 
+  /** Drops every request's state except those in `keep` (e.g. the previous runs of a query tab). */
+  forgetAllExcept(keep: Iterable<string>): void {
+    const kept = new Set(keep);
+    const { executions } = this.store.getState();
+    if (Object.keys(executions).every((id) => kept.has(id))) return;
+    this.store.setState({
+      executions: Object.fromEntries(Object.entries(executions).filter(([id]) => kept.has(id))),
+    });
+  }
+
   /** Resolves with the request's state once it is done (finished, failed or interrupted); rejects if it is unknown. */
   whenDone(requestId: string): Promise<ExecutionState> {
+    return this.waitFor(requestId, (execution) => execution.status === "done");
+  }
+
+  /**
+   * Resolves once the request is done or paused (its first page is in and it waits for `fetch_more`): the point
+   * where the next statement of a run may be sent. Rejects if the request is unknown or forgotten meanwhile.
+   */
+  whenSettled(requestId: string): Promise<ExecutionState> {
+    return this.waitFor(requestId, (execution) => execution.status !== "running");
+  }
+
+  private waitFor(requestId: string, reached: (execution: ExecutionState) => boolean): Promise<ExecutionState> {
     return new Promise((resolve, reject) => {
       const settle = (snapshot: SessionSnapshot): boolean => {
         const execution = snapshot.executions[requestId];
         if (!execution) reject(new Error(`Unknown or forgotten request ${requestId}`));
-        else if (execution.status === "done") resolve(execution);
+        else if (reached(execution)) resolve(execution);
         else return false;
         return true;
       };

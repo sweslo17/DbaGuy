@@ -7,6 +7,8 @@ interface StatusBarProps {
   rowCount: number;
   columnCount: number;
   hasMore: boolean;
+  /** Only some of the rows were ever loaded. */
+  partial: boolean;
   /** Figures of a selection of more than one cell, else null. */
   aggregates: Aggregates | null;
   /** Opens the export dialog (shown only when set). */
@@ -45,12 +47,12 @@ function Figures({ aggregates: a }: { aggregates: Aggregates }) {
 
 /** Under the grid: the size of the result, the selected cell count with its numeric figures, and Export. */
 export const StatusBar = memo(function StatusBar(props: StatusBarProps) {
-  const { rowCount, columnCount, hasMore, aggregates, onExport } = props;
+  const { rowCount, columnCount, hasMore, partial, aggregates, onExport } = props;
   return (
     <div className="flex h-6 shrink-0 items-center gap-4 border-y border-border px-3 text-[12px] whitespace-nowrap text-muted">
       <span className="shrink-0">
         {plural(rowCount, "row")}
-        {hasMore ? " loaded" : ""} · {plural(columnCount, "column")}
+        {hasMore ? " loaded" : partial ? " (partial)" : ""} · {plural(columnCount, "column")}
       </span>
       <span className="ml-auto flex min-w-0 items-center gap-4">
         {aggregates && (

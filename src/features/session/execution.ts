@@ -8,6 +8,8 @@ export interface ResultSetState {
   rows: unknown[][];
   rowCount: number;
   hasMore: boolean;
+  /** It ended while paused (discarded by the next statement, cancelled or interrupted): only some rows were loaded. */
+  partial: boolean;
 }
 
 /** One request on a session, folded from its server events. */
@@ -71,8 +73,13 @@ export function interruptExecution(state: ExecutionState): ExecutionState {
     status: "done",
     interrupted: true,
     messages: [...state.messages, { severity: "warning", text: INTERRUPTED_MESSAGE }],
-    resultSets: state.resultSets.map((s) => ({ ...s, hasMore: false })),
+    resultSets: endSets(state.resultSets),
   };
+}
+
+/** The request is over: a set still waiting for more rows keeps only those it has. */
+function endSets(sets: ResultSetState[]): ResultSetState[] {
+  return sets.map((s) => (s.hasMore ? { ...s, hasMore: false, partial: true } : s));
 }
 
 /** Rebuilds only the touched result set, so appending rows stays linear in the total row count. */
@@ -91,7 +98,7 @@ export function applyEvent(state: ExecutionState, event: ServerEvent): Execution
         ...state,
         resultSets: [
           ...state.resultSets,
-          { index: event.index, columns: event.columns, rows: [], rowCount: 0, hasMore: false },
+          { index: event.index, columns: event.columns, rows: [], rowCount: 0, hasMore: false, partial: false },
         ],
       };
     case "rows":
@@ -121,7 +128,7 @@ export function applyEvent(state: ExecutionState, event: ServerEvent): Execution
         cancelled: event.cancelled,
         timedOut: event.timed_out,
         skipped: event.skipped,
-        resultSets: state.resultSets.map((s) => ({ ...s, hasMore: false })),
+        resultSets: endSets(state.resultSets),
       };
     default:
       return state; // an event type this client does not know must never wipe the state

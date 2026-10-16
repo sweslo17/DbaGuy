@@ -9,7 +9,8 @@ export function Tabs<T extends string>({
 }: {
   value: T;
   onValueChange: (value: T) => void;
-  items: { value: T; label: string }[];
+  /** `title`: a tooltip (e.g. the full text of a shortened label). */
+  items: { value: T; label: string; title?: string }[];
   /** Spacing around the bar (default: a margin below it). */
   className?: string;
 }) {
@@ -21,9 +22,10 @@ export function Tabs<T extends string>({
           type="button"
           role="tab"
           aria-selected={value === item.value}
+          title={item.title}
           onClick={() => onValueChange(item.value)}
           className={cn(
-            "-mb-px border-b-2 px-3 py-1.5 text-[12px] outline-none focus-visible:text-accent",
+            "-mb-px shrink-0 border-b-2 px-3 py-1.5 text-[12px] whitespace-nowrap outline-none focus-visible:text-accent",
             value === item.value ? "border-accent text-fg" : "border-transparent text-muted hover:text-fg",
           )}
         >

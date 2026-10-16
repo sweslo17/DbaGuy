@@ -20,6 +20,8 @@ export interface QueryToolbarProps {
   session: SessionInfo | null;
   sessionFailed: boolean;
   state: SessionStateView | null;
+  /** What ⌘↵ runs without a selection (the `run.default` setting). */
+  runDefault: "statement" | "all";
   canRun: boolean;
   /** Why Run is disabled, as a tooltip (e.g. an export is running). */
   runBlockedReason?: string;
@@ -52,22 +54,22 @@ function ConnectionLabel({
 }
 
 export function QueryToolbar(props: QueryToolbarProps) {
-  const { canRun, runBlockedReason, canCancel, onRun, onRunAll, onCancel } = props;
+  const { runDefault, canRun, runBlockedReason, canCancel, onRun, onRunAll, onCancel } = props;
+  const runTitle = `Run the selection, or ${runDefault === "all" ? "every statement" : "the statement under the cursor"} (⌘↵)`;
   return (
     <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border px-2">
-      <Button
-        variant="primary"
-        size="sm"
-        onClick={onRun}
-        disabled={!canRun}
-        title={runBlockedReason ?? "Run the selection, or the whole text (⌘↵)"}
-      >
+      <Button variant="primary" size="sm" onClick={onRun} disabled={!canRun} title={runBlockedReason ?? runTitle}>
         <Play size={12} /> Run
       </Button>
-      <Button size="sm" onClick={onRunAll} disabled={!canRun} title={runBlockedReason ?? "Run the whole text (⌘⇧↵)"}>
+      <Button
+        size="sm"
+        onClick={onRunAll}
+        disabled={!canRun}
+        title={runBlockedReason ?? "Run every statement (of the selection, if any), one after another (⌘⇧↵)"}
+      >
         <ListEnd size={12} /> Run all
       </Button>
-      <Button size="sm" onClick={onCancel} disabled={!canCancel} title="Cancel the running statement">
+      <Button size="sm" onClick={onCancel} disabled={!canCancel} title="Cancel the running statement and stop the run">
         <Square size={12} /> Cancel
       </Button>
       <div className="flex-1" />
