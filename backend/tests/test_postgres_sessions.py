@@ -59,3 +59,12 @@ def test_transaction_failed_is_reported_after_an_error_inside_a_transaction(pg_w
     assert failed.in_transaction is True and failed.transaction_failed is True
     rolled_back = run(worker, rec, "r", "ROLLBACK")
     assert rolled_back.in_transaction is False and rolled_back.transaction_failed is False
+
+
+def test_statement_timeout_on_postgres(pg_worker):
+    worker, recorder = pg_worker
+    worker.submit(ExecuteCommand(request_id="t", sql="SELECT pg_sleep(5)", timeout_s=0.3))
+    done = recorder.wait_for(finished("t"), timeout=30)
+    assert done.timed_out and done.cancelled and done.elapsed_ms < 3000
+    assert recorder.of("t", "message")[-1].text == "Timed out after 0.3 s"
+    assert not run(worker, recorder, "u", "SELECT 1").cancelled

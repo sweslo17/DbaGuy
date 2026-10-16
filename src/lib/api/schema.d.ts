@@ -278,6 +278,15 @@ export interface components {
             /** Request Id */
             request_id: string;
         };
+        /** Classification */
+        Classification: {
+            kind: components["schemas"]["StatementKind"];
+            /**
+             * Dangerous Reasons
+             * @default []
+             */
+            dangerous_reasons: string[];
+        };
         /**
          * ColumnCategory
          * @enum {string}
@@ -308,6 +317,32 @@ export interface components {
             /** Type Name */
             type_name: string;
             category: components["schemas"]["ColumnCategory"];
+        };
+        /** CommitCommand */
+        CommitCommand: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "commit";
+            /** Request Id */
+            request_id: string;
+        };
+        /**
+         * ConfirmationRequiredEvent
+         * @description The statement was not run: resend it with `confirmed=true` once the user agreed. `finished(skipped)` follows.
+         */
+        ConfirmationRequiredEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "confirmation_required";
+            /** Request Id */
+            request_id: string;
+            /** Reasons */
+            reasons: string[];
+            classification: components["schemas"]["Classification"];
         };
         /** ConnectionTestRequest */
         ConnectionTestRequest: {
@@ -395,6 +430,18 @@ export interface components {
              * @default 500
              */
             page_size: number;
+            /**
+             * Confirmed
+             * @default false
+             */
+            confirmed: boolean;
+            /** Timeout S */
+            timeout_s?: number | null;
+            /**
+             * History
+             * @default true
+             */
+            history: boolean;
         };
         /**
          * ExecutionSchema
@@ -402,9 +449,9 @@ export interface components {
          */
         ExecutionSchema: {
             /** Command */
-            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"];
+            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"] | components["schemas"]["CommitCommand"] | components["schemas"]["RollbackCommand"] | components["schemas"]["SetAutocommitCommand"];
             /** Event */
-            event: components["schemas"]["StartedEvent"] | components["schemas"]["ResultSetEvent"] | components["schemas"]["RowsEvent"] | components["schemas"]["ResultSetEndEvent"] | components["schemas"]["AffectedEvent"] | components["schemas"]["MessageEvent"] | components["schemas"]["ErrorEvent"] | components["schemas"]["FinishedEvent"];
+            event: components["schemas"]["StartedEvent"] | components["schemas"]["ResultSetEvent"] | components["schemas"]["RowsEvent"] | components["schemas"]["ResultSetEndEvent"] | components["schemas"]["AffectedEvent"] | components["schemas"]["MessageEvent"] | components["schemas"]["ErrorEvent"] | components["schemas"]["ConfirmationRequiredEvent"] | components["schemas"]["SessionStateEvent"] | components["schemas"]["FinishedEvent"];
         };
         /** FetchMoreCommand */
         FetchMoreCommand: {
@@ -444,6 +491,16 @@ export interface components {
              * @default false
              */
             cancelled: boolean;
+            /**
+             * Timed Out
+             * @default false
+             */
+            timed_out: boolean;
+            /**
+             * Skipped
+             * @default false
+             */
+            skipped: boolean;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -616,6 +673,16 @@ export interface components {
             /** Columns */
             columns: components["schemas"]["ColumnMeta"][];
         };
+        /** RollbackCommand */
+        RollbackCommand: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "rollback";
+            /** Request Id */
+            request_id: string;
+        };
         /** RowsEvent */
         RowsEvent: {
             /**
@@ -780,6 +847,39 @@ export interface components {
             database: string | null;
             server: components["schemas"]["ServerInfo"];
         };
+        /**
+         * SessionStateEvent
+         * @description The session's transaction state: sent right before every `finished`, on attach and after an idle rollback.
+         */
+        SessionStateEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "session_state";
+            /** Autocommit */
+            autocommit: boolean;
+            /** In Transaction */
+            in_transaction: boolean;
+            /** Transaction Failed */
+            transaction_failed: boolean;
+            /** Transaction Started At */
+            transaction_started_at?: string | null;
+            /** Idle Seconds */
+            idle_seconds?: number | null;
+        };
+        /** SetAutocommitCommand */
+        SetAutocommitCommand: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "set_autocommit";
+            /** Request Id */
+            request_id: string;
+            /** Enabled */
+            enabled: boolean;
+        };
         /** SqliteProfile */
         SqliteProfile: {
             /** Name */
@@ -913,6 +1013,11 @@ export interface components {
             /** Request Id */
             request_id: string;
         };
+        /**
+         * StatementKind
+         * @enum {string}
+         */
+        StatementKind: "read" | "write" | "ddl" | "transaction" | "session" | "unknown";
         /** ValidationError */
         ValidationError: {
             /** Location */

@@ -78,6 +78,7 @@ class SessionManager:
         with self._lock:
             entry.attached += 1
         entry.worker.set_emitter(emit)
+        entry.worker.replay_state()  # a client attaching mid-transaction learns the state before any `finished`
         return entry.worker
 
     def detach(self, session_id: str, emit: Emitter) -> None:

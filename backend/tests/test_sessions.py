@@ -39,7 +39,7 @@ class Recorder:
             return next(e for e in self.events if predicate(e))
 
     def of(self, request_id, type_):
-        return [e for e in self.events if e.request_id == request_id and e.type == type_]
+        return [e for e in self.events if e.type == type_ and getattr(e, "request_id", None) == request_id]
 
     def types(self):
         return [e.type for e in self.events]
@@ -65,11 +65,11 @@ def setup(tmp_path):
 
 
 def finished(rid):
-    return lambda e: e.request_id == rid and e.type == "finished"
+    return lambda e: e.type == "finished" and e.request_id == rid  # type first: session_state has no request_id
 
 
 def paused(rid, count):
-    return lambda e: e.request_id == rid and e.type == "result_set_end" and e.row_count == count
+    return lambda e: e.type == "result_set_end" and e.request_id == rid and e.row_count == count
 
 
 def test_paging_fetch_more_and_finish(setup):
@@ -114,7 +114,7 @@ def test_dml_and_error(setup):
 def test_cancel_running_query(setup):
     _, _, worker, rec = setup
     worker.submit(ExecuteCommand(request_id="c1", sql=LONG_SQL))
-    rec.wait_for(lambda e: e.request_id == "c1" and e.type == "started")
+    rec.wait_for(lambda e: e.type == "started" and e.request_id == "c1")
     time.sleep(0.3)
     worker.cancel("c1")
     done = rec.wait_for(finished("c1"), timeout=5)
@@ -146,7 +146,8 @@ def test_fetch_more_without_an_open_result_still_finishes(setup):
     worker.submit(FetchMoreCommand(request_id="ghost", count=10))
     done = rec.wait_for(finished("ghost"))
     assert [e.code for e in rec.of("ghost", "error")] == ["no_open_result"]
-    assert rec.types() == ["error", "finished"]  # the error comes first, then the one `finished`
+    # attach replays the state; then the error, then the one `finished` right after the state it reports
+    assert rec.types() == ["session_state", "error", "session_state", "finished"]
     assert done.cancelled is False and done.in_transaction is False and done.elapsed_ms == 0
 
 

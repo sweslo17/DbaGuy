@@ -1,10 +1,12 @@
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from datetime import UTC, datetime
+from typing import Any, Literal, TypeVar
 
 from loguru import logger
 from pydantic import BaseModel
@@ -15,6 +17,8 @@ from ..domain.errors import ConnectionFailed, SessionBusy
 from ..domain.execution import (
     AffectedEvent,
     CancelCommand,
+    CommitCommand,
+    ConfirmationRequiredEvent,
     DiscardCommand,
     ErrorEvent,
     ExecuteCommand,
@@ -24,38 +28,105 @@ from ..domain.execution import (
     MessageSeverity,
     ResultSetEndEvent,
     ResultSetEvent,
+    RollbackCommand,
     RowsEvent,
+    SessionStateEvent,
+    SetAutocommitCommand,
     StartedEvent,
 )
+from ..services.safety import GuardAction, GuardDecision
+from ..sql.classifier import Classification, StatementKind
+from ..sql.dialects import Dialect
+from .session_state import SessionStateTracker
 
 T = TypeVar("T")
 Emitter = Callable[[BaseModel], None]
+TransactionCommand = CommitCommand | RollbackCommand | SetAutocommitCommand
 _CHUNK = 200
 _STOP = object()
+_FAILED_COMMIT = "The transaction had failed, so COMMIT rolled it back"
 
 
 def _discard_event(_: BaseModel) -> None:
     return None
 
 
+@dataclass(frozen=True)
+class ExecutionRecord:
+    """One execute that passed the policy, as the history keeps it."""
+
+    request_id: str
+    sql: str
+    started_at: datetime
+    elapsed_ms: int  # until the first pause or the end: reading time is not query time
+    rows: int  # rows sent plus affected rows
+    status: Literal["ok", "error", "cancelled", "timeout"]
+    error: str | None = None
+
+
+def _run_everything(sql: str, confirmed: bool) -> GuardDecision:
+    return GuardDecision(action=GuardAction.RUN, classification=Classification(kind=StatementKind.UNKNOWN))
+
+
+def _ignore(*_: object) -> None:
+    return None
+
+
+@dataclass(frozen=True)
+class WorkerHooks:
+    """How a worker reaches the rest of the app. The defaults run everything and record nothing."""
+
+    dialect: Dialect = Dialect.SQLITE
+    check: Callable[[str, bool], GuardDecision] = _run_everything  # (sql, confirmed)
+    on_record: Callable[[ExecutionRecord], None] = _ignore
+    on_schema_change: Callable[[], None] = _ignore
+
+
+@dataclass
+class _Request:
+    """One execute request, from `started` to `finished`."""
+
+    request_id: str
+    sql: str
+    history: bool = True
+    timeout_s: float | None = None
+    started: float = field(default_factory=time.monotonic)
+    started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    kind: StatementKind = StatementKind.UNKNOWN
+    ran: bool = False  # passed the policy and reached the connection
+    rows: int = 0
+    first_page_ms: int | None = None  # set at the first pause
+    timer_armed: bool = False  # guarded by the worker's _state_lock
+    timed_out: bool = False
+
+    def elapsed_ms(self) -> int:
+        return int((time.monotonic() - self.started) * 1000)
+
+
 @dataclass
 class _OpenExecution:
-    request_id: str
+    req: _Request
     result: StatementResult
-    started: float
     index: int = 0
     sent: int = 0
     columns_sent: bool = False
     peeked: list[list[Any]] = field(default_factory=list)  # raw rows read ahead to detect a full page
+
+    @property
+    def request_id(self) -> str:
+        return self.req.request_id
 
 
 class SessionWorker:
     """Owns one connection and one thread; every driver call happens on that thread.
 
     Locking: `_queue_lock` guards `_closed` and every enqueue, so nothing can land behind the stop marker.
-    `_state_lock` guards `_running_request`, `_cancel_requested` and `_queued`; it is held across
-    `connection.cancel()`, so a cancel can never hit a statement other than the one it was meant for (the worker
-    changes the running request under it).
+    `_state_lock` guards `_running_request`, `_cancel_requested`, `_queued` and `_Request.timer_armed`; it is held
+    across `connection.cancel()`, so a cancel can never hit a statement other than the one it was meant for (the
+    worker changes the running request under it). `_tracker` has its own leaf lock for the session state that other
+    threads read; `_state_send_lock` keeps a replayed state from overtaking a newer one.
+
+    Every request ends with exactly one `finished`, and a `session_state` immediately before it.
     """
 
     def __init__(self, name: str, opener: Callable[[], Any]) -> None:
@@ -70,6 +141,7 @@ class SessionWorker:
         self._emit_lock = threading.Lock()
         self._queue_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._state_send_lock = threading.Lock()
         self._running_request: str | None = None
         # A cancel reached the running request; honoured at the next page boundary in case no driver call was in
         # flight to interrupt (the driver then has nothing to cancel and the request would pause instead).
@@ -77,6 +149,9 @@ class SessionWorker:
         self._queued: dict[str, bool] = {}  # execute requests waiting in the queue -> cancelled before they started
         self._open_exec: _OpenExecution | None = None
         self._closed = False
+        self._hooks = WorkerHooks()
+        self._tracker = SessionStateTracker()
+        self._ddl_pending = False  # worker thread only: DDL ran inside a transaction that has not ended yet
         self.last_activity = time.monotonic()
 
     # ---- lifecycle (any thread) ----
@@ -88,6 +163,10 @@ class SessionWorker:
             raise ConnectionFailed(f"Timed out opening a connection for {self.name}")
         if self._open_error is not None:
             raise self._open_error
+
+    def configure(self, hooks: WorkerHooks) -> None:
+        """Set before the session is registered, so no command can run with the defaults."""
+        self._hooks = hooks
 
     @property
     def connection(self) -> DatabaseConnection:
@@ -103,6 +182,13 @@ class SessionWorker:
         with self._emit_lock:
             if self._emit is emit:
                 self._emit = _discard_event
+
+    def replay_state(self) -> None:
+        """Send the last known `session_state` (with a fresh `idle_seconds`) to the current emitter."""
+        with self._state_send_lock:
+            state = self._tracker.snapshot()
+            if state is not None:
+                self._send(state)
 
     def call(self, fn: Callable[[DatabaseConnection], T], timeout: float | None = 120.0) -> T:
         """Run fn(connection) on the worker thread and wait for its result."""
@@ -133,6 +219,8 @@ class SessionWorker:
                 self._put(lambda: self._discard(command.request_id))
             case CancelCommand():
                 self.cancel(command.request_id)
+            case CommitCommand() | RollbackCommand() | SetAutocommitCommand():
+                self._put(lambda: self._transaction_command(command))
 
     def cancel(self, request_id: str) -> None:
         """Cancel a request: stop it if it is running, skip it if it is still queued, close it if it is paused."""
@@ -150,6 +238,23 @@ class SessionWorker:
             self._put(lambda: self._discard(request_id, cancelled=True))  # a paused result, if it is the open one
         except SessionBusy:
             pass  # closing: the worker finishes the open result itself
+
+    def check_idle_transaction(self, warn_after_s: float, rollback_after_s: float) -> None:
+        """Warn once per idle stretch of an open transaction, and roll it back once idle too long (0 disables)."""
+        idle = self._tracker.idle_stretch()
+        if idle is None:
+            return
+        if 0 < warn_after_s <= idle.seconds and self._tracker.claim_warning(idle.token):
+            logger.info("Transaction on {} idle for {:.0f} s", self.name, idle.seconds)
+            self._send(MessageEvent(
+                request_id="", severity=MessageSeverity.WARNING,
+                text=f"Transaction idle for {idle.seconds / 60:.0f} min — commit or roll back to release its locks",
+            ))
+        if 0 < rollback_after_s <= idle.seconds:
+            try:
+                self._put(lambda: self._idle_rollback(idle.token, rollback_after_s))
+            except SessionBusy:
+                pass  # closing: closing the connection ends the transaction anyway
 
     def close(self) -> None:
         if not self._begin_close():
@@ -194,6 +299,15 @@ class SessionWorker:
                 self._queued.pop(cmd.request_id, None)
             raise
 
+    def _time_out(self, req: _Request) -> None:  # timer thread
+        with self._state_lock:
+            if not req.timer_armed or self._running_request != req.request_id:
+                return  # paused or over: the timeout no longer applies
+            logger.info("Request {} on {} timed out after {:g} s", req.request_id, self.name, req.timeout_s)
+            req.timed_out = True
+            self._cancel_requested = True
+            self._cancel_connection()
+
     # ---- worker thread ----
 
     def _run(self) -> None:
@@ -206,6 +320,7 @@ class SessionWorker:
             self._opened.set()
             self._run_queued()
             return
+        self._refresh_state()  # cached for replay_state(); start() returning guarantees it exists
         self._opened.set()
         self._run_queued()
         self._discard_open()
@@ -237,21 +352,21 @@ class SessionWorker:
         except Exception:
             logger.exception("Failed to deliver event on {}", self.name)
 
+    def _notify(self, what: str, hook: Callable[..., None], *args: object) -> None:
+        """Call a hook; its failure is logged and never affects execution."""
+        try:
+            hook(*args)
+        except Exception:
+            logger.warning("The {} hook of {} failed", what, self.name, exc_info=True)
+
     def _set_running(self, request_id: str | None) -> bool:
         """Change the running request. Returns whether a cancel had been requested for the previous one."""
         with self._state_lock:
             cancel_requested = self._cancel_requested
             self._running_request = request_id
             self._cancel_requested = False
+            self._tracker.activity(busy=request_id is not None)
         return cancel_requested
-
-    def _transaction_state(self) -> tuple[bool, bool]:
-        """(in_transaction, transaction_failed); both False when the connection cannot tell (e.g. it is gone)."""
-        try:
-            connection = self.connection
-            return connection.in_transaction(), connection.transaction_failed()
-        except Exception:
-            return False, False
 
     def _begin_request(self, request_id: str) -> str | None:
         """Atomically leave the queue and become the running request. Returns why it must not run, if so."""
@@ -263,29 +378,74 @@ class SessionWorker:
                 return "Session closed before the query started"
             self._running_request = request_id
             self._cancel_requested = False
+            self._tracker.activity(busy=True)
         return None
 
     def _execute(self, cmd: ExecuteCommand) -> None:
         self._discard_open()
-        started = time.monotonic()
+        req = _Request(request_id=cmd.request_id, sql=cmd.sql, history=cmd.history, timeout_s=cmd.timeout_s or None)
         skipped = self._begin_request(cmd.request_id)
         self._send(StartedEvent(request_id=cmd.request_id))
         if skipped is not None:
             self._send(MessageEvent(request_id=cmd.request_id, severity=MessageSeverity.WARNING, text=skipped))
-            self._send_finished(cmd.request_id, started, cancelled=True)
+            self._send_finished(cmd.request_id, req.elapsed_ms(), cancelled=True)
             return
-        logger.debug("[{}] execute {}: {}", self.name, cmd.request_id, cmd.sql[:2000])
         try:
-            result = self.connection.run(cmd.sql)
-            self._open_exec = _OpenExecution(request_id=cmd.request_id, result=result, started=started)
-            self._pump(self._open_exec, cmd.page_size)
+            if not self._passes_policy(req, cmd.confirmed):
+                return
+            logger.debug("[{}] execute {}: {}", self.name, cmd.request_id, cmd.sql[:2000])
+            req.ran = True
+            with self._timeout(req):
+                result = self.connection.run(cmd.sql)
+                self._open_exec = _OpenExecution(req=req, result=result)
+                self._pump(self._open_exec, cmd.page_size)
         except StatementError as exc:
-            self._fail(cmd.request_id, started, exc)
+            self._fail(req, exc)
         except Exception as exc:
             logger.exception("Unexpected error executing on {}", self.name)
-            self._fail(cmd.request_id, started, StatementError(f"Internal error: {exc}"))
+            self._fail(req, StatementError(f"Internal error: {exc}"))
         finally:
             self._set_running(None)
+
+    def _passes_policy(self, req: _Request, confirmed: bool) -> bool:
+        """Check the statement before it reaches the connection; when it may not run, end the request here."""
+        decision = self._hooks.check(req.sql, confirmed)
+        req.kind = decision.classification.kind
+        if decision.action == GuardAction.RUN:
+            return True
+        self._set_running(None)  # it never runs: from now on a cancel must not reach the connection
+        if decision.action == GuardAction.BLOCK:
+            logger.info("[{}] blocked {} statement {} (read-only)", self.name, req.kind, req.request_id)
+            self._send(ErrorEvent(
+                request_id=req.request_id, code="read_only",
+                message=f"This connection is read-only: {req.kind} statements are not allowed",
+            ))
+            self._send_finished(req.request_id, req.elapsed_ms())
+        else:
+            logger.info("[{}] {} needs confirmation: {}", self.name, req.request_id, ", ".join(decision.reasons))
+            self._send(ConfirmationRequiredEvent(
+                request_id=req.request_id, reasons=decision.reasons, classification=decision.classification,
+            ))
+            self._send_finished(req.request_id, req.elapsed_ms(), skipped=True)
+        return False
+
+    @contextmanager
+    def _timeout(self, req: _Request) -> Iterator[None]:
+        """Cancel `req` if it is still the running request after `req.timeout_s` (until its first pause or end)."""
+        if not req.timeout_s:
+            yield
+            return
+        timer = threading.Timer(req.timeout_s, self._time_out, args=(req,))
+        timer.daemon = True
+        with self._state_lock:
+            req.timer_armed = True
+        timer.start()
+        try:
+            yield
+        finally:
+            timer.cancel()
+            with self._state_lock:  # a timer already firing must not cancel a later request with the same id
+                req.timer_armed = False
 
     def _fetch_more(self, cmd: FetchMoreCommand) -> None:
         execution = self._open_exec
@@ -294,16 +454,16 @@ class SessionWorker:
         if execution is None or execution.request_id != cmd.request_id:
             self._send(ErrorEvent(request_id=cmd.request_id, message="No open result to fetch from", code="no_open_result"))
             # Every request ends with exactly one `finished`; without it a client waiting on this request would hang.
-            self._send_finished(cmd.request_id, None, cancelled=False)
+            self._send_finished(cmd.request_id, 0)
             return
         self._set_running(cmd.request_id)
         try:
             self._pump(execution, cmd.count)
         except StatementError as exc:
-            self._fail(cmd.request_id, execution.started, exc)
+            self._fail(execution.req, exc)
         except Exception as exc:
             logger.exception("Unexpected error fetching on {}", self.name)
-            self._fail(cmd.request_id, execution.started, StatementError(f"Internal error: {exc}"))
+            self._fail(execution.req, StatementError(f"Internal error: {exc}"))
         finally:
             self._set_running(None)
 
@@ -312,11 +472,14 @@ class SessionWorker:
         if execution is None or execution.request_id != request_id:
             return
         if cancelled:
-            self._send(MessageEvent(request_id=request_id, severity=MessageSeverity.WARNING, text="Query cancelled"))
+            text = self._cancel_text(execution.req, "Query cancelled")
+            self._send(MessageEvent(request_id=request_id, severity=MessageSeverity.WARNING, text=text))
         self._finish(execution, cancelled=cancelled)
 
     def _pause(self, ex: _OpenExecution) -> None:
         """A page is full and more rows exist: pause, unless a cancel arrived that the driver had nothing to stop."""
+        if ex.req.first_page_ms is None:
+            ex.req.first_page_ms = ex.req.elapsed_ms()
         # Leave the running state before any event: a cancel from now on discards instead of interrupting.
         if self._set_running(None):
             self._discard(ex.request_id, cancelled=True)
@@ -338,6 +501,7 @@ class SessionWorker:
             if columns is None:
                 affected = result.affected_rows()
                 if affected is not None:
+                    ex.req.rows += affected
                     self._send(AffectedEvent(request_id=ex.request_id, index=ex.index, rows=affected))
             else:
                 if not ex.columns_sent:
@@ -352,6 +516,7 @@ class SessionWorker:
                         cells = [encode_row(r) for r in rows]
                         self._send(RowsEvent(request_id=ex.request_id, index=ex.index, rows=cells))
                         ex.sent += len(rows)
+                        ex.req.rows += len(rows)
                         budget -= len(rows)
                     self._send_messages(ex)
                     if len(rows) < want:
@@ -372,16 +537,123 @@ class SessionWorker:
             ex.peeked = []
         self._finish(ex)
 
-    def _send_finished(self, request_id: str, started: float | None, cancelled: bool) -> None:
-        """The one `finished` every request ends with; `started=None` for requests that never ran."""
-        in_transaction, transaction_failed = self._transaction_state()
+    def _transaction_command(self, cmd: TransactionCommand) -> None:
+        self._discard_open()
+        started = time.monotonic()
+        self._send(StartedEvent(request_id=cmd.request_id))
+        if self._closed:
+            text = "Session closed before the command ran"
+            self._send(MessageEvent(request_id=cmd.request_id, severity=MessageSeverity.WARNING, text=text))
+            self._send_finished(cmd.request_id, 0, cancelled=True)
+            return
+        try:
+            self._run_transaction_command(cmd)
+        except StatementError as exc:
+            logger.info("[{}] {} failed ({})", self.name, cmd.type, exc.code)
+            self._send(ErrorEvent(request_id=cmd.request_id, message=exc.message, code=exc.code, position=exc.position))
+        except Exception as exc:
+            logger.exception("Unexpected error in {} on {}", cmd.type, self.name)
+            self._send(ErrorEvent(request_id=cmd.request_id, message=f"Internal error: {exc}"))
+        self._send_finished(cmd.request_id, int((time.monotonic() - started) * 1000))
+
+    def _run_transaction_command(self, cmd: TransactionCommand) -> None:
+        connection = self.connection
+        match cmd:
+            case CommitCommand():
+                failed = connection.transaction_failed()  # PostgreSQL: COMMIT of an aborted transaction rolls back
+                connection.commit()
+                if failed:
+                    logger.info("[{}] commit rolled back an aborted transaction", self.name)
+                    self._send(MessageEvent(
+                        request_id=cmd.request_id, severity=MessageSeverity.WARNING, text=_FAILED_COMMIT,
+                    ))
+                    return
+                logger.info("[{}] commit", self.name)
+            case RollbackCommand():
+                connection.rollback()
+                logger.info("[{}] rollback", self.name)
+            case SetAutocommitCommand():
+                connection.set_autocommit(cmd.enabled)
+                logger.info("[{}] auto-commit {}", self.name, "on" if cmd.enabled else "off")
+
+    def _idle_rollback(self, token: int, after_s: float) -> None:
+        # Compare before discarding: finishing a paused result is activity too, but the rollback must still happen.
+        if self._closed or not self._tracker.unchanged_since(token):
+            return  # something ran meanwhile (or the session is closing): the transaction is not idle any more
+        self._discard_open()  # a paused result holds the transaction open
+        try:
+            self.connection.rollback()
+        except StatementError as exc:
+            logger.warning("Idle rollback failed on {}: {}", self.name, exc.message)
+            return
+        logger.info("Rolled back an idle transaction on {}", self.name)
+        self._refresh_state()
+        self._send(MessageEvent(
+            request_id="", severity=MessageSeverity.WARNING,
+            text=f"Rolled back the transaction after {after_s / 60:g} min idle",
+        ))
+
+    @staticmethod
+    def _cancel_text(req: _Request, default: str) -> str:
+        return f"Timed out after {req.timeout_s:g} s" if req.timed_out else default
+
+    def _connection_state(self) -> tuple[bool, bool, bool]:
+        """(autocommit, in_transaction, transaction_failed); outside any transaction when the connection cannot tell
+        (e.g. it is gone)."""
+        try:
+            connection = self.connection
+            # bool(): building the state must never fail, or the request could not send its `finished`
+            autocommit, in_transaction = bool(connection.autocommit()), bool(connection.in_transaction())
+            return autocommit, in_transaction, bool(connection.transaction_failed())
+        except Exception as exc:
+            logger.debug("Session state of {} unavailable: {}", self.name, exc)
+            last = self._tracker.snapshot()
+            return (last.autocommit if last is not None else True), False, False
+
+    def _refresh_state(self, began_at: datetime | None = None, ddl_done: bool = False) -> SessionStateEvent:
+        """Recompute and send `session_state`; report DDL once other connections can see it (no open transaction)."""
+        autocommit, in_transaction, failed = self._connection_state()
+        self._ddl_pending = self._ddl_pending or ddl_done
+        if self._ddl_pending and not in_transaction:
+            self._ddl_pending = False
+            self._notify("schema change", self._hooks.on_schema_change)
+        with self._state_send_lock:
+            state = self._tracker.update(autocommit, in_transaction, failed, began_at)
+            self._send(state)
+        return state
+
+    def _send_finished(
+        self, request_id: str, elapsed_ms: int, *, cancelled: bool = False, timed_out: bool = False,
+        skipped: bool = False, began_at: datetime | None = None, ddl_done: bool = False,
+    ) -> None:
+        """The one `finished` every request ends with, right after the `session_state` it reports."""
+        state = self._refresh_state(began_at, ddl_done)
         self._send(FinishedEvent(
             request_id=request_id,
-            elapsed_ms=0 if started is None else int((time.monotonic() - started) * 1000),
-            in_transaction=in_transaction,
-            transaction_failed=transaction_failed,
+            elapsed_ms=elapsed_ms,
+            in_transaction=state.in_transaction,
+            transaction_failed=state.transaction_failed,
             cancelled=cancelled,
+            timed_out=timed_out,
+            skipped=skipped,
         ))
+
+    def _complete(self, req: _Request, *, error: StatementError | None = None, cancelled: bool = False) -> None:
+        """End an execute: history record, then session state (+ schema invalidation), then `finished` — so whoever
+        has seen `finished` can rely on all three."""
+        timed_out = cancelled and req.timed_out
+        if req.history and req.ran:
+            status = "error" if error else "timeout" if timed_out else "cancelled" if cancelled else "ok"
+            self._notify("history", self._hooks.on_record, ExecutionRecord(
+                request_id=req.request_id, sql=req.sql, started_at=req.started_at,
+                elapsed_ms=req.first_page_ms if req.first_page_ms is not None else req.elapsed_ms(),
+                rows=req.rows, status=status, error=error.message if error else None,
+            ))
+        ddl_done = error is None and not cancelled and req.kind == StatementKind.DDL
+        self._send_finished(
+            req.request_id, req.elapsed_ms(), cancelled=cancelled, timed_out=timed_out, began_at=req.started_at,
+            ddl_done=ddl_done,
+        )
 
     def _finish(self, ex: _OpenExecution, cancelled: bool = False) -> None:
         self._set_running(None)  # before `finished` goes out: from then on a cancel must not reach the connection
@@ -390,9 +662,9 @@ class SessionWorker:
             ex.result.close()
         except Exception as exc:
             logger.warning("Error closing result on {}: {}", self.name, exc)
-        self._send_finished(ex.request_id, ex.started, cancelled)
+        self._complete(ex.req, cancelled=cancelled)
 
-    def _fail(self, request_id: str, started: float, exc: StatementError) -> None:
+    def _fail(self, req: _Request, exc: StatementError) -> None:
         self._set_running(None)
         if self._open_exec is not None:
             try:
@@ -402,7 +674,9 @@ class SessionWorker:
             self._open_exec = None
         cancelled = isinstance(exc, StatementCancelled)
         if cancelled:
-            self._send(MessageEvent(request_id=request_id, severity=MessageSeverity.WARNING, text=exc.message))
+            text = self._cancel_text(req, exc.message)
+            self._send(MessageEvent(request_id=req.request_id, severity=MessageSeverity.WARNING, text=text))
+            self._complete(req, cancelled=True)
         else:
-            self._send(ErrorEvent(request_id=request_id, message=exc.message, code=exc.code, position=exc.position))
-        self._send_finished(request_id, started, cancelled)
+            self._send(ErrorEvent(request_id=req.request_id, message=exc.message, code=exc.code, position=exc.position))
+            self._complete(req, error=exc)

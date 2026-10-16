@@ -30,6 +30,13 @@ def client(tmp_path):
         yield test_client
 
 
+def receive(ws):
+    """The next event that is not a `session_state` (sent on attach and right before every `finished`)."""
+    while (event := ws.receive_json())["type"] == "session_state":
+        pass
+    return event
+
+
 @pytest.fixture
 def sqlite_profile_id(client, tmp_path):
     db = tmp_path / "api.db"
@@ -97,13 +104,19 @@ def test_metadata_and_session_over_websocket(client, sqlite_profile_id):
             events.append(ws.receive_json())
             if events[-1]["type"] == "finished":
                 break
-        assert [e["type"] for e in events] == ["started", "result_set", "rows", "result_set_end", "finished"]
-        assert events[2]["rows"] == [[1, "a"], [2, "b"], [3, "c"]]
+        assert [e["type"] for e in events] == [
+            "session_state", "started", "result_set", "rows", "result_set_end", "session_state", "finished",
+        ]
+        assert events[0] == events[5] == {
+            "type": "session_state", "autocommit": True, "in_transaction": False, "transaction_failed": False,
+            "transaction_started_at": None, "idle_seconds": None,
+        }
+        assert events[3]["rows"] == [[1, "a"], [2, "b"], [3, "c"]]
         ws.send_json({"type": "bogus", "request_id": "x"})
         assert ws.receive_json()["code"] == "invalid_command"
         assert ws.receive_json() == {
             "type": "finished", "request_id": "x", "elapsed_ms": 0, "in_transaction": False,
-            "transaction_failed": False, "cancelled": False,
+            "transaction_failed": False, "cancelled": False, "timed_out": False, "skipped": False,
         }
     assert client.delete(f"/sessions/{sid}", headers=AUTH).status_code == 204
 
@@ -149,9 +162,9 @@ def test_invalid_command_without_a_request_id_gets_an_error_but_no_finished(clie
     sid = client.post("/sessions", json={"profile_id": sqlite_profile_id}, headers=AUTH).json()["session_id"]
     with client.websocket_connect(f"{WS_BASE}/sessions/{sid}/ws?token={TOKEN}") as ws:
         ws.send_json({"type": "bogus"})
-        assert ws.receive_json()["code"] == "invalid_command"
+        assert receive(ws)["code"] == "invalid_command"
         ws.send_json({"type": "execute", "request_id": "q", "sql": "SELECT 1"})
-        assert ws.receive_json()["type"] == "started"  # nothing was queued between the error and this request
+        assert receive(ws)["type"] == "started"  # nothing was queued between the error and this request
 
 
 def test_command_rejected_by_a_closed_session_gets_an_error_and_finished(client, sqlite_profile_id):
@@ -159,8 +172,8 @@ def test_command_rejected_by_a_closed_session_gets_an_error_and_finished(client,
     with client.websocket_connect(f"{WS_BASE}/sessions/{sid}/ws?token={TOKEN}") as ws:
         client.app.state.container.sessions.worker(sid).close()  # the socket stays attached to a dead worker
         ws.send_json({"type": "execute", "request_id": "late", "sql": "SELECT 1"})
-        error = ws.receive_json()
-        finished = ws.receive_json()
+        error = receive(ws)
+        finished = receive(ws)
     assert error["type"] == "error" and error["request_id"] == "late" and error["code"] == "session_busy"
     assert finished["type"] == "finished" and finished["request_id"] == "late" and finished["cancelled"] is False
 
@@ -195,7 +208,7 @@ def test_websocket_cancel_stops_a_running_statement(client, sqlite_profile_id):
     with client.websocket_connect(f"{WS_BASE}/sessions/{sid}/ws?token={TOKEN}") as ws:
         ws.send_json({"type": "cancel", "request_id": "nothing-running"})  # unknown request: ignored, not fatal
         ws.send_json({"type": "execute", "request_id": "slow", "sql": endless})
-        assert ws.receive_json()["type"] == "started"
+        assert receive(ws)["type"] == "started"
         ws.send_json({"type": "cancel", "request_id": "slow"})
         finished = None
         while finished is None:

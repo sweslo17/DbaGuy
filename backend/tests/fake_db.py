@@ -43,7 +43,8 @@ class FakeResult(StatementResult):
 
 class FakeConnection(DatabaseConnection):
     """`run()` words: `rows N` returns N rows; `block` waits until cancel() (then raises StatementCancelled);
-    `fail MSG` raises StatementError; `begin` opens a transaction; anything else returns an empty result."""
+    `fail MSG` raises StatementError (and aborts an open transaction, like PostgreSQL); `begin` opens a transaction;
+    anything else returns an empty result."""
 
     def __init__(self) -> None:
         self.runs: list[str] = []
@@ -55,6 +56,7 @@ class FakeConnection(DatabaseConnection):
         self.auto = True
         self.commits = 0
         self.rollbacks = 0
+        self.failed = False  # the open transaction is aborted (set by `fail` inside a transaction)
 
     def server_info(self) -> ServerInfo:
         return ServerInfo(engine=Engine.SQLITE, version="fake")
@@ -82,6 +84,7 @@ class FakeConnection(DatabaseConnection):
             self._unblock.clear()  # one fake connection can serve several `block` statements in a test
             raise StatementCancelled()
         if word == "fail":
+            self.failed = self.tx
             raise StatementError(arg or "boom", code="42000")
         if word == "begin":
             self.tx = True
@@ -89,6 +92,9 @@ class FakeConnection(DatabaseConnection):
 
     def in_transaction(self) -> bool:
         return self.tx
+
+    def transaction_failed(self) -> bool:
+        return self.tx and self.failed
 
     def autocommit(self) -> bool:
         return self.auto
@@ -99,14 +105,19 @@ class FakeConnection(DatabaseConnection):
         self.auto = enabled
 
     def commit(self) -> None:
-        if self.tx:  # like the real adapters, nothing to do (and nothing counted) without an open transaction
-            self.commits += 1
-            self.tx = False
+        if not self.tx:  # like the real adapters, nothing to do (and nothing counted) without an open transaction
+            return
+        if self.failed:  # like PostgreSQL: COMMIT of an aborted transaction silently rolls it back
+            self.rollback()
+            return
+        self.commits += 1
+        self.tx = False
 
     def rollback(self) -> None:
         if self.tx:
             self.rollbacks += 1
             self.tx = False
+            self.failed = False
 
     def cancel(self) -> None:
         self.cancel_calls += 1

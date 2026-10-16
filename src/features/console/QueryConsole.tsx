@@ -52,6 +52,7 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
     inTransaction.current = false; // a fresh session starts outside any transaction
     if (!socket) return;
     return socket.subscribe((event) => {
+      if (event.type === "session_state") return; // session-wide, not part of a request; this console ignores it
       if (event.type === "finished") inTransaction.current = event.in_transaction;
       setExecution((prev) => (prev && event.request_id === prev.requestId ? applyEvent(prev, event) : prev));
     });
@@ -89,7 +90,7 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
     setOrigin(hasSelection ? originOf(sql, el.selectionStart) : WHOLE_TEXT);
     const requestId = crypto.randomUUID();
     setExecution(newExecution(requestId));
-    socket.send({ type: "execute", request_id: requestId, sql: text, page_size: PAGE });
+    socket.send({ type: "execute", request_id: requestId, sql: text, page_size: PAGE, confirmed: false, history: true });
   };
   const cancel = () => {
     if (execution) socket?.send({ type: "cancel", request_id: execution.requestId });

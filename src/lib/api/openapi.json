@@ -1003,6 +1003,26 @@
         ],
         "title": "CancelCommand"
       },
+      "Classification": {
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/StatementKind"
+          },
+          "dangerous_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Dangerous Reasons",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "title": "Classification"
+      },
       "ColumnCategory": {
         "type": "string",
         "enum": [
@@ -1087,6 +1107,57 @@
           "category"
         ],
         "title": "ColumnMeta"
+      },
+      "CommitCommand": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "commit",
+            "title": "Type",
+            "default": "commit"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id"
+        ],
+        "title": "CommitCommand"
+      },
+      "ConfirmationRequiredEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "confirmation_required",
+            "title": "Type",
+            "default": "confirmation_required"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Reasons"
+          },
+          "classification": {
+            "$ref": "#/components/schemas/Classification"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "reasons",
+          "classification"
+        ],
+        "title": "ConfirmationRequiredEvent",
+        "description": "The statement was not run: resend it with `confirmed=true` once the user agreed. `finished(skipped)` follows."
       },
       "ConnectionTestRequest": {
         "properties": {
@@ -1326,6 +1397,29 @@
             "minimum": 1.0,
             "title": "Page Size",
             "default": 500
+          },
+          "confirmed": {
+            "type": "boolean",
+            "title": "Confirmed",
+            "default": false
+          },
+          "timeout_s": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 86400.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout S"
+          },
+          "history": {
+            "type": "boolean",
+            "title": "History",
+            "default": true
           }
         },
         "type": "object",
@@ -1350,6 +1444,15 @@
               },
               {
                 "$ref": "#/components/schemas/DiscardCommand"
+              },
+              {
+                "$ref": "#/components/schemas/CommitCommand"
+              },
+              {
+                "$ref": "#/components/schemas/RollbackCommand"
+              },
+              {
+                "$ref": "#/components/schemas/SetAutocommitCommand"
               }
             ],
             "title": "Command",
@@ -1357,9 +1460,12 @@
               "propertyName": "type",
               "mapping": {
                 "cancel": "#/components/schemas/CancelCommand",
+                "commit": "#/components/schemas/CommitCommand",
                 "discard": "#/components/schemas/DiscardCommand",
                 "execute": "#/components/schemas/ExecuteCommand",
-                "fetch_more": "#/components/schemas/FetchMoreCommand"
+                "fetch_more": "#/components/schemas/FetchMoreCommand",
+                "rollback": "#/components/schemas/RollbackCommand",
+                "set_autocommit": "#/components/schemas/SetAutocommitCommand"
               }
             }
           },
@@ -1387,6 +1493,12 @@
                 "$ref": "#/components/schemas/ErrorEvent"
               },
               {
+                "$ref": "#/components/schemas/ConfirmationRequiredEvent"
+              },
+              {
+                "$ref": "#/components/schemas/SessionStateEvent"
+              },
+              {
                 "$ref": "#/components/schemas/FinishedEvent"
               }
             ],
@@ -1395,12 +1507,14 @@
               "propertyName": "type",
               "mapping": {
                 "affected": "#/components/schemas/AffectedEvent",
+                "confirmation_required": "#/components/schemas/ConfirmationRequiredEvent",
                 "error": "#/components/schemas/ErrorEvent",
                 "finished": "#/components/schemas/FinishedEvent",
                 "message": "#/components/schemas/MessageEvent",
                 "result_set": "#/components/schemas/ResultSetEvent",
                 "result_set_end": "#/components/schemas/ResultSetEndEvent",
                 "rows": "#/components/schemas/RowsEvent",
+                "session_state": "#/components/schemas/SessionStateEvent",
                 "started": "#/components/schemas/StartedEvent"
               }
             }
@@ -1468,6 +1582,16 @@
           "cancelled": {
             "type": "boolean",
             "title": "Cancelled",
+            "default": false
+          },
+          "timed_out": {
+            "type": "boolean",
+            "title": "Timed Out",
+            "default": false
+          },
+          "skipped": {
+            "type": "boolean",
+            "title": "Skipped",
             "default": false
           }
         },
@@ -1970,6 +2094,25 @@
         ],
         "title": "ResultSetEvent"
       },
+      "RollbackCommand": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "rollback",
+            "title": "Type",
+            "default": "rollback"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id"
+        ],
+        "title": "RollbackCommand"
+      },
       "RowsEvent": {
         "properties": {
           "type": {
@@ -2371,6 +2514,83 @@
         ],
         "title": "SessionInfo"
       },
+      "SessionStateEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "session_state",
+            "title": "Type",
+            "default": "session_state"
+          },
+          "autocommit": {
+            "type": "boolean",
+            "title": "Autocommit"
+          },
+          "in_transaction": {
+            "type": "boolean",
+            "title": "In Transaction"
+          },
+          "transaction_failed": {
+            "type": "boolean",
+            "title": "Transaction Failed"
+          },
+          "transaction_started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transaction Started At"
+          },
+          "idle_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idle Seconds"
+          }
+        },
+        "type": "object",
+        "required": [
+          "autocommit",
+          "in_transaction",
+          "transaction_failed"
+        ],
+        "title": "SessionStateEvent",
+        "description": "The session's transaction state: sent right before every `finished`, on attach and after an idle rollback."
+      },
+      "SetAutocommitCommand": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "set_autocommit",
+            "title": "Type",
+            "default": "set_autocommit"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "enabled"
+        ],
+        "title": "SetAutocommitCommand"
+      },
       "SqliteProfile": {
         "properties": {
           "name": {
@@ -2640,6 +2860,18 @@
           "request_id"
         ],
         "title": "StartedEvent"
+      },
+      "StatementKind": {
+        "type": "string",
+        "enum": [
+          "read",
+          "write",
+          "ddl",
+          "transaction",
+          "session",
+          "unknown"
+        ],
+        "title": "StatementKind"
       },
       "ValidationError": {
         "properties": {
