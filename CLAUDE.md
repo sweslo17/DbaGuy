@@ -53,7 +53,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
 | 啟動測試 DB | `docker compose -f dev/docker-compose.yml up -d --build --wait` |
 | Backend 測試 | `cd backend && .venv/bin/pytest -q` |
 | 開發（Tauri） | `scripts/dev.sh` |
-| 開發（瀏覽器，給 Claude 用內建瀏覽器驗證） | `scripts/dev.sh --web` 後開 `http://localhost:1420` |
+| 開發（瀏覽器，給 Claude 用內建瀏覽器驗證） | `scripts/dev.sh --web` 後開 `http://localhost:1420`（資料放 `dev/data/`，不碰正式的 app 資料） |
 | 重新產生 API 型別 | `npm run gen:api` |
 | 型別檢查／build | `npm run typecheck` / `npm run build` |
 | 打包 `.app` | `npm run build:app` |
@@ -89,7 +89,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
 | # | 子專案 | 狀態 |
 |---|---|---|
 | ① | 地基：Tauri + sidecar、adapter 介面、連線管理、PG + SQLite 物件瀏覽 | 完成 |
-| ② | 核心查詢流程：編輯器、結果 grid、執行範圍、取消、history、安全 | 進行中：02a 後端完成（[followups](docs/superpowers/notes/2026-10-16-02a-query-backend-followups.md)）；02b grid、02c 編輯器待做 |
+| ② | 核心查詢流程：編輯器、結果 grid、執行範圍、取消、history、安全 | 進行中：02a 後端、02b grid 與資料完成（[02a](docs/superpowers/notes/2026-10-16-02a-query-backend-followups.md)、[02b](docs/superpowers/notes/2026-10-16-02b-grid-and-data-followups.md) followups）；02c 編輯器待做 |
 | ③ | MySQL + MSSQL adapter | 未開始 |
 | ④ | Couchbase 一級支援 | 未開始 |
 | ⑤ | Grid 內編輯（暫存修改、預覽 DML、一次 commit） | 未開始 |
