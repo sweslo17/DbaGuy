@@ -8,6 +8,7 @@ import { ApiError, errorMessage } from "@/lib/api/client";
 import { isDialogOpen } from "@/lib/dialogs";
 import { isImeKeyEvent } from "@/lib/ime";
 import { baseName } from "@/lib/scriptPaths";
+import { isCommandKey } from "@/lib/shortcuts";
 import { reportTabStatus } from "@/stores/tabStatus";
 import { useWorkspace, type QueryTabState } from "@/stores/workspace";
 import type { CodeEditorHandle } from "../editor/CodeEditor";
@@ -306,10 +307,11 @@ export function useScriptBinding({
     if (!active) return;
     const onKey = (e: KeyboardEvent) => {
       if (isImeKeyEvent(e) || e.defaultPrevented) return;
-      if (!e.metaKey || e.ctrlKey || e.altKey || e.key.toLowerCase() !== "s") return;
+      const saveAs = isCommandKey(e, "s", { shift: true });
+      if (!saveAs && !isCommandKey(e, "s")) return;
       e.preventDefault();
       if (isDialogOpen()) return;
-      if (e.shiftKey) commands.current.saveAs();
+      if (saveAs) commands.current.saveAs();
       else commands.current.save();
     };
     window.addEventListener("keydown", onKey);

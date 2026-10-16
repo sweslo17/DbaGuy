@@ -64,8 +64,8 @@ function CommandList({ choose }: { choose: Choose }) {
 
 /**
  * The command palette and quick open (spec §4.10), in the app's one dialog look; the app's ⌘⇧P and ⌘P open them. A
- * chosen command runs once the palette has closed and the focus is back where it was, so the tab's own handler finds
- * its editor focused and any dialog it opens is the only one.
+ * chosen command runs once the palette has closed, so any dialog it opens is the only one; then the focus goes back
+ * where it was, unless the command switched tabs.
  */
 export function PaletteHost() {
   const mode = usePalette((s) => s.mode);
@@ -80,11 +80,17 @@ export function PaletteHost() {
     event.preventDefault();
     const run = pending.current;
     pending.current = null;
-    // A dialog open now replaced the palette: that one keeps the focus. The palette itself counts too, which absorbs the
-    // spurious call StrictMode makes while it is still open (its double mount unmounts the focus scope).
-    const { returnFocus } = usePalette.getState();
-    if (!isDialogOpen() && returnFocus instanceof HTMLElement && returnFocus.isConnected) returnFocus.focus();
+    const before = useWorkspace.getState().activeTabId;
     run?.();
+    // The command switched tabs (quick open, New query): the focus is left alone. A query tab focuses its own editor
+    // once shown, and the workspace blurs whatever the hidden tab still held, so keys never reach a hidden editor.
+    if (useWorkspace.getState().activeTabId !== before) return;
+    // A dialog open now keeps the focus: the palette itself still counts while StrictMode's double mount makes a
+    // spurious call. A dialog the command opens mounts a render later; it takes the focus from the element restored
+    // here and gives it back on close.
+    if (isDialogOpen()) return;
+    const { returnFocus } = usePalette.getState();
+    if (returnFocus instanceof HTMLElement && returnFocus.isConnected) returnFocus.focus();
   };
 
   return (

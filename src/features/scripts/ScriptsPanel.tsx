@@ -99,14 +99,16 @@ function NameInput({
       onChange={(e) => setValue(e.target.value)}
       onClick={(e) => e.stopPropagation()}
       onDoubleClick={(e) => e.stopPropagation()}
+      // Only the keys handled here stop: ⌘S, ⌘W, ⌘P… still reach the window (the tree ignores keys while a name is typed).
       onKeyDown={(e) => {
-        e.stopPropagation(); // not the tree's keys
         if (isImeKeyEvent(e)) return;
         if (e.key === "Enter") {
           e.preventDefault();
+          e.stopPropagation();
           void commit().then((ok) => !ok && input.current?.focus());
         } else if (e.key === "Escape") {
           e.preventDefault();
+          e.stopPropagation();
           cancel();
         }
       }}

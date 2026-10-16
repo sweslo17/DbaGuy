@@ -1,5 +1,5 @@
 import { Dialog as RadixDialog } from "radix-ui";
-import { useRef, type ReactNode } from "react";
+import { useLayoutEffect, useRef, type ReactNode } from "react";
 import { cn } from "@/lib/cn";
 import { isDialogOpen, PALETTE_ATTRIBUTE } from "@/lib/dialogs";
 import { isImeKeyEvent } from "@/lib/ime";
@@ -32,8 +32,13 @@ export function Dialog({
   palette?: boolean;
 }) {
   const content = useRef<HTMLDivElement>(null);
-  /** What had the focus when the dialog took it; it gets it back on close (ruling R-02c-18). */
+  /** What had the focus when the dialog opened; it gets it back on close (ruling R-02c-18). */
   const opener = useRef<Element | null>(null);
+  // Recorded as `open` turns true, before anything inside can take the focus: Radix's Portal mounts the content a commit
+  // later, so not even a child's `autoFocus` (the close guard's Cancel, Unlock's field) has run yet.
+  useLayoutEffect(() => {
+    if (open) opener.current = document.activeElement;
+  }, [open]);
   return (
     <RadixDialog.Root open={open} onOpenChange={onOpenChange}>
       <RadixDialog.Portal>
@@ -48,9 +53,7 @@ export function Dialog({
           onOpenAutoFocus={(e) => {
             e.preventDefault();
             const dialog = content.current;
-            if (!dialog || dialog.contains(document.activeElement)) return;
-            opener.current = document.activeElement;
-            dialog.focus({ preventScroll: true });
+            if (dialog && !dialog.contains(document.activeElement)) dialog.focus({ preventScroll: true });
           }}
           // Radix would focus the trigger, and these dialogs have none: the focus would be lost on the page.
           onCloseAutoFocus={(e) => {

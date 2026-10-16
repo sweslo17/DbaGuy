@@ -1,9 +1,11 @@
 import { Loader2, Plus, X } from "lucide-react";
-import { useEffect, useMemo } from "react";
+import { useEffect, useLayoutEffect, useMemo } from "react";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import type { Profile } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
+import { isDialogOpen } from "@/lib/dialogs";
 import { isImeKeyEvent } from "@/lib/ime";
+import { isCommandKey } from "@/lib/shortcuts";
 import { useTabStatus } from "@/stores/tabStatus";
 import { useWorkspace, type Tab } from "@/stores/workspace";
 import { useProfiles } from "../connections/hooks";
@@ -13,6 +15,9 @@ import { QueryTab } from "../query/QueryTab";
 import { relationOf } from "../table-data/filterValue";
 import { TableDataTab } from "../table-data/TableDataTab";
 import { isClosePending, requestCloseTab } from "./closeGuards";
+
+/** The attribute that marks a tab's content with its tab id. */
+const TAB_PANEL = "data-tab-panel";
 
 /** A tab's content: a query tab's editor, a relation's table data, or any other object's detail. */
 function TabContent({ tab, active }: { tab: Tab; active: boolean }) {
@@ -101,15 +106,24 @@ export function Workspace() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (isImeKeyEvent(e)) return;
-      if (e.metaKey && e.key === "w" && activeTabId) {
-        e.preventDefault();
-        // A close is being asked about (its dialog is open, maybe for another tab): never queue a second one behind it.
-        if (!isClosePending()) void requestCloseTab(activeTabId);
-      }
+      if (isImeKeyEvent(e) || !isCommandKey(e, "w")) return;
+      e.preventDefault();
+      // Never the tab behind a dialog, the palette included (ruling R-02c-19), and never a second close queued behind
+      // one being asked about (its dialog may be another tab's).
+      if (!activeTabId || isDialogOpen() || isClosePending()) return;
+      void requestCloseTab(activeTabId);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+  }, [activeTabId]);
+
+  // The tab just hidden may still hold the focus (e.g. a palette command switched tabs): keys must never reach a hidden
+  // editor. A query tab focuses its own editor once it is shown.
+  useLayoutEffect(() => {
+    const focused = document.activeElement;
+    if (!(focused instanceof HTMLElement)) return;
+    const panel = focused.closest(`[${TAB_PANEL}]`);
+    if (panel && panel.getAttribute(TAB_PANEL) !== activeTabId) focused.blur();
   }, [activeTabId]);
 
   // A new query tab starts on the connection selected in the explorer.
@@ -142,7 +156,7 @@ export function Workspace() {
         {/* Tabs stay mounted while hidden so their sessions and editors keep their state; closing a tab unmounts it.
             A tab whose content throws shows the error in its place; the other tabs carry on. */}
         {tabs.map((tab) => (
-          <div key={tab.id} className={cn("h-full", tab.id !== activeTabId && "hidden")}>
+          <div key={tab.id} data-tab-panel={tab.id} className={cn("h-full", tab.id !== activeTabId && "hidden")}>
             <ErrorBoundary name={`Tab ${tab.title}`} title="This tab hit an error" recover="retry">
               <TabContent tab={tab} active={tab.id === activeTabId} />
             </ErrorBoundary>

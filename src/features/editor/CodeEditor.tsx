@@ -107,11 +107,15 @@ export function CodeEditor({
     viewRef.current = view;
     applied.current = { options: init.options, extensions: init.extensions };
     return () => {
-      // Read before anything is torn down: whatever order React unmounts in, the content is handed over.
-      const { anchor, head } = view.state.selection.main;
-      latest.current.onUnmount?.({ text: view.state.doc.toString(), selection: { anchor, head } });
-      view.destroy();
-      if (viewRef.current === view) viewRef.current = null;
+      try {
+        // Read before anything is torn down: whatever order React unmounts in, the content is handed over.
+        const { anchor, head } = view.state.selection.main;
+        latest.current.onUnmount?.({ text: view.state.doc.toString(), selection: { anchor, head } });
+      } finally {
+        // Even if the receiver throws: the view and its listeners never outlive the component.
+        view.destroy();
+        if (viewRef.current === view) viewRef.current = null;
+      }
     };
   }, []);
 
