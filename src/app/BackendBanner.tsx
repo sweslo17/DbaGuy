@@ -2,6 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/Button";
+import { saveWorkspaceNow } from "@/features/workspace/workspaceSync";
 import { errorMessage } from "@/lib/api/client";
 import { isTauriRuntime, restartBackend } from "@/lib/backend";
 
@@ -27,6 +28,7 @@ export function BackendBanner() {
     setError(null);
     try {
       await restartBackend();
+      saveWorkspaceNow(); // new port and token: what was typed while it was down is saved at once
       setExited(false);
       await qc.invalidateQueries();
     } catch (e) {

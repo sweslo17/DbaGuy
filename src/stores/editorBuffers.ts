@@ -57,3 +57,10 @@ export function onEdited(listener: () => void): () => void {
   editListeners.add(listener);
   return () => editListeners.delete(listener);
 }
+
+// Dev only: the mounted editors' readers live here for the app's lifetime. A hot update would hand the writer an empty
+// copy (it would save stale text), so the page reloads instead; the writer's flush on unload keeps the latest text.
+if (import.meta.hot) {
+  import.meta.hot.accept();
+  import.meta.hot.dispose(() => window.location.reload());
+}

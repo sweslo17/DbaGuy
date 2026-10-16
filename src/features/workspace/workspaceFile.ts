@@ -9,10 +9,18 @@ import type { QueryTabState, Tab, WorkspaceSnapshot } from "@/stores/workspace";
 
 const WORKSPACE_VERSION = 1;
 
-/** Lone UTF-16 surrogates (a broken paste): the backend cannot write them as UTF-8, which would fail every save. */
+/**
+ * Lone UTF-16 surrogates (a broken paste, an odd object name): the backend cannot write them as UTF-8, which would
+ * fail every save.
+ */
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
 
-const wellFormed = (text: string) => text.replace(LONE_SURROGATE, "�");
+const wellFormed = (text: string) => text.replace(LONE_SURROGATE, "\uFFFD");
+
+/** The JSON `PUT /workspace` sends: every string well-formed (a title, a name or the text alike). */
+export function workspaceJson(file: SavedWorkspace): string {
+  return JSON.stringify(file, (_key, value: unknown) => (typeof value === "string" ? wellFormed(value) : value));
+}
 
 /** The tab's selection as last known: its editor's, else what it was restored with. */
 function selectionOf(tab: QueryTabState, buffer: EditorBuffer | null): TextSelection | null {
@@ -34,7 +42,7 @@ function savedTab(tab: Tab, readBuffer: (tabId: string) => EditorBuffer | null):
     profile_id: tab.profileId,
     database: tab.database,
     script_path: tab.scriptPath,
-    buffer: wellFormed(buffer?.text ?? tab.initialText),
+    buffer: buffer?.text ?? tab.initialText,
     cursor: selection?.head ?? null,
     // Only a real range: a bare cursor is `cursor`.
     selection: selection && selection.anchor !== selection.head ? selection : null,
