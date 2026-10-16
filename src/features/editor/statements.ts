@@ -6,8 +6,9 @@ import type { Dialect } from "@/lib/api/types";
 /*
  * The statements of the document, as the backend splitter sees them (`POST /sql/split`: `$$` bodies, BEGIN ATOMIC and
  * trigger bodies are handled there). The split is cached in a state field and mapped through every edit, so the
- * statement under the cursor is known at once; a fresh split replaces it 150 ms after typing stops. Offsets are UTF-16
- * code units on both sides, which is what JS strings and CodeMirror positions use.
+ * statement under the cursor is known at once; a fresh split replaces it once typing stops (150 ms, longer for a
+ * script that takes long to split). Offsets are UTF-16 code units on both sides, which is what JS strings and
+ * CodeMirror positions use.
  */
 
 /** UTF-16 offsets into the document: [from, to) is the statement, `terminatorEnd` is after its `;` (or `to`). */
@@ -79,12 +80,19 @@ export function refreshStatements(view: EditorView): void {
   view.dispatch({ effects: refresh.of(null) });
 }
 
-/** Re-splits the document 150 ms after the last change; answers for an older version are dropped. */
+/**
+ * Re-splits the document once typing pauses; answers for an older version are dropped. One split at a time: the
+ * whole document goes to the backend (about 0.5 s per MB), so a large script must not pile splits up behind each
+ * other, which would also hold up completion. The pause grows with the time the last split took.
+ */
 function splitter(dialect: () => Dialect | null) {
   return ViewPlugin.fromClass(
     class {
       private timer: number | null = null;
       private destroyed = false;
+      /** A split is waiting for the backend. */
+      private inFlight = false;
+      private lastDurationMs = 0;
 
       constructor(private readonly view: EditorView) {
         this.schedule(0);
@@ -92,7 +100,7 @@ function splitter(dialect: () => Dialect | null) {
 
       update(update: ViewUpdate): void {
         if (update.state.field(statementsField).version !== update.startState.field(statementsField).version) {
-          this.schedule(SPLIT_DELAY_MS);
+          this.schedule(Math.max(SPLIT_DELAY_MS, 2 * this.lastDurationMs));
         }
       }
 
@@ -108,15 +116,25 @@ function splitter(dialect: () => Dialect | null) {
 
       private async split(): Promise<void> {
         this.timer = null;
+        if (this.inFlight) return; // the split in flight splits again when it returns, if the text moved on
         const current = dialect();
         if (!current) return; // no connection yet: nothing to split for; a dialect change refreshes
         const { state } = this.view;
         const { version } = state.field(statementsField);
+        this.inFlight = true;
+        const started = performance.now();
         try {
           const ranges = await splitText(state.doc.toString(), current);
           if (!this.destroyed) applySplit(this.view, version, ranges);
         } catch (error) {
           console.warn(`Could not split the statements: ${errorMessage(error)}`);
+        } finally {
+          this.inFlight = false;
+          this.lastDurationMs = performance.now() - started;
+        }
+        // Changed while it ran, and the split scheduled for that already came and went: once more, now.
+        if (!this.destroyed && this.timer === null && this.view.state.field(statementsField).version !== version) {
+          void this.split();
         }
       }
     },
