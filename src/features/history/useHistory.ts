@@ -53,18 +53,19 @@ export function useHistory(q: string, profileId: string | null) {
 /**
  * What the History panel does with an entry: insert its SQL into the active query tab, open it in a new tab, and clear
  * the whole history. A new tab opens on the entry's connection and database, or on none (the user picks one) when that
- * connection no longer exists: never on an unknown profile.
+ * connection is known to be deleted.
  */
 export function useHistoryActions() {
   const qc = useQueryClient();
   const profiles = useProfiles().data;
   return useMemo(() => {
     const openInNewTab = (entry: HistoryEntry) => {
-      const exists = !!profiles?.some((item) => item.profile.id === entry.profile_id);
+      // Only a loaded list without the profile means it was deleted; while the list is unknown, the entry's own counts.
+      const deleted = !!profiles && !profiles.some((item) => item.profile.id === entry.profile_id);
       const { openQuery } = useWorkspace.getState();
-      openQuery(exists ? entry.profile_id : null, exists ? entry.database : null, { text: entry.sql });
+      openQuery(deleted ? null : entry.profile_id, deleted ? null : entry.database, { text: entry.sql });
       console.info(`Opened history entry ${entry.id} in a new query tab`);
-      if (!exists && profiles) {
+      if (deleted) {
         toast("info", `The connection “${entry.profile_name}” no longer exists. Choose one for the new tab.`);
       }
     };

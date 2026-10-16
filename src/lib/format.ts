@@ -21,7 +21,8 @@ const RELATIVE_UNITS: [Intl.RelativeTimeFormatUnit, number][] = [
   ["hour", 3_600_000],
   ["minute", 60_000],
 ];
-const relativeTime = new Intl.RelativeTimeFormat(undefined, { numeric: "auto", style: "short" });
+/** English, like the rest of the UI (ruling R-02c-11); absolute times stay in the user's locale. */
+const relativeTime = new Intl.RelativeTimeFormat("en", { numeric: "auto", style: "short" });
 
 /** How long before `now` the time `at` was (ms since the epoch): "now", "5 min. ago", "yesterday", "3 wk. ago". */
 export function formatRelativeTime(at: number, now: number): string {

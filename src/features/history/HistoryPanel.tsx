@@ -1,3 +1,4 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Ban, CircleCheck, CircleX, Search, TimerOff, Trash2, X, type LucideIcon } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
@@ -11,7 +12,7 @@ import { isImeKeyEvent } from "@/lib/ime";
 import { useNow } from "@/lib/useNow";
 import { useWorkspace } from "@/stores/workspace";
 import { useProfiles } from "../connections/hooks";
-import { useHistory, useHistoryActions } from "./useHistory";
+import { refreshHistory, useHistory, useHistoryActions } from "./useHistory";
 
 const ROW_HEIGHT = 40;
 const SEARCH_DELAY_MS = 200;
@@ -166,9 +167,9 @@ function ScopeToggle({
  * The sidebar's History view (spec §4.6): the executed statements, newest first, searchable (substring of the SQL)
  * and filterable to the active tab's connection, loading 100 more as the list nears its end. A click previews the
  * entry below the list; a double-click (or Enter) inserts its SQL at the cursor of the active query tab, ⌥ opens it in
- * a new query tab on its connection. The list refreshes after every run.
+ * a new query tab on its connection. The list refreshes after every run, and whenever the view is shown again.
  */
-export function HistoryPanel() {
+export function HistoryPanel({ shown }: { shown: boolean }) {
   const [search, setSearch] = useState("");
   const [q, setQ] = useState("");
   useEffect(() => {
@@ -194,6 +195,15 @@ export function HistoryPanel() {
   const [clearing, setClearing] = useState(false);
   const now = useNow(60_000);
 
+  // Shown again: whatever was recorded without a refresh (e.g. a paused result whose tab closed) appears. Not when
+  // first shown: the list is loading then.
+  const qc = useQueryClient();
+  const wasShown = useRef(shown);
+  useEffect(() => {
+    if (shown && !wasShown.current) refreshHistory(qc);
+    wasShown.current = shown;
+  }, [shown, qc]);
+
   const listRef = useRef<HTMLDivElement>(null);
   const virtualizer = useVirtualizer({
     count: entries.length,
@@ -203,9 +213,10 @@ export function HistoryPanel() {
   });
   const visible = virtualizer.getVirtualItems();
 
-  // A new search or filter starts at the top.
+  // A new search or scope starts at the top with nothing selected, so a hidden entry's preview never comes back later.
   useEffect(() => {
     listRef.current?.scrollTo({ top: 0 });
+    setSelectedId(null);
   }, [q, profileFilter]);
 
   // The next page, once the rendered rows near the end: never while a page or a refetch is loading (it would cancel
@@ -257,6 +268,16 @@ export function HistoryPanel() {
   };
 
   const retry = () => void (history.isFetchNextPageError ? history.fetchNextPage() : history.refetch());
+  const failure = history.isError && !history.isFetching && (
+    <div className="shrink-0 p-3 text-[12px]">
+      <p className="text-danger" data-selectable>
+        {errorMessage(history.error)}
+      </p>
+      <button className="mt-1 text-accent" onClick={retry}>
+        Retry
+      </button>
+    </div>
+  );
   const filtered = q !== "" || profileFilter !== null;
 
   return (
@@ -304,20 +325,26 @@ export function HistoryPanel() {
         </div>
         <ScopeToggle only={profileFilter !== null} scopeName={scopeName} disabled={!scopeId} onChange={setOnlyScope} />
       </div>
+      {/* Notes and Retry stay outside the listbox: its keys (Enter, arrows) are not theirs. */}
+      {history.isPending && <p className="animate-delayed-show p-3 text-[12px] text-muted">Loading…</p>}
+      {history.isSuccess && entries.length === 0 && (
+        <p className="p-4 text-[12px] text-muted">
+          {filtered ? "No statements match." : "No statements yet. Statements run in query tabs show up here."}
+        </p>
+      )}
+      {entries.length === 0 && failure}
       <div
         ref={listRef}
         role="listbox"
         aria-label="Query history"
         tabIndex={0}
         onKeyDown={onKeyDown}
-        className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto outline-none"
-      >
-        {history.isPending && <p className="animate-delayed-show p-3 text-[12px] text-muted">Loading…</p>}
-        {history.isSuccess && entries.length === 0 && (
-          <p className="p-4 text-[12px] text-muted">
-            {filtered ? "No statements match." : "No statements yet. Statements run in query tabs show up here."}
-          </p>
+        className={cn(
+          "min-h-0 flex-1 overflow-x-hidden overflow-y-auto outline-none",
+          "focus-visible:outline-solid focus-visible:outline-2 focus-visible:-outline-offset-2",
+          "focus-visible:outline-accent/50",
         )}
+      >
         <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
           {visible.map((item) => {
             const entry = entries[item.index];
@@ -340,19 +367,10 @@ export function HistoryPanel() {
             );
           })}
         </div>
-        {history.isFetchingNextPage && <p className="px-3 py-1.5 text-[11px] text-muted">Loading more…</p>}
-        {/* Below the rows: a page that failed to load more is where the list ends. */}
-        {history.isError && !history.isFetching && (
-          <div className="p-3 text-[12px]">
-            <p className="text-danger" data-selectable>
-              {errorMessage(history.error)}
-            </p>
-            <button className="mt-1 text-accent" onClick={retry}>
-              Retry
-            </button>
-          </div>
-        )}
       </div>
+      {history.isFetchingNextPage && <p className="shrink-0 px-3 py-1.5 text-[11px] text-muted">Loading more…</p>}
+      {/* Below the rows: a page that failed to load more is where the list ends. */}
+      {entries.length > 0 && failure}
       {selected && <Preview entry={selected} onClose={() => setSelectedId(null)} />}
       {confirmClear && (
         <ConfirmDialog

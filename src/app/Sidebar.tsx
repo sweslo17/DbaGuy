@@ -8,10 +8,11 @@ import { ScriptsPanel } from "../features/scripts/ScriptsPanel";
 
 type SidebarView = "connections" | "scripts" | "history";
 
-const VIEWS: { value: SidebarView; label: string; render: () => ReactNode }[] = [
+/** `render` gets whether the view is the one shown (a view stays mounted while hidden). */
+const VIEWS: { value: SidebarView; label: string; render: (shown: boolean) => ReactNode }[] = [
   { value: "connections", label: "Connections", render: () => <Explorer /> },
   { value: "scripts", label: "Scripts", render: () => <ScriptsPanel /> },
-  { value: "history", label: "History", render: () => <HistoryPanel /> },
+  { value: "history", label: "History", render: (shown) => <HistoryPanel shown={shown} /> },
 ];
 
 const isView = (value: string | null): value is SidebarView => VIEWS.some((view) => view.value === value);
@@ -40,7 +41,7 @@ export function Sidebar() {
               aria-label={view.label}
               className={cn("min-h-0 flex-1", view.value !== current && "hidden")}
             >
-              {view.render()}
+              {view.render(view.value === current)}
             </div>
           ),
       )}
