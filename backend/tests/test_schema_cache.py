@@ -3,6 +3,7 @@ import threading
 import time
 
 import pytest
+from loguru import logger
 
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
@@ -228,3 +229,21 @@ def test_index_without_waiting_skips_a_build_in_progress(env, monkeypatch):
     index = cache.index(pid, wait=False)
     assert index is not None and index.snapshot is cache.peek(pid)
     assert cache.index(pid) is index
+
+
+def test_a_failing_index_construction_is_logged_with_its_traceback_and_re_raised(env, monkeypatch):
+    cache, pid, _, _ = env
+
+    def broken(*args):
+        raise RuntimeError("index bug")
+
+    monkeypatch.setattr("dbaguy_backend.services.schema_cache.SnapshotIndex", broken)
+    records = []
+    sink_id = logger.add(lambda message: records.append(message.record), level="ERROR")
+    try:
+        with pytest.raises(RuntimeError, match="index bug"):
+            cache.index(pid)
+    finally:
+        logger.remove(sink_id)
+    assert len(records) == 1 and records[0]["exception"] is not None
+    assert cache.peek(pid) is not None  # the snapshot itself is fine and stays cached

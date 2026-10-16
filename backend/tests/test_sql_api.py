@@ -9,6 +9,7 @@ from tests.test_api import AUTH, client, sqlite_profile_id  # noqa: F401  (fixtu
 
 EMOJI_SQL = "SELECT '😀'; SELECT * FROM t WHERE t.i"
 WARNING = logger.level("WARNING").no
+ERROR = logger.level("ERROR").no
 DEBUG = logger.level("DEBUG").no
 
 
@@ -168,3 +169,34 @@ def test_sql_text_is_only_logged_at_debug(client, sqlite_profile_id, log_records
                 headers=AUTH)
     assert any(r["level"].no == DEBUG and "/sql/complete" in r["message"] for r in log_records)  # calls are logged
     assert not [r for r in log_records if r["level"].no > DEBUG and "payroll_marker" in r["message"]]
+
+
+@pytest.mark.parametrize("cell", [
+    {"$type": "bytes"}, {"$type": "bytes", "preview": "ab"}, {"$type": "bytes", "preview": 5, "size": "x"},
+    {"$type": "bytes", "preview": "ab", "size": None}, {"$type": "text"}, {"$type": "text", "truncated": True},
+    {"$type": "text", "preview": "abc", "size": None}, {"$type": "other"}, {"size": 1},
+])
+def test_malformed_grid_cells_are_a_422_for_every_format(client, log_records, cell):
+    columns = [{"name": "v", "category": "text"}]
+    for kind in ("tsv", "csv", "json", "jsonl", "markdown", "insert", "in_list"):
+        body = {"dialect": "postgres", "kind": kind, "columns": columns, "rows": [["fine"], [cell]]}
+        response = client.post("/sql/format-rows", json=body, headers=AUTH)
+        assert response.status_code == 422, kind
+        error = response.json()["error"]
+        assert error["code"] == "validation_failed" and "Row index 1, column index 0" in error["message"], kind
+    assert not [r for r in log_records if r["level"].no >= ERROR]  # a client mistake is not a server error
+
+
+def test_a_snapshot_index_bug_is_logged_and_completion_falls_back_to_keywords(
+    client, sqlite_profile_id, log_records, monkeypatch
+):
+    def broken(*args, **kwargs):
+        raise RuntimeError("index bug")
+
+    monkeypatch.setattr("dbaguy_backend.services.schema_cache.SnapshotIndex", broken)
+    body = {"profile_id": sqlite_profile_id, "text": "SEL", "cursor": 3}
+    result = client.post("/sql/complete", json=body, headers=AUTH)
+    assert result.status_code == 200 and "SELECT" in labels(result)
+    errors = [r for r in log_records if r["level"].no >= ERROR]
+    assert len(errors) == 1 and "completion index" in errors[0]["message"]
+    assert errors[0]["exception"] is not None and errors[0]["exception"].type is RuntimeError  # with the traceback

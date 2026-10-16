@@ -160,3 +160,53 @@ def test_typed_json_does_not_change_the_other_formats():
     assert fmt(F.INSERT, rows=[['{"k":1}', "12.50"]], cols=cols, table_name="t").text == (
         "INSERT INTO t (j, n) VALUES ('{\"k\":1}', 12.50);"
     )
+
+
+MALFORMED_CELLS = [
+    {"$type": "bytes"},
+    {"$type": "bytes", "preview": "ab"},  # no size
+    {"$type": "bytes", "preview": 5, "size": "x"},
+    {"$type": "bytes", "preview": "ab", "size": None},
+    {"$type": "bytes", "preview": "ab", "size": True},  # a bool is not a size
+    {"$type": "bytes", "preview": "ab", "size": -1},
+    {"$type": "bytes", "preview": "abc", "size": 2},  # not whole bytes
+    {"$type": "bytes", "preview": "zz", "size": 1},  # not hex
+    {"$type": "text"},
+    {"$type": "text", "truncated": True},  # no preview
+    {"$type": "text", "preview": "abc"},  # no size
+    {"$type": "text", "preview": "abc", "size": None},
+    {"$type": "text", "preview": 7, "size": 3},
+    {"$type": "text", "preview": "abc", "size": 3, "truncated": "yes"},
+    {"$type": "geometry", "preview": "x", "size": 1},
+    {"preview": "x", "size": 1},
+]
+ONE_TEXT_COLUMN = [FormatColumn(name="v", category=C.TEXT)]
+
+
+@pytest.mark.parametrize("cell", MALFORMED_CELLS)
+def test_malformed_encoded_cells_are_validation_errors_in_every_format(cell):
+    for kind in F:
+        with pytest.raises(ValidationFailed) as info:
+            fmt(kind, rows=[["fine"], [cell]], cols=ONE_TEXT_COLUMN)
+        assert "Row index 1, column index 0" in info.value.message, kind
+        assert info.value.detail == {"row": 1, "column": 0}
+
+
+def test_a_malformed_cell_error_does_not_echo_the_cell():
+    for cell in ({"$type": "bytes", "preview": "leak-marker", "size": 1}, {"$type": "leak-marker"},
+                 {"$type": "text", "preview": "leak-marker", "size": "leak-marker"}):
+        with pytest.raises(ValidationFailed) as info:
+            fmt(F.CSV, rows=[[cell]], cols=ONE_TEXT_COLUMN)
+        assert "leak-marker" not in info.value.message and "leak-marker" not in str(info.value.detail)
+
+
+def test_well_formed_encoded_cells_still_format():
+    cells = [{"$type": "text", "preview": "abc", "size": 3}, {"$type": "text", "preview": "abc", "size": 3, "truncated": False},
+             {"$type": "bytes", "preview": "", "size": 0}]
+    assert fmt(F.CSV, rows=[[c] for c in cells], cols=ONE_TEXT_COLUMN, header=False).text == "abc\nabc\n0x\n"
+
+
+def test_raw_values_are_not_checked_for_the_encoded_shape():
+    # a driver dict that happens to look like an encoded cell is just a JSON value, written as text
+    rows = [[{"$type": "bytes"}]]
+    assert fmt(F.JSONL, rows=rows, cols=ONE_TEXT_COLUMN, source="raw").text == '{"v": "{\\"$type\\": \\"bytes\\"}"}'

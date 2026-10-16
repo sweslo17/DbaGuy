@@ -97,7 +97,11 @@ class SchemaCache:
             entry = self._entries.get(key)
             if entry is not None and entry.snapshot is snapshot and entry.index is not None:
                 return entry.index
-        built = SnapshotIndex(snapshot, self._adapter(profile_id).dialect)  # outside `_lock`: big schemas take a while
+        try:  # outside `_lock`: big schemas take a while
+            built = SnapshotIndex(snapshot, self._adapter(profile_id).dialect)
+        except Exception:  # not a build failure, so nothing has logged it yet: a bug, which callers only degrade past
+            logger.exception("Could not build the completion index of {}", profile_id)
+            raise
         with self._lock:
             entry = self._entries.get(key)
             if entry is None or entry.snapshot is not snapshot:

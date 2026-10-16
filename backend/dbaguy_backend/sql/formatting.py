@@ -33,6 +33,7 @@ _DEFAULT_TABLE = "table_name"
 _NUMERIC = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?", re.ASCII)
 # _NUMERIC without the leading zeros that JSON forbids
 _JSON_NUMBER = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?")
+_HEX_BYTES = re.compile(r"(?:[0-9a-fA-F]{2})*")
 _NEWLINES = re.compile(r"\r\n|\r|\n")
 _TSV_SPECIAL = frozenset('\t\n\r"')
 _BOOL_SQL = {Dialect.POSTGRES: ("TRUE", "FALSE"), Dialect.SQLITE: ("1", "0")}
@@ -71,25 +72,62 @@ def _normalise_raw(value: Any) -> Cell:
     return encode_value(value)  # scalars unchanged; big ints, Decimal, dates, UUID, list/dict become text
 
 
+class _MalformedCell(Exception):
+    """An encoded cell that is not shaped like `encode_value`'s output. The reason never contains the cell."""
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _encoded_binary(cell: dict[str, Any]) -> _Binary:
+    preview, size = cell.get("preview"), cell.get("size")
+    if not (isinstance(preview, str) and _HEX_BYTES.fullmatch(preview) and _is_int(size) and size >= 0):
+        raise _MalformedCell("a bytes cell needs a preview of whole hex bytes and a size of at least 0")
+    return _Binary(preview, truncated=len(preview) < 2 * size)  # preview is hex: 2 chars a byte
+
+
+def _encoded_text(cell: dict[str, Any]) -> str | _Truncated:
+    preview, size, truncated = cell.get("preview"), cell.get("size"), cell.get("truncated", False)
+    if not (isinstance(preview, str) and _is_int(size) and isinstance(truncated, bool)):
+        raise _MalformedCell("a text cell needs a text preview, a size and, optionally, a true/false truncated flag")
+    return _Truncated(preview) if truncated else preview
+
+
 def _normalise_encoded(value: Any) -> Cell:
+    """Raises `_MalformedCell`: the only objects an encoded cell can be are `encode_value`'s bytes and text cells."""
     if isinstance(value, dict):
         match value.get("$type"):
             case "bytes":
-                preview = value["preview"]
-                return _Binary(preview, truncated=len(preview) < 2 * value["size"])  # preview is hex: 2 chars a byte
+                return _encoded_binary(value)
             case "text":
-                return _Truncated(value["preview"]) if value.get("truncated") else value["preview"]
+                return _encoded_text(value)
+            case _:
+                raise _MalformedCell("an object cell must be a bytes or a text cell")
     return _normalise_raw(value)
 
 
 _NORMALISERS: dict[Source, Callable[[Any], Cell]] = {"encoded": _normalise_encoded, "raw": _normalise_raw}
 
 
+def _normalise_row(row: Sequence[Any], row_index: int, normalise: Callable[[Any], Cell]) -> list[Cell]:
+    cells = []
+    for column_index, value in enumerate(row):
+        try:
+            cells.append(normalise(value))
+        except _MalformedCell as malformed:
+            raise ValidationFailed(
+                f"Row index {row_index}, column index {column_index} is not a valid cell: {malformed}",
+                detail={"row": row_index, "column": column_index},
+            ) from None
+    return cells
+
+
 def _cells(rows: Iterable[Sequence[Any]], width: int, normalise: Callable[[Any], Cell]) -> Iterator[list[Cell]]:
-    for row in rows:
+    for row_index, row in enumerate(rows):
         if len(row) != width:
             raise ValidationFailed(f"A row has {len(row)} cells but there are {width} columns")
-        yield [normalise(value) for value in row]
+        yield _normalise_row(row, row_index, normalise)
 
 
 # --- cell renderers -----------------------------------------------------------------------------------------------
