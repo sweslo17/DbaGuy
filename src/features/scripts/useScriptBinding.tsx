@@ -53,8 +53,8 @@ export interface ScriptBinding {
  * is never compared twice. Nothing here is React state of the tab: the dot goes through the tab status store. A
  * restored tab does not know its file's content: it is read again the first time the tab is shown, and a tab restored
  * without text of its own (it held just its file's) gets the file's content as it is now (ruling R-02c-21). A file that
- * is gone marks the tab "file missing" (⌘S writes it again). Closing a tab with unsaved edits, a missing file or a file
- * not read yet asks Save / Discard / Cancel, before the session's guards.
+ * is gone marks the tab "file missing" (⌘S writes it again, unless the tab never had text of its own). Closing a tab
+ * with unsaved edits, a missing file or a file not read yet asks Save / Discard / Cancel, before the session's guards.
  */
 export function useScriptBinding({
   tab,

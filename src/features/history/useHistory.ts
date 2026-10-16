@@ -89,12 +89,16 @@ export function useHistoryActions() {
       }
     };
 
-    /** At the cursor of the active query tab, replacing its selection; with no query tab active, in a new tab. */
+    /**
+     * At the cursor of the active query tab, replacing its selection; with no query tab active (or one still loading
+     * its script), in a new tab.
+     */
     const insert = (entry: HistoryEntry) => {
       const { tabs, activeTabId } = useWorkspace.getState();
       const active = tabs.find((tab) => tab.id === activeTabId);
       const editor = active?.kind === "query" ? mountedEditor(active.id) : null;
-      if (editor) editor.insert(entry.sql);
+      // A tab still loading its script is read-only: inserting would keep its file's text from ever loading.
+      if (editor && !editor.view.state.readOnly) editor.insert(entry.sql);
       else openInNewTab(entry);
     };
 

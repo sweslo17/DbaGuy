@@ -73,6 +73,7 @@ async function loadWaitingTabs(path: string): Promise<void> {
     try {
       file = await readScript(tab.scriptPath);
     } catch (error) {
+      if (error instanceof ApiError && error.status === 404) continue; // already gone: the tab has nothing to keep
       throw new Error(`its open tab could not get the file's text first (${errorMessage(error)})`);
     }
     const now = scriptTab(file.path); // read meanwhile (its tab was shown), or typed into: nothing to give it

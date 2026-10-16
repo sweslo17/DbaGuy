@@ -37,7 +37,9 @@ function TabContent({ tab, active }: { tab: Tab; active: boolean }) {
 function tabTooltip(tab: Tab, profile: Profile | undefined, missing: boolean): string {
   const lines = [profile ? `${tab.title} · ${profile.name}` : tab.title];
   if (tab.kind === "query" && tab.scriptPath !== null) {
-    lines.push(missing ? `${tab.scriptPath} — file missing; ⌘S saves it again` : tab.scriptPath);
+    // A tab still waiting for its file has no text of its own: ⌘S has nothing to write back.
+    const resave = tab.textFromFile ? "" : "; ⌘S saves it again";
+    lines.push(missing ? `${tab.scriptPath} — file missing${resave}` : tab.scriptPath);
   }
   return lines.join("\n");
 }
