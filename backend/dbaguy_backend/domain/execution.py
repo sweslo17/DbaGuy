@@ -27,7 +27,7 @@ class ServerMessage(BaseModel):
 
 class ErrorPosition(BaseModel):
     line: int  # 1-based, relative to the executed statement
-    column: int  # 1-based
+    column: int  # 1-based, in UTF-16 code units (the editor's unit)
 
 
 # ---- client -> server ----

@@ -374,6 +374,111 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sql/split": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Split Statements */
+        post: operations["split_statements_sql_split_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sql/analyze": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Analyze
+         * @description What the safety policy would say about each statement if the user had not confirmed it yet.
+         */
+        post: operations["analyze_sql_analyze_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sql/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Complete At */
+        post: operations["complete_at_sql_complete_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sql/describe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Describe */
+        post: operations["describe_sql_describe_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sql/format-rows": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Format Rows For Copy */
+        post: operations["format_rows_for_copy_sql_format_rows_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sql/browse-select": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Browse Select */
+        post: operations["browse_select_sql_browse_select_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -391,6 +496,16 @@ export interface components {
             index: number;
             /** Rows */
             rows: number;
+        };
+        /** AnalyzeRequest */
+        AnalyzeRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Statements */
+            statements: string[];
         };
         /**
          * AppSettings
@@ -432,6 +547,33 @@ export interface components {
             notifications: components["schemas"]["NotificationSettings"];
             /** Scripts Dir */
             scripts_dir?: string | null;
+        };
+        /** BrowseSelectRequest */
+        BrowseSelectRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Path */
+            path: components["schemas"]["PathSegment"][];
+            /** Where */
+            where?: string | null;
+            /**
+             * Order By
+             * @default []
+             */
+            order_by: components["schemas"]["SortKey"][];
+            /**
+             * Count
+             * @default false
+             */
+            count: boolean;
+        };
+        /** BrowseSelectResponse */
+        BrowseSelectResponse: {
+            /** Sql */
+            sql: string;
         };
         /** CancelCommand */
         CancelCommand: {
@@ -493,6 +635,46 @@ export interface components {
             /** Request Id */
             request_id: string;
         };
+        /** CompleteRequest */
+        CompleteRequest: {
+            /** Database */
+            database?: string | null;
+            /** Text */
+            text: string;
+            /** Cursor */
+            cursor: number;
+            /** Profile Id */
+            profile_id?: string | null;
+            dialect?: components["schemas"]["Dialect"] | null;
+        };
+        /** CompletionItem */
+        CompletionItem: {
+            /** Label */
+            label: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "keyword" | "schema" | "table" | "view" | "materialized_view" | "column" | "alias" | "function" | "join";
+            /** Detail */
+            detail?: string | null;
+            /** Apply */
+            apply?: string | null;
+            /**
+             * Boost
+             * @default 0
+             */
+            boost: number;
+        };
+        /** CompletionResponse */
+        CompletionResponse: {
+            /** Start */
+            start: number;
+            /** End */
+            end: number;
+            /** Items */
+            items: components["schemas"]["CompletionItem"][];
+        };
         /**
          * ConfirmationRequiredEvent
          * @description The statement was not run: resend it with `confirmed=true` once the user agreed. `finished(skipped)` follows.
@@ -527,6 +709,45 @@ export interface components {
             server_version?: string | null;
             /** Elapsed Ms */
             elapsed_ms: number;
+        };
+        /** DescribeColumn */
+        DescribeColumn: {
+            /** Name */
+            name: string;
+            /** Type Name */
+            type_name: string;
+            /** Is Primary Key */
+            is_primary_key: boolean;
+            /** References */
+            references?: string | null;
+        };
+        /** DescribeRequest */
+        DescribeRequest: {
+            /** Database */
+            database?: string | null;
+            /** Text */
+            text: string;
+            /** Cursor */
+            cursor: number;
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+        };
+        /** DescribeResult */
+        DescribeResult: {
+            /** Schema Name */
+            schema_name: string;
+            /** Name */
+            name: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "table" | "view" | "materialized_view";
+            /** Columns */
+            columns: components["schemas"]["DescribeColumn"][];
         };
         /**
          * Dialect
@@ -721,11 +942,52 @@ export interface components {
              */
             skipped: boolean;
         };
+        /** FormatColumn */
+        FormatColumn: {
+            /** Name */
+            name: string;
+            category: components["schemas"]["ColumnCategory"];
+        };
         /**
          * FormatKind
          * @enum {string}
          */
         FormatKind: "tsv" | "csv" | "json" | "jsonl" | "markdown" | "insert" | "in_list";
+        /** FormatResult */
+        FormatResult: {
+            /** Text */
+            text: string;
+            /**
+             * Warnings
+             * @default []
+             */
+            warnings: string[];
+        };
+        /** FormatRowsRequest */
+        FormatRowsRequest: {
+            dialect: components["schemas"]["Dialect"];
+            kind: components["schemas"]["FormatKind"];
+            /** Columns */
+            columns: components["schemas"]["FormatColumn"][];
+            /** Rows */
+            rows: unknown[][];
+            options?: components["schemas"]["RowFormatOptions"];
+        };
+        /**
+         * GuardAction
+         * @enum {string}
+         */
+        GuardAction: "run" | "confirm" | "block";
+        /** GuardDecision */
+        GuardDecision: {
+            action: components["schemas"]["GuardAction"];
+            /**
+             * Reasons
+             * @default []
+             */
+            reasons: string[];
+            classification: components["schemas"]["Classification"];
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -1279,6 +1541,27 @@ export interface components {
             /** Enabled */
             enabled: boolean;
         };
+        /** SortKey */
+        SortKey: {
+            /** Column */
+            column: string;
+            /**
+             * Descending
+             * @default false
+             */
+            descending: boolean;
+        };
+        /** SplitRequest */
+        SplitRequest: {
+            /** Text */
+            text: string;
+            dialect: components["schemas"]["Dialect"];
+        };
+        /** SplitResponse */
+        SplitResponse: {
+            /** Statements */
+            statements: components["schemas"]["StatementRange"][];
+        };
         /** SqliteProfile */
         SqliteProfile: {
             /** Name */
@@ -1417,6 +1700,15 @@ export interface components {
          * @enum {string}
          */
         StatementKind: "read" | "write" | "ddl" | "transaction" | "session" | "unknown";
+        /** StatementRange */
+        StatementRange: {
+            /** Start */
+            start: number;
+            /** End */
+            end: number;
+            /** Terminator End */
+            terminator_end: number;
+        };
         /** TextSelection */
         TextSelection: {
             /** Anchor */
@@ -2412,6 +2704,216 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    split_statements_sql_split_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SplitRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SplitResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    analyze_sql_analyze_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AnalyzeRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GuardDecision"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    complete_at_sql_complete_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CompleteRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CompletionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    describe_sql_describe_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DescribeRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DescribeResult"] | null;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    format_rows_for_copy_sql_format_rows_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FormatRowsRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FormatResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    browse_select_sql_browse_select_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BrowseSelectRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BrowseSelectResponse"];
+                };
             };
             /** @description Validation Error */
             422: {

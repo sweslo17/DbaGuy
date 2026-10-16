@@ -57,6 +57,12 @@ def test_offset_to_line_col():
     assert offset_to_line_col("abc", 999) == (1, 4)
 
 
+def test_error_columns_count_utf16_units():
+    assert offset_to_line_col("SELECT '😀', nope", 13) == (1, 14)  # 'n' is the 13th character, 14th UTF-16 unit
+    assert offset_to_line_col("a\n😀b", 4) == (2, 3)
+    assert offset_to_line_col("SELECT x", 8) == (1, 8)
+
+
 def test_quote_helpers():
     assert quote_ident_pg("users") == "users"
     assert quote_ident_pg("Users") == '"Users"'

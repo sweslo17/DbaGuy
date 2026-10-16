@@ -107,6 +107,13 @@ def test_error_position_with_cjk(conn):
     assert (info.value.position.line, info.value.position.column) == (2, 3)
 
 
+def test_error_column_counts_utf16_units_after_an_astral_character(conn):
+    with pytest.raises(StatementError) as info:
+        conn.run("SELECT '😀' AS a, nope_column FROM big_table").fetch(1)
+    assert info.value.code == "42703"
+    assert (info.value.position.line, info.value.position.column) == (1, 19)  # 18th character, 19th UTF-16 unit
+
+
 def test_cancel_running_query(conn):
     threading.Timer(0.5, conn.cancel).start()
     started = time.monotonic()

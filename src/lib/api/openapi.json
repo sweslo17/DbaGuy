@@ -1617,6 +1617,373 @@
           }
         }
       }
+    },
+    "/sql/split": {
+      "post": {
+        "tags": [
+          "sql"
+        ],
+        "summary": "Split Statements",
+        "operationId": "split_statements_sql_split_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SplitRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SplitResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sql/analyze": {
+      "post": {
+        "tags": [
+          "sql"
+        ],
+        "summary": "Analyze",
+        "description": "What the safety policy would say about each statement if the user had not confirmed it yet.",
+        "operationId": "analyze_sql_analyze_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnalyzeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GuardDecision"
+                  },
+                  "title": "Response Analyze Sql Analyze Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sql/complete": {
+      "post": {
+        "tags": [
+          "sql"
+        ],
+        "summary": "Complete At",
+        "operationId": "complete_at_sql_complete_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompleteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompletionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sql/describe": {
+      "post": {
+        "tags": [
+          "sql"
+        ],
+        "summary": "Describe",
+        "operationId": "describe_sql_describe_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DescribeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/DescribeResult"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Describe Sql Describe Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sql/format-rows": {
+      "post": {
+        "tags": [
+          "sql"
+        ],
+        "summary": "Format Rows For Copy",
+        "operationId": "format_rows_for_copy_sql_format_rows_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FormatRowsRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FormatResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sql/browse-select": {
+      "post": {
+        "tags": [
+          "sql"
+        ],
+        "summary": "Browse Select",
+        "operationId": "browse_select_sql_browse_select_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BrowseSelectRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowseSelectResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1649,6 +2016,30 @@
           "rows"
         ],
         "title": "AffectedEvent"
+      },
+      "AnalyzeRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "statements": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 10000,
+            "title": "Statements"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "statements"
+        ],
+        "title": "AnalyzeRequest"
       },
       "AppSettings": {
         "properties": {
@@ -1700,6 +2091,66 @@
         "type": "object",
         "title": "AppSettings",
         "description": "The app preferences (`settings.json`). Persisted, so a newer build's extra fields are tolerated on read and\nkept on write; input from the API stays strict."
+      },
+      "BrowseSelectRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "path": {
+            "items": {
+              "$ref": "#/components/schemas/PathSegment"
+            },
+            "type": "array",
+            "title": "Path"
+          },
+          "where": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Where"
+          },
+          "order_by": {
+            "items": {
+              "$ref": "#/components/schemas/SortKey"
+            },
+            "type": "array",
+            "title": "Order By",
+            "default": []
+          },
+          "count": {
+            "type": "boolean",
+            "title": "Count",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "path"
+        ],
+        "title": "BrowseSelectRequest"
+      },
+      "BrowseSelectResponse": {
+        "properties": {
+          "sql": {
+            "type": "string",
+            "title": "Sql"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sql"
+        ],
+        "title": "BrowseSelectResponse"
       },
       "CancelCommand": {
         "properties": {
@@ -1844,6 +2295,141 @@
         ],
         "title": "CommitCommand"
       },
+      "CompleteRequest": {
+        "properties": {
+          "database": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Database"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "cursor": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Cursor"
+          },
+          "profile_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Profile Id"
+          },
+          "dialect": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Dialect"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "text",
+          "cursor"
+        ],
+        "title": "CompleteRequest"
+      },
+      "CompletionItem": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "keyword",
+              "schema",
+              "table",
+              "view",
+              "materialized_view",
+              "column",
+              "alias",
+              "function",
+              "join"
+            ],
+            "title": "Kind"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "apply": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Apply"
+          },
+          "boost": {
+            "type": "integer",
+            "title": "Boost",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "kind"
+        ],
+        "title": "CompletionItem"
+      },
+      "CompletionResponse": {
+        "properties": {
+          "start": {
+            "type": "integer",
+            "title": "Start"
+          },
+          "end": {
+            "type": "integer",
+            "title": "End"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CompletionItem"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "items"
+        ],
+        "title": "CompletionResponse"
+      },
       "ConfirmationRequiredEvent": {
         "properties": {
           "type": {
@@ -1954,6 +2540,113 @@
           "elapsed_ms"
         ],
         "title": "ConnectionTestResult"
+      },
+      "DescribeColumn": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "type_name": {
+            "type": "string",
+            "title": "Type Name"
+          },
+          "is_primary_key": {
+            "type": "boolean",
+            "title": "Is Primary Key"
+          },
+          "references": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "References"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "type_name",
+          "is_primary_key"
+        ],
+        "title": "DescribeColumn"
+      },
+      "DescribeRequest": {
+        "properties": {
+          "database": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Database"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "cursor": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Cursor"
+          },
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "text",
+          "cursor",
+          "profile_id"
+        ],
+        "title": "DescribeRequest"
+      },
+      "DescribeResult": {
+        "properties": {
+          "schema_name": {
+            "type": "string",
+            "title": "Schema Name"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "table",
+              "view",
+              "materialized_view"
+            ],
+            "title": "Kind"
+          },
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/DescribeColumn"
+            },
+            "type": "array",
+            "title": "Columns"
+          }
+        },
+        "type": "object",
+        "required": [
+          "schema_name",
+          "name",
+          "kind",
+          "columns"
+        ],
+        "title": "DescribeResult"
       },
       "Dialect": {
         "type": "string",
@@ -2409,6 +3102,23 @@
         ],
         "title": "FinishedEvent"
       },
+      "FormatColumn": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "category": {
+            "$ref": "#/components/schemas/ColumnCategory"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "category"
+        ],
+        "title": "FormatColumn"
+      },
       "FormatKind": {
         "type": "string",
         "enum": [
@@ -2421,6 +3131,98 @@
           "in_list"
         ],
         "title": "FormatKind"
+      },
+      "FormatResult": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "title": "FormatResult"
+      },
+      "FormatRowsRequest": {
+        "properties": {
+          "dialect": {
+            "$ref": "#/components/schemas/Dialect"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/FormatKind"
+          },
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/FormatColumn"
+            },
+            "type": "array",
+            "title": "Columns"
+          },
+          "rows": {
+            "items": {
+              "items": {},
+              "type": "array"
+            },
+            "type": "array",
+            "maxItems": 100000,
+            "title": "Rows"
+          },
+          "options": {
+            "$ref": "#/components/schemas/RowFormatOptions"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "dialect",
+          "kind",
+          "columns",
+          "rows"
+        ],
+        "title": "FormatRowsRequest"
+      },
+      "GuardAction": {
+        "type": "string",
+        "enum": [
+          "run",
+          "confirm",
+          "block"
+        ],
+        "title": "GuardAction"
+      },
+      "GuardDecision": {
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/GuardAction"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Reasons",
+            "default": []
+          },
+          "classification": {
+            "$ref": "#/components/schemas/Classification"
+          }
+        },
+        "type": "object",
+        "required": [
+          "action",
+          "classification"
+        ],
+        "title": "GuardDecision"
       },
       "HTTPValidationError": {
         "properties": {
@@ -3783,6 +4585,58 @@
         ],
         "title": "SetAutocommitCommand"
       },
+      "SortKey": {
+        "properties": {
+          "column": {
+            "type": "string",
+            "title": "Column"
+          },
+          "descending": {
+            "type": "boolean",
+            "title": "Descending",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "column"
+        ],
+        "title": "SortKey"
+      },
+      "SplitRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "dialect": {
+            "$ref": "#/components/schemas/Dialect"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "text",
+          "dialect"
+        ],
+        "title": "SplitRequest"
+      },
+      "SplitResponse": {
+        "properties": {
+          "statements": {
+            "items": {
+              "$ref": "#/components/schemas/StatementRange"
+            },
+            "type": "array",
+            "title": "Statements"
+          }
+        },
+        "type": "object",
+        "required": [
+          "statements"
+        ],
+        "title": "SplitResponse"
+      },
       "SqliteProfile": {
         "properties": {
           "name": {
@@ -4064,6 +4918,29 @@
           "unknown"
         ],
         "title": "StatementKind"
+      },
+      "StatementRange": {
+        "properties": {
+          "start": {
+            "type": "integer",
+            "title": "Start"
+          },
+          "end": {
+            "type": "integer",
+            "title": "End"
+          },
+          "terminator_end": {
+            "type": "integer",
+            "title": "Terminator End"
+          }
+        },
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "terminator_end"
+        ],
+        "title": "StatementRange"
       },
       "TextSelection": {
         "properties": {
