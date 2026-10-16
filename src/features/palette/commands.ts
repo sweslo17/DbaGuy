@@ -4,6 +4,7 @@ import { errorMessage } from "@/lib/api/client";
 import type { AppSettings } from "@/lib/api/types";
 import { useWorkspace, workingProfileId, type Tab } from "@/stores/workspace";
 import { refreshSchema } from "../explorer/refreshSchema";
+import { HISTORY_VIEW } from "../history/useHistory";
 import { readQueryTabActions, type QueryTabActionId, type QueryTabActions } from "../query/tabActions";
 import { openSettings } from "../settings/SettingsDialog";
 import { requestCloseTab } from "../workspace/closeGuards";
@@ -138,7 +139,7 @@ export const COMMANDS: readonly PaletteCommand[] = [
     id: "openHistory",
     label: "Open history",
     enabled: always,
-    run: () => useWorkspace.getState().setSidebarTab("history"),
+    run: () => useWorkspace.getState().setSidebarTab(HISTORY_VIEW),
   },
   {
     id: "openScripts",

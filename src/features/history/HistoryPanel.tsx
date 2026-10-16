@@ -20,6 +20,8 @@ const SEARCH_DELAY_MS = 200;
 const LOAD_AHEAD_ROWS = 30;
 /** The row shows at most this much of the SQL's first line (the full text is in the preview). */
 const LINE_CHARS = 300;
+/** The preview shows this much of the SQL until "Show all". */
+const PREVIEW_CHARS = 20_000;
 
 const STATUS: Record<HistoryStatus, { icon: LucideIcon; label: string; className: string }> = {
   ok: { icon: CircleCheck, label: "Succeeded", className: "text-success" },
@@ -77,8 +79,19 @@ function HistoryRow({ entry, now, selected }: { entry: HistoryEntry; now: number
   );
 }
 
-/** The selected entry in full, below the list: its SQL and error can be selected and copied. */
+/** The first `length` UTF-16 units of `text`, never ending inside a surrogate pair. */
+function cut(text: string, length: number): string {
+  const end = /[\uD800-\uDBFF]/.test(text.charAt(length - 1)) ? length - 1 : length;
+  return text.slice(0, end);
+}
+
+/**
+ * The selected entry, below the list: its SQL (the first 20,000 characters until "Show all") and error can be
+ * selected and copied.
+ */
 function Preview({ entry, onClose }: { entry: HistoryEntry; onClose: () => void }) {
+  const [showAll, setShowAll] = useState(false);
+  const shortened = !showAll && entry.sql.length > PREVIEW_CHARS;
   const facts = [STATUS[entry.status].label, formatDuration(entry.elapsed_ms)];
   if (entry.status === "ok") facts.push(plural(entry.rows, "row"));
   const where = entry.database ? `${entry.profile_name} · ${entry.database}` : entry.profile_name;
@@ -108,8 +121,13 @@ function Preview({ entry, onClose }: { entry: HistoryEntry; onClose: () => void 
       </div>
       <div className="min-h-0 overflow-auto px-2 pt-1 pb-2">
         <pre className="font-mono text-[12px] break-words whitespace-pre-wrap" data-selectable>
-          {entry.sql}
+          {shortened ? `${cut(entry.sql, PREVIEW_CHARS)}…` : entry.sql}
         </pre>
+        {shortened && (
+          <button type="button" className="mt-1 text-[11px] text-accent hover:underline" onClick={() => setShowAll(true)}>
+            Show all ({entry.sql.length.toLocaleString()} characters)
+          </button>
+        )}
         {entry.error && (
           <p className="mt-1.5 text-[12px] break-words whitespace-pre-wrap text-danger" data-selectable>
             {entry.error}
@@ -167,7 +185,8 @@ function ScopeToggle({
  * The sidebar's History view (spec §4.6): the executed statements, newest first, searchable (substring of the SQL)
  * and filterable to the active tab's connection, loading 100 more as the list nears its end. A click previews the
  * entry below the list; a double-click (or Enter) inserts its SQL at the cursor of the active query tab, ⌥ opens it in
- * a new query tab on its connection. The list refreshes after every run, and whenever the view is shown again.
+ * a new query tab on its connection. The list refreshes (its newest page) after every run while it is shown, and
+ * whenever the view is shown again.
  */
 export function HistoryPanel({ shown }: { shown: boolean }) {
   const [search, setSearch] = useState("");
@@ -371,7 +390,7 @@ export function HistoryPanel({ shown }: { shown: boolean }) {
       {history.isFetchingNextPage && <p className="shrink-0 px-3 py-1.5 text-[11px] text-muted">Loading more…</p>}
       {/* Below the rows: a page that failed to load more is where the list ends. */}
       {entries.length > 0 && failure}
-      {selected && <Preview entry={selected} onClose={() => setSelectedId(null)} />}
+      {selected && <Preview key={selected.id} entry={selected} onClose={() => setSelectedId(null)} />}
       {confirmClear && (
         <ConfirmDialog
           open

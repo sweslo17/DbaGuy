@@ -1,4 +1,10 @@
-import { keepPreviousData, useInfiniteQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useInfiniteQuery,
+  useQueryClient,
+  type InfiniteData,
+  type QueryClient,
+} from "@tanstack/react-query";
 import { useMemo } from "react";
 import { toast } from "@/components/ui/Toast";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
@@ -13,10 +19,23 @@ import { useProfiles } from "../connections/hooks";
  */
 
 export const historyKey = ["history"] as const;
+/** The sidebar view (the workspace's `sidebar_tab`) that shows the history. */
+export const HISTORY_VIEW = "history";
 const PAGE_SIZE = 100;
 
-/** Refetches the history being shown (every search and filter that is mounted); the others refetch when next shown. */
+type HistoryData = InfiniteData<HistoryPage, number | null>;
+
+/** Only the newest page: the pages below it load again as the list is scrolled. */
+const firstPageOnly = (data: HistoryData | undefined): HistoryData | undefined =>
+  data && data.pages.length > 1 ? { pages: data.pages.slice(0, 1), pageParams: data.pageParams.slice(0, 1) } : data;
+
+/**
+ * The history changed (a run ended, it was cleared). While the History view is shown, its newest page is fetched again
+ * (only that one, not every page loaded below it); a hidden view does nothing now, as it refreshes when shown again.
+ */
 export function refreshHistory(qc: QueryClient): void {
+  if (useWorkspace.getState().sidebarTab !== HISTORY_VIEW) return;
+  qc.setQueriesData<HistoryData>({ queryKey: historyKey }, firstPageOnly);
   void qc.invalidateQueries({ queryKey: historyKey });
 }
 

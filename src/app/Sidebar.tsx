@@ -4,15 +4,16 @@ import { cn } from "@/lib/cn";
 import { useWorkspace } from "@/stores/workspace";
 import { Explorer } from "../features/explorer/Explorer";
 import { HistoryPanel } from "../features/history/HistoryPanel";
+import { HISTORY_VIEW } from "../features/history/useHistory";
 import { ScriptsPanel } from "../features/scripts/ScriptsPanel";
 
-type SidebarView = "connections" | "scripts" | "history";
+type SidebarView = "connections" | "scripts" | typeof HISTORY_VIEW;
 
 /** `render` gets whether the view is the one shown (a view stays mounted while hidden). */
 const VIEWS: { value: SidebarView; label: string; render: (shown: boolean) => ReactNode }[] = [
   { value: "connections", label: "Connections", render: () => <Explorer /> },
   { value: "scripts", label: "Scripts", render: () => <ScriptsPanel /> },
-  { value: "history", label: "History", render: (shown) => <HistoryPanel shown={shown} /> },
+  { value: HISTORY_VIEW, label: "History", render: (shown) => <HistoryPanel shown={shown} /> },
 ];
 
 const isView = (value: string | null): value is SidebarView => VIEWS.some((view) => view.value === value);
