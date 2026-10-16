@@ -1,12 +1,16 @@
-import { X } from "lucide-react";
+import { Loader2, Plus, X } from "lucide-react";
 import { useEffect, useMemo } from "react";
+import type { Profile } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
+import { useTabStatus } from "@/stores/tabStatus";
 import { useWorkspace, type Tab } from "@/stores/workspace";
 import { useProfiles } from "../connections/hooks";
+import { profileColor } from "../connections/profileColors";
 import { ObjectDetailView } from "../explorer/ObjectDetailView";
 import { QueryTab } from "../query/QueryTab";
 import { relationOf } from "../table-data/filterValue";
 import { TableDataTab } from "../table-data/TableDataTab";
+import { requestCloseTab } from "./closeGuards";
 
 /** A tab's content: a query tab's editor, a relation's table data, or any other object's detail. */
 function TabContent({ tab, active }: { tab: Tab; active: boolean }) {
@@ -22,14 +26,57 @@ function TabContent({ tab, active }: { tab: Tab; active: boolean }) {
   }
 }
 
+/**
+ * One tab in the strip: its connection's colour underlines it; a query tab shows a spinner while it works and a dot
+ * when its script has unsaved changes. Every way of closing it goes through the close guards.
+ */
+function TabLabel({ tab, active, profile }: { tab: Tab; active: boolean; profile: Profile | undefined }) {
+  const activate = useWorkspace((s) => s.activate);
+  const status = useTabStatus(tab.id);
+  const tint = profileColor(profile?.color);
+  const query = tab.kind === "query";
+  return (
+    <div
+      role="tab"
+      aria-selected={active}
+      onClick={() => activate(tab.id)}
+      onAuxClick={(e) => {
+        if (e.button === 1) void requestCloseTab(tab.id);
+      }}
+      className={cn(
+        "group flex h-7 max-w-[220px] shrink-0 items-center gap-1.5 rounded-t-md px-2.5 text-[12px]",
+        active ? "bg-bg" : "text-muted hover:bg-hover",
+      )}
+      style={tint ? { boxShadow: `inset 0 -2px 0 ${tint}` } : undefined}
+      title={profile ? `${tab.title} · ${profile.name}` : tab.title}
+    >
+      {query && status.busy && <Loader2 size={11} className="shrink-0 animate-spin text-muted" aria-label="Running" />}
+      <span className="truncate">
+        {query && status.dirty && <span aria-label="Unsaved changes">• </span>}
+        {tab.title}
+      </span>
+      {profile && <span className="truncate text-[11px] text-muted">{profile.name}</span>}
+      <button
+        title="Close (⌘W)"
+        className="shrink-0 rounded opacity-0 group-hover:opacity-100 hover:bg-hover"
+        onClick={(e) => {
+          e.stopPropagation();
+          void requestCloseTab(tab.id);
+        }}
+      >
+        <X size={12} />
+      </button>
+    </div>
+  );
+}
+
 export function Workspace() {
   const tabs = useWorkspace((s) => s.tabs);
   const activeTabId = useWorkspace((s) => s.activeTabId);
-  const activate = useWorkspace((s) => s.activate);
-  const closeTab = useWorkspace((s) => s.closeTab);
+  const openQuery = useWorkspace((s) => s.openQuery);
   const profiles = useProfiles();
-  const profileNames = useMemo(
-    () => new Map(profiles.data?.map((entry) => [entry.profile.id, entry.profile.name])),
+  const profilesById = useMemo(
+    () => new Map(profiles.data?.map((entry) => [entry.profile.id, entry.profile])),
     [profiles.data],
   );
   const active = tabs.find((t) => t.id === activeTabId) ?? null;
@@ -39,46 +86,35 @@ export function Workspace() {
       if (e.isComposing || e.key === "Process") return;
       if (e.metaKey && e.key === "w" && activeTabId) {
         e.preventDefault();
-        closeTab(activeTabId);
+        void requestCloseTab(activeTabId);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [activeTabId, closeTab]);
+  }, [activeTabId]);
+
+  // A new query tab starts on the connection selected in the explorer.
+  const newQuery = () => openQuery(useWorkspace.getState().selectedProfileId, null);
 
   return (
     <div className="flex h-full flex-col">
       <div role="tablist" className="flex h-8 shrink-0 items-end gap-px overflow-x-auto border-b border-border bg-panel px-1">
         {tabs.map((tab) => (
-          <div
+          <TabLabel
             key={tab.id}
-            role="tab"
-            aria-selected={tab.id === activeTabId}
-            onClick={() => activate(tab.id)}
-            onAuxClick={(e) => {
-              if (e.button === 1) closeTab(tab.id);
-            }}
-            className={cn(
-              "group flex h-7 max-w-[220px] shrink-0 items-center gap-1.5 rounded-t-md px-2.5 text-[12px]",
-              tab.id === activeTabId ? "bg-bg" : "text-muted hover:bg-hover",
-            )}
-          >
-            <span className="truncate">{tab.title}</span>
-            {tab.profileId !== null && (
-              <span className="truncate text-[11px] text-muted">{profileNames.get(tab.profileId)}</span>
-            )}
-            <button
-              title="Close"
-              className="rounded opacity-0 hover:bg-hover group-hover:opacity-100"
-              onClick={(e) => {
-                e.stopPropagation();
-                closeTab(tab.id);
-              }}
-            >
-              <X size={12} />
-            </button>
-          </div>
+            tab={tab}
+            active={tab.id === activeTabId}
+            profile={tab.profileId === null ? undefined : profilesById.get(tab.profileId)}
+          />
         ))}
+        <button
+          title="New query on the connection selected in the sidebar"
+          aria-label="New query"
+          className="mb-1 ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted hover:bg-hover hover:text-fg"
+          onClick={newQuery}
+        >
+          <Plus size={14} />
+        </button>
       </div>
       <div className="min-h-0 flex-1">
         {!active && (

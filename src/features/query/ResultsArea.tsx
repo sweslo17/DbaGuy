@@ -49,15 +49,15 @@ export interface ResultsAreaProps extends Omit<RunMessagesProps, "run"> {
   phase: SessionPhase;
   dialect: Dialect | null;
   pageSize: number;
-  /** The export's default file name. */
-  title: string;
+  /** Opens the tab's export dialog for a result's statement; stable across renders. */
+  onExport: (sql: string) => void;
 }
 
 /**
  * The results of the tab's latest run (spec §4.1): a tab per result set, titled by its statement, plus Messages.
  * Until a new run delivers its first result, the previous grids stay, dimmed. A grid mounts the first time its tab is
- * shown and then stays mounted while another tab is shown, so its scroll, widths and a running export survive
- * switching. Without a choice by the user, the first result is shown, or Messages once a statement failed.
+ * shown and then stays mounted while another tab is shown, so its scroll and widths survive switching (the export
+ * dialog belongs to the query tab). Without a choice by the user, the first result is shown, or Messages once a statement failed.
  */
 export function ResultsArea({
   run,
@@ -66,7 +66,7 @@ export function ResultsArea({
   phase,
   dialect,
   pageSize,
-  title,
+  onExport,
   ...messages
 }: ResultsAreaProps) {
   const tabs = useMemo(() => resultTabs(run, executions), [run, executions]);
@@ -118,9 +118,9 @@ export function ResultsArea({
               stale={held.stale}
               canLoadMore={canLoadMore}
               exportable={!run.active}
+              onExport={onExport}
               controller={controller}
               pageSize={pageSize}
-              title={title}
               dialect={dialect}
               hidden={tab.key !== selected}
             />

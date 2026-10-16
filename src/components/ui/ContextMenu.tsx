@@ -1,4 +1,4 @@
-import { ChevronRight } from "lucide-react";
+import { Check, ChevronRight } from "lucide-react";
 import { ContextMenu as Radix, DropdownMenu as RadixDropdown } from "radix-ui";
 import { Fragment, type MouseEvent, type ReactNode } from "react";
 import { cn } from "@/lib/cn";
@@ -12,6 +12,8 @@ export interface MenuItem {
   separatorBefore?: boolean;
   /** Shown muted at the right edge, e.g. "⌘C". */
   shortcut?: string;
+  /** A choice in a list: true shows a check mark (false keeps the mark's space, so the labels line up). */
+  checked?: boolean;
   /** A submenu. */
   children?: MenuItem[];
 }
@@ -44,6 +46,9 @@ function MenuItems({ items, parts: P }: { items: MenuItem[]; parts: MenuParts })
         </P.Sub>
       ) : (
         <P.Item onSelect={item.onSelect} disabled={item.disabled} className={cn(ITEM, item.danger && "text-danger")}>
+          {item.checked !== undefined && (
+            <Check size={12} className={cn("mr-1.5 -ml-0.5 shrink-0", !item.checked && "invisible")} />
+          )}
           <span className="min-w-0 truncate">{item.label}</span>
           {item.shortcut && <span className="ml-auto pl-6 text-[12px] opacity-60">{item.shortcut}</span>}
         </P.Item>
@@ -83,12 +88,14 @@ export interface DropdownMenuProps {
   align?: "start" | "center" | "end";
   /** Extra classes for the menu, e.g. a maximum width. */
   className?: string;
+  /** Told when the menu opens or closes (e.g. to load its items only once it is opened). */
+  onOpenChange?: (open: boolean) => void;
 }
 
 /** A menu opened by a button, with the same items and look as the context menu. */
-export function DropdownMenu({ items, children, align = "start", className }: DropdownMenuProps) {
+export function DropdownMenu({ items, children, align = "start", className, onOpenChange }: DropdownMenuProps) {
   return (
-    <RadixDropdown.Root>
+    <RadixDropdown.Root onOpenChange={onOpenChange}>
       <RadixDropdown.Trigger asChild>{children}</RadixDropdown.Trigger>
       <RadixDropdown.Portal>
         <RadixDropdown.Content className={cn(CONTENT, className)} align={align} sideOffset={4}>

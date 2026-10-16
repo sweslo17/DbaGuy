@@ -2,6 +2,7 @@ import { Loader2 } from "lucide-react";
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useStore } from "zustand";
 import { Button } from "@/components/ui/Button";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Dialog } from "@/components/ui/Dialog";
 import { Checkbox, FieldRow, Input, Select } from "@/components/ui/Field";
 import { toast } from "@/components/ui/Toast";
@@ -9,11 +10,15 @@ import { errorMessage } from "@/lib/api/client";
 import type { FormatKind, RowFormatOptions } from "@/lib/api/types";
 import { plural } from "@/lib/format";
 import { canChooseFiles, chooseSavePath } from "@/lib/native";
+import { useNow } from "@/lib/useNow";
 import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
 import type { SessionController } from "../session/SessionController";
 import { COPY_FORMAT_LABELS } from "./copy";
 
 type TableName = { schema: string | null; name: string };
+
+/** Cancelling an export cancels its statement, which aborts the transaction it runs in (PostgreSQL). */
+export const EXPORT_CANCEL_ABORTS_TRANSACTION = "Cancelling the export aborts the open transaction";
 
 /** What the export dialog writes: the statement behind a grid, run again in full on the grid's own session. */
 export interface ExportSource {
@@ -87,16 +92,6 @@ function formatElapsed(ms: number): string {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
-/** The current time, updated every `intervalMs` while mounted. */
-function useNow(intervalMs: number): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), intervalMs);
-    return () => window.clearInterval(timer);
-  }, [intervalMs]);
-  return now;
-}
-
 function ExportProgress({ path, rows, startedAt }: { path: string; rows: number; startedAt: number }) {
   const now = useNow(500);
   return (
@@ -133,7 +128,8 @@ function OutcomeNote({ outcome }: { outcome: Outcome }) {
  * session and streams the raw values through the shared formatter, which also ends the grid's paused page. While the
  * export runs the dialog shows its progress and can only be left by cancelling it — or closed while the session is
  * not connected, since the export is interrupted then anyway; an error or a cancel keeps the dialog open with the
- * settings, so the path can be changed and the export retried.
+ * settings, so the path can be changed and the export retried. Inside an open transaction, cancelling would abort it:
+ * the dialog says so beside Cancel and asks before cancelling. Hosted by the tab, so a remounting grid never ends it.
  */
 export function ExportDialog({
   source,
@@ -153,9 +149,11 @@ export function ExportDialog({
   const [path, setPath] = useState("");
   const [running, setRunning] = useState<{ requestId: string; path: string; startedAt: number } | null>(null);
   const [cancelling, setCancelling] = useState(false);
+  const [confirmCancel, setConfirmCancel] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const execution = useStore(controller.store, (s) => (running ? s.executions[running.requestId] : undefined));
   const connected = useStore(controller.store, (s) => s.phase === "open");
+  const inTransaction = useStore(controller.store, (s) => !!s.state?.inTransaction && !s.state.transactionFailed);
   const pathInput = useRef<HTMLInputElement>(null);
   const isOpen = useRef(open);
   useEffect(() => {
@@ -203,6 +201,7 @@ export function ExportDialog({
     const settle = (next: Outcome | null) => {
       controller.forget(requestId);
       setRunning(null);
+      setConfirmCancel(false);
       if (next?.kind === "error" && !isOpen.current) {
         // Closed while disconnected: say how it ended now, not in a note waiting for the next opening.
         toast("error", `Export failed: ${next.message}`);
@@ -226,10 +225,12 @@ export function ExportDialog({
   };
 
   const cancel = () => {
+    setConfirmCancel(false);
     if (!running) return;
     controller.cancel(running.requestId);
     setCancelling(true);
   };
+  const askCancel = () => (inTransaction ? setConfirmCancel(true) : cancel());
 
   /**
    * A running export keeps the dialog open (Escape and outside clicks do nothing, Cancel stops it) while the session is
@@ -251,8 +252,11 @@ export function ExportDialog({
   // Export keeps its slot (disabled while running), so a double click on it never lands on Cancel.
   const footer = (
     <>
+      {running && connected && inTransaction && (
+        <span className="mr-auto self-center text-[12px] text-warning">{EXPORT_CANCEL_ABORTS_TRANSACTION}</span>
+      )}
       {running && connected ? (
-        <Button onClick={cancel} disabled={cancelling}>
+        <Button onClick={askCancel} disabled={cancelling}>
           {cancelling ? "Cancelling…" : "Cancel"}
         </Button>
       ) : (
@@ -268,6 +272,15 @@ export function ExportDialog({
 
   return (
     <Dialog open={open} onOpenChange={changeOpen} title="Export result" width={520} footer={footer}>
+      <ConfirmDialog
+        open={confirmCancel && !!running && connected}
+        onOpenChange={setConfirmCancel}
+        title="Cancel the export?"
+        message={`${EXPORT_CANCEL_ABORTS_TRANSACTION}: afterwards it can only be rolled back.`}
+        confirmLabel="Cancel export"
+        cancelLabel="Keep exporting"
+        onConfirm={cancel}
+      />
       {running ? (
         <ExportProgress path={running.path} rows={execution?.progressRows ?? 0} startedAt={running.startedAt} />
       ) : (

@@ -11,19 +11,12 @@ import { cn } from "@/lib/cn";
 import { useWorkspace } from "@/stores/workspace";
 import { ConnectionDialog, ENGINE_LABELS } from "../connections/ConnectionDialog";
 import { useDeleteProfile, useProfiles } from "../connections/hooks";
+import { profileColor } from "../connections/profileColors";
 import { secretsNeeded, UnlockDialog, type SecretsNeeded } from "../connections/UnlockDialog";
 import { folderLabel, kindIcon } from "./kinds";
 import { nodeKeyPrefix, profileKey, useTreeRows, type Expansion, type TreeRow } from "./useTreeRows";
 
 const ROW_HEIGHT = 22;
-const COLOR_CLASSES: Record<string, string> = {
-  none: "bg-transparent",
-  green: "bg-green-500",
-  yellow: "bg-yellow-400",
-  orange: "bg-orange-500",
-  red: "bg-red-500",
-  purple: "bg-purple-500",
-};
 /** Nodes that group other nodes: double-click expands them instead of opening a detail tab. */
 const CONTAINER_KINDS = new Set(["folder", "database", "schema"]);
 
@@ -31,6 +24,13 @@ type ErrorRow = Extract<TreeRow, { type: "error" }>;
 
 const isExpandable = (row: TreeRow) =>
   row.type === "folder" || row.type === "profile" || (row.type === "node" && row.node.has_children);
+
+/** The connection a row belongs to (a folder belongs to none). */
+function rowProfileId(row: TreeRow): string | null {
+  if (row.type === "profile") return row.entry.profile.id;
+  if (row.type === "node" || row.type === "error") return row.profileId;
+  return null;
+}
 
 function Chevron({ show, open, onToggle }: { show: boolean; open: boolean; onToggle: () => void }) {
   if (!show) return <span className="w-4 shrink-0" />;
@@ -54,6 +54,7 @@ export function Explorer() {
   const deleteProfile = useDeleteProfile();
   const openObject = useWorkspace((s) => s.openObject);
   const openQuery = useWorkspace((s) => s.openQuery);
+  const selectProfile = useWorkspace((s) => s.selectProfile);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   // Which {profile, path} each expandable row loads its children from; filled the first time a row is expanded.
   const [expansions] = useState(() => new Map<string, Expansion>());
@@ -71,6 +72,13 @@ export function Explorer() {
     estimateSize: () => ROW_HEIGHT,
     overscan: 20,
   });
+
+  /** Selects a row; its connection becomes the workspace's selected profile (the default of a new query tab). */
+  const selectRow = (row: TreeRow) => {
+    setSelected(row.key);
+    const profileId = rowProfileId(row);
+    if (profileId) selectProfile(profileId);
+  };
 
   const toggle = useCallback(
     (row: TreeRow, force?: boolean) => {
@@ -117,6 +125,7 @@ export function Explorer() {
     for (const key of [...expansions.keys()]) if (owned(key)) expansions.delete(key);
     setExpanded((prev) => new Set([...prev].filter((key) => !owned(key))));
     setSelected((prev) => (prev && owned(prev) ? null : prev));
+    if (useWorkspace.getState().selectedProfileId === profileId) selectProfile(null);
     qc.removeQueries({ queryKey: ["children", profileId] });
     qc.removeQueries({ queryKey: ["detail", profileId] });
     // Table and object tabs close; query tabs keep their text and lose only the connection.
@@ -134,7 +143,7 @@ export function Explorer() {
       const clamped = Math.max(0, Math.min(rows.length - 1, i));
       const target = rows[clamped];
       if (!target) return;
-      setSelected(target.key);
+      selectRow(target);
       virtualizer.scrollToIndex(clamped);
     };
     if (e.key === "ArrowDown") {
@@ -183,7 +192,7 @@ export function Explorer() {
       case "folder": {
         const Icon = kindIcon("folder");
         return (
-          <div {...aria} className={base} style={pad} onClick={() => setSelected(row.key)} onDoubleClick={() => toggle(row)}>
+          <div {...aria} className={base} style={pad} onClick={() => selectRow(row)} onDoubleClick={() => toggle(row)}>
             {chevron}
             <Icon size={14} className="shrink-0 text-muted" />
             <span className="truncate">{row.name}</span>
@@ -197,13 +206,13 @@ export function Explorer() {
             {...aria}
             className={base}
             style={pad}
-            onClick={() => setSelected(row.key)}
-            onContextMenu={() => setSelected(row.key)}
+            onClick={() => selectRow(row)}
+            onContextMenu={() => selectRow(row)}
             onDoubleClick={() => toggle(row)}
           >
             {chevron}
             <Server size={14} className="shrink-0 text-muted" />
-            <span className={cn("h-2 w-2 shrink-0 rounded-full", COLOR_CLASSES[p.color])} />
+            <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: profileColor(p.color) ?? "transparent" }} />
             <span className="truncate font-medium">{p.name}</span>
             <span className="ml-auto shrink-0 text-[11px] text-muted">{ENGINE_LABELS[p.engine]}</span>
           </div>
@@ -230,7 +239,7 @@ export function Explorer() {
             className={cn(base, row.node.system && "opacity-60")}
             style={pad}
             title={row.node.detail ? `${label} — ${row.node.detail}` : label}
-            onClick={() => setSelected(row.key)}
+            onClick={() => selectRow(row)}
             onDoubleClick={() => activate(row)}
           >
             {chevron}

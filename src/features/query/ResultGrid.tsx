@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo } from "react";
+import { memo, useCallback } from "react";
 import type { Dialect } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { DataGrid } from "../grid/DataGrid";
@@ -19,10 +19,10 @@ export interface ResultGridProps {
   canLoadMore: boolean;
   /** The run is over: an export would not have to wait behind its statements. */
   exportable: boolean;
+  /** Opens the tab's export dialog for this statement; stable across renders. */
+  onExport: (sql: string) => void;
   controller: SessionController | null;
   pageSize: number;
-  /** The export's default file name. */
-  title: string;
   dialect: Dialect | null;
   hidden: boolean;
 }
@@ -32,12 +32,9 @@ export interface ResultGridProps {
  * changed (the reducer keeps the identity of every untouched execution and set), not every grid of the run.
  */
 export const ResultGrid = memo(function ResultGrid(props: ResultGridProps) {
-  const { set, requestId, sql, controller, pageSize, title, canLoadMore, exportable } = props;
+  const { set, requestId, sql, controller, pageSize, canLoadMore, exportable, onExport } = props;
   const loadMore = useCallback(() => controller?.fetchMore(requestId, pageSize), [controller, requestId, pageSize]);
-  const exportSource = useMemo(
-    () => (controller && exportable ? { controller, sql, title } : null),
-    [controller, exportable, sql, title],
-  );
+  const exportThis = useCallback(() => onExport(sql), [onExport, sql]);
   return (
     <div className={cn("h-full", props.hidden && "hidden")}>
       <DataGrid
@@ -49,7 +46,7 @@ export const ResultGrid = memo(function ResultGrid(props: ResultGridProps) {
         onLoadMore={canLoadMore ? loadMore : undefined}
         stale={props.stale}
         dialect={props.dialect}
-        exportSource={exportSource}
+        onExport={controller && exportable ? exportThis : undefined}
       />
     </div>
   );

@@ -16,6 +16,7 @@ import type {
 } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { useEngines, useImportUrl, useSaveProfile, useTestConnection } from "./hooks";
+import { PROFILE_COLOR_ORDER } from "./profileColors";
 
 export const ENGINE_LABELS: Record<Engine, string> = {
   postgres: "PostgreSQL",
@@ -25,7 +26,6 @@ export const ENGINE_LABELS: Record<Engine, string> = {
   sqlite: "SQLite",
 };
 
-const COLORS: ProfileDraft["color"][] = ["none", "green", "yellow", "orange", "red", "purple"];
 const SSL_MODES: SslConfig["mode"][] = ["disable", "prefer", "require", "verify-ca", "verify-full"];
 const SSL_FILE_FIELDS = [
   { field: "ca_file", label: "CA file" },
@@ -297,7 +297,7 @@ function ConnectionDialogBody({
         </FieldRow>
         <FieldRow label="Color">
           <Select value={draft.color} onChange={(e) => patchCommon({ color: e.target.value as ProfileDraft["color"] })}>
-            {COLORS.map((color) => (
+            {PROFILE_COLOR_ORDER.map((color) => (
               <option key={color} value={color}>
                 {color}
               </option>

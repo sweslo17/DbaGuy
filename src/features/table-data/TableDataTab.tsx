@@ -6,15 +6,18 @@ import { Tabs } from "@/components/ui/Tabs";
 import { cn } from "@/lib/cn";
 import { plural } from "@/lib/format";
 import { useWorkspace, type TableTabState } from "@/stores/workspace";
-import { useDialect } from "../connections/hooks";
+import { useDialect, useProfiles } from "../connections/hooks";
 import { ColumnsView, DdlView } from "../explorer/ObjectDetailView";
 import { kindLabel } from "../explorer/kinds";
 import { DataGrid } from "../grid/DataGrid";
+import { ExportDialog } from "../grid/ExportDialog";
 import type { GridSort } from "../grid/GridHeader";
 import { useHeldResult } from "../grid/useHeldResult";
+import { useSessionGuards } from "../query/CloseTabGuard";
 import { CONNECTION_LOST } from "../session/execution";
 import { isExporting } from "../session/SessionController";
 import { SessionError } from "../session/SessionError";
+import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
 import { FilterBar } from "./FilterBar";
 import { addCondition, filterForValue, type Relation } from "./filterValue";
 import { useTableData, type TableDataState } from "./useTableData";
@@ -105,6 +108,12 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   const { applyFilter, toggleSort, sortBy } = table;
   const dialect = useDialect(tab.profileId);
   const openQuery = useWorkspace((s) => s.openQuery);
+  const profiles = useProfiles();
+  const profileName = profiles.data?.find((entry) => entry.profile.id === tab.profileId)?.profile.name;
+  const guards = useSessionGuards(table.controller, profileName ? `${tab.title} · ${profileName}` : tab.title);
+  useCloseGuard(tab.id, CLOSE_GUARD_ORDER.export, () => guards.exportStep("close"));
+  const [exportOpen, setExportOpen] = useState(false);
+  const openExport = useCallback(() => setExportOpen(true), []);
   const phase = snapshot?.phase ?? "opening";
   const current = execution?.resultSets[0] ?? null;
   // Until a sort, filter or refresh delivers its first page, the grid keeps the previous rows (and its layout), dimmed.
@@ -150,6 +159,7 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
     },
     [columns, rows, dialect, applyFilter, state.filter, exporting],
   );
+  // Export writes the current browse SELECT (filter, sort and refresh wait while it runs).
   const exportSource = useMemo(
     () =>
       table.controller && execution && relation
@@ -231,12 +241,14 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
             onHeaderClick={onHeaderClick}
             onSortBy={exporting ? undefined : onSortBy}
             extraCellMenu={extraCellMenu}
-            exportSource={exportSource}
+            onExport={exportSource ? openExport : undefined}
           />
         ) : (
           placeholder && <p className="p-4 text-[12px] text-muted">{placeholder}</p>
         )}
       </div>
+      {exportSource && <ExportDialog source={exportSource} open={exportOpen} onOpenChange={setExportOpen} />}
+      {guards.dialog}
     </div>
   );
 }

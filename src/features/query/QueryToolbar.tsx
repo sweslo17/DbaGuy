@@ -1,25 +1,20 @@
 import { ListEnd, Play, Square } from "lucide-react";
 import { Button } from "@/components/ui/Button";
-import type { SessionInfo } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
-import type { SessionPhase, SessionStateView } from "../session/SessionController";
+import type { SessionStateView } from "../session/SessionController";
+import { ConnectionPicker, type ConnectionPickerProps } from "./ConnectionPicker";
 import { TransactionBadge } from "./TransactionBadge";
 
-const PHASE_DOT: Record<SessionPhase, string> = {
-  opening: "bg-warning",
-  open: "bg-success",
-  reconnecting: "bg-warning",
-  failed: "bg-danger",
-  closed: "bg-danger",
-};
+/** Toolbar buttons keep their size: the connection's details shrink first. */
+const FIXED = "shrink-0 whitespace-nowrap";
 
 export interface QueryToolbarProps {
-  /** null: the tab has no connection yet. */
-  profileName: string | null;
-  phase: SessionPhase;
-  session: SessionInfo | null;
-  sessionFailed: boolean;
+  connection: ConnectionPickerProps;
   state: SessionStateView | null;
+  /** The tab is shown: the badge's clock ticks. */
+  visible: boolean;
+  /** A session message just arrived: the badge pulses. */
+  pulse: boolean;
   /** What ⌘↵ runs without a selection (the `run.default` setting). */
   runDefault: "statement" | "all";
   canRun: boolean;
@@ -29,57 +24,107 @@ export interface QueryToolbarProps {
   onRun: () => void;
   onRunAll: () => void;
   onCancel: () => void;
+  /** The tab's desired auto-commit mode. */
+  autocommit: boolean;
+  onAutocommitChange: (enabled: boolean) => void;
+  /** Commit and Rollback are possible now; otherwise `endBlockedReason` says why not. */
+  canEnd: boolean;
+  endBlockedReason?: string;
+  onCommit: () => void;
+  onRollback: () => void;
 }
 
-/** The connection this tab runs on: profile, database and server, with the session's phase as a dot. */
-function ConnectionLabel({
-  profileName,
-  phase,
-  session,
-  sessionFailed,
-}: Pick<QueryToolbarProps, "profileName" | "phase" | "session" | "sessionFailed">) {
-  if (profileName === null) return <span className="text-[12px] text-muted">Choose a connection</span>;
-  const detail = session
-    ? [session.database, session.server.version].filter(Boolean).join(" · ")
-    : sessionFailed
-      ? "Not connected"
-      : "Connecting…";
+/** "Auto-commit" with a checkbox; its tooltip says why it is disabled (on the label: a disabled input shows none). */
+function AutocommitToggle({
+  checked,
+  disabledReason,
+  onChange,
+}: {
+  checked: boolean;
+  disabledReason?: string;
+  onChange: (enabled: boolean) => void;
+}) {
   return (
-    <span className="flex min-w-0 items-center gap-1.5 text-[12px]">
-      <span className={cn("h-2 w-2 shrink-0 rounded-full", PHASE_DOT[phase])} title={phase} />
-      <span className="shrink-0 font-medium">{profileName}</span>
-      <span className="truncate text-[11px] text-muted">{detail}</span>
-    </span>
+    <label
+      className={cn(
+        "flex shrink-0 items-center gap-1.5 px-1 text-[12px] whitespace-nowrap",
+        disabledReason && "opacity-50",
+      )}
+      title={disabledReason ?? "Commit each statement on its own; off: statements run in a transaction until Commit"}
+    >
+      <input
+        type="checkbox"
+        className="accent-[var(--accent)]"
+        checked={checked}
+        disabled={!!disabledReason}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      Auto-commit
+    </label>
   );
 }
 
 export function QueryToolbar(props: QueryToolbarProps) {
-  const { runDefault, canRun, runBlockedReason, canCancel, onRun, onRunAll, onCancel } = props;
+  const { runDefault, canRun, runBlockedReason, canCancel, onRun, onRunAll, onCancel, state } = props;
   const runTitle = `Run the selection, or ${runDefault === "all" ? "every statement" : "the statement under the cursor"} (⌘↵)`;
+  const endReason = props.canEnd ? undefined : props.endBlockedReason;
   return (
-    <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border px-2">
-      <Button variant="primary" size="sm" onClick={onRun} disabled={!canRun} title={runBlockedReason ?? runTitle}>
+    <div className="flex h-9 min-w-0 shrink-0 items-center gap-2 overflow-hidden border-b border-border px-2">
+      <Button
+        variant="primary"
+        size="sm"
+        className={FIXED}
+        onClick={onRun}
+        disabled={!canRun}
+        title={runBlockedReason ?? runTitle}
+      >
         <Play size={12} /> Run
       </Button>
       <Button
         size="sm"
+        className={FIXED}
         onClick={onRunAll}
         disabled={!canRun}
         title={runBlockedReason ?? "Run every statement (of the selection, if any), one after another (⌘⇧↵)"}
       >
         <ListEnd size={12} /> Run all
       </Button>
-      <Button size="sm" onClick={onCancel} disabled={!canCancel} title="Cancel the running statement and stop the run">
+      <Button
+        size="sm"
+        className={FIXED}
+        onClick={onCancel}
+        disabled={!canCancel}
+        title="Cancel the running statement and stop the run"
+      >
         <Square size={12} /> Cancel
       </Button>
-      <div className="flex-1" />
-      <TransactionBadge state={props.state} />
-      <ConnectionLabel
-        profileName={props.profileName}
-        phase={props.phase}
-        session={props.session}
-        sessionFailed={props.sessionFailed}
+      <div className="mx-1 h-4 w-px shrink-0 bg-border" />
+      <AutocommitToggle
+        checked={props.autocommit}
+        disabledReason={state?.inTransaction ? "Commit or roll back first" : undefined}
+        onChange={props.onAutocommitChange}
       />
+      <Button
+        size="sm"
+        className={FIXED}
+        onClick={props.onCommit}
+        disabled={!props.canEnd}
+        title={endReason ?? "Commit the transaction"}
+      >
+        Commit
+      </Button>
+      <Button
+        size="sm"
+        className={FIXED}
+        onClick={props.onRollback}
+        disabled={!props.canEnd}
+        title={endReason ?? "Roll back the transaction"}
+      >
+        Rollback
+      </Button>
+      <div className="flex-1" />
+      <TransactionBadge state={state} visible={props.visible} pulse={props.pulse} />
+      <ConnectionPicker {...props.connection} />
     </div>
   );
 }

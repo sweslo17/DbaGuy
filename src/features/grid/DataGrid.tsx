@@ -21,7 +21,6 @@ import { cn } from "@/lib/cn";
 import { aggregate } from "./aggregate";
 import { columnSignature, HEADER_HEIGHT, ROW_HEIGHT } from "./columns";
 import { copyDefault, copySelection, type CopyFormat, type CopyInput } from "./copy";
-import { ExportDialog, type ExportSource } from "./ExportDialog";
 import { GridDrawerPanel, type GridDrawer } from "./GridDrawer";
 import { GridHeader, type GridSort } from "./GridHeader";
 import { GridMenu } from "./GridMenu";
@@ -72,8 +71,11 @@ export interface DataGridProps {
   /** Items appended to a cell's context menu. */
   extraCellMenu?: (row: number, column: number) => MenuItem[];
   onSelectionChange?: (state: GridSelectionState | null) => void;
-  /** The statement behind the rows, for "Export…" (context menu and status bar); none: no export. */
-  exportSource?: ExportSource | null;
+  /**
+   * "Export…" (context menu and status bar) calls it; none: no export. The tab hosts the export dialog, so a running
+   * export outlives a remounting grid.
+   */
+  onExport?: () => void;
   ref?: Ref<DataGridHandle>;
 }
 
@@ -125,7 +127,7 @@ function LoadMoreFooter({ rowCount, hasMore, loading, onLoadMore }: LoadMoreFoot
  */
 export function DataGrid(props: DataGridProps) {
   const { columns, rows, hasMore, sort, onHeaderClick, stale = false, ref } = props;
-  const { dialect, tableName, onSortBy, extraCellMenu, onSelectionChange, exportSource, partial = false } = props;
+  const { dialect, tableName, onSortBy, extraCellMenu, onSelectionChange, onExport, partial = false } = props;
   // Stale rows are only shown: nothing is loaded for them.
   const loadingMore = props.loadingMore && !stale;
   const onLoadMore = stale ? undefined : props.onLoadMore;
@@ -140,8 +142,6 @@ export function DataGrid(props: DataGridProps) {
   const [drawerWidth, setDrawerWidth] = useState(DRAWER_WIDTH);
   /** The drawer's width while it is open; kept for the next opening when it closes. */
   const liveDrawerWidth = useRef(DRAWER_WIDTH);
-  const [exportOpen, setExportOpen] = useState(false);
-  const openExport = useCallback(() => setExportOpen(true), []);
   const footer = hasMore || loadingMore || rows.length === 0;
 
   const rowVirtualizer = useVirtualizer({
@@ -326,7 +326,7 @@ export function DataGrid(props: DataGridProps) {
                 openRecord={openAt(openRecord)}
                 sortBy={onSortBy}
                 extraCellMenu={extraCellMenu}
-                openExport={exportSource ? openExport : undefined}
+                openExport={onExport}
               >
                 <div
                   ref={scrollRef}
@@ -426,9 +426,8 @@ export function DataGrid(props: DataGridProps) {
         hasMore={hasMore}
         partial={partial}
         aggregates={aggregates}
-        onExport={exportSource ? openExport : undefined}
+        onExport={onExport}
       />
-      {exportSource && <ExportDialog source={exportSource} open={exportOpen} onOpenChange={setExportOpen} />}
     </div>
   );
 }

@@ -28,6 +28,16 @@ export const nodeKey = (profileId: string, path: PathSegment[]) => `${nodeKeyPre
 export const childrenQueryKey = (profileId: string, path: PathSegment[]) =>
   ["children", profileId, pathKey(path)] as const;
 
+/** The query for an object's children (`path` [] is the connection's root): shared by the tree and the query tab. */
+export function childrenQuery(profileId: string, path: PathSegment[]) {
+  return {
+    queryKey: childrenQueryKey(profileId, path),
+    queryFn: async () => unwrap(await (await api()).POST("/metadata/children", { body: { profile_id: profileId, path } })),
+    staleTime: 5 * 60_000,
+    retry: false, // the row offers an explicit Retry; auto-retrying delays the error and re-asks for passwords
+  };
+}
+
 /** The object whose children an expanded row shows. */
 export interface Expansion {
   profileId: string;
@@ -42,13 +52,7 @@ export function useTreeRows(
 ): TreeRow[] {
   const targets = useMemo(() => [...expansions.entries()].filter(([key]) => expanded.has(key)), [expansions, expanded]);
   const results = useQueries({
-    queries: targets.map(([, target]) => ({
-      queryKey: childrenQueryKey(target.profileId, target.path),
-      queryFn: async () =>
-        unwrap(await (await api()).POST("/metadata/children", { body: { profile_id: target.profileId, path: target.path } })),
-      staleTime: 5 * 60_000,
-      retry: false, // the row offers an explicit Retry; auto-retrying delays the error and re-asks for passwords
-    })),
+    queries: targets.map(([, target]) => childrenQuery(target.profileId, target.path)),
   });
 
   return useMemo(() => {
