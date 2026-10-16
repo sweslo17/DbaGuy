@@ -3,6 +3,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${DBAGUY_DEV_PORT:-18765}"
+# Dev runs keep their profiles, history and workspace in the git-ignored dev/data, never in the app's real
+# ~/Library/Application Support/DbaGuy (set DBAGUY_DATA_DIR to override).
+export DBAGUY_DATA_DIR="${DBAGUY_DATA_DIR:-$ROOT/dev/data}"
+mkdir -p "$DBAGUY_DATA_DIR"
 # A fresh secret every run: the dev backend listens on a fixed port, so a fixed token would let any local page or
 # process drive it. It goes to the backend, to Vite (--web) and to the Tauri dev shell.
 TOKEN="$("$ROOT/backend/.venv/bin/python" -c 'import secrets; print(secrets.token_hex(32))')"

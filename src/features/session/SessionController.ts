@@ -97,7 +97,11 @@ export class SessionController {
     private readonly database: string | null,
   ) {}
 
-  /** Creates the backend session and connects its socket. Idempotent. */
+  /**
+   * Creates the backend session and starts connecting its socket. Idempotent. It resolves before the socket is open:
+   * wait for `phase === "open"` before sending commands, because a command sent earlier ends at once as
+   * `not_connected`.
+   */
   open(): Promise<void> {
     if (this.closed) return Promise.resolve();
     this.opening ??= this.connect();
@@ -247,11 +251,10 @@ export class SessionController {
     }));
   }
 
-  /** Sends only while the socket is open: SessionSocket would otherwise queue the command and replay it late. */
+  /** Sends only while the session is open and its WebSocket is too (`phase` lags a socket that is closing). */
   private send(command: ClientCommand): boolean {
     if (this.closed || !this.socket || this.store.getState().phase !== "open") return false;
-    this.socket.send(command);
-    return true;
+    return this.socket.trySend(command);
   }
 
   private track(kind: ExecutionKind, sql: string, command: ClientCommand): string {

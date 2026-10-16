@@ -117,7 +117,7 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
         <Button variant="primary" size="sm" onClick={run} disabled={!canRun}>
           Run ⌘↵
         </Button>
-        <Button size="sm" onClick={cancel} disabled={execution?.status !== "running"}>
+        <Button size="sm" onClick={cancel} disabled={phase !== "open" || execution?.status !== "running"}>
           Cancel
         </Button>
         <div className="flex-1" />

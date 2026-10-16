@@ -10,12 +10,11 @@ const CLOSE_SESSION_NOT_FOUND = 4404;
 const BACKOFF_BASE_MS = 250;
 const BACKOFF_MAX_MS = 5000;
 
-/** One WebSocket per session; queues commands until open and reconnects with backoff. */
+/** One WebSocket per session; reconnects with backoff. Commands are never queued: they are sent only while open. */
 export class SessionSocket {
   private ws: WebSocket | null = null;
   private readonly listeners = new Set<Listener>();
   private readonly statusListeners = new Set<StatusListener>();
-  private readonly pending: ClientCommand[] = [];
   private closedByUser = false;
   private rejected = false;
   private attempts = 0;
@@ -38,7 +37,6 @@ export class SessionSocket {
     ws.onopen = () => {
       this.attempts = 0;
       this.setStatus("open");
-      for (const command of this.pending.splice(0)) ws.send(JSON.stringify(command));
     };
     ws.onmessage = (message) => {
       const event = JSON.parse(message.data as string) as ServerEvent;
@@ -54,9 +52,11 @@ export class SessionSocket {
     };
   }
 
-  send(command: ClientCommand): void {
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(command));
-    else this.pending.push(command);
+  /** Sends only while the WebSocket is open (never queued, so nothing is replayed after a reconnect). */
+  trySend(command: ClientCommand): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN) return false;
+    this.ws.send(JSON.stringify(command));
+    return true;
   }
 
   subscribe(listener: Listener): () => void {
