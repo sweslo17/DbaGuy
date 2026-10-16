@@ -23,12 +23,6 @@ const FIELD_CHARS = 2000;
 
 function RecordField({ column, value }: { column: ColumnMeta; value: unknown }) {
   const cell = describeCell(value, column.category, FIELD_CHARS);
-  // Clipped at FIELD_CHARS (or one less, not to split a surrogate pair).
-  const cut =
-    (cell.kind === "text" || cell.kind === "json") &&
-    typeof value === "string" &&
-    value.length > FIELD_CHARS &&
-    cell.text.length >= FIELD_CHARS - 1;
   return (
     <>
       <dt className="min-w-0 border-b border-border px-3 py-1">
@@ -43,7 +37,7 @@ function RecordField({ column, value }: { column: ColumnMeta; value: unknown }) 
       >
         <span className={cn(cell.kind === "null" && "text-muted italic")}>
           {cell.text}
-          {cut && "…"}
+          {cell.clipped && "…"}
         </span>
         {cell.detail && <span className="text-muted">{cell.detail}</span>}
         {cell.kind === "empty" && <span className="font-sans text-muted italic">empty string</span>}

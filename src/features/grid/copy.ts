@@ -9,6 +9,8 @@ export type CopyFormat = "tsv" | "csv" | "json" | "markdown" | "insert" | "in_li
 
 /** The most rows `/sql/format-rows` accepts; larger selections are exported instead. */
 export const COPY_ROW_LIMIT = 100_000;
+/** The most cells (rows × columns) a copy sends: a wide selection under the row limit would still stall the app. */
+export const COPY_CELL_LIMIT = 1_000_000;
 
 /** "Copy as" menu order. */
 export const COPY_FORMATS: readonly CopyFormat[] = [
@@ -147,8 +149,10 @@ export async function copySelection(format: CopyFormat, input: CopyInput): Promi
   const { rect, columns } = input;
   if (format === "column_names") return copyColumnNames(columns.slice(rect.left, rect.right + 1));
   const rowCount = rect.bottom - rect.top + 1;
-  if (rowCount > COPY_ROW_LIMIT) {
-    toast("warning", `Selection too large to copy (${rowCount.toLocaleString()} rows). Use Export instead.`);
+  const cells = cellCount(rect);
+  if (rowCount > COPY_ROW_LIMIT || cells > COPY_CELL_LIMIT) {
+    const size = rowCount > COPY_ROW_LIMIT ? plural(rowCount, "row") : plural(cells, "cell");
+    toast("warning", `Selection too large to copy (${size}). Use Export instead.`);
     return;
   }
   if (input.dialect === null && DIALECT_FORMATS.has(format)) {

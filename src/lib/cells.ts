@@ -8,6 +8,8 @@ export interface CellDisplay {
   kind: CellKind;
   /** Muted suffix after the text, e.g. the size of a bytes or truncated value. */
   detail?: string;
+  /** Text and JSON: `text` stops at `maxLength` before the end of the value (callers that need to may add "…"). */
+  clipped?: boolean;
   title?: string;
   alignRight: boolean;
 }
@@ -23,6 +25,7 @@ export const BYTES_PREVIEW = 64; // keep in sync with BYTES_PREVIEW in the backe
 
 const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"];
 const JSON_WHITESPACE = new Set([" ", "\n", "\r", "\t"]);
+const LINE_BREAKS = /[\r\n\t]+/g;
 /** Characters a JSON value can start / end with (string, object, array, number, true / false / null). */
 const VALUE_START = new Set('"{[-0123456789tfn');
 const VALUE_END = new Set('"}]0123456789el');
@@ -45,15 +48,23 @@ function clip(text: string, max: number): string {
   return text.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
 }
 
+/** Display text cut to a length, and whether anything was cut. */
+interface Shortened {
+  text: string;
+  clipped: boolean;
+}
+
 /**
  * JSON text without the whitespace between tokens, stopping after `max` characters. Lexical on purpose: parsing and
- * re-serialising would round big numbers.
+ * re-serialising would round big numbers. Only for json columns: other text that merely looks like JSON keeps its
+ * spaces (`oneLine`).
  */
-function compactJson(text: string, max: number): string {
+function compactJson(text: string, max: number): Shortened {
   let out = "";
   let inString = false;
   let escaped = false;
-  for (let i = 0; i < text.length && out.length < max; i += 1) {
+  let i = 0;
+  for (; i < text.length && out.length < max; i += 1) {
     const ch = text[i];
     if (inString) {
       if (escaped) escaped = false;
@@ -66,7 +77,12 @@ function compactJson(text: string, max: number): string {
     }
     out += ch;
   }
-  return out;
+  return { text: out, clipped: skipSpace(text, i, 1) < text.length };
+}
+
+/** At most `max` characters of `text` on one line: each run of newlines, tabs and CRs becomes one space; spaces stay. */
+function oneLine(text: string, max: number): Shortened {
+  return { text: clip(text, max).replace(LINE_BREAKS, " "), clipped: text.length > max };
 }
 
 /** Index of the first non-whitespace character at or after `from` (`step` 1) or at or before it (`step` -1). */
@@ -151,11 +167,17 @@ export function describeCell(value: unknown, category: ColumnCategory, maxLength
     case "truncated":
       return describeTruncated(value as EncodedCell, maxLength);
     case "json": {
-      const text = typeof value === "string" ? compactJson(value, maxLength) : clip(JSON.stringify(value), maxLength);
-      return { text, kind, alignRight: false };
+      // Compacted only in a json column: a text value that merely looks like JSON ("[1] and [2]") keeps its spaces.
+      const shown =
+        typeof value !== "string"
+          ? oneLine(JSON.stringify(value), maxLength)
+          : category === "json"
+            ? compactJson(value, maxLength)
+            : oneLine(value, maxLength);
+      return { ...shown, kind, alignRight: false };
     }
     case "text":
-      return { text: clip(String(value), maxLength), kind, alignRight: false };
+      return { ...oneLine(String(value), maxLength), kind, alignRight: false };
   }
 }
 
