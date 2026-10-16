@@ -86,8 +86,9 @@ class SchemaCache:
     def index(self, profile_id: UUID, database: str | None = None, wait: bool = True) -> SnapshotIndex | None:
         """Completion index of the current snapshot, built once per snapshot.
 
-        With `wait=False` it returns None at once while another thread is building that snapshot, so per-keystroke
-        requests do not pile up behind a slow or unreachable server.
+        With `wait=False` it does not wait while another thread is building that snapshot, so per-keystroke requests
+        do not pile up behind a slow or unreachable server: it answers from the expired snapshot being replaced, or
+        None when there is none.
         """
         snapshot = self._snapshot(profile_id, database, wait)
         if snapshot is None:
@@ -151,8 +152,8 @@ class SchemaCache:
         return self._registry.get(self._profiles.get(profile_id).engine)
 
     def _snapshot(self, profile_id: UUID, database: str | None, wait: bool) -> SchemaSnapshot | None:
-        """The cached snapshot, else a build (one per key; other keys are not blocked). Without `wait`, None when
-        another thread is building this key right now."""
+        """The cached snapshot, else a build (one per key; other keys are not blocked). Without `wait`, while another
+        thread is building this key: the expired snapshot it replaces, or None when there is none."""
         key = self._key(profile_id, database)
         with self._lock:
             cached = self._cached(key)
@@ -160,6 +161,11 @@ class SchemaCache:
                 return cached
             key_lock = self._key_locks.setdefault(key, threading.Lock())
         if not key_lock.acquire(blocking=wait):
+            with self._lock:
+                expired = self._entries.get(key)
+            if expired is not None:
+                logger.debug("Schema snapshot of {} is being rebuilt; using the previous one", profile_id)
+                return expired.snapshot
             logger.debug("Schema snapshot of {} is still being built; not waiting", profile_id)
             return None
         try:

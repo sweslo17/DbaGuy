@@ -110,15 +110,18 @@ def _completion_dialect(container: AppContainer, body: CompleteRequest) -> Diale
     return body.dialect
 
 
-def _snapshot_index(container: AppContainer, profile_id: UUID, database: str | None) -> SnapshotIndex | None:
+def _snapshot_index(
+    container: AppContainer, profile_id: UUID, database: str | None, wait: bool
+) -> SnapshotIndex | None:
     """The completion index of the profile's schema, or None: keywords only (spec §5).
 
-    None while another request is building the snapshot (a keystroke never waits for it) and when the build fails.
-    A failed build is logged once, at WARNING, by `SchemaCache`, which then re-raises it for a while without
-    reconnecting; those repeats are only DEBUG here, or typing would log a warning per keystroke.
+    Without `wait` (a keystroke), it never queues behind a build another request is running: the previous snapshot
+    answers meanwhile, or None when there is none yet. None also when the build fails: that is logged once, at
+    WARNING, by `SchemaCache`, which then re-raises it for a while without reconnecting; those repeats are only DEBUG
+    here, or typing would log a warning per keystroke.
     """
     try:
-        return container.schema_cache.index(profile_id, database, wait=False)
+        return container.schema_cache.index(profile_id, database, wait=wait)
     except Exception as exc:
         logger.debug("No schema snapshot for {} ({}: {}); keywords only", profile_id, type(exc).__name__, exc)
         return None
@@ -147,7 +150,7 @@ def complete_at(body: CompleteRequest, container: AppContainer = Depends(get_con
     dialect = _completion_dialect(container, body)
     snapshot_index = None
     if body.profile_id is not None:
-        snapshot_index = _snapshot_index(container, body.profile_id, body.database)
+        snapshot_index = _snapshot_index(container, body.profile_id, body.database, wait=False)
     index = Utf16Index(body.text)
     result = complete(body.text, index.from_utf16(body.cursor), dialect, snapshot_index)
     logger.debug("Completion at {}: {} items{}", body.cursor, len(result.items),
@@ -158,7 +161,8 @@ def complete_at(body: CompleteRequest, container: AppContainer = Depends(get_con
 @router.post("/describe", response_model=DescribeResult | None)
 def describe(body: DescribeRequest, container: AppContainer = Depends(get_container)) -> DescribeResult | None:
     dialect = _profile_dialect(container, body.profile_id)
-    snapshot_index = _snapshot_index(container, body.profile_id, body.database)
+    # An explicit user action, not a keystroke: worth waiting for a snapshot that is being built.
+    snapshot_index = _snapshot_index(container, body.profile_id, body.database, wait=True)
     return describe_at(body.text, Utf16Index(body.text).from_utf16(body.cursor), dialect, snapshot_index)
 
 

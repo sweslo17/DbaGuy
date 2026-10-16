@@ -231,6 +231,35 @@ def test_index_without_waiting_skips_a_build_in_progress(env, monkeypatch):
     assert cache.index(pid) is index
 
 
+def test_index_without_waiting_serves_the_expired_snapshot_while_it_is_rebuilt(env, monkeypatch):
+    cache, pid, db, clock = env
+    previous = cache.index(pid)
+    sqlite3.connect(db).executescript("CREATE TABLE later (id INTEGER);")
+    clock.now += 61  # expired: the next get() rebuilds it
+    real = cache._metadata.with_connection
+    started, release = threading.Event(), threading.Event()
+
+    def blocked(*args):
+        started.set()
+        release.wait(5)
+        return real(*args)
+
+    monkeypatch.setattr(cache._metadata, "with_connection", blocked)
+    builder = threading.Thread(target=cache.get, args=(pid,))
+    builder.start()
+    try:
+        assert started.wait(5)
+        began = time.monotonic()
+        assert cache.index(pid, wait=False) is previous  # completion keeps its tables during the rebuild
+        assert time.monotonic() - began < 0.5
+    finally:
+        release.set()
+        builder.join(5)
+    current = cache.index(pid, wait=False)
+    assert current is not previous and current.snapshot is cache.peek(pid)
+    assert "later" in [r.name for r in current.snapshot.schemas[0].relations]
+
+
 def test_a_failing_index_construction_is_logged_with_its_traceback_and_re_raised(env, monkeypatch):
     cache, pid, _, _ = env
 

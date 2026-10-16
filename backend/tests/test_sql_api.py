@@ -136,11 +136,39 @@ def test_completion_does_not_wait_for_a_snapshot_another_request_is_building(cli
         result = client.post("/sql/complete", json=body, headers=AUTH)
         assert time.monotonic() - started < 5  # a keystroke never queues behind the build
         assert result.status_code == 200 and "id" not in labels(result)  # keywords only, for now
-        assert client.post("/sql/describe", json={**body, "cursor": 15}, headers=AUTH).json() is None
     finally:
         finish_build.set()
         builder.join(timeout=10)
     assert labels(client.post("/sql/complete", json=body, headers=AUTH)) == ["id"]
+
+
+def test_describe_waits_for_a_snapshot_another_request_is_building(client, sqlite_profile_id, monkeypatch):
+    # Describe is an explicit user action (F1 / alt-click): an answer is worth a short wait, unlike a keystroke.
+    metadata = client.app.state.container.metadata
+    build_started, finish_build = threading.Event(), threading.Event()
+    real = metadata.with_connection
+
+    def slow_build(*args, **kwargs):
+        build_started.set()
+        assert finish_build.wait(timeout=10)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(metadata, "with_connection", slow_build)
+    builder = threading.Thread(target=lambda: client.app.state.container.schema_cache.get(UUID(sqlite_profile_id)))
+    builder.start()
+    answers = []
+    body = {"profile_id": sqlite_profile_id, "text": "SELECT * FROM t", "cursor": 15}
+    describer = threading.Thread(target=lambda: answers.append(client.post("/sql/describe", json=body, headers=AUTH)))
+    try:
+        assert build_started.wait(timeout=10)
+        describer.start()
+        describer.join(timeout=0.5)
+        assert describer.is_alive()  # waiting for the snapshot instead of answering "nothing found"
+    finally:
+        finish_build.set()
+        builder.join(timeout=10)
+        describer.join(timeout=10)
+    assert answers[0].status_code == 200 and answers[0].json()["name"] == "t"
 
 
 def test_an_unreachable_profile_warns_once_not_on_every_keystroke(client, unreachable_profile_id, log_records):
