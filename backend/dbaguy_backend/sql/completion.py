@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from ..domain.schema import RelationKind, SchemaSnapshot, SnapshotRelation, SnapshotSchema
 from .dialects import Dialect, qualified, quote_ident
-from .lexer import Token, TokenKind, tokenize
+from .lexer import INSIGNIFICANT, Token, TokenKind, tokenize
 from .scope import (
     BEFORE_NAME, IDENT, Scope, ScopeRelation, enclosing_group, find_ctes, introduces_relation, scope_at, unquote,
 )
@@ -85,7 +85,6 @@ CLAUSE_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
 _COLUMN_CLAUSES = frozenset(
     "SELECT WHERE HAVING SET BY RETURNING WHEN THEN ELSE CASE DISTINCT USING ON".split()
 )
-_SKIPPED = (TokenKind.SPACE, TokenKind.COMMENT)
 _NO_ITEMS_INSIDE = (TokenKind.STRING, TokenKind.COMMENT, TokenKind.QUOTED)
 
 
@@ -243,7 +242,7 @@ def _statement_bounds(text: str, cursor: int, dialect: Dialect) -> tuple[int, in
 
 
 def _significant(tokens: Iterable[Token]) -> list[Token]:
-    return [token for token in tokens if token.kind not in _SKIPPED]
+    return [token for token in tokens if token.kind not in INSIGNIFICANT]
 
 
 def _token_before(tokens: list[Token], offset: int) -> Token | None:

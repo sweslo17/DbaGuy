@@ -7,10 +7,10 @@ from pydantic import BaseModel
 from ..domain.errors import ValidationFailed
 from ..domain.metadata import NodeKind, PathSegment
 from .dialects import Dialect, qualified, quote_ident
-from .lexer import TokenKind, tokenize
+from .lexer import INSIGNIFICANT, TokenKind, tokenize
 
 _RELATION_KINDS = frozenset({NodeKind.TABLE, NodeKind.VIEW, NodeKind.MATERIALIZED_VIEW, NodeKind.PARTITION})
-_TRAILING = frozenset({TokenKind.SPACE, TokenKind.COMMENT, TokenKind.SEMI})
+_TRAILING = INSIGNIFICANT | {TokenKind.SEMI}
 
 
 class SortKey(BaseModel):

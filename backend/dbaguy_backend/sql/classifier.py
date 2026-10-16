@@ -131,13 +131,19 @@ def _from_sqlglot(sql: str, dialect: Dialect) -> list[Classification | None] | N
     return None
 
 
-def _classify_statement(sql: str, dialect: Dialect) -> Classification:
+def _classify_statement(sql: str, dialect: Dialect, has_body: bool = False) -> Classification:
+    """One statement as the splitter sees it; `has_body`: it holds a routine or trigger body."""
     while (inner := _explain_inner(sql, dialect)) is not None:  # EXPLAIN ANALYZE runs the statement it explains
         sql = inner
     found = _from_sqlglot(sql, dialect)
-    if found is not None and len(found) == 1 and found[0] is not None:
-        return found[0]
-    return _lexical(sql, dialect)
+    if not found:
+        return _lexical(sql, dialect)
+    if len(found) == 1:
+        return found[0] or _lexical(sql, dialect)
+    if has_body:  # sqlglot does not know routine/trigger bodies and cuts them at their inner `;`
+        return _lexical(sql, dialect)
+    # The splitter saw one statement where sqlglot sees several: judge every one, never just the first.
+    return _combine([c or Classification(kind=StatementKind.UNKNOWN) for c in found])
 
 
 def _combine(results: list[Classification]) -> Classification:
@@ -155,8 +161,8 @@ def classify(sql: str, dialect: Dialect) -> Classification:
     """
     spans = split(sql, dialect)
     if len(spans) > 1:
-        return _combine([_classify_statement(span.text, dialect) for span in spans])
-    return _classify_statement(sql, dialect)
+        return _combine([_classify_statement(span.text, dialect, span.has_body) for span in spans])
+    return _classify_statement(sql, dialect, has_body=bool(spans) and spans[0].has_body)
 
 
 def warm_up() -> None:

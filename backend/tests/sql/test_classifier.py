@@ -12,9 +12,11 @@ from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect as SqlglotDialect
 
 from dbaguy_backend.domain.classification import DangerReason
+from dbaguy_backend.sql import classifier
 from dbaguy_backend.sql.classifier import StatementKind as K
 from dbaguy_backend.sql.classifier import classify, warm_up
 from dbaguy_backend.sql.dialects import Dialect
+from dbaguy_backend.sql.splitter import StatementSpan
 
 PG, LITE = Dialect.POSTGRES, Dialect.SQLITE
 
@@ -208,3 +210,28 @@ def test_warm_up_parses_once_per_dialect_and_logs_its_duration(monkeypatch):
         logger.remove(sink)
     assert len(calls) == len(Dialect)
     assert any("warmed up" in m and " ms" in m for m in messages)
+
+
+# ---- statements the splitter must not merge, and sqlglot's view of one span ----
+
+def test_column_names_begin_atomic_or_trigger_cannot_hide_a_statement():
+    assert (classify("SELECT started AS begin, atomic FROM jobs; DROP TABLE t", PG).kind,
+            classify("SELECT started AS begin, atomic FROM jobs; DROP TABLE t", PG).dangerous_reasons) == (K.DDL, ["drop"])
+    result = classify("CREATE TABLE t (trigger int, begin int); DELETE FROM t", LITE)
+    assert (result.kind, result.dangerous_reasons) == (K.DDL, ["delete_without_where"])
+
+
+def test_routine_and_trigger_bodies_stay_one_ddl_statement():
+    # sqlglot cuts these at their inner `;`: the body's statements must not count as statements of their own.
+    fn = classify("CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; DELETE FROM t; END", PG)
+    trigger = classify("CREATE TEMP TRIGGER tr AFTER INSERT ON t BEGIN UPDATE u SET a = 1; DELETE FROM v; END", LITE)
+    assert (fn.kind, fn.dangerous_reasons) == (K.DDL, [])
+    assert (trigger.kind, trigger.dangerous_reasons) == (K.DDL, [])
+
+
+def test_several_statements_sqlglot_finds_in_one_span_are_each_classified(monkeypatch):
+    # Defence in depth: if the splitter ever merges two statements, the second one still counts.
+    monkeypatch.setattr(classifier, "split", lambda sql, dialect: [StatementSpan(0, len(sql), len(sql), sql)])
+    result = classify("SELECT 1; DROP TABLE t; UPDATE u SET a = 1", PG)
+    assert (result.kind, result.dangerous_reasons) == (K.DDL, ["drop", "update_without_where"])
+    assert classify("SELECT 1; LISTEN x", PG).kind == K.UNKNOWN  # a statement sqlglot cannot judge is not a read
