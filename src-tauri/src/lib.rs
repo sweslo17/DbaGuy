@@ -41,6 +41,8 @@ pub fn run() {
                 .level(log::LevelFilter::Info)
                 .build(),
         )
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(BackendManager::default())
         .setup(|app| {
             let _ = app.state::<BackendManager>().start(app.handle());
