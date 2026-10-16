@@ -38,7 +38,8 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
   - `domain/`：pydantic 模型（profile、metadata、WS 執行協定）
   - `adapters/`：`base.py` 是 5 種 DB 共用的介面；每個 engine 一個子套件，在 `container.default_registry()` 註冊
   - `sessions/worker.py`：每個 session 一條連線、一個執行緒；分頁、暫停、取消都在這裡通用處理
-  - `services/`：profile、連線（含 SSH tunnel）、metadata
+  - `sql/`：純函式的 SQL 文字處理（lexer、切分、分類、補全、copy/匯出格式、表格瀏覽 SELECT）；API 位移一律 UTF-16，只在 `sql/offsets.py` 轉換
+  - `services/`：profile、連線（含 SSH tunnel）、metadata、schema 快取、安全政策、history、設定／工作區／scripts
   - `api/`：FastAPI routers；WS 在 `api/sessions.py`
 - `src/`：React 前端；API 型別由 `npm run gen:api` 從 OpenAPI 產生（`src/lib/api/schema.d.ts`，不要手改）
 - `src-tauri/`：Rust 外殼，只負責視窗與 sidecar 生命週期（`src/backend.rs`）
@@ -88,7 +89,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
 | # | 子專案 | 狀態 |
 |---|---|---|
 | ① | 地基：Tauri + sidecar、adapter 介面、連線管理、PG + SQLite 物件瀏覽 | 完成 |
-| ② | 核心查詢流程：編輯器、結果 grid、執行範圍、取消、history、安全 | 未開始 |
+| ② | 核心查詢流程：編輯器、結果 grid、執行範圍、取消、history、安全 | 進行中：02a 後端完成（[followups](docs/superpowers/notes/2026-10-16-02a-query-backend-followups.md)）；02b grid、02c 編輯器待做 |
 | ③ | MySQL + MSSQL adapter | 未開始 |
 | ④ | Couchbase 一級支援 | 未開始 |
 | ⑤ | Grid 內編輯（暫存修改、預覽 DML、一次 commit） | 未開始 |
