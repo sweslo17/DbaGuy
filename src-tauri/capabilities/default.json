@@ -8,7 +8,10 @@
     "core:window:allow-start-dragging",
     "log:default",
     "dialog:allow-save",
-    "notification:default",
+    "dialog:allow-open",
+    "notification:allow-is-permission-granted",
+    "notification:allow-request-permission",
+    "notification:allow-notify",
     "clipboard-manager:allow-write-text"
   ]
 }

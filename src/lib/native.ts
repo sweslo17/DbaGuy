@@ -15,6 +15,17 @@ export async function chooseSavePath(defaultName: string, filters: FileFilter[])
   return (await save({ defaultPath: defaultName, filters })) ?? null;
 }
 
+/** A folder picked in the native dialog (app only: null in browser mode or when cancelled). */
+export async function chooseFolder(defaultPath?: string): Promise<string | null> {
+  if (!isTauriRuntime()) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  return (await open({ directory: true, multiple: false, defaultPath })) ?? null;
+}
+
+/**
+ * A system notification. Permission is asked the first time one is sent (in the app by macOS, in browser mode by the
+ * browser); once refused, nothing is shown.
+ */
 export async function notify(title: string, body: string): Promise<void> {
   try {
     if (isTauriRuntime()) {
@@ -22,8 +33,9 @@ export async function notify(title: string, body: string): Promise<void> {
       let granted = await n.isPermissionGranted();
       if (!granted) granted = (await n.requestPermission()) === "granted";
       if (granted) n.sendNotification({ title, body });
-    } else if (typeof Notification !== "undefined" && Notification.permission === "granted") {
-      new Notification(title, { body });
+    } else if (typeof Notification !== "undefined") {
+      if (Notification.permission === "default") await Notification.requestPermission();
+      if (Notification.permission === "granted") new Notification(title, { body });
     }
   } catch (error) {
     console.warn("Notification failed", error);

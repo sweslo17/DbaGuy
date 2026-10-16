@@ -1,8 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
+import { Settings } from "lucide-react";
 import { useEffect, useRef, type ReactNode } from "react";
 import { Group, Panel, useDefaultLayout } from "react-resizable-panels";
 import { PanelHandle } from "@/components/ui/PanelHandle";
 import { Toaster } from "@/components/ui/Toast";
+import { openSettings, SettingsDialogHost } from "@/features/settings/SettingsDialog";
 import { saveWorkspaceNow, useWorkspaceSaveFailing } from "@/features/workspace/workspaceSync";
 import { api, unwrap } from "@/lib/api/client";
 import { BackendBanner } from "./BackendBanner";
@@ -35,6 +37,15 @@ export function AppShell({ sidebar, workspace }: { sidebar: ReactNode; workspace
         <span data-tauri-drag-region className="text-[12px] font-semibold text-muted">
           DbaGuy
         </span>
+        <button
+          type="button"
+          title="Settings (⌘,)"
+          aria-label="Settings"
+          className="ml-auto flex h-6 w-6 items-center justify-center rounded text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-accent/50"
+          onClick={openSettings}
+        >
+          <Settings size={14} />
+        </button>
       </div>
       <BackendBanner />
       <div className="min-h-0 flex-1">
@@ -67,6 +78,7 @@ export function AppShell({ sidebar, workspace }: { sidebar: ReactNode; workspace
         )}
       </div>
       <Toaster />
+      <SettingsDialogHost />
     </div>
   );
 }

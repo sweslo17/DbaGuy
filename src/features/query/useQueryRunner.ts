@@ -24,6 +24,8 @@ export interface RunState {
   active: boolean;
   startedAt: number;
   finishedAt: number | null;
+  /** The user cancelled it (or the tab closing stopped it). */
+  cancelled: boolean;
 }
 
 /** A statement the safety policy flagged: it needs the user's confirmation (`confirm`) or cannot run (`block`). */
@@ -160,6 +162,7 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
         active: true,
         startedAt: Date.now(),
         finishedAt: null,
+        cancelled: false,
       };
       const publish = (next: RunState) => {
         state = next;
@@ -215,6 +218,7 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
         steps: state.steps.map((step) => (step.status === "pending" ? { ...step, status: "skipped" } : step)),
         active: false,
         finishedAt: Date.now(),
+        cancelled: job.cancelled,
       });
       // The backend records each statement in the history as it ends, before its `finished`. A paused last result
       // ends later (read to the end, discarded or closed): the History panel refreshes again then.

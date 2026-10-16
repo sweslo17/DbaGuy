@@ -15,8 +15,10 @@ import { CodeEditor, type CodeEditorHandle } from "../editor/CodeEditor";
 import { sqlCompletion, type CompletionTarget } from "../editor/completion";
 import { describeOnDemand } from "../editor/describe";
 import { errorMarksExtension } from "../editor/diagnostics";
+import { formatSql } from "../editor/format";
 import { currentStatementHighlight, refreshStatements, statementsExtension } from "../editor/statements";
 import { ExportDialog } from "../grid/ExportDialog";
+import { useLongQueryNotifications } from "../notifications/useLongQueryNotifications";
 import type { ExecutionState } from "../session/execution";
 import { busy, isExporting, type SessionPhase } from "../session/SessionController";
 import { SessionError } from "../session/SessionError";
@@ -38,9 +40,10 @@ const NO_EXECUTIONS: Record<string, ExecutionState> = {};
  * A query tab (spec §3.5, §4.1, §4.2): toolbar, then the editor above the results. Its session opens the first time
  * the tab is shown and closes with the tab, or reopens when the connection picker changes it; the editor lives as long
  * as the tab, so undo history survives tab switches. ⌘↵ runs the selection or (by `run.default`) the statement under
- * the cursor; ⌘⇧↵ runs every statement. ⌘S saves the tab to its script file (⌘⇧S: Save As). Closing the tab or
- * switching its connection first stops a running export and ends an open transaction, asking each time; closing also
- * asks about unsaved script changes. The tab hosts the export dialog, so it outlives the result grids.
+ * the cursor; ⌘⇧↵ runs every statement; ⌘⇧F formats. ⌘S saves the tab to its script file (⌘⇧S: Save As). Closing the
+ * tab or switching its connection first stops a running export and ends an open transaction, asking each time;
+ * closing also asks about unsaved script changes. The tab hosts the export dialog, so it outlives the result grids. A
+ * long run that ends while DbaGuy is in the background notifies.
  */
 export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean }) {
   const { settings } = useAppSettings();
@@ -69,6 +72,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
 
   const profile = profiles.data?.find((entry) => entry.profile.id === tab.profileId)?.profile ?? null;
   const profileName = tab.profileId === null ? null : (profile?.name ?? "…");
+  useLongQueryNotifications(run, snapshot?.executions ?? NO_EXECUTIONS, profile?.name ?? null);
   /** The tab and its connection, as dialogs and toasts name it. */
   const subject = profileName ? `${tab.title} · ${profileName}` : tab.title;
   const phase: SessionPhase = snapshot?.phase ?? "opening";
@@ -159,11 +163,16 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     }
   };
 
-  // The editor's keymap is built once: it calls the latest `start` and script commands through refs.
+  // ⌘⇧F: the selection, else the statement under the cursor, by the tab's dialect and the editor settings.
+  const format = () => withView((v) => void formatSql(v, { dialect, editor: settings.editor }));
+
+  // The editor's keymap is built once: it calls the latest `start`, `format` and script commands through refs.
   const startRef = useRef(start);
+  const formatRef = useRef(format);
   const scriptRef = useRef(script);
   useLayoutEffect(() => {
     startRef.current = start;
+    formatRef.current = format;
     scriptRef.current = script;
   });
   // What the editor's extensions read at each use (split, completion, describe), so they never need reconfiguring.
@@ -190,6 +199,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
         { key: "Shift-Mod-Enter", run: () => runFromKey("all") },
         { key: "Mod-s", run: () => (scriptRef.current.save(), true) },
         { key: "Shift-Mod-s", run: () => (scriptRef.current.saveAs(), true) },
+        { key: "Shift-Mod-f", run: () => (formatRef.current(), true) },
       ]),
     ),
     placeholder("SELECT …  (⌘↵ to run)"),

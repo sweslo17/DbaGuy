@@ -83,7 +83,8 @@ interface WorkspaceState extends WorkspaceSnapshot {
   moveScripts: (from: string, to: string) => void;
   /**
    * The script file or folder at `path` is gone: the tabs bound to it (or to a file below it) keep their text but are
-   * no longer bound to a file. Returns their titles.
+   * no longer bound to a file. `""` (the scripts folder itself, e.g. once it moved) unbinds every script tab. Returns
+   * their titles.
    */
   unbindScripts: (path: string) => string[];
   /** Replaces the tabs with the saved workspace (startup only, before the workspace renders). */

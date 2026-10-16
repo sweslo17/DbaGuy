@@ -23,7 +23,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
 export function useAppSettings(): {
   settings: AppSettings;
   isLoading: boolean;
-  save: (next: AppSettings) => Promise<void>;
+  /** `settings` are the stored ones (false: the defaults, until `GET /settings` answers). */
+  loaded: boolean;
+  /** Resolves to the settings as stored; an invalid value (422) or a failure throws `ApiError`. */
+  save: (next: AppSettings) => Promise<AppSettings>;
 } {
   const qc = useQueryClient();
   const query = useQuery({
@@ -35,8 +38,9 @@ export function useAppSettings(): {
     async (next: AppSettings) => {
       const saved = unwrap(await (await api()).PUT("/settings", { body: next }));
       qc.setQueryData(settingsKey, saved);
+      return saved;
     },
     [qc],
   );
-  return { settings: query.data ?? DEFAULT_SETTINGS, isLoading: query.isLoading, save };
+  return { settings: query.data ?? DEFAULT_SETTINGS, isLoading: query.isLoading, loaded: query.data !== undefined, save };
 }

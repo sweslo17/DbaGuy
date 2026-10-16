@@ -20,9 +20,9 @@ export function joinPath(folder: string, name: string): string {
   return folder ? `${folder}/${name}` : name;
 }
 
-/** `path` is `ancestor` itself or lies below it. */
+/** `path` is `ancestor` itself or lies below it; everything lies within "" (the scripts folder). */
 export function isWithin(path: string, ancestor: string): boolean {
-  return path === ancestor || path.startsWith(`${ancestor}/`);
+  return ancestor === "" || path === ancestor || path.startsWith(`${ancestor}/`);
 }
 
 /** Where `path` (within `from`) is once `from` has moved to `to`. */

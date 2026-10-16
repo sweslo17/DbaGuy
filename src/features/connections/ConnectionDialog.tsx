@@ -44,7 +44,19 @@ const DEFAULT_SSH: SshConfig = {
 };
 
 type TabId = "general" | "ssl" | "ssh" | "advanced";
-type CommonField = "name" | "folder" | "color" | "read_only" | "save_password";
+type CommonField = "name" | "folder" | "color" | "read_only" | "safety" | "save_password";
+type SafetyLevel = ProfileDraft["safety"];
+
+/** The safety levels (spec §3.4): when a statement needs confirming before it runs. */
+const SAFETY_LEVELS: { value: SafetyLevel; label: string; explanation: string }[] = [
+  { value: "relaxed", label: "Relaxed", explanation: "Runs every statement without asking" },
+  {
+    value: "standard",
+    label: "Standard",
+    explanation: "Asks before UPDATE or DELETE without WHERE, DROP, TRUNCATE and ALTER … DROP",
+  },
+  { value: "strict", label: "Strict", explanation: "Asks before every statement that is not a read" },
+];
 type Feedback = { ok: boolean; text: string } | null;
 
 function emptyDraft(engine: Engine): ProfileDraft {
@@ -70,8 +82,8 @@ function toDraft(entry: ProfileEntry): ProfileDraft {
 
 /** The fields that describe the profile itself rather than how to reach the database. */
 function commonFields(draft: ProfileDraft): Pick<ProfileDraft, CommonField> {
-  const { name, folder, color, read_only, save_password } = draft;
-  return { name, folder, color, read_only, save_password };
+  const { name, folder, color, read_only, safety, save_password } = draft;
+  return { name, folder, color, read_only, safety, save_password };
 }
 
 function optionsToText(draft: ProfileDraft): string {
@@ -350,6 +362,15 @@ function ConnectionDialogBody({
               onChange={(e) => patchCommon({ read_only: e.target.checked })}
             />
           </div>
+        </FieldRow>
+        <FieldRow label="Safety" hint={SAFETY_LEVELS.find((level) => level.value === draft.safety)?.explanation}>
+          <Select value={draft.safety} onChange={(e) => patchCommon({ safety: e.target.value as SafetyLevel })}>
+            {SAFETY_LEVELS.map((level) => (
+              <option key={level.value} value={level.value}>
+                {level.label}
+              </option>
+            ))}
+          </Select>
         </FieldRow>
       </TabPanel>
 

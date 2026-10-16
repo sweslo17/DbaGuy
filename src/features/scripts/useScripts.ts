@@ -45,6 +45,19 @@ export async function scriptExists(path: string): Promise<boolean> {
   }
 }
 
+/**
+ * The scripts folder is now another one (ruling R-02c-12): the tree is read again, and every tab bound to a script
+ * keeps its text but is unbound, since its path would now name a file in the new folder (⌘S would overwrite it).
+ */
+export function scriptsFolderChanged(qc: QueryClient): void {
+  void qc.invalidateQueries({ queryKey: scriptTreeKey });
+  const titles = useWorkspace.getState().unbindScripts("");
+  console.info(`Scripts folder changed; unbound ${titles.length} script tab(s)`);
+  if (!titles.length) return;
+  const tabs = titles.length === 1 ? `${titles[0]} keeps its text` : `${titles.join(", ")} keep their text`;
+  toast("info", `The scripts folder changed. ${tabs}, no longer saved to a file (Save As saves to the new folder).`);
+}
+
 /** Every folder in the tree, depth first (parents before their children). */
 export function folderPaths(items: ScriptNode[]): string[] {
   return items.flatMap((node) => (node.kind === "folder" ? [node.path, ...folderPaths(node.children)] : []));
