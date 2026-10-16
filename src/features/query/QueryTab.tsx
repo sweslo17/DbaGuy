@@ -81,6 +81,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     if (!canRun || !current || dialect === null || planning.current) return;
     planning.current = true;
     try {
+      const plannedDoc = current.state.doc; // planRun reads the text before its first await
       let planned: PlannedStatement[];
       try {
         planned = await planRun(current, mode, settings.run.default, dialect);
@@ -88,7 +89,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
         toast("error", `Could not split the text into statements: ${errorMessage(error)}`);
         return;
       }
-      if (planned.length) await runner.start(planned);
+      if (planned.length) await runner.start(planned, { unchanged: () => view()?.state.doc === plannedDoc });
     } finally {
       planning.current = false;
     }
@@ -192,7 +193,11 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
           </Panel>
         </Group>
       </div>
-      <ConfirmRunDialog prompt={runner.prompt} onClosed={() => editor.current?.focus()} />
+      <ConfirmRunDialog
+        prompt={runner.prompt}
+        context={profileName ? `${tab.title} · ${profileName}` : tab.title}
+        onClosed={() => editor.current?.focus()}
+      />
     </div>
   );
 }

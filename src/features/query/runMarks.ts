@@ -40,16 +40,19 @@ export function markStatementError(view: EditorView, index: number, execution: E
   if (span) addErrorMark(view, span.from, span.to, execution.error.message);
 }
 
-/** The error's place as the editor shows it: 1-based line and column (UTF-16 units, like the editor). */
+/**
+ * The error's place as the editor shows it: 1-based line and column (UTF-16 units, like the editor); the column is null
+ * when the database gave no position (the line is then where the statement starts).
+ */
 export function errorLocation(
   view: EditorView,
   index: number,
   execution: ExecutionState,
-): { line: number; column: number } | null {
+): { line: number; column: number | null } | null {
   const span = errorSpan(view, index, execution);
   if (!span) return null;
   const line = view.state.doc.lineAt(Math.min(span.from, view.state.doc.length));
-  return { line: line.number, column: span.from - line.from + 1 };
+  return { line: line.number, column: execution.error?.position ? span.from - line.from + 1 : null };
 }
 
 /** Puts the cursor on the error of statement `index` (or its start) and focuses the editor. */

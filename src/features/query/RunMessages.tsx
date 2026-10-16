@@ -6,9 +6,10 @@ import { formatDuration, plural } from "@/lib/format";
 import { CONNECTION_LOST, type ExecutionState } from "../session/execution";
 import type { RunState, RunStep, StepStatus } from "./useQueryRunner";
 
+/** Where an error is in the editor: 1-based; `column` is null when the database gave no position (the statement). */
 export interface ErrorLocation {
   line: number;
-  column: number;
+  column: number | null;
 }
 
 export interface RunMessagesProps {
@@ -62,20 +63,32 @@ function StatementError({
   const { error } = execution;
   if (!error) return null;
   const at = locate(index, execution);
-  const detail = [at && `Line ${at.line}, column ${at.column}`, error.code].filter(Boolean).join(" · ");
+  const place = at && (at.column === null ? `Statement at line ${at.line}` : `Line ${at.line}, column ${at.column}`);
   return (
-    <div className="flex flex-col items-start gap-1">
-      <button
-        type="button"
-        className="max-w-full cursor-pointer rounded px-1 -mx-1 text-left text-danger hover:bg-hover"
-        title="Show in the editor"
-        onClick={() => onJump(index, execution)}
-      >
-        <span className="whitespace-pre-wrap" data-selectable>
-          {error.message}
-        </span>
-        {detail && <span className="block text-[11px] opacity-80">{detail}</span>}
-      </button>
+    <div className="flex flex-col items-start gap-0.5 text-danger">
+      <div className="whitespace-pre-wrap" data-selectable>
+        {error.message}
+      </div>
+      {(place || error.code) && (
+        <div className="flex items-center gap-1 text-[11px]">
+          {place && (
+            <button
+              type="button"
+              className="-mx-1 cursor-pointer rounded px-1 underline decoration-dotted underline-offset-2 hover:bg-hover"
+              title="Show in the editor"
+              onClick={() => onJump(index, execution)}
+            >
+              {place}
+            </button>
+          )}
+          {error.code && (
+            <span className="opacity-80" data-selectable>
+              {place ? "· " : ""}
+              {error.code}
+            </span>
+          )}
+        </div>
+      )}
       {error.code === CONNECTION_LOST && (
         <Button size="sm" onClick={onReconnect}>
           Reconnect

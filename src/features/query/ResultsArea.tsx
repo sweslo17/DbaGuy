@@ -1,11 +1,10 @@
 import { useMemo, useState } from "react";
 import { Tabs } from "@/components/ui/Tabs";
 import type { Dialect } from "@/lib/api/types";
-import { cn } from "@/lib/cn";
-import { DataGrid } from "../grid/DataGrid";
 import { useHeldResult } from "../grid/useHeldResult";
 import type { ExecutionState, ResultSetState } from "../session/execution";
 import type { SessionController, SessionPhase } from "../session/SessionController";
+import { ResultGrid } from "./ResultGrid";
 import { RunMessages, type RunMessagesProps } from "./RunMessages";
 import type { RunState } from "./useQueryRunner";
 
@@ -56,9 +55,9 @@ export interface ResultsAreaProps extends Omit<RunMessagesProps, "run"> {
 
 /**
  * The results of the tab's latest run (spec §4.1): a tab per result set, titled by its statement, plus Messages.
- * Until a new run delivers its first result, the previous grids stay, dimmed. Grids stay mounted while another tab is
- * shown, so their scroll, widths and a running export survive switching. Without a choice by the user, the first
- * result is shown, or Messages once a statement failed.
+ * Until a new run delivers its first result, the previous grids stay, dimmed. A grid mounts the first time its tab is
+ * shown and then stays mounted while another tab is shown, so its scroll, widths and a running export survive
+ * switching. Without a choice by the user, the first result is shown, or Messages once a statement failed.
  */
 export function ResultsArea({
   run,
@@ -74,6 +73,8 @@ export function ResultsArea({
   const held = useHeldResult(tabs.length ? tabs : null, !!run?.active);
   const shown = held.value ?? [];
   const [picked, setPicked] = useState<{ runId: string; key: string } | null>(null);
+  /** Tabs shown at least once: only their grids are mounted (a 200-statement script mounts what is looked at). */
+  const [visited, setVisited] = useState<ReadonlySet<string>>(() => new Set());
 
   if (!run) {
     return (
@@ -88,6 +89,7 @@ export function ResultsArea({
       ? picked.key
       : null;
   const selected = pickedKey ?? (failed ? MESSAGES : (shown[0]?.key ?? MESSAGES));
+  if (selected !== MESSAGES && !visited.has(selected)) setVisited(new Set(visited).add(selected));
   // Only the last statement can still be paused, and only once the run is over (the next statement would end it).
   const canLoadMore = !!controller && phase === "open" && !run.active;
 
@@ -104,22 +106,24 @@ export function ResultsArea({
       />
       <div className="relative min-h-0 flex-1">
         {shown.map((tab) => {
+          if (tab.key !== selected && !visited.has(tab.key)) return null;
           const { execution, set } = tab;
-          const last = execution.resultSets.at(-1)?.index === set.index;
           return (
-            <div key={tab.key} className={cn("h-full", tab.key !== selected && "hidden")}>
-              <DataGrid
-                columns={set.columns}
-                rows={set.rows}
-                hasMore={set.hasMore}
-                partial={set.partial}
-                loadingMore={execution.status === "running" && last}
-                onLoadMore={canLoadMore ? () => controller.fetchMore(execution.requestId, pageSize) : undefined}
-                stale={held.stale}
-                dialect={dialect}
-                exportSource={controller ? { controller, sql: execution.sql, title } : null}
-              />
-            </div>
+            <ResultGrid
+              key={tab.key}
+              set={set}
+              requestId={execution.requestId}
+              sql={execution.sql}
+              loadingMore={execution.status === "running" && execution.resultSets.at(-1)?.index === set.index}
+              stale={held.stale}
+              canLoadMore={canLoadMore}
+              exportable={!run.active}
+              controller={controller}
+              pageSize={pageSize}
+              title={title}
+              dialect={dialect}
+              hidden={tab.key !== selected}
+            />
           );
         })}
         {selected === MESSAGES && <RunMessages run={run} executions={executions} {...messages} />}

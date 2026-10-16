@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
 import { BLOCKED_TEXT, reasonText } from "./reasons";
@@ -27,7 +28,7 @@ function FlaggedItem({ item }: { item: FlaggedStatement }) {
             </span>
           ))}
       </div>
-      <pre className="overflow-hidden font-mono text-[12px] text-ellipsis whitespace-pre">
+      <pre className="overflow-hidden font-mono text-[12px] text-ellipsis whitespace-pre" data-selectable>
         {preview(item.statement.sql)}
       </pre>
     </li>
@@ -38,12 +39,24 @@ function FlaggedItem({ item }: { item: FlaggedStatement }) {
  * Confirmation of the statements the safety policy flagged, all in one list. A blocked statement (read-only
  * connection) cannot run: the dialog only offers Close and nothing is sent. Otherwise Run sends the whole run with
  * these statements confirmed, and Cancel (or Escape) sends nothing. Focus starts on the harmless button and goes to
- * `onClosed` afterwards (the editor).
+ * `onClosed` afterwards (the editor). The title names the tab: a confirmation asked mid-run may appear while another
+ * tab is in front.
  */
-export function ConfirmRunDialog({ prompt, onClosed }: { prompt: ConfirmPrompt | null; onClosed?: () => void }) {
+export function ConfirmRunDialog({
+  prompt,
+  context,
+  onClosed,
+}: {
+  prompt: ConfirmPrompt | null;
+  /** The tab and its connection, e.g. "Query 1 · dev pg". */
+  context: string;
+  onClosed?: () => void;
+}) {
   const items = prompt?.items ?? [];
   const blocked = items.some((item) => item.decision.action === "block");
   const answer = (run: boolean) => prompt?.answer(run);
+  // A prompt that goes away unanswered (replaced, or the dialog unmounts with its tab) means "do not run".
+  useEffect(() => () => prompt?.answer(false), [prompt]);
   const note = blocked
     ? "Nothing was sent."
     : prompt?.when === "during"
@@ -61,7 +74,7 @@ export function ConfirmRunDialog({ prompt, onClosed }: { prompt: ConfirmPrompt |
         event.preventDefault();
         onClosed();
       }}
-      title={blocked ? BLOCKED_TEXT : "Confirm before running"}
+      title={`${blocked ? BLOCKED_TEXT : "Confirm before running"} — ${context}`}
       width={600}
       footer={
         blocked ? (

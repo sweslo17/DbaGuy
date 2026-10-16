@@ -1,5 +1,5 @@
 import { forEachDiagnostic, setDiagnostics, setDiagnosticsEffect, type Diagnostic } from "@codemirror/lint";
-import { EditorState, StateEffect, StateField, type Extension } from "@codemirror/state";
+import { EditorState, StateEffect, StateField, type ChangeDesc, type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 
 /*
@@ -15,16 +15,17 @@ export interface Span {
 
 const setTracked = StateEffect.define<readonly Span[]>();
 
+/** Where a span is after `changes`: text inserted at either edge stays outside it. */
+function mapSpan<T extends Span>(span: T, changes: ChangeDesc): T {
+  const from = changes.mapPos(span.from, 1);
+  return { ...span, from, to: Math.max(from, changes.mapPos(span.to, -1)) };
+}
+
 const trackedField = StateField.define<readonly Span[]>({
   create: () => [],
   update(spans, tr) {
     let next = spans;
-    if (tr.docChanged && spans.length) {
-      next = spans.map(({ from, to }) => {
-        const start = tr.changes.mapPos(from, 1);
-        return { from: start, to: Math.max(start, tr.changes.mapPos(to, -1)) };
-      });
-    }
+    if (tr.docChanged && spans.length) next = spans.map((span) => mapSpan(span, tr.changes));
     for (const effect of tr.effects) if (effect.is(setTracked)) next = effect.value;
     return next;
   },
@@ -43,11 +44,7 @@ const dropTouchedMarks = EditorState.transactionExtender.of((tr) => {
   const marks = currentMarks(tr.startState);
   const kept = marks.filter((mark) => !tr.changes.touchesRange(mark.from, mark.to));
   if (kept.length === marks.length) return null;
-  const moved = kept.map((mark) => {
-    const from = tr.changes.mapPos(mark.from, 1);
-    return { ...mark, from, to: Math.max(from, tr.changes.mapPos(mark.to, -1)) };
-  });
-  return { effects: setDiagnosticsEffect.of(moved) };
+  return { effects: setDiagnosticsEffect.of(kept.map((mark) => mapSpan(mark, tr.changes))) };
 });
 
 /** Lint's own colours are fixed; these follow the theme tokens. */

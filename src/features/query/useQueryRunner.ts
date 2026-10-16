@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { toast } from "@/components/ui/Toast";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import type { AppSettings, GuardDecision } from "@/lib/api/types";
@@ -73,6 +73,14 @@ function stepStatus(execution: ExecutionState | null): StepStatus {
 const isFatal = (execution: ExecutionState | null) =>
   !execution || execution.interrupted || FATAL_CODES.has(execution.error?.code ?? "");
 
+export interface StartOptions {
+  /**
+   * Whether the editor still holds the text the statements were planned from; checked just before the first statement
+   * is sent. Their offsets (flash, marks, jumps) are only right for that text.
+   */
+  unchanged?: () => boolean;
+}
+
 /** The run in progress: what cancel needs to reach it. */
 interface ActiveRun {
   controller: SessionController;
@@ -94,6 +102,9 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
     latest.current = { controller, profileId, settings, timeoutS, listener };
   });
   const active = useRef<ActiveRun | null>(null);
+  /** The open confirmation's answer: a tab closed while it is open answers "no", so the run never hangs. */
+  const pending = useRef<((run: boolean) => void) | null>(null);
+  useEffect(() => () => pending.current?.(false), []);
 
   const ask = useCallback(
     (when: ConfirmPrompt["when"], items: FlaggedStatement[]) =>
@@ -102,9 +113,11 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
         const answer = (run: boolean) => {
           if (answered) return;
           answered = true;
+          if (pending.current === answer) pending.current = null;
           setPrompt(null);
           resolve(run);
         };
+        pending.current = answer;
         setPrompt({ when, items, answer });
       }),
     [],
@@ -203,7 +216,7 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
   );
 
   const start = useCallback(
-    async (planned: PlannedStatement[]): Promise<void> => {
+    async (planned: PlannedStatement[], options: StartOptions = {}): Promise<void> => {
       const { controller: session, profileId: profile } = latest.current;
       if (!session || !profile || planned.length === 0 || active.current) return;
       if (busy(session.store.getState())) return;
@@ -211,7 +224,13 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
       active.current = job;
       try {
         const confirmed = await confirmUpFront(profile, planned);
-        if (confirmed && !job.cancelled) await execute(job, planned, confirmed);
+        if (!confirmed || job.cancelled) return;
+        if (options.unchanged && !options.unchanged()) {
+          // Typed while the statements were being checked: their offsets no longer match the text.
+          toast("warning", "The text changed — run again");
+          return;
+        }
+        await execute(job, planned, confirmed);
       } finally {
         active.current = null;
       }
