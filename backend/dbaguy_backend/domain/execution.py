@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 from ..sql.classifier import Classification
 from .column_category import ColumnCategory
+from .formats import FormatKind, RowFormatOptions
 
 
 class ColumnMeta(BaseModel):
@@ -41,6 +42,17 @@ class ExecuteCommand(BaseModel):
     history: bool = True  # False for queries the app runs on the user's behalf (e.g. table browsing)
 
 
+class ExportCommand(BaseModel):
+    """Run `sql` again on this session and write its whole result, as raw values, to the file at `path`."""
+
+    type: Literal["export"] = "export"
+    request_id: str
+    sql: str
+    format: FormatKind
+    path: str  # absolute, in an existing folder; written as `<path>.part` first, so a failed export keeps any old file
+    options: RowFormatOptions = RowFormatOptions()
+
+
 class FetchMoreCommand(BaseModel):
     type: Literal["fetch_more"] = "fetch_more"
     request_id: str
@@ -74,8 +86,8 @@ class SetAutocommitCommand(BaseModel):
 
 
 ClientCommand = Annotated[
-    ExecuteCommand | FetchMoreCommand | CancelCommand | DiscardCommand | CommitCommand | RollbackCommand
-    | SetAutocommitCommand,
+    ExecuteCommand | ExportCommand | FetchMoreCommand | CancelCommand | DiscardCommand | CommitCommand
+    | RollbackCommand | SetAutocommitCommand,
     Field(discriminator="type"),
 ]
 
@@ -131,6 +143,14 @@ class ErrorEvent(BaseModel):
     position: ErrorPosition | None = None
 
 
+class ProgressEvent(BaseModel):
+    """An export has written `rows` rows so far; sent after every 10,000 rows."""
+
+    type: Literal["progress"] = "progress"
+    request_id: str
+    rows: int
+
+
 class ConfirmationRequiredEvent(BaseModel):
     """The statement was not run: resend it with `confirmed=true` once the user agreed. `finished(skipped)` follows."""
 
@@ -165,7 +185,7 @@ class FinishedEvent(BaseModel):
 
 ServerEvent = Annotated[
     StartedEvent | ResultSetEvent | RowsEvent | ResultSetEndEvent | AffectedEvent | MessageEvent | ErrorEvent
-    | ConfirmationRequiredEvent | SessionStateEvent | FinishedEvent,
+    | ProgressEvent | ConfirmationRequiredEvent | SessionStateEvent | FinishedEvent,
     Field(discriminator="type"),
 ]
 

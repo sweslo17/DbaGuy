@@ -449,9 +449,34 @@ export interface components {
          */
         ExecutionSchema: {
             /** Command */
-            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"] | components["schemas"]["CommitCommand"] | components["schemas"]["RollbackCommand"] | components["schemas"]["SetAutocommitCommand"];
+            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["ExportCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"] | components["schemas"]["CommitCommand"] | components["schemas"]["RollbackCommand"] | components["schemas"]["SetAutocommitCommand"];
             /** Event */
-            event: components["schemas"]["StartedEvent"] | components["schemas"]["ResultSetEvent"] | components["schemas"]["RowsEvent"] | components["schemas"]["ResultSetEndEvent"] | components["schemas"]["AffectedEvent"] | components["schemas"]["MessageEvent"] | components["schemas"]["ErrorEvent"] | components["schemas"]["ConfirmationRequiredEvent"] | components["schemas"]["SessionStateEvent"] | components["schemas"]["FinishedEvent"];
+            event: components["schemas"]["StartedEvent"] | components["schemas"]["ResultSetEvent"] | components["schemas"]["RowsEvent"] | components["schemas"]["ResultSetEndEvent"] | components["schemas"]["AffectedEvent"] | components["schemas"]["MessageEvent"] | components["schemas"]["ErrorEvent"] | components["schemas"]["ProgressEvent"] | components["schemas"]["ConfirmationRequiredEvent"] | components["schemas"]["SessionStateEvent"] | components["schemas"]["FinishedEvent"];
+        };
+        /**
+         * ExportCommand
+         * @description Run `sql` again on this session and write its whole result, as raw values, to the file at `path`.
+         */
+        ExportCommand: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "export";
+            /** Request Id */
+            request_id: string;
+            /** Sql */
+            sql: string;
+            format: components["schemas"]["FormatKind"];
+            /** Path */
+            path: string;
+            /**
+             * @default {
+             *       "header": true,
+             *       "null_text": ""
+             *     }
+             */
+            options: components["schemas"]["RowFormatOptions"];
         };
         /** FetchMoreCommand */
         FetchMoreCommand: {
@@ -502,6 +527,11 @@ export interface components {
              */
             skipped: boolean;
         };
+        /**
+         * FormatKind
+         * @enum {string}
+         */
+        FormatKind: "tsv" | "csv" | "json" | "jsonl" | "markdown" | "insert" | "in_list";
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -643,6 +673,21 @@ export interface components {
             profile: components["schemas"]["ServerProfileDraft"] | components["schemas"]["SqliteProfileDraft"];
             secrets?: components["schemas"]["ProfileSecretsInput"];
         };
+        /**
+         * ProgressEvent
+         * @description An export has written `rows` rows so far; sent after every 10,000 rows.
+         */
+        ProgressEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "progress";
+            /** Request Id */
+            request_id: string;
+            /** Rows */
+            rows: number;
+        };
         /** ResultSetEndEvent */
         ResultSetEndEvent: {
             /**
@@ -682,6 +727,26 @@ export interface components {
             type: "rollback";
             /** Request Id */
             request_id: string;
+        };
+        /**
+         * RowFormatOptions
+         * @description Shared by copy (`/sql/format-rows`) and export (WS `export`).
+         */
+        RowFormatOptions: {
+            /**
+             * Header
+             * @default true
+             */
+            header: boolean;
+            /**
+             * Null Text
+             * @default
+             */
+            null_text: string;
+            /** Table Schema */
+            table_schema?: string | null;
+            /** Table Name */
+            table_name?: string | null;
         };
         /** RowsEvent */
         RowsEvent: {

@@ -6,6 +6,7 @@ from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 from loguru import logger
@@ -22,10 +23,12 @@ from ..domain.execution import (
     DiscardCommand,
     ErrorEvent,
     ExecuteCommand,
+    ExportCommand,
     FetchMoreCommand,
     FinishedEvent,
     MessageEvent,
     MessageSeverity,
+    ProgressEvent,
     ResultSetEndEvent,
     ResultSetEvent,
     RollbackCommand,
@@ -34,17 +37,24 @@ from ..domain.execution import (
     SetAutocommitCommand,
     StartedEvent,
 )
+from ..domain.formats import FormatColumn, FormatKind
 from ..services.safety import GuardAction, GuardDecision
 from ..sql.classifier import Classification, StatementKind
 from ..sql.dialects import Dialect
+from ..sql.formatting import open_writer
+from ..storage.atomic_file import atomic_text_file
 from .session_state import SessionStateTracker
 
 T = TypeVar("T")
+RequestCommand = TypeVar("RequestCommand", ExecuteCommand, ExportCommand)
 Emitter = Callable[[BaseModel], None]
 TransactionCommand = CommitCommand | RollbackCommand | SetAutocommitCommand
 _CHUNK = 200
 _STOP = object()
 _FAILED_COMMIT = "The transaction had failed, so COMMIT rolled it back"
+_EXPORT_CHUNK = 1000  # rows fetched, written and checked for a cancel at a time
+_PROGRESS_EVERY = 10_000  # an export reports its row count each time it passes a multiple of this
+_EXPORT_SELECT_ONLY = "Only a statement that returns rows (SELECT, WITH, VALUES…) can be exported"
 
 
 def _discard_event(_: BaseModel) -> None:
@@ -62,6 +72,10 @@ class ExecutionRecord:
     rows: int  # rows sent plus affected rows
     status: Literal["ok", "error", "cancelled", "timeout"]
     error: str | None = None
+
+
+def _read_only_message(kind: StatementKind) -> str:
+    return f"This connection is read-only: {kind} statements are not allowed"
 
 
 def _run_everything(sql: str, confirmed: bool) -> GuardDecision:
@@ -84,7 +98,7 @@ class WorkerHooks:
 
 @dataclass
 class _Request:
-    """One execute request, from `started` to `finished`."""
+    """One execute or export request, from `started` to `finished`."""
 
     request_id: str
     sql: str
@@ -146,7 +160,7 @@ class SessionWorker:
         # A cancel reached the running request; honoured right before run() and at the next page boundary in case no
         # driver call was in flight to interrupt (the driver then has nothing to cancel and the request would go on).
         self._cancel_requested = False
-        self._queued: dict[str, bool] = {}  # execute requests waiting in the queue -> cancelled before they started
+        self._queued: dict[str, bool] = {}  # requests waiting in the queue -> cancelled before they started
         self._open_exec: _OpenExecution | None = None
         self._closed = False
         self._hooks = WorkerHooks()
@@ -212,7 +226,9 @@ class SessionWorker:
     def submit(self, command: BaseModel) -> None:
         match command:
             case ExecuteCommand():
-                self._submit_execute(command)
+                self._submit_request(command, self._execute)
+            case ExportCommand():
+                self._submit_request(command, self._export)
             case FetchMoreCommand():
                 self._put(lambda: self._fetch_more(command))
             case DiscardCommand():
@@ -289,11 +305,12 @@ class SessionWorker:
             self.last_activity = time.monotonic()
             self._queue.put(task)
 
-    def _submit_execute(self, cmd: ExecuteCommand) -> None:
+    def _submit_request(self, cmd: RequestCommand, run: Callable[[RequestCommand], None]) -> None:
+        """Queue a request that ends with its own `finished`; until it starts, `cancel()` only marks it."""
         with self._state_lock:
             self._queued[cmd.request_id] = False
         try:
-            self._put(lambda: self._execute(cmd))
+            self._put(lambda: run(cmd))
         except BaseException:
             with self._state_lock:
                 self._queued.pop(cmd.request_id, None)
@@ -387,22 +404,30 @@ class SessionWorker:
             self._tracker.activity(busy=True)
         return None
 
+    def _start_request(self, req: _Request) -> bool:
+        """Leave the queue and announce `started`. When the request must not run, end it here and return False."""
+        skipped = self._begin_request(req.request_id)
+        self._send(StartedEvent(request_id=req.request_id))
+        if skipped is None:
+            return True
+        self._send(MessageEvent(request_id=req.request_id, severity=MessageSeverity.WARNING, text=skipped))
+        self._send_finished(req.request_id, req.elapsed_ms(), cancelled=True)
+        return False
+
+    def _raise_if_cancelled(self) -> None:
+        """Honour a cancel that reached the running request while no driver call was there to interrupt."""
+        if self._take_cancel_request():
+            raise StatementCancelled()
+
     def _execute(self, cmd: ExecuteCommand) -> None:
         self._discard_open()
         req = _Request(request_id=cmd.request_id, sql=cmd.sql, history=cmd.history, timeout_s=cmd.timeout_s or None)
-        skipped = self._begin_request(cmd.request_id)
-        self._send(StartedEvent(request_id=cmd.request_id))
-        if skipped is not None:
-            self._send(MessageEvent(request_id=cmd.request_id, severity=MessageSeverity.WARNING, text=skipped))
-            self._send_finished(cmd.request_id, req.elapsed_ms(), cancelled=True)
+        if not self._start_request(req):
             return
         try:
             if not self._passes_policy(req, cmd.confirmed):
                 return
-            if self._take_cancel_request():
-                # Cancelled during the policy check: the driver had nothing to interrupt, so stop here.
-                self._fail(req, StatementCancelled())
-                return
+            self._raise_if_cancelled()  # cancelled during the policy check: the driver had nothing to interrupt
             logger.debug("[{}] execute {}: {}", self.name, cmd.request_id, cmd.sql[:2000])
             req.ran = True
             with self._timeout(req):
@@ -417,19 +442,20 @@ class SessionWorker:
         finally:
             self._set_running(None)
 
-    def _passes_policy(self, req: _Request, confirmed: bool) -> bool:
-        """Check the statement before it reaches the connection; when it may not run, end the request here."""
+    def _decide(self, req: _Request, confirmed: bool) -> GuardDecision:
         decision = self._hooks.check(req.sql, confirmed)
         req.kind = decision.classification.kind
+        return decision
+
+    def _passes_policy(self, req: _Request, confirmed: bool) -> bool:
+        """Check the statement before it reaches the connection; when it may not run, end the request here."""
+        decision = self._decide(req, confirmed)
         if decision.action == GuardAction.RUN:
             return True
         self._set_running(None)  # it never runs: from now on a cancel must not reach the connection
         if decision.action == GuardAction.BLOCK:
             logger.info("[{}] blocked {} statement {} (read-only)", self.name, req.kind, req.request_id)
-            self._send(ErrorEvent(
-                request_id=req.request_id, code="read_only",
-                message=f"This connection is read-only: {req.kind} statements are not allowed",
-            ))
+            self._send(ErrorEvent(request_id=req.request_id, code="read_only", message=_read_only_message(req.kind)))
             self._send_finished(req.request_id, req.elapsed_ms())
         else:
             logger.info("[{}] {} needs confirmation: {}", self.name, req.request_id, ", ".join(decision.reasons))
@@ -549,6 +575,80 @@ class SessionWorker:
             ex.columns_sent = False
             ex.peeked = []
         self._finish(ex)
+
+    def _export(self, cmd: ExportCommand) -> None:
+        self._discard_open()  # one connection: a result the grid left paused ends before the export runs
+        req = _Request(request_id=cmd.request_id, sql=cmd.sql, history=False)
+        if not self._start_request(req):
+            return
+        try:
+            target = self._check_export(cmd, req)
+            self._raise_if_cancelled()  # cancelled during the checks: the driver had nothing to interrupt
+            logger.info("[{}] export {} as {} to {}", self.name, cmd.request_id, cmd.format, target)
+            logger.debug("[{}] export {}: {}", self.name, cmd.request_id, cmd.sql[:2000])
+            req.ran = True
+            written = self._write_export(cmd, target, req)
+        except StatementError as exc:
+            self._fail(req, exc)
+        except OSError as exc:
+            self._fail(req, StatementError(f"Cannot write {cmd.path}: {exc.strerror or exc}", code="export_io"))
+        except Exception as exc:
+            logger.exception("Unexpected error exporting on {}", self.name)
+            self._fail(req, StatementError(f"Internal error: {exc}"))
+        else:
+            logger.info("[{}] exported {:,} rows to {} in {} ms", self.name, written, target, req.elapsed_ms())
+            text = f"Exported {written:,} rows to {target}"
+            self._send(MessageEvent(request_id=cmd.request_id, severity=MessageSeverity.INFO, text=text))
+            self._complete(req)
+        finally:
+            self._set_running(None)
+
+    def _check_export(self, cmd: ExportCommand, req: _Request) -> Path:
+        """Reject what an export cannot do, before anything runs or is written. Returns the file to write."""
+        if cmd.format == FormatKind.IN_LIST:
+            raise StatementError("An IN list cannot be exported; copy it from the grid", code="unsupported_format")
+        target = Path(cmd.path).expanduser()
+        if not target.is_absolute() or target.is_dir() or not target.parent.is_dir():
+            raise StatementError(f"Choose a file in an existing folder to export into: {cmd.path}", code="invalid_path")
+        if self._decide(req, False).action == GuardAction.BLOCK:
+            raise StatementError(_read_only_message(req.kind), code="read_only")
+        if req.kind != StatementKind.READ:
+            raise StatementError(_EXPORT_SELECT_ONLY, code="export_requires_select")
+        return target
+
+    def _write_export(self, cmd: ExportCommand, target: Path, req: _Request) -> int:
+        """Run the statement and write its whole result, raw values, into `target`. Returns the rows written.
+
+        A failed or cancelled export removes its partial file instead of finishing the document, so the writer's
+        `close()` runs only when every row is in.
+        """
+        result = self.connection.run(cmd.sql)
+        try:
+            columns = result.columns()
+            if columns is None:
+                raise StatementError(_EXPORT_SELECT_ONLY, code="export_requires_select")
+            written = 0
+            with atomic_text_file(target) as fp:
+                writer = open_writer(
+                    cmd.format, fp, [FormatColumn(name=c.name, category=c.category) for c in columns],
+                    cmd.options, self._hooks.dialect,
+                )
+                while True:
+                    rows = result.fetch(_EXPORT_CHUNK)
+                    self._raise_if_cancelled()
+                    if not rows:
+                        break
+                    writer.write(rows)
+                    before, written = written, written + len(rows)
+                    req.rows = written
+                    if written // _PROGRESS_EVERY > before // _PROGRESS_EVERY:
+                        self._send(ProgressEvent(request_id=cmd.request_id, rows=written))
+                writer.close()
+            return written
+        finally:
+            # Before `finished` goes out and the result closes: from now on a cancel must not reach the connection.
+            self._set_running(None)
+            self._close_result(result)
 
     def _transaction_command(self, cmd: TransactionCommand) -> None:
         self._discard_open()
@@ -671,22 +771,22 @@ class SessionWorker:
             ddl_done=ddl_done,
         )
 
+    def _close_result(self, result: StatementResult) -> None:
+        try:
+            result.close()
+        except Exception as exc:
+            logger.warning("Error closing result on {}: {}", self.name, exc)
+
     def _finish(self, ex: _OpenExecution, cancelled: bool = False) -> None:
         self._set_running(None)  # before `finished` goes out: from then on a cancel must not reach the connection
         self._open_exec = None
-        try:
-            ex.result.close()
-        except Exception as exc:
-            logger.warning("Error closing result on {}: {}", self.name, exc)
+        self._close_result(ex.result)
         self._complete(ex.req, cancelled=cancelled)
 
     def _fail(self, req: _Request, exc: StatementError) -> None:
         self._set_running(None)
         if self._open_exec is not None:
-            try:
-                self._open_exec.result.close()
-            except Exception:
-                pass
+            self._close_result(self._open_exec.result)
             self._open_exec = None
         cancelled = isinstance(exc, StatementCancelled)
         if cancelled:

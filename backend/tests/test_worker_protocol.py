@@ -9,15 +9,17 @@ import pytest
 from dbaguy_backend.domain.execution import (
     CommitCommand,
     ExecuteCommand,
+    ExportCommand,
     FetchMoreCommand,
     RollbackCommand,
     SetAutocommitCommand,
 )
+from dbaguy_backend.domain.formats import FormatKind
 from dbaguy_backend.services.safety import GuardAction, GuardDecision, SafetyPolicy
 from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks
 from dbaguy_backend.sql.classifier import Classification, StatementKind
 from dbaguy_backend.sql.dialects import Dialect
-from tests.fake_db import FakeLease
+from tests.fake_db import FakeLease, FakeResult
 from tests.fake_ssh import run_in_thread
 from tests.test_sessions import Recorder
 
@@ -320,3 +322,82 @@ def test_no_idle_rollback_when_something_ran_in_between(make_worker):
     worker.cancel("b")
     rec.wait_for(lambda e: e.type == "finished" and e.request_id == "b")
     assert conn.rollbacks == 0
+
+
+# ---- export: the same request lifecycle as an execute ----
+
+def reads(sql, confirmed):
+    return GuardDecision(action=GuardAction.RUN, classification=Classification(kind=StatementKind.READ))
+
+
+def export(worker, recorder, rid, sql, path):
+    worker.submit(ExportCommand(request_id=rid, sql=sql, format=FormatKind.CSV, path=str(path)))
+    return recorder.wait_for(lambda e: e.type == "finished" and e.request_id == rid)
+
+
+def test_export_runs_the_statement_once_and_is_not_recorded_in_history(make_worker, tmp_path):
+    records = []
+    worker, conn, rec = make_worker(check=reads, on_record=records.append)
+    done = export(worker, rec, "x", "rows 3", tmp_path / "n.csv")
+    assert not done.cancelled and (tmp_path / "n.csv").read_text(encoding="utf-8") == "n\n0\n1\n2\n"
+    assert conn.runs == ["rows 3"] and records == []
+    assert [m.text for m in rec.of("x", "message")] == [f"Exported 3 rows to {tmp_path / 'n.csv'}"]
+
+
+def test_export_is_blocked_on_a_read_only_connection(make_worker, tmp_path):
+    worker, conn, rec = make_worker(check=standard(read_only=True))
+    export(worker, rec, "x", "DELETE FROM t", tmp_path / "n.csv")
+    assert rec.of("x", "error")[0].code == "read_only" and conn.runs == [] and not (tmp_path / "n.csv").exists()
+
+
+def test_a_statement_without_columns_cannot_be_exported_and_its_result_is_closed(make_worker, tmp_path):
+    worker, conn, rec = make_worker(check=reads)
+    result = FakeResult(0)
+    result.columns = lambda: None
+    conn.run = lambda sql: result
+    export(worker, rec, "x", "anything", tmp_path / "n.csv")
+    assert rec.of("x", "error")[0].code == "export_requires_select" and result.closed
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_cancel_during_the_policy_check_stops_an_export_before_it_runs(make_worker, tmp_path):
+    checking, release = threading.Event(), threading.Event()
+
+    def slow_check(sql, confirmed):
+        checking.set()
+        assert release.wait(5)
+        return reads(sql, confirmed)
+
+    worker, conn, rec = make_worker(check=slow_check)
+    worker.submit(ExportCommand(request_id="x", sql="rows 1", format=FormatKind.CSV, path=str(tmp_path / "n.csv")))
+    assert checking.wait(5)
+    worker.cancel("x")
+    release.set()
+    done = rec.wait_for(lambda e: e.type == "finished" and e.request_id == "x")
+    assert done.cancelled and conn.runs == [] and list(tmp_path.iterdir()) == []
+    assert not run(worker, rec, "y", "rows 1").cancelled  # the cancel does not leak into the next request
+
+
+def test_a_queued_export_can_be_cancelled_before_it_starts(make_worker, tmp_path):
+    worker, conn, rec = make_worker(check=reads)
+    worker.submit(ExecuteCommand(request_id="slow", sql="block"))
+    assert conn.blocked.wait(5)
+    worker.submit(ExportCommand(request_id="x", sql="rows 1", format=FormatKind.CSV, path=str(tmp_path / "n.csv")))
+    worker.cancel("x")
+    worker.cancel("slow")
+    done = rec.wait_for(lambda e: e.type == "finished" and e.request_id == "x")
+    assert done.cancelled and conn.runs == ["block"] and list(tmp_path.iterdir()) == []
+    assert [m.text for m in rec.of("x", "message")] == ["Query cancelled before it started"]
+
+
+def test_a_running_export_is_not_an_idle_transaction(make_worker, tmp_path):
+    worker, conn, rec = make_worker(check=reads)
+    run(worker, rec, "a", "begin")
+    conn.blocked.clear()
+    worker.submit(ExportCommand(request_id="x", sql="block", format=FormatKind.CSV, path=str(tmp_path / "n.csv")))
+    assert conn.blocked.wait(5)
+    time.sleep(0.15)  # longer than the warning threshold, with the transaction open and the export still running
+    worker.check_idle_transaction(warn_after_s=0.1, rollback_after_s=0)
+    worker.cancel("x")
+    rec.wait_for(lambda e: e.type == "finished" and e.request_id == "x")
+    assert [e for e in rec.events if e.type == "message" and e.request_id == ""] == []
