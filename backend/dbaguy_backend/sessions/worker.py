@@ -243,8 +243,7 @@ class SessionWorker:
         with self._state_lock:
             if self._running_request == request_id:
                 logger.info("Cancelling request {} on {}", request_id, self.name)
-                self._cancel_requested = True
-                self._cancel_connection()
+                self._interrupt_running()
                 return
             if request_id in self._queued:
                 logger.info("Request {} on {} cancelled before it started", request_id, self.name)
@@ -277,7 +276,7 @@ class SessionWorker:
             return
         with self._state_lock:
             if self._running_request is not None and self._lease is not None:
-                self._cancel_connection()
+                self._interrupt_running()
         if self._thread.ident is not None:
             self._thread.join(timeout=10)
             if self._thread.is_alive():
@@ -291,6 +290,12 @@ class SessionWorker:
             self._closed = True
             self._queue.put(_STOP)
         return True
+
+    def _interrupt_running(self) -> None:
+        """Stop the running request: flag it, for when no driver call is in flight, and interrupt the driver.
+        The caller holds `_state_lock`."""
+        self._cancel_requested = True
+        self._cancel_connection()
 
     def _cancel_connection(self) -> None:
         try:
@@ -322,8 +327,7 @@ class SessionWorker:
                 return  # paused or over: the timeout no longer applies
             logger.info("Request {} on {} timed out after {:g} s", req.request_id, self.name, req.timeout_s)
             req.timed_out = True
-            self._cancel_requested = True
-            self._cancel_connection()
+            self._interrupt_running()
 
     # ---- worker thread ----
 
@@ -589,9 +593,10 @@ class SessionWorker:
             req.ran = True
             written = self._write_export(cmd, target, req)
         except StatementError as exc:
-            self._fail(req, exc)
+            self._fail_export(req, cmd, exc)
         except OSError as exc:
-            self._fail(req, StatementError(f"Cannot write {cmd.path}: {exc.strerror or exc}", code="export_io"))
+            error = StatementError(f"Cannot write {cmd.path}: {exc.strerror or exc}", code="export_io")
+            self._fail_export(req, cmd, error)
         except Exception as exc:
             logger.exception("Unexpected error exporting on {}", self.name)
             self._fail(req, StatementError(f"Internal error: {exc}"))
@@ -602,6 +607,13 @@ class SessionWorker:
             self._complete(req)
         finally:
             self._set_running(None)
+
+    def _fail_export(self, req: _Request, cmd: ExportCommand, exc: StatementError) -> None:
+        if isinstance(exc, StatementCancelled):
+            logger.info("[{}] export {} to {} cancelled", self.name, cmd.request_id, cmd.path)
+        else:
+            logger.warning("[{}] export {} to {} failed: {}", self.name, cmd.request_id, cmd.path, exc.message)
+        self._fail(req, exc)
 
     def _check_export(self, cmd: ExportCommand, req: _Request) -> Path:
         """Reject what an export cannot do, before anything runs or is written. Returns the file to write."""

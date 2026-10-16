@@ -401,3 +401,28 @@ def test_a_running_export_is_not_an_idle_transaction(make_worker, tmp_path):
     worker.cancel("x")
     rec.wait_for(lambda e: e.type == "finished" and e.request_id == "x")
     assert [e for e in rec.events if e.type == "message" and e.request_id == ""] == []
+
+
+class EndlessResult(FakeResult):
+    """Rows that never block: a driver cancel has nothing to interrupt, only the worker's own check can stop it.
+    Bounded, so a worker that fails to stop ends the export instead of filling the disk."""
+
+    def __init__(self, limit: int = 1_000_000) -> None:
+        super().__init__(0)
+        self._left = limit
+
+    def fetch(self, n):
+        taken, self._left = min(n, self._left), max(self._left - n, 0)
+        return [[1]] * taken
+
+
+def test_closing_the_session_stops_a_running_export(make_worker, tmp_path):
+    worker, conn, rec = make_worker(check=reads)
+    conn.run = lambda sql: EndlessResult()
+    worker.submit(ExportCommand(request_id="x", sql="endless", format=FormatKind.CSV, path=str(tmp_path / "n.csv")))
+    rec.wait_for(lambda e: e.type == "progress" and e.request_id == "x")
+    started = time.monotonic()
+    worker.close()
+    assert time.monotonic() - started < 2
+    assert [e.cancelled for e in rec.of("x", "finished")] == [True]
+    assert list(tmp_path.iterdir()) == []  # neither the file nor its .part
