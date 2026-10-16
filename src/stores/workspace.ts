@@ -83,10 +83,11 @@ interface WorkspaceState extends WorkspaceSnapshot {
   moveScripts: (from: string, to: string) => void;
   /**
    * The script file or folder at `path` is gone: the tabs bound to it (or to a file below it) keep their text but are
-   * no longer bound to a file. `""` (the scripts folder itself, e.g. once it moved) unbinds every script tab. Returns
-   * their titles.
+   * no longer bound to a file. Returns their titles.
    */
   unbindScripts: (path: string) => string[];
+  /** The scripts folder is another one now: every tab bound to a script is unbound, as above. Returns their titles. */
+  unbindAllScripts: () => string[];
   /** Replaces the tabs with the saved workspace (startup only, before the workspace renders). */
   restore: (snapshot: WorkspaceSnapshot) => void;
 }
@@ -95,9 +96,24 @@ interface WorkspaceState extends WorkspaceSnapshot {
 let queryCounter = 0;
 const queryNumber = (tab: Tab) => (tab.kind === "query" ? Number(/^Query (\d+)$/.exec(tab.title)?.[1] ?? 0) : 0);
 
+/** The ids of the query tabs bound to a script for which `matches` holds. */
+const boundWhere = (tabs: Tab[], matches: (scriptPath: string) => boolean) =>
+  new Set(tabs.filter((t) => t.kind === "query" && t.scriptPath !== null && matches(t.scriptPath)).map((t) => t.id));
+
 /** The ids of the query tabs bound to the script at `path`, or to a file below it when it is a folder. */
-const boundTo = (tabs: Tab[], path: string) =>
-  new Set(tabs.filter((t) => t.kind === "query" && t.scriptPath !== null && isWithin(t.scriptPath, path)).map((t) => t.id));
+const boundTo = (tabs: Tab[], path: string) => boundWhere(tabs, (scriptPath) => isWithin(scriptPath, path));
+
+/** Unbinds the query tabs `ids`, which keep their text, and returns their titles. */
+function unbindTabs(ids: Set<string>): string[] {
+  if (!ids.size) return [];
+  useWorkspace.setState((s) => ({
+    tabs: s.tabs.map((t) => (t.kind === "query" && ids.has(t.id) ? { ...t, scriptPath: null, savedText: null } : t)),
+  }));
+  return useWorkspace
+    .getState()
+    .tabs.filter((t) => ids.has(t.id))
+    .map((t) => t.title);
+}
 
 /** The query tab bound to the script file at `path`, if one is open. */
 export function scriptTab(path: string): QueryTabState | undefined {
@@ -167,14 +183,8 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
       }),
     }));
   },
-  unbindScripts: (path) => {
-    const bound = boundTo(get().tabs, path);
-    if (!bound.size) return [];
-    set((s) => ({
-      tabs: s.tabs.map((t) => (t.kind === "query" && bound.has(t.id) ? { ...t, scriptPath: null, savedText: null } : t)),
-    }));
-    return get().tabs.filter((t) => bound.has(t.id)).map((t) => t.title);
-  },
+  unbindScripts: (path) => unbindTabs(boundTo(get().tabs, path)),
+  unbindAllScripts: () => unbindTabs(boundWhere(get().tabs, () => true)),
   restore: ({ tabs, activeTabId, sidebarTab }) => {
     queryCounter = Math.max(queryCounter, ...tabs.map(queryNumber));
     set({ tabs, activeTabId, sidebarTab });

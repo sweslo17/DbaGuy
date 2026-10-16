@@ -8,7 +8,7 @@ import { errorMessage } from "@/lib/api/client";
 import type { AppSettings } from "@/lib/api/types";
 import { isImeKeyEvent } from "@/lib/ime";
 import { canChooseFiles, chooseFolder } from "@/lib/native";
-import { settingsKey, useAppSettings } from "@/stores/settings";
+import { useAppSettings } from "@/stores/settings";
 import { scriptsFolderChanged } from "../scripts/useScripts";
 import {
   hasNumberProblem,
@@ -223,18 +223,34 @@ function SettingsForm({ initial }: { initial: AppSettings }) {
 }
 
 /**
+ * Before the stored settings are known: loading, or why they could not be read, with Retry (which shows "Loading…"
+ * again while it asks).
+ */
+function SettingsUnavailable({ error, reload }: { error: Error | null; reload: () => Promise<unknown> }) {
+  return (
+    <Dialog open onOpenChange={(next) => !next && close()} title="Settings" width={540}>
+      {error ? (
+        <div className="flex flex-col items-start gap-2">
+          <p className="text-[13px]">Could not load the settings</p>
+          <p className="text-[12px] whitespace-pre-wrap text-danger" data-selectable>
+            {errorMessage(error)}
+          </p>
+          <Button onClick={() => void reload()}>Retry</Button>
+        </div>
+      ) : (
+        <p className="text-[13px] text-muted">Loading the settings…</p>
+      )}
+    </Dialog>
+  );
+}
+
+/**
  * The Settings dialog (spec §4.9), mounted once by the app shell; ⌘, opens it unless another dialog has the keyboard.
  * Until the stored settings have loaded it shows nothing to edit, so the defaults are never saved over them.
  */
 export function SettingsDialogHost() {
-  const qc = useQueryClient();
   const open = useSettingsDialog((s) => s.open);
-  const { settings, loaded } = useAppSettings();
-
-  // The first read failed (the backend was down): opening reads them again.
-  useEffect(() => {
-    if (open && !loaded) void qc.refetchQueries({ queryKey: settingsKey });
-  }, [open, loaded, qc]);
+  const { settings, loaded, loadError, reload } = useAppSettings();
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -249,12 +265,5 @@ export function SettingsDialogHost() {
   }, []);
 
   if (!open) return null;
-  if (!loaded) {
-    return (
-      <Dialog open onOpenChange={(next) => !next && close()} title="Settings" width={540}>
-        <p className="text-[13px] text-muted">Loading the settings…</p>
-      </Dialog>
-    );
-  }
-  return <SettingsForm initial={settings} />;
+  return loaded ? <SettingsForm initial={settings} /> : <SettingsUnavailable error={loadError} reload={reload} />;
 }

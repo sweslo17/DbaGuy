@@ -25,6 +25,9 @@ export function useAppSettings(): {
   isLoading: boolean;
   /** `settings` are the stored ones (false: the defaults, until `GET /settings` answers). */
   loaded: boolean;
+  /** Why the last `GET /settings` failed (null: it did not); `reload` asks again. */
+  loadError: Error | null;
+  reload: () => Promise<unknown>;
   /** Resolves to the settings as stored; an invalid value (422) or a failure throws `ApiError`. */
   save: (next: AppSettings) => Promise<AppSettings>;
 } {
@@ -42,5 +45,12 @@ export function useAppSettings(): {
     },
     [qc],
   );
-  return { settings: query.data ?? DEFAULT_SETTINGS, isLoading: query.isLoading, loaded: query.data !== undefined, save };
+  return {
+    settings: query.data ?? DEFAULT_SETTINGS,
+    isLoading: query.isLoading,
+    loaded: query.data !== undefined,
+    loadError: query.error,
+    reload: query.refetch,
+    save,
+  };
 }

@@ -1,5 +1,6 @@
 import { Loader2, Plus, X } from "lucide-react";
 import { useEffect, useMemo } from "react";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import type { Profile } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { isImeKeyEvent } from "@/lib/ime";
@@ -138,10 +139,13 @@ export function Workspace() {
         {!active && (
           <p className="p-6 text-center text-muted">Open a table from the sidebar, or right-click a connection → New Query</p>
         )}
-        {/* Tabs stay mounted while hidden so their sessions and editors keep their state; closing a tab unmounts it. */}
+        {/* Tabs stay mounted while hidden so their sessions and editors keep their state; closing a tab unmounts it.
+            A tab whose content throws shows the error in its place; the other tabs carry on. */}
         {tabs.map((tab) => (
           <div key={tab.id} className={cn("h-full", tab.id !== activeTabId && "hidden")}>
-            <TabContent tab={tab} active={tab.id === activeTabId} />
+            <ErrorBoundary name={`Tab ${tab.title}`} title="This tab hit an error" recover="retry">
+              <TabContent tab={tab} active={tab.id === activeTabId} />
+            </ErrorBoundary>
           </div>
         ))}
       </div>

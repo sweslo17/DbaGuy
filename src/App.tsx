@@ -2,6 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { AppShell } from "./app/AppShell";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Sidebar } from "./app/Sidebar";
 import { Workspace } from "./features/workspace/Workspace";
 import { restoreWorkspace } from "./features/workspace/workspaceSync";
@@ -24,5 +25,10 @@ export function App() {
   }, [queryClient]);
 
   if (!restored) return <Restoring />;
-  return <AppShell sidebar={<Sidebar />} workspace={<Workspace />} />;
+  // An error anywhere in the app shows its message and a Reload (a tab's own error stays inside that tab).
+  return (
+    <ErrorBoundary name="App" title="DbaGuy hit an error" recover="reload">
+      <AppShell sidebar={<Sidebar />} workspace={<Workspace />} />
+    </ErrorBoundary>
+  );
 }

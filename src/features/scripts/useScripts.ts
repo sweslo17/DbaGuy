@@ -51,7 +51,7 @@ export async function scriptExists(path: string): Promise<boolean> {
  */
 export function scriptsFolderChanged(qc: QueryClient): void {
   void qc.invalidateQueries({ queryKey: scriptTreeKey });
-  const titles = useWorkspace.getState().unbindScripts("");
+  const titles = useWorkspace.getState().unbindAllScripts();
   console.info(`Scripts folder changed; unbound ${titles.length} script tab(s)`);
   if (!titles.length) return;
   const tabs = titles.length === 1 ? `${titles[0]} keeps its text` : `${titles.join(", ")} keep their text`;

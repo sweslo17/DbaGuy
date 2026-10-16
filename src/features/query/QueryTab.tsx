@@ -5,7 +5,7 @@ import { Group, Panel } from "react-resizable-panels";
 import { PanelHandle } from "@/components/ui/PanelHandle";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
-import { markEdited, registerEditor } from "@/stores/editorBuffers";
+import { markEdited, readEditorBuffer, registerEditor, rememberEditorBuffer } from "@/stores/editorBuffers";
 import { useAppSettings } from "@/stores/settings";
 import { useReportTabStatus } from "@/stores/tabStatus";
 import { useWorkspace, type QueryTabState } from "@/stores/workspace";
@@ -225,9 +225,11 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   }, [active]);
 
   // The workspace writer reads the editor only when it saves: a keystroke just marks the workspace edited, so typing
-  // never re-renders the tab tree (R-02c-4). The History panel inserts through it. A layout effect, so that unmounting
-  // reads the editor before it goes.
+  // never re-renders the tab tree (R-02c-4). The History panel inserts through it. What the editor held when it is
+  // destroyed (the tab closing, or its content crashing) reaches the writer through `onUnmount` (R-02c-14).
   useLayoutEffect(() => registerEditor(tab.id, () => editor.current), [tab.id]);
+  // Mounted again ("Try again" after this tab crashed): the editor starts from what it held, not from the tab's start.
+  const [remembered] = useState(() => readEditorBuffer(tab.id));
 
   const locate = (index: number, execution: ExecutionState) => {
     const current = view();
@@ -235,6 +237,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   };
   const jump = (index: number, execution: ExecutionState) => withView((v) => jumpToError(v, index, execution));
   const initialSelection =
+    remembered?.selection ??
     tab.initialSelection ??
     (tab.initialCursor !== undefined ? { anchor: tab.initialCursor, head: tab.initialCursor } : undefined);
   const tint = profileColor(profile?.color);
@@ -280,7 +283,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
             <div className="h-full" style={tint ? { borderTop: `2px solid ${tint}` } : undefined}>
               <CodeEditor
                 ref={editor}
-                initialText={tab.initialText}
+                initialText={remembered?.text ?? tab.initialText}
                 initialSelection={initialSelection}
                 dialect={dialect}
                 extensions={extensions}
@@ -289,6 +292,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
                   script.docChanged();
                 }}
                 onSelectionChange={markEdited}
+                onUnmount={(content) => rememberEditorBuffer(tab.id, content)}
               />
             </div>
           </Panel>

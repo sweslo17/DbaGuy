@@ -20,6 +20,12 @@ export interface CodeEditorHandle {
   insert(text: string): void;
 }
 
+/** An editor's text and main selection. */
+export interface EditorContent {
+  text: string;
+  selection: { anchor: number; head: number };
+}
+
 export interface CodeEditorProps {
   initialText: string;
   initialSelection?: { anchor: number; head: number };
@@ -28,6 +34,11 @@ export interface CodeEditorProps {
   /** The text changed. Called on every keystroke, so it carries no text: read it (`getText`) only when needed. */
   onChange?: () => void;
   onSelectionChange?: (selection: { anchor: number; head: number }) => void;
+  /**
+   * The editor is being destroyed (unmounted, including by a crash): its final content, read just before. StrictMode's
+   * mount check destroys a first editor too, so a receiver keeps it only until something newer arrives.
+   */
+  onUnmount?: (content: EditorContent) => void;
   /**
    * Tab-specific extensions (run keymap, completion, statements, diagnostics…). They come before the base ones, so
    * their keymaps win at equal precedence. Keep the array stable (memoize it): a new array reconfigures the editor.
@@ -53,6 +64,7 @@ export function CodeEditor({
   dialect,
   onChange,
   onSelectionChange,
+  onUnmount,
   extensions = NONE,
   ref,
 }: CodeEditorProps) {
@@ -63,9 +75,9 @@ export function CodeEditor({
   const options = useMemo(() => editorOptions(editor, dialect), [editor, dialect]);
   // What the view is configured with now: the reconfigure effects only swap what changed since.
   const applied = useRef<{ options: EditorOptions; extensions: Extension[] }>({ options, extensions });
-  const latest = useRef({ initialText, initialSelection, options, extensions, onChange, onSelectionChange });
+  const latest = useRef({ initialText, initialSelection, options, extensions, onChange, onSelectionChange, onUnmount });
   useLayoutEffect(() => {
-    latest.current = { initialText, initialSelection, options, extensions, onChange, onSelectionChange };
+    latest.current = { initialText, initialSelection, options, extensions, onChange, onSelectionChange, onUnmount };
   });
 
   // Created once (twice under StrictMode's mount check, which destroys the first) from the props at mount time.
@@ -95,6 +107,9 @@ export function CodeEditor({
     viewRef.current = view;
     applied.current = { options: init.options, extensions: init.extensions };
     return () => {
+      // Read before anything is torn down: whatever order React unmounts in, the content is handed over.
+      const { anchor, head } = view.state.selection.main;
+      latest.current.onUnmount?.({ text: view.state.doc.toString(), selection: { anchor, head } });
       view.destroy();
       if (viewRef.current === view) viewRef.current = null;
     };

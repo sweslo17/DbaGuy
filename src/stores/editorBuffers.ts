@@ -16,18 +16,26 @@ export type MountedEditor = () => CodeEditorHandle | null;
  * panel inserts into the active tab's editor.
  */
 const editors = new Map<string, MountedEditor>();
-/** What an editor held when it unmounted while its tab stayed open, by tab id. */
+/** What each tab's editor held when it was last destroyed, by tab id (dropped once the tab is closed). */
 const lastKnown = new Map<string, EditorBuffer>();
 const editListeners = new Set<() => void>();
 
-/** Registers a tab's mounted editor; the returned function unregisters it, keeping what it held last. */
+/** Registers a tab's mounted editor; the returned function unregisters it. */
 export function registerEditor(tabId: string, editor: MountedEditor): () => void {
   editors.set(tabId, editor);
   return () => {
-    const final = readMounted(editor);
-    if (final) lastKnown.set(tabId, final);
     if (editors.get(tabId) === editor) editors.delete(tabId);
   };
+}
+
+/**
+ * A tab's editor is being destroyed (ruling R-02c-14): what it held, read by the editor itself just before, so it does
+ * not depend on the order React detaches refs and runs cleanups (a crash unmounts everything at once). A mounted
+ * editor's live content still wins, so the write from StrictMode's mount check (the first editor it destroys) is
+ * harmless; the real unmount writes again.
+ */
+export function rememberEditorBuffer(tabId: string, buffer: EditorBuffer): void {
+  lastKnown.set(tabId, buffer);
 }
 
 function readMounted(editor: MountedEditor): EditorBuffer | null {
@@ -42,7 +50,10 @@ function readMounted(editor: MountedEditor): EditorBuffer | null {
   }
 }
 
-/** The tab's editor content now: its mounted editor's, else what it held last; null if it never mounted. */
+/**
+ * The tab's editor content now: its mounted editor's, else what it held when it was destroyed (a tab whose content
+ * crashed, or one being mounted again); null if it never mounted.
+ */
 export function readEditorBuffer(tabId: string): EditorBuffer | null {
   const editor = editors.get(tabId);
   return (editor && readMounted(editor)) ?? lastKnown.get(tabId) ?? null;

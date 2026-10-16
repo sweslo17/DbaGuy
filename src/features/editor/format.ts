@@ -59,13 +59,19 @@ function mapOffset(before: string, after: string, offset: number): number {
   return at;
 }
 
-/** What to format: the trimmed selection, or the statement under the cursor (without its `;`). */
+/**
+ * What to format: the trimmed selection, or the statement under the cursor (without its `;`); null when that is
+ * nothing (a blank selection, or the cursor between statements).
+ */
 async function target(
   view: EditorView,
   dialect: Dialect | null,
 ): Promise<{ state: EditorState; from: number; to: number; selection: boolean } | null> {
   const { main } = view.state.selection;
-  if (!main.empty) return { state: view.state, ...trimmed(view.state, main.from, main.to), selection: true };
+  if (!main.empty) {
+    const range = trimmed(view.state, main.from, main.to);
+    return range.to > range.from ? { state: view.state, ...range, selection: true } : null;
+  }
   let state: EditorState;
   let ranges: StatementRange[];
   if (dialect) ({ state, ranges } = await currentStatements(view, dialect));
@@ -80,7 +86,8 @@ async function target(
 
 /**
  * Formats the selection, else the statement under the cursor, as one undo step of its own. A cursor between statements
- * formats nothing; a text the formatter cannot parse is left unchanged and the reason shown in a toast.
+ * formats nothing (never a neighbouring statement) and says so; a text the formatter cannot parse is left unchanged
+ * and the reason shown in a toast.
  */
 export async function formatSql(view: EditorView, settings: FormatSettings): Promise<void> {
   if (formatting.has(view)) return;
@@ -93,7 +100,10 @@ export async function formatSql(view: EditorView, settings: FormatSettings): Pro
       toast("error", `Could not find the statement to format: ${errorMessage(error)}`);
       return;
     }
-    if (!found || found.to <= found.from) return;
+    if (!found) {
+      toast("info", "Put the cursor in a statement (or select text) to format it");
+      return;
+    }
     const { state, from, to, selection } = found;
     const original = state.sliceDoc(from, to);
     let formatted: string;
