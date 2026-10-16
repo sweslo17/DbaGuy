@@ -487,9 +487,12 @@ class PostgresConnection(DatabaseConnection):
     def set_autocommit(self, enabled: bool) -> None:
         if self._conn.autocommit == enabled:
             return
-        if self._conn.info.transaction_status != pq.TransactionStatus.IDLE:
+        if self._conn.info.transaction_status in (pq.TransactionStatus.INTRANS, pq.TransactionStatus.INERROR):
             raise transaction_open_error()
-        self._conn.autocommit = enabled
+        try:
+            self._conn.autocommit = enabled  # a dead connection fails here, translated like commit() does
+        except psycopg.Error as exc:
+            raise self.translate_error(exc, "SET AUTOCOMMIT") from exc
         logger.info("Auto-commit {} on PostgreSQL db={}", "on" if enabled else "off", self.current_database())
 
     def commit(self) -> None:

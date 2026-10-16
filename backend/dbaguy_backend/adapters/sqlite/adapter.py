@@ -11,6 +11,7 @@ from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
 from ...domain.profiles import AnyProfile, Engine, SqliteProfile, SqliteProfileDraft
 from ...domain.schema import SchemaSnapshot
 from ...sql.dialects import Dialect
+from ...sql.lexer import first_keyword
 from ..base import (
     DatabaseAdapter,
     DatabaseConnection,
@@ -25,6 +26,10 @@ from . import introspection
 from . import schema as sqlite_schema
 
 _PEEK_ROWS = 200
+# Statements that control the transaction themselves or cannot run inside one: manual mode does not BEGIN for them.
+_NO_AUTO_BEGIN = frozenset(
+    {"BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE", "VACUUM", "PRAGMA", "ATTACH", "DETACH"}
+)
 
 
 def _translate(exc: sqlite3.Error) -> StatementError:
@@ -97,8 +102,9 @@ class SqliteStatementResult(StatementResult):
 
 class SqliteConnection(DatabaseConnection):
     def __init__(self, conn: sqlite3.Connection, path: Path) -> None:
-        self._conn = conn
+        self._conn = conn  # isolation_level=None: the driver never begins a transaction on its own
         self._path = path
+        self._manual = False  # manual-commit mode: run() begins a transaction in front of every statement
 
     def server_info(self) -> ServerInfo:
         return ServerInfo(engine=Engine.SQLITE, version=sqlite3.sqlite_version, current_database="main")
@@ -124,7 +130,21 @@ class SqliteConnection(DatabaseConnection):
         except sqlite3.Error as exc:
             raise _translate(exc) from exc
 
+    def _begin_if_manual(self, sql: str) -> None:
+        """Manual mode: open the transaction the statement runs in, as psycopg does for PostgreSQL.
+
+        The driver's own implicit BEGIN only recognises INSERT/UPDATE/DELETE/REPLACE, so a CTE-prefixed write or DDL
+        would otherwise autocommit and escape rollback().
+        """
+        if not self._manual or self._conn.in_transaction or first_keyword(sql, Dialect.SQLITE) in _NO_AUTO_BEGIN:
+            return
+        try:
+            self._conn.execute("BEGIN")
+        except sqlite3.Error as exc:
+            raise _translate(exc) from exc
+
     def run(self, sql: str) -> StatementResult:
+        self._begin_if_manual(sql)
         cursor = self._conn.cursor()
         try:
             cursor.execute(sql)
@@ -137,15 +157,14 @@ class SqliteConnection(DatabaseConnection):
         return self._conn.in_transaction
 
     def autocommit(self) -> bool:
-        return self._conn.isolation_level is None
+        return not self._manual
 
     def set_autocommit(self, enabled: bool) -> None:
         if self.autocommit() == enabled:
             return
         if self._conn.in_transaction:
             raise transaction_open_error()
-        # Manual mode: the driver issues BEGIN before the first INSERT/UPDATE/DELETE/REPLACE.
-        self._conn.isolation_level = None if enabled else "DEFERRED"
+        self._manual = not enabled
         logger.info("Auto-commit {} on SQLite database {}", "on" if enabled else "off", self._path)
 
     def commit(self) -> None:

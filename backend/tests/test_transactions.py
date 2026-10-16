@@ -47,6 +47,67 @@ def test_sqlite_manual_commit_mode(tmp_path):
         conn.close()
 
 
+@pytest.fixture
+def sqlite_manual(tmp_path):
+    """A SQLite connection in manual-commit mode on a database that holds one empty table `t`."""
+    db = tmp_path / "t.db"
+    sqlite3.connect(db).executescript("CREATE TABLE t (id INTEGER);")
+    conn = SqliteAdapter().open(SqliteProfile(id=uuid4(), name="t", engine="sqlite", path=str(db)), None, None, None)
+    conn.set_autocommit(False)
+    yield conn
+    conn.close()
+
+
+def test_sqlite_manual_mode_rolls_back_dml_whatever_its_first_word(sqlite_manual):
+    conn = sqlite_manual
+    drain(conn.run("WITH x AS (SELECT 9 AS i) INSERT INTO t SELECT i FROM x"))
+    assert conn.in_transaction()
+    conn.rollback()
+    assert scalar(conn, "SELECT count(*) FROM t") == 0
+
+
+def test_sqlite_manual_mode_rolls_back_ddl(sqlite_manual):
+    conn = sqlite_manual
+    drain(conn.run("CREATE TABLE z (id INTEGER)"))
+    assert conn.in_transaction()
+    conn.rollback()
+    assert scalar(conn, "SELECT count(*) FROM sqlite_master WHERE name = 'z'") == 0
+
+
+def test_sqlite_manual_mode_select_opens_a_transaction(sqlite_manual):
+    conn = sqlite_manual
+    assert scalar(conn, "SELECT 1") == 1
+    assert conn.in_transaction()
+    with pytest.raises(StatementError) as exc:
+        conn.set_autocommit(True)
+    assert exc.value.code == "transaction_open"
+    conn.commit()
+    assert not conn.in_transaction()
+    conn.commit()  # nothing open: a no-op
+    conn.set_autocommit(True)
+    assert conn.autocommit()
+
+
+def test_sqlite_manual_mode_runs_statements_that_cannot_be_inside_a_transaction(sqlite_manual):
+    conn = sqlite_manual
+    drain(conn.run("VACUUM"))
+    drain(conn.run("-- compact\nVACUUM"))
+    assert not conn.in_transaction()
+    assert scalar(conn, "PRAGMA user_version") == 0
+    assert not conn.in_transaction()
+
+
+def test_sqlite_manual_mode_leaves_the_users_own_transaction_control_alone(sqlite_manual):
+    conn = sqlite_manual
+    drain(conn.run("BEGIN"))  # no second BEGIN in front of it
+    drain(conn.run("INSERT INTO t VALUES (1)"))
+    assert conn.in_transaction()
+    drain(conn.run("COMMIT"))
+    assert not conn.in_transaction()
+    conn.rollback()
+    assert scalar(conn, "SELECT count(*) FROM t") == 1
+
+
 @requires_pg
 def test_postgres_manual_commit_mode():
     conn = PostgresAdapter().open(make_pg_profile(), Endpoint(PG_HOST, PG_PORT), PG_PASSWORD, None)
@@ -91,3 +152,12 @@ def test_postgres_read_only_connection_stays_read_only_in_manual_mode():
         conn.rollback()
     finally:
         conn.close()
+
+
+@requires_pg
+def test_postgres_set_autocommit_on_a_dead_connection_is_not_reported_as_an_open_transaction():
+    conn = PostgresAdapter().open(make_pg_profile(), Endpoint(PG_HOST, PG_PORT), PG_PASSWORD, None)
+    conn._conn.close()
+    with pytest.raises(StatementError) as exc:
+        conn.set_autocommit(False)
+    assert exc.value.code != "transaction_open"

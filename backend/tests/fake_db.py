@@ -42,7 +42,8 @@ class FakeResult(StatementResult):
 
 
 class FakeConnection(DatabaseConnection):
-    """`run("rows N")` returns N rows; `run("block")` waits until cancel() (then raises StatementCancelled)."""
+    """`run()` words: `rows N` returns N rows; `block` waits until cancel() (then raises StatementCancelled);
+    `fail MSG` raises StatementError; `begin` opens a transaction; anything else returns an empty result."""
 
     def __init__(self) -> None:
         self.runs: list[str] = []
@@ -98,12 +99,14 @@ class FakeConnection(DatabaseConnection):
         self.auto = enabled
 
     def commit(self) -> None:
-        self.commits += 1
-        self.tx = False
+        if self.tx:  # like the real adapters, nothing to do (and nothing counted) without an open transaction
+            self.commits += 1
+            self.tx = False
 
     def rollback(self) -> None:
-        self.rollbacks += 1
-        self.tx = False
+        if self.tx:
+            self.rollbacks += 1
+            self.tx = False
 
     def cancel(self) -> None:
         self.cancel_calls += 1
