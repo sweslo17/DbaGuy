@@ -190,18 +190,14 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
                 )}
                 {execution.resultSets.map((set) => (
                   <div key={`${execution.requestId}:${set.index}`} className="min-h-[120px] flex-1">
-                    {dialect ? (
-                      <DataGrid
-                        columns={set.columns}
-                        rows={set.rows}
-                        hasMore={set.hasMore}
-                        loadingMore={execution.status === "running" && set.index === lastSetIndex}
-                        onLoadMore={phase === "open" ? loadMore : undefined}
-                        dialect={dialect}
-                      />
-                    ) : (
-                      <div className="p-3 text-muted">Loading…</div>
-                    )}
+                    <DataGrid
+                      columns={set.columns}
+                      rows={set.rows}
+                      hasMore={set.hasMore}
+                      loadingMore={execution.status === "running" && set.index === lastSetIndex}
+                      onLoadMore={phase === "open" ? loadMore : undefined}
+                      dialect={dialect}
+                    />
                   </div>
                 ))}
                 <div

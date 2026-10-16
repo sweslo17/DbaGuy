@@ -237,14 +237,20 @@ export interface KeyboardSelectionInput {
   select: (selection: GridSelection | null) => void;
   /** Scrolls a cell into view; a negative index leaves that axis alone. */
   scrollToCell: (row: number, col: number) => void;
-  onCopy?: (rect: Rect, format: "tsv") => void;
+  /** ⌘C: copies the selection as TSV. */
+  onCopy?: () => void;
   onOpenValue?: (pos: CellPos) => void;
   onOpenRecord?: (pos: CellPos) => void;
 }
 
+/** ⌘ + `letter` (lower case), without shift. */
+const isShortcut = (e: KeyboardEvent, letter: string) =>
+  e.metaKey && !e.shiftKey && (e.code === `Key${letter.toUpperCase()}` || e.key.toLowerCase() === letter);
+
 /**
  * Keyboard handler of the focused grid (spec §4.3). Keys typed into a control inside the grid and IME composition
- * are left alone; shortcut letters match the physical key (`code`), so Caps Lock and non-Latin layouts work.
+ * are left alone; shortcut letters match the physical key (`code`: Caps Lock and non-Latin layouts) or the character
+ * (`key`: Dvorak, AZERTY).
  */
 export function gridKeyDown(e: KeyboardEvent<HTMLDivElement>, input: KeyboardSelectionInput): void {
   if (e.target !== e.currentTarget || e.altKey || e.ctrlKey) return;
@@ -265,16 +271,16 @@ export function gridKeyDown(e: KeyboardEvent<HTMLDivElement>, input: KeyboardSel
     scrollToCell(next.mode === "columns" ? -1 : next.focus.row, next.mode === "rows" ? -1 : next.focus.col);
     return;
   }
-  if (e.metaKey && !e.shiftKey && e.code === "KeyA") {
+  if (isShortcut(e, "a")) {
     e.preventDefault();
     select(selectAll(selection?.focus ?? firstCellInView(geometry, el))); // the active cell stays where it was
     return;
   }
   if (!selection || !rect) return;
-  if (e.metaKey && !e.shiftKey && e.code === "KeyC") {
+  if (isShortcut(e, "c")) {
     if (!input.onCopy) return;
     e.preventDefault();
-    input.onCopy(rect, "tsv");
+    input.onCopy();
   } else if (e.metaKey || e.shiftKey) {
     // Other shortcuts belong to the app.
   } else if (key === "Escape") {

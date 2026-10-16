@@ -119,7 +119,9 @@ export const GridHeader = memo(function GridHeader(props: GridHeaderProps) {
             className={cn(
               "flex shrink-0 flex-col justify-center border-b border-border bg-panel px-2",
               columnClass(column),
-              column.left === undefined && "relative", // pinned cells are sticky, which also anchors the handle
+              // Pinned cells are sticky, which also anchors the handle. Unpinned ones are their own stacking context,
+              // so their resize handle (z-10) stays under the pinned headers it scrolls beneath.
+              column.left === undefined && "relative isolate",
               column.col >= selLeft && column.col <= selRight && SELECTED_CLASS,
             )}
             style={columnStyle(column)}

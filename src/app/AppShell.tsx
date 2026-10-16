@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
+import { Toaster } from "@/components/ui/Toast";
 import { api, unwrap } from "@/lib/api/client";
 import { BackendBanner } from "./BackendBanner";
 
@@ -47,6 +48,7 @@ export function AppShell({ sidebar, workspace }: { sidebar: ReactNode; workspace
           {health.isError ? "Backend unreachable" : health.data ? `Backend v${health.data.version}` : "Connecting…"}
         </span>
       </div>
+      <Toaster />
     </div>
   );
 }

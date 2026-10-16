@@ -30,6 +30,8 @@ export type Classification = S["Classification"];
 export type Dialect = S["Dialect"];
 export type FormatKind = S["FormatKind"];
 export type RowFormatOptions = S["RowFormatOptions"];
+export type FormatRowsRequest = S["FormatRowsRequest"];
+export type FormatResult = S["FormatResult"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

@@ -1,0 +1,93 @@
+import { X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { create } from "zustand";
+import { cn } from "@/lib/cn";
+
+export type ToastKind = "info" | "success" | "warning" | "error";
+
+interface ToastItem {
+  id: number;
+  kind: ToastKind;
+  text: string;
+}
+
+const MAX_VISIBLE = 4;
+const DURATION_MS: Record<ToastKind, number> = { info: 4000, success: 4000, warning: 4000, error: 8000 };
+// No warning token exists yet: the same yellow the console uses for warning messages.
+const STRIPE: Record<ToastKind, string> = {
+  info: "bg-accent",
+  success: "bg-success",
+  warning: "bg-yellow-500",
+  error: "bg-danger",
+};
+
+const useToasts = create<{ items: ToastItem[] }>(() => ({ items: [] }));
+let nextId = 1;
+
+/** Shows a toast in the bottom-right corner (app-wide; the oldest goes once more than MAX_VISIBLE are shown). */
+export function toast(kind: ToastKind, text: string): void {
+  const item = { id: nextId++, kind, text };
+  useToasts.setState((s) => ({ items: [...s.items, item].slice(-MAX_VISIBLE) }));
+}
+
+function dismiss(id: number): void {
+  useToasts.setState((s) => ({ items: s.items.filter((item) => item.id !== id) }));
+}
+
+/** One toast: dismisses itself after its kind's duration, counted only while the stack is not hovered. */
+function ToastView({ item, paused }: { item: ToastItem; paused: boolean }) {
+  const remaining = useRef(DURATION_MS[item.kind]);
+  useEffect(() => {
+    if (paused) return;
+    const started = Date.now();
+    const timer = window.setTimeout(() => dismiss(item.id), remaining.current);
+    return () => {
+      window.clearTimeout(timer);
+      remaining.current -= Date.now() - started;
+    };
+  }, [paused, item.id]);
+
+  return (
+    <div
+      role={item.kind === "error" ? "alert" : "status"}
+      className="flex overflow-hidden rounded-lg border border-border bg-elevated text-[12px] shadow-xl"
+    >
+      <div className={cn("w-[3px] shrink-0", STRIPE[item.kind])} />
+      <div className="min-w-0 flex-1 px-3 py-2 break-words whitespace-pre-wrap" data-selectable>
+        {item.text}
+      </div>
+      <button
+        type="button"
+        aria-label="Dismiss"
+        className="m-1 flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted hover:bg-hover hover:text-fg"
+        onClick={() => dismiss(item.id)}
+      >
+        <X size={12} />
+      </button>
+    </div>
+  );
+}
+
+/** The toast stack; mounted once (AppShell). Hovering it pauses every timer. */
+export function Toaster() {
+  const items = useToasts((s) => s.items);
+  const [hovered, setHovered] = useState(false);
+  if (items.length === 0) {
+    // Dismissing the last toast unmounts the stack without a mouseleave: the next one starts unpaused.
+    if (hovered) setHovered(false);
+    return null;
+  }
+  return (
+    <div
+      role="region"
+      aria-label="Notifications"
+      className="fixed right-3 bottom-9 z-[100] flex w-[340px] max-w-[calc(100vw-24px)] flex-col gap-2"
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+    >
+      {items.map((item) => (
+        <ToastView key={item.id} item={item} paused={hovered} />
+      ))}
+    </div>
+  );
+}

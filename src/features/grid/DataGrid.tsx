@@ -9,6 +9,7 @@ import {
   useMemo,
   useRef,
   type KeyboardEvent,
+  type MouseEvent,
   type Ref,
 } from "react";
 import type { MenuItem } from "@/components/ui/ContextMenu";
@@ -16,11 +17,13 @@ import { Button } from "@/components/ui/Button";
 import type { ColumnMeta, Dialect } from "@/lib/api/types";
 import { aggregate } from "./aggregate";
 import { HEADER_HEIGHT, ROW_HEIGHT } from "./columns";
+import { copySelection, type CopyFormat } from "./copy";
 import { GridHeader, type GridSort } from "./GridHeader";
+import { GridMenu } from "./GridMenu";
 import { GridRow } from "./GridRow";
-import { useGridGeometry } from "./hitTest";
+import { hitTest, useGridGeometry, viewportPoint } from "./hitTest";
 import { useColumnLayout, useColumnStrip } from "./layout";
-import { cellCount, type CellPos, type GridSelection, type Rect } from "./selection";
+import { cellCount, selectCell, type CellPos, type GridSelection, type Rect } from "./selection";
 import { StatusBar } from "./StatusBar";
 import { gridKeyDown, usePointerSelection, useSelectionState } from "./useSelection";
 
@@ -46,13 +49,16 @@ export interface DataGridProps {
   /** Rows are being fetched (the next page, or the first one). */
   loadingMore: boolean;
   onLoadMore?: () => void;
-  dialect: Dialect; // copy/INSERT formats (Task 5)
+  /** Dialect of the copy formats that need one (INSERT, IN list); null while unknown, and those copies refuse. */
+  dialect: Dialect | null;
+  /** INSERT copies target this table (table data); else a `table_name` placeholder. */
   tableName?: { schema: string | null; name: string } | null;
   sort?: GridSort[]; // table data view (Task 7)
   onHeaderClick?: (column: number, additive: boolean) => void;
+  /** Header menu "Sort ascending / descending": the sort becomes this column alone (shown only when set). */
+  onSortBy?: (column: number, descending: boolean) => void;
+  /** Items appended to a cell's context menu. */
   extraCellMenu?: (row: number, column: number) => MenuItem[];
-  /** ⌘C (Task 5). */
-  onCopy?: (rect: Rect, format: "tsv") => void;
   /** Enter: the value viewer (Task 6). */
   onOpenValue?: (pos: CellPos) => void;
   /** Space: the record view (Task 6). */
@@ -104,7 +110,7 @@ function LoadMoreFooter({ rowCount, hasMore, loading, onLoadMore }: LoadMoreFoot
  */
 export function DataGrid(props: DataGridProps) {
   const { columns, rows, hasMore, loadingMore, onLoadMore, sort, onHeaderClick, ref } = props;
-  const { onCopy, onOpenValue, onOpenRecord, onSelectionChange } = props;
+  const { dialect, tableName, onSortBy, extraCellMenu, onOpenValue, onOpenRecord, onSelectionChange } = props;
   const rootRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const focusId = useId();
@@ -180,6 +186,24 @@ export function DataGrid(props: DataGridProps) {
   useImperativeHandle(ref, () => ({ scrollToCell, focus: focusGrid }), [scrollToCell, focusGrid]);
 
   const pointer = usePointerSelection({ scrollRef, columns, geometry, selection, rect, select, focusGrid });
+  /** Copies the selection: the rows loaded now, whatever the selection mode. */
+  const copy = (format: CopyFormat) => {
+    if (!selection || !rect) return;
+    const wholeColumns = selection.mode === "columns" || selection.mode === "all";
+    void copySelection(format, { rect, rows, columns, dialect, tableName, wholeColumns });
+  };
+  /** A drawer opened from the menu shows the clicked cell: it becomes the active cell. */
+  const openAt = (open: ((pos: CellPos) => void) | undefined) =>
+    open &&
+    ((pos: CellPos) => {
+      if (selection?.focus.row !== pos.row || selection.focus.col !== pos.col) select(selectCell(pos));
+      open(pos);
+    });
+  const menuHit = (e: MouseEvent) => {
+    const el = scrollRef.current;
+    // The scroll container itself is only hit through its scrollbars.
+    return el && e.target !== el ? hitTest(geometry, viewportPoint(el, e.clientX, e.clientY)) : null;
+  };
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) =>
     gridKeyDown(e, {
       scrollRef,
@@ -189,7 +213,7 @@ export function DataGrid(props: DataGridProps) {
       rect,
       select,
       scrollToCell,
-      onCopy,
+      onCopy: () => copy("tsv"),
       onOpenValue,
       onOpenRecord,
     });
@@ -226,62 +250,76 @@ export function DataGrid(props: DataGridProps) {
         className="group/grid relative isolate flex min-h-0 flex-1 flex-col outline-none"
         onKeyDown={onKeyDown}
       >
-        <div
-          ref={scrollRef}
-          className="relative min-h-0 flex-1 overflow-auto font-mono text-[12px]"
-          onPointerDown={pointer.onPointerDown}
-          onPointerMove={pointer.onPointerMove}
-          onPointerUp={pointer.onPointerUp}
-          onPointerCancel={pointer.onPointerCancel}
-          onLostPointerCapture={pointer.onLostPointerCapture}
+        <GridMenu
+          hitAt={menuHit}
+          columns={columns}
+          rect={rect}
+          focus={selection?.focus ?? null}
+          pinnedCount={layout.pinnedCount}
+          copy={copy}
+          pin={layout.pin}
+          openValue={openAt(onOpenValue)}
+          openRecord={openAt(onOpenRecord)}
+          sortBy={onSortBy}
+          extraCellMenu={extraCellMenu}
         >
-          <div className="relative isolate" style={{ width: strip.totalWidth, height: rowVirtualizer.getTotalSize() }}>
-            <GridHeader
-              strip={strip}
-              sort={sort}
-              onHeaderClick={onHeaderClick}
-              onResize={layout.resize}
-              onAutofit={layout.autofit}
-              selLeft={left}
-              selRight={right}
-            />
-            {virtualRows.map((item) => {
-              const touched = item.index >= top && item.index <= bottom;
-              return (
-                <GridRow
-                  key={item.index}
-                  index={item.index}
-                  row={rows[item.index]}
-                  top={item.start}
-                  strip={strip}
-                  selLeft={touched ? left : -1}
-                  selRight={touched ? right : -1}
-                  focusCol={focus?.row === item.index ? focus.col : -1}
-                  focusId={focusId}
-                />
-              );
-            })}
-            {footer && (
-              <div
-                className="absolute left-0 flex"
-                style={{
-                  top: HEADER_HEIGHT + rows.length * ROW_HEIGHT,
-                  height: FOOTER_HEIGHT,
-                  width: strip.totalWidth,
-                }}
-              >
-                <div className="sticky left-0 flex items-center px-2 font-sans text-muted">
-                  <LoadMoreFooter
-                    rowCount={rows.length}
-                    hasMore={hasMore}
-                    loading={loadingMore}
-                    onLoadMore={onLoadMore}
+          <div
+            ref={scrollRef}
+            className="relative min-h-0 flex-1 overflow-auto font-mono text-[12px]"
+            onPointerDown={pointer.onPointerDown}
+            onPointerMove={pointer.onPointerMove}
+            onPointerUp={pointer.onPointerUp}
+            onPointerCancel={pointer.onPointerCancel}
+            onLostPointerCapture={pointer.onLostPointerCapture}
+          >
+            <div className="relative isolate" style={{ width: strip.totalWidth, height: rowVirtualizer.getTotalSize() }}>
+              <GridHeader
+                strip={strip}
+                sort={sort}
+                onHeaderClick={onHeaderClick}
+                onResize={layout.resize}
+                onAutofit={layout.autofit}
+                selLeft={left}
+                selRight={right}
+              />
+              {virtualRows.map((item) => {
+                const touched = item.index >= top && item.index <= bottom;
+                return (
+                  <GridRow
+                    key={item.index}
+                    index={item.index}
+                    row={rows[item.index]}
+                    top={item.start}
+                    strip={strip}
+                    selLeft={touched ? left : -1}
+                    selRight={touched ? right : -1}
+                    focusCol={focus?.row === item.index ? focus.col : -1}
+                    focusId={focusId}
                   />
+                );
+              })}
+              {footer && (
+                <div
+                  className="absolute left-0 flex"
+                  style={{
+                    top: HEADER_HEIGHT + rows.length * ROW_HEIGHT,
+                    height: FOOTER_HEIGHT,
+                    width: strip.totalWidth,
+                  }}
+                >
+                  <div className="sticky left-0 flex items-center px-2 font-sans text-muted">
+                    <LoadMoreFooter
+                      rowCount={rows.length}
+                      hasMore={hasMore}
+                      loading={loadingMore}
+                      onLoadMore={onLoadMore}
+                    />
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
+            </div>
           </div>
-        </div>
+        </GridMenu>
         {/* Keyboard focus ring, drawn over the sticky header and pinned columns. */}
         <div className="pointer-events-none absolute inset-0 z-10 hidden border border-accent group-focus-visible/grid:block" />
       </div>
