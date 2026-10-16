@@ -4,11 +4,11 @@ import { Button } from "@/components/ui/Button";
 import { ApiError } from "@/lib/api/client";
 import { cn } from "@/lib/cn";
 import type { ConsoleTab } from "@/stores/workspace";
-import { useProfiles } from "../connections/hooks";
+import { useDialect, useProfiles } from "../connections/hooks";
 import { secretsNeeded, UnlockDialog } from "../connections/UnlockDialog";
 import { PAGE_SIZE, type SessionPhase, type SessionStateView } from "../session/SessionController";
 import { useSession } from "../session/useSession";
-import { ResultTable } from "./ResultTable";
+import { DataGrid } from "../grid/DataGrid";
 
 /** Error code of a statement whose database connection dropped: the session must be reopened. */
 const CONNECTION_LOST = "connection_lost";
@@ -62,6 +62,7 @@ function TransactionBadge({ state }: { state: SessionStateView | null }) {
 export function QueryConsole({ tab }: { tab: ConsoleTab }) {
   const { controller, snapshot, retry } = useSession(tab.profileId, tab.database);
   const profiles = useProfiles();
+  const dialect = useDialect(tab.profileId);
   const [sql, setSql] = useState("");
   const [requestId, setRequestId] = useState<string | null>(null);
   const [origin, setOrigin] = useState<Origin>(WHOLE_TEXT);
@@ -110,6 +111,9 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
   const profile = profiles.data?.find((p) => p.profile.id === tab.profileId)?.profile;
   const needsPassword = error instanceof ApiError && error.code === "password_required" && !!profile;
   const errorPosition = execution?.error?.position;
+  const lastSetIndex = execution?.resultSets.at(-1)?.index;
+  // A paused result keeps `hasMore` while its next page loads: the grid shows that, the status line does not.
+  const running = execution?.status === "running" && !execution.resultSets.some((s) => s.hasMore);
 
   return (
     <div className="flex h-full flex-col">
@@ -162,11 +166,14 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
             />
           </Panel>
           <Separator className="h-px bg-border outline-none data-[separator=active]:bg-accent data-[separator=hover]:bg-accent data-[separator=focus]:bg-accent" />
-          <Panel id="results" minSize="20%" className="overflow-auto">
+          <Panel id="results" minSize="20%">
             {execution && (
-              <div className="flex flex-col gap-3 p-3 text-[12px]">
+              <div className="flex h-full flex-col text-[12px]">
                 {execution.error && (
-                  <div className="rounded-md border border-danger/40 bg-danger/10 p-2 text-danger" data-selectable>
+                  <div
+                    className="m-3 mb-0 shrink-0 rounded-md border border-danger/40 bg-danger/10 p-2 text-danger"
+                    data-selectable
+                  >
                     <div className="whitespace-pre-wrap">{execution.error.message}</div>
                     {errorPosition && (
                       <div className="mt-1 text-[11px]">
@@ -183,37 +190,52 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
                   </div>
                 )}
                 {execution.resultSets.map((set) => (
-                  <div key={set.index} className="flex flex-col gap-1">
-                    <ResultTable set={set} />
-                    <div className="flex items-center gap-2 text-muted">
-                      <span>
-                        {plural(set.rows.length, "row")}
-                        {set.hasMore ? " loaded" : ""}
-                      </span>
-                      {set.hasMore && execution.status === "paused" && phase === "open" && (
-                        <Button size="sm" onClick={loadMore}>
-                          Load {PAGE_SIZE} more
-                        </Button>
+                  <div key={`${execution.requestId}:${set.index}`} className="flex min-h-[120px] flex-1 flex-col">
+                    <div className="min-h-0 flex-1">
+                      {dialect ? (
+                        <DataGrid
+                          columns={set.columns}
+                          rows={set.rows}
+                          hasMore={set.hasMore}
+                          loadingMore={execution.status === "running" && set.index === lastSetIndex}
+                          onLoadMore={phase === "open" ? loadMore : undefined}
+                          dialect={dialect}
+                        />
+                      ) : (
+                        <div className="p-3 text-muted">Loading…</div>
                       )}
+                    </div>
+                    <div className="flex h-6 shrink-0 items-center border-y border-border px-3 text-muted">
+                      {plural(set.rows.length, "row")}
+                      {set.hasMore ? " loaded" : ""}
                     </div>
                   </div>
                 ))}
-                {execution.affected.map((a) => (
-                  <div key={a.index}>{plural(a.rows, "row")} affected</div>
-                ))}
-                {execution.messages.map((m, i) => (
-                  <div
-                    key={i}
-                    className={m.severity === "warning" ? "text-yellow-600 dark:text-yellow-400" : "text-muted"}
-                    data-selectable
-                  >
-                    {m.text}
-                  </div>
-                ))}
-                <div className="flex items-center gap-2 text-muted">
-                  {execution.status === "running" && <span>Running…</span>}
-                  {execution.elapsedMs !== null && <span>{execution.elapsedMs} ms</span>}
-                  {execution.cancelled && <span>Cancelled</span>}
+                <div
+                  className={cn(
+                    "flex flex-col gap-1 overflow-auto px-3 py-2 empty:hidden",
+                    execution.resultSets.length > 0 ? "max-h-[35%] shrink-0" : "min-h-0 flex-1",
+                  )}
+                >
+                  {execution.affected.map((a) => (
+                    <div key={a.index}>{plural(a.rows, "row")} affected</div>
+                  ))}
+                  {execution.messages.map((m, i) => (
+                    <div
+                      key={i}
+                      className={m.severity === "warning" ? "text-yellow-600 dark:text-yellow-400" : "text-muted"}
+                      data-selectable
+                    >
+                      {m.text}
+                    </div>
+                  ))}
+                  {(running || execution.elapsedMs !== null || execution.cancelled) && (
+                    <div className="flex items-center gap-2 text-muted">
+                      {running && <span>Running…</span>}
+                      {execution.elapsedMs !== null && <span>{execution.elapsedMs} ms</span>}
+                      {execution.cancelled && <span>Cancelled</span>}
+                    </div>
+                  )}
                 </div>
               </div>
             )}

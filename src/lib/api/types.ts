@@ -21,6 +21,7 @@ export type ObjectDetail = S["ObjectDetail"];
 export type ColumnInfo = S["ColumnInfo"];
 export type SessionInfo = S["SessionInfo"];
 export type ColumnMeta = S["ColumnMeta"];
+export type ColumnCategory = S["ColumnCategory"];
 export type ServerEvent = S["ExecutionSchema"]["event"];
 export type ClientCommand = S["ExecutionSchema"]["command"];
 export type SessionStateEvent = S["SessionStateEvent"];

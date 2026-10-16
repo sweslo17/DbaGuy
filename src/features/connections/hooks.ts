@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, unwrap } from "@/lib/api/client";
-import type { ProfileDraft, ProfileSecretsInput } from "@/lib/api/types";
+import type { Dialect, ProfileDraft, ProfileSecretsInput } from "@/lib/api/types";
 
 export const profilesKey = ["profiles"] as const;
 
@@ -14,6 +14,14 @@ export function useEngines() {
     queryFn: async () => unwrap(await (await api()).GET("/system/engines")),
     staleTime: Infinity,
   });
+}
+
+/** SQL dialect of a profile's engine (copy and export formats); null until profiles and engines are loaded. */
+export function useDialect(profileId: string): Dialect | null {
+  const profiles = useProfiles();
+  const engines = useEngines();
+  const engine = profiles.data?.find((entry) => entry.profile.id === profileId)?.profile.engine;
+  return engines.data?.find((info) => info.engine === engine)?.dialect ?? null;
 }
 
 export function useSaveProfile() {
