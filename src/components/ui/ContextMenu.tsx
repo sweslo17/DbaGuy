@@ -64,16 +64,18 @@ export interface ContextMenuProps {
   /** Runs before the menu opens; `preventDefault()` keeps it closed. */
   onContextMenu?: (e: MouseEvent) => void;
   onOpenChange?: (open: boolean) => void;
+  /** Where focus goes once the menu has closed (`preventDefault()` keeps it where an item put it, e.g. an input). */
+  onCloseAutoFocus?: (event: Event) => void;
 }
 
-export function ContextMenu({ items, children, onContextMenu, onOpenChange }: ContextMenuProps) {
+export function ContextMenu({ items, children, onContextMenu, onOpenChange, onCloseAutoFocus }: ContextMenuProps) {
   return (
     <Radix.Root onOpenChange={onOpenChange}>
       <Radix.Trigger asChild onContextMenu={onContextMenu}>
         {children}
       </Radix.Trigger>
       <Radix.Portal>
-        <Radix.Content className={CONTENT}>
+        <Radix.Content className={CONTENT} onCloseAutoFocus={onCloseAutoFocus}>
           <MenuItems items={items} parts={Radix} />
         </Radix.Content>
       </Radix.Portal>

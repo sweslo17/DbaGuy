@@ -2,7 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { AppShell } from "./app/AppShell";
-import { Explorer } from "./features/explorer/Explorer";
+import { Sidebar } from "./app/Sidebar";
 import { Workspace } from "./features/workspace/Workspace";
 import { restoreWorkspace } from "./features/workspace/workspaceSync";
 
@@ -24,5 +24,5 @@ export function App() {
   }, [queryClient]);
 
   if (!restored) return <Restoring />;
-  return <AppShell sidebar={<Explorer />} workspace={<Workspace />} />;
+  return <AppShell sidebar={<Sidebar />} workspace={<Workspace />} />;
 }

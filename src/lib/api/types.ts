@@ -43,6 +43,10 @@ export type DescribeColumn = S["DescribeColumn"];
 export type SavedWorkspace = S["WorkspaceState"];
 export type SavedTab = S["WorkspaceTab"];
 export type TextSelection = S["TextSelection"];
+/** The scripts folder (spec §4.7): its tree, and one `.sql` file with its content. */
+export type ScriptTree = S["ScriptTree"];
+export type ScriptNode = S["ScriptNode"];
+export type ScriptFile = S["ScriptFile"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

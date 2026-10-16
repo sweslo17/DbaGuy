@@ -1,0 +1,180 @@
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMemo } from "react";
+import { toast } from "@/components/ui/Toast";
+import { api, ApiError, errorMessage, unwrap } from "@/lib/api/client";
+import type { ScriptFile, ScriptNode, ScriptTree } from "@/lib/api/types";
+import { baseName, joinPath, nameProblem, parentPath, withSqlSuffix } from "@/lib/scriptPaths";
+import { scriptTab, useWorkspace } from "@/stores/workspace";
+
+/*
+ * The scripts folder (spec §4.7): the backend's `/scripts` API, the tree as one shared query, and the actions the
+ * Scripts panel offers. Every failure is shown as a toast with the backend's message (dot names, conflicts, `.sql`).
+ */
+
+export const scriptTreeKey = ["scripts", "tree"] as const;
+
+async function fetchScriptTree(): Promise<ScriptTree> {
+  return unwrap(await (await api()).GET("/scripts"));
+}
+
+/** The scripts folder's tree (folders first), shared by the panel, the Save As dialog and quick open. */
+export function useScriptTree(enabled = true) {
+  return useQuery({ queryKey: scriptTreeKey, queryFn: fetchScriptTree, enabled });
+}
+
+export async function readScript(path: string, signal?: AbortSignal): Promise<ScriptFile> {
+  return unwrap(await (await api()).GET("/scripts/file", { params: { query: { path } }, signal }));
+}
+
+/** Creates or replaces the file. */
+export async function writeScript(path: string, content: string): Promise<ScriptFile> {
+  return unwrap(await (await api()).PUT("/scripts/file", { body: { path, content } }));
+}
+
+/**
+ * Whether a file exists at `path` (writing it would replace it). Any answer but "found" or "not found" is thrown: the
+ * name is not usable (a dot, a folder there) or the file cannot be checked, and then nothing should be written.
+ */
+export async function scriptExists(path: string): Promise<boolean> {
+  try {
+    await readScript(path);
+    return true;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return false;
+    throw error;
+  }
+}
+
+/** Every folder in the tree, depth first (parents before their children). */
+export function folderPaths(items: ScriptNode[]): string[] {
+  return items.flatMap((node) => (node.kind === "folder" ? [node.path, ...folderPaths(node.children)] : []));
+}
+
+/** Paths being read to open: a second double-click while the first read is underway does not open a second tab. */
+const opening = new Set<string>();
+
+/**
+ * Opens a script in a query tab bound to it (spec §4.7), or activates the tab that has it already. A new tab starts on
+ * the connection selected in the explorer; afterwards it keeps its own (the workspace remembers it).
+ */
+export async function openScript(path: string): Promise<void> {
+  const open = scriptTab(path);
+  if (open) return useWorkspace.getState().activate(open.id);
+  if (opening.has(path)) return;
+  opening.add(path);
+  try {
+    const file = await readScript(path);
+    const again = scriptTab(file.path); // opened meanwhile (e.g. saved there from another tab)
+    if (again) return useWorkspace.getState().activate(again.id);
+    const { selectedProfileId, openQuery } = useWorkspace.getState();
+    openQuery(selectedProfileId, null, { text: file.content, scriptPath: file.path, title: baseName(file.path) });
+    console.info(`Opened script ${file.path}`);
+  } catch (error) {
+    toast("error", `Could not open ${path}: ${errorMessage(error)}`);
+  } finally {
+    opening.delete(path);
+  }
+}
+
+/** A trimmed name, or null after telling why it cannot be used. */
+function usableName(raw: string): string | null {
+  const name = raw.trim();
+  const problem = nameProblem(name);
+  if (problem) toast("error", problem);
+  return problem ? null : name;
+}
+
+/** Runs one change to the scripts folder: toasts its failure, refreshes the tree after a success. */
+async function change(failure: string, run: () => Promise<void>, refresh: () => Promise<void>): Promise<boolean> {
+  try {
+    await run();
+    return true;
+  } catch (error) {
+    toast("error", `${failure}: ${errorMessage(error)}`);
+    return false;
+  } finally {
+    void refresh();
+  }
+}
+
+/**
+ * The Scripts panel's changes to the folder. Each resolves to the resulting path (true for a delete) when done, or
+ * null (false) after a failure, which was shown as a toast. Tabs bound to a renamed file follow it; tabs bound to a
+ * deleted file keep their text, unbound.
+ */
+export function useScriptActions() {
+  const qc = useQueryClient();
+  return useMemo(() => {
+    const refresh = () => qc.invalidateQueries({ queryKey: scriptTreeKey });
+
+    /** Creates an empty file in `folder` (never over an existing one) and opens it. */
+    const createFile = async (folder: string, rawName: string): Promise<string | null> => {
+      const name = usableName(rawName);
+      if (name === null) return null;
+      const path = joinPath(folder, withSqlSuffix(name));
+      const created = await change(
+        `Could not create ${path}`,
+        async () => {
+          if (await scriptExists(path)) throw new Error(`${path} already exists`);
+          await writeScript(path, "");
+          console.info(`Created script ${path}`);
+        },
+        refresh,
+      );
+      if (!created) return null;
+      await openScript(path);
+      return path;
+    };
+
+    const createFolder = async (parent: string, rawName: string): Promise<string | null> => {
+      const name = usableName(rawName);
+      if (name === null) return null;
+      const path = joinPath(parent, name);
+      const created = await change(
+        `Could not create the folder ${path}`,
+        async () => {
+          unwrap(await (await api()).POST("/scripts/folder", { body: { path } }));
+          console.info(`Created script folder ${path}`);
+        },
+        refresh,
+      );
+      return created ? path : null;
+    };
+
+    /** Renames in place (same folder); a file keeps (or gets) its `.sql` suffix. */
+    const rename = async (node: ScriptNode, rawName: string): Promise<string | null> => {
+      const name = usableName(rawName);
+      if (name === null) return null;
+      const to = joinPath(parentPath(node.path), node.kind === "file" ? withSqlSuffix(name) : name);
+      if (to === node.path) return to;
+      const renamed = await change(
+        `Could not rename ${node.path}`,
+        async () => {
+          unwrap(await (await api()).POST("/scripts/rename", { body: { from: node.path, to } }));
+          useWorkspace.getState().moveScripts(node.path, to);
+          console.info(`Renamed script ${node.path} to ${to}`);
+        },
+        refresh,
+      );
+      return renamed ? to : null;
+    };
+
+    /** Deletes a file or an empty folder (the backend refuses a folder with anything in it). */
+    const remove = async (node: ScriptNode): Promise<boolean> =>
+      change(
+        `Could not delete ${node.path}`,
+        async () => {
+          unwrap(await (await api()).DELETE("/scripts/file", { params: { query: { path: node.path } } }));
+          console.info(`Deleted script ${node.path}`);
+          const titles = useWorkspace.getState().unbindScripts(node.path);
+          if (titles.length) {
+            const tabs = titles.length === 1 ? "Its open tab keeps" : `${titles.length} open tabs keep`;
+            toast("info", `${node.path} was deleted. ${tabs} the text, no longer saved to a file.`);
+          }
+        },
+        refresh,
+      );
+
+    return { refresh, createFile, createFolder, rename, remove };
+  }, [qc]);
+}

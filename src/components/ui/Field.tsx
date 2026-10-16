@@ -58,7 +58,7 @@ export function FieldRow({ label, hint, children }: { label: string; hint?: stri
     <div role="group" aria-label={label || undefined} className="grid grid-cols-[120px_1fr] items-center gap-x-3 gap-y-1">
       <Label className="text-right">{label}</Label>
       <div>{children}</div>
-      {hint && <span className="col-start-2 text-[11px] text-muted">{hint}</span>}
+      {hint && <span className="col-start-2 text-[11px] text-muted [overflow-wrap:anywhere]">{hint}</span>}
     </div>
   );
 }

@@ -26,6 +26,15 @@ function TabContent({ tab, active }: { tab: Tab; active: boolean }) {
   }
 }
 
+/** The tab's tooltip: its title and connection, and for a query tab bound to a script, the file (and if it is gone). */
+function tabTooltip(tab: Tab, profile: Profile | undefined, missing: boolean): string {
+  const lines = [profile ? `${tab.title} · ${profile.name}` : tab.title];
+  if (tab.kind === "query" && tab.scriptPath !== null) {
+    lines.push(missing ? `${tab.scriptPath} — file missing; ⌘S saves it again` : tab.scriptPath);
+  }
+  return lines.join("\n");
+}
+
 /**
  * One tab in the strip: its connection's colour underlines it; a query tab shows a spinner while it works and a dot
  * when its script has unsaved changes. Every way of closing it goes through the close guards.
@@ -48,11 +57,18 @@ function TabLabel({ tab, active, profile }: { tab: Tab; active: boolean; profile
         active ? "bg-bg" : "text-muted hover:bg-hover",
       )}
       style={tint ? { boxShadow: `inset 0 -2px 0 ${tint}` } : undefined}
-      title={profile ? `${tab.title} · ${profile.name}` : tab.title}
+      title={tabTooltip(tab, profile, status.missing)}
     >
       {query && status.busy && <Loader2 size={11} className="shrink-0 animate-spin text-muted" aria-label="Running" />}
       <span className="truncate">
-        {query && status.dirty && <span aria-label="Unsaved changes">• </span>}
+        {query && status.dirty && (
+          <span
+            className={status.missing ? "text-warning" : undefined}
+            aria-label={status.missing ? "File missing" : "Unsaved changes"}
+          >
+            •{" "}
+          </span>
+        )}
         {tab.title}
       </span>
       {profile && <span className="truncate text-[11px] text-muted">{profile.name}</span>}

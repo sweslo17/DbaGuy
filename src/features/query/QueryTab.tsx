@@ -22,6 +22,7 @@ import { busy, isExporting, type SessionPhase } from "../session/SessionControll
 import { SessionError } from "../session/SessionError";
 import { useSessionGuards } from "../session/SessionGuards";
 import { useSession } from "../session/useSession";
+import { useScriptBinding } from "../scripts/useScriptBinding";
 import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
 import { ConfirmRunDialog } from "./ConfirmRunDialog";
 import { QueryToolbar } from "./QueryToolbar";
@@ -37,8 +38,9 @@ const NO_EXECUTIONS: Record<string, ExecutionState> = {};
  * A query tab (spec §3.5, §4.1, §4.2): toolbar, then the editor above the results. Its session opens the first time
  * the tab is shown and closes with the tab, or reopens when the connection picker changes it; the editor lives as long
  * as the tab, so undo history survives tab switches. ⌘↵ runs the selection or (by `run.default`) the statement under
- * the cursor; ⌘⇧↵ runs every statement. Closing the tab or switching its connection first stops a running export and
- * ends an open transaction, asking each time; the tab hosts the export dialog, so it outlives the result grids.
+ * the cursor; ⌘⇧↵ runs every statement. ⌘S saves the tab to its script file (⌘⇧S: Save As). Closing the tab or
+ * switching its connection first stops a running export and ends an open transaction, asking each time; closing also
+ * asks about unsaved script changes. The tab hosts the export dialog, so it outlives the result grids.
  */
 export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean }) {
   const { settings } = useAppSettings();
@@ -109,8 +111,8 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
       ? "Wait for the running statement or export"
       : undefined;
 
-  // Closing the tab: a running export, then the run (nothing more is sent), then an open transaction (Task 6 adds the
-  // unsaved script).
+  // Closing the tab: a running export, then the run (nothing more is sent), then an open transaction, then the unsaved
+  // script (registered by the script binding below).
   const guards = useSessionGuards(controller, subject);
   useCloseGuard(tab.id, CLOSE_GUARD_ORDER.export, (intent) => guards.exportStep(intent));
   useCloseGuard(tab.id, CLOSE_GUARD_ORDER.run, () => {
@@ -119,6 +121,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   });
   useCloseGuard(tab.id, CLOSE_GUARD_ORDER.transaction, (intent) => guards.transactionStep(intent));
   useReportTabStatus(tab.id, { busy: running || sessionBusy });
+  const script = useScriptBinding({ tab, shown, active, editor });
 
   const switching = useRef(false);
   const changeConnection = async (profileId: string, database: string | null) => {
@@ -156,10 +159,12 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     }
   };
 
-  // The editor's keymap is built once: it calls the latest `start` through a ref.
+  // The editor's keymap is built once: it calls the latest `start` and script commands through refs.
   const startRef = useRef(start);
+  const scriptRef = useRef(script);
   useLayoutEffect(() => {
     startRef.current = start;
+    scriptRef.current = script;
   });
   // What the editor's extensions read at each use (split, completion, describe), so they never need reconfiguring.
   const target: CompletionTarget = {
@@ -183,6 +188,8 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
       keymap.of([
         { key: "Mod-Enter", run: () => runFromKey("default") },
         { key: "Shift-Mod-Enter", run: () => runFromKey("all") },
+        { key: "Mod-s", run: () => (scriptRef.current.save(), true) },
+        { key: "Shift-Mod-s", run: () => (scriptRef.current.saveAs(), true) },
       ]),
     ),
     placeholder("SELECT …  (⌘↵ to run)"),
@@ -275,7 +282,10 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
                 initialSelection={initialSelection}
                 dialect={dialect}
                 extensions={extensions}
-                onChange={markEdited}
+                onChange={() => {
+                  markEdited();
+                  script.docChanged();
+                }}
                 onSelectionChange={markEdited}
               />
             </div>
@@ -306,6 +316,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
         />
       )}
       {guards.dialog}
+      {script.dialogs}
     </div>
   );
 }

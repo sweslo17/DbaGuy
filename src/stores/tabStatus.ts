@@ -5,11 +5,14 @@ import { create } from "zustand";
 export interface TabStatus {
   /** A run, an export or a page is in progress: a spinner. */
   busy: boolean;
-  /** The script has unsaved changes (Task 6): a dot. */
+  /** The script has unsaved changes: a dot. */
   dirty: boolean;
+  /** The script file the tab is bound to no longer exists: the tooltip says so (⌘S recreates it). */
+  missing: boolean;
 }
 
-const IDLE: TabStatus = { busy: false, dirty: false };
+const IDLE: TabStatus = { busy: false, dirty: false, missing: false };
+const FIELDS = Object.keys(IDLE) as (keyof TabStatus)[];
 
 const useStatuses = create<Record<string, TabStatus>>(() => ({}));
 
@@ -18,16 +21,25 @@ export function useTabStatus(tabId: string): TabStatus {
   return useStatuses((statuses) => statuses[tabId] ?? IDLE);
 }
 
+/**
+ * Sets the given fields of a tab's status (undefined ones keep their value). Cheap when nothing changes, so it may be
+ * called on every keystroke. Only for a mounted tab: the entry goes when it unmounts (`useReportTabStatus`).
+ */
+export function reportTabStatus(tabId: string, patch: Partial<TabStatus>): void {
+  useStatuses.setState((statuses) => {
+    const current = statuses[tabId] ?? IDLE;
+    const changed = FIELDS.filter((field) => patch[field] !== undefined && patch[field] !== current[field]);
+    if (!changed.length) return statuses;
+    const next = { ...current };
+    for (const field of changed) next[field] = patch[field]!;
+    return { ...statuses, [tabId]: next };
+  });
+}
+
 /** Reports a tab's status while the component is mounted; the entry goes with it. */
 export function useReportTabStatus(tabId: string, patch: Partial<TabStatus>): void {
-  const { busy, dirty } = patch;
-  useEffect(() => {
-    useStatuses.setState((statuses) => {
-      const current = statuses[tabId] ?? IDLE;
-      const next = { busy: busy ?? current.busy, dirty: dirty ?? current.dirty };
-      return next.busy === current.busy && next.dirty === current.dirty ? statuses : { ...statuses, [tabId]: next };
-    });
-  }, [tabId, busy, dirty]);
+  const { busy, dirty, missing } = patch;
+  useEffect(() => reportTabStatus(tabId, { busy, dirty, missing }), [tabId, busy, dirty, missing]);
   useEffect(
     () => () =>
       useStatuses.setState((statuses) => {
