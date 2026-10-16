@@ -46,9 +46,7 @@ export class SessionSocket {
       this.ws = null;
       this.rejected = close.code === CLOSE_UNAUTHORIZED || close.code === CLOSE_SESSION_NOT_FOUND;
       this.setStatus("closed");
-      if (this.closedByUser || this.rejected) return;
-      const delay = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** this.attempts++);
-      this.timer = setTimeout(() => void this.connect(), delay);
+      this.scheduleReconnect();
     };
   }
 
@@ -73,6 +71,22 @@ export class SessionSocket {
     this.closedByUser = true;
     if (this.timer) clearTimeout(this.timer);
     this.ws?.close();
+  }
+
+  /**
+   * The next attempt, after a growing delay; until the user closes the socket or the backend rejects it. An attempt
+   * that fails before it has a WebSocket (e.g. the backend info cannot be read while the shell restarts it) schedules
+   * the next one itself: no `onclose` would.
+   */
+  private scheduleReconnect(): void {
+    if (this.closedByUser || this.rejected) return;
+    const delay = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** this.attempts++);
+    this.timer = setTimeout(() => {
+      this.connect().catch((error: unknown) => {
+        console.warn(`Session ${this.sessionId}: reconnect attempt failed`, error);
+        this.scheduleReconnect();
+      });
+    }, delay);
   }
 
   private setStatus(status: SocketStatus): void {
