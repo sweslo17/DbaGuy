@@ -9,6 +9,9 @@ from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import ColumnCategory, ColumnMeta, ServerMessage
 from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
 from ...domain.profiles import AnyProfile, Engine, SqliteProfile, SqliteProfileDraft
+from ...domain.schema import SchemaSnapshot
+from ...sql.dialects import Dialect
+from ...sql.lexer import first_keyword
 from ..base import (
     DatabaseAdapter,
     DatabaseConnection,
@@ -17,10 +20,16 @@ from ..base import (
     StatementCancelled,
     StatementError,
     StatementResult,
+    transaction_open_error,
 )
 from . import introspection
+from . import schema as sqlite_schema
 
 _PEEK_ROWS = 200
+# Statements that control the transaction themselves or cannot run inside one: manual mode does not BEGIN for them.
+_NO_AUTO_BEGIN = frozenset(
+    {"BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE", "VACUUM", "PRAGMA", "ATTACH", "DETACH"}
+)
 
 
 def _translate(exc: sqlite3.Error) -> StatementError:
@@ -93,8 +102,9 @@ class SqliteStatementResult(StatementResult):
 
 class SqliteConnection(DatabaseConnection):
     def __init__(self, conn: sqlite3.Connection, path: Path) -> None:
-        self._conn = conn
+        self._conn = conn  # isolation_level=None: the driver never begins a transaction on its own
         self._path = path
+        self._manual = False  # manual-commit mode: run() begins a transaction in front of every statement
 
     def server_info(self) -> ServerInfo:
         return ServerInfo(engine=Engine.SQLITE, version=sqlite3.sqlite_version, current_database="main")
@@ -114,7 +124,27 @@ class SqliteConnection(DatabaseConnection):
         except sqlite3.Error as exc:
             raise _translate(exc) from exc
 
+    def schema_snapshot(self) -> SchemaSnapshot:
+        try:
+            return sqlite_schema.build_snapshot(self._conn)
+        except sqlite3.Error as exc:
+            raise _translate(exc) from exc
+
+    def _begin_if_manual(self, sql: str) -> None:
+        """Manual mode: open the transaction the statement runs in, as psycopg does for PostgreSQL.
+
+        The driver's own implicit BEGIN only recognises INSERT/UPDATE/DELETE/REPLACE, so a CTE-prefixed write or DDL
+        would otherwise autocommit and escape rollback().
+        """
+        if not self._manual or self._conn.in_transaction or first_keyword(sql, Dialect.SQLITE) in _NO_AUTO_BEGIN:
+            return
+        try:
+            self._conn.execute("BEGIN")
+        except sqlite3.Error as exc:
+            raise _translate(exc) from exc
+
     def run(self, sql: str) -> StatementResult:
+        self._begin_if_manual(sql)
         cursor = self._conn.cursor()
         try:
             cursor.execute(sql)
@@ -125,6 +155,29 @@ class SqliteConnection(DatabaseConnection):
 
     def in_transaction(self) -> bool:
         return self._conn.in_transaction
+
+    def autocommit(self) -> bool:
+        return not self._manual
+
+    def set_autocommit(self, enabled: bool) -> None:
+        if self.autocommit() == enabled:
+            return
+        if self._conn.in_transaction:
+            raise transaction_open_error()
+        self._manual = not enabled
+        logger.info("Auto-commit {} on SQLite database {}", "on" if enabled else "off", self._path)
+
+    def commit(self) -> None:
+        try:
+            self._conn.commit()
+        except sqlite3.Error as exc:
+            raise _translate(exc) from exc
+
+    def rollback(self) -> None:
+        try:
+            self._conn.rollback()
+        except sqlite3.Error as exc:
+            raise _translate(exc) from exc
 
     def cancel(self) -> None:
         self._conn.interrupt()
@@ -138,10 +191,15 @@ class SqliteAdapter(DatabaseAdapter):
     engine = Engine.SQLITE
     url_schemes = ("sqlite",)
     default_port = None
+    dialect = Dialect.SQLITE
 
     def parse_url(self, url: str) -> ParsedUrl:
+        """`sqlite:///abs/path` and `sqlite:////abs/path` (SQLAlchemy's absolute form) are absolute paths, `sqlite://rel`
+        and `sqlite:rel` relative ones; `~` is expanded when the file is opened."""
         parsed = urlparse(url)
         path = unquote(parsed.netloc + parsed.path)
+        if path.startswith("//"):  # one root, however many slashes: `//abs` would read as a URI authority later
+            path = "/" + path.lstrip("/")
         if not path:
             raise ValidationFailed("A SQLite URL needs a file path, e.g. sqlite:///Users/me/app.db")
         name = Path(path).name or "SQLite"

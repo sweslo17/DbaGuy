@@ -16,6 +16,7 @@ import type {
 } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { useEngines, useImportUrl, useSaveProfile, useTestConnection } from "./hooks";
+import { PROFILE_COLOR_ORDER } from "./profileColors";
 
 export const ENGINE_LABELS: Record<Engine, string> = {
   postgres: "PostgreSQL",
@@ -25,7 +26,6 @@ export const ENGINE_LABELS: Record<Engine, string> = {
   sqlite: "SQLite",
 };
 
-const COLORS: ProfileDraft["color"][] = ["none", "green", "yellow", "orange", "red", "purple"];
 const SSL_MODES: SslConfig["mode"][] = ["disable", "prefer", "require", "verify-ca", "verify-full"];
 const SSL_FILE_FIELDS = [
   { field: "ca_file", label: "CA file" },
@@ -44,11 +44,23 @@ const DEFAULT_SSH: SshConfig = {
 };
 
 type TabId = "general" | "ssl" | "ssh" | "advanced";
-type CommonField = "name" | "folder" | "color" | "read_only" | "save_password";
+type CommonField = "name" | "folder" | "color" | "read_only" | "safety" | "save_password";
+type SafetyLevel = ProfileDraft["safety"];
+
+/** The safety levels (spec §3.4): when a statement needs confirming before it runs. */
+const SAFETY_LEVELS: { value: SafetyLevel; label: string; explanation: string }[] = [
+  { value: "relaxed", label: "Relaxed", explanation: "Runs every statement without asking" },
+  {
+    value: "standard",
+    label: "Standard",
+    explanation: "Asks before UPDATE or DELETE without WHERE, DROP, TRUNCATE and ALTER … DROP",
+  },
+  { value: "strict", label: "Strict", explanation: "Asks before every statement that is not a read" },
+];
 type Feedback = { ok: boolean; text: string } | null;
 
 function emptyDraft(engine: Engine): ProfileDraft {
-  const common = { name: "", folder: "", color: "none", read_only: false, save_password: true } as const;
+  const common = { name: "", folder: "", color: "none", read_only: false, safety: "standard", save_password: true } as const;
   if (engine === "sqlite") return { ...common, engine, path: "" };
   return {
     ...common,
@@ -70,8 +82,8 @@ function toDraft(entry: ProfileEntry): ProfileDraft {
 
 /** The fields that describe the profile itself rather than how to reach the database. */
 function commonFields(draft: ProfileDraft): Pick<ProfileDraft, CommonField> {
-  const { name, folder, color, read_only, save_password } = draft;
-  return { name, folder, color, read_only, save_password };
+  const { name, folder, color, read_only, safety, save_password } = draft;
+  return { name, folder, color, read_only, safety, save_password };
 }
 
 function optionsToText(draft: ProfileDraft): string {
@@ -297,7 +309,7 @@ function ConnectionDialogBody({
         </FieldRow>
         <FieldRow label="Color">
           <Select value={draft.color} onChange={(e) => patchCommon({ color: e.target.value as ProfileDraft["color"] })}>
-            {COLORS.map((color) => (
+            {PROFILE_COLOR_ORDER.map((color) => (
               <option key={color} value={color}>
                 {color}
               </option>
@@ -350,6 +362,15 @@ function ConnectionDialogBody({
               onChange={(e) => patchCommon({ read_only: e.target.checked })}
             />
           </div>
+        </FieldRow>
+        <FieldRow label="Safety" hint={SAFETY_LEVELS.find((level) => level.value === draft.safety)?.explanation}>
+          <Select value={draft.safety} onChange={(e) => patchCommon({ safety: e.target.value as SafetyLevel })}>
+            {SAFETY_LEVELS.map((level) => (
+              <option key={level.value} value={level.value}>
+                {level.label}
+              </option>
+            ))}
+          </Select>
         </FieldRow>
       </TabPanel>
 

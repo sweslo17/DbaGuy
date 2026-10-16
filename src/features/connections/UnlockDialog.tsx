@@ -4,6 +4,7 @@ import { Dialog } from "@/components/ui/Dialog";
 import { FieldRow, Input } from "@/components/ui/Field";
 import { errorMessage } from "@/lib/api/client";
 import type { Profile } from "@/lib/api/types";
+import { isImeKeyEvent } from "@/lib/ime";
 import { useUnlockProfile } from "./hooks";
 
 /** Which secrets a `password_required` error asks for (its `detail`). */
@@ -52,7 +53,7 @@ function UnlockDialogBody({
       },
     );
   };
-  const onEnter = (e: KeyboardEvent) => e.key === "Enter" && !e.nativeEvent.isComposing && submit();
+  const onEnter = (e: KeyboardEvent) => e.key === "Enter" && !isImeKeyEvent(e) && submit();
   return (
     <Dialog
       open

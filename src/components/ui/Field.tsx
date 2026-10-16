@@ -9,7 +9,7 @@ import {
 import { cn } from "@/lib/cn";
 
 const control =
-  "rounded-md border border-border bg-elevated px-2 text-[13px] outline-none focus:border-accent disabled:opacity-60";
+  "rounded-md border border-border bg-elevated px-2 text-[13px] outline-none focus:border-accent aria-invalid:border-danger disabled:opacity-60";
 const singleLine = `h-7 w-full ${control}`;
 
 export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputElement>>(function Input(
@@ -53,12 +53,28 @@ export function Label({ className, ...props }: LabelHTMLAttributes<HTMLLabelElem
   return <label className={cn("text-[12px] text-muted", className)} {...props} />;
 }
 
-export function FieldRow({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+/** A labelled control; `error` (a value the form cannot take) shows in place of the hint. */
+export function FieldRow({
+  label,
+  hint,
+  error,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  error?: string | null;
+  children: ReactNode;
+}) {
+  const note = error || hint;
   return (
     <div role="group" aria-label={label || undefined} className="grid grid-cols-[120px_1fr] items-center gap-x-3 gap-y-1">
       <Label className="text-right">{label}</Label>
       <div>{children}</div>
-      {hint && <span className="col-start-2 text-[11px] text-muted">{hint}</span>}
+      {note && (
+        <span className={cn("col-start-2 text-[11px] [overflow-wrap:anywhere]", error ? "text-danger" : "text-muted")}>
+          {note}
+        </span>
+      )}
     </div>
   );
 }

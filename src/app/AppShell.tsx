@@ -1,6 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
-import type { ReactNode } from "react";
-import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
+import { Settings } from "lucide-react";
+import { useEffect, useRef, type ReactNode } from "react";
+import { Group, Panel, useDefaultLayout } from "react-resizable-panels";
+import { PanelHandle } from "@/components/ui/PanelHandle";
+import { Toaster } from "@/components/ui/Toast";
+import { openSettings, SettingsDialogHost } from "@/features/settings/SettingsDialog";
+import { saveWorkspaceNow, useWorkspaceSaveFailing } from "@/features/workspace/workspaceSync";
 import { api, unwrap } from "@/lib/api/client";
 import { BackendBanner } from "./BackendBanner";
 
@@ -12,6 +17,14 @@ export function AppShell({ sidebar, workspace }: { sidebar: ReactNode; workspace
     queryFn: async () => unwrap(await (await api()).GET("/system/health")),
     refetchInterval: 15_000,
   });
+  // The backend answers again after it did not: what was typed meanwhile is saved now, not at the next retry.
+  const unreachable = health.isError;
+  const wasUnreachable = useRef(false);
+  useEffect(() => {
+    if (wasUnreachable.current && !unreachable) saveWorkspaceNow();
+    wasUnreachable.current = unreachable;
+  }, [unreachable]);
+  const saveFailing = useWorkspaceSaveFailing();
   // Persists the sidebar width in localStorage (react-resizable-panels v4 has no autoSaveId).
   const { defaultLayout, onLayoutChanged } = useDefaultLayout({ id: LAYOUT_ID });
 
@@ -24,6 +37,15 @@ export function AppShell({ sidebar, workspace }: { sidebar: ReactNode; workspace
         <span data-tauri-drag-region className="text-[12px] font-semibold text-muted">
           DbaGuy
         </span>
+        <button
+          type="button"
+          title="Settings (⌘,)"
+          aria-label="Settings"
+          className="ml-auto flex h-6 w-6 items-center justify-center rounded text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-accent/50"
+          onClick={openSettings}
+        >
+          <Settings size={14} />
+        </button>
       </div>
       <BackendBanner />
       <div className="min-h-0 flex-1">
@@ -36,7 +58,7 @@ export function AppShell({ sidebar, workspace }: { sidebar: ReactNode; workspace
           <Panel id="sidebar" defaultSize="22%" minSize="15%" className="bg-panel">
             {sidebar}
           </Panel>
-          <Separator className="w-px bg-border outline-none data-[separator=active]:bg-accent data-[separator=hover]:bg-accent data-[separator=focus]:bg-accent" />
+          <PanelHandle orientation="horizontal" />
           <Panel id="workspace" minSize="40%" className="bg-bg">
             {workspace}
           </Panel>
@@ -46,7 +68,17 @@ export function AppShell({ sidebar, workspace }: { sidebar: ReactNode; workspace
         <span className={health.isError ? "text-danger" : ""}>
           {health.isError ? "Backend unreachable" : health.data ? `Backend v${health.data.version}` : "Connecting…"}
         </span>
+        {saveFailing && (
+          <span
+            className="text-danger"
+            title="Your open tabs could not be saved. They are kept in this window and retried."
+          >
+            Not saved
+          </span>
+        )}
       </div>
+      <Toaster />
+      <SettingsDialogHost />
     </div>
   );
 }

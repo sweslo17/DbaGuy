@@ -1277,6 +1277,23 @@ test = ["build[virtualenv] (>=1.0.3)", "filelock (>=3.4.0)", "ini2toml[lite] (>=
 type = ["importlib_metadata (>=7.0.2) ; python_version < \"3.10\"", "jaraco.develop (>=7.21) ; sys_platform != \"cygwin\"", "mypy (==1.18.*)", "pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 
 [[package]]
+name = "sqlglot"
+version = "30.23.0"
+description = "An easily customizable SQL parser and transpiler"
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+files = [
+    {file = "sqlglot-30.23.0-py3-none-any.whl", hash = "sha256:b5a645722cb4c6b649e9131b94830d9df9a557e87be63713179d848320f2baa1"},
+    {file = "sqlglot-30.23.0.tar.gz", hash = "sha256:34b5b62fa4cbf042ee6b9e829236577b2f8db4538dd20007de2aa5383c92e845"},
+]
+
+[package.extras]
+c = ["sqlglotc (==30.23.0) ; python_version >= \"3.10\""]
+dev = ["duckdb (>=0.6)", "mypy (>=2.4.0) ; python_version >= \"3.10\"", "mypy ; python_version < \"3.10\"", "pandas", "pandas-stubs", "pdoc", "pre-commit", "pyperf", "python-dateutil", "pytz", "ruff (==0.15.6)", "setuptools_scm", "types-python-dateutil", "types-pytz", "typing_extensions"]
+rs = ["sqlglotc (==30.23.0) ; python_version >= \"3.10\"", "sqlglotrs (==0.13.0)"]
+
+[[package]]
 name = "starlette"
 version = "1.8.0"
 description = "The little ASGI library that shines."
@@ -1659,4 +1676,4 @@ dev = ["black (>=19.3b0) ; python_version >= \"3.6\"", "pytest (>=4.6.2)"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13,<3.14"
-content-hash = "d98a433672a673c82945260df3e7b9bab605bd3e8394c160a30316596029441f"
+content-hash = "69da243ee8e10bd609072a244d24caaf321a7bfb926411b7181d561c4796f991"

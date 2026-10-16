@@ -7,6 +7,7 @@ export function ConfirmDialog({
   title,
   message,
   confirmLabel = "Delete",
+  cancelLabel = "Cancel",
   onConfirm,
   pending = false,
   error = null,
@@ -16,6 +17,7 @@ export function ConfirmDialog({
   title: string;
   message: string;
   confirmLabel?: string;
+  cancelLabel?: string;
   onConfirm: () => void;
   pending?: boolean;
   error?: string | null;
@@ -29,7 +31,7 @@ export function ConfirmDialog({
       footer={
         <>
           <Button variant="ghost" onClick={() => onOpenChange(false)}>
-            Cancel
+            {cancelLabel}
           </Button>
           <Button variant="danger" onClick={onConfirm} disabled={pending}>
             {confirmLabel}

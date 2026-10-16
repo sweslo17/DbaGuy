@@ -10,6 +10,7 @@ from ..domain.errors import SessionNotFound
 from ..domain.metadata import ServerInfo
 from ..services.connection_service import ConnectionService
 from ..services.profile_service import ProfileService
+from .hooks import SessionHooksFactory
 from .worker import Emitter, SessionWorker
 
 
@@ -36,9 +37,13 @@ class _Entry:
 class SessionManager:
     """User sessions (one per editor tab). Closed explicitly or after idling without a WebSocket."""
 
-    def __init__(self, connections: ConnectionService, profiles: ProfileService, idle_timeout: float = 600.0) -> None:
+    def __init__(
+        self, connections: ConnectionService, profiles: ProfileService, hooks: SessionHooksFactory | None = None,
+        idle_timeout: float = 600.0,
+    ) -> None:
         self._connections = connections
         self._profiles = profiles
+        self._hooks = hooks  # None: workers keep their defaults (everything runs, nothing is recorded)
         self._idle_timeout = idle_timeout
         self._sessions: dict[str, _Entry] = {}
         self._lock = threading.Lock()
@@ -54,6 +59,8 @@ class SessionManager:
         try:
             worker.start()
             server = worker.call(lambda c: c.server_info())
+            if self._hooks is not None:
+                worker.configure(self._hooks.build(profile.id, server.current_database))  # before it is registered
         except BaseException:
             worker.close()  # whatever failed, never leave the thread, connection or tunnel behind
             raise
@@ -78,6 +85,7 @@ class SessionManager:
         with self._lock:
             entry.attached += 1
         entry.worker.set_emitter(emit)
+        entry.worker.replay_state()  # a client attaching mid-transaction learns the state before any `finished`
         return entry.worker
 
     def detach(self, session_id: str, emit: Emitter) -> None:
@@ -113,6 +121,16 @@ class SessionManager:
             ids = list(self._sessions)
         for sid in ids:
             self._pop_and_close(sid)
+
+    def check_idle_transactions(self, warn_after_s: float, rollback_after_s: float) -> None:
+        """Warn about idle transactions and roll them back in time; one failing session does not stop the rest."""
+        with self._lock:
+            entries = list(self._sessions.items())
+        for session_id, entry in entries:
+            try:
+                entry.worker.check_idle_transaction(warn_after_s, rollback_after_s)
+            except Exception:
+                logger.exception("Idle-transaction check failed for session {}", session_id)
 
     def _is_idle(self, entry: _Entry) -> bool:
         return entry.attached == 0 and time.monotonic() - entry.detached_at >= self._idle_timeout

@@ -159,6 +159,43 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/metadata/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Search */
+        get: operations["search_metadata_search_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/metadata/schema/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Refresh Schema
+         * @description Forget the cached schema; the next completion or search rebuilds it.
+         */
+        post: operations["refresh_schema_metadata_schema_refresh_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sessions": {
         parameters: {
             query?: never;
@@ -213,6 +250,235 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Settings */
+        get: operations["get_settings_settings_get"];
+        /** Update Settings */
+        put: operations["update_settings_settings_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workspace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Workspace */
+        get: operations["get_workspace_workspace_get"];
+        /** Put Workspace */
+        put: operations["put_workspace_workspace_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/scripts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Script Tree */
+        get: operations["script_tree_scripts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/scripts/file": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read Script */
+        get: operations["read_script_scripts_file_get"];
+        /** Write Script */
+        put: operations["write_script_scripts_file_put"];
+        post?: never;
+        /** Delete Script */
+        delete: operations["delete_script_scripts_file_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/scripts/rename": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Rename Script */
+        post: operations["rename_script_scripts_rename_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/scripts/folder": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create Script Folder */
+        post: operations["create_script_folder_scripts_folder_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Search History */
+        get: operations["search_history_history_get"];
+        put?: never;
+        post?: never;
+        /** Clear History */
+        delete: operations["clear_history_history_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sql/split": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Split Statements */
+        post: operations["split_statements_sql_split_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sql/analyze": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Analyze
+         * @description What the safety policy would say about each statement if the user had not confirmed it yet.
+         */
+        post: operations["analyze_sql_analyze_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sql/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Complete At */
+        post: operations["complete_at_sql_complete_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sql/describe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Describe */
+        post: operations["describe_sql_describe_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sql/format-rows": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Format Rows For Copy */
+        post: operations["format_rows_for_copy_sql_format_rows_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sql/browse-select": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Browse Select */
+        post: operations["browse_select_sql_browse_select_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -231,6 +497,84 @@ export interface components {
             /** Rows */
             rows: number;
         };
+        /** AnalyzeRequest */
+        AnalyzeRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Statements */
+            statements: string[];
+        };
+        /**
+         * AppSettings
+         * @description The app preferences (`settings.json`). Persisted, so a newer build's extra fields are tolerated on read and
+         *     kept on write; input from the API stays strict.
+         */
+        AppSettings: {
+            /**
+             * @default {
+             *       "font_size": 13,
+             *       "vim": false,
+             *       "word_wrap": false,
+             *       "tab_size": 2,
+             *       "keyword_case": "upper"
+             *     }
+             */
+            editor: components["schemas"]["EditorSettings"];
+            /**
+             * @default {
+             *       "default": "statement",
+             *       "continue_on_error": false,
+             *       "page_size": 500,
+             *       "statement_timeout_s": 0
+             *     }
+             */
+            run: components["schemas"]["RunSettings"];
+            /**
+             * @default {
+             *       "idle_transaction_warn_minutes": 3,
+             *       "idle_transaction_rollback_minutes": 0
+             *     }
+             */
+            safety: components["schemas"]["SafetySettings"];
+            /**
+             * @default {
+             *       "long_query_seconds": 15
+             *     }
+             */
+            notifications: components["schemas"]["NotificationSettings"];
+            /** Scripts Dir */
+            scripts_dir?: string | null;
+        };
+        /** BrowseSelectRequest */
+        BrowseSelectRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Path */
+            path: components["schemas"]["PathSegment"][];
+            /** Where */
+            where?: string | null;
+            /**
+             * Order By
+             * @default []
+             */
+            order_by: components["schemas"]["SortKey"][];
+            /**
+             * Count
+             * @default false
+             */
+            count: boolean;
+        };
+        /** BrowseSelectResponse */
+        BrowseSelectResponse: {
+            /** Sql */
+            sql: string;
+        };
         /** CancelCommand */
         CancelCommand: {
             /**
@@ -240,6 +584,15 @@ export interface components {
             type: "cancel";
             /** Request Id */
             request_id: string;
+        };
+        /** Classification */
+        Classification: {
+            kind: components["schemas"]["StatementKind"];
+            /**
+             * Dangerous Reasons
+             * @default []
+             */
+            dangerous_reasons: components["schemas"]["DangerReason"][];
         };
         /**
          * ColumnCategory
@@ -272,6 +625,72 @@ export interface components {
             type_name: string;
             category: components["schemas"]["ColumnCategory"];
         };
+        /** CommitCommand */
+        CommitCommand: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "commit";
+            /** Request Id */
+            request_id: string;
+        };
+        /** CompleteRequest */
+        CompleteRequest: {
+            /** Database */
+            database?: string | null;
+            /** Text */
+            text: string;
+            /** Cursor */
+            cursor: number;
+            /** Profile Id */
+            profile_id?: string | null;
+            dialect?: components["schemas"]["Dialect"] | null;
+        };
+        /** CompletionItem */
+        CompletionItem: {
+            /** Label */
+            label: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "keyword" | "schema" | "table" | "view" | "materialized_view" | "column" | "alias" | "function" | "join";
+            /** Detail */
+            detail?: string | null;
+            /** Apply */
+            apply?: string | null;
+            /**
+             * Boost
+             * @default 0
+             */
+            boost: number;
+        };
+        /** CompletionResponse */
+        CompletionResponse: {
+            /** Start */
+            start: number;
+            /** End */
+            end: number;
+            /** Items */
+            items: components["schemas"]["CompletionItem"][];
+        };
+        /**
+         * ConfirmationRequiredEvent
+         * @description The statement was not run: resend it with `confirmed=true` once the user agreed. `finished(skipped)` follows.
+         */
+        ConfirmationRequiredEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "confirmation_required";
+            /** Request Id */
+            request_id: string;
+            /** Reasons */
+            reasons: components["schemas"]["GuardReason"][];
+            classification: components["schemas"]["Classification"];
+        };
         /** ConnectionTestRequest */
         ConnectionTestRequest: {
             /** Profile */
@@ -291,6 +710,57 @@ export interface components {
             /** Elapsed Ms */
             elapsed_ms: number;
         };
+        /**
+         * DangerReason
+         * @description Why a statement is dangerous: the standard safety level asks before running it.
+         * @enum {string}
+         */
+        DangerReason: "update_without_where" | "delete_without_where" | "drop" | "truncate" | "alter_drop";
+        /** DescribeColumn */
+        DescribeColumn: {
+            /** Name */
+            name: string;
+            /** Type Name */
+            type_name: string;
+            /** Is Primary Key */
+            is_primary_key: boolean;
+            /** References */
+            references?: string | null;
+        };
+        /** DescribeRequest */
+        DescribeRequest: {
+            /** Database */
+            database?: string | null;
+            /** Text */
+            text: string;
+            /** Cursor */
+            cursor: number;
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+        };
+        /** DescribeResult */
+        DescribeResult: {
+            /** Schema Name */
+            schema_name: string;
+            /** Name */
+            name: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "table" | "view" | "materialized_view";
+            /** Columns */
+            columns: components["schemas"]["DescribeColumn"][];
+        };
+        /**
+         * Dialect
+         * @description The SQL dialect of an engine: how its statements are split, classified, completed and quoted.
+         * @enum {string}
+         */
+        Dialect: "postgres" | "sqlite";
         /** DiscardCommand */
         DiscardCommand: {
             /**
@@ -300,6 +770,35 @@ export interface components {
             type: "discard";
             /** Request Id */
             request_id: string;
+        };
+        /** EditorSettings */
+        EditorSettings: {
+            /**
+             * Font Size
+             * @default 13
+             */
+            font_size: number;
+            /**
+             * Vim
+             * @default false
+             */
+            vim: boolean;
+            /**
+             * Word Wrap
+             * @default false
+             */
+            word_wrap: boolean;
+            /**
+             * Tab Size
+             * @default 2
+             */
+            tab_size: number;
+            /**
+             * Keyword Case
+             * @default upper
+             * @enum {string}
+             */
+            keyword_case: "upper" | "preserve";
         };
         /**
          * Engine
@@ -313,6 +812,7 @@ export interface components {
             default_port: number | null;
             /** Url Schemes */
             url_schemes: string[];
+            dialect: components["schemas"]["Dialect"];
         };
         /** ErrorEvent */
         ErrorEvent: {
@@ -352,6 +852,18 @@ export interface components {
              * @default 500
              */
             page_size: number;
+            /**
+             * Confirmed
+             * @default false
+             */
+            confirmed: boolean;
+            /** Timeout S */
+            timeout_s?: number | null;
+            /**
+             * History
+             * @default true
+             */
+            history: boolean;
         };
         /**
          * ExecutionSchema
@@ -359,9 +871,34 @@ export interface components {
          */
         ExecutionSchema: {
             /** Command */
-            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"];
+            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["ExportCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"] | components["schemas"]["CommitCommand"] | components["schemas"]["RollbackCommand"] | components["schemas"]["SetAutocommitCommand"];
             /** Event */
-            event: components["schemas"]["StartedEvent"] | components["schemas"]["ResultSetEvent"] | components["schemas"]["RowsEvent"] | components["schemas"]["ResultSetEndEvent"] | components["schemas"]["AffectedEvent"] | components["schemas"]["MessageEvent"] | components["schemas"]["ErrorEvent"] | components["schemas"]["FinishedEvent"];
+            event: components["schemas"]["StartedEvent"] | components["schemas"]["ResultSetEvent"] | components["schemas"]["RowsEvent"] | components["schemas"]["ResultSetEndEvent"] | components["schemas"]["AffectedEvent"] | components["schemas"]["MessageEvent"] | components["schemas"]["ErrorEvent"] | components["schemas"]["ProgressEvent"] | components["schemas"]["ConfirmationRequiredEvent"] | components["schemas"]["SessionStateEvent"] | components["schemas"]["FinishedEvent"];
+        };
+        /**
+         * ExportCommand
+         * @description Run `sql` again on this session and write its whole result, as raw values, to the file at `path`.
+         */
+        ExportCommand: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "export";
+            /** Request Id */
+            request_id: string;
+            /** Sql */
+            sql: string;
+            format: components["schemas"]["FormatKind"];
+            /** Path */
+            path: string;
+            /**
+             * @default {
+             *       "header": true,
+             *       "null_text": ""
+             *     }
+             */
+            options: components["schemas"]["RowFormatOptions"];
         };
         /** FetchMoreCommand */
         FetchMoreCommand: {
@@ -401,7 +938,70 @@ export interface components {
              * @default false
              */
             cancelled: boolean;
+            /**
+             * Timed Out
+             * @default false
+             */
+            timed_out: boolean;
+            /**
+             * Skipped
+             * @default false
+             */
+            skipped: boolean;
         };
+        /** FormatColumn */
+        FormatColumn: {
+            /** Name */
+            name: string;
+            category: components["schemas"]["ColumnCategory"];
+        };
+        /**
+         * FormatKind
+         * @enum {string}
+         */
+        FormatKind: "tsv" | "csv" | "json" | "jsonl" | "markdown" | "insert" | "in_list";
+        /** FormatResult */
+        FormatResult: {
+            /** Text */
+            text: string;
+            /**
+             * Warnings
+             * @default []
+             */
+            warnings: string[];
+        };
+        /** FormatRowsRequest */
+        FormatRowsRequest: {
+            dialect: components["schemas"]["Dialect"];
+            kind: components["schemas"]["FormatKind"];
+            /** Columns */
+            columns: components["schemas"]["FormatColumn"][];
+            /** Rows */
+            rows: unknown[][];
+            options?: components["schemas"]["RowFormatOptions"];
+        };
+        /**
+         * GuardAction
+         * @enum {string}
+         */
+        GuardAction: "run" | "confirm" | "block";
+        /** GuardDecision */
+        GuardDecision: {
+            action: components["schemas"]["GuardAction"];
+            /**
+             * Reasons
+             * @default []
+             */
+            reasons: components["schemas"]["GuardReason"][];
+            classification: components["schemas"]["Classification"];
+        };
+        /**
+         * GuardReason
+         * @description Why the safety policy asks for confirmation (a danger, or any non-read statement at the strict level) or blocks
+         *     a statement (a read-only connection). Every `DangerReason` is one, with the same value.
+         * @enum {string}
+         */
+        GuardReason: "update_without_where" | "delete_without_where" | "drop" | "truncate" | "alter_drop" | "strict_write" | "strict_ddl" | "strict_transaction" | "strict_session" | "strict_unknown" | "read_only";
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -416,6 +1016,45 @@ export interface components {
             status: "ok";
             /** Version */
             version: string;
+        };
+        /** HistoryEntry */
+        HistoryEntry: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Profile Name */
+            profile_name: string;
+            /** Database */
+            database: string | null;
+            /** Sql */
+            sql: string;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /** Elapsed Ms */
+            elapsed_ms: number;
+            /** Rows */
+            rows: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ok" | "error" | "cancelled" | "timeout";
+            /** Error */
+            error?: string | null;
+            /** Id */
+            id: number;
+        };
+        /** HistoryPage */
+        HistoryPage: {
+            /** Items */
+            items: components["schemas"]["HistoryEntry"][];
+            /** Next Before */
+            next_before: number | null;
         };
         /** ImportUrlRequest */
         ImportUrlRequest: {
@@ -457,6 +1096,14 @@ export interface components {
             /** Path */
             path?: components["schemas"]["PathSegment"][];
         };
+        /** NotificationSettings */
+        NotificationSettings: {
+            /**
+             * Long Query Seconds
+             * @default 15
+             */
+            long_query_seconds: number;
+        };
         /** ObjectDetail */
         ObjectDetail: {
             /** Path */
@@ -495,6 +1142,22 @@ export interface components {
             /** Detail */
             detail?: string | null;
         };
+        /** ObjectSearchHit */
+        ObjectSearchHit: {
+            /** Database */
+            database: string | null;
+            /** Schema Name */
+            schema_name: string;
+            /** Name */
+            name: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "table" | "view" | "materialized_view";
+            /** Path */
+            path: components["schemas"]["PathSegment"][];
+        };
         /** PathSegment */
         PathSegment: {
             /** Kind */
@@ -527,6 +1190,21 @@ export interface components {
             profile: components["schemas"]["ServerProfileDraft"] | components["schemas"]["SqliteProfileDraft"];
             secrets?: components["schemas"]["ProfileSecretsInput"];
         };
+        /**
+         * ProgressEvent
+         * @description An export has written `rows` rows so far; sent after every 10,000 rows.
+         */
+        ProgressEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "progress";
+            /** Request Id */
+            request_id: string;
+            /** Rows */
+            rows: number;
+        };
         /** ResultSetEndEvent */
         ResultSetEndEvent: {
             /**
@@ -557,6 +1235,36 @@ export interface components {
             /** Columns */
             columns: components["schemas"]["ColumnMeta"][];
         };
+        /** RollbackCommand */
+        RollbackCommand: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "rollback";
+            /** Request Id */
+            request_id: string;
+        };
+        /**
+         * RowFormatOptions
+         * @description Shared by copy (`/sql/format-rows`) and export (WS `export`).
+         */
+        RowFormatOptions: {
+            /**
+             * Header
+             * @default true
+             */
+            header: boolean;
+            /**
+             * Null Text
+             * @default
+             */
+            null_text: string;
+            /** Table Schema */
+            table_schema?: string | null;
+            /** Table Name */
+            table_name?: string | null;
+        };
         /** RowsEvent */
         RowsEvent: {
             /**
@@ -570,6 +1278,108 @@ export interface components {
             index: number;
             /** Rows */
             rows: unknown[][];
+        };
+        /** RunSettings */
+        RunSettings: {
+            /**
+             * Default
+             * @default statement
+             * @enum {string}
+             */
+            default: "statement" | "all";
+            /**
+             * Continue On Error
+             * @default false
+             */
+            continue_on_error: boolean;
+            /**
+             * Page Size
+             * @default 500
+             */
+            page_size: number;
+            /**
+             * Statement Timeout S
+             * @default 0
+             */
+            statement_timeout_s: number;
+        };
+        /** SafetySettings */
+        SafetySettings: {
+            /**
+             * Idle Transaction Warn Minutes
+             * @default 3
+             */
+            idle_transaction_warn_minutes: number;
+            /**
+             * Idle Transaction Rollback Minutes
+             * @default 0
+             */
+            idle_transaction_rollback_minutes: number;
+        };
+        /** SchemaRefreshRequest */
+        SchemaRefreshRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Database */
+            database?: string | null;
+        };
+        /** ScriptFile */
+        ScriptFile: {
+            /** Path */
+            path: string;
+            /** Content */
+            content: string;
+            /**
+             * Modified At
+             * Format: date-time
+             */
+            modified_at: string;
+        };
+        /** ScriptFolder */
+        ScriptFolder: {
+            /** Path */
+            path: string;
+        };
+        /** ScriptNode */
+        ScriptNode: {
+            /** Name */
+            name: string;
+            /** Path */
+            path: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "file" | "folder";
+            /**
+             * Children
+             * @default []
+             */
+            children: components["schemas"]["ScriptNode"][];
+        };
+        /** ScriptRename */
+        ScriptRename: {
+            /** From */
+            from: string;
+            /** To */
+            to: string;
+        };
+        /** ScriptTree */
+        ScriptTree: {
+            /** Root */
+            root: string;
+            /** Items */
+            items: components["schemas"]["ScriptNode"][];
+        };
+        /** ScriptWrite */
+        ScriptWrite: {
+            /** Path */
+            path: string;
+            /** Content */
+            content: string;
         };
         /** ServerInfo */
         ServerInfo: {
@@ -601,6 +1411,12 @@ export interface components {
              * @default false
              */
             read_only: boolean;
+            /**
+             * Safety
+             * @default standard
+             * @enum {string}
+             */
+            safety: "relaxed" | "standard" | "strict";
             /**
              * Save Password
              * @default true
@@ -652,6 +1468,12 @@ export interface components {
              */
             read_only: boolean;
             /**
+             * Safety
+             * @default standard
+             * @enum {string}
+             */
+            safety: "relaxed" | "standard" | "strict";
+            /**
              * Save Password
              * @default true
              */
@@ -699,6 +1521,61 @@ export interface components {
             database: string | null;
             server: components["schemas"]["ServerInfo"];
         };
+        /**
+         * SessionStateEvent
+         * @description The session's transaction state: sent right before every `finished` and every pause, on attach and after an
+         *     idle rollback.
+         */
+        SessionStateEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "session_state";
+            /** Autocommit */
+            autocommit: boolean;
+            /** In Transaction */
+            in_transaction: boolean;
+            /** Transaction Failed */
+            transaction_failed: boolean;
+            /** Transaction Started At */
+            transaction_started_at?: string | null;
+            /** Idle Seconds */
+            idle_seconds?: number | null;
+        };
+        /** SetAutocommitCommand */
+        SetAutocommitCommand: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "set_autocommit";
+            /** Request Id */
+            request_id: string;
+            /** Enabled */
+            enabled: boolean;
+        };
+        /** SortKey */
+        SortKey: {
+            /** Column */
+            column: string;
+            /**
+             * Descending
+             * @default false
+             */
+            descending: boolean;
+        };
+        /** SplitRequest */
+        SplitRequest: {
+            /** Text */
+            text: string;
+            dialect: components["schemas"]["Dialect"];
+        };
+        /** SplitResponse */
+        SplitResponse: {
+            /** Statements */
+            statements: components["schemas"]["StatementRange"][];
+        };
         /** SqliteProfile */
         SqliteProfile: {
             /** Name */
@@ -719,6 +1596,12 @@ export interface components {
              * @default false
              */
             read_only: boolean;
+            /**
+             * Safety
+             * @default standard
+             * @enum {string}
+             */
+            safety: "relaxed" | "standard" | "strict";
             /**
              * Save Password
              * @default true
@@ -757,6 +1640,12 @@ export interface components {
              * @default false
              */
             read_only: boolean;
+            /**
+             * Safety
+             * @default standard
+             * @enum {string}
+             */
+            safety: "relaxed" | "standard" | "strict";
             /**
              * Save Password
              * @default true
@@ -820,6 +1709,27 @@ export interface components {
             /** Request Id */
             request_id: string;
         };
+        /**
+         * StatementKind
+         * @enum {string}
+         */
+        StatementKind: "read" | "write" | "ddl" | "transaction" | "session" | "unknown";
+        /** StatementRange */
+        StatementRange: {
+            /** Start */
+            start: number;
+            /** End */
+            end: number;
+            /** Terminator End */
+            terminator_end: number;
+        };
+        /** TextSelection */
+        TextSelection: {
+            /** Anchor */
+            anchor: number;
+            /** Head */
+            head: number;
+        };
         /** ValidationError */
         ValidationError: {
             /** Location */
@@ -832,6 +1742,56 @@ export interface components {
             input?: unknown;
             /** Context */
             ctx?: Record<string, never>;
+        };
+        /**
+         * WorkspaceState
+         * @description The open tabs (`workspace.json`), written whole every few seconds so that a crash loses nothing.
+         */
+        WorkspaceState: {
+            /**
+             * Version
+             * @default 1
+             */
+            version: number;
+            /**
+             * Tabs
+             * @default []
+             */
+            tabs: components["schemas"]["WorkspaceTab"][];
+            /** Active Tab Id */
+            active_tab_id?: string | null;
+            /** Sidebar Tab */
+            sidebar_tab?: string | null;
+        };
+        /** WorkspaceTab */
+        WorkspaceTab: {
+            /** Id */
+            id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "query" | "table" | "object";
+            /**
+             * Title
+             * @default
+             */
+            title: string;
+            /** Profile Id */
+            profile_id?: string | null;
+            /** Database */
+            database?: string | null;
+            /** Script Path */
+            script_path?: string | null;
+            /** Object Path */
+            object_path?: components["schemas"]["PathSegment"][] | null;
+            /** Buffer */
+            buffer?: string | null;
+            /** Cursor */
+            cursor?: number | null;
+            selection?: components["schemas"]["TextSelection"] | null;
+            /** Autocommit */
+            autocommit?: boolean | null;
         };
     };
     responses: never;
@@ -1213,6 +2173,75 @@ export interface operations {
             };
         };
     };
+    search_metadata_search_get: {
+        parameters: {
+            query: {
+                profile_id: string;
+                q?: string;
+                database?: string | null;
+                limit?: number;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ObjectSearchHit"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    refresh_schema_metadata_schema_refresh_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SchemaRefreshRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     create_session_sessions_post: {
         parameters: {
             query?: never;
@@ -1297,6 +2326,607 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ExecutionSchema"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_settings_settings_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppSettings"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_settings_settings_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AppSettings"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppSettings"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_workspace_workspace_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceState"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_workspace_workspace_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkspaceState"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    script_tree_scripts_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScriptTree"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_script_scripts_file_get: {
+        parameters: {
+            query: {
+                path: string;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScriptFile"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    write_script_scripts_file_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScriptWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScriptFile"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_script_scripts_file_delete: {
+        parameters: {
+            query: {
+                path: string;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    rename_script_scripts_rename_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScriptRename"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_script_folder_scripts_folder_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScriptFolder"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_history_history_get: {
+        parameters: {
+            query?: {
+                q?: string;
+                profile_id?: string | null;
+                limit?: number;
+                before?: number | null;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HistoryPage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    clear_history_history_delete: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    split_statements_sql_split_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SplitRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SplitResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    analyze_sql_analyze_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AnalyzeRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GuardDecision"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    complete_at_sql_complete_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CompleteRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CompletionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    describe_sql_describe_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DescribeRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DescribeResult"] | null;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    format_rows_for_copy_sql_format_rows_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FormatRowsRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FormatResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    browse_select_sql_browse_select_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BrowseSelectRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BrowseSelectResponse"];
                 };
             };
             /** @description Validation Error */

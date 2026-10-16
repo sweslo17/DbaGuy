@@ -3,10 +3,17 @@
 import threading
 from typing import Any
 
-from dbaguy_backend.adapters.base import DatabaseConnection, StatementCancelled, StatementResult
+from dbaguy_backend.adapters.base import (
+    DatabaseConnection,
+    StatementCancelled,
+    StatementError,
+    StatementResult,
+    transaction_open_error,
+)
 from dbaguy_backend.domain.execution import ColumnCategory, ColumnMeta, ServerMessage
 from dbaguy_backend.domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
 from dbaguy_backend.domain.profiles import Engine
+from dbaguy_backend.domain.schema import SchemaSnapshot
 
 
 class FakeResult(StatementResult):
@@ -35,7 +42,10 @@ class FakeResult(StatementResult):
 
 
 class FakeConnection(DatabaseConnection):
-    """`run("rows N")` returns N rows; `run("block")` waits until cancel() (then raises StatementCancelled)."""
+    """`run()` words: `rows N` returns N rows; `block` waits until cancel() (then raises StatementCancelled);
+    `fail MSG` raises StatementError (and aborts an open transaction, like PostgreSQL); `begin` opens a transaction;
+    anything else returns an empty result. In manual-commit mode (`auto` False) every statement opens a transaction
+    first, like the real adapters."""
 
     def __init__(self) -> None:
         self.runs: list[str] = []
@@ -43,6 +53,11 @@ class FakeConnection(DatabaseConnection):
         self.closed = False
         self.blocked = threading.Event()  # set while a "block" statement is waiting
         self._unblock = threading.Event()
+        self.tx = False
+        self.auto = True
+        self.commits = 0
+        self.rollbacks = 0
+        self.failed = False  # the open transaction is aborted (set by `fail` inside a transaction)
 
     def server_info(self) -> ServerInfo:
         return ServerInfo(engine=Engine.SQLITE, version="fake")
@@ -56,16 +71,56 @@ class FakeConnection(DatabaseConnection):
     def object_detail(self, path: list[PathSegment]) -> ObjectDetail:
         raise NotImplementedError
 
+    def schema_snapshot(self) -> SchemaSnapshot:
+        raise NotImplementedError
+
     def run(self, sql: str) -> StatementResult:
+        """`rows N` → N rows; `block` → waits for cancel(); `fail MSG` → StatementError; `begin` opens a
+        transaction; anything else → an empty result."""
         self.runs.append(sql)
-        if sql == "block":
+        if not self.auto:
+            self.tx = True  # manual mode: the adapters BEGIN before the statement, even a SELECT that then pauses
+        word, _, arg = sql.partition(" ")
+        if word == "block":
             self.blocked.set()
             assert self._unblock.wait(10), "block was never cancelled"
+            self._unblock.clear()  # one fake connection can serve several `block` statements in a test
             raise StatementCancelled()
-        return FakeResult(int(sql.split()[1]))
+        if word == "fail":
+            self.failed = self.tx
+            raise StatementError(arg or "boom", code="42000")
+        if word == "begin":
+            self.tx = True
+        return FakeResult(int(arg) if word == "rows" else 0)
 
     def in_transaction(self) -> bool:
-        return False
+        return self.tx
+
+    def transaction_failed(self) -> bool:
+        return self.tx and self.failed
+
+    def autocommit(self) -> bool:
+        return self.auto
+
+    def set_autocommit(self, enabled: bool) -> None:
+        if self.tx and enabled != self.auto:
+            raise transaction_open_error()
+        self.auto = enabled
+
+    def commit(self) -> None:
+        if not self.tx:  # like the real adapters, nothing to do (and nothing counted) without an open transaction
+            return
+        if self.failed:  # like PostgreSQL: COMMIT of an aborted transaction silently rolls it back
+            self.rollback()
+            return
+        self.commits += 1
+        self.tx = False
+
+    def rollback(self) -> None:
+        if self.tx:
+            self.rollbacks += 1
+            self.tx = False
+            self.failed = False
 
     def cancel(self) -> None:
         self.cancel_calls += 1

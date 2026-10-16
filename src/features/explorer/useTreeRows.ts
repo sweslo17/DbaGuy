@@ -7,7 +7,7 @@ import { buildFolderTree, type FolderNode } from "../connections/folders";
 export type TreeRow =
   | { type: "folder"; key: string; name: string; depth: number }
   | { type: "profile"; key: string; entry: ProfileEntry; depth: number }
-  | { type: "node"; key: string; profileId: string; profileName: string; node: ObjectNode; depth: number }
+  | { type: "node"; key: string; profileId: string; node: ObjectNode; depth: number }
   | { type: "loading"; key: string; depth: number }
   | {
       type: "error";
@@ -28,6 +28,16 @@ export const nodeKey = (profileId: string, path: PathSegment[]) => `${nodeKeyPre
 export const childrenQueryKey = (profileId: string, path: PathSegment[]) =>
   ["children", profileId, pathKey(path)] as const;
 
+/** The query for an object's children (`path` [] is the connection's root): shared by the tree and the query tab. */
+export function childrenQuery(profileId: string, path: PathSegment[]) {
+  return {
+    queryKey: childrenQueryKey(profileId, path),
+    queryFn: async () => unwrap(await (await api()).POST("/metadata/children", { body: { profile_id: profileId, path } })),
+    staleTime: 5 * 60_000,
+    retry: false, // the row offers an explicit Retry; auto-retrying delays the error and re-asks for passwords
+  };
+}
+
 /** The object whose children an expanded row shows. */
 export interface Expansion {
   profileId: string;
@@ -42,19 +52,13 @@ export function useTreeRows(
 ): TreeRow[] {
   const targets = useMemo(() => [...expansions.entries()].filter(([key]) => expanded.has(key)), [expansions, expanded]);
   const results = useQueries({
-    queries: targets.map(([, target]) => ({
-      queryKey: childrenQueryKey(target.profileId, target.path),
-      queryFn: async () =>
-        unwrap(await (await api()).POST("/metadata/children", { body: { profile_id: target.profileId, path: target.path } })),
-      staleTime: 5 * 60_000,
-      retry: false, // the row offers an explicit Retry; auto-retrying delays the error and re-asks for passwords
-    })),
+    queries: targets.map(([, target]) => childrenQuery(target.profileId, target.path)),
   });
 
   return useMemo(() => {
     const byKey = new Map(targets.map(([key], i) => [key, results[i]]));
     const rows: TreeRow[] = [];
-    const pushChildren = (profileId: string, profileName: string, ownerKey: string, depth: number) => {
+    const pushChildren = (profileId: string, ownerKey: string, depth: number) => {
       const result = byKey.get(ownerKey);
       if (!result || result.isPending) {
         rows.push({ type: "loading", key: `${ownerKey}#loading`, depth });
@@ -76,8 +80,8 @@ export function useTreeRows(
       }
       for (const node of result.data ?? []) {
         const key = nodeKey(profileId, node.path);
-        rows.push({ type: "node", key, profileId, profileName, node, depth });
-        if (node.has_children && expanded.has(key)) pushChildren(profileId, profileName, key, depth + 1);
+        rows.push({ type: "node", key, profileId, node, depth });
+        if (node.has_children && expanded.has(key)) pushChildren(profileId, key, depth + 1);
       }
     };
     const walk = (folder: FolderNode, depth: number) => {
@@ -89,7 +93,7 @@ export function useTreeRows(
       for (const entry of folder.profiles) {
         const key = profileKey(entry.profile.id);
         rows.push({ type: "profile", key, entry, depth });
-        if (expanded.has(key)) pushChildren(entry.profile.id, entry.profile.name, key, depth + 1);
+        if (expanded.has(key)) pushChildren(entry.profile.id, key, depth + 1);
       }
     };
     walk(buildFolderTree(entries), 0);

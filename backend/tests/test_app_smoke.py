@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import textwrap
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -158,3 +159,20 @@ def test_openapi_dump_needs_no_token(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "/system/health" in json.loads(result.stdout)["paths"]
+
+
+def test_importing_the_app_leaves_sqlglot_for_later_and_the_domain_needs_no_sql_package(tmp_path):
+    # sqlglot costs ~190 ms of start-up: the classifier imports it on first use (warmed in the background).
+    code = textwrap.dedent("""
+        import importlib, pkgutil, sys
+        import dbaguy_backend.domain as domain
+        for info in pkgutil.iter_modules(domain.__path__):
+            importlib.import_module(f"dbaguy_backend.domain.{info.name}")
+        leaks = sorted(m for m in sys.modules if m.startswith(("dbaguy_backend.sql", "sqlglot")))
+        assert not leaks, f"the domain imports {leaks}"
+        import dbaguy_backend.app
+        assert "sqlglot" not in sys.modules, "importing the app loads sqlglot"
+    """)
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
+                            cwd=Path(__file__).parents[1])
+    assert result.returncode == 0, result.stderr

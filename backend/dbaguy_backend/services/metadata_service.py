@@ -67,12 +67,21 @@ class MetadataService:
         for key in keys:
             self._drop(key)
 
-    def _call(self, request: MetadataRequest, fn: Callable[[DatabaseConnection], T]) -> T:
-        profile = self._profiles.get(request.profile_id)
+    def with_connection(self, profile_id: UUID, database: str | None, fn: Callable[[DatabaseConnection], T]) -> T:
+        """Run `fn` on the metadata connection of (profile, database), reconnecting once if it was lost.
+
+        `database` only selects a connection for engines that open one per database.
+        """
+        profile = self._profiles.get(profile_id)
         adapter = self._registry.get(profile.engine)
-        database = None
-        if adapter.capabilities.per_database_connection and request.path and request.path[0].kind == NodeKind.DATABASE:
-            database = request.path[0].name
+        return self._call_on(profile, database if adapter.capabilities.per_database_connection else None, fn)
+
+    def _call(self, request: MetadataRequest, fn: Callable[[DatabaseConnection], T]) -> T:
+        head = request.path[0] if request.path else None
+        database = head.name if head is not None and head.kind == NodeKind.DATABASE else None
+        return self.with_connection(request.profile_id, database, fn)
+
+    def _call_on(self, profile: AnyProfile, database: str | None, fn: Callable[[DatabaseConnection], T]) -> T:
         key = (profile.id, database)
         for attempt in (1, 2):
             worker = self._worker(key, profile, database)

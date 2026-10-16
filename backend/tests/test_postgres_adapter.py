@@ -107,6 +107,13 @@ def test_error_position_with_cjk(conn):
     assert (info.value.position.line, info.value.position.column) == (2, 3)
 
 
+def test_error_column_counts_utf16_units_after_an_astral_character(conn):
+    with pytest.raises(StatementError) as info:
+        conn.run("SELECT '😀' AS a, nope_column FROM big_table").fetch(1)
+    assert info.value.code == "42703"
+    assert (info.value.position.line, info.value.position.column) == (1, 19)  # 18th character, 19th UTF-16 unit
+
+
 def test_cancel_running_query(conn):
     threading.Timer(0.5, conn.cancel).start()
     started = time.monotonic()
@@ -329,3 +336,71 @@ def test_profile_options_cannot_redirect_or_override_the_connection():
     warning = "\n".join(messages)
     assert all(key in warning for key in reserved)  # names are logged ...
     assert not any(value in warning for value in ("attacker.invalid", "wrong-secret", "ssl-secret", "/nonexistent"))  # ... values never
+
+
+@requires_pg
+def test_read_only_profile_is_read_only_in_the_database():
+    conn = PostgresAdapter().open(make_pg_profile(read_only=True), Endpoint(PG_HOST, PG_PORT), PG_PASSWORD, None)
+    try:
+        result = conn.run("SHOW default_transaction_read_only")
+        assert result.fetch(1) == [["on"]]
+        result.close()
+        with pytest.raises(StatementError) as exc:
+            conn.run("CREATE TEMP TABLE ro_probe (id int)")
+        assert exc.value.code == "25006"  # read_only_sql_transaction
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_read_only_connection_restores_read_only_after_set_config_hidden_in_a_string():
+    conn = PostgresAdapter().open(make_pg_profile(read_only=True), Endpoint(PG_HOST, PG_PORT), PG_PASSWORD, None)
+    try:
+        # The statement guard sees only a string literal here; the server-side check must catch the switched-off GUC.
+        result = conn.run(
+            "SELECT query_to_xml('select set_config(''default_transaction_read_only'',''off'',false)', false, false, '')"
+        )
+        result.fetch(1)
+        result.close()
+        with pytest.raises(StatementError) as exc:
+            conn.run("CREATE TEMP TABLE ro_probe2 (id int)")
+        assert exc.value.code == "25006"  # read_only_sql_transaction
+        assert conn._conn.info.parameter_status("default_transaction_read_only") == "on"
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_writable_connection_does_not_re_assert_read_only():
+    conn = PostgresAdapter().open(make_pg_profile(), Endpoint(PG_HOST, PG_PORT), PG_PASSWORD, None)
+    try:
+        result = conn.run("SELECT set_config('default_transaction_read_only', 'off', false)")
+        result.fetch(1)
+        result.close()
+        conn.run("SELECT 1").close()
+        assert conn._conn.info.parameter_status("default_transaction_read_only") == "off"  # nothing restored it
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_read_only_connection_runs_one_statement_at_a_time():
+    conn = PostgresAdapter().open(make_pg_profile(read_only=True), Endpoint(PG_HOST, PG_PORT), PG_PASSWORD, None)
+    try:
+        # One call that would switch the default off and commit between statements: refused before anything runs.
+        script = (
+            "SELECT query_to_xml('select set_config(''default_transaction_read_only'',''off'',false)',"
+            " false, false, ''); COMMIT; CREATE TEMP TABLE oos1 (id int)"
+        )
+        with pytest.raises(StatementError) as exc:
+            conn.run(script)
+        assert exc.value.code == "read_only_single_statement"
+        assert conn._conn.info.parameter_status("default_transaction_read_only") == "on"
+        result = conn.run("SELECT to_regclass('oos1')")
+        assert result.fetch(1) == [[None]]  # the CREATE never ran
+        result.close()
+        result = conn.run("SELECT 1;")  # one statement with a trailing semicolon still runs
+        assert result.fetch(1) == [[1]]
+        result.close()
+    finally:
+        conn.close()

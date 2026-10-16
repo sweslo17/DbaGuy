@@ -1,11 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, unwrap } from "@/lib/api/client";
-import type { ProfileDraft, ProfileSecretsInput } from "@/lib/api/types";
+import type { Dialect, ProfileDraft, ProfileSecretsInput } from "@/lib/api/types";
+import { invalidateExplorer } from "../explorer/explorerCache";
 
 export const profilesKey = ["profiles"] as const;
 
+export async function fetchProfiles() {
+  return unwrap(await (await api()).GET("/profiles"));
+}
+
 export function useProfiles() {
-  return useQuery({ queryKey: profilesKey, queryFn: async () => unwrap(await (await api()).GET("/profiles")) });
+  return useQuery({ queryKey: profilesKey, queryFn: fetchProfiles });
 }
 
 export function useEngines() {
@@ -14,6 +19,14 @@ export function useEngines() {
     queryFn: async () => unwrap(await (await api()).GET("/system/engines")),
     staleTime: Infinity,
   });
+}
+
+/** SQL dialect of a profile's engine; null without a profile and until profiles and engines are loaded. */
+export function useDialect(profileId: string | null): Dialect | null {
+  const profiles = useProfiles();
+  const engines = useEngines();
+  const engine = profiles.data?.find((entry) => entry.profile.id === profileId)?.profile.engine;
+  return engines.data?.find((info) => info.engine === engine)?.dialect ?? null;
 }
 
 export function useSaveProfile() {
@@ -28,10 +41,7 @@ export function useSaveProfile() {
     },
     onSuccess: (_, input) => {
       qc.invalidateQueries({ queryKey: profilesKey });
-      if (input.id) {
-        qc.invalidateQueries({ queryKey: ["children", input.id] });
-        qc.invalidateQueries({ queryKey: ["detail", input.id] });
-      }
+      if (input.id) void invalidateExplorer(qc, input.id);
     },
   });
 }

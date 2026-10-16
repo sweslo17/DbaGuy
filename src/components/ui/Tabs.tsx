@@ -1,28 +1,38 @@
 import type { ReactNode } from "react";
 import { cn } from "@/lib/cn";
 
+/** A tab button's look: underlined in the accent colour while it is the selected one. */
+export function tabClass(selected: boolean): string {
+  return cn(
+    "-mb-px shrink-0 border-b-2 px-3 py-1.5 text-[12px] whitespace-nowrap outline-none focus-visible:text-accent",
+    selected ? "border-accent text-fg" : "border-transparent text-muted hover:text-fg",
+  );
+}
+
 export function Tabs<T extends string>({
   value,
   onValueChange,
   items,
+  className = "mb-3",
 }: {
   value: T;
   onValueChange: (value: T) => void;
-  items: { value: T; label: string }[];
+  /** `title`: a tooltip (e.g. the full text of a shortened label). */
+  items: { value: T; label: string; title?: string }[];
+  /** Spacing around the bar (default: a margin below it). */
+  className?: string;
 }) {
   return (
-    <div role="tablist" className="mb-3 flex gap-1 border-b border-border">
+    <div role="tablist" className={cn("flex gap-1 border-b border-border", className)}>
       {items.map((item) => (
         <button
           key={item.value}
           type="button"
           role="tab"
           aria-selected={value === item.value}
+          title={item.title}
           onClick={() => onValueChange(item.value)}
-          className={cn(
-            "-mb-px border-b-2 px-3 py-1.5 text-[12px] outline-none focus-visible:text-accent",
-            value === item.value ? "border-accent text-fg" : "border-transparent text-muted hover:text-fg",
-          )}
+          className={tabClass(value === item.value)}
         >
           {item.label}
         </button>

@@ -2,6 +2,8 @@ import socket
 import sqlite3
 import threading
 import time
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
 
 import pytest
 import uvicorn
@@ -13,6 +15,7 @@ from websockets.sync.client import connect
 from dbaguy_backend.app import create_app
 from dbaguy_backend.config import Settings
 from dbaguy_backend.container import AppContainer
+from dbaguy_backend.domain.history import HistoryRecord
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
 
 TOKEN = "test-token"
@@ -27,6 +30,13 @@ def client(tmp_path):
     container = AppContainer(settings, secret_store=InMemorySecretStore())
     with TestClient(create_app(settings, container), base_url=BASE_URL) as test_client:
         yield test_client
+
+
+def receive(ws):
+    """The next event that is not a `session_state` (sent on attach and right before every `finished`)."""
+    while (event := ws.receive_json())["type"] == "session_state":
+        pass
+    return event
 
 
 @pytest.fixture
@@ -96,15 +106,48 @@ def test_metadata_and_session_over_websocket(client, sqlite_profile_id):
             events.append(ws.receive_json())
             if events[-1]["type"] == "finished":
                 break
-        assert [e["type"] for e in events] == ["started", "result_set", "rows", "result_set_end", "finished"]
-        assert events[2]["rows"] == [[1, "a"], [2, "b"], [3, "c"]]
+        assert [e["type"] for e in events] == [
+            "session_state", "started", "result_set", "rows", "result_set_end", "session_state", "finished",
+        ]
+        assert events[0] == events[5] == {
+            "type": "session_state", "autocommit": True, "in_transaction": False, "transaction_failed": False,
+            "transaction_started_at": None, "idle_seconds": None,
+        }
+        assert events[3]["rows"] == [[1, "a"], [2, "b"], [3, "c"]]
         ws.send_json({"type": "bogus", "request_id": "x"})
         assert ws.receive_json()["code"] == "invalid_command"
         assert ws.receive_json() == {
             "type": "finished", "request_id": "x", "elapsed_ms": 0, "in_transaction": False,
-            "transaction_failed": False, "cancelled": False,
+            "transaction_failed": False, "cancelled": False, "timed_out": False, "skipped": False,
         }
     assert client.delete(f"/sessions/{sid}", headers=AUTH).status_code == 204
+
+
+def test_metadata_search_and_refresh(client, sqlite_profile_id):
+    hits = client.get("/metadata/search", params={"profile_id": sqlite_profile_id, "q": "t"}, headers=AUTH).json()
+    assert hits[0]["name"] == "t" and hits[0]["path"][-1] == {"kind": "table", "name": "t"}
+    response = client.post("/metadata/schema/refresh", json={"profile_id": sqlite_profile_id}, headers=AUTH)
+    assert response.status_code == 204
+
+
+def test_profile_changes_drop_the_cached_schema(client, sqlite_profile_id, tmp_path):
+    cache = client.app.state.container.schema_cache
+    pid = UUID(sqlite_profile_id)
+
+    def warm_up():
+        client.get("/metadata/search", params={"profile_id": sqlite_profile_id, "q": "t"}, headers=AUTH)
+        assert cache.peek(pid) is not None
+
+    warm_up()
+    body = {"profile": {"engine": "sqlite", "name": "renamed", "path": str(tmp_path / "api.db")}}
+    assert client.put(f"/profiles/{sqlite_profile_id}", json=body, headers=AUTH).status_code == 200
+    assert cache.peek(pid) is None
+    warm_up()
+    assert client.post(f"/profiles/{sqlite_profile_id}/unlock", json={"password": "x"}, headers=AUTH).status_code == 204
+    assert cache.peek(pid) is None
+    warm_up()
+    assert client.delete(f"/profiles/{sqlite_profile_id}", headers=AUTH).status_code == 204
+    assert cache.peek(pid) is None
 
 
 def test_encoded_cells_reach_the_websocket_client_unchanged(client, sqlite_profile_id):
@@ -121,9 +164,9 @@ def test_invalid_command_without_a_request_id_gets_an_error_but_no_finished(clie
     sid = client.post("/sessions", json={"profile_id": sqlite_profile_id}, headers=AUTH).json()["session_id"]
     with client.websocket_connect(f"{WS_BASE}/sessions/{sid}/ws?token={TOKEN}") as ws:
         ws.send_json({"type": "bogus"})
-        assert ws.receive_json()["code"] == "invalid_command"
+        assert receive(ws)["code"] == "invalid_command"
         ws.send_json({"type": "execute", "request_id": "q", "sql": "SELECT 1"})
-        assert ws.receive_json()["type"] == "started"  # nothing was queued between the error and this request
+        assert receive(ws)["type"] == "started"  # nothing was queued between the error and this request
 
 
 def test_command_rejected_by_a_closed_session_gets_an_error_and_finished(client, sqlite_profile_id):
@@ -131,8 +174,8 @@ def test_command_rejected_by_a_closed_session_gets_an_error_and_finished(client,
     with client.websocket_connect(f"{WS_BASE}/sessions/{sid}/ws?token={TOKEN}") as ws:
         client.app.state.container.sessions.worker(sid).close()  # the socket stays attached to a dead worker
         ws.send_json({"type": "execute", "request_id": "late", "sql": "SELECT 1"})
-        error = ws.receive_json()
-        finished = ws.receive_json()
+        error = receive(ws)
+        finished = receive(ws)
     assert error["type"] == "error" and error["request_id"] == "late" and error["code"] == "session_busy"
     assert finished["type"] == "finished" and finished["request_id"] == "late" and finished["cancelled"] is False
 
@@ -167,7 +210,7 @@ def test_websocket_cancel_stops_a_running_statement(client, sqlite_profile_id):
     with client.websocket_connect(f"{WS_BASE}/sessions/{sid}/ws?token={TOKEN}") as ws:
         ws.send_json({"type": "cancel", "request_id": "nothing-running"})  # unknown request: ignored, not fatal
         ws.send_json({"type": "execute", "request_id": "slow", "sql": endless})
-        assert ws.receive_json()["type"] == "started"
+        assert receive(ws)["type"] == "started"
         ws.send_json({"type": "cancel", "request_id": "slow"})
         finished = None
         while finished is None:
@@ -236,3 +279,85 @@ def test_websocket_close_codes_are_visible_to_a_real_client(live_port, session_i
         with pytest.raises(ConnectionClosed) as closed:
             ws.recv(timeout=2)
     assert closed.value.rcvd is not None and closed.value.rcvd.code == expected_code
+
+
+def test_settings_and_workspace_api(client):
+    settings = client.get("/settings", headers=AUTH).json()
+    assert settings["run"]["page_size"] == 500
+    settings["editor"]["vim"] = True
+    assert client.put("/settings", json=settings, headers=AUTH).json()["editor"]["vim"] is True
+    workspace = {"version": 1, "tabs": [{"id": "t1", "kind": "query", "buffer": "SELECT '😀'"}], "active_tab_id": "t1"}
+    assert client.put("/workspace", json=workspace, headers=AUTH).status_code == 204
+    assert client.get("/workspace", headers=AUTH).json()["tabs"][0]["buffer"] == "SELECT '😀'"
+    object_tab = {"id": "o1", "kind": "object", "title": "orders",
+                  "object_path": [{"kind": "schema", "name": "public"}, {"kind": "table", "name": "orders"}]}
+    workspace["tabs"].append(object_tab)
+    assert client.put("/workspace", json=workspace, headers=AUTH).status_code == 204
+    assert client.get("/workspace", headers=AUTH).json()["tabs"][1]["kind"] == "object"
+
+
+def test_settings_and_workspace_reject_bad_input(client):
+    settings = client.get("/settings", headers=AUTH).json()
+    assert client.put("/settings", json={**settings, "editor": {"font_size": 999}}, headers=AUTH).status_code == 422
+    assert client.put("/settings", json={**settings, "future": 1}, headers=AUTH).status_code == 422
+    relative = client.put("/settings", json={**settings, "scripts_dir": "relative"}, headers=AUTH)
+    assert relative.status_code == 422 and relative.json()["error"]["code"] == "validation_failed"
+    assert client.put("/workspace", json={"tabs": [{"id": "", "kind": "query"}]}, headers=AUTH).status_code == 422
+    assert client.get("/settings").status_code == 401 and client.put("/workspace", json={}).status_code == 401
+
+
+def test_scripts_api(client):
+    assert client.put("/scripts/file", json={"path": "a.sql", "content": "SELECT 1"}, headers=AUTH).status_code == 200
+    assert client.get("/scripts", headers=AUTH).json()["items"][0]["path"] == "a.sql"
+    assert client.get("/scripts/file", params={"path": "a.sql"}, headers=AUTH).json()["content"] == "SELECT 1"
+    assert client.post("/scripts/rename", json={"from": "a.sql", "to": "b.sql"}, headers=AUTH).status_code == 204
+    assert client.get("/scripts/file", params={"path": "../x.sql"}, headers=AUTH).status_code == 422
+    assert client.delete("/scripts/file", params={"path": "b.sql"}, headers=AUTH).status_code == 204
+
+
+def test_scripts_api_folders_and_errors(client, tmp_path):
+    assert client.post("/scripts/folder", json={"path": "reports"}, headers=AUTH).status_code == 204
+    again = client.post("/scripts/folder", json={"path": "reports"}, headers=AUTH)
+    assert again.status_code == 409 and again.json()["error"]["code"] == "already_exists"
+    missing = client.get("/scripts/file", params={"path": "gone.sql"}, headers=AUTH)
+    assert missing.status_code == 404 and missing.json()["error"]["code"] == "not_found"
+    tree = client.get("/scripts", headers=AUTH).json()
+    assert tree["root"] == str(tmp_path / "data" / "scripts") and tree["items"][0]["kind"] == "folder"
+    assert client.post("/scripts/rename", json={"from": "a.sql"}, headers=AUTH).status_code == 422
+    assert client.post("/scripts/rename", json={"from": "a.sql", "to": "b.sql", "x": 1}, headers=AUTH).status_code == 422
+    assert client.get("/scripts").status_code == 401
+
+
+def test_scripts_follow_the_configured_folder(client, tmp_path):
+    settings = client.get("/settings", headers=AUTH).json()
+    settings["scripts_dir"] = str(tmp_path / "repo")
+    assert client.put("/settings", json=settings, headers=AUTH).status_code == 200
+    client.put("/scripts/file", json={"path": "q.sql", "content": "SELECT 2"}, headers=AUTH)
+    assert (tmp_path / "repo" / "q.sql").read_text() == "SELECT 2"
+
+
+def test_scripts_api_path_problems_are_client_errors(client, tmp_path):
+    (tmp_path / "data" / "scripts" / ".git").mkdir(parents=True)
+    assert client.put("/scripts/file", json={"path": "file.sql", "content": "x"}, headers=AUTH).status_code == 200
+    assert client.get("/scripts/file", params={"path": "file.sql/x.sql"}, headers=AUTH).status_code == 404
+    in_the_way = client.put("/scripts/file", json={"path": "file.sql/x.sql", "content": "x"}, headers=AUTH)
+    assert in_the_way.status_code == 409 and in_the_way.json()["error"]["code"] == "already_exists"
+    too_long = client.get("/scripts/file", params={"path": "x" * 252 + ".sql"}, headers=AUTH)
+    assert too_long.status_code == 422 and "too long" in too_long.json()["error"]["message"]
+    assert client.post("/scripts/rename", json={"from": ".git", "to": "old"}, headers=AUTH).status_code == 422
+    assert client.post("/scripts/folder", json={"path": ".git/new"}, headers=AUTH).status_code == 422
+    assert client.put("/scripts/file", json={"path": ".git/x.sql", "content": "x"}, headers=AUTH).status_code == 422
+    assert [p.name for p in (tmp_path / "data" / "scripts" / ".git").iterdir()] == []
+
+
+def test_history_api(client):
+    container = client.app.state.container
+    container.history.record(HistoryRecord(profile_id=uuid4(), profile_name="p", database=None, sql="SELECT 42",
+                                           started_at=datetime.now(UTC), elapsed_ms=1, rows=1, status="ok"))
+    page = client.get("/history", params={"q": "42"}, headers=AUTH).json()
+    assert [e["sql"] for e in page["items"]] == ["SELECT 42"]
+    assert client.delete("/history", headers=AUTH).status_code == 204
+    assert client.get("/history", headers=AUTH).json()["items"] == []
+    assert client.get("/history").status_code == 401 and client.delete("/history").status_code == 401
+    assert client.get("/history", params={"limit": 0}, headers=AUTH).status_code == 422
+    assert client.get("/history", params={"limit": 1001}, headers=AUTH).status_code == 422

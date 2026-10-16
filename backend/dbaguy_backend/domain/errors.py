@@ -66,6 +66,18 @@ class ProfileStoreError(DomainError):
     status = 500
 
 
+class StorageError(DomainError):
+    """A local data file (settings, workspace, scripts) cannot be read, moved aside or written."""
+
+    code = "storage_error"
+    status = 500
+
+
+class AlreadyExists(DomainError):
+    code = "already_exists"
+    status = 409
+
+
 class QueryFailed(DomainError):
     code = "query_failed"
     status = 400

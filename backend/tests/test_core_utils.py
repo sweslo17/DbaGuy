@@ -12,6 +12,7 @@ from dbaguy_backend.adapters.values import MAX_SAFE_INT, TEXT_LIMIT, encode_valu
 from dbaguy_backend.domain.errors import UnsupportedEngine, ValidationFailed
 from dbaguy_backend.domain.execution import ClientCommand, ServerEvent
 from dbaguy_backend.domain.profiles import Engine, SqliteProfileDraft
+from dbaguy_backend.sql.dialects import Dialect
 from pydantic import TypeAdapter
 
 
@@ -56,6 +57,12 @@ def test_offset_to_line_col():
     assert offset_to_line_col("abc", 999) == (1, 4)
 
 
+def test_error_columns_count_utf16_units():
+    assert offset_to_line_col("SELECT '😀', nope", 13) == (1, 14)  # 'n' is the 13th character, 14th UTF-16 unit
+    assert offset_to_line_col("a\n😀b", 4) == (2, 3)
+    assert offset_to_line_col("SELECT x", 8) == (1, 8)
+
+
 def test_quote_helpers():
     assert quote_ident_pg("users") == "users"
     assert quote_ident_pg("Users") == '"Users"'
@@ -68,6 +75,7 @@ def test_quote_helpers():
 
 def test_first_keyword():
     assert first_keyword("  -- note\n /* block */ select 1") == "select"
+    assert first_keyword("/* a /* b */ c */ select 1") == "select"  # PostgreSQL nests block comments
     assert first_keyword("(select 1)") == "("
     assert first_keyword("WITH x AS (SELECT 1) SELECT * FROM x") == "with"
     assert first_keyword("") == ""
@@ -84,6 +92,7 @@ class FakeAdapter(DatabaseAdapter):
     engine = Engine.SQLITE
     url_schemes = ("fake",)
     default_port = None
+    dialect = Dialect.SQLITE
 
     def parse_url(self, url):
         return ParsedUrl(profile=SqliteProfileDraft(engine="sqlite", name="fake", path=url))

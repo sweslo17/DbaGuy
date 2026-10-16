@@ -1,4 +1,6 @@
 mod backend;
+#[cfg(target_os = "macos")]
+mod menu;
 
 use backend::{BackendInfo, BackendManager};
 use std::path::PathBuf;
@@ -31,7 +33,11 @@ fn log_dir() -> PathBuf {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // ⌘W reaches the page (it closes a tab): the menu's Close Window is ⌘⇧W.
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(menu::app_menu).on_menu_event(menu::on_menu_event);
+    builder
         .plugin(
             tauri_plugin_log::Builder::new()
                 .targets([
@@ -41,6 +47,9 @@ pub fn run() {
                 .level(log::LevelFilter::Info)
                 .build(),
         )
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(BackendManager::default())
         .setup(|app| {
             let _ = app.state::<BackendManager>().start(app.handle());

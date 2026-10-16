@@ -10,12 +10,11 @@ const CLOSE_SESSION_NOT_FOUND = 4404;
 const BACKOFF_BASE_MS = 250;
 const BACKOFF_MAX_MS = 5000;
 
-/** One WebSocket per session; queues commands until open and reconnects with backoff. */
+/** One WebSocket per session; reconnects with backoff. Commands are never queued: they are sent only while open. */
 export class SessionSocket {
   private ws: WebSocket | null = null;
   private readonly listeners = new Set<Listener>();
   private readonly statusListeners = new Set<StatusListener>();
-  private readonly pending: ClientCommand[] = [];
   private closedByUser = false;
   private rejected = false;
   private attempts = 0;
@@ -38,7 +37,6 @@ export class SessionSocket {
     ws.onopen = () => {
       this.attempts = 0;
       this.setStatus("open");
-      for (const command of this.pending.splice(0)) ws.send(JSON.stringify(command));
     };
     ws.onmessage = (message) => {
       const event = JSON.parse(message.data as string) as ServerEvent;
@@ -48,15 +46,15 @@ export class SessionSocket {
       this.ws = null;
       this.rejected = close.code === CLOSE_UNAUTHORIZED || close.code === CLOSE_SESSION_NOT_FOUND;
       this.setStatus("closed");
-      if (this.closedByUser || this.rejected) return;
-      const delay = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** this.attempts++);
-      this.timer = setTimeout(() => void this.connect(), delay);
+      this.scheduleReconnect();
     };
   }
 
-  send(command: ClientCommand): void {
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(command));
-    else this.pending.push(command);
+  /** Sends only while the WebSocket is open (never queued, so nothing is replayed after a reconnect). */
+  trySend(command: ClientCommand): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN) return false;
+    this.ws.send(JSON.stringify(command));
+    return true;
   }
 
   subscribe(listener: Listener): () => void {
@@ -73,6 +71,22 @@ export class SessionSocket {
     this.closedByUser = true;
     if (this.timer) clearTimeout(this.timer);
     this.ws?.close();
+  }
+
+  /**
+   * The next attempt, after a growing delay; until the user closes the socket or the backend rejects it. An attempt
+   * that fails before it has a WebSocket (e.g. the backend info cannot be read while the shell restarts it) schedules
+   * the next one itself: no `onclose` would.
+   */
+  private scheduleReconnect(): void {
+    if (this.closedByUser || this.rejected) return;
+    const delay = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** this.attempts++);
+    this.timer = setTimeout(() => {
+      this.connect().catch((error: unknown) => {
+        console.warn(`Session ${this.sessionId}: reconnect attempt failed`, error);
+        this.scheduleReconnect();
+      });
+    }, delay);
   }
 
   private setStatus(status: SocketStatus): void {

@@ -5,25 +5,21 @@ import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type Reac
 import { Button } from "@/components/ui/Button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ContextMenu } from "@/components/ui/ContextMenu";
+import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
 import type { Profile, ProfileEntry } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { useWorkspace } from "@/stores/workspace";
 import { ConnectionDialog, ENGINE_LABELS } from "../connections/ConnectionDialog";
 import { useDeleteProfile, useProfiles } from "../connections/hooks";
+import { profileColor } from "../connections/profileColors";
 import { secretsNeeded, UnlockDialog, type SecretsNeeded } from "../connections/UnlockDialog";
+import { requestCloseTab, requestDisconnectTab } from "../workspace/closeGuards";
+import { forgetExplorer } from "./explorerCache";
 import { folderLabel, kindIcon } from "./kinds";
 import { nodeKeyPrefix, profileKey, useTreeRows, type Expansion, type TreeRow } from "./useTreeRows";
 
 const ROW_HEIGHT = 22;
-const COLOR_CLASSES: Record<string, string> = {
-  none: "bg-transparent",
-  green: "bg-green-500",
-  yellow: "bg-yellow-400",
-  orange: "bg-orange-500",
-  red: "bg-red-500",
-  purple: "bg-purple-500",
-};
 /** Nodes that group other nodes: double-click expands them instead of opening a detail tab. */
 const CONTAINER_KINDS = new Set(["folder", "database", "schema"]);
 
@@ -31,6 +27,13 @@ type ErrorRow = Extract<TreeRow, { type: "error" }>;
 
 const isExpandable = (row: TreeRow) =>
   row.type === "folder" || row.type === "profile" || (row.type === "node" && row.node.has_children);
+
+/** The connection a row belongs to (a folder belongs to none). */
+function rowProfileId(row: TreeRow): string | null {
+  if (row.type === "profile") return row.entry.profile.id;
+  if (row.type === "node" || row.type === "error") return row.profileId;
+  return null;
+}
 
 function Chevron({ show, open, onToggle }: { show: boolean; open: boolean; onToggle: () => void }) {
   if (!show) return <span className="w-4 shrink-0" />;
@@ -53,13 +56,15 @@ export function Explorer() {
   const profiles = useProfiles();
   const deleteProfile = useDeleteProfile();
   const openObject = useWorkspace((s) => s.openObject);
-  const openConsole = useWorkspace((s) => s.openConsole);
+  const openQuery = useWorkspace((s) => s.openQuery);
+  const selectProfile = useWorkspace((s) => s.selectProfile);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   // Which {profile, path} each expandable row loads its children from; filled the first time a row is expanded.
   const [expansions] = useState(() => new Map<string, Expansion>());
   const [selected, setSelected] = useState<string | null>(null);
   const [dialog, setDialog] = useState<{ open: boolean; entry?: ProfileEntry }>({ open: false });
   const [toDelete, setToDelete] = useState<ProfileEntry | null>(null);
+  const [releasing, setReleasing] = useState(false);
   const [unlock, setUnlock] = useState<{ profile: Profile; needs: SecretsNeeded } | null>(null);
   const promptedErrors = useRef(new Set<string>());
   const entries = profiles.data ?? [];
@@ -71,6 +76,13 @@ export function Explorer() {
     estimateSize: () => ROW_HEIGHT,
     overscan: 20,
   });
+
+  /** Selects a row; its connection becomes the workspace's selected profile (the default of a new query tab). */
+  const selectRow = (row: TreeRow) => {
+    setSelected(row.key);
+    const profileId = rowProfileId(row);
+    if (profileId) selectProfile(profileId);
+  };
 
   const toggle = useCallback(
     (row: TreeRow, force?: boolean) => {
@@ -89,7 +101,7 @@ export function Explorer() {
 
   const activate = (row: TreeRow) => {
     if (row.type === "node" && !CONTAINER_KINDS.has(row.node.kind)) {
-      openObject(row.profileId, row.node, row.profileName);
+      openObject(row.profileId, row.node);
     } else if (isExpandable(row)) {
       toggle(row);
     }
@@ -117,10 +129,45 @@ export function Explorer() {
     for (const key of [...expansions.keys()]) if (owned(key)) expansions.delete(key);
     setExpanded((prev) => new Set([...prev].filter((key) => !owned(key))));
     setSelected((prev) => (prev && owned(prev) ? null : prev));
-    qc.removeQueries({ queryKey: ["children", profileId] });
-    qc.removeQueries({ queryKey: ["detail", profileId] });
-    const { tabs, closeTab } = useWorkspace.getState();
-    tabs.filter((t) => t.profileId === profileId).forEach((t) => closeTab(t.id));
+    if (useWorkspace.getState().selectedProfileId === profileId) selectProfile(null);
+    forgetExplorer(qc, profileId);
+    // Their tabs agreed already (releaseTabs): table and object tabs close; query tabs keep their text and lose only the
+    // connection.
+    const { tabs, closeTab, updateTab } = useWorkspace.getState();
+    for (const tab of tabs.filter((t) => t.profileId === profileId)) {
+      if (tab.kind === "query") updateTab(tab.id, "query", { profileId: null, database: null });
+      else closeTab(tab.id);
+    }
+  };
+
+  /**
+   * Before a profile is deleted, each of its tabs is asked in turn (a running export, a run, an open transaction):
+   * table and object tabs close, query tabs agree to lose their session. Any "no" keeps the profile.
+   */
+  const releaseTabs = async (profileId: string): Promise<boolean> => {
+    for (const tab of useWorkspace.getState().tabs.filter((t) => t.profileId === profileId)) {
+      const agreed = tab.kind === "query" ? await requestDisconnectTab(tab.id) : await requestCloseTab(tab.id);
+      if (!agreed && useWorkspace.getState().tabs.some((t) => t.id === tab.id)) {
+        toast("warning", `Profile not deleted — ${tab.title} is still open`);
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const deleteEntry = async (entry: ProfileEntry) => {
+    setReleasing(true);
+    try {
+      if (!(await releaseTabs(entry.profile.id))) return;
+    } finally {
+      setReleasing(false);
+    }
+    deleteProfile.mutate(entry.profile.id, {
+      onSuccess: () => {
+        forgetProfile(entry.profile.id);
+        setToDelete(null);
+      },
+    });
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
@@ -130,7 +177,7 @@ export function Explorer() {
       const clamped = Math.max(0, Math.min(rows.length - 1, i));
       const target = rows[clamped];
       if (!target) return;
-      setSelected(target.key);
+      selectRow(target);
       virtualizer.scrollToIndex(clamped);
     };
     if (e.key === "ArrowDown") {
@@ -179,7 +226,7 @@ export function Explorer() {
       case "folder": {
         const Icon = kindIcon("folder");
         return (
-          <div {...aria} className={base} style={pad} onClick={() => setSelected(row.key)} onDoubleClick={() => toggle(row)}>
+          <div {...aria} className={base} style={pad} onClick={() => selectRow(row)} onDoubleClick={() => toggle(row)}>
             {chevron}
             <Icon size={14} className="shrink-0 text-muted" />
             <span className="truncate">{row.name}</span>
@@ -193,13 +240,13 @@ export function Explorer() {
             {...aria}
             className={base}
             style={pad}
-            onClick={() => setSelected(row.key)}
-            onContextMenu={() => setSelected(row.key)}
+            onClick={() => selectRow(row)}
+            onContextMenu={() => selectRow(row)}
             onDoubleClick={() => toggle(row)}
           >
             {chevron}
             <Server size={14} className="shrink-0 text-muted" />
-            <span className={cn("h-2 w-2 shrink-0 rounded-full", COLOR_CLASSES[p.color])} />
+            <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: profileColor(p.color) ?? "transparent" }} />
             <span className="truncate font-medium">{p.name}</span>
             <span className="ml-auto shrink-0 text-[11px] text-muted">{ENGINE_LABELS[p.engine]}</span>
           </div>
@@ -207,7 +254,7 @@ export function Explorer() {
         return (
           <ContextMenu
             items={[
-              { label: "New Query", onSelect: () => openConsole(p.id, null, p.name) },
+              { label: "New Query", onSelect: () => openQuery(p.id, null) },
               { label: "Edit…", onSelect: () => setDialog({ open: true, entry: row.entry }) },
               { label: "Refresh", onSelect: () => void qc.invalidateQueries({ queryKey: ["children", p.id] }) },
               { label: "Delete…", onSelect: () => setToDelete(row.entry), danger: true, separatorBefore: true },
@@ -226,7 +273,7 @@ export function Explorer() {
             className={cn(base, row.node.system && "opacity-60")}
             style={pad}
             title={row.node.detail ? `${label} — ${row.node.detail}` : label}
-            onClick={() => setSelected(row.key)}
+            onClick={() => selectRow(row)}
             onDoubleClick={() => activate(row)}
           >
             {chevron}
@@ -297,7 +344,7 @@ export function Explorer() {
         <ConfirmDialog
           open
           title="Delete connection"
-          pending={deleteProfile.isPending}
+          pending={deleteProfile.isPending || releasing}
           error={deleteProfile.isError ? errorMessage(deleteProfile.error) : null}
           message={`Delete "${toDelete.profile.name}"? Its saved password is removed from the Keychain.`}
           onOpenChange={(open) => {
@@ -305,14 +352,7 @@ export function Explorer() {
             deleteProfile.reset();
             setToDelete(null);
           }}
-          onConfirm={() =>
-            deleteProfile.mutate(toDelete.profile.id, {
-              onSuccess: () => {
-                forgetProfile(toDelete.profile.id);
-                setToDelete(null);
-              },
-            })
-          }
+          onConfirm={() => void deleteEntry(toDelete)}
         />
       )}
       {unlock && (

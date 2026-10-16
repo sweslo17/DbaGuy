@@ -14,7 +14,11 @@ from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import ColumnMeta, ErrorPosition, MessageSeverity, ServerMessage
 from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
 from ...domain.profiles import AnyProfile, Engine, ServerProfile, ServerProfileDraft, SslConfig
+from ...domain.schema import SchemaSnapshot
+from ...sql.dialects import Dialect
+from ...sql.splitter import split
 from ..base import (
+    FAILED_COMMIT_MESSAGE,
     AdapterCapabilities,
     DatabaseAdapter,
     DatabaseConnection,
@@ -23,10 +27,12 @@ from ..base import (
     StatementCancelled,
     StatementError,
     StatementResult,
+    transaction_open_error,
 )
 from ..positions import offset_to_line_col
 from ..sql_text import first_keyword
 from . import ddl, introspection
+from . import schema as pg_schema
 from .loaders import category_for_oid, configure_user_loaders
 
 _ROW_KEYWORDS = frozenset({"select", "with", "values", "table", "show", "explain", "fetch", "("})
@@ -38,6 +44,7 @@ _DECLARABLE_KEYWORDS = frozenset({"select", "values", "table", "(", "with"})
 # Data-modifying statements and SELECT ... INTO, which DECLARE rejects. Matched anywhere (literals and comments too).
 _NOT_DECLARABLE = re.compile(r"\b(?:insert|update|delete|merge|into)\b", re.IGNORECASE)
 _CURSOR_PREFIX = "dbaguy_cursor_"
+_COMMIT_KEYWORDS = frozenset({"commit", "end"})
 # COPY through the client needs psycopg's copy() API; plain execute() leaves the connection stuck in COPY mode.
 _COPY_CLIENT_STREAM = re.compile(r"\b(?:stdin|stdout)\b", re.IGNORECASE)
 _UNSUPPORTED_COPY = "COPY FROM STDIN / TO STDOUT is not supported in the console yet"
@@ -59,6 +66,10 @@ _DEFAULT_CONNECT_PARAMS: dict[str, Any] = {
 _CONNECTION_LOST = "connection_lost"
 # SQLSTATEs that mean the server dropped us: connection exceptions and admin/crash shutdown.
 _CONNECTION_LOST_STATES = frozenset({"57P01", "57P02", "57P03"})
+# Read-only profiles set the session default at connect and re-assert it before every statement: a SELECT can call
+# set_config() to switch the default off, whether written out, hidden in a string or inside a user function.
+_READ_ONLY_GUC = "default_transaction_read_only"
+_READ_ONLY_SESSION = "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
 
 # libpq's chunked streaming uses the extended protocol, which accepts one statement per query.
 _MULTI_STATEMENT_ERROR = "cannot insert multiple commands into a prepared statement"
@@ -316,8 +327,13 @@ class _CursorResult(StatementResult):
 
 
 class PostgresConnection(DatabaseConnection):
-    def __init__(self, conn: psycopg.Connection) -> None:
+    def __init__(self, conn: psycopg.Connection, read_only: bool = False) -> None:
         self._conn = conn
+        self._read_only = read_only
+        if read_only:
+            # Manual-commit mode: psycopg's BEGIN must not depend on the session default, which a statement can turn
+            # off. (Never set False: that would force READ WRITE over a server-side read-only default.)
+            conn.read_only = True
         self._messages: deque[ServerMessage] = deque(maxlen=1000)
         self._cursor_ids = itertools.count(1)
         self._custom_types: dict[int, str] = {int(oid): name for oid, name in conn.execute(_CUSTOM_TYPES_SQL)}
@@ -397,6 +413,10 @@ class PostgresConnection(DatabaseConnection):
         self._check_database(path)
         return ddl.object_detail(self._conn, path)
 
+    def schema_snapshot(self) -> SchemaSnapshot:
+        # The connection's own (native-loader) cursors: arrays come back as lists, unlike the text-first user cursors.
+        return pg_schema.build_snapshot(self._conn)
+
     def _user_cursor(self) -> psycopg.Cursor:
         cursor = self._conn.cursor()
         configure_user_loaders(cursor.adapters)
@@ -414,6 +434,10 @@ class PostgresConnection(DatabaseConnection):
         except psycopg.Error:
             cursor.close()
             raise
+        if first_keyword(sql) in _COMMIT_KEYWORDS and cursor.statusmessage == "ROLLBACK":
+            # COMMIT of an aborted transaction is a silent ROLLBACK: say so, as the Commit button does.
+            logger.info("A typed COMMIT rolled back an aborted transaction on db={}", self.current_database())
+            self._messages.append(ServerMessage(severity=MessageSeverity.WARNING, text=FAILED_COMMIT_MESSAGE))
         return _BufferedResult(self, cursor, sql)
 
     def _run_streamed(self, sql: str) -> StatementResult:
@@ -425,21 +449,69 @@ class PostgresConnection(DatabaseConnection):
             logger.debug("Script has several statements and cannot be streamed; running it buffered")
         return self._run_buffered(sql)
 
+    def _restore_read_only(self) -> None:
+        """Re-asserts READ ONLY when the server reports the session default as off, or reports nothing (PG < 14).
+
+        An aborted transaction is left alone: SET cannot run in it, and it can write nothing until ROLLBACK undoes
+        whatever switched the default off.
+        """
+        if not self._read_only or self.transaction_failed():
+            return
+        state = self._conn.info.parameter_status(_READ_ONLY_GUC)
+        if state == "on":
+            return
+        self._conn.execute(_READ_ONLY_SESSION)
+        if state == "off":
+            logger.warning("Read-only connection: default_transaction_read_only was turned off; restored")
+
     def run(self, sql: str) -> StatementResult:
+        if self._read_only and len(split(sql, Dialect.POSTGRES)) > 1:
+            # A script could switch the default off and commit between statements, which no per-call check can see.
+            raise StatementError(
+                "Read-only connections run one statement at a time", code="read_only_single_statement"
+            )
         if _uses_client_copy(sql):
             raise StatementError(_UNSUPPORTED_COPY, code="unsupported_copy")
         try:
+            self._restore_read_only()
             if _likely_returns_rows(sql):
                 status = self._conn.info.transaction_status
-                if status == pq.TransactionStatus.IDLE:
-                    return self._run_streamed(sql)  # autocommit: cancelling an abandoned stream is harmless
-                if status == pq.TransactionStatus.INTRANS and _declarable(sql):
+                if status == pq.TransactionStatus.IDLE and self._conn.autocommit:
+                    return self._run_streamed(sql)  # no transaction: cancelling an abandoned stream is harmless
+                # In a transaction, or about to open one (manual mode: psycopg begins before the first statement):
+                # never stream, abandoning a stream would cancel it and abort the user's transaction.
+                if status in (pq.TransactionStatus.IDLE, pq.TransactionStatus.INTRANS) and _declarable(sql):
                     return _CursorResult(self, self._server_cursor(), sql)
-                # Anything else inside a transaction (SHOW, EXPLAIN, RETURNING, scripts…) is read in full: abandoning
-                # a stream would cancel it and abort the user's transaction.
+                # Anything else (SHOW, EXPLAIN, RETURNING, scripts…) is read in full.
             return self._run_buffered(sql)
         except psycopg.Error as exc:  # e.g. creating a cursor on a dead connection
             raise self.translate_error(exc, sql) from exc
+
+    def autocommit(self) -> bool:
+        return self._conn.autocommit
+
+    def set_autocommit(self, enabled: bool) -> None:
+        if self._conn.autocommit == enabled:
+            return
+        if self._conn.info.transaction_status in (pq.TransactionStatus.INTRANS, pq.TransactionStatus.INERROR):
+            raise transaction_open_error()
+        try:
+            self._conn.autocommit = enabled  # a dead connection fails here, translated like commit() does
+        except psycopg.Error as exc:
+            raise self.translate_error(exc, "SET AUTOCOMMIT") from exc
+        logger.info("Auto-commit {} on PostgreSQL db={}", "on" if enabled else "off", self.current_database())
+
+    def commit(self) -> None:
+        try:
+            self._conn.commit()  # psycopg skips it when the connection is idle
+        except psycopg.Error as exc:
+            raise self.translate_error(exc, "COMMIT") from exc
+
+    def rollback(self) -> None:
+        try:
+            self._conn.rollback()
+        except psycopg.Error as exc:
+            raise self.translate_error(exc, "ROLLBACK") from exc
 
     def in_transaction(self) -> bool:
         return self._conn.info.transaction_status in (pq.TransactionStatus.INTRANS, pq.TransactionStatus.INERROR)
@@ -461,6 +533,7 @@ class PostgresAdapter(DatabaseAdapter):
     engine = Engine.POSTGRES
     url_schemes = ("postgres", "postgresql")
     default_port = 5432
+    dialect = Dialect.POSTGRES
     capabilities = AdapterCapabilities(per_database_connection=True)
 
     def parse_url(self, url: str) -> ParsedUrl:
@@ -511,5 +584,15 @@ class PostgresAdapter(DatabaseAdapter):
             conn = psycopg.connect(autocommit=True, **params)
         except psycopg.Error as exc:
             raise ConnectionFailed(str(exc).strip()) from exc
-        logger.info("Connected to PostgreSQL {}:{} db={}", params["host"], endpoint.port, params["dbname"])
-        return PostgresConnection(conn)
+        if profile.read_only:
+            # Enforced by the server too, so a function with side effects called from a SELECT cannot write either.
+            try:
+                conn.execute(_READ_ONLY_SESSION)
+            except psycopg.Error as exc:
+                conn.close()
+                raise ConnectionFailed(f"Could not make the connection read-only: {exc}") from exc
+        logger.info(
+            "Connected to PostgreSQL {}:{} db={}{}",
+            params["host"], endpoint.port, params["dbname"], " read_only=True" if profile.read_only else "",
+        )
+        return PostgresConnection(conn, read_only=profile.read_only)

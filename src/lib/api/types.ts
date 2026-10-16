@@ -18,11 +18,41 @@ export type Engine = EngineInfo["engine"];
 export type PathSegment = S["PathSegment"];
 export type ObjectNode = S["ObjectNode"];
 export type ObjectDetail = S["ObjectDetail"];
+/** A table or view found by `GET /metadata/search`, with the explorer path that opens it. */
+export type ObjectSearchHit = S["ObjectSearchHit"];
 export type ColumnInfo = S["ColumnInfo"];
 export type SessionInfo = S["SessionInfo"];
 export type ColumnMeta = S["ColumnMeta"];
+export type ColumnCategory = S["ColumnCategory"];
 export type ServerEvent = S["ExecutionSchema"]["event"];
 export type ClientCommand = S["ExecutionSchema"]["command"];
+export type SessionStateEvent = S["SessionStateEvent"];
+export type GuardReason = S["GuardReason"];
+export type GuardAction = S["GuardAction"];
+export type GuardDecision = S["GuardDecision"];
+export type Classification = S["Classification"];
+export type Dialect = S["Dialect"];
+export type FormatKind = S["FormatKind"];
+export type RowFormatOptions = S["RowFormatOptions"];
+export type FormatRowsRequest = S["FormatRowsRequest"];
+export type FormatResult = S["FormatResult"];
+export type AppSettings = S["AppSettings"];
+export type EditorSettings = S["EditorSettings"];
+export type CompletionItem = S["CompletionItem"];
+export type DescribeResult = S["DescribeResult"];
+export type DescribeColumn = S["DescribeColumn"];
+/** `workspace.json` (spec §4.8): the open tabs, as `GET`/`PUT /workspace` exchange them. */
+export type SavedWorkspace = S["WorkspaceState"];
+export type SavedTab = S["WorkspaceTab"];
+export type TextSelection = S["TextSelection"];
+/** The scripts folder (spec §4.7): its tree, and one `.sql` file with its content. */
+export type ScriptTree = S["ScriptTree"];
+export type ScriptNode = S["ScriptNode"];
+export type ScriptFile = S["ScriptFile"];
+/** The query history (spec §4.6): one executed statement, and a page of them (newest first). */
+export type HistoryEntry = S["HistoryEntry"];
+export type HistoryPage = S["HistoryPage"];
+export type HistoryStatus = HistoryEntry["status"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");
