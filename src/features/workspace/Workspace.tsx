@@ -1,9 +1,18 @@
 import { X } from "lucide-react";
 import { useEffect } from "react";
 import { cn } from "@/lib/cn";
-import { useWorkspace } from "@/stores/workspace";
+import { useWorkspace, type Tab } from "@/stores/workspace";
 import { QueryConsole } from "../console/QueryConsole";
 import { ObjectDetailView } from "../explorer/ObjectDetailView";
+import { relationOf } from "../table-data/filterValue";
+import { TableDataTab } from "../table-data/TableDataTab";
+
+/** A tab's content: a relation opens as table data, any other object as its detail, a console as a query console. */
+function TabContent({ tab, active }: { tab: Tab; active: boolean }) {
+  if (tab.kind === "console") return <QueryConsole tab={tab} />;
+  const relation = relationOf(tab.path);
+  return relation ? <TableDataTab tab={tab} relation={relation} active={active} /> : <ObjectDetailView tab={tab} />;
+}
 
 export function Workspace() {
   const tabs = useWorkspace((s) => s.tabs);
@@ -59,10 +68,10 @@ export function Workspace() {
         {!active && (
           <p className="p-6 text-center text-muted">Open a table from the sidebar, or right-click a connection → New Query</p>
         )}
-        {/* Tabs stay mounted while hidden so console sessions keep their state. */}
+        {/* Tabs stay mounted while hidden so their sessions keep their state; closing a tab unmounts it, which closes them. */}
         {tabs.map((tab) => (
           <div key={tab.id} className={cn("h-full", tab.id !== activeTabId && "hidden")}>
-            {tab.kind === "object" ? <ObjectDetailView tab={tab} /> : <QueryConsole tab={tab} />}
+            <TabContent tab={tab} active={tab.id === activeTabId} />
           </div>
         ))}
       </div>

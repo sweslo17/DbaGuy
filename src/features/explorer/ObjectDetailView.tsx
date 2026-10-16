@@ -1,9 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
 import { Check, Copy } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/Button";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
-import { pathKey } from "@/lib/api/types";
+import { pathKey, type ColumnInfo, type ObjectDetail } from "@/lib/api/types";
 import type { ObjectTab } from "@/stores/workspace";
 import { kindLabel } from "./kinds";
 
@@ -31,7 +31,8 @@ function CopyDdlButton({ ddl }: { ddl: string }) {
   );
 }
 
-export function ObjectDetailView({ tab }: { tab: ObjectTab }) {
+/** Loads an object's detail (`/metadata/detail`) and renders it with `children`; shows loading and errors itself. */
+function WithDetail({ tab, children }: { tab: ObjectTab; children: (detail: ObjectDetail) => ReactNode }) {
   const detail = useQuery({
     queryKey: ["detail", tab.profileId, pathKey(tab.path)],
     queryFn: async () =>
@@ -45,60 +46,127 @@ export function ObjectDetailView({ tab }: { tab: ObjectTab }) {
       </p>
     );
   }
-  const d = detail.data;
+  return children(detail.data);
+}
+
+/** "approximate" next to a DDL rebuilt from the catalog; nothing for the original statement. */
+function DdlBadge({ detail }: { detail: ObjectDetail }) {
+  if (!detail.ddl || !detail.ddl_is_generated) return null;
   return (
-    <div className="flex h-full flex-col overflow-auto">
-      <div className="flex items-center gap-2 border-b border-border px-4 py-2">
-        <span className="text-[11px] uppercase tracking-wide text-muted">{kindLabel(d.kind)}</span>
-        <span className="font-semibold" data-selectable>
-          {d.name}
-        </span>
-        {d.ddl_is_generated && (
-          <span
-            className="rounded bg-hover px-1.5 text-[11px] text-muted"
-            title="Rebuilt from the catalog; may differ from the original statement"
-          >
-            approximate
-          </span>
-        )}
-        <div className="flex-1" />
-        {d.ddl && <CopyDdlButton ddl={d.ddl} />}
-      </div>
-      {d.comment && (
-        <p className="px-4 pt-2 text-[12px] text-muted" data-selectable>
-          {d.comment}
-        </p>
+    <span
+      className="rounded bg-hover px-1.5 text-[11px] text-muted"
+      title="Rebuilt from the catalog; may differ from the original statement"
+    >
+      approximate
+    </span>
+  );
+}
+
+function Comment({ text }: { text: string }) {
+  return (
+    <p className="px-4 pt-2 text-[12px] text-muted" data-selectable>
+      {text}
+    </p>
+  );
+}
+
+function ColumnsTable({ columns }: { columns: ColumnInfo[] }) {
+  return (
+    <table className="mx-4 mt-3 border-collapse text-[12px]" data-selectable>
+      <thead>
+        <tr className="text-left text-muted">
+          {["Name", "Type", "Nullable", "Default", "PK", "Comment"].map((h) => (
+            <th key={h} className="border-b border-border px-2 py-1 font-medium">
+              {h}
+            </th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {columns.map((c) => (
+          <tr key={c.name} className="hover:bg-hover">
+            <td className="px-2 py-0.5 font-medium">{c.name}</td>
+            <td className="px-2 py-0.5 font-mono">{c.type_name}</td>
+            <td className="px-2 py-0.5">{c.nullable ? "yes" : "no"}</td>
+            <td className="px-2 py-0.5 font-mono text-muted">{c.default ?? ""}</td>
+            <td className="px-2 py-0.5">{c.is_primary_key ? "●" : ""}</td>
+            <td className="px-2 py-0.5 text-muted">{c.comment ?? ""}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function DdlText({ ddl }: { ddl: string }) {
+  return (
+    <pre
+      className="m-4 whitespace-pre-wrap rounded-md border border-border bg-panel p-3 font-mono text-[12px]"
+      data-selectable
+    >
+      {ddl}
+    </pre>
+  );
+}
+
+/** A table data tab's Columns view: the object's comment and its columns. */
+export function ColumnsView({ tab }: { tab: ObjectTab }) {
+  return (
+    <WithDetail tab={tab}>
+      {(d) => (
+        <div className="h-full overflow-auto pb-4">
+          {d.comment && <Comment text={d.comment} />}
+          {d.columns?.length ? <ColumnsTable columns={d.columns} /> : <p className="p-4 text-muted">No columns</p>}
+        </div>
       )}
-      {d.columns && (
-        <table className="mx-4 mt-3 border-collapse text-[12px]" data-selectable>
-          <thead>
-            <tr className="text-left text-muted">
-              {["Name", "Type", "Nullable", "Default", "PK", "Comment"].map((h) => (
-                <th key={h} className="border-b border-border px-2 py-1 font-medium">
-                  {h}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {d.columns.map((c) => (
-              <tr key={c.name} className="hover:bg-hover">
-                <td className="px-2 py-0.5 font-medium">{c.name}</td>
-                <td className="px-2 py-0.5 font-mono">{c.type_name}</td>
-                <td className="px-2 py-0.5">{c.nullable ? "yes" : "no"}</td>
-                <td className="px-2 py-0.5 font-mono text-muted">{c.default ?? ""}</td>
-                <td className="px-2 py-0.5">{c.is_primary_key ? "●" : ""}</td>
-                <td className="px-2 py-0.5 text-muted">{c.comment ?? ""}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+    </WithDetail>
+  );
+}
+
+/** A table data tab's DDL view. */
+export function DdlView({ tab }: { tab: ObjectTab }) {
+  return (
+    <WithDetail tab={tab}>
+      {(d) =>
+        d.ddl ? (
+          <div className="flex h-full flex-col">
+            <div className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-2">
+              <DdlBadge detail={d} />
+              <div className="flex-1" />
+              <CopyDdlButton ddl={d.ddl} />
+            </div>
+            <div className="min-h-0 flex-1 overflow-auto">
+              <DdlText ddl={d.ddl} />
+            </div>
+          </div>
+        ) : (
+          <p className="p-4 text-muted">No DDL available</p>
+        )
+      }
+    </WithDetail>
+  );
+}
+
+/** Detail tab of an object without rows (function, sequence, index, …): its comment, columns and DDL on one page. */
+export function ObjectDetailView({ tab }: { tab: ObjectTab }) {
+  return (
+    <WithDetail tab={tab}>
+      {(d) => (
+        <div className="flex h-full flex-col overflow-auto">
+          <div className="flex items-center gap-2 border-b border-border px-4 py-2">
+            <span className="text-[11px] uppercase tracking-wide text-muted">{kindLabel(d.kind)}</span>
+            <span className="font-semibold" data-selectable>
+              {d.name}
+            </span>
+            <DdlBadge detail={d} />
+            <div className="flex-1" />
+            {d.ddl && <CopyDdlButton ddl={d.ddl} />}
+          </div>
+          {d.comment && <Comment text={d.comment} />}
+          {d.columns && <ColumnsTable columns={d.columns} />}
+          {d.ddl && <DdlText ddl={d.ddl} />}
+        </div>
       )}
-      {d.ddl && (
-        <pre className="m-4 whitespace-pre-wrap rounded-md border border-border bg-panel p-3 font-mono text-[12px]" data-selectable>
-          {d.ddl}
-        </pre>
-      )}
-    </div>
+    </WithDetail>
   );
 }

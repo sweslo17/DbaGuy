@@ -37,6 +37,8 @@ export interface ExecutionState {
 }
 
 export const INTERRUPTED_MESSAGE = "Connection interrupted — results may be incomplete";
+/** Error code of a statement whose database connection dropped: the session must be reopened (retried). */
+export const CONNECTION_LOST = "connection_lost";
 /** Error codes the backend sends for requests it never ran; the request is over even if `finished` goes missing. */
 const TERMINAL_ERROR_CODES = new Set(["no_open_result", "invalid_command"]);
 

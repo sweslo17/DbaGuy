@@ -53,7 +53,7 @@ export function Explorer() {
   const profiles = useProfiles();
   const deleteProfile = useDeleteProfile();
   const openObject = useWorkspace((s) => s.openObject);
-  const openConsole = useWorkspace((s) => s.openConsole);
+  const openQuery = useWorkspace((s) => s.openQuery);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   // Which {profile, path} each expandable row loads its children from; filled the first time a row is expanded.
   const [expansions] = useState(() => new Map<string, Expansion>());
@@ -207,7 +207,7 @@ export function Explorer() {
         return (
           <ContextMenu
             items={[
-              { label: "New Query", onSelect: () => openConsole(p.id, null, p.name) },
+              { label: "New Query", onSelect: () => openQuery(p.id, null, p.name) },
               { label: "Edit…", onSelect: () => setDialog({ open: true, entry: row.entry }) },
               { label: "Refresh", onSelect: () => void qc.invalidateQueries({ queryKey: ["children", p.id] }) },
               { label: "Delete…", onSelect: () => setToDelete(row.entry), danger: true, separatorBefore: true },

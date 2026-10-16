@@ -5,13 +5,16 @@ export function Tabs<T extends string>({
   value,
   onValueChange,
   items,
+  className = "mb-3",
 }: {
   value: T;
   onValueChange: (value: T) => void;
   items: { value: T; label: string }[];
+  /** Spacing around the bar (default: a margin below it). */
+  className?: string;
 }) {
   return (
-    <div role="tablist" className="mb-3 flex gap-1 border-b border-border">
+    <div role="tablist" className={cn("flex gap-1 border-b border-border", className)}>
       {items.map((item) => (
         <button
           key={item.value}

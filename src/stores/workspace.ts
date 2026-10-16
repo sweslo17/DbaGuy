@@ -16,6 +16,8 @@ export interface ConsoleTab {
   database: string | null;
   title: string;
   subtitle: string;
+  /** The editor's text when the tab opens (e.g. a table data tab's "Open in query tab"). */
+  initialSql?: string;
 }
 export type Tab = ObjectTab | ConsoleTab;
 
@@ -24,7 +26,8 @@ interface WorkspaceState {
   activeTabId: string | null;
   selectedProfileId: string | null;
   openObject: (profileId: string, node: ObjectNode, profileName: string) => void;
-  openConsole: (profileId: string, database: string | null, profileName: string) => void;
+  /** Opens a new query tab, its editor prefilled with `initialSql`. */
+  openQuery: (profileId: string, database: string | null, profileName: string, initialSql?: string) => void;
   closeTab: (id: string) => void;
   activate: (id: string) => void;
   selectProfile: (id: string | null) => void;
@@ -51,7 +54,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
     }
     set({ activeTabId: id });
   },
-  openConsole: (profileId, database, profileName) => {
+  openQuery: (profileId, database, profileName, initialSql) => {
     consoleCounter += 1;
     const id = `console:${crypto.randomUUID()}`;
     const tab: ConsoleTab = {
@@ -61,6 +64,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
       database,
       title: `Query ${consoleCounter}`,
       subtitle: profileName,
+      initialSql,
     };
     set((s) => ({ tabs: [...s.tabs, tab], activeTabId: id }));
   },

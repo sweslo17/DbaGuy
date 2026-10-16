@@ -2,18 +2,16 @@ import { useRef, useState, type KeyboardEvent } from "react";
 import { Group, Panel } from "react-resizable-panels";
 import { Button } from "@/components/ui/Button";
 import { PanelHandle } from "@/components/ui/PanelHandle";
-import { ApiError } from "@/lib/api/client";
 import { cn } from "@/lib/cn";
 import { plural } from "@/lib/format";
 import type { ConsoleTab } from "@/stores/workspace";
-import { useDialect, useProfiles } from "../connections/hooks";
-import { secretsNeeded, UnlockDialog } from "../connections/UnlockDialog";
+import { useDialect } from "../connections/hooks";
+import { CONNECTION_LOST } from "../session/execution";
 import { PAGE_SIZE, type SessionPhase, type SessionStateView } from "../session/SessionController";
+import { SessionError } from "../session/SessionError";
 import { useSession } from "../session/useSession";
 import { DataGrid } from "../grid/DataGrid";
 
-/** Error code of a statement whose database connection dropped: the session must be reopened. */
-const CONNECTION_LOST = "connection_lost";
 const INDENT = "  ";
 const PHASE_DOT: Record<SessionPhase, string> = {
   opening: "bg-yellow-400",
@@ -61,12 +59,10 @@ function TransactionBadge({ state }: { state: SessionStateView | null }) {
 
 export function QueryConsole({ tab }: { tab: ConsoleTab }) {
   const { controller, snapshot, retry } = useSession(tab.profileId, tab.database);
-  const profiles = useProfiles();
   const dialect = useDialect(tab.profileId);
-  const [sql, setSql] = useState("");
+  const [sql, setSql] = useState(tab.initialSql ?? "");
   const [requestId, setRequestId] = useState<string | null>(null);
   const [origin, setOrigin] = useState<Origin>(WHOLE_TEXT);
-  const [unlockDismissed, setUnlockDismissed] = useState(false);
   const editor = useRef<HTMLTextAreaElement>(null);
 
   const phase: SessionPhase = snapshot?.phase ?? "opening";
@@ -92,10 +88,6 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
   const loadMore = () => {
     if (execution) controller?.fetchMore(execution.requestId, PAGE_SIZE);
   };
-  const retrySession = () => {
-    setUnlockDismissed(false);
-    retry();
-  };
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && e.metaKey) {
       e.preventDefault();
@@ -108,8 +100,6 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
     }
   };
 
-  const profile = profiles.data?.find((p) => p.profile.id === tab.profileId)?.profile;
-  const needsPassword = error instanceof ApiError && error.code === "password_required" && !!profile;
   const errorPosition = execution?.error?.position;
   const lastSetIndex = execution?.resultSets.at(-1)?.index;
   // A paused result keeps `hasMore` while its next page loads: the grid shows that, the status line does not.
@@ -135,23 +125,7 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
               : "Connecting…"}
         </span>
       </div>
-      {error && (!needsPassword || unlockDismissed) && (
-        <div className="flex items-center gap-2 border-b border-border px-3 py-2 text-[12px] text-danger" data-selectable>
-          <span className="flex-1 whitespace-pre-wrap">{error.message}</span>
-          <Button size="sm" onClick={retrySession}>
-            Retry
-          </Button>
-        </div>
-      )}
-      {needsPassword && profile && (
-        <UnlockDialog
-          open={!unlockDismissed}
-          profile={profile}
-          needs={secretsNeeded(error instanceof ApiError ? error.detail : undefined)}
-          onOpenChange={(open) => !open && setUnlockDismissed(true)}
-          onUnlocked={retrySession}
-        />
-      )}
+      <SessionError profileId={tab.profileId} error={error} onRetry={retry} />
       <div className="min-h-0 flex-1">
         <Group orientation="vertical">
           <Panel id="editor" defaultSize="40%" minSize="15%">
@@ -183,7 +157,7 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
                       </div>
                     )}
                     {execution.error.code === CONNECTION_LOST && (
-                      <Button size="sm" className="mt-2" onClick={retrySession}>
+                      <Button size="sm" className="mt-2" onClick={retry}>
                         Reconnect
                       </Button>
                     )}
