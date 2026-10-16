@@ -2178,7 +2178,7 @@
           },
           "dangerous_reasons": {
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/DangerReason"
             },
             "type": "array",
             "title": "Dangerous Reasons",
@@ -2444,7 +2444,7 @@
           },
           "reasons": {
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/GuardReason"
             },
             "type": "array",
             "title": "Reasons"
@@ -2540,6 +2540,18 @@
           "elapsed_ms"
         ],
         "title": "ConnectionTestResult"
+      },
+      "DangerReason": {
+        "type": "string",
+        "enum": [
+          "update_without_where",
+          "delete_without_where",
+          "drop",
+          "truncate",
+          "alter_drop"
+        ],
+        "title": "DangerReason",
+        "description": "Why a statement is dangerous: the standard safety level asks before running it."
       },
       "DescribeColumn": {
         "properties": {
@@ -2654,7 +2666,8 @@
           "postgres",
           "sqlite"
         ],
-        "title": "Dialect"
+        "title": "Dialect",
+        "description": "The SQL dialect of an engine: how its statements are split, classified, completed and quoted."
       },
       "DiscardCommand": {
         "properties": {
@@ -3207,7 +3220,7 @@
           },
           "reasons": {
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/GuardReason"
             },
             "type": "array",
             "title": "Reasons",
@@ -3223,6 +3236,24 @@
           "classification"
         ],
         "title": "GuardDecision"
+      },
+      "GuardReason": {
+        "type": "string",
+        "enum": [
+          "update_without_where",
+          "delete_without_where",
+          "drop",
+          "truncate",
+          "alter_drop",
+          "strict_write",
+          "strict_ddl",
+          "strict_transaction",
+          "strict_session",
+          "strict_unknown",
+          "read_only"
+        ],
+        "title": "GuardReason",
+        "description": "Why the safety policy asks for confirmation (a danger, or any non-read statement at the strict level) or blocks\na statement (a read-only connection). Every `DangerReason` is one, with the same value."
       },
       "HTTPValidationError": {
         "properties": {
@@ -5058,7 +5089,8 @@
             "type": "string",
             "enum": [
               "query",
-              "table"
+              "table",
+              "object"
             ],
             "title": "Kind"
           },

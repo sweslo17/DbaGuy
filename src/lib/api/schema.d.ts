@@ -592,7 +592,7 @@ export interface components {
              * Dangerous Reasons
              * @default []
              */
-            dangerous_reasons: string[];
+            dangerous_reasons: components["schemas"]["DangerReason"][];
         };
         /**
          * ColumnCategory
@@ -688,7 +688,7 @@ export interface components {
             /** Request Id */
             request_id: string;
             /** Reasons */
-            reasons: string[];
+            reasons: components["schemas"]["GuardReason"][];
             classification: components["schemas"]["Classification"];
         };
         /** ConnectionTestRequest */
@@ -710,6 +710,12 @@ export interface components {
             /** Elapsed Ms */
             elapsed_ms: number;
         };
+        /**
+         * DangerReason
+         * @description Why a statement is dangerous: the standard safety level asks before running it.
+         * @enum {string}
+         */
+        DangerReason: "update_without_where" | "delete_without_where" | "drop" | "truncate" | "alter_drop";
         /** DescribeColumn */
         DescribeColumn: {
             /** Name */
@@ -751,6 +757,7 @@ export interface components {
         };
         /**
          * Dialect
+         * @description The SQL dialect of an engine: how its statements are split, classified, completed and quoted.
          * @enum {string}
          */
         Dialect: "postgres" | "sqlite";
@@ -985,9 +992,16 @@ export interface components {
              * Reasons
              * @default []
              */
-            reasons: string[];
+            reasons: components["schemas"]["GuardReason"][];
             classification: components["schemas"]["Classification"];
         };
+        /**
+         * GuardReason
+         * @description Why the safety policy asks for confirmation (a danger, or any non-read statement at the strict level) or blocks
+         *     a statement (a read-only connection). Every `DangerReason` is one, with the same value.
+         * @enum {string}
+         */
+        GuardReason: "update_without_where" | "delete_without_where" | "drop" | "truncate" | "alter_drop" | "strict_write" | "strict_ddl" | "strict_transaction" | "strict_session" | "strict_unknown" | "read_only";
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -1757,7 +1771,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "query" | "table";
+            kind: "query" | "table" | "object";
             /**
              * Title
              * @default
