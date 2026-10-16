@@ -46,11 +46,11 @@ export function useSelectionState(columns: ColumnMeta[], rowCount: number) {
   return { dims, selection, rect, select };
 }
 
-/** The selection a press on `hit` makes; `from` is the selection a shift-press extends. */
-function selectionFor(hit: GridHit, from: GridSelection | null, dims: Dims): GridSelection {
+/** The selection a press on `hit` makes; `from` is the selection a shift-press extends, `active` the active cell. */
+function selectionFor(hit: GridHit, from: GridSelection | null, active: CellPos): GridSelection {
   switch (hit.kind) {
     case "corner":
-      return selectAll(dims);
+      return selectAll(active);
     case "header":
       return selectColumns(from ? from.anchor.col : hit.col, hit.col);
     case "rowNumber":
@@ -78,7 +78,7 @@ function hitInside(hit: GridHit, rect: Rect): boolean {
 }
 
 /** Auto-scroll starts this close (px) to an edge of the body and speeds up past it. */
-const EDGE = 24;
+const EDGE = 12;
 const MAX_STEP = 40;
 /** A press becomes a drag (and may auto-scroll) once the pointer moves this far: a click near an edge never scrolls. */
 const DRAG_SLOP = 4;
@@ -91,6 +91,7 @@ function edgeStep(pos: number, start: number, end: number): number {
 }
 
 interface Drag {
+  pointerId: number;
   mode: SelectionMode;
   /** The selection this drag has made so far (state lags one render behind). */
   selection: GridSelection;
@@ -105,8 +106,9 @@ interface Drag {
 
 export interface PointerSelectionInput {
   scrollRef: RefObject<HTMLDivElement | null>;
+  /** A new column list ends a drag in progress. */
+  columns: ColumnMeta[];
   geometry: GridGeometry;
-  dims: Dims;
   selection: GridSelection | null;
   rect: Rect | null;
   select: (selection: GridSelection | null) => void;
@@ -115,7 +117,8 @@ export interface PointerSelectionInput {
 
 /**
  * Mouse selection on the scroll area: press selects (shift extends), dragging extends with pointer capture and
- * auto-scrolls near the edges (one rAF loop per drag), a context click keeps a selection it lands in.
+ * auto-scrolls near the edges (one rAF loop per drag), a context click keeps a selection it lands in. A drag ends on
+ * pointerup, on a new column list, when the window loses focus and on unmount.
  */
 export function usePointerSelection(input: PointerSelectionInput) {
   const latest = useRef(input);
@@ -125,10 +128,18 @@ export function usePointerSelection(input: PointerSelectionInput) {
   const drag = useRef<Drag | null>(null);
 
   const stop = useCallback(() => {
-    if (drag.current) cancelAnimationFrame(drag.current.frame);
+    const d = drag.current;
+    if (!d) return;
     drag.current = null;
+    cancelAnimationFrame(d.frame);
+    const el = latest.current.scrollRef.current;
+    if (el?.hasPointerCapture(d.pointerId)) el.releasePointerCapture(d.pointerId);
   }, []);
-  useEffect(() => stop, [stop]);
+  useEffect(() => stop, [stop, input.columns]);
+  useEffect(() => {
+    window.addEventListener("blur", stop);
+    return () => window.removeEventListener("blur", stop);
+  }, [stop]);
 
   /** Extends the drag's selection to the cell under the pointer (only the axis its mode can change). */
   const follow = useCallback((d: Drag, el: HTMLElement) => {
@@ -158,26 +169,27 @@ export function usePointerSelection(input: PointerSelectionInput) {
   }, [follow]);
 
   const onPointerDown = (e: PointerEvent<HTMLDivElement>) => {
-    const { scrollRef, geometry, dims, selection, rect, select, focusGrid } = latest.current;
+    const { scrollRef, geometry, selection, rect, select, focusGrid } = latest.current;
     const el = scrollRef.current;
-    if (!el || (e.button !== 0 && e.button !== 2)) return;
-    const p = viewportPoint(el, e.clientX, e.clientY);
-    if (p.x >= p.width || p.y >= p.height) return; // a scrollbar
-    const hit = hitTest(geometry, p);
+    // The scroll container itself is only hit through its scrollbars (classic or overlay).
+    if (!el || e.target === el || (e.button !== 0 && e.button !== 2)) return;
+    const hit = hitTest(geometry, viewportPoint(el, e.clientX, e.clientY));
     if (!hit) return;
     focusGrid();
+    const active = selection?.focus ?? firstCellInView(geometry, el);
     if (e.button === 2 || e.ctrlKey) {
       // Context click: the menu (Task 5) acts on the selection, so keep it when the click is inside.
-      if (!rect || !hitInside(hit, rect)) select(selectionFor(hit, null, dims));
+      if (!rect || !hitInside(hit, rect)) select(selectionFor(hit, null, active));
       return;
     }
-    const next = selectionFor(hit, e.shiftKey ? selection : null, dims);
+    const next = selectionFor(hit, e.shiftKey ? selection : null, active);
     select(next);
     if (hit.kind === "corner") return;
     stop();
     el.setPointerCapture(e.pointerId);
     const { clientX, clientY } = e;
     drag.current = {
+      pointerId: e.pointerId,
       mode: next.mode,
       selection: next,
       startX: clientX,
@@ -230,9 +242,13 @@ export interface KeyboardSelectionInput {
   onOpenRecord?: (pos: CellPos) => void;
 }
 
-/** Keyboard handler of the focused grid (spec §4.3). Keys typed into a control inside the grid are left alone. */
+/**
+ * Keyboard handler of the focused grid (spec §4.3). Keys typed into a control inside the grid and IME composition
+ * are left alone; shortcut letters match the physical key (`code`), so Caps Lock and non-Latin layouts work.
+ */
 export function gridKeyDown(e: KeyboardEvent<HTMLDivElement>, input: KeyboardSelectionInput): void {
   if (e.target !== e.currentTarget || e.altKey || e.ctrlKey) return;
+  if (e.nativeEvent.isComposing || e.key === "Process") return;
   const { scrollRef, geometry, dims, selection, rect, select, scrollToCell } = input;
   const el = scrollRef.current;
   if (!el || dims.rows === 0 || dims.cols === 0) return;
@@ -249,13 +265,13 @@ export function gridKeyDown(e: KeyboardEvent<HTMLDivElement>, input: KeyboardSel
     scrollToCell(next.mode === "columns" ? -1 : next.focus.row, next.mode === "rows" ? -1 : next.focus.col);
     return;
   }
-  if (e.metaKey && !e.shiftKey && key === "a") {
+  if (e.metaKey && !e.shiftKey && e.code === "KeyA") {
     e.preventDefault();
-    select(selectAll(dims));
+    select(selectAll(selection?.focus ?? firstCellInView(geometry, el))); // the active cell stays where it was
     return;
   }
   if (!selection || !rect) return;
-  if (e.metaKey && !e.shiftKey && key === "c") {
+  if (e.metaKey && !e.shiftKey && e.code === "KeyC") {
     if (!input.onCopy) return;
     e.preventDefault();
     input.onCopy(rect, "tsv");
@@ -265,6 +281,7 @@ export function gridKeyDown(e: KeyboardEvent<HTMLDivElement>, input: KeyboardSel
     if (cellCount(rect) <= 1) return; // nothing to collapse: let a parent use Escape
     e.preventDefault();
     select(selectCell(selection.focus));
+    scrollToCell(selection.focus.row, selection.focus.col);
   } else if (key === "Enter") {
     e.preventDefault();
     input.onOpenValue?.(selection.focus);

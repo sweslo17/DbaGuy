@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { clamp } from "@/lib/math";
 import { HEADER_HEIGHT, ROW_HEIGHT } from "./columns";
 import type { ColumnLayout } from "./layout";
 import type { CellPos } from "./selection";
@@ -93,11 +94,11 @@ export function hitTest(g: GridGeometry, p: ViewportPoint): GridHit | null {
 
 /** The visible body cell nearest to `p` (a drag that leaves the body keeps extending to its edge). */
 export function cellNear(g: GridGeometry, p: ViewportPoint): CellPos {
-  const y = Math.min(Math.max(p.y, HEADER_HEIGHT), p.height - 1);
-  const x = Math.min(Math.max(p.x, g.rowNumberWidth), p.width - 1);
+  const y = clamp(p.y, HEADER_HEIGHT, p.height - 1);
+  const x = clamp(p.x, g.rowNumberWidth, p.width - 1);
   const col = columnAt(g, x, p.scrollLeft);
   return {
-    row: Math.min(Math.max(rowAt(y, p.scrollTop), 0), g.rowCount - 1),
+    row: clamp(rowAt(y, p.scrollTop), 0, g.rowCount - 1),
     col: col < 0 ? g.colCount - 1 : col,
   };
 }

@@ -179,7 +179,7 @@ export function DataGrid(props: DataGridProps) {
   const focusGrid = useCallback(() => rootRef.current?.focus({ preventScroll: true }), []);
   useImperativeHandle(ref, () => ({ scrollToCell, focus: focusGrid }), [scrollToCell, focusGrid]);
 
-  const pointer = usePointerSelection({ scrollRef, geometry, dims, selection, rect, select, focusGrid });
+  const pointer = usePointerSelection({ scrollRef, columns, geometry, selection, rect, select, focusGrid });
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) =>
     gridKeyDown(e, {
       scrollRef,
@@ -199,8 +199,12 @@ export function DataGrid(props: DataGridProps) {
   const left = rect?.left ?? -1;
   const bottom = rect?.bottom ?? -1;
   const right = rect?.right ?? -1;
-  const emitSelection = useEffectEvent(() => onSelectionChange?.(selection && rect ? { selection, rect } : null));
-  useEffect(() => emitSelection(), [selection, top, left, bottom, right]);
+  const emitSelection = useEffectEvent((): void => {
+    onSelectionChange?.(selection && rect ? { selection, rect } : null);
+  });
+  useEffect(() => {
+    emitSelection();
+  }, [selection, top, left, bottom, right]);
   // Status-bar figures, only when the rect changes. `rows` is left out of the deps on purpose: pages are only
   // appended, so its length stands for it.
   const aggregates = useMemo(() => {

@@ -1,13 +1,15 @@
+import { clamp } from "@/lib/math";
+
 /**
  * The grid's selection model (pure): one rectangle between an anchor and a focus cell. The focus is the active cell
  * (outlined, followed by the keyboard, the value viewer and the record view); in "rows" / "columns" mode the rectangle
- * spans every column / row, so it grows with the loaded rows.
+ * spans every column / row, so it grows with the loaded rows. "all" spans everything and only keeps an active cell.
  */
 export interface CellPos {
   row: number;
   col: number;
 }
-export type SelectionMode = "cells" | "rows" | "columns";
+export type SelectionMode = "cells" | "rows" | "columns" | "all";
 export interface GridSelection {
   anchor: CellPos;
   focus: CellPos;
@@ -26,9 +28,8 @@ export interface Dims {
 }
 export type MoveKey = "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" | "Home" | "End" | "PageUp" | "PageDown";
 
-const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
-
 export function rectOf(sel: GridSelection, dims: Dims): Rect {
+  if (sel.mode === "all") return { top: 0, bottom: dims.rows - 1, left: 0, right: dims.cols - 1 };
   const top = Math.min(sel.anchor.row, sel.focus.row);
   const bottom = Math.max(sel.anchor.row, sel.focus.row);
   const left = Math.min(sel.anchor.col, sel.focus.col);
@@ -40,7 +41,9 @@ export function rectOf(sel: GridSelection, dims: Dims): Rect {
 
 export const cellCount = (r: Rect) => Math.max(0, r.bottom - r.top + 1) * Math.max(0, r.right - r.left + 1);
 export const selectCell = (pos: CellPos): GridSelection => ({ anchor: pos, focus: pos, mode: "cells" });
-export const extendTo = (sel: GridSelection, pos: CellPos): GridSelection => ({ ...sel, focus: pos });
+/** Moves the focus to `pos`; extending a select-all starts a rectangle at its active cell. */
+export const extendTo = (sel: GridSelection, pos: CellPos): GridSelection =>
+  sel.mode === "all" ? { anchor: sel.focus, focus: pos, mode: "cells" } : { ...sel, focus: pos };
 
 /** Whole columns. The focus stays in the first row: the active cell is the column's top cell. */
 export function selectColumns(anchorCol: number, focusCol: number): GridSelection {
@@ -52,8 +55,9 @@ export function selectRows(anchorRow: number, focusRow: number): GridSelection {
   return { anchor: { row: anchorRow, col: 0 }, focus: { row: focusRow, col: 0 }, mode: "rows" };
 }
 
-export function selectAll(dims: Dims): GridSelection {
-  return { anchor: { row: 0, col: 0 }, focus: { row: dims.rows - 1, col: dims.cols - 1 }, mode: "cells" };
+/** Everything, rows loaded later included; `active` stays the active cell. */
+export function selectAll(active: CellPos): GridSelection {
+  return { anchor: active, focus: active, mode: "all" };
 }
 
 export function move(
@@ -93,7 +97,7 @@ export function move(
       break;
   }
   next = { row: clamp(next.row, 0, lastRow), col: clamp(next.col, 0, lastCol) };
-  return opts.extend ? { ...sel, focus: next } : selectCell(next);
+  return opts.extend ? extendTo(sel, next) : selectCell(next);
 }
 
 /** The selection inside `dims` (null when the grid is empty); the same object when nothing had to move. */

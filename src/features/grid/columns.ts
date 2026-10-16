@@ -1,5 +1,6 @@
 import type { ColumnMeta } from "@/lib/api/types";
 import { describeCell } from "@/lib/cells";
+import { clamp } from "@/lib/math";
 
 export const ROW_HEIGHT = 22;
 export const HEADER_HEIGHT = 40;
@@ -17,7 +18,6 @@ const SORT_CONTROL = 24;
 const SAMPLE_ROWS = 100;
 const AUTOFIT_SAMPLE = 2000;
 const MEASURE_CHARS = 200; // a column is never wider than this many characters
-const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 function headerWidth(column: ColumnMeta, measure: TextMeasure, sortable: boolean): number {
   return Math.max(measure(column.name, "header") + (sortable ? SORT_CONTROL : 0), measure(column.type_name, "type"));
