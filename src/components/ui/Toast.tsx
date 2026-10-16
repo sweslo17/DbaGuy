@@ -13,11 +13,10 @@ interface ToastItem {
 
 const MAX_VISIBLE = 4;
 const DURATION_MS: Record<ToastKind, number> = { info: 4000, success: 4000, warning: 4000, error: 8000 };
-// No warning token exists yet: the same yellow the console uses for warning messages.
 const STRIPE: Record<ToastKind, string> = {
   info: "bg-accent",
   success: "bg-success",
-  warning: "bg-yellow-500",
+  warning: "bg-warning",
   error: "bg-danger",
 };
 

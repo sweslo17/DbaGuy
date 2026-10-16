@@ -13,6 +13,7 @@
   --color-accent-fg: var(--accent-fg);
   --color-danger: var(--danger);
   --color-success: var(--success);
+  --color-warning: var(--warning);
   --color-hover: var(--hover);
   --color-selected: var(--selected);
   /* Fades in after a short delay: a quick request never flashes its "Loading…" note. */
@@ -39,6 +40,8 @@
   --accent-fg: #ffffff;
   --danger: #d70015;
   --success: #248a3d;
+  /* Amber, 5.0:1 on bg and 4.6:1 on panel. */
+  --warning: #b45309;
   --hover: rgba(0, 0, 0, 0.05);
   --selected: rgba(10, 102, 217, 0.14);
   color-scheme: light dark;
@@ -56,6 +59,8 @@
     --accent-fg: #ffffff;
     --danger: #ff6961;
     --success: #4cd964;
+    /* 10.0:1 on bg, 9.2:1 on panel. */
+    --warning: #fbbf24;
     --hover: rgba(255, 255, 255, 0.06);
     --selected: rgba(59, 140, 255, 0.24);
   }

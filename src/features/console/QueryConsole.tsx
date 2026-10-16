@@ -15,9 +15,9 @@ import { useHeldResult } from "../grid/useHeldResult";
 
 const INDENT = "  ";
 const PHASE_DOT: Record<SessionPhase, string> = {
-  opening: "bg-yellow-400",
+  opening: "bg-warning",
   open: "bg-success",
-  reconnecting: "bg-yellow-400",
+  reconnecting: "bg-warning",
   failed: "bg-danger",
   closed: "bg-danger",
 };
@@ -49,10 +49,7 @@ function TransactionBadge({ state }: { state: SessionStateView | null }) {
   }
   if (!state?.inTransaction) return null;
   return (
-    <span
-      className="rounded bg-orange-500/20 px-1.5 text-[11px] text-orange-600 dark:text-orange-400"
-      title="A transaction is open"
-    >
+    <span className="rounded bg-warning/15 px-1.5 text-[11px] text-warning" title="A transaction is open">
       Transaction
     </span>
   );
@@ -206,7 +203,7 @@ export function QueryConsole({ tab }: { tab: ConsoleTab }) {
                   {execution.messages.map((m, i) => (
                     <div
                       key={i}
-                      className={m.severity === "warning" ? "text-yellow-600 dark:text-yellow-400" : "text-muted"}
+                      className={m.severity === "warning" ? "text-warning" : "text-muted"}
                       data-selectable
                     >
                       {m.text}
