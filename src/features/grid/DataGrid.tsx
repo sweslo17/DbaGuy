@@ -307,6 +307,7 @@ export function DataGrid(props: DataGridProps) {
               aria-rowcount={hasMore ? -1 : rows.length + 1}
               aria-colcount={columns.length + 1}
               aria-activedescendant={focus ? focusId : undefined}
+              aria-busy={stale}
               className="group/grid relative isolate flex h-full min-h-0 flex-col outline-none"
               onKeyDown={onKeyDown}
             >
@@ -390,7 +391,7 @@ export function DataGrid(props: DataGridProps) {
               </GridMenu>
               {stale && (
                 <div
-                  role="status"
+                  aria-hidden
                   className="pointer-events-none absolute top-11 right-3 z-20 animate-delayed-show rounded-md border border-border bg-elevated px-2 py-0.5 font-sans text-[12px] text-muted shadow"
                 >
                   Loading…
