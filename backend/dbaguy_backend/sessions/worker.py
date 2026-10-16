@@ -716,8 +716,19 @@ class SessionWorker:
         self._discard_open()  # a paused result holds the transaction open
         try:
             self.connection.rollback()
-        except StatementError as exc:
-            logger.warning("Idle rollback failed on {}: {}", self.name, exc.message)
+        except Exception as exc:  # e.g. the connection is gone
+            if isinstance(exc, StatementError):
+                logger.warning("Idle rollback failed on {}: {}", self.name, exc.message)
+                reason = exc.message
+            else:
+                logger.exception("Idle rollback failed on {}", self.name)
+                reason = f"Internal error: {exc}"
+            # Report what the connection says now: a dead one has no transaction, so the idle check stops retrying.
+            self._refresh_state()
+            self._send(MessageEvent(
+                request_id="", severity=MessageSeverity.WARNING,
+                text=f"Could not roll back the idle transaction: {reason}",
+            ))
             return
         logger.info("Rolled back an idle transaction on {}", self.name)
         self._refresh_state()

@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+from dbaguy_backend.adapters.base import StatementError
 from dbaguy_backend.domain.execution import (
     CommitCommand,
     ExecuteCommand,
@@ -309,6 +310,31 @@ def test_idle_transaction_warning_then_rollback(make_worker):
     rec.wait_for(lambda e: e.type == "message" and e.text.startswith("Rolled back"))
     assert conn.rollbacks == 1 and not conn.tx
     assert [e for e in rec.events if e.type == "session_state"][-1].in_transaction is False
+
+
+def test_a_failed_idle_rollback_on_a_dead_connection_is_reported_once_and_not_retried(make_worker):
+    worker, conn, rec = make_worker()
+    run(worker, rec, "a", "begin")
+    attempts = []
+
+    def connection_gone(*_):
+        raise StatementError("Connection to the server was lost: terminated", code="connection_lost")
+
+    def rollback():
+        attempts.append(1)
+        conn.in_transaction = connection_gone  # a dead connection cannot report a transaction any more
+        connection_gone()
+
+    conn.rollback = rollback
+    time.sleep(0.15)
+    for _ in range(3):  # the housekeeping keeps checking every 15 s
+        worker.check_idle_transaction(warn_after_s=0, rollback_after_s=0.1)
+        worker.call(lambda c: None)  # queued behind any rollback: it has run once this returns
+    assert len(attempts) == 1
+    [failure] = [e for e in rec.events if e.type == "message" and e.request_id == ""]  # one session-level message
+    assert failure.severity == "warning" and failure.text.startswith("Could not roll back the idle transaction")
+    assert "Connection to the server was lost" in failure.text
+    assert last_state(rec).in_transaction is False
 
 
 def test_no_idle_rollback_when_something_ran_in_between(make_worker):

@@ -15,7 +15,7 @@ def container(tmp_path):
 
 
 def test_building_the_app_creates_no_history_file(container, tmp_path):
-    # `npm run gen:api` builds the app with the real data dir just to dump its OpenAPI schema
+    # Building the app, e.g. only to dump its OpenAPI schema, must not create the history database
     assert not (tmp_path / "data" / "history.db").exists()
 
 

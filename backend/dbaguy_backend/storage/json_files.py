@@ -37,16 +37,29 @@ def error_fields(exc: ValidationError) -> str:
     return ", ".join(sorted({".".join(str(part) for part in err["loc"]) or "<entry>" for err in exc.errors()}))
 
 
-def move_aside(path: Path, reason: str, error: type[DomainError]) -> None:
-    """Back the unreadable file up under a unique name, so that saving later never destroys it."""
+def move_aside(path: Path, reason: str, error: type[DomainError], companions: tuple[str, ...] = ()) -> None:
+    """Back the unreadable file up under a unique name, so that saving later never destroys it.
+
+    `companions`: suffixes of files that belong to it (SQLite's `-wal` and `-shm`), moved along under the backup's
+    name when they exist, so they are never left next to the file that replaces it.
+    """
+
+    def taken(candidate: Path) -> bool:
+        return any(candidate.with_name(candidate.name + suffix).exists() for suffix in ("", *companions))
+
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup = next(
         candidate
         for counter in itertools.count(1)
-        if not (candidate := path.with_name(f"{path.name}.corrupt-{stamp}-{counter}")).exists()
+        if not taken(candidate := path.with_name(f"{path.name}.corrupt-{stamp}-{counter}"))
     )
     try:
         path.replace(backup)
+        for suffix in companions:
+            try:
+                path.with_name(path.name + suffix).replace(backup.with_name(backup.name + suffix))
+            except FileNotFoundError:
+                pass
     except OSError as exc:
         logger.error("{} is unreadable ({}) and could not be moved aside: {}", path.name, reason, exc)
         raise error(f"{path.name} is unreadable and could not be moved aside: {exc.strerror or exc}") from exc

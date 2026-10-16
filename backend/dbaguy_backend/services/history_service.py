@@ -35,6 +35,7 @@ END;
 _DATA_COLUMNS = "profile_id, profile_name, database_name, sql, started_at, elapsed_ms, rows, status, error"
 _MAX_ERROR = 500
 _TRIGRAM = 3  # the full-text index matches from this many characters; shorter searches scan with LIKE
+_SQLITE_COMPANIONS = ("-wal", "-shm")  # a database's write-ahead log and its index: they go wherever it goes
 
 
 def _like_pattern(q: str) -> str:
@@ -85,8 +86,12 @@ class HistoryService:
             logger.error("Cannot open the history {}: {}", self._path, exc)
             raise StorageError(f"Cannot open the history: {exc}") from exc
         except sqlite3.DatabaseError as exc:
-            move_aside(self._path, str(exc), StorageError)
+            move_aside(self._path, str(exc), StorageError, companions=_SQLITE_COMPANIONS)
+        try:
             return self._connect()
+        except sqlite3.Error as exc:
+            logger.error("Cannot create a new history {}: {}", self._path, exc)
+            raise StorageError(f"Cannot open the history: {exc}") from exc
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._path, check_same_thread=False, isolation_level=None)

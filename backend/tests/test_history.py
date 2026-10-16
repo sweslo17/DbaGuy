@@ -68,6 +68,41 @@ def test_a_corrupt_file_is_moved_aside(tmp_path):
     history.close()
 
 
+def test_a_corrupt_database_is_moved_aside_together_with_its_wal_and_shm(tmp_path, monkeypatch):
+    (tmp_path / "h.db").write_bytes(b"not a database at all" * 100)
+    (tmp_path / "h.db-wal").write_bytes(b"stale wal")  # left next to a new database, SQLite could replay it into it
+    (tmp_path / "h.db-shm").write_bytes(b"stale shm")
+    real, calls = HistoryService._connect, []
+
+    def connect(self):  # the first open finds the damage before SQLite touches the companions (e.g. a stale -wal)
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return real(self)
+
+    monkeypatch.setattr(HistoryService, "_connect", connect)
+    history = HistoryService(tmp_path / "h.db")
+    history.record(rec("SELECT 1"))
+    assert sqls(history.search()) == ["SELECT 1"]
+    history.close()
+    [backup] = [p for p in tmp_path.glob("h.db.corrupt-*") if not p.name.endswith(("-wal", "-shm"))]
+    assert backup.with_name(backup.name + "-wal").read_bytes() == b"stale wal"
+    assert backup.with_name(backup.name + "-shm").read_bytes() == b"stale shm"
+
+
+def test_a_new_history_that_cannot_be_created_after_the_move_is_a_storage_error(tmp_path, monkeypatch):
+    (tmp_path / "h.db").write_bytes(b"not a database at all" * 100)
+    failures = iter([sqlite3.DatabaseError("file is not a database"), sqlite3.OperationalError("disk I/O error")])
+
+    def connect(self):
+        raise next(failures)
+
+    monkeypatch.setattr(HistoryService, "_connect", connect)
+    history = HistoryService(tmp_path / "h.db")
+    with pytest.raises(StorageError, match="disk I/O error"):
+        history.search()
+
+
 def test_retention_is_applied_when_the_file_is_opened(tmp_path):
     history = HistoryService(tmp_path / "h.db", retention=2, prune_every=1000)
     for i in range(5):
