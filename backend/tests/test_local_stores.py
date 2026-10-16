@@ -1,10 +1,13 @@
 import json
+import os
 
 import pytest
+from loguru import logger
 
 from dbaguy_backend.domain.errors import AlreadyExists, NotFound, StorageError, ValidationFailed
 from dbaguy_backend.domain.settings import AppSettings
 from dbaguy_backend.domain.workspace import WorkspaceState
+from dbaguy_backend.services import scripts_service
 from dbaguy_backend.services.scripts_service import ScriptsService
 from dbaguy_backend.services.settings_service import SettingsService
 from dbaguy_backend.services.workspace_service import WorkspaceService
@@ -49,6 +52,14 @@ def test_atomic_text_file_writers_do_not_share_a_temp_file(tmp_path):
         second.write("second")
         assert len(list(tmp_path.iterdir())) == 2
     assert len(list(tmp_path.iterdir())) == 1 and target.read_text() in {"first", "second"}
+
+
+@pytest.mark.parametrize("name", ["x" * 251 + ".txt", "a" + "é" * 125 + ".txt"], ids=["255 bytes", "multibyte"])
+def test_atomic_text_file_can_write_any_target_name_the_file_system_accepts(tmp_path, name):
+    target = tmp_path / name
+    with atomic_text_file(target) as fp:  # the temp file name is longer than the target's: it must be cut short
+        fp.write("x")
+    assert [p.name for p in tmp_path.iterdir()] == [name] and target.read_text() == "x"
 
 
 def test_write_text_atomic_creates_parents_and_reports_failures_as_the_given_error(tmp_path):
@@ -100,8 +111,6 @@ def test_unreadable_settings_are_moved_aside(tmp_path, content):
 
 
 def test_a_corrupt_file_is_reported_without_its_contents(tmp_path):
-    from loguru import logger
-
     path = tmp_path / "settings.json"
     path.write_text('{"editor": {"font_size": 999, "secret": "do-not-log-me"}}')
     messages: list[str] = []
@@ -132,6 +141,17 @@ def test_scripts_dir_expands_the_home_folder_and_rejects_unknown_users(tmp_path,
         service.update(AppSettings(scripts_dir="~no-such-user-dbaguy/sql"))
     with pytest.raises(ValidationFailed):
         service.update(AppSettings(scripts_dir=""))
+
+
+def test_scripts_dir_cannot_be_an_existing_file(tmp_path):
+    (tmp_path / "file").write_text("x")
+    service = SettingsService(tmp_path / "settings.json", tmp_path / "scripts")
+    with pytest.raises(ValidationFailed, match="not a folder"):
+        service.update(AppSettings(scripts_dir=str(tmp_path / "file")))
+    assert service.get().scripts_dir is None and not (tmp_path / "settings.json").exists()  # nothing was saved
+    (tmp_path / "folder").mkdir()
+    service.update(AppSettings(scripts_dir=str(tmp_path / "folder")))  # an existing folder is fine
+    service.update(AppSettings(scripts_dir=str(tmp_path / "not-yet")))  # and so is one that will be created
 
 
 def test_a_scripts_folder_that_cannot_be_created_is_a_storage_error(tmp_path):
@@ -285,6 +305,94 @@ def test_other_files_in_the_folder_are_neither_read_nor_deleted_nor_moved(script
     assert (root / "README.md").read_text() == "docs" and (root / "sub" / "config").read_text() == "c"
 
 
+def test_dot_prefixed_names_cannot_be_used_not_even_to_reach_a_git_folder(scripts):
+    service, root = scripts
+    (root / ".git" / "hooks").mkdir(parents=True)
+    (root / ".git" / "config").write_text("c")
+    (root / ".hidden.sql").write_text("h")
+    service.write("docs/a.sql", "a")
+    (root / "via-link").symlink_to(root / ".git", target_is_directory=True)  # a plain name that leads to a dot folder
+    hidden = [".git", ".git/config", ".git/hooks/x.sql", ".hidden.sql", "docs/.x.sql", "docs/.d/y.sql",
+              "via-link", "via-link/hooks/x.sql"]
+    for path in hidden:
+        for action in (service.read, service.delete, service.create_folder):
+            with pytest.raises(ValidationFailed):
+                action(path)
+        with pytest.raises(ValidationFailed):
+            service.write(path, "x")
+        with pytest.raises(ValidationFailed):
+            service.rename(path, "moved.sql")  # as the source
+        with pytest.raises(ValidationFailed):
+            service.rename("docs/a.sql", path)  # as the target
+    with pytest.raises(ValidationFailed):
+        service.rename(".git", ".git-old")  # a folder: it has no .sql rule to stop it
+    with pytest.raises(ValidationFailed):
+        service.rename("docs", ".git/hooks/docs")
+    with pytest.raises(ValidationFailed):
+        service.rename("docs", "via-link/docs")
+    assert sorted(p.name for p in root.iterdir()) == [".git", ".hidden.sql", "docs", "via-link"]
+    assert sorted(p.name for p in (root / ".git").iterdir()) == ["config", "hooks"]
+    assert list((root / ".git" / "hooks").iterdir()) == [] and (root / "docs" / "a.sql").read_text() == "a"
+    assert (root / ".git" / "config").read_text() == "c" and (root / ".hidden.sql").read_text() == "h"
+
+
+def test_a_file_in_the_way_is_a_missing_path_or_a_conflict_never_a_server_error(scripts):
+    service, root = scripts
+    (root / "file.sql").write_text("x")
+    (root / "folder").mkdir()
+    service.write("a.sql", "a")
+    for missing in (lambda: service.read("file.sql/x.sql"), lambda: service.delete("file.sql/x.sql"),
+                    lambda: service.rename("file.sql/x.sql", "y.sql")):
+        with pytest.raises(NotFound):
+            missing()
+    for conflict in (lambda: service.write("file.sql/x.sql", "x"), lambda: service.create_folder("file.sql/sub"),
+                     lambda: service.create_folder("file.sql"), lambda: service.rename("folder", "file.sql/f"),
+                     lambda: service.rename("a.sql", "file.sql/b.sql")):
+        with pytest.raises(AlreadyExists):
+            conflict()
+    assert sorted(p.name for p in root.iterdir()) == ["a.sql", "file.sql", "folder"]  # nothing created, no temp file
+    assert (root / "file.sql").read_text() == "x"
+
+
+def test_names_longer_than_the_file_system_allows_are_rejected_not_crashes(scripts):
+    service, root = scripts
+    service.write("a.sql", "a")
+    too_long_file, too_long_folder = "x" * 252 + ".sql", "d" * 256  # 256 bytes
+    for path in (too_long_file, f"{too_long_folder}/a.sql"):
+        for action in (service.read, service.delete, service.create_folder):
+            with pytest.raises(ValidationFailed, match="too long"):
+                action(path)
+        with pytest.raises(ValidationFailed, match="too long"):
+            service.write(path, "x")
+        with pytest.raises(ValidationFailed, match="too long"):
+            service.rename("a.sql", path)
+        with pytest.raises(ValidationFailed, match="too long"):
+            service.rename(path, "b.sql")
+    assert [p.name for p in root.iterdir()] == ["a.sql"]
+
+
+@pytest.mark.parametrize("name", ["x" * 251 + ".sql", "a" + "é" * 125 + ".sql"], ids=["255 bytes", "multibyte"])
+def test_a_script_whose_name_is_as_long_as_allowed_can_be_saved(scripts, name):
+    service, root = scripts
+    service.write(name, "ok")  # the temp file's name is longer than this one's
+    assert service.read(name).content == "ok" and [p.name for p in root.iterdir()] == [name]
+
+
+def test_only_regular_files_are_used(scripts):
+    service, root = scripts
+    os.mkfifo(root / "pipe.sql")  # reading it would block for ever
+    for action in (service.read, service.delete, lambda p: service.write(p, "x"), lambda p: service.rename(p, "r.sql")):
+        with pytest.raises(ValidationFailed, match="regular file"):
+            action("pipe.sql")
+    (root / "loop.sql").symlink_to(root / "loop.sql")  # a link that points at itself
+    (root / "broken.sql").symlink_to(root / "nowhere.sql")
+    for name in ("loop.sql", "broken.sql"):
+        for action in (service.read, service.delete, lambda p: service.rename(p, "r.sql")):
+            with pytest.raises(NotFound):
+                action(name)
+    assert (root / "pipe.sql").exists() and (root / "loop.sql").is_symlink() and (root / "broken.sql").is_symlink()
+
+
 def test_write_limits_and_conflicts(scripts):
     service, root = scripts
     service.write("big.sql", "x" * (10 * 1024 * 1024))  # exactly the limit
@@ -299,7 +407,7 @@ def test_write_limits_and_conflicts(scripts):
     with pytest.raises(ValidationFailed):
         service.write("folder.sql", "x")
     (root / "file.sql").write_text("x")
-    with pytest.raises(StorageError):
+    with pytest.raises(AlreadyExists):
         service.write("file.sql/inside.sql", "x")  # a file where a parent folder should be
 
 
@@ -368,34 +476,60 @@ def test_create_folder_and_delete_conflicts(scripts):
         service.delete("missing")
 
 
-def test_tree_order_and_limits(scripts, monkeypatch):
-    from loguru import logger
-
-    from dbaguy_backend.services import scripts_service
-
-    service, root = scripts
+def test_tree_order(scripts):
+    service, _ = scripts
     for name in ("b.sql", "A.sql", "c.SQL", "zdir/n.sql", "Adir/n.sql"):
         service.write(name, "x")
     assert [n.name for n in service.tree().items] == ["Adir", "zdir", "A.sql", "b.sql", "c.SQL"]
 
+
+@pytest.fixture
+def logged_warnings():
     messages: list[str] = []
     sink = logger.add(lambda m: messages.append(m.record["message"]), level="WARNING")
-    try:
-        monkeypatch.setattr(scripts_service, "_MAX_NODES", 3)
-        listed = service.tree().items  # depth first, folders first, then by name: Adir, Adir/n.sql, zdir
-        assert [n.name for n in listed] == ["Adir", "zdir"] and [c.name for c in listed[0].children] == ["n.sql"]
-        assert listed[1].children == []
-        assert len(messages) == 1
+    yield messages
+    logger.remove(sink)
 
-        monkeypatch.setattr(scripts_service, "_MAX_NODES", 10_000)
-        monkeypatch.setattr(scripts_service, "_MAX_DEPTH", 2)
-        service.write("l1/l2/l3/deep.sql", "x")
-        messages.clear()
-        l1 = next(n for n in service.tree().items if n.name == "l1")
-        assert [n.name for n in l1.children] == ["l2"] and l1.children[0].children == []
-        assert len(messages) == 1
-    finally:
-        logger.remove(sink)
+
+def count_nodes(nodes) -> int:
+    return sum(1 + count_nodes(n.children) for n in nodes)
+
+
+def test_the_node_limit_lists_shallow_entries_before_deep_ones(scripts, monkeypatch, logged_warnings):
+    service, root = scripts
+    for i in range(20):
+        (root / "A-modules" / f"pkg{i:02}" / "deep").mkdir(parents=True)  # a big folder that sorts first
+    service.write("queries/q.sql", "x")
+    service.write("top.sql", "x")
+    monkeypatch.setattr(scripts_service, "_MAX_NODES", 10)
+    items = service.tree().items
+    assert [n.name for n in items] == ["A-modules", "queries", "top.sql"]  # nothing top-level is lost
+    assert count_nodes(items) == 10 and len(logged_warnings) == 1
+    monkeypatch.setattr(scripts_service, "_MAX_NODES", 10_000)
+    logged_warnings.clear()
+    assert count_nodes(service.tree().items) == 44 and logged_warnings == []
+
+
+def test_the_node_limit_cuts_a_single_folder_by_name(scripts, monkeypatch, logged_warnings):
+    service, _ = scripts
+    for name in ("b.sql", "A.sql", "c.SQL", "zdir/n.sql", "Adir/n.sql"):
+        service.write(name, "x")
+    monkeypatch.setattr(scripts_service, "_MAX_NODES", 3)
+    items = service.tree().items  # folders first, then by name
+    assert [n.name for n in items] == ["Adir", "zdir", "A.sql"] and len(logged_warnings) == 1
+
+
+def test_the_depth_limit_warns_only_when_something_is_left_out(scripts, monkeypatch, logged_warnings):
+    service, root = scripts
+    monkeypatch.setattr(scripts_service, "_MAX_DEPTH", 2)
+    service.create_folder("l1/l2")  # a folder at the deepest level that holds nothing listable: nothing is hidden
+    (root / "l1" / "l2" / ".hidden.sql").write_text("x")
+    (root / "l1" / "l2" / "notes.txt").write_text("x")
+    l1 = service.tree().items[0]
+    assert [n.name for n in l1.children] == ["l2"] and l1.children[0].children == [] and logged_warnings == []
+    service.write("l1/l2/deep.sql", "x")
+    l1 = service.tree().items[0]
+    assert l1.children[0].children == [] and len(logged_warnings) == 1  # now there is something below the limit
 
 
 def test_an_unreadable_scripts_folder_is_a_storage_error(tmp_path):

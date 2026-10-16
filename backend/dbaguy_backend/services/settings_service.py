@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from loguru import logger
@@ -19,7 +20,9 @@ class SettingsService:
 
     def update(self, value: AppSettings) -> AppSettings:
         if value.scripts_dir is not None:
-            self._expand(value.scripts_dir)  # rejects what is not an absolute path
+            scripts_dir = self._expand(value.scripts_dir)  # rejects what is not an absolute path
+            if os.path.exists(scripts_dir) and not os.path.isdir(scripts_dir):
+                raise ValidationFailed(f"{scripts_dir} exists and is not a folder")
         self._doc.save(value)
         logger.info("Settings saved")
         return value

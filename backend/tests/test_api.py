@@ -327,3 +327,17 @@ def test_scripts_follow_the_configured_folder(client, tmp_path):
     assert client.put("/settings", json=settings, headers=AUTH).status_code == 200
     client.put("/scripts/file", json={"path": "q.sql", "content": "SELECT 2"}, headers=AUTH)
     assert (tmp_path / "repo" / "q.sql").read_text() == "SELECT 2"
+
+
+def test_scripts_api_path_problems_are_client_errors(client, tmp_path):
+    (tmp_path / "data" / "scripts" / ".git").mkdir(parents=True)
+    assert client.put("/scripts/file", json={"path": "file.sql", "content": "x"}, headers=AUTH).status_code == 200
+    assert client.get("/scripts/file", params={"path": "file.sql/x.sql"}, headers=AUTH).status_code == 404
+    in_the_way = client.put("/scripts/file", json={"path": "file.sql/x.sql", "content": "x"}, headers=AUTH)
+    assert in_the_way.status_code == 409 and in_the_way.json()["error"]["code"] == "already_exists"
+    too_long = client.get("/scripts/file", params={"path": "x" * 252 + ".sql"}, headers=AUTH)
+    assert too_long.status_code == 422 and "too long" in too_long.json()["error"]["message"]
+    assert client.post("/scripts/rename", json={"from": ".git", "to": "old"}, headers=AUTH).status_code == 422
+    assert client.post("/scripts/folder", json={"path": ".git/new"}, headers=AUTH).status_code == 422
+    assert client.put("/scripts/file", json={"path": ".git/x.sql", "content": "x"}, headers=AUTH).status_code == 422
+    assert [p.name for p in (tmp_path / "data" / "scripts" / ".git").iterdir()] == []
