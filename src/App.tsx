@@ -4,8 +4,11 @@ import { useEffect, useState } from "react";
 import { AppShell } from "./app/AppShell";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Sidebar } from "./app/Sidebar";
+import { PaletteHost, togglePalette } from "./features/palette/CommandPalette";
 import { Workspace } from "./features/workspace/Workspace";
 import { restoreWorkspace } from "./features/workspace/workspaceSync";
+import { isDialogOpen } from "./lib/dialogs";
+import { isImeKeyEvent } from "./lib/ime";
 
 /** Until the saved tabs are back: nothing renders that could open a session or write the workspace. */
 function Restoring() {
@@ -17,18 +20,42 @@ function Restoring() {
   );
 }
 
+/**
+ * ⌘P quick open and ⌘⇧P commands (spec §4.10), anywhere in the window once the workspace is back: they open the
+ * palette, switch it, or close it. Never the browser's Print; nothing while another dialog has the keyboard or an input
+ * method is composing. (⌘, and ⌘W are handled by the settings dialog and the workspace.)
+ */
+function usePaletteShortcuts(enabled: boolean) {
+  useEffect(() => {
+    if (!enabled) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (isImeKeyEvent(e) || e.defaultPrevented) return;
+      if (!e.metaKey || e.ctrlKey || e.altKey) return;
+      // The physical key too: a non-Latin layout may not report "p".
+      if (e.code !== "KeyP" && e.key.toLowerCase() !== "p") return;
+      e.preventDefault();
+      if (isDialogOpen({ exceptPalette: true })) return;
+      togglePalette(e.shiftKey ? "commands" : "quickOpen");
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [enabled]);
+}
+
 export function App() {
   const queryClient = useQueryClient();
   const [restored, setRestored] = useState(false);
   useEffect(() => {
     void restoreWorkspace(queryClient).then(() => setRestored(true));
   }, [queryClient]);
+  usePaletteShortcuts(restored);
 
   if (!restored) return <Restoring />;
   // An error anywhere in the app shows its message and a Reload (a tab's own error stays inside that tab).
   return (
     <ErrorBoundary name="App" title="DbaGuy hit an error" recover="reload">
       <AppShell sidebar={<Sidebar />} workspace={<Workspace />} />
+      <PaletteHost />
     </ErrorBoundary>
   );
 }

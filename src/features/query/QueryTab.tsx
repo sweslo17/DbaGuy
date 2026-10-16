@@ -31,6 +31,7 @@ import { QueryToolbar } from "./QueryToolbar";
 import { ResultsArea } from "./ResultsArea";
 import { beginRunMarks, errorLocation, flashStatement, jumpToError, markStatementError } from "./runMarks";
 import { planRun, type PlannedStatement, type RunMode } from "./runPlan";
+import { useQueryTabActions } from "./tabActions";
 import { useQueryRunner, type RunListener } from "./useQueryRunner";
 import { useTransactionControls } from "./useTransactionControls";
 
@@ -114,6 +115,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     : sessionBusy
       ? "Wait for the running statement or export"
       : undefined;
+  const autocommitBlockedReason = inTransaction ? "Commit or roll back first" : runningReason;
 
   // Closing the tab: the unsaved script first (registered by the script binding below), then a running export, then
   // the run (nothing more is sent), then an open transaction.
@@ -165,6 +167,21 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
 
   // ⌘⇧F: the selection, else the statement under the cursor, by the tab's dialect and the editor settings.
   const format = () => withView((v) => void formatSql(v, { dialect, editor: settings.editor }));
+
+  // The command palette calls the same handlers as the toolbar and the keymap, enabled when their controls are
+  // (ruling R-02c-15).
+  useQueryTabActions(tab.id, {
+    run: { enabled: canRun, run: () => void start("default") },
+    runAll: { enabled: canRun, run: () => void start("all") },
+    format: { enabled: true, run: format },
+    toggleAutocommit: {
+      enabled: !autocommitBlockedReason,
+      checked: tab.autocommit,
+      run: () => transaction.setAutocommit(!tab.autocommit),
+    },
+    commit: { enabled: canEnd, run: transaction.commit },
+    rollback: { enabled: canEnd, run: transaction.rollback },
+  });
 
   // The editor's keymap is built once: it calls the latest `start`, `format` and script commands through refs.
   const startRef = useRef(start);
@@ -266,7 +283,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
         onRunAll={() => void start("all")}
         onCancel={cancel}
         autocommit={tab.autocommit}
-        autocommitBlockedReason={inTransaction ? "Commit or roll back first" : runningReason}
+        autocommitBlockedReason={autocommitBlockedReason}
         onAutocommitChange={transaction.setAutocommit}
         canEnd={canEnd}
         endBlockedReason={endBlockedReason}

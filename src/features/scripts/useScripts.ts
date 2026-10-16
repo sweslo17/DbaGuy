@@ -17,9 +17,12 @@ async function fetchScriptTree(): Promise<ScriptTree> {
   return unwrap(await (await api()).GET("/scripts"));
 }
 
-/** The scripts folder's tree (folders first), shared by the panel, the Save As dialog and quick open. */
-export function useScriptTree(enabled = true) {
-  return useQuery({ queryKey: scriptTreeKey, queryFn: fetchScriptTree, enabled });
+/**
+ * The scripts folder's tree (folders first), shared by the panel, the Save As dialog and quick open. `cached`: a copy
+ * already loaded is used as it is, not asked for again (quick open, on every ⌘P); it is read only if there is none.
+ */
+export function useScriptTree({ cached = false }: { cached?: boolean } = {}) {
+  return useQuery({ queryKey: scriptTreeKey, queryFn: fetchScriptTree, ...(cached && { staleTime: Infinity }) });
 }
 
 export async function readScript(path: string, signal?: AbortSignal): Promise<ScriptFile> {

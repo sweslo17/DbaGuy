@@ -6,6 +6,7 @@ import { Dialog } from "@/components/ui/Dialog";
 import { Checkbox, FieldRow, Input, Select } from "@/components/ui/Field";
 import { errorMessage } from "@/lib/api/client";
 import type { AppSettings } from "@/lib/api/types";
+import { isDialogOpen } from "@/lib/dialogs";
 import { isImeKeyEvent } from "@/lib/ime";
 import { canChooseFiles, chooseFolder } from "@/lib/native";
 import { useAppSettings } from "@/stores/settings";
@@ -257,7 +258,7 @@ export function SettingsDialogHost() {
       if (isImeKeyEvent(e) || e.defaultPrevented) return;
       if (!e.metaKey || e.ctrlKey || e.altKey || e.shiftKey || e.key !== ",") return;
       e.preventDefault();
-      if (document.querySelector('[role="dialog"][data-state="open"]')) return; // a modal dialog (Radix)
+      if (isDialogOpen({ exceptPalette: true })) return; // from the palette, Settings replaces it
       openSettings();
     };
     window.addEventListener("keydown", onKey);

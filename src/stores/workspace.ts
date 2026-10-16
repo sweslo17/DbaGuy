@@ -115,6 +115,14 @@ function unbindTabs(ids: Set<string>): string[] {
     .map((t) => t.title);
 }
 
+/**
+ * The connection being worked with: the active tab's, else the one selected in the explorer. A new query tab from the
+ * command palette starts on it, and quick open searches its objects.
+ */
+export function workingProfileId(s: Pick<WorkspaceState, "tabs" | "activeTabId" | "selectedProfileId">): string | null {
+  return s.tabs.find((t) => t.id === s.activeTabId)?.profileId ?? s.selectedProfileId;
+}
+
 /** The query tab bound to the script file at `path`, if one is open. */
 export function scriptTab(path: string): QueryTabState | undefined {
   return useWorkspace

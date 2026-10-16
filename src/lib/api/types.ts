@@ -18,6 +18,8 @@ export type Engine = EngineInfo["engine"];
 export type PathSegment = S["PathSegment"];
 export type ObjectNode = S["ObjectNode"];
 export type ObjectDetail = S["ObjectDetail"];
+/** A table or view found by `GET /metadata/search`, with the explorer path that opens it. */
+export type ObjectSearchHit = S["ObjectSearchHit"];
 export type ColumnInfo = S["ColumnInfo"];
 export type SessionInfo = S["SessionInfo"];
 export type ColumnMeta = S["ColumnMeta"];

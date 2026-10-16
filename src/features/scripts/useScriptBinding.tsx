@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
 import { toast } from "@/components/ui/Toast";
 import { ApiError, errorMessage } from "@/lib/api/client";
+import { isDialogOpen } from "@/lib/dialogs";
 import { isImeKeyEvent } from "@/lib/ime";
 import { baseName } from "@/lib/scriptPaths";
 import { reportTabStatus } from "@/stores/tabStatus";
@@ -307,7 +308,7 @@ export function useScriptBinding({
       if (isImeKeyEvent(e) || e.defaultPrevented) return;
       if (!e.metaKey || e.ctrlKey || e.altKey || e.key.toLowerCase() !== "s") return;
       e.preventDefault();
-      if (document.querySelector('[role="dialog"][data-state="open"]')) return; // a modal dialog (Radix)
+      if (isDialogOpen()) return;
       if (e.shiftKey) commands.current.saveAs();
       else commands.current.save();
     };
