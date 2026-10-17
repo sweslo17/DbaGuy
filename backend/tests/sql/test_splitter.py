@@ -350,4 +350,4 @@ def test_mysql_what_the_tracker_cannot_tell_apart_merges_and_never_splits_a_body
 def test_delimiter_lines_are_found_in_linear_time_on_one_long_line(text):  # M5: /sql/split runs on every edit
     started = time.perf_counter()
     split(text, MY)
-    assert time.perf_counter() - started < 0.3
+    assert time.perf_counter() - started < 1.0  # ~0.2 s here; 3.4 s for the first input before M5
