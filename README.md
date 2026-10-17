@@ -1,4 +1,9 @@
-# DbaGuy
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="logos/01_Horizontal-Logo/For-Dark-Background/DbaGuy-logo-reversed-1024px.png">
+    <img src="logos/01_Horizontal-Logo/For-Light-Background/DbaGuy-logo-color-1024px.png" alt="DbaGuy" width="360">
+  </picture>
+</h1>
 
 A fast, focused SQL IDE for macOS — one app for PostgreSQL, MySQL, SQLite, Couchbase (SQL++) and SQL Server.
 
