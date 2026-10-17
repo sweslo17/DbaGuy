@@ -57,7 +57,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
 |---|---|
 | 啟動測試 DB | `docker compose -f dev/docker-compose.yml up -d --build --wait` |
 | Backend 測試 | `cd backend && .venv/bin/pytest -q` |
-| 開發（Tauri） | `scripts/dev.sh` |
+| 開發（Tauri） | `scripts/dev.sh`（不要直接跑 `npm run tauri dev`：沒有 `DBAGUY_DEV_BACKEND_URL` 時 Tauri 會自己啟動 backend，而且沒有 `DBAGUY_DATA_DIR`，所以用的是正式的 `~/Library/Application Support/DbaGuy` 與正式的 Keychain service `app.dbaguy`） |
 | 開發（瀏覽器，給 Claude 用內建瀏覽器驗證） | `scripts/dev.sh --web` 後開 `http://localhost:1420`（資料放 `dev/data/`，不碰正式的 app 資料） |
 | 重新產生 API 型別 | `npm run gen:api` |
 | 型別檢查／build | `npm run typecheck` / `npm run build` |
@@ -78,6 +78,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
   - 使用者 SQL 走 `_VerbatimCursor`（直接 `cmd_query`，原文送出）。不用 `cursor.execute()`：它的 DELIMITER 改寫會改到文字。也不用 `conn.cursor()`：每句會多送一次 PING。`MULTI_STATEMENTS` 關閉，一次 `run()` 一句；`DELIMITER` 行由 splitter 吃掉，不送到 server。
   - 取消與提前關閉結果：從一條短的側連線送 `KILL QUERY <thread>`，交易保留；關閉時把剩下的結果（含 CALL 後面的 result set）讀掉丟棄。
   - `in_transaction` 讀協定的 status flag，不多一次 round trip；`autocommit` 有快取，只在可能改到它的語句（提到 autocommit、CALL／EXECUTE）之後重新讀。
+  - 連線選項 `time_zone`／`sql_mode` 不交給 driver（它會不加引號直接拼進自己的 `SET`）：adapter 在連線後用 `quote_literal` 送一句 `SET SESSION time_zone = '…', SESSION sql_mode = '…'`，在 READ ONLY 之前。URL 匯入照樣把它們放進 profile options。
   - 唯讀 profile：連線後 `SET SESSION TRANSACTION READ ONLY`（server 也會擋住藏在 function／procedure 裡的寫入），再加上 `SafetyPolicy` 的 allow-list。
   - Text-first 載入，型別表在 `adapters/mysql/types.py`：大的 unsigned 整數、DECIMAL、日期不失真（`0000-00-00` 與超過 24 小時的 TIME 照原樣），`TINYINT(1)` 顯示數字。
 - 密碼只在 Keychain；`save_password=false` 的連線，在連線設定或 unlock 對話框輸入的密碼只暫存在記憶體到 app 結束。缺少的密碼（含 SSH 密碼驗證的 SSH 密碼）回 `password_required`，`detail` 指出缺哪一個。
@@ -101,9 +102,10 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
   - SSL mode `disable`（含匯入的 `useSSL=false`）時，pure driver 做不了 caching_sha2_password 的完整登入，所以 server 重啟後第一次用密碼登入會失敗（Access denied）。錯誤訊息附提示：第一次登入要用 TLS（SSL mode Prefer 或 Require），或改用 mysql_native_password 的帳號。帳密真的打錯時也會出現這個提示。
   - 取消剛好在語句結束時送到，會回報成已取消（實際已執行完）。
   - Procedure 裡的 `SLEEP()` 會吞掉 KILL QUERY（提早回傳，procedure 接著跑下一句），所以取消或關閉這種 CALL 時，後面的結果仍會送來，被讀掉丟棄。
-  - 關閉暫停中的大結果要把已在路上的列讀掉：本機 125 萬列約 3.7 秒（TLS 4.1 秒）。讀掉超過 10 秒就放棄這條連線（顯示 Reconnect）。
+  - 關閉暫停中的結果時的 drain：KILL QUERY 送出後，讀列不設時間上限，但能讀的只剩 server 已經送出的列（本機 125 萬列約 3.7 秒，TLS 4.1 秒）。10 秒上限只用在兩處，超過就放棄這條連線（顯示 Reconnect）：KILL 送不出去時的整個 drain；以及 KILL 之後等待 CALL 下一個 result set 的時間合計（例如 procedure 在迴圈裡 `SLEEP()`，吞掉 KILL 後還一直送結果）。
   - Pure driver 的串流以絕對預算驗收（10 萬列 ≤ 2.0 秒、500 列一頁 ≤ 25 ms），不跟 PG 比：本機實測 10 萬列 0.59–0.60 秒、最慢一頁 3.5 ms。上面的 drain 與大量匯出若嫌慢，之後的優化是 C extension 或 bulk read（carry）。
-  - Table／view 超過 10,000 個的 server，補全用的 snapshot 只載入目前的 database（連線沒指定 database 就不載入）。
+  - Table／view 超過 10,000 個的 server，補全用的 snapshot 只載入目前的 database（連線沒指定 database 就不載入）。這是縮小範圍，不是大小上限：目前的 database 本身再大也會整個載入。
+  - Tab 不會跟著 `USE` 切換：補全的預設 schema 一直是 metadata 連線的 database（profile 的 database），`USE` 之後補全建議的未加前綴名稱可能屬於另一個 database。從 History 重開的 MySQL tab 會連到當時記錄的 database，UI 沒有 database picker 可以改；schema snapshot 每個 profile 只有一份（`SchemaCache` 對沒有 per-database 連線的 engine 忽略 database）。
   - Dev 的 `mysql` container 帶 `--log-bin-trust-function-creators=1`：8.4 預設開 binary log，沒有 SUPER 的 `dbaguy` 才能建 function 與 trigger。
 - 打包版量測（Apple Silicon、macOS 26；03a 時量，已拿掉 loguru `enqueue=True`、已加入 mysql-connector）：冷啟動到第一個 API 請求約 0.9–1.1 秒（每次重新 build 後的第一次啟動約 2.3 秒）；各程序 RSS 加總約 293–305 MB（上限值，共用頁面重複計算），`footprint` 加總約 156 MB（backend 約 70 MB）。Sidecar 約 41 MB，加入 MySQL 只多約 0.3 MB；如果讓 PyInstaller 自動收進 C extension 與它帶的 dylib，會變成約 54 MB。
 

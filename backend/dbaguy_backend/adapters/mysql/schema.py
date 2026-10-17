@@ -10,7 +10,8 @@ from ...sql.dialects import Dialect, quote_literal
 from . import catalog
 
 # Over this many tables and views on the server, only the current database's relations are loaded (information_schema
-# gets slow on a server with tens of thousands of tables).
+# gets slow on a server with tens of thousands of tables). It narrows the scope; it does not bound the size: a current
+# database that alone holds more relations than this is still loaded whole.
 RELATION_LIMIT = 10_000
 
 _SYSTEM_LIST = "(" + ", ".join(quote_literal(Dialect.MYSQL, name) for name in sorted(catalog.SYSTEM_SCHEMAS)) + ")"
@@ -80,7 +81,8 @@ def _fill_keys(conn: MySQLConnection, current_only: bool, relations: dict[tuple,
 
 
 def build_snapshot(conn: MySQLConnection) -> SchemaSnapshot:
-    """Schema snapshot of the server: every non-system database, or the current one over RELATION_LIMIT relations."""
+    """Schema snapshot of the server: every non-system database, or over RELATION_LIMIT relations only the current one
+    (none without one). That is a narrower scope, not a size cap: the current database is loaded whole however big."""
     schemas = {name: SnapshotSchema(name=name, system=is_system) for name, is_system in catalog.list_schemas(conn)}
     (count,) = catalog.query(conn, _COUNT.format(scope=f"TABLE_SCHEMA NOT IN {_SYSTEM_LIST}"))[0]
     current_only = count > RELATION_LIMIT
