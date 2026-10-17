@@ -77,7 +77,7 @@ MariaDB 專屬功能（相容的部分能用就好，不另測）、MySQL 5.7 �
 | 客戶端指令 | — | — | `DELIMITER x` | `GO [n]` |
 | body 追蹤 | `begin_atomic` | `trigger` | `compound`（CREATE PROCEDURE/FUNCTION/TRIGGER/EVENT 內的 BEGIN…END） | `tsql_block`（BEGIN…END、BEGIN TRY/CATCH） |
 
-- `quote_ident(dialect, name)`、`quote_literal(dialect, value)`、`bool_literal(dialect, value)`、`bytes_literal(dialect, hex)` 成為唯一的常值與識別字來源：MySQL `` `a``b` ``、`'it\\'s'`（反斜線也跳脫）、`TRUE/FALSE`、`X'0102'`；T-SQL `[a]]b]`、`N'中文'`、`1/0`、`0x0102`。`formatting._BOOL_SQL`／`_BYTES_SQL` 改為呼叫這些函式。
+- `quote_ident(dialect, name)`、`quote_literal(dialect, value)`、`bool_literal(dialect, value)`、`bytes_literal(dialect, hex)` 成為唯一的常值與識別字來源：MySQL `` `a``b` ``、`'it''s \\ x'`（`'` 與 `\` 都加倍，任何 sql_mode 都讀回原值）、`TRUE/FALSE`、`X'0102'`；T-SQL `[a]]b]`、`N'中文'`、`1/0`、`0x0102`。`formatting._BOOL_SQL`／`_BYTES_SQL` 改為呼叫這些函式。
 - 保留字表：MySQL 8.4、T-SQL 各一份（只放需要加引號的字）。
 
 ### 3.3 切分（`sql/lexer.py`、`sql/splitter.py`）
@@ -94,7 +94,7 @@ MariaDB 專屬功能（相容的部分能用就好，不另測）、MySQL 5.7 �
 - 補洞（詞法規則，在 sqlglot 失敗或回傳 `Command` 時）：
   - `SELECT … INTO OUTFILE|DUMPFILE` → WRITE（寫 server 檔案）；`SELECT … INTO @var` → READ。
   - `LOAD DATA`、`LOAD XML` → WRITE；`HANDLER`、`DO` → WRITE。
-  - 含 `EXEC_COMMENT` token 的語句 → UNKNOWN（唯讀時擋、strict 時確認）。
+  - 含 `/*! … */` 可執行註解的語句 → UNKNOWN（唯讀時擋、strict 時確認）；`/*+ … */` optimizer hint 不影響分類（不會寫入）。
   - `DELIMITER` 不會進到分類器（切分時已移除）。
   - T-SQL：`DECLARE`（含 table variable）、`PRINT`、`SET @var = …`、`SELECT @var = …` → READ；`EXEC`／`EXECUTE`、`sp_executesql` → UNKNOWN（程序可能寫入）；`WAITFOR` → READ；`DBCC`、`BACKUP`、`RESTORE`、`BULK INSERT`、`KILL` → UNKNOWN／WRITE。
 - 唯讀允許的 SESSION 語句（依方言的白名單，取代只認 PG 的 `_harmless_pg_setting`）：
@@ -108,14 +108,14 @@ MariaDB 專屬功能（相容的部分能用就好，不另測）、MySQL 5.7 �
 ### 3.5 MySQL adapter（`adapters/mysql/`）
 
 - **連線**：`mysql.connector.connect(use_pure=True, autocommit=True, client_flags=[-MULTI_STATEMENTS], connection_timeout=10, charset="utf8mb4")`。TCP keepalive 由 socket 選項開啟。記下 `connection_id`。`options` 傳給 driver，保留鍵（user、password、host、port、database、client_flags、use_pure、allow_local_infile…）不得覆寫；`allow_local_infile` 一律關閉。
-- **TLS**（`SslConfig.mode` 對應）：disable → `ssl_disabled`；prefer → 預設（嘗試 TLS、不驗證）；require → 必須 TLS、不驗證；verify-ca → `ssl_verify_cert` + CA；verify-full → 再加 `ssl_verify_identity`。經 SSH tunnel 時 verify-full 若 driver 無法對真實 host 名稱驗證，連線失敗並說明（fail closed）。
+- **TLS**（`SslConfig.mode` 對應）：disable → `ssl_disabled`；prefer → 預設（嘗試 TLS、不驗證）；require → 必須 TLS、不驗證（driver 無法表達「必須」，連線後檢查 `is_secure`，不是 TLS 就斷線報錯）；verify-ca → `ssl_verify_cert` + CA；verify-full → 再加 `ssl_verify_identity`。經 SSH tunnel 時 verify-full 若 driver 無法對真實 host 名稱驗證，連線失敗並說明（fail closed）。
 - **URL**：`mysql://`、`mysql+mysqlconnector://`、`mysql+pymysql://`、`jdbc:mysql://`；`ssl-mode`／`sslmode` 查詢參數對應 `SslConfig`。Registry 對 `jdbc:` 前綴先去掉再判斷 scheme。
 - **執行**：`cursor(raw=True)`、unbuffered，一律不帶參數；結果逐頁 `fetchmany`。`CALL` 之後迴圈 `nextset()` 到結束。零列結果的欄位標題來自 `description`。
 - **型別**（text-first，同 PG）：raw bytes 依欄位型別轉換 — 整數 → int、`FLOAT/DOUBLE` → float、`DECIMAL` → str、`DATE/DATETIME/TIMESTAMP/TIME/YEAR` → str（保留 `0000-00-00`）、`JSON` → str（category json）、二進位 charset（63）的 BLOB/BINARY/VARBINARY → bytes、`BIT` → int、其他 → utf-8 字串。Category 對照表在 `adapters/mysql/types.py`。
 - **取消**：`cancel()` 用相同 endpoint 與帳密開短連線（`connection_timeout=3`）送 `KILL QUERY <id>`，並記下「這句已被 kill」；該句之後回傳的結果或 1317 錯誤一律轉成 `StatementCancelled`。`StatementResult.close()` 對未讀完的串流也用 `KILL QUERY` 再丟棄剩餘封包，交易不受影響。
 - **交易狀態**：`in_transaction` 來自協定狀態旗標（不往返）；`autocommit` 為 adapter 記錄的值，沒有未讀結果時用 `SELECT @@autocommit` 校正（使用者自己打 `SET autocommit=…`）。`set_autocommit` 送 `SET autocommit=0|1`，交易中時回 `transaction_open`。`transaction_failed` 永遠 False。DDL 隱含 commit，狀態旗標自然反映。
 - **錯誤**：`errno` + SQLSTATE + 訊息；連線類錯誤（2006、2013、2055 等）→ `connection_lost`；錯誤位置只有「at line N」時轉成 `ErrorPosition(line, 1)`。
-- **物件瀏覽**：root → 資料庫（kind `schema`；`information_schema`、`mysql`、`performance_schema`、`sys` 標為系統）→ 資料夾 Tables／Views／Functions／Procedures／Triggers／Events（只列非空）→ 物件；表 → Columns／Indexes／Foreign keys／Triggers。新增 kind `event`、資料夾 `EVENTS`。
+- **物件瀏覽**：root → 資料庫（kind `schema`；`information_schema`、`mysql`、`performance_schema`、`sys` 標為系統）→ 資料夾 Tables／Views／Functions／Procedures／Triggers／Events（只列非空）→ 物件；表 → Columns／Indexes／Foreign keys／Triggers。新增 kind `event`、`foreign_key`，資料夾 `EVENTS`、`FOREIGN_KEYS`（index 與 FK 的 DDL 由 catalog 組成）。
 - **DDL**：`SHOW CREATE TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|EVENT`（server 原文，`ddl_is_generated = False`）。
 - **Snapshot**：一次查 `information_schema` 的 SCHEMATA、TABLES、COLUMNS、KEY_COLUMN_USAGE（PK、FK）、ROUTINES，涵蓋所有非系統資料庫；`default_schema` 與 `search_path` 為連線的目前資料庫。關聯數超過 10,000 時只載入目前資料庫並記 log。
 - **Server info**：`VERSION()`、`DATABASE()`、`CURRENT_USER()`。
