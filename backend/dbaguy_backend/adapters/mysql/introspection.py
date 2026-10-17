@@ -5,6 +5,7 @@ Every name interpolated into SQL goes through `quote_ident_mysql`; every value g
 """
 
 import mysql.connector
+from loguru import logger
 from mysql.connector.connection import MySQLConnection
 
 from ...domain.errors import NotFound, ValidationFailed
@@ -21,6 +22,7 @@ UNION ALL SELECT 'procedures', COUNT(*) FROM information_schema.ROUTINES
     WHERE ROUTINE_SCHEMA = %s AND ROUTINE_TYPE = 'PROCEDURE'
 UNION ALL SELECT 'triggers', COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = %s
 UNION ALL SELECT 'events', COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA = %s
+UNION ALL SELECT 'exists', COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s
 """
 _TABLE_FOLDER_COUNTS = """
 SELECT 'indexes', COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
@@ -28,6 +30,7 @@ UNION ALL SELECT 'foreign_keys', COUNT(*) FROM information_schema.REFERENTIAL_CO
     WHERE CONSTRAINT_SCHEMA = %s AND TABLE_NAME = %s
 UNION ALL SELECT 'triggers', COUNT(*) FROM information_schema.TRIGGERS
     WHERE EVENT_OBJECT_SCHEMA = %s AND EVENT_OBJECT_TABLE = %s
+UNION ALL SELECT 'exists', COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
 """
 _OBJECTS: dict[Folder, str] = {  # (name, detail); the order is the order of the schema's folders
     Folder.TABLES: "SELECT TABLE_NAME, NULL FROM information_schema.TABLES "
@@ -76,6 +79,12 @@ JOIN information_schema.REFERENTIAL_CONSTRAINTS r
 WHERE k.TABLE_SCHEMA = %s AND k.TABLE_NAME = %s AND k.CONSTRAINT_NAME = %s ORDER BY k.ORDINAL_POSITION
 """
 _TABLE_COMMENT = "SELECT TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s"
+_VIEW_DEFINITION = "SELECT VIEW_DEFINITION FROM information_schema.VIEWS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s"
+# Run only when a query came back empty, to tell an empty answer from a schema or table that is gone.
+_PRESENCE = (
+    "SELECT (SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s), "
+    "(SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s)"
+)
 
 _KIND_OF_FOLDER: dict[Folder, NodeKind] = {
     Folder.TABLES: NodeKind.TABLE,
@@ -98,16 +107,29 @@ _SHOW_CREATE: dict[NodeKind, tuple[str, int]] = {
 _GENERATED = (NodeKind.INDEX, NodeKind.FOREIGN_KEY, NodeKind.COLUMN)  # leaves of a table: the path holds the table
 
 
+# Whether the schema (and table) a call names still exists is not a query of its own: it rides on the count query of
+# the level (an `exists` row) or is only asked once an answer came back empty or failed, so the common path of every
+# call is one round trip, however far the connection is.
+
+
 def _require_schema(conn: MySQLConnection, name: str) -> None:
     if catalog.first_row(conn, "SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s", (name,)) is None:
         raise NotFound(f"Schema '{name}' not found")
 
 
-def _schema_of(conn: MySQLConnection, path: list[PathSegment]) -> str:
-    """The schema a path starts at, which must exist."""
+def _require_table(conn: MySQLConnection, schema: str, table: str, kind: str) -> None:
+    """After an empty answer about a table's children: NotFound when the schema or the table is gone."""
+    schema_count, table_count = catalog.first_row(conn, _PRESENCE, (schema, schema, table))
+    if not schema_count:
+        raise NotFound(f"Schema '{schema}' not found")
+    if not table_count:
+        raise NotFound(f"{kind} '{table}' not found")
+
+
+def _schema_name(path: list[PathSegment]) -> str:
+    """The schema a path starts at (it is not looked up here: the level's own query does that)."""
     if path[0].kind != NodeKind.SCHEMA:
         raise ValidationFailed(f"A path starts at a schema, not at a {path[0].kind}")
-    _require_schema(conn, path[0].name)
     return path[0].name
 
 
@@ -152,7 +174,7 @@ def list_children(conn: MySQLConnection, path: list[PathSegment]) -> list[Object
             make_node(path, NodeKind.SCHEMA, name, has_children=True, system=is_system)
             for name, is_system in catalog.list_schemas(conn)
         ]
-    schema = _schema_of(conn, path)
+    schema = _schema_name(path)
     last = path[-1]
     folder = _folder(last.name) if last.kind == NodeKind.FOLDER else None  # unknown folder names fail at any depth
     depth = len(path)
@@ -167,55 +189,86 @@ def list_children(conn: MySQLConnection, path: list[PathSegment]) -> list[Object
     return []
 
 
+def _counts(conn: MySQLConnection, sql: str, *names: str) -> dict[str, int]:
+    """A UNION ALL of ('label', COUNT(*)) rows; every `%s` of the statement takes the same `names`."""
+    return dict(catalog.query(conn, sql, list(names) * (sql.count("%s") // len(names))))
+
+
 def _schema_folders(conn: MySQLConnection, path: list[PathSegment], schema: str) -> list[ObjectNode]:
-    counts = dict(catalog.query(conn, _FOLDER_COUNTS, [schema] * len(_OBJECTS)))
-    return [make_node(path, NodeKind.FOLDER, folder, has_children=True) for folder in _OBJECTS if counts.get(folder)]
+    counts = _counts(conn, _FOLDER_COUNTS, schema)
+    if not counts["exists"]:
+        raise NotFound(f"Schema '{schema}' not found")
+    return [make_node(path, NodeKind.FOLDER, folder, has_children=True) for folder in _OBJECTS if counts[folder]]
 
 
 def _schema_objects(conn: MySQLConnection, path: list[PathSegment], schema: str, folder: Folder) -> list[ObjectNode]:
     if folder not in _OBJECTS:
         raise ValidationFailed(f"Folder '{folder}' is not listed at schema level")
+    rows = catalog.query(conn, _OBJECTS[folder], (schema,))
+    if not rows:
+        _require_schema(conn, schema)  # a folder is listed only when it has objects: empty means stale or gone
     kind = _KIND_OF_FOLDER[folder]
-    return [
-        make_node(path, kind, name, has_children=kind in _HAS_FOLDERS, detail=detail)
-        for name, detail in catalog.query(conn, _OBJECTS[folder], (schema,))
-    ]
+    return [make_node(path, kind, name, has_children=kind in _HAS_FOLDERS, detail=detail) for name, detail in rows]
 
 
 def _table_folders(conn: MySQLConnection, path: list[PathSegment], schema: str, table: PathSegment) -> list[ObjectNode]:
+    counts = _counts(conn, _TABLE_FOLDER_COUNTS, schema, table.name)
+    if not counts["exists"]:
+        _require_table(conn, schema, table.name, table.kind)  # tells a dropped schema from a dropped table
+        raise NotFound(f"{table.kind} '{table.name}' not found")
     folders = [Folder.COLUMNS]
-    if table.kind == NodeKind.TABLE:
-        counts = dict(catalog.query(conn, _TABLE_FOLDER_COUNTS, [schema, table.name] * 3))
-        folders += [folder for folder in (Folder.INDEXES, Folder.FOREIGN_KEYS, Folder.TRIGGERS) if counts.get(folder)]
+    if table.kind == NodeKind.TABLE:  # a view has no indexes, foreign keys or triggers
+        folders += [folder for folder in (Folder.INDEXES, Folder.FOREIGN_KEYS, Folder.TRIGGERS) if counts[folder]]
     return [make_node(path, NodeKind.FOLDER, folder, has_children=True) for folder in folders]
 
 
+def _column_nodes(conn: MySQLConnection, path: list[PathSegment], schema: str, table: str) -> list[ObjectNode]:
+    return [
+        make_node(path, NodeKind.COLUMN, col.name, has_children=False, detail=_column_detail(col))
+        for col in columns(conn, schema, table)
+    ]
+
+
+def _index_nodes(conn: MySQLConnection, path: list[PathSegment], schema: str, table: str) -> list[ObjectNode]:
+    return [
+        make_node(path, NodeKind.INDEX, name, has_children=False, detail=_index_detail(name, non_unique))
+        for name, non_unique in catalog.query(conn, _INDEXES, (schema, table))
+    ]
+
+
+def _foreign_key_nodes(conn: MySQLConnection, path: list[PathSegment], schema: str, table: str) -> list[ObjectNode]:
+    return [
+        make_node(
+            path, NodeKind.FOREIGN_KEY, name, has_children=False,
+            detail=f"({cols}) → {ref_schema}.{ref_table} ({ref_cols})",
+        )
+        for name, cols, ref_schema, ref_table, ref_cols in catalog.query(conn, _FOREIGN_KEYS, (schema, table))
+    ]
+
+
+def _trigger_nodes(conn: MySQLConnection, path: list[PathSegment], schema: str, table: str) -> list[ObjectNode]:
+    return [
+        make_node(path, NodeKind.TRIGGER, name, has_children=False, detail=timing)
+        for name, timing in catalog.query(conn, _TABLE_TRIGGERS, (schema, table))
+    ]
+
+
+_TABLE_LEAVES = {
+    Folder.COLUMNS: _column_nodes,
+    Folder.INDEXES: _index_nodes,
+    Folder.FOREIGN_KEYS: _foreign_key_nodes,
+    Folder.TRIGGERS: _trigger_nodes,
+}
+
+
 def _table_children(conn: MySQLConnection, path: list[PathSegment], schema: str, folder: Folder) -> list[ObjectNode]:
-    table = path[2].name
-    if folder == Folder.COLUMNS:
-        return [
-            make_node(path, NodeKind.COLUMN, col.name, has_children=False, detail=_column_detail(col))
-            for col in columns(conn, schema, table)
-        ]
-    if folder == Folder.INDEXES:
-        return [
-            make_node(path, NodeKind.INDEX, name, has_children=False, detail=_index_detail(name, non_unique))
-            for name, non_unique in catalog.query(conn, _INDEXES, (schema, table))
-        ]
-    if folder == Folder.FOREIGN_KEYS:
-        return [
-            make_node(
-                path, NodeKind.FOREIGN_KEY, name, has_children=False,
-                detail=f"({cols}) → {ref_schema}.{ref_table} ({ref_cols})",
-            )
-            for name, cols, ref_schema, ref_table, ref_cols in catalog.query(conn, _FOREIGN_KEYS, (schema, table))
-        ]
-    if folder == Folder.TRIGGERS:
-        return [
-            make_node(path, NodeKind.TRIGGER, name, has_children=False, detail=timing)
-            for name, timing in catalog.query(conn, _TABLE_TRIGGERS, (schema, table))
-        ]
-    raise ValidationFailed(f"Folder '{folder}' is not listed under a table")
+    if folder not in _TABLE_LEAVES:
+        raise ValidationFailed(f"Folder '{folder}' is not listed under a table")
+    table = path[2]
+    nodes = _TABLE_LEAVES[folder](conn, path, schema, table.name)
+    if not nodes:  # a table always has columns and a folder is listed only when it has leaves: stale, or gone
+        _require_table(conn, schema, table.name, table.kind)
+    return nodes
 
 
 # ---- details -------------------------------------------------------------------------------------------------------
@@ -223,37 +276,58 @@ def _table_children(conn: MySQLConnection, path: list[PathSegment], schema: str,
 
 def _index_ddl(schema: str, table: str, name: str, parts: list[tuple]) -> str:
     """parts: (NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, COLLATION, EXPRESSION) in index order."""
-    columns = ", ".join(
+    key_columns = ", ".join(
         (f"({expression})" if expression else q(column) + (f"({sub_part})" if sub_part else ""))
         + (" DESC" if collation == "D" else "")
         for _, _, column, sub_part, collation, expression in parts
     )
     target = f"{q(schema)}.{q(table)}"
     if name == "PRIMARY":
-        return f"ALTER TABLE {target} ADD PRIMARY KEY ({columns});"
+        return f"ALTER TABLE {target} ADD PRIMARY KEY ({key_columns});"
     non_unique, index_type = parts[0][0], parts[0][1]
     prefix = {"FULLTEXT": "FULLTEXT ", "SPATIAL": "SPATIAL "}.get(index_type, "" if non_unique else "UNIQUE ")
-    return f"CREATE {prefix}INDEX {q(name)} ON {target} ({columns});"
+    return f"CREATE {prefix}INDEX {q(name)} ON {target} ({key_columns});"
 
 
 def _foreign_key_ddl(schema: str, table: str, name: str, parts: list[tuple]) -> str:
     """parts: (COLUMN_NAME, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, UPDATE_RULE,
     DELETE_RULE) in key order."""
     _, ref_schema, ref_table, _, on_update, on_delete = parts[0]
-    columns = ", ".join(q(p[0]) for p in parts)
+    key_columns = ", ".join(q(p[0]) for p in parts)
     ref_columns = ", ".join(q(p[3]) for p in parts)
     return (
-        f"ALTER TABLE {q(schema)}.{q(table)} ADD CONSTRAINT {q(name)} FOREIGN KEY ({columns}) "
+        f"ALTER TABLE {q(schema)}.{q(table)} ADD CONSTRAINT {q(name)} FOREIGN KEY ({key_columns}) "
         f"REFERENCES {q(ref_schema)}.{q(ref_table)} ({ref_columns}) ON UPDATE {on_update} ON DELETE {on_delete};"
     )
 
 
-def _server_ddl(conn: MySQLConnection, schema: str, kind: NodeKind, name: str) -> str | None:
+def _view_definition_ddl(conn: MySQLConnection, schema: str, name: str) -> str | None:
+    """The best DDL of a view whose SHOW CREATE is refused: its definition, when information_schema shows it."""
+    row = catalog.first_row(conn, _VIEW_DEFINITION, (schema, name))
+    return f"CREATE VIEW {q(schema)}.{q(name)} AS {row[0]};" if row and row[0] else None
+
+
+def _server_ddl(conn: MySQLConnection, schema: str, kind: NodeKind, name: str) -> tuple[str | None, bool]:
+    """(ddl, is_generated): the server's own text; None when the account may not read it."""
     word, ddl_index = _SHOW_CREATE[kind]
-    row = catalog.first_row(conn, f"SHOW CREATE {word} {q(schema)}.{q(name)}")
+    try:
+        row = catalog.first_row(conn, f"SHOW CREATE {word} {q(schema)}.{q(name)}")
+    except mysql.connector.Error as exc:
+        if exc.errno not in catalog.UNREADABLE_DEFINITION_ERRNOS:
+            raise
+        _require_schema(conn, schema)  # a dropped schema answers 1142 as well; that one is NotFound
+        logger.debug(
+            "MySQL error {} on SHOW CREATE {} {}.{}: no server DDL ({})", exc.errno, word, schema, name, exc.msg
+        )
+        if kind == NodeKind.VIEW:
+            return _view_definition_ddl(conn, schema, name), True
+        return None, False
     if row is None:
         raise NotFound(f"{kind} '{name}' not found")
-    return f"{row[ddl_index]};" if row[ddl_index] else None  # NULL: the account may not see the definition
+    if not row[ddl_index]:  # NULL: the account may not see the definition
+        logger.debug("MySQL SHOW CREATE {} {}.{} returned no definition", word, schema, name)
+        return None, False
+    return f"{row[ddl_index]};", False
 
 
 def _generated_ddl(conn: MySQLConnection, schema: str, table: str, kind: NodeKind, name: str) -> str:
@@ -264,6 +338,7 @@ def _generated_ddl(conn: MySQLConnection, schema: str, table: str, kind: NodeKin
         parts = catalog.query(conn, _FOREIGN_KEY_PARTS, (schema, table, name))
         build = _foreign_key_ddl
     if not parts:
+        _require_table(conn, schema, table, NodeKind.TABLE)
         raise NotFound(f"{kind} '{name}' not found")
     return build(schema, table, name, parts)
 
@@ -272,13 +347,13 @@ def _detail(conn: MySQLConnection, path: list[PathSegment], schema: str) -> Obje
     last = path[-1]
     kind = NodeKind(last.kind) if last.kind in NodeKind else None
     if kind in _SHOW_CREATE:
-        ddl = _server_ddl(conn, schema, kind, last.name)
+        ddl, is_generated = _server_ddl(conn, schema, kind, last.name)
         comment = None
         if kind == NodeKind.TABLE:
             row = catalog.first_row(conn, _TABLE_COMMENT, (schema, last.name))
             comment = (row[0] or None) if row else None
         return ObjectDetail(
-            path=path, kind=last.kind, name=last.name, ddl=ddl,
+            path=path, kind=last.kind, name=last.name, ddl=ddl, ddl_is_generated=is_generated and ddl is not None,
             columns=columns(conn, schema, last.name) if kind in _HAS_FOLDERS else None, comment=comment,
         )
     if kind in _GENERATED:
@@ -288,6 +363,7 @@ def _detail(conn: MySQLConnection, path: list[PathSegment], schema: str) -> Obje
         if kind == NodeKind.COLUMN:
             match = [col for col in columns(conn, schema, table) if col.name == last.name]
             if not match:
+                _require_table(conn, schema, table, NodeKind.TABLE)
                 raise NotFound(f"Column '{last.name}' not found")
             return ObjectDetail(path=path, kind=last.kind, name=last.name, columns=match)
         ddl = _generated_ddl(conn, schema, table, kind, last.name)
@@ -298,10 +374,15 @@ def _detail(conn: MySQLConnection, path: list[PathSegment], schema: str) -> Obje
 def object_detail(conn: MySQLConnection, path: list[PathSegment]) -> ObjectDetail:
     if not path:
         raise ValidationFailed("Empty path")
-    schema = _schema_of(conn, path)
+    schema = _schema_name(path)
     try:
         return _detail(conn, path, schema)
     except mysql.connector.Error as exc:
-        if exc.errno in catalog.MISSING_OBJECT_ERRNOS:
-            raise NotFound(f"{path[-1].kind} '{path[-1].name}' not found") from exc
+        missing = exc.errno in catalog.MISSING_OBJECT_ERRNOS
+        if missing or exc.errno in catalog.ACCESS_DENIED_ERRNOS:
+            _require_schema(conn, schema)  # the server words a dropped schema in several ways: say so plainly
+        if missing:
+            kind, name = path[-1].kind, path[-1].name
+            logger.debug("MySQL error {} on {} {}.{} mapped to NotFound ({})", exc.errno, kind, schema, name, exc.msg)
+            raise NotFound(f"{kind} '{name}' not found") from exc
         raise  # MetadataService retries once, then reports QueryFailed

@@ -1,5 +1,6 @@
 import mysql.connector
 import pytest
+from loguru import logger
 from mysql.connector.cursor import MySQLCursorBuffered
 
 from dbaguy_backend.adapters.mysql import catalog, introspection, schema as mysql_schema
@@ -29,6 +30,33 @@ def sql_log(monkeypatch):
 
     monkeypatch.setattr(MySQLCursorBuffered, "execute", spy)
     return seen
+
+
+@pytest.fixture
+def debug_log():
+    """The messages loguru writes at DEBUG and above."""
+    messages: list[str] = []
+    sink_id = logger.add(messages.append, level="DEBUG", format="{message}")
+    yield messages
+    logger.remove(sink_id)
+
+
+@pytest.fixture
+def show_create_refused(monkeypatch):
+    """Make the server refuse SHOW CREATE the way an account without SHOW VIEW is refused (errno chosen per test)."""
+    original = catalog.first_row
+
+    def install(errno, *, view_definition=None):
+        def patched(conn, sql, params=()):
+            if sql.startswith("SHOW CREATE"):
+                raise mysql.connector.errors.ProgrammingError(msg=f"refused ({errno})", errno=errno, sqlstate="42000")
+            if view_definition is not None and "VIEW_DEFINITION" in sql:
+                return (view_definition,)
+            return original(conn, sql, params)
+
+        monkeypatch.setattr(catalog, "first_row", patched)
+
+    return install
 
 
 def seg(kind, name):
@@ -200,6 +228,18 @@ def test_every_missing_kind_is_not_found(conn):
         introspection.object_detail(conn, [*DB, seg("folder", "tables"), seg("table", "100%s%")])
 
 
+@pytest.mark.parametrize(
+    ("folder", "kind"),
+    [("tables", "table"), ("views", "view"), ("procedures", "procedure"), ("functions", "function"),
+     ("triggers", "trigger"), ("events", "event")],
+)
+def test_a_dropped_schema_is_named_whatever_the_server_says(conn, folder, kind):
+    """The server answers 1142, 1305, 1049 or 1044 for a missing schema depending on the statement and the grants."""
+    path = [seg("schema", "nope"), seg("folder", folder), seg(kind, "x")]
+    with pytest.raises(NotFound, match="Schema 'nope' not found"):
+        introspection.object_detail(conn, path)
+
+
 def test_invalid_paths_are_rejected(conn):
     with pytest.raises(ValidationFailed):
         introspection.list_children(conn, [*DB, seg("folder", "nonsense")])
@@ -326,3 +366,140 @@ def test_catalog_query_decodes_and_never_pings(conn, monkeypatch):
 def test_catalog_constants():
     assert catalog.SYSTEM_SCHEMAS == frozenset({"information_schema", "mysql", "performance_schema", "sys"})
     assert catalog.MISSING_OBJECT_ERRNOS == frozenset({1049, 1146, 1305, 1360, 1539})
+
+
+# ---- fix round 1 ---------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("errno", sorted(catalog.UNREADABLE_DEFINITION_ERRNOS))
+def test_view_detail_survives_a_refused_show_create(conn, show_create_refused, debug_log, errno):
+    """No SHOW VIEW (1142) or an invalid view (1356): the columns stay and the definition replaces the server DDL."""
+    show_create_refused(errno)
+    view = introspection.object_detail(conn, [*DB, seg("folder", "views"), seg("view", "order_summary")])
+    assert view.ddl.startswith("CREATE VIEW `dbaguy`.`order_summary` AS select") and view.ddl.endswith(";")
+    assert view.ddl_is_generated
+    assert [c.name for c in view.columns] == ["name", "orders", "total"]
+    assert any(str(errno) in message and "SHOW CREATE VIEW" in message for message in debug_log)
+
+
+def test_view_detail_without_a_readable_definition(conn, show_create_refused):
+    show_create_refused(1142, view_definition="")  # information_schema hides the definition too
+    view = introspection.object_detail(conn, [*DB, seg("folder", "views"), seg("view", "order_summary")])
+    assert view.ddl is None and not view.ddl_is_generated
+    assert [c.name for c in view.columns] == ["name", "orders", "total"]
+
+
+@pytest.mark.parametrize(
+    ("folder", "kind", "name"),
+    [("tables", "table", "customers"), ("procedures", "procedure", "two_results"),
+     ("functions", "function", "add_numbers"), ("triggers", "trigger", "orders_note"),
+     ("events", "event", "purge_job_log")],
+)
+def test_other_kinds_without_server_ddl_have_no_ddl(conn, show_create_refused, folder, kind, name):
+    show_create_refused(1142)
+    detail = introspection.object_detail(conn, [*DB, seg("folder", folder), seg(kind, name)])
+    assert detail.ddl is None and not detail.ddl_is_generated
+    if kind == "table":  # what information_schema still shows stays
+        assert [c.name for c in detail.columns][:2] == ["id", "email"] and detail.comment == "Customer master data"
+
+
+def test_other_show_create_errors_still_propagate(conn, show_create_refused):
+    show_create_refused(1064)
+    with pytest.raises(mysql.connector.Error) as caught:
+        introspection.object_detail(conn, ORDERS)
+    assert caught.value.errno == 1064
+
+
+def test_a_dropped_schema_is_not_taken_for_a_refused_show_create(conn, show_create_refused):
+    show_create_refused(1142)  # what the server really answers for a table of a missing schema
+    with pytest.raises(NotFound, match="Schema 'nope' not found"):
+        introspection.object_detail(conn, [seg("schema", "nope"), seg("folder", "tables"), seg("table", "orders")])
+
+
+def test_not_found_errnos_are_logged_at_debug(conn, debug_log):
+    with pytest.raises(NotFound):
+        introspection.object_detail(conn, [*DB, seg("folder", "procedures"), seg("procedure", "nope")])
+    assert any("1305" in message and "NotFound" in message for message in debug_log)
+
+
+def test_a_stale_node_is_not_found_at_every_level(conn):
+    """A vanished schema, table or view raises NotFound instead of listing empty folders."""
+    tables = [*DB, seg("folder", "tables")]
+    stale = [
+        [seg("schema", "nope")],
+        [seg("schema", "nope"), seg("folder", "tables")],
+        [*tables, seg("table", "nope")],
+        [*DB, seg("folder", "views"), seg("view", "nope")],
+        [seg("schema", "nope"), seg("folder", "tables"), seg("table", "orders")],
+        [*tables, seg("table", "nope"), seg("folder", "columns")],
+        [*tables, seg("table", "nope"), seg("folder", "indexes")],
+        [seg("schema", "nope"), seg("folder", "tables"), seg("table", "orders"), seg("folder", "columns")],
+    ]
+    for path in stale:
+        with pytest.raises(NotFound):
+            introspection.list_children(conn, path)
+    with pytest.raises(NotFound, match="Schema 'nope' not found"):
+        introspection.list_children(conn, [seg("schema", "nope"), seg("folder", "tables"), seg("table", "orders")])
+    with pytest.raises(NotFound, match="table 'nope' not found"):
+        introspection.list_children(conn, [*tables, seg("table", "nope")])
+    with pytest.raises(NotFound, match="view 'nope' not found"):
+        introspection.list_children(conn, [*DB, seg("folder", "views"), seg("view", "nope")])
+    with pytest.raises(NotFound, match="table 'nope' not found"):
+        introspection.list_children(conn, [*tables, seg("table", "nope"), seg("folder", "columns")])
+    with pytest.raises(NotFound, match="Schema 'nope' not found"):
+        introspection.object_detail(
+            conn, [seg("schema", "nope"), seg("folder", "tables"), seg("table", "orders"),
+                   seg("folder", "indexes"), seg("index", "PRIMARY")]
+        )
+    with pytest.raises(NotFound, match="table 'nope' not found"):
+        introspection.object_detail(
+            conn, [*tables, seg("table", "nope"), seg("folder", "indexes"), seg("index", "PRIMARY")]
+        )
+
+
+def test_an_empty_table_folder_of_an_existing_table_is_just_empty(conn):
+    """The existence check must not turn a legitimately empty answer into NotFound."""
+    tick = [*DB, seg("folder", "tables"), seg("table", "tick`table")]
+    assert introspection.list_children(conn, [*tick, seg("folder", "foreign_keys")]) == []
+    assert introspection.list_children(conn, [*tick, seg("folder", "triggers")]) == []
+
+
+@pytest.mark.parametrize(
+    ("label", "path", "queries"),
+    [
+        ("schemas", [], 1),
+        ("schema folders", DB, 1),
+        ("tables", [*DB, seg("folder", "tables")], 1),
+        ("table folders", ORDERS, 1),
+        ("view folders", [*DB, seg("folder", "views"), seg("view", "order_summary")], 1),
+        ("columns", [*ORDERS, seg("folder", "columns")], 1),
+        ("indexes", [*ORDERS, seg("folder", "indexes")], 1),
+        ("foreign keys", [*ORDERS, seg("folder", "foreign_keys")], 1),
+        ("table triggers", [*ORDERS, seg("folder", "triggers")], 1),
+    ],
+)
+def test_listing_is_one_round_trip(conn, sql_log, label, path, queries):
+    """Over an SSH tunnel every query costs a round trip, so the schema/table check rides on the level's own query."""
+    _ = conn.sql_mode  # the driver reads it once per connection before it first substitutes parameters
+    sql_log.clear()
+    introspection.list_children(conn, path)
+    assert len(sql_log) == queries, f"{label}: {sql_log}"
+
+
+@pytest.mark.parametrize(
+    ("label", "path", "queries"),
+    [
+        ("table", ORDERS, 3),  # SHOW CREATE, TABLE_COMMENT, COLUMNS
+        ("view", [*DB, seg("folder", "views"), seg("view", "order_summary")], 2),  # SHOW CREATE, COLUMNS
+        ("procedure", [*DB, seg("folder", "procedures"), seg("procedure", "two_results")], 1),
+        ("trigger", [*ORDERS, seg("folder", "triggers"), seg("trigger", "orders_note")], 1),
+        ("index", [*ORDERS, seg("folder", "indexes"), seg("index", "PRIMARY")], 1),
+        ("foreign key", [*ORDERS, seg("folder", "foreign_keys"), seg("foreign_key", "orders_customer_fk")], 1),
+        ("column", [*ORDERS, seg("folder", "columns"), seg("column", "id")], 1),
+    ],
+)
+def test_detail_has_no_query_for_the_schema_check(conn, sql_log, label, path, queries):
+    _ = conn.sql_mode
+    sql_log.clear()
+    introspection.object_detail(conn, path)
+    assert len(sql_log) == queries, f"{label}: {sql_log}"
