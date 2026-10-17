@@ -3,11 +3,9 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { toast } from "@/components/ui/Toast";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import type { AppSettings, GuardDecision } from "@/lib/api/types";
-import { useEngineInfo } from "../connections/hooks";
 import { refreshHistory } from "../history/useHistory";
 import { CONNECTION_LOST, type ExecutionState } from "../session/execution";
 import { busy, type SessionController } from "../session/SessionController";
-import { cancelAbortsTransaction } from "../session/transactions";
 import type { PlannedStatement } from "./runPlan";
 
 export type StepStatus = "pending" | "running" | "done" | "error" | "cancelled" | "skipped";
@@ -106,10 +104,9 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
   /** The statements are being checked (`/sql/analyze`) before any is sent: a long script takes a moment. */
   const [checking, setChecking] = useState(false);
   const qc = useQueryClient();
-  const cancelAborts = cancelAbortsTransaction(useEngineInfo(profileId));
-  const latest = useRef({ controller, profileId, settings, timeoutS, listener, cancelAborts });
+  const latest = useRef({ controller, profileId, settings, timeoutS, listener });
   useLayoutEffect(() => {
-    latest.current = { controller, profileId, settings, timeoutS, listener, cancelAborts };
+    latest.current = { controller, profileId, settings, timeoutS, listener };
   });
   const active = useRef<ActiveRun | null>(null);
   /** The open confirmation's answer: a tab closed while it is open answers "no", so the run never hangs. */
@@ -269,15 +266,13 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
   }, []);
 
   /**
-   * Sends no further statement. Used once the tab is closing, so a COMMIT chosen then never commits only part of the
-   * script. The running statement is cancelled too where a cancel keeps the transaction (MySQL); where it would abort
-   * an open transaction (PostgreSQL) it is left to finish.
+   * Sends no further statement, so a COMMIT chosen in the close guards never commits only part of the script. The
+   * running statement is left to finish on every engine (R-03a-F4): this runs before the guards ask anything, so a
+   * cancel here would lose it even if the user then answers Cancel, and a Commit would silently leave it out. Closing
+   * the session interrupts it anyway.
    */
   const stop = useCallback(() => {
-    const job = active.current;
-    if (!job) return;
-    job.cancelled = true;
-    if (job.requestId && !latest.current.cancelAborts) job.controller.cancel(job.requestId);
+    if (active.current) active.current.cancelled = true;
   }, []);
 
   const run = result && result.controller === controller ? result.run : null;
