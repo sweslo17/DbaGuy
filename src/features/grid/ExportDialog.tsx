@@ -12,6 +12,7 @@ import { plural } from "@/lib/format";
 import { isImeKeyEvent } from "@/lib/ime";
 import { canChooseFiles, chooseSavePath } from "@/lib/native";
 import { useNow } from "@/lib/useNow";
+import { useEngineInfo } from "../connections/hooks";
 import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
 import type { SessionController } from "../session/SessionController";
 import { EXPORT_CANCEL_ABORTS_TRANSACTION } from "../session/transactions";
@@ -127,8 +128,9 @@ function OutcomeNote({ outcome }: { outcome: Outcome }) {
  * session and streams the raw values through the shared formatter, which also ends the grid's paused page. While the
  * export runs the dialog shows its progress and can only be left by cancelling it — or closed while the session is
  * not connected, since the export is interrupted then anyway; an error or a cancel keeps the dialog open with the
- * settings, so the path can be changed and the export retried. Inside an open transaction, cancelling would abort it:
- * the dialog says so beside Cancel and asks before cancelling. Hosted by the tab, so a remounting grid never ends it.
+ * settings, so the path can be changed and the export retried. Inside an open transaction on an engine where cancelling
+ * aborts it (PostgreSQL), the dialog says so beside Cancel and asks before cancelling. Hosted by the tab, so a
+ * remounting grid never ends it.
  */
 export function ExportDialog({
   source,
@@ -140,6 +142,7 @@ export function ExportDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const { controller, sql, title } = source;
+  const engine = useEngineInfo(controller.profileId);
   const prefill = source.tableName ?? null;
   const [format, setFormat] = useState<ExportFormat>("csv");
   const [header, setHeader] = useState(true);
@@ -153,6 +156,8 @@ export function ExportDialog({
   const execution = useStore(controller.store, (s) => (running ? s.executions[running.requestId] : undefined));
   const connected = useStore(controller.store, (s) => s.phase === "open");
   const inTransaction = useStore(controller.store, (s) => !!s.state?.inTransaction && !s.state.transactionFailed);
+  // Unknown engine (still loading): assume the cancel aborts the transaction, so the warning errs on the safe side.
+  const cancelAbortsTransaction = inTransaction && (engine?.cancel_aborts_transaction ?? true);
   const pathInput = useRef<HTMLInputElement>(null);
   const isOpen = useRef(open);
   useEffect(() => {
@@ -229,7 +234,7 @@ export function ExportDialog({
     controller.cancel(running.requestId);
     setCancelling(true);
   };
-  const askCancel = () => (inTransaction ? setConfirmCancel(true) : cancel());
+  const askCancel = () => (cancelAbortsTransaction ? setConfirmCancel(true) : cancel());
 
   /**
    * A running export keeps the dialog open (Escape and outside clicks do nothing, Cancel stops it) while the session is
@@ -251,7 +256,7 @@ export function ExportDialog({
   // Export keeps its slot (disabled while running), so a double click on it never lands on Cancel.
   const footer = (
     <>
-      {running && connected && inTransaction && (
+      {running && connected && cancelAbortsTransaction && (
         <span className="mr-auto self-center text-[12px] text-warning">{EXPORT_CANCEL_ABORTS_TRANSACTION}</span>
       )}
       {running && connected ? (
@@ -272,7 +277,7 @@ export function ExportDialog({
   return (
     <Dialog open={open} onOpenChange={changeOpen} title="Export result" width={520} footer={footer}>
       <ConfirmDialog
-        open={confirmCancel && !!running && connected}
+        open={confirmCancel && cancelAbortsTransaction && !!running && connected}
         onOpenChange={setConfirmCancel}
         title="Cancel the export?"
         message={`${EXPORT_CANCEL_ABORTS_TRANSACTION}: afterwards it can only be rolled back.`}

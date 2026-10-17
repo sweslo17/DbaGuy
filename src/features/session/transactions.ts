@@ -5,7 +5,10 @@ import type { SessionController } from "./SessionController";
 
 export type TransactionEnd = "commit" | "rollback";
 
-/** Cancelling an export cancels its statement, which aborts the transaction it runs in (PostgreSQL). */
+/**
+ * Cancelling an export cancels its statement, which aborts the transaction it runs in on engines whose
+ * `cancel_aborts_transaction` is true (PostgreSQL); elsewhere the transaction survives and this is never shown.
+ */
 export const EXPORT_CANCEL_ABORTS_TRANSACTION = "Cancelling the export aborts the open transaction";
 
 /** What a message's severity shows as when it becomes a toast. */

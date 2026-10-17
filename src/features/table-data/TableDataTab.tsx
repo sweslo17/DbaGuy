@@ -3,6 +3,8 @@ import { useCallback, useMemo, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import type { MenuItem } from "@/components/ui/ContextMenu";
 import { Tabs } from "@/components/ui/Tabs";
+import { toast } from "@/components/ui/Toast";
+import { errorMessage } from "@/lib/api/client";
 import { cn } from "@/lib/cn";
 import { plural } from "@/lib/format";
 import { useWorkspace, type TableTabState } from "@/stores/workspace";
@@ -19,10 +21,12 @@ import { SessionError } from "../session/SessionError";
 import { useSessionGuards } from "../session/SessionGuards";
 import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
 import { FilterBar } from "./FilterBar";
-import { addCondition, filterForValue, type Relation } from "./filterValue";
+import { addCondition, valueCondition, type Relation } from "./filterValue";
 import { useTableData, type TableDataState } from "./useTableData";
 
 type View = "data" | "columns" | "ddl";
+const FILTER_BY_VALUE = "Filter by this value";
+const CUT_VALUE_MESSAGE = "This value cannot be matched exactly: the grid holds only its beginning";
 const VIEWS: { value: View; label: string }[] = [
   { value: "data", label: "Data" },
   { value: "columns", label: "Columns" },
@@ -147,15 +151,20 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   const extraCellMenu = useCallback(
     (row: number, col: number): MenuItem[] => {
       const column = columns?.[col];
-      const condition =
-        column && rows && row < rows.length && dialect ? filterForValue(column, rows[row][col], dialect) : null;
-      return [
-        {
-          label: "Filter by this value",
-          disabled: !condition || exporting,
-          onSelect: () => condition && applyFilter(addCondition(state.filter, condition)),
-        },
-      ];
+      if (!column || !rows || row >= rows.length || !dialect || exporting) {
+        return [{ label: FILTER_BY_VALUE, disabled: true }];
+      }
+      // The backend builds the condition (quoting by dialect); null: the cell is cut, so nothing matches it exactly.
+      const filterByValue = async () => {
+        try {
+          const condition = await valueCondition(dialect, column, rows[row][col]);
+          if (condition === null) toast("info", CUT_VALUE_MESSAGE);
+          else applyFilter(addCondition(state.filter, condition));
+        } catch (error) {
+          toast("error", errorMessage(error));
+        }
+      };
+      return [{ label: FILTER_BY_VALUE, onSelect: () => void filterByValue() }];
     },
     [columns, rows, dialect, applyFilter, state.filter, exporting],
   );

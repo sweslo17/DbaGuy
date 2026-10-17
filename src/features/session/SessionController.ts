@@ -110,7 +110,7 @@ export class SessionController {
   private messageCount = 0;
 
   constructor(
-    private readonly profileId: string,
+    readonly profileId: string,
     private readonly database: string | null,
   ) {}
 

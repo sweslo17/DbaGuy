@@ -3,11 +3,11 @@ import { ChevronDown, Database } from "lucide-react";
 import { useState, type ComponentProps } from "react";
 import { DropdownMenu, type MenuItem } from "@/components/ui/ContextMenu";
 import { errorMessage } from "@/lib/api/client";
-import type { Dialect, ProfileEntry, SessionInfo } from "@/lib/api/types";
+import type { ProfileEntry, SessionInfo } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { ENGINE_LABELS } from "../connections/ConnectionDialog";
 import { buildFolderTree, type FolderNode } from "../connections/folders";
-import { useProfiles } from "../connections/hooks";
+import { useEngineInfo, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
 import { childrenQuery } from "../explorer/useTreeRows";
 import type { SessionPhase } from "../session/SessionController";
@@ -24,7 +24,6 @@ export interface ConnectionPickerProps {
   profileId: string | null;
   /** The database the tab asked for; null: the profile's default. */
   database: string | null;
-  dialect: Dialect | null;
   phase: SessionPhase;
   /** What the open session reports (its database and server). */
   session: SessionInfo | null;
@@ -65,7 +64,10 @@ function Trigger({ children, className, ...props }: ComponentProps<"button">) {
   );
 }
 
-/** PostgreSQL: the databases of the connection, from the explorer's root children (loaded when the menu opens). */
+/**
+ * For engines with one connection per database (PostgreSQL): the databases of the connection, from the explorer's root
+ * children (loaded when the menu opens).
+ */
 function DatabasePicker({
   profileId,
   current,
@@ -107,12 +109,13 @@ function DatabasePicker({
 }
 
 /**
- * The tab's connection (spec §4.2): the profile (grouped by folder) and, for PostgreSQL, the database, with the
- * session's phase as a dot and its server version. A red profile's name sits on a red chip. Changing either reopens
- * the tab's session (the tab asks first if that would lose an export or a transaction).
+ * The tab's connection (spec §4.2): the profile (grouped by folder) and, for engines with one connection per database,
+ * the database, with the session's phase as a dot and its server version. A red profile's name sits on a red chip.
+ * Changing either reopens the tab's session (the tab asks first if that would lose an export or a transaction).
  */
 export function ConnectionPicker(props: ConnectionPickerProps) {
-  const { profileId, database, dialect, phase, session, sessionFailed, blockedReason, onChange } = props;
+  const { profileId, database, phase, session, sessionFailed, blockedReason, onChange } = props;
+  const engine = useEngineInfo(profileId);
   const profiles = useProfiles();
   const entries: ProfileEntry[] = profiles.data ?? [];
   const profile = entries.find((entry) => entry.profile.id === profileId)?.profile ?? null;
@@ -151,7 +154,7 @@ export function ConnectionPicker(props: ConnectionPickerProps) {
           </span>
         </Trigger>
       </DropdownMenu>
-      {profileId !== null && dialect === "postgres" && (
+      {profileId !== null && engine?.per_database_connection && (
         <DatabasePicker
           profileId={profileId}
           current={currentDatabase}

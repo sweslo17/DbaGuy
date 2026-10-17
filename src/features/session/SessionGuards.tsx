@@ -3,6 +3,7 @@ import { useStore } from "zustand";
 import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
 import { toast } from "@/components/ui/Toast";
+import { useEngineInfo } from "../connections/hooks";
 import { busy, isExporting, type SessionController } from "./SessionController";
 import { endTransaction, EXPORT_CANCEL_ABORTS_TRANSACTION, type TransactionEnd } from "./transactions";
 
@@ -12,6 +13,7 @@ import { endTransaction, EXPORT_CANCEL_ABORTS_TRANSACTION, type TransactionEnd }
  */
 export type GuardIntent = "close" | "switch" | "disconnect";
 
+/** `inTransaction`: in an open transaction that stopping the export would abort (only where the engine does that). */
 type Prompt =
   { kind: "export"; intent: GuardIntent; inTransaction: boolean } | { kind: "transaction"; intent: GuardIntent };
 
@@ -70,11 +72,14 @@ async function stopExports(controller: SessionController): Promise<void> {
  * be rendered by the tab; an unanswered question is answered "no" when the tab goes away.
  */
 export function useSessionGuards(controller: SessionController | null, subject: string) {
+  const engine = useEngineInfo(controller?.profileId ?? null);
+  // Unknown engine (still loading): assume the cancel aborts the transaction, so the warning errs on the safe side.
+  const cancelAborts = engine?.cancel_aborts_transaction ?? true;
   const [asking, setAsking] = useState<Asking | null>(null);
   const answer = useRef<((go: boolean) => void) | null>(null);
-  const latest = useRef({ controller, subject });
+  const latest = useRef({ controller, subject, cancelAborts });
   useLayoutEffect(() => {
-    latest.current = { controller, subject };
+    latest.current = { controller, subject, cancelAborts };
   });
   useEffect(() => () => answer.current?.(false), []);
 
@@ -96,11 +101,11 @@ export function useSessionGuards(controller: SessionController | null, subject: 
 
   const exportStep = useCallback(
     async (intent: GuardIntent): Promise<boolean> => {
-      const session = latest.current.controller;
+      const { controller: session, cancelAborts } = latest.current;
       const snapshot = session?.store.getState() ?? null;
       if (!session || !isExporting(snapshot)) return true;
       const inTransaction = !!snapshot?.state?.inTransaction && !snapshot.state.transactionFailed;
-      return ask({ kind: "export", intent, inTransaction }, session);
+      return ask({ kind: "export", intent, inTransaction: inTransaction && cancelAborts }, session);
     },
     [ask],
   );

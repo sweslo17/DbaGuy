@@ -27,6 +27,25 @@ export const ENGINE_LABELS: Record<Engine, string> = {
 };
 
 const SSL_MODES: SslConfig["mode"][] = ["disable", "prefer", "require", "verify-ca", "verify-full"];
+/** The engine's own name for each stored mode (the stored value stays libpq-style); other engines show it raw. */
+const SSL_MODE_LABELS: Partial<Record<Engine, Record<SslConfig["mode"], string>>> = {
+  mysql: {
+    disable: "disable (DISABLED)",
+    prefer: "prefer (PREFERRED)",
+    require: "require (REQUIRED)",
+    "verify-ca": "verify-ca (VERIFY_CA)",
+    "verify-full": "verify-full (VERIFY_IDENTITY)",
+  },
+};
+const SSL_MODE_HINTS: Partial<Record<Engine, string>> = {
+  mysql: "verify-full cannot be used through an SSH tunnel",
+};
+/** The Import URL placeholder for the selected engine (PostgreSQL's when it has none). */
+const URL_EXAMPLES: Partial<Record<Engine, string>> = {
+  postgres: "postgres://user@host:5432/db",
+  mysql: "mysql://user@host:3306/db or jdbc:mysql://host:3306/db",
+  sqlite: "sqlite:///path/to.db",
+};
 const SSL_FILE_FIELDS = [
   { field: "ca_file", label: "CA file" },
   { field: "cert_file", label: "Client cert" },
@@ -282,7 +301,7 @@ function ConnectionDialogBody({
           <FieldRow label="Import URL">
             <div className="flex gap-2">
               <Input
-                placeholder="postgres://user@host:5432/db or sqlite:///path/to.db"
+                placeholder={URL_EXAMPLES[draft.engine] ?? URL_EXAMPLES.postgres}
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
               />
@@ -375,11 +394,11 @@ function ConnectionDialogBody({
       </TabPanel>
 
       <TabPanel value="ssl" current={tab}>
-        <FieldRow label="Mode">
+        <FieldRow label="Mode" hint={SSL_MODE_HINTS[draft.engine]}>
           <Select value={ssl.mode} onChange={(e) => patchSsl({ mode: e.target.value as SslConfig["mode"] })}>
             {SSL_MODES.map((mode) => (
               <option key={mode} value={mode}>
-                {mode}
+                {SSL_MODE_LABELS[draft.engine]?.[mode] ?? mode}
               </option>
             ))}
           </Select>
