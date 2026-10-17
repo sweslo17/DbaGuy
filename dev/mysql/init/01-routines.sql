@@ -1,4 +1,7 @@
 -- Stored programs, written the way the mysql client needs them (and the way DbaGuy splits them): DELIMITER lines.
+-- The image's init client runs in the POSIX locale and would send non-ASCII text as latin1 (double-encoded).
+SET NAMES utf8mb4;
+
 USE dbaguy;
 
 DELIMITER $$

@@ -1,5 +1,8 @@
 -- DbaGuy dev MySQL (mysql:8.4). Runs once, as root, when the container is created. Fake credentials only.
 -- Objects are created with the dev account as DEFINER so that the account DbaGuy connects with can read their DDL.
+-- The image's init client runs in the POSIX locale and would send non-ASCII text as latin1 (double-encoded).
+SET NAMES utf8mb4;
+
 CREATE DATABASE analytics;
 GRANT ALL ON analytics.* TO 'dbaguy'@'%';
 
@@ -56,6 +59,24 @@ CREATE TABLE job_log (
     message VARCHAR(200),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Values the type conversion has to survive: TIME beyond 24 h, fractional seconds, zero and partly-zero dates, FLOAT, LONGTEXT.
+CREATE TABLE edge_values (
+    id INT PRIMARY KEY,
+    long_time TIME,
+    neg_long_time TIME,
+    frac_time TIME(6),
+    frac_dt DATETIME(6),
+    zero_dt DATETIME,
+    part_zero DATE,
+    f FLOAT,
+    lt LONGTEXT,
+    vb VARBINARY(8)
+);
+
+-- A CJK identifier and a reserved-word table name (quoting, completion and DDL tests).
+CREATE TABLE `客戶備註` (`編號` INT PRIMARY KEY, `內容` VARCHAR(50));
+CREATE TABLE `group` (`id` INT PRIMARY KEY, `order` INT);
 
 CREATE DEFINER = `dbaguy`@`%` SQL SECURITY INVOKER VIEW order_summary AS
 SELECT c.name, COUNT(o.id) AS orders, SUM(o.total) AS total

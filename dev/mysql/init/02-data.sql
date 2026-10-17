@@ -1,6 +1,6 @@
 USE dbaguy;
 
--- The image's init client runs in the POSIX locale and would send these literals as latin1 (double-encoded text).
+-- The image's init client runs in the POSIX locale and would send non-ASCII text as latin1 (double-encoded).
 SET NAMES utf8mb4;
 
 SET SESSION cte_max_recursion_depth = 100000;
@@ -26,6 +26,16 @@ INSERT INTO types_demo VALUES
      '{"a": [1, 2], "b": null}', x'DEADBEEF', x'01020304', 'happy', 'a,b', 'it''s \\ back', '中文 😀'),
     (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 SET SESSION sql_mode = DEFAULT;
+
+-- Edge values: strict mode would reject the zero and partly-zero dates, so relax it for this one insert.
+SET SESSION sql_mode = '';
+INSERT INTO edge_values VALUES
+    (1, '838:59:59', '-838:59:59', '12:34:56.789012', '2026-10-17 01:02:03.456789', '0000-00-00 00:00:00',
+     '2026-00-15', 0.1, 'a long text value', x'00FF');
+SET SESSION sql_mode = DEFAULT;
+
+INSERT INTO `客戶備註` (`編號`, `內容`) VALUES (1, '測試');
+INSERT INTO `group` (`id`, `order`) VALUES (1, 42);
 
 INSERT INTO `Order Items` (`select`, `order`) VALUES ('first', 1);
 INSERT INTO `tick``table` (`a``b`, label) VALUES (1, 'one');
