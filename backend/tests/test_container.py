@@ -23,6 +23,23 @@ def test_only_the_app_data_dir_uses_the_app_keychain_service(tmp_path):
     assert keychain_service(default_data_dir().with_name("DbaGuy-dev")) == "app.dbaguy.dev"
 
 
+def test_a_symlink_to_the_app_data_dir_is_the_app_data_dir(tmp_path, monkeypatch):  # R-03a-K1 edge
+    # HOME points at a temp dir: the default data dir is created there, never under the real ~/Library.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    app_dir = default_data_dir()
+    assert app_dir.is_relative_to(tmp_path)
+    app_dir.mkdir(parents=True)
+    link = tmp_path / "link-to-app-data"
+    link.symlink_to(app_dir, target_is_directory=True)
+    # The same directory, so the same saved passwords: the app's service, whichever spelling reached it.
+    assert keychain_service(link) == "app.dbaguy"
+    assert keychain_service(app_dir) == "app.dbaguy"
+    other = tmp_path / "dev-data"
+    other.mkdir()
+    (tmp_path / "link-to-dev-data").symlink_to(other, target_is_directory=True)
+    assert keychain_service(tmp_path / "link-to-dev-data") == "app.dbaguy.dev"
+
+
 def test_the_container_opens_the_keychain_service_of_its_data_dir(tmp_path, monkeypatch):
     services: list[str] = []
 
