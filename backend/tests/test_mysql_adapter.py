@@ -1,5 +1,6 @@
 import threading
 import time
+from contextlib import suppress
 
 import mysql.connector
 import pytest
@@ -214,17 +215,76 @@ def test_closing_a_call_at_a_result_set_boundary_stops_the_procedure(conn):  # R
     assert_next_statement_gets_its_own_rows(conn)
 
 
-def test_a_drain_that_cannot_end_gives_up_the_connection(conn, monkeypatch):  # fix round 1: never wedge
+def give_up_on(conn, sql, monkeypatch):
+    """Open `sql` in a manual transaction, then close it while no KILL can be sent and the drain limit is 0.5 s."""
     monkeypatch.setattr(mysql_adapter, "_DRAIN_LIMIT_S", 0.5)
+    conn.set_autocommit(False)
+    conn.run("CREATE TEMPORARY TABLE zz_tx (id INT)").close()
+    conn.run("INSERT INTO zz_tx VALUES (1)").close()
+    assert conn.in_transaction()
+    thread = conn.run("SELECT CONNECTION_ID()")
+    [[thread_id]] = thread.fetch(1)
+    thread.close()
+    result = conn.run(sql)
+    assert result.fetch(1)
+    monkeypatch.setattr(mysql.connector, "connect", refuse)  # the KILL cannot be sent
+    try:
+        started = time.monotonic()
+        result.close()
+        assert time.monotonic() - started < 1.5
+        assert not conn.in_transaction()  # the connection is gone, its transaction with it: no badge, no idle rollback
+        with pytest.raises(StatementError) as info:
+            conn.run("SELECT 1")
+        assert info.value.code == "connection_lost"  # the Reconnect UI takes over
+    finally:
+        monkeypatch.undo()
+        cleaner = mysql.connector.connect(**mysql_driver_kwargs())  # a dropped client's statement may run on a while
+        with suppress(mysql.connector.Error):
+            cleaner.cmd_query(f"KILL {thread_id}")
+        cleaner.close()
+
+
+def test_a_drain_that_cannot_end_gives_up_the_connection(conn, monkeypatch):  # fix round 1: never wedge
+    give_up_on(conn, ENDLESS, monkeypatch)
+
+
+def test_a_trickling_stream_cannot_outlast_the_drain_limit(conn, monkeypatch):  # fix round 2
+    # About 100 rows a second, sent in bursts of 8 as the server's 16 KB network buffer fills: a batch of 1,000 rows
+    # would take 10 s.
+    give_up_on(conn, "SELECT SLEEP(0.01), REPEAT('x', 2000) FROM big_table", monkeypatch)
+
+
+def test_a_call_working_between_its_result_sets_cannot_outlast_the_drain_limit(conn, monkeypatch):  # fix round 2
+    with mysql_procedure("zz_sleep_between", SLEEP_BETWEEN) as name:
+        give_up_on(conn, f"CALL {name}()", monkeypatch)  # nextset() would wait for the SLEEP(3)
+
+
+def test_a_drain_after_a_kill_that_was_sent_is_never_cut_short(conn, monkeypatch):  # R-03a-T9f
+    monkeypatch.setattr(mysql_adapter, "_DRAIN_LIMIT_S", 0.0)  # the limit is only for a drain without a KILL
+    conn.set_autocommit(False)
+    conn.run("CREATE TEMPORARY TABLE zz_tx (id INT)").close()
+    conn.run("INSERT INTO zz_tx VALUES (1)").close()
     result = conn.run(ENDLESS)
-    assert len(result.fetch(100)) == 100
-    monkeypatch.setattr(mysql.connector, "connect", refuse)  # the KILL cannot be sent: the stream never ends
-    started = time.monotonic()
+    assert len(result.fetch(500)) == 500
     result.close()
-    assert time.monotonic() - started < 3
-    with pytest.raises(StatementError) as info:
-        conn.run("SELECT 1")
-    assert info.value.code == "connection_lost"  # the Reconnect UI takes over
+    assert conn.in_transaction()
+    rows = conn.run("SELECT COUNT(*) FROM zz_tx")
+    assert rows.fetch(1) == [[1]]
+    rows.close()
+    conn.rollback()
+
+
+def test_a_client_read_timeout_drops_the_connection(monkeypatch):  # fix round 2: a reply left half read
+    conn = open_mysql(options={"read_timeout": "1"})
+    try:
+        with pytest.raises(StatementError) as info:
+            conn.run("SELECT SLEEP(3)")
+        assert info.value.code == "connection_lost" and not conn.in_transaction()
+        with pytest.raises(StatementError) as again:
+            conn.run("SELECT 1")  # never the SLEEP's late reply
+        assert again.value.code == "connection_lost"
+    finally:
+        conn.close()
 
 
 def test_text_that_is_not_valid_unicode_is_a_statement_error(conn):  # fix round 1: a lone surrogate
@@ -392,6 +452,9 @@ def test_a_failing_ddl_has_committed_and_the_flag_says_so(conn):  # R-03a-T9b
             conn.run("CREATE TABLE zz_implicit (id INT)")  # MySQL commits before it runs DDL, even DDL that fails
         assert info.value.code == "1050"
         assert not conn.in_transaction()
+        warnings = conn.run("SHOW WARNINGS")  # R-03a-T9e: reading the flags again keeps the diagnostics
+        assert [row[1] for row in warnings.fetch(5)] == [1050]
+        warnings.close()
         conn.rollback()
         rows = conn.run("SELECT COUNT(*) FROM zz_implicit")
         assert rows.fetch(1) == [[1]]  # committed: the rollback could not undo it
@@ -400,6 +463,24 @@ def test_a_failing_ddl_has_committed_and_the_flag_says_so(conn):  # R-03a-T9b
         conn.rollback()
         owner.cmd_query("DROP TABLE IF EXISTS zz_implicit")
         owner.close()
+
+
+def test_show_warnings_still_lists_the_error_of_a_failed_statement(conn, monkeypatch):  # R-03a-T9e
+    for sql, errno in (("SELECT * FROM nope", 1146), ("SELECT 1,\nFROM t", 1064)):
+        with pytest.raises(StatementError):
+            conn.run(sql)
+        warnings = conn.run("SHOW WARNINGS")
+        assert [(row[0], row[1]) for row in warnings.fetch(5)] == [("Error", errno)]
+        warnings.close()
+    probes = []
+    monkeypatch.setattr(conn, "_read_status", lambda: probes.append(1))
+    for sql in ("SELECT 1,\nFROM t", ""):  # parse errors: nothing ran, nothing to read again
+        with pytest.raises(StatementError):
+            conn.run(sql)
+    assert probes == []
+    with pytest.raises(StatementError):
+        conn.run("SELECT * FROM nope")
+    assert probes == [1]
 
 
 def test_read_only_profile_is_read_only_in_the_database():
