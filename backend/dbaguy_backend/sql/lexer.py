@@ -12,7 +12,7 @@ class TokenKind(StrEnum):
     STRING = "string"
     NUMBER = "number"
     COMMENT = "comment"
-    EXEC_COMMENT = "exec_comment"  # MySQL /*! … */ and /*+ … */: code for the server, never INSIGNIFICANT
+    EXEC_COMMENT = "exec_comment"  # MySQL /*! … */, /*+ … */ and MariaDB /*M! … */: never INSIGNIFICANT
     SPACE = "space"
     SEMI = "semi"
     DELIMITER = "delimiter"  # a custom terminator from a MySQL DELIMITER line (only when scan() is given one)
@@ -43,6 +43,12 @@ _NUMBER = re.compile(r"\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?")
 _PUNCT = {";": TokenKind.SEMI, ".": TokenKind.DOT, ",": TokenKind.COMMA, "(": TokenKind.LPAREN, ")": TokenKind.RPAREN}
 # Tokens that never change what a statement means: skipped wherever statements are read word by word.
 INSIGNIFICANT = frozenset({TokenKind.SPACE, TokenKind.COMMENT})
+# Executable comments (EXEC_COMMENT): the server runs the text of a version comment as code, MySQL's `/*! … */` and
+# MariaDB's `/*M! … */` alike (MySQL itself skips the latter; DbaGuy treats MariaDB as MySQL). `/*+ … */` holds
+# optimizer hints. Prefixes are case-sensitive, as in the servers.
+VERSION_COMMENT_STARTS = ("/*!", "/*M!")
+HINT_COMMENT_START = "/*+"
+_EXECUTABLE_COMMENT_STARTS = (*VERSION_COMMENT_STARTS, HINT_COMMENT_START)
 
 
 def _ident_start(ch: str) -> bool:
@@ -118,7 +124,7 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
             i = n if end is None else end.start()
             kind = TokenKind.COMMENT
         elif text.startswith("/*", i):
-            executable = rules.executable_comments and text.startswith(("/*!", "/*+"), i)
+            executable = rules.executable_comments and text.startswith(_EXECUTABLE_COMMENT_STARTS, i)
             depth, i = 1, i + 2
             while i < n and depth:
                 if text.startswith("*/", i):

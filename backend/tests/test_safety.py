@@ -215,6 +215,15 @@ def test_mysql_read_only_still_blocks_a_read_write_transaction(sql):
     assert decide_my(sql, read_only=True) == (A.BLOCK, ["read_only"])
 
 
+@pytest.mark.parametrize(("sql", "reasons"), [
+    ("ALTER TABLE t DROP PARTITION p0", ["alter_drop"]), ("ALTER TABLE t TRUNCATE PARTITION p0, p1", ["truncate"]),
+    ("ALTER TABLE t DROP PRIMARY KEY", ["alter_drop"]), ("ALTER TABLE t DROP INDEX i", ["alter_drop"]),
+])
+def test_mysql_alters_that_lose_data_are_confirmed_at_the_default_level(sql, reasons):  # R-03a-F1
+    assert decide_my(sql) == (A.CONFIRM, reasons)
+    assert decide_my(sql, read_only=True) == (A.BLOCK, ["read_only"])
+
+
 def test_mysql_version_comments_are_unknown_statements():
     assert decide_my("/*!40101 SET NAMES utf8 */", "strict") == (A.CONFIRM, ["strict_unknown"])
     assert decide_my("SELECT /*+ BKA(t) */ * FROM t", "strict") == (A.RUN, [])

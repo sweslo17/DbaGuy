@@ -29,6 +29,9 @@ SQLGLOT_DIALECT: dict[Dialect, type[SqlglotDialect]] = {
 # Text sqlglot does not understand (RecursionError: absurd nesting). Anything else is unexpected, e.g. a sqlglot bug.
 EXPECTED_FAILURES = (ParseError, TokenError, RecursionError)
 _DML = (exp.Insert, exp.Update, exp.Delete, exp.Merge)
+# What an ALTER can drop: a column, index, key or constraint is an exp.Drop; a primary key and a partition have their
+# own nodes (R-03a-F1).
+_ALTER_DROPS = (exp.Drop, exp.DropPrimaryKey, exp.DropPartition)
 # SELECT … INTO <table>; MySQL's INTO only fills variables or writes a file
 INTO_CREATES_A_TABLE: frozenset[Dialect] = frozenset({Dialect.POSTGRES, Dialect.SQLITE})
 
@@ -61,7 +64,7 @@ def classify_expression(node: exp.Expression, dialect: Dialect) -> Classificatio
     if isinstance(node, exp.TruncateTable):
         return Classification(kind=StatementKind.DDL, dangerous_reasons=[DangerReason.TRUNCATE])
     if isinstance(node, exp.Alter):
-        drops = any(isinstance(child, exp.Drop) for child in node.walk() if child is not node)
+        drops = any(isinstance(child, _ALTER_DROPS) for child in node.walk() if child is not node)
         return Classification(kind=StatementKind.DDL, dangerous_reasons=[DangerReason.ALTER_DROP] if drops else [])
     if isinstance(node, exp.Create):
         return Classification(kind=StatementKind.DDL)

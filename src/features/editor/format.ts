@@ -37,8 +37,9 @@ function trimmed(state: EditorState, from: number, to: number): { from: number; 
 }
 
 /**
- * The statement the cursor is in (from its first character to after its `;`), or null when the cursor is in the
- * whitespace or comments between statements: then nothing is formatted.
+ * The statement the cursor is in (from its first character to after its terminator: `;`, or the custom delimiter a
+ * MySQL `DELIMITER` line set), or null when the cursor is in the whitespace or comments between statements: then
+ * nothing is formatted.
  */
 function statementUnder(ranges: readonly StatementRange[], pos: number): StatementRange | null {
   return ranges.find((r) => r.from <= pos && pos <= r.terminatorEnd) ?? null;

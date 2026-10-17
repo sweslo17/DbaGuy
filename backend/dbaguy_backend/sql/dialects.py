@@ -25,7 +25,7 @@ class LexRules:
     line_comment_end: re.Pattern[str]  # ends a `--` or `#` comment
     dash_comment_needs_space: bool  # MySQL: `--` starts a comment only before whitespace, a control char or the end
     hash_comments: bool  # MySQL: `#` starts a line comment
-    executable_comments: bool  # MySQL: `/*! … */` and `/*+ … */` are code (EXEC_COMMENT), not comments
+    executable_comments: bool  # MySQL: `/*! … */`, `/*+ … */` and MariaDB `/*M! … */` are code (EXEC_COMMENT)
     dollar_quotes: bool  # PostgreSQL $tag$…$tag$ strings
     dollar_params: bool  # PostgreSQL $1 parameters
     escape_string_prefixes: frozenset[str]  # PostgreSQL E'…': backslash escapes in that string only

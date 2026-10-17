@@ -140,13 +140,16 @@ class _CompoundTracker:
     special. A word right after a dot is a name, never a keyword (`NEW.begin`, `ev.end`), and executable comments are
     skipped in the program's head (`CREATE /*!50003 DEFINER=… */ PROCEDURE`).
 
-    Wrong guesses fail on the safe side. A name `begin` inside a body keeps a block open, so the statement merges with
-    what follows; the server then rejects the merged text (multi-statements are off), so nothing runs. So does a CASE
-    that opens right after a name `end` closed its enclosing CASE expression early (`CASE WHEN end THEN CASE …`). A
-    routine without BEGIN … END whose statement uses an unqualified column named `begin` merges the same way.
+    Most wrong guesses fail on the safe side. A name `begin` inside a body keeps a block open, so the statement merges
+    with what follows; the server then rejects the merged text (multi-statements are off), so nothing runs. So does a
+    CASE that opens right after a name `end` closed its enclosing CASE expression early (`CASE WHEN end THEN CASE …`).
+    A routine without BEGIN … END whose statement uses an unqualified column named `begin` merges the same way.
 
-    The remaining limit: a routine whose whole body is a bare control-flow statement without BEGIN
-    (`FOR EACH ROW IF … END IF`) is split at its inner `;` unless a DELIMITER line is used.
+    The remaining limits, both cutting a body at an inner `;` unless a DELIMITER line is used:
+    - a routine whose whole body is a bare control-flow statement without BEGIN (`FOR EACH ROW IF … END IF`);
+    - a CASE statement written directly as a `DECLARE … HANDLER` action (CASE does not follow a statement start there,
+      so it is read as an expression) with a bare column named `end` inside: that `end` closes the CASE, and the
+      CASE's own END then closes the enclosing block.
     """
 
     def __init__(self) -> None:
@@ -200,14 +203,18 @@ def _emit(
     spans.append(StatementSpan(start, end, terminator, text[start:end], has_body))
 
 
-def _delimiter_line(text: str, token: Token, current: list[Token]) -> re.Match[str] | None:
-    """A MySQL `DELIMITER x` line: the word DELIMITER is first on its line and no statement has started."""
-    if token.kind != TokenKind.WORD or token.upper != "DELIMITER":
+def _delimiter_line(text: str, token: Token, started: bool) -> re.Match[str] | None:
+    """A MySQL `DELIMITER x` line: the word DELIMITER is first on its line and no statement has started.
+
+    Linear however long the line: only the spaces and tabs right before the word are looked at (not the line back to
+    its start), and the rest of the line is read only once the word is known to start it (`/sql/split` runs on every
+    edit)."""
+    if started or token.kind != TokenKind.WORD or token.upper != "DELIMITER":
         return None
-    if any(t.kind not in INSIGNIFICANT for t in current):
-        return None
-    line_start = text.rfind("\n", 0, token.start) + 1
-    if text[line_start:token.start].strip(" \t"):
+    i = token.start
+    while i > 0 and text[i - 1] in " \t":
+        i -= 1
+    if i > 0 and text[i - 1] != "\n":
         return None
     return _DELIMITER_ARGUMENT.match(text, token.end)
 
@@ -221,9 +228,10 @@ def split(text: str, dialect: Dialect) -> list[StatementSpan]:
     while True:
         tracker = _tracker(rules.body_rule)
         current: list[Token] = []
+        started = False  # `current` holds a significant token: a statement has begun
         restart: int | None = None
         for token in scan(text, dialect, start, delimiter):
-            if commands and (line := _delimiter_line(text, token, current)):
+            if commands and (line := _delimiter_line(text, token, started)):
                 delimiter = None if line.group(1) == ";" else line.group(1)
                 restart = line.end()  # the line is consumed: it belongs to no statement and never reaches the server
                 break
@@ -231,10 +239,11 @@ def split(text: str, dialect: Dialect) -> list[StatementSpan]:
                 delimiter is None and token.kind == TokenKind.SEMI and tracker.depth == 0
             ):
                 _emit(spans, text, current, token.end, tracker.has_body)
-                current, tracker = [], _tracker(rules.body_rule)
+                current, tracker, started = [], _tracker(rules.body_rule), False
                 continue
             current.append(token)
             if token.kind not in INSIGNIFICANT:
+                started = True
                 tracker.feed(token)  # also under a custom delimiter: has_body tells the classifier about bodies
         if restart is None:
             _emit(spans, text, current, None, tracker.has_body)

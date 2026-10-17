@@ -124,6 +124,15 @@ def test_mysql_executable_comments_are_code():
     assert K.EXEC_COMMENT not in INSIGNIFICANT
 
 
+def test_mariadb_executable_comments_are_code_too():  # M4: MariaDB runs `/*M! … */`
+    assert kinds("/*M!DELETE FROM t WHERE*/ (SELECT 1)", MY)[0] == (K.EXEC_COMMENT, "/*M!DELETE FROM t WHERE*/")
+    assert kinds("SELECT /*M!100100 1, */ 2", MY)[1] == (K.EXEC_COMMENT, "/*M!100100 1, */")
+    assert kinds("/*M! open", MY) == [(K.EXEC_COMMENT, "/*M! open")]
+    assert kinds("/*m! x */", MY) == [(K.COMMENT, "/*m! x */")]  # the server's prefix is case-sensitive
+    assert kinds("/*M x */", MY) == [(K.COMMENT, "/*M x */")]
+    assert kinds("/*M! x */") == [(K.COMMENT, "/*M! x */")]  # PostgreSQL: an ordinary comment
+
+
 def test_mysql_variables_are_words():
     assert kinds("SET @x := @@session.sql_mode", MY) == [
         (K.WORD, "SET"), (K.WORD, "@x"), (K.OTHER, ":"), (K.OTHER, "="), (K.WORD, "@@session"), (K.DOT, "."),

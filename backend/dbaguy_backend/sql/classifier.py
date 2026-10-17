@@ -7,7 +7,7 @@ from loguru import logger
 # The models live in the domain (the execution protocol carries them); re-exported here for the sql/ callers.
 from ..domain.classification import Classification, DangerReason, StatementKind
 from .dialects import Dialect
-from .lexer import INSIGNIFICANT, Token, TokenKind, tokenize
+from .lexer import HINT_COMMENT_START, INSIGNIFICANT, VERSION_COMMENT_STARTS, Token, TokenKind, tokenize
 from .splitter import split
 
 __all__ = ["Classification", "DangerReason", "StatementKind", "classify", "warm_up"]
@@ -32,9 +32,10 @@ _KEYWORD_KIND: dict[str, StatementKind] = {
         StatementKind.SESSION,
     ),
 }
-# Keywords whose meaning differs by dialect, consulted before _KEYWORD_KIND (spec §3.4).
+# Keywords whose meaning differs by dialect, consulted before _KEYWORD_KIND (spec §3.4). MySQL's RESET is never a
+# session setting: RESET MASTER, RESET REPLICA, RESET PERSIST act on the server (sqlglot reads them as an alias).
 _DIALECT_KEYWORD_KIND: dict[Dialect, dict[str, StatementKind]] = {
-    Dialect.MYSQL: {"LOAD": StatementKind.WRITE, "HANDLER": StatementKind.WRITE},
+    Dialect.MYSQL: {"LOAD": StatementKind.WRITE, "HANDLER": StatementKind.WRITE, "RESET": StatementKind.UNKNOWN},
 }
 # MySQL: sqlglot reads every `START …` as a transaction, and so does _KEYWORD_KIND (START REPLICA, START
 # GROUP_REPLICATION, …). A statement counts as a TRANSACTION only when it begins with one of these; anything else is
@@ -61,18 +62,21 @@ _SEVERITY = (
     StatementKind.UNKNOWN,
 )
 _ANALYZE = ("ANALYZE", "ANALYSE")  # PostgreSQL accepts both spellings; EXPLAIN ANALYZE really executes the statement
+# What follows DROP inside an ALTER when it loses rows or the keys and constraints that guard them (R-03a-F1).
+# `ALTER COLUMN a DROP DEFAULT|NOT NULL|EXPRESSION|IDENTITY` loses neither.
+_ALTER_DROPPED = frozenset({"PARTITION", "PRIMARY", "COLUMN", "INDEX", "KEY", "FOREIGN", "CONSTRAINT", "CHECK"})
 
 
 def _has_version_comment(tokens: list[Token]) -> bool:
-    """MySQL runs the text of `/*! … */` as code, so nothing in it can be judged (spec §3.4). `/*+ … */` holds only
-    optimizer hints, which never change what a statement does."""
-    return any(t.kind == TokenKind.EXEC_COMMENT and t.text.startswith("/*!") for t in tokens)
+    """MySQL runs the text of `/*! … */` as code (MariaDB that of `/*M! … */` too), so nothing in it can be judged
+    (spec §3.4). `/*+ … */` holds only optimizer hints, which never change what a statement does."""
+    return any(t.kind == TokenKind.EXEC_COMMENT and t.text.startswith(VERSION_COMMENT_STARTS) for t in tokens)
 
 
 def _is_hint(token: Token) -> bool:
     """A MySQL optimizer hint `/*+ … */`: for the server a plain comment wherever it does not follow SELECT, INSERT,
     UPDATE or DELETE, such as between the words of EXPLAIN."""
-    return token.kind == TokenKind.EXEC_COMMENT and token.text.startswith("/*+")
+    return token.kind == TokenKind.EXEC_COMMENT and token.text.startswith(HINT_COMMENT_START)
 
 
 def _words(tokens: list[Token]) -> list[str]:
@@ -95,6 +99,18 @@ def _begins_a_transaction_statement(words: list[str], dialect: Dialect) -> bool:
 def _writes_server_file(words: list[str]) -> bool:
     """SELECT … INTO OUTFILE|DUMPFILE writes a file on the database server, which a READ ONLY session allows."""
     return any(a == "INTO" and b in ("OUTFILE", "DUMPFILE") for a, b in zip(words, words[1:]))
+
+
+def _alter_reasons(words: list[str]) -> list[DangerReason]:
+    """ALTER … DROP COLUMN|INDEX|KEY|PRIMARY KEY|FOREIGN KEY|CONSTRAINT|CHECK|PARTITION and ALTER … TRUNCATE PARTITION:
+    as destructive as DROP and TRUNCATE (MySQL purges partitioned tables this way), so confirmed alike (R-03a-F1)."""
+    if words[:1] != ["ALTER"]:
+        return []
+    pairs = set(zip(words, words[1:]))
+    reasons = [DangerReason.ALTER_DROP] if any(a == "DROP" and b in _ALTER_DROPPED for a, b in pairs) else []
+    if ("TRUNCATE", "PARTITION") in pairs:
+        reasons.append(DangerReason.TRUNCATE)
+    return reasons
 
 
 def _lexical(sql: str, dialect: Dialect) -> Classification:
@@ -200,6 +216,10 @@ def _classify_statement(sql: str, dialect: Dialect, has_body: bool = False) -> C
     result = _classify_text(sql, dialect, has_body)
     if result.kind == StatementKind.TRANSACTION and not _begins_a_transaction_statement(words, dialect):
         return Classification(kind=StatementKind.UNKNOWN)
+    # R-03a-F1: the words decide after whichever rules did. sqlglot 30.23 cannot parse `ALTER TABLE t DROP PARTITION p`
+    # and reads `TRUNCATE PARTITION` as a Command, so both reach the keyword rules, which judge only the first word.
+    if missing := [r for r in _alter_reasons(words) if r not in result.dangerous_reasons]:
+        result = Classification(kind=result.kind, dangerous_reasons=[*result.dangerous_reasons, *missing])
     # R-03a-P7: decided after sqlglot too, as a floor. sqlglot 30.23 cannot parse INTO OUTFILE (so _lexical sees it
     # today), but a sqlglot that parses it as exp.Into would make it a plain READ for MySQL (INTO_CREATES_A_TABLE
     # excludes it). A floor, not an early return: `CREATE PROCEDURE … INTO OUTFILE` stays DDL, and a DDL result is

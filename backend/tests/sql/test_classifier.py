@@ -152,6 +152,16 @@ def test_sqlite(sql, kind):
     ("SELECT 1; /*!50000 DELETE FROM t */", K.UNKNOWN, []),
     ("SELECT 1 /*! unterminated", K.UNKNOWN, []),
     ("EXPLAIN /*!50000 ANALYZE */ DELETE FROM t", K.UNKNOWN, []),
+    # MariaDB runs `/*M! … */` as code too (M4).
+    ("/*M!DELETE FROM t WHERE*/ (SELECT 1)", K.UNKNOWN, []),
+    ("/*M!100100 DELETE FROM t */ SELECT 1", K.UNKNOWN, []),
+    ("SELECT 1 /*M! , 2 */", K.UNKNOWN, []),
+    ("SELECT 1 /*m! , 2 */", K.READ, []),  # the prefix is case-sensitive, as in the server
+    # RESET acts on the server in MySQL, never on the session (M8).
+    ("RESET MASTER", K.UNKNOWN, []),
+    ("RESET BINARY LOGS AND GTIDS", K.UNKNOWN, []),
+    ("RESET REPLICA", K.UNKNOWN, []),
+    ("RESET PERSIST", K.UNKNOWN, []),
     # INTO OUTFILE follows more than SELECT.
     ("TABLE t INTO OUTFILE '/tmp/x'", K.WRITE, []),
     ("VALUES ROW(1) INTO DUMPFILE '/tmp/x'", K.WRITE, []),
@@ -222,6 +232,53 @@ def test_sqlite(sql, kind):
 def test_mysql(sql, kind, reasons):
     result = classify(sql, MY)
     assert (result.kind, list(result.dangerous_reasons)) == (kind, reasons)
+
+
+# R-03a-F1: dropping or emptying partitions, and the primary key, are as destructive as DROP INDEX.
+@pytest.mark.parametrize(("sql", "reasons"), [
+    ("ALTER TABLE t DROP PARTITION p0", ["alter_drop"]),  # sqlglot 30.23: ParseError, so the keyword rules
+    ("ALTER TABLE t DROP PARTITION p0, p1", ["alter_drop"]),
+    ("alter table t drop partition p0", ["alter_drop"]),
+    ("ALTER TABLE t TRUNCATE PARTITION p0", ["truncate"]),  # sqlglot 30.23: a Command
+    ("ALTER TABLE t TRUNCATE PARTITION ALL", ["truncate"]),
+    ("ALTER TABLE t DROP PRIMARY KEY", ["alter_drop"]),  # sqlglot: DropPrimaryKey, which is not an exp.Drop
+    ("ALTER TABLE t ADD COLUMN a int, DROP PRIMARY KEY", ["alter_drop"]),
+    ("ALTER TABLE t DROP INDEX i", ["alter_drop"]),
+    ("ALTER TABLE t DROP FOREIGN KEY fk", ["alter_drop"]),
+    ("ALTER TABLE t DROP CHECK c", ["alter_drop"]),
+    ("ALTER TABLE t ALTER COLUMN a DROP DEFAULT", []),
+    ("ALTER TABLE t ADD PARTITION (PARTITION p3 VALUES LESS THAN (2030))", []),
+    ("ALTER TABLE t REORGANIZE PARTITION p0 INTO (PARTITION p1 VALUES LESS THAN (10))", []),
+    ("ALTER TABLE t COMMENT = 'drop partition'", []),
+    ("ALTER TABLE `drop` ADD COLUMN `partition` int", []),
+])
+def test_mysql_alters_that_lose_data_are_dangerous(sql, reasons):
+    result = classify(sql, MY)
+    assert (result.kind, list(result.dangerous_reasons)) == (K.DDL, reasons)
+
+
+@pytest.mark.parametrize(("sql", "reasons"), [
+    ("ALTER TABLE t DROP PARTITION p0", ["alter_drop"]), ("ALTER TABLE t TRUNCATE PARTITION p0", ["truncate"]),
+    ("ALTER TABLE t DROP PRIMARY KEY", ["alter_drop"]),
+])
+@pytest.mark.parametrize("sqlglot_says", [None, [Classification(kind=K.DDL)]], ids=["keyword rules", "sqlglot"])
+def test_alter_drop_reasons_hold_whichever_rules_decide(sql, reasons, sqlglot_says, monkeypatch):
+    # The keyword rules (sqlglot cannot parse it) or a syntax tree that says DDL without the reason (a future sqlglot
+    # parsing the partition forms into nodes the tree rules do not know): the reason is there either way.
+    monkeypatch.setattr(classifier, "_from_sqlglot", lambda text, dialect: sqlglot_says)
+    assert classify(sql, MY).dangerous_reasons == reasons
+
+
+def test_the_tree_rules_count_a_dropped_primary_key():
+    from dbaguy_backend.sql import sqlglot_rules
+
+    [node] = sqlglot_rules.parse("ALTER TABLE t DROP PRIMARY KEY", MY)
+    assert sqlglot_rules.classify_expression(node, MY).dangerous_reasons == [DangerReason.ALTER_DROP]
+
+
+def test_reset_stays_a_session_statement_elsewhere():
+    assert classify("RESET ALL", PG).kind == K.SESSION
+    assert classify("RESET search_path", PG).kind == K.SESSION
 
 
 def test_select_into_still_creates_a_table_in_postgres():
@@ -328,14 +385,16 @@ def test_dialects_survive_a_bundle_without_sqlglots_by_name_lookups():
                 raise ModuleNotFoundError(f"No module named {name!r}")
             return real(name, package)
         importlib.import_module = bundled_only
-        from dbaguy_backend.sql.classifier import classify
+        from dbaguy_backend.sql.classifier import _from_sqlglot
         from dbaguy_backend.sql.dialects import Dialect
-        print(json.dumps([classify("ALTER TABLE t DROP COLUMN a", d).dangerous_reasons for d in Dialect]))
+        # sqlglot's own answer (None when it could not run: a TypeError here); the keyword rules give the same reason
+        sql = "ALTER TABLE t DROP COLUMN a"
+        print(json.dumps([[c.dangerous_reasons for c in _from_sqlglot(sql, d)] for d in Dialect]))
     """)
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
                             cwd=Path(__file__).parents[2])
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == [["alter_drop"]] * len(Dialect)  # parsed, not the keyword fallback
+    assert json.loads(result.stdout) == [[["alter_drop"]]] * len(Dialect)  # parsed, not the keyword fallback
 
 
 def test_an_unexpected_sqlglot_failure_is_a_warning_naming_only_the_exception(monkeypatch):

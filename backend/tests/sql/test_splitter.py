@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from dbaguy_backend.sql.dialects import Dialect
@@ -337,3 +339,15 @@ def test_mysql_what_the_tracker_cannot_tell_apart_merges_and_never_splits_a_body
     ):
         first = split(f"{proc}; SELECT 3", MY)[0]
         assert first.end >= len(proc), proc
+
+
+@pytest.mark.parametrize("text", [
+    "delimiter;" * 40_000,  # the word at every statement start, never first on its line: 3.4 s before M5
+    ";delimiter x" * 33_000,
+    "\t delimiter;" * 30_000,
+    "/*c*/" * 40_000 + " delimiter" * 40_000,  # comments before the statement starts
+], ids=["bare", "with argument", "spaces before", "comments first"])
+def test_delimiter_lines_are_found_in_linear_time_on_one_long_line(text):  # M5: /sql/split runs on every edit
+    started = time.perf_counter()
+    split(text, MY)
+    assert time.perf_counter() - started < 0.3
