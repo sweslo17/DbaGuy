@@ -36,7 +36,7 @@
 1. **Text containing `delimiter` + whitespace** (a column alias, a comment, a string) is sent byte-for-byte. mysql-connector's `cursor.execute()` runs such text through its own DELIMITER rewriter. → Task 9 `test_text_mentioning_delimiter_is_sent_verbatim`.
 2. **mysqldump / Workbench scripts**: `DELIMITER ;;`, `/*!50003 CREATE*/ … */;;` wrapped triggers, `/*!40101 SET … */;` header lines, CRLF line endings. They must split exactly as the mysql client splits them. → Task 2 `test_mysqldump_style_script_with_crlf`.
 3. **Identifiers with a backtick, a space, a reserved word or CJK** (`` tick`table ``, `Order Items`, `select`) must survive the tree, SHOW CREATE, the browse SELECT, the sort key, the value filter and the INSERT copy. → Task 3 quoting tests, Task 8 `test_names_with_backticks_round_trip`, Task 9 `test_browse_select_on_a_backtick_name_runs`.
-4. **A result that ends in an odd state** must leave the connection usable for the next statement, with no "Commands out of sync". Cases: a `CALL` that fails after its first result set; a small result that the server has fully sent but the client has not read, then closed (KILL QUERY on an idle thread); a cancel that arrives when nothing is running. → Task 9 `test_procedure_failing_after_a_result_set_leaves_the_connection_usable`, `test_closing_a_fully_sent_result_does_not_poison_the_next_statement`, `test_cancel_with_nothing_running_is_harmless`.
+4. **A result that ends in an odd state** must leave the connection usable for the next statement, with no "Commands out of sync". Cases: a `CALL` that fails after its first result set; a small result that the server has fully sent but the client has not read, then closed (KILL QUERY on an idle thread); a cancel that arrives when nothing is running. A cancel must also never relabel a later error (a failing COMMIT shows its real error, not "cancelled"). → Task 9 `test_procedure_failing_after_a_result_set_leaves_the_connection_usable`, `test_closing_a_fully_sent_result_does_not_poison_the_next_statement`, `test_cancel_with_nothing_running_is_harmless`, `test_a_cancel_never_relabels_later_errors`.
 5. **Cancel through an SSH tunnel.** The KILL side connection must reach the server through the same tunnel endpoint, with the same TLS settings. → Task 9 `test_mysql_through_the_ssh_bastion_including_cancel`.
 
 ## Pain points this plan must address
@@ -45,10 +45,10 @@ From `docs/research/2026-10-15-feature-priorities.md`. Every phase review checks
 
 | Source row | How 03a addresses it, or avoids regressing it |
 |---|---|
-| §2 Q1 輕、快、低記憶體 (§8: 又重又慢) | Pure-Python driver (469 KB) with the C extension kept out of the bundle (Task 11). Results stream unbuffered page by page and are never read in full (Task 9). The snapshot uses 7 fixed queries and is capped at 10,000 relations (Task 8). Streaming 100k rows is measured against PG with a 3× stop rule (Task 9). Startup is re-measured (Task 11). |
-| §2 Q2 穩定、不丟工作 (§8: 當機或丟失工作) | Every driver error becomes a `StatementError`, and `connection_lost` drives the existing Reconnect UI. Closing or cancelling never wedges the connection: KILL + drain, no "Commands out of sync" (Task 9). A MySQL session lives on its own worker thread, so it cannot block other tabs. Workspace persistence is untouched. |
+| §2 Q1 輕、快、低記憶體 (§8: 又重又慢) | Pure-Python driver (469 KB) with the C extension kept out of the bundle (Task 11). Results stream unbuffered page by page and are never read in full; even the early-close fallback drains in raw batches (Task 9). The snapshot uses 7 fixed queries and is capped at 10,000 relations (Task 8). Speed is held to an absolute budget, not a ratio to PG (R-03a-P1): 100k rows in pages of 500, including `encode_row`, in ≤ 2.0 s, and no 500-row page over 25 ms (Task 9). Over budget means stop and report; the C extension is a later optimisation (carries). Startup is re-measured without touching the real app data (Task 11). |
+| §2 Q2 穩定、不丟工作 (§8: 當機或丟失工作) | Every driver error becomes a `StatementError`, and `connection_lost` drives the existing Reconnect UI. Closing or cancelling never wedges the connection: KILL + raw-batch drain, no "Commands out of sync" (Task 9). The "KILL sent" flag belongs to one statement, so a later failing COMMIT shows its real error, not "cancelled" (R-03a-P4). A MySQL session lives on its own worker thread, so it cannot block other tabs. Workspace persistence is untouched. |
 | §2 Q5 多引擎從第一天 (§8: 要切換好幾個工具) | MySQL plugs into the unchanged adapter contract with no engine branches in services. The UI reads `EngineInfo` capabilities instead of `dialect === "postgres"` (Tasks 5 and 10). Every PG/SQLite flow (tree, table data, query, copy, export, history, transactions) works on MySQL, so Navicat or Workbench is not needed. |
-| §3 M1 連線管理 (SSH, SSL/CA, URL import) | SSH tunnel incl. cancel (Task 9 bastion test). Every `SslConfig` mode is mapped, with fail-closed `verify-full` through a tunnel and `require` enforced (Task 7). `mysql://`, `mysql+…://`, `jdbc:mysql://` import with `ssl-mode`/`sslmode`/`useSSL` (Tasks 5 and 7). Per-engine SSL labels and URL example (Task 10). |
+| §3 M1 連線管理 (SSH, SSL/CA, URL import) | SSH tunnel incl. cancel (Task 9 bastion test). Every `SslConfig` mode is mapped, with fail-closed `verify-full` through a tunnel and `require` enforced (Task 7). `mysql://`, `mysql+…://`, `jdbc:mysql://` import with `ssl-mode`/`sslmode`/`useSSL` (Tasks 5 and 7). Per-engine SSL labels and URL example (Task 10). Limit: with `disable` (e.g. a `useSSL=false` import), the pure driver cannot finish a caching_sha2_password full login. A failed login then explains how to fix it (R-03a-P5, Task 9), and CLAUDE.md lists it as a known limit (Task 11). |
 | §3 M2 完整的物件瀏覽 (procedure, trigger, DDL, metadata speed) | Databases → Tables/Views/Functions/Procedures/Triggers/Events; table → Columns/Indexes/Foreign keys/Triggers. Server DDL comes from `SHOW CREATE`; index and FK leaves get generated DDL (Task 8). One metadata connection serves every database. |
 | §3 M5 明確的執行範圍 (`DELIMITER`, batch semantics) | `DELIMITER` lines are consumed and never sent; compound bodies keep their inner `;`; the highlighted range is exactly what is sent (Task 2; manual check in Task 10). |
 | §3 M6 Schema-aware 補全 (fast on big schemas) | MySQL keywords, backtick quoting on apply, `#` comments and executable comments silence completion, index hints are not aliases (Task 3). The snapshot is fixed-cost and capped (Task 8). |
@@ -56,7 +56,7 @@ From `docs/research/2026-10-15-feature-priorities.md`. Every phase review checks
 | §3 M9 複製與匯出 | INSERT and IN-list copy and export use MySQL literals: backticks, `X'…'`, backslash-safe strings (Task 3). Export streams through the unchanged worker; 500k-row CSV in the manual check (Task 10). |
 | §3 M10 錯誤訊息 (raw error, exact line) | The server message plus SQLSTATE, the errno as the code chip, `at line N` → `ErrorPosition(N, 1)` (Task 9). |
 | §3 M11 安全 (DB-level read-only, confirmations, transaction indicator, idle rollback) | Server-side `SET SESSION TRANSACTION READ ONLY` plus the classifier and allow-list; the `/*! */`, `INTO OUTFILE` and `LOAD DATA` holes are closed (Tasks 4 and 9). The transaction badge comes from the protocol flag without round trips, so idle warning and rollback work unchanged (Task 9). |
-| §3 M12 取消查詢與每個 tab 的 timeout | `KILL QUERY` from a side connection, within 1 s, and the transaction survives. The worker timeout is reused (Task 9). The export-cancel warning is shown only where cancel really aborts the transaction (Task 10). |
+| §3 M12 取消查詢與每個 tab 的 timeout | `KILL QUERY` from a side connection, within 1 s, and the transaction survives. The worker timeout is reused (Task 9). The export-cancel warning is shown only where cancel really aborts the transaction, with the capability hook called unconditionally (R-03a-P3, Task 10). |
 | §3 S5 Visual EXPLAIN (MySQL last) | Not in 03a. Not regressed: `EXPLAIN`/`EXPLAIN ANALYZE` results show in the grid and are classified correctly, including `FORMAT=…` (Task 4). |
 | §6 MySQL 5.7 information_schema is slow → lazy per schema | MySQL < 8 is out of scope (spec §1). The 10,000-relation cap loads only the current database on huge servers and logs it (Task 8). Lazy per-schema loading stays deferred (Ruling 19). |
 | §7 記下 `CONNECTION_ID()` | The handshake thread id is kept for `KILL QUERY` and logged at open (Task 9). |
@@ -151,14 +151,12 @@ Task order follows dependencies: the `sql/` rule tables (1–4) come first, beca
 
 Why the extra edits: adding `Dialect.MYSQL` breaks `test_every_dialect_parses_through_sqlglot_resolved_by_import[mysql]` and `test_dialects_survive_a_bundle_without_sqlglots_by_name_lookups` unless `SQLGLOT_DIALECT` has MySQL, so the line goes in here. After `npm run gen:api`, `SQL_DIALECTS: Record<Dialect, SQLDialect>` in `extensions.ts` fails typecheck until it has a `mysql` entry.
 
-- [ ] **Step 1: Write the failing tests** — append to `backend/tests/sql/test_lexer.py`:
+- [ ] **Step 1: Write the failing tests** in `backend/tests/sql/test_lexer.py`:
+  - Change the top of the file to `PG, LITE, MY = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL` (line 7). `MY` must be defined before the existing parametrize lists that use it below.
+  - Add `INSIGNIFICANT, scan` to the `sql.lexer` import.
+  - Append:
 
 ```python
-from dbaguy_backend.sql.lexer import INSIGNIFICANT, scan
-
-MY = Dialect.MYSQL
-
-
 def test_mysql_strings_escape_with_backslashes_and_double_quotes_are_strings():
     assert kinds(r"'it\'s; ok' 'a''b' '\\'", MY) == [
         (K.STRING, r"'it\'s; ok'"), (K.STRING, "'a''b'"), (K.STRING, r"'\\'"),
@@ -1128,13 +1126,18 @@ Expected: FAIL. `SELECT a INTO @x` gives `ddl`, `INTO OUTFILE` gives `read`, `/*
     }
 
 
-    def _has_version_comment(sql: str, dialect: Dialect) -> bool:
+    def _has_version_comment(tokens: list[Token]) -> bool:
         """MySQL runs the text of `/*! … */` as code, so nothing in it can be judged (spec §3.4). `/*+ … */` holds only
         optimizer hints, which never change what a statement does."""
-        return any(t.kind == TokenKind.EXEC_COMMENT and t.text.startswith("/*!") for t in tokenize(sql, dialect))
+        return any(t.kind == TokenKind.EXEC_COMMENT and t.text.startswith("/*!") for t in tokens)
+
+
+    def _writes_server_file(words: list[str]) -> bool:
+        """SELECT … INTO OUTFILE|DUMPFILE writes a file on the database server, which a READ ONLY session allows."""
+        return any(a == "INTO" and b in ("OUTFILE", "DUMPFILE") for a, b in zip(words, words[1:]))
     ```
 
-    - In `_lexical`, take `kind = _DIALECT_KEYWORD_KIND.get(dialect, {}).get(first) or _KEYWORD_KIND.get(first, StatementKind.UNKNOWN)`. For SELECT/WITH, compute `pairs = list(zip(words, words[1:]))`. `locks` also accepts the pair `("LOCK", "IN")`. Add `writes_file = any(a == "INTO" and b in ("OUTFILE", "DUMPFILE") for a, b in pairs)`. Any of `has_dml`, `locks` or `writes_file` gives WRITE.
+    - In `_lexical`, take `kind = _DIALECT_KEYWORD_KIND.get(dialect, {}).get(first) or _KEYWORD_KIND.get(first, StatementKind.UNKNOWN)`. For SELECT/WITH, `locks` also accepts the pair `("LOCK", "IN")`. Any of `has_dml`, `locks` or `_writes_server_file(words)` gives WRITE.
     - In `_explain_inner`, replace the trailing `while` with:
 
     ```python
@@ -1149,7 +1152,17 @@ Expected: FAIL. `SELECT a INTO @x` gives `ddl`, `INTO OUTFILE` gives `read`, `/*
                 break
     ```
 
-    - The first line of `_classify_statement`: `if _has_version_comment(sql, dialect): return Classification(kind=StatementKind.UNKNOWN)`.
+    - `_classify_statement` begins with these checks, before `_explain_inner` and before sqlglot:
+
+    ```python
+        tokens = tokenize(sql, dialect)
+        if _has_version_comment(tokens):
+            return Classification(kind=StatementKind.UNKNOWN)
+        # R-03a-P7: decided before sqlglot too. sqlglot 30.23 cannot parse INTO OUTFILE (so _lexical sees it today), but
+        # a sqlglot that parses it as exp.Into would make it a plain READ for MySQL (INTO_CREATES_A_TABLE excludes it).
+        if dialect is Dialect.MYSQL and _writes_server_file([t.upper for t in tokens if t.kind == TokenKind.WORD]):
+            return Classification(kind=StatementKind.WRITE)
+    ```
 
 - [ ] **Step 4: Implement the allow-lists in `services/safety.py`.**
   - `_harmless_pg_setting(sql)` drops its `dialect` parameter and its PG check, and splits and tokenizes with `Dialect.POSTGRES`.
@@ -1381,9 +1394,12 @@ Expected: `pyproject.toml` `[project] dependencies` gains the line and `poetry.l
 
 - [ ] **Step 4: Add the compose service.** Add the `mysql` service to `dev/docker-compose.yml` and make the bastion `depends_on` both databases. The healthcheck uses TCP (`-h 127.0.0.1`): the image's temporary init server has no networking, so the container reports healthy only after the seed has run.
 
+The `command` flag (R-03a-P6) lets the non-SUPER `dbaguy` account create functions and triggers. The binary log is on by default in 8.4, which otherwise rejects them with error 1419. It is needed for the manual check in Task 10.
+
 ```yaml
   mysql:
     image: mysql:8.4
+    command: ["--log-bin-trust-function-creators=1"]
     environment:
       MYSQL_ROOT_PASSWORD: dbaguy
       MYSQL_USER: dbaguy
@@ -1567,7 +1583,7 @@ WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 50
 SELECT CONCAT('/page/', n) FROM seq;
 ```
 
-- [ ] **Step 6: Add the support helpers.** In `tests/support.py`, add the names under Interfaces. `_mysql_ready()` mirrors `_pg_ready()`: port open, then a real `mysql.connector.connect(**mysql_driver_kwargs())` closed again; `mysql.connector.Error` → False. Evaluate it once at import into `MYSQL_AVAILABLE`.
+- [ ] **Step 6: Add the support helpers.** In `tests/support.py`, add the names under Interfaces. `_mysql_ready()` mirrors `_pg_ready()`: port open, then a real `mysql.connector.connect(**mysql_driver_kwargs())` closed again; `mysql.connector.Error` → False. Evaluate it once at import into `MYSQL_AVAILABLE`. Keep `mysql_driver_kwargs()` TLS-capable (never `ssl_disabled`). Its TLS login fills the server's caching_sha2_password cache, and that is what lets the `ssl disable` test profiles log in over plain TCP after a server restart (R-03a-P5).
 
 - [ ] **Step 7: Start the containers and run the tests**
 
@@ -1645,11 +1661,13 @@ def test_parse_url_errors(url, message):
 
 def test_connect_params_keep_the_target_and_the_safety_settings():
     options = {"host": "evil", "init_command": "SET SESSION TRANSACTION READ WRITE", "allow_local_infile": "true",
-               "connection_timeout": "5", "auth_plugin": "mysql_native_password", "compress": "true"}
+               "connection_timeout": "5", "auth_plugin": "mysql_native_password", "compress": "true",
+               "get_warnings": "true", "raise_on_warnings": "true"}
     params = connect_params(profile(options=options), DIRECT, "pw", None)
     assert (params["host"], params["port"], params["user"], params["password"], params["database"]) == (
         "db.example.com", 3306, "me", "pw", "app")
     assert "init_command" not in params and params["allow_local_infile"] is False
+    assert "get_warnings" not in params and "raise_on_warnings" not in params  # R-03a-P7: warnings stay one message
     assert params["connection_timeout"] == 5 and params["auth_plugin"] == "mysql_native_password" and params["compress"] is True
     assert params["use_pure"] is True and params["autocommit"] is True
     assert params["client_flags"] == [-ClientFlag.MULTI_STATEMENTS]
@@ -1699,13 +1717,14 @@ CONNECT_TIMEOUT_S = 10
 KILL_CONNECT_TIMEOUT_S = 3  # the worker holds its state lock while a cancel connects
 _DEFAULTS: dict[str, Any] = {"connection_timeout": CONNECT_TIMEOUT_S, "charset": "utf8mb4"}
 # Arguments that pick the target, carry secrets or decide DbaGuy's guarantees (one statement per call, no LOCAL INFILE,
-# read-only not undone by init_command, pure driver): never taken from free-form options or a URL.
+# read-only not undone by init_command, pure driver, warnings as one message without extra queries or raising):
+# never taken from free-form options or a URL.
 RESERVED_OPTIONS = frozenset({
     "user", "password", "passwd", "password1", "password2", "password3", "host", "port", "database", "db",
     "unix_socket", "client_flags", "use_pure", "allow_local_infile", "allow_local_infile_in_path", "autocommit",
     "consume_results", "raw", "buffered", "converter_class", "dsn", "option_files", "option_groups", "init_command",
     "conn_attrs", "pool_name", "pool_size", "pool_reset_session", "ssl_disabled", "ssl_ca", "ssl_cert", "ssl_key",
-    "ssl_verify_cert", "ssl_verify_identity",
+    "ssl_verify_cert", "ssl_verify_identity", "get_warnings", "raise_on_warnings",
 })
 _SSL_MODES: dict[str, SslMode] = {  # MySQL ssl-mode, Connector/J sslMode and libpq sslmode spellings
     "disabled": "disable", "disable": "disable", "preferred": "prefer", "prefer": "prefer",
@@ -1782,7 +1801,7 @@ git commit -m "feat(mysql): connection settings — URL import (mysql://, jdbc:,
   - `schema.RELATION_LIMIT = 10_000`; `schema.build_snapshot(conn) -> SchemaSnapshot`.
 
 Tree shape (spec §3.5; MySQL databases are `schema` nodes):
-- `[]` → every schema in `information_schema.SCHEMATA`, `has_children=True`, `system` for `SYSTEM_SCHEMAS`, user schemas first, each group by name.
+- `[]` → every schema in `information_schema.SCHEMATA`, `has_children=True`, `system` for `SYSTEM_SCHEMAS`, user schemas first, each group by name. `SCHEMATA` shows only what the account may access. For the dev `dbaguy` account that is `dbaguy`, `analytics`, `information_schema` and `performance_schema`, never `mysql` or `sys`. Tests assert only on those; the seed grants nothing extra (R-03a-P2).
 - `[schema]` → the non-empty folders, in the order `tables, views, functions, procedures, triggers, events`, found with one `UNION ALL` count query.
 - `[schema, folder]` → objects:
 
@@ -1861,7 +1880,8 @@ def test_tree(conn):
     root = introspection.list_children(conn, [])
     assert {"dbaguy", "analytics"} <= set(names(root))
     system = {n.name for n in root if n.system}
-    assert {"information_schema", "mysql", "performance_schema", "sys"} <= system
+    # R-03a-P2: SCHEMATA lists only what the account may access; dbaguy (no global grants) sees these two system schemas
+    assert {"information_schema", "performance_schema"} <= system
     assert all(not n.system for n in root[:2]) and all(n.kind == "schema" for n in root)  # user schemas first
     assert names(introspection.list_children(conn, DB)) == ["tables", "views", "functions", "procedures", "triggers", "events"]
     assert names(introspection.list_children(conn, [seg("schema", "analytics")])) == ["tables"]
@@ -1940,8 +1960,8 @@ def test_snapshot(conn):
     assert rel(snap, "analytics", "page_views").kind == "table"
     dbaguy = next(s for s in snap.schemas if s.name == "dbaguy")
     assert dbaguy.functions == ["add_numbers"] and not dbaguy.system
-    mysql_db = next(s for s in snap.schemas if s.name == "mysql")
-    assert mysql_db.system and mysql_db.relations == []
+    performance = next(s for s in snap.schemas if s.name == "performance_schema")  # visible to dbaguy (R-03a-P2)
+    assert performance.system and performance.relations == []
 
 
 def test_snapshot_over_the_limit_loads_only_the_current_database(conn, monkeypatch):
@@ -2219,8 +2239,12 @@ def drain(result):
 
 
 def test_wrong_password():
-    with pytest.raises(ConnectionFailed, match="Access denied"):
-        MysqlAdapter().open(make_mysql_profile(), ENDPOINT, "wrong", None)
+    with pytest.raises(ConnectionFailed, match="Access denied") as plain:
+        MysqlAdapter().open(make_mysql_profile(), ENDPOINT, "wrong", None)  # ssl disable
+    assert "needs TLS (SSL mode Prefer or Require)" in plain.value.message  # R-03a-P5: the hint for disable mode
+    with pytest.raises(ConnectionFailed, match="Access denied") as secure:
+        MysqlAdapter().open(make_mysql_profile(ssl=SslConfig(mode="require")), ENDPOINT, "wrong", None)
+    assert "needs TLS" not in secure.value.message
 
 
 def test_server_info(conn):
@@ -2309,6 +2333,25 @@ def test_closing_a_fully_sent_result_does_not_poison_the_next_statement(conn):  
 def test_cancel_with_nothing_running_is_harmless(conn):  # Review Focus 4
     conn.cancel()
     assert conn.run("SELECT 1").fetch(1) == [[1]]
+
+
+def test_a_cancel_never_relabels_later_errors(conn):  # Review Focus 4, R-03a-P4
+    threading.Timer(0.5, conn.cancel).start()
+    with pytest.raises(StatementCancelled):
+        conn.run("SELECT SLEEP(30)")
+    with pytest.raises(StatementError) as failing:  # the next statement's own error
+        conn.run("SELECT * FROM nope")
+    assert failing.value.code == "1146"
+    result = conn.run("SELECT CONNECTION_ID()")
+    [[thread]] = result.fetch(1)
+    result.close()
+    conn.cancel()  # nothing running: the KILL hits nothing, and its flag must not reach commit()
+    killer = mysql.connector.connect(**mysql_driver_kwargs())
+    killer.cmd_query(f"KILL {thread}")
+    killer.close()
+    with pytest.raises(StatementError) as lost:
+        conn.commit()
+    assert lost.value.code == "connection_lost"  # not "cancelled"
 
 
 def test_one_statement_per_run(conn):
@@ -2660,6 +2703,12 @@ def column_kind(description: tuple) -> ColumnKind:
 ```python
 _CONNECTION_LOST_ERRNOS = frozenset({1053, 2006, 2013, 2055, 4031})  # shutdown, gone away, lost, lost at, idle kick
 _QUERY_INTERRUPTED = 1317
+_DRAIN_BATCH = 1000  # rows read and dropped at a time when discarding the rest of a result
+_TLS_LOGIN_HINT = (  # R-03a-P5: the pure driver cannot finish a caching_sha2_password full login over plain TCP
+    "MySQL 8 needs TLS (SSL mode Prefer or Require) for the first password login after a server restart; "
+    "or use an account with mysql_native_password."
+)
+_LOGIN_FAILED_ERRNOS = frozenset({1045, 2061})  # access denied; "authentication requires secure connection"
 _AT_LINE = re.compile(r" at line (\d+)\s*$")
 _MENTIONS_AUTOCOMMIT = re.compile(r"autocommit", re.IGNORECASE)
 _MAY_SET_AUTOCOMMIT = frozenset({"CALL", "EXECUTE"})  # a procedure or prepared statement may switch it too
@@ -2693,7 +2742,7 @@ class MysqlResult(StatementResult):
 
     def _translate(self, exc: mysql.connector.Error) -> StatementError:
         self._failed = True
-        return self._owner.translate_error(exc)
+        return self._owner.translate_error(exc, statement=True)
 
     def columns(self) -> list[ColumnMeta] | None:
         return self._columns
@@ -2777,24 +2826,28 @@ In `MysqlConnection`:
     def finish(self, cursor: _VerbatimCursor, more_results: bool) -> None:
         """End a result: stop the statement if rows are still coming, then read and drop what is left, including later
         result sets of a CALL (otherwise: "Commands out of sync"). The transaction is untouched. If the KILL cannot be
-        sent, everything left is read, which is slow for a huge result but keeps the transaction."""
+        sent, everything left is read in raw batches (never held in memory at once, never converted), which is slow for a
+        huge result but keeps the transaction. The statement is over afterwards, so its "KILL sent" flag is cleared."""
         try:
             if self._conn.unread_result:
                 self.kill_query("close of a partly read result")
             while True:
-                if self._conn.unread_result:
-                    self._conn.consume_results()
+                while self._conn.unread_result:
+                    self._conn.get_rows(count=_DRAIN_BATCH, raw=True)  # R-03a-P7: raw batches, not consume_results()
                 if not more_results or not cursor.nextset():
                     break
         except mysql.connector.Error as exc:
             if exc.errno != _QUERY_INTERRUPTED:  # 1317 is the KILL we just sent
                 logger.warning("Discarding the rest of a MySQL result failed: {}", exc)
         finally:
+            self._killed.clear()  # R-03a-P4: the flag belongs to this statement only
             with suppress(mysql.connector.Error):
                 cursor.close()
 
-    def translate_error(self, exc: mysql.connector.Error) -> StatementError:
-        if self._killed.is_set() or exc.errno == _QUERY_INTERRUPTED:
+    def translate_error(self, exc: mysql.connector.Error, statement: bool = False) -> StatementError:
+        """`statement`: the error comes from the user's statement (run, fetch, next result), the only place a cancel can
+        show. Commit, rollback, auto-commit and state queries never report "cancelled" (R-03a-P4)."""
+        if statement and (self._killed.is_set() or exc.errno == _QUERY_INTERRUPTED):
             return StatementCancelled()
         text = exc.msg or str(exc)
         # errno -1 OperationalError: "MySQL Connection not available" (the socket is already gone)
@@ -2815,12 +2868,14 @@ In `MysqlConnection`:
         try:
             cursor.execute_verbatim(sql)
         except mysql.connector.Error as exc:
+            error = self.translate_error(exc, statement=True)
+            self._killed.clear()  # the statement is over: its flag must not reach the next call (R-03a-P4)
             with suppress(mysql.connector.Error):
                 cursor.close()
-            raise self.translate_error(exc) from exc
+            raise error from exc
         result = MysqlResult(self, cursor)
         if self._killed.is_set():  # it ended normally after KILL QUERY (SLEEP() returns 1): still a cancel
-            result.close()
+            result.close()  # finish() clears the flag
             raise StatementCancelled()
         return result
 ```
@@ -2828,9 +2883,9 @@ In `MysqlConnection`:
 The rest of `MysqlConnection` follows these rules:
 - **`__init__`** takes `(conn, kill_params, read_only: bool, database: str | None)` and keeps `self._thread_id = conn.connection_id`, `self._autocommit = True`, `self._autocommit_stale = False` and `self._killed = threading.Event()`.
 - **`autocommit()`:** when `_autocommit_stale` and nothing is unread, run `catalog.first_row(self._conn, "SELECT @@session.autocommit")`, update and clear the flag. On a driver error, keep the last value and log DEBUG. Otherwise return the cached value, with no round trip.
-- **`set_autocommit(enabled)`:** no-op when `self.autocommit() == enabled`. Raise `transaction_open_error()` when `self._conn.in_transaction`. Otherwise `cmd_query(f"SET autocommit = {1 if enabled else 0}")` (translate errors), update the cache, and log INFO `"Auto-commit {} on MySQL thread {}"`.
+- **`set_autocommit(enabled)`:** no-op when `self.autocommit() == enabled`. Raise `transaction_open_error()` when `self._conn.in_transaction`. Otherwise `cmd_query(f"SET autocommit = {1 if enabled else 0}")` (errors through `translate_error(exc)`, never `statement=True`), update the cache, and log INFO `"Auto-commit {} on MySQL thread {}"`.
 - **`in_transaction()`** returns `bool(self._conn.in_transaction)`: the server status flag from the last packet, no round trip. **`transaction_failed()`** is inherited (False).
-- **`commit()` / `rollback()`:** `self._conn.commit()` / `rollback()`, with translated errors.
+- **`commit()` / `rollback()`:** `self._conn.commit()` / `rollback()`. Errors go through `translate_error(exc)` without `statement`, so a failing commit shows its real error or `connection_lost`, never "cancelled" (R-03a-P4).
 - **`server_info()`:** `catalog.first_row(conn, "SELECT VERSION(), DATABASE(), CURRENT_USER()")`, refreshes `_database`, and gives `version=f"{'MariaDB' if 'mariadb' in v.lower() else 'MySQL'} {v}"`. **`current_database()`** returns `_database` (no round trip).
 - **`list_children` / `object_detail` / `schema_snapshot`** delegate to Task 8 with `self._conn`.
 - **`close()`:** `self._conn.close()`; on a `mysql.connector.Error`, `self._conn.shutdown()`.
@@ -2838,7 +2893,9 @@ The rest of `MysqlConnection` follows these rules:
 `MysqlAdapter.open(profile, endpoint, password, database)`:
 1. `ValidationFailed("Not a MySQL server profile")` unless it is a `ServerProfile` with an endpoint.
 2. `params = connect_params(...)`.
-3. `mysql.connector.connect(**params)`. `mysql.connector.Error` → `ConnectionFailed(str(exc).strip())`. `AttributeError`/`ValueError`/`TypeError` (an option the driver does not know or cannot take) → `ConnectionFailed(f"Invalid MySQL connection option: {exc}")`.
+3. `mysql.connector.connect(**params)`.
+   - `mysql.connector.Error` → `ConnectionFailed(str(exc).strip())`. When `profile.ssl.mode == "disable"` and the error's errno is in `_LOGIN_FAILED_ERRNOS`, or its text mentions `caching_sha2_password`, append `"\n" + _TLS_LOGIN_HINT` (R-03a-P5). This also covers `useSSL=false` imports, which map to `disable`.
+   - `AttributeError`/`ValueError`/`TypeError` (an option the driver does not know or cannot take) → `ConnectionFailed(f"Invalid MySQL connection option: {exc}")`.
 4. In a try block that `shutdown()`s the connection on any failure:
    - if `requires_tls(profile.ssl) and not conn.is_secure`, raise `ConnectionFailed(f"The server does not offer TLS, which ssl mode '{profile.ssl.mode}' requires")`;
    - if `profile.read_only`, `cmd_query(_READ_ONLY_SESSION)` (a driver error → `ConnectionFailed(f"Could not make the connection read-only: {exc}")`);
@@ -2867,41 +2924,50 @@ def _enable_keepalive(conn: MySQLConnection) -> None:
 Run: `cd backend && .venv/bin/pytest -q`
 Expected: all green; no MySQL test is skipped (containers up).
 
-- [ ] **Step 7: Measure streaming against PostgreSQL** (spec §2: switch to the C extension only past 3× PG). This is a throwaway check and is not committed:
+- [ ] **Step 7: Check the streaming budget** (R-03a-P1, replacing spec §2's 3×-PG rule). The pure driver's row decoding alone costs about 16× psycopg's, so a ratio to PG would always fail; the budget is absolute instead:
+  - **100,000 rows of `big_table` in ≤ 2.0 s end to end:** `run()` plus `fetch(500)` pages plus `encode_row` on every row, as the worker does;
+  - **no 500-row page over 25 ms** (`fetch(500)` + `encode_row`).
+
+  This is a throwaway check, not committed; run it on the dev machine against the dev MySQL:
 
 ```bash
 cd backend && .venv/bin/python - <<'EOF'
+import statistics
 import time
 from dbaguy_backend.adapters.base import Endpoint
 from dbaguy_backend.adapters.mysql.adapter import MysqlAdapter
-from dbaguy_backend.adapters.postgres.adapter import PostgresAdapter
-from tests.support import (MYSQL_HOST, MYSQL_PASSWORD, MYSQL_PORT, PG_HOST, PG_PASSWORD, PG_PORT,
-                           make_mysql_profile, make_pg_profile)
-for name, adapter, profile, endpoint, password in [
-    ("postgres", PostgresAdapter(), make_pg_profile(), Endpoint(PG_HOST, PG_PORT), PG_PASSWORD),
-    ("mysql", MysqlAdapter(), make_mysql_profile(), Endpoint(MYSQL_HOST, MYSQL_PORT), MYSQL_PASSWORD),
-]:
-    conn = adapter.open(profile, endpoint, password, None)
-    for _ in range(2):  # the second pass is the one that counts (warm caches)
-        started = time.perf_counter()
-        result = conn.run("SELECT id, label, value FROM big_table ORDER BY id")
-        total = 0
-        while rows := result.fetch(500):
-            total += len(rows)
-        result.close()
-    print(name, total, f"{time.perf_counter() - started:.2f} s")
-    conn.close()
+from dbaguy_backend.adapters.values import encode_row
+from tests.support import MYSQL_HOST, MYSQL_PASSWORD, MYSQL_PORT, make_mysql_profile
+
+conn = MysqlAdapter().open(make_mysql_profile(), Endpoint(MYSQL_HOST, MYSQL_PORT), MYSQL_PASSWORD, None)
+for attempt in range(2):  # the second pass is the one that counts (warm caches)
+    pages, total = [], 0
+    started = time.perf_counter()
+    result = conn.run("SELECT id, label, value FROM big_table ORDER BY id")
+    while True:
+        page_started = time.perf_counter()
+        rows = result.fetch(500)
+        cells = [encode_row(row) for row in rows]
+        pages.append(time.perf_counter() - page_started)
+        total += len(cells)
+        if not rows:
+            break
+    result.close()
+    elapsed = time.perf_counter() - started
+print(f"rows={total} total={elapsed:.2f}s pages={len(pages)} "
+      f"median_page={statistics.median(pages) * 1000:.1f}ms max_page={max(pages) * 1000:.1f}ms")
+conn.close()
 EOF
 ```
 
-Expected: two lines with 100000 rows each. Put both timings in the commit body. If MySQL is over 3× PG, **stop and report BLOCKED** to the controller with the numbers; do not switch drivers in this task, because the C extension changes the cursor classes and the packaging.
+Expected: `rows=100000`, `total` ≤ 2.00 s, `max_page` ≤ 25.0 ms. Put the printed line in the commit body and in the task report. If either budget is exceeded, **stop and report BLOCKED** to the controller with the numbers. Do not switch drivers in this task: the C extension changes the cursor classes and the packaging, and it is carried as a later optimisation.
 
 - [ ] **Step 8: Commit**
 
 ```bash
 git add backend/dbaguy_backend/adapters/mysql backend/dbaguy_backend/container.py backend/tests
 git commit -m "feat(mysql): MySQL adapter — verbatim streaming, type table, KILL QUERY cancel and close, transactions, read-only session" \
-  -m "Streaming 100k rows: PostgreSQL <x> s, MySQL <y> s (pure driver)."
+  -m "Streaming budget (R-03a-P1): <the printed rows=… total=… median_page=… max_page=… line>."
 ```
 
 ---
@@ -2910,7 +2976,7 @@ git commit -m "feat(mysql): MySQL adapter — verbatim streaming, type table, KI
 
 **Files:**
 - Modify: `src/features/connections/hooks.ts`, `src/features/connections/ConnectionDialog.tsx`
-- Modify: `src/features/query/ConnectionPicker.tsx`
+- Modify: `src/features/query/ConnectionPicker.tsx`, `src/features/query/QueryTab.tsx` (drop the `dialect` it passes to the picker)
 - Modify: `src/features/session/SessionController.ts`, `src/features/session/SessionGuards.tsx`, `src/features/session/transactions.ts`
 - Modify: `src/features/grid/ExportDialog.tsx`
 - Modify: `src/features/table-data/filterValue.ts`, `src/features/table-data/TableDataTab.tsx`
@@ -2928,10 +2994,14 @@ git commit -m "feat(mysql): MySQL adapter — verbatim streaming, type table, KI
   - `valueCondition(dialect: Dialect, column: ColumnMeta, value: unknown): Promise<string | null>` (filterValue.ts). `quoteIdent` and `filterForValue` are deleted.
 
 Rules:
-- **Database picker:** in `ConnectionPicker`, the `DatabasePicker` shows when `useEngineInfo(profileId)?.per_database_connection` is true (PG yes; MySQL and SQLite no). Update the component's doc comment to say "for engines with one connection per database".
+- **Hooks (R-03a-P3):** every component or hook that reads a capability calls `useEngineInfo(…)` once, unconditionally, at its top (`const engine = useEngineInfo(…)`). Booleans are derived from `engine` afterwards. Never call it inside `&&`, `?:`, JSX conditions or callbacks: `useEngineInfo` wraps `useQuery`, so a conditional call changes the hook count and crashes the component.
+- **Database picker:**
+  - In `ConnectionPicker`, add `const engine = useEngineInfo(profileId)` at the top. The `DatabasePicker` renders when `profileId !== null && engine?.per_database_connection` (PG yes; MySQL and SQLite no).
+  - Remove the now-unused `dialect` from `ConnectionPickerProps` and from the destructuring, and the `dialect,` entry of the `connection={{ … }}` object in `QueryTab.tsx` (`noUnusedLocals` is on).
+  - Update the component's doc comment to say "for engines with one connection per database".
 - **Export-cancel warning** shows only where it is true:
-  - `ExportDialog`: `const cancelAbortsTransaction = inTransaction && (useEngineInfo(controller.profileId)?.cancel_aborts_transaction ?? true)`. Use it for the footer warning, for `askCancel` (confirm only when true; otherwise cancel at once) and for the confirm message.
-  - `SessionGuards`: the export step's `inTransaction` becomes `inTransaction && cancelAborts`, where `cancelAborts` is read from `useEngineInfo(controller?.profileId ?? null)` and kept in the existing `latest` ref.
+  - `ExportDialog`: at the top, `const engine = useEngineInfo(controller.profileId)`. Then `const cancelAbortsTransaction = inTransaction && (engine?.cancel_aborts_transaction ?? true)`. Use it for the footer warning, for `askCancel` (confirm only when true; otherwise cancel at once) and for the confirm message.
+  - `SessionGuards`: at the top of `useSessionGuards`, `const engine = useEngineInfo(controller?.profileId ?? null)`, with `cancelAborts = engine?.cancel_aborts_transaction ?? true` kept in the existing `latest` ref. The export step's `inTransaction` becomes `inTransaction && cancelAborts`.
   - `transactions.ts`: the doc comment of `EXPORT_CANCEL_ABORTS_TRANSACTION` says it applies to engines whose `cancel_aborts_transaction` is true (PostgreSQL).
 - **Filter by this value:** the `TableDataTab` cell-menu item is enabled whenever `column && rows && row < rows.length && dialect && !exporting`. `onSelect` calls `valueCondition(dialect, column, rows[row][col])`:
   - a string → `applyFilter(addCondition(state.filter, condition))`;
@@ -2953,14 +3023,14 @@ Run: `npm run typecheck && npm run build`
 Expected: both pass.
 
 - [ ] **Step 3: Manual check in the browser.** Run `scripts/dev.sh --web` and open http://localhost:1420, with the dev containers up.
-  1. New Connection → Engine MySQL. The URL placeholder shows the MySQL example. Import `jdbc:mysql://dbaguy@127.0.0.1:33067/dbaguy?useSSL=false`: host, port 33067, database, user and SSL `disable` fill in. Password `dbaguy`, untick "Save password in Keychain", Test → "Connected to MySQL 8.4.x", Save. The SSL tab shows the MySQL names.
+  1. New Connection → Engine MySQL. The URL placeholder shows the MySQL example. Import `jdbc:mysql://dbaguy@127.0.0.1:33067/dbaguy?useSSL=false`: host, port 33067, database, user and SSL `disable` fill in. Password `dbaguy`, untick "Save password in Keychain", Test → "Connected to MySQL 8.4.x", Save. The SSL tab shows the MySQL names. If the container was restarted since the last login, Test fails with "Access denied" plus the TLS hint (R-03a-P5). Check that the hint shows, set SSL to Prefer, Test once (this fills the server's login cache), then set it back to disable and Test again.
   2. The explorer shows `dbaguy` and `analytics` first, with the system schemas greyed. `dbaguy` → Tables / Views / Functions / Procedures / Triggers / Events (with icons). `orders` → Columns / Indexes / Foreign Keys / Triggers. Double-click `orders_customer_idx` and `orders_customer_fk`: generated DDL. Double-click `purge_job_log`: the event DDL. Open `tick`table` and `Order Items` as tables: rows load.
   3. Table tab on `types_demo`: the zero date shows `0000-00-00`, big numbers are exact, blobs show hex. Right-click → "Filter by this value":
      - on `note` (`it's \ back`), the filter becomes ``note = 'it''s \\ back'`` and returns row 1;
-     - on `flag`, `flag = TRUE` returns row 1;
+     - on `flag` (a `TINYINT(1)`, shown as a number: Ruling 14), `flag = 1` returns row 1;
      - on a blob cell, `data = X'deadbeef'` returns row 1.
   4. A query tab bound to MySQL has no database picker (a PG tab still has one).
-     - Paste the contents of `dev/mysql/init/01-routines.sql` with each name changed to `…_copy`, the trigger on `job_log` (two triggers cannot be `BEFORE INSERT ON orders` at once), and the `USE` line removed.
+     - Paste the contents of `dev/mysql/init/01-routines.sql` with each name changed to `…_copy`, the trigger on `job_log` (two triggers cannot be `BEFORE INSERT ON orders` at once), and the `USE` line removed. Creating a function and a trigger as `dbaguy` works only because of the compose flag `--log-bin-trust-function-creators=1` (R-03a-P6).
      - With the cursor inside the procedure body, ⌘↵ highlights only that `CREATE PROCEDURE …` (no `DELIMITER` lines) and runs it.
      - ⌘⇧↵ runs every statement. The Messages pane shows each run, and the explorer's Procedures folder shows `two_results_copy` after a refresh.
   5. `SELECT SLEEP(30)` → Cancel stops within about 1 s; `SELECT 1` then works. `SELECT * FROM big_table` pages with Load more.
@@ -2983,6 +3053,7 @@ git commit -m "feat(app): MySQL in the UI — capability-driven database picker 
 
 **Files:**
 - Modify: `backend/dbaguy-backend.spec`
+- Modify: `scripts/measure-startup.sh` (launch the app with a temporary data dir, R-03a-P7)
 - Modify: `CLAUDE.md`
 - Create (scratchpad only, not committed): a WebSocket probe script
 
@@ -3012,8 +3083,8 @@ Set `excludes=["tkinter", "pytest", "PyInstaller", "_mysql_connector", *_MYSQL_L
 
 - [ ] **Step 2: Build the sidecar and check its contents**
 
-Run: `npm run build:backend && find src-tauri/resources/backend -name "_mysql_connector*" | wc -l && ls src-tauri/resources/backend/_internal | grep -c "^mysql$"`
-Expected: `0`, then `1`.
+Run: `npm run build:backend && find src-tauri/resources/backend -name "_mysql_connector*" | wc -l`
+Expected: `0` (the C extension is left out). Pure-Python packages such as `mysql.connector` live inside the PYZ archive, not as `_internal/` directories, so their presence is not checked here. The frozen-sidecar probe in Step 3 (TLS login, analyze, tree, query) is the check that `mysql.connector` and sqlglot's MySQL dialect are bundled (R-03a-P7).
 
 - [ ] **Step 3: Probe the frozen sidecar against MySQL** (with the dev containers up). In shell 1:
 
@@ -3047,12 +3118,18 @@ with connect(f"ws://127.0.0.1:{port}/sessions/{session}/ws?token={token}") as ws
 
 Expected: a `rows` event with `[[1, "row 1"], [2, "row 2"], [3, "row 3"]]`, then `finished`. Stop the sidecar with Ctrl-C.
 
-- [ ] **Step 4: Build the app, check signatures and re-measure startup**
+- [ ] **Step 4: Make the startup measurement use a temporary data dir.** `scripts/measure-startup.sh` starts the app with `open -n "$APP"`. LaunchServices does not pass the caller's environment to the app, so the sidecar would use the real `~/Library/Application Support/DbaGuy`. The script cannot take a data dir today, so change it minimally (R-03a-P7):
+  - after the `APP=` line, add `DATA_DIR="${DBAGUY_DATA_DIR:-$(mktemp -d)}"` and `echo "data dir: $DATA_DIR"`;
+  - replace `open -n "$APP"` with `open -n --env "DBAGUY_DATA_DIR=$DATA_DIR" "$APP"`.
+
+  macOS `open --env` adds the variable to the launched app's environment. The sidecar inherits it: `src-tauri/src/backend.rs` only sets `DBAGUY_TOKEN`, `DBAGUY_PORT` and `DBAGUY_WATCH_STDIN`. The script keeps reading `~/Library/Logs/DbaGuy/backend.log`, which is the log dir, not the app data.
+
+- [ ] **Step 5: Build the app, check signatures and re-measure startup**
 
 Run: `npm run build:app && codesign --verify --deep --strict src-tauri/target/release/bundle/macos/DbaGuy.app && echo "signature ok" && scripts/measure-startup.sh`
-Expected: "signature ok", a cold-start time, an RSS total, and "backend exited with the app". Record the numbers for CLAUDE.md.
+Expected: "signature ok", "data dir: /…/T/tmp.…" (not Application Support), a cold-start time, an RSS total, and "backend exited with the app". Before the run, note `stat -f %m ~/Library/Application\ Support/DbaGuy` (if the directory exists). Afterwards, check that the value is unchanged (the real app data was not touched). Record the numbers for CLAUDE.md.
 
-- [ ] **Step 5: Update `CLAUDE.md`** (keep its language and style):
+- [ ] **Step 6: Update `CLAUDE.md`** (keep its language and style):
   - **開發指令 → 測試 DB line:** add `MySQL 127.0.0.1:33067（dbaguy/dbaguy，root 同密碼，另有 analytics database）`. The bastion can reach `postgres:5432` and `mysql:3306`.
   - **Repo 結構 → adapters:** mention `adapters/mysql/` (settings, catalog/introspection/schema, types, adapter).
   - **架構重點:** add a MySQL bullet:
@@ -3066,22 +3143,25 @@ Expected: "signature ok", a cold-start time, an RSS total, and "backend exited w
     - the lexer assumes MySQL's default sql_mode (`ANSI_QUOTES` / `NO_BACKSLASH_ESCAPES` are not detected);
     - a cancel that lands just as a statement finishes is reported as cancelled;
     - a MySQL snapshot over 10,000 relations loads only the current database;
+    - with SSL mode `disable` (incl. `useSSL=false` imports), the pure driver cannot finish a caching_sha2_password full login, so the first password login after a server restart fails with "Access denied". The error carries the hint: MySQL 8 needs TLS (SSL mode Prefer or Require) for the first password login after a server restart; or use an account with mysql_native_password (R-03a-P5);
+    - pure-driver streaming is held to an absolute budget (100k rows ≤ 2.0 s, 500-row page ≤ 25 ms), not to PG speed. Record the Task 9 numbers here; the C extension is a later optimisation;
+    - the dev `mysql` container runs with `--log-bin-trust-function-creators=1`, so `dbaguy` can create functions and triggers while the binary log is on;
     - replace the startup and RSS numbers with the new measurement (noting that `enqueue=True` is gone and mysql-connector was added).
   - **進度 ③:** `進行中：03a 方言基礎 + MySQL 完成；03b SQL Server 待做`.
 
-- [ ] **Step 6: Report what only a real server can verify.** For the user's final test list (spec §4), list in the task handoff:
+- [ ] **Step 7: Report what only a real server can verify.** For the user's final test list (spec §4), list in the task handoff:
   - TLS `verify-ca` against the company CA, and `verify-full` without a tunnel;
   - Cancel and early close through the company network and bastion;
   - Tree and snapshot time on the largest company database;
   - The read-only profile against a real account.
 
-- [ ] **Step 7: Run the full suites again and commit**
+- [ ] **Step 8: Run the full suites again and commit**
 
 Run: `cd backend && .venv/bin/pytest -q && cd .. && npm run typecheck && npm run build`
 Expected: green.
 
 ```bash
-git add backend/dbaguy-backend.spec CLAUDE.md
+git add backend/dbaguy-backend.spec scripts/measure-startup.sh CLAUDE.md
 git commit -m "build: bundle the pure mysql-connector and sqlglot's MySQL dialect; verify the sidecar against MySQL; document 03a"
 ```
 
@@ -3101,6 +3181,7 @@ git commit -m "build: bundle the pure mysql-connector and sqlglot's MySQL dialec
 | 02b / 02c: `filterForValue` is PG/SQLite only | Task 3 (`/sql/value-condition`) + Task 10 |
 | 02c: sql-formatter mapping and splitting need MySQL | Task 1 (`LANGUAGES.mysql`, CodeMirror `MySQL`) + Task 2 |
 | 02c: cap sqlglot input for huge INSERTs (⑥) | Not ③ — untouched |
+| New carry from 03a (R-03a-P1) | C extension as a later optimisation if large exports feel slow. |
 
 ## Rulings recorded while planning
 
@@ -3115,12 +3196,12 @@ git commit -m "build: bundle the pure mysql-connector and sqlglot's MySQL dialec
 | 7 | Compound bodies open only on the first BEGIN of `CREATE [OR REPLACE] [DEFINER=…] [SQL SECURITY …] PROCEDURE/FUNCTION/TRIGGER/EVENT`, never right after a dot. | Spec §3.3; the dot guard covers `NEW.begin` in triggers. | A body-less routine using an unqualified column `begin` merges with following statements; the server rejects the merged text. |
 | 8 | User SQL goes through a `MySQLCursorRaw` subclass that calls `cmd_query` directly. | `cursor.execute()` rewrites any text matching `delimiter\s+` outside quotes, comments included (found in the 26.7.0 source). | Depends on protected cursor members (`_handle_result`, `_reset_result`); a driver upgrade must re-check them (pinned `<27`). |
 | 9 | MySQL errors: code = errno as text, message = server text + `SQLSTATE: x` line, position = `(N, 1)` from `at line N`. | Spec §3.5: errno + SQLSTATE + message; the errno is what MySQL users search for. | The chip shows `1064` where PG shows a SQLSTATE; purely cosmetic. |
-| 10 | A statement counts as cancelled once KILL was sent. A failed KILL clears the flag. | Spec §2: `SLEEP` returns 1 rather than an error after KILL. | A statement finishing in the same millisecond is reported as cancelled although it completed. |
-| 11 | `close()` of an unread result always sends KILL QUERY, then drains. If the KILL connection fails, it drains everything. | Spec §3.5; the transaction must survive. | Closing a huge result when the server refuses the side connection reads it in full (slow, logged as a WARNING). |
+| 10 | A statement counts as cancelled once KILL was sent. A failed KILL clears the flag, and so does the end of the statement (R-03a-P4). | Spec §2: `SLEEP` returns 1 rather than an error after KILL. | A statement finishing in the same millisecond is reported as cancelled although it completed. |
+| 11 | `close()` of an unread result always sends KILL QUERY, then drains. If the KILL connection fails, it drains everything in raw batches of 1,000 (R-03a-P7). | Spec §3.5; the transaction must survive. | Closing a huge result when the server refuses the side connection reads it all, slowly but in constant memory (logged as a WARNING). |
 | 12 | `autocommit()` is cached and recalibrated with `SELECT @@session.autocommit` only after statements mentioning "autocommit" or starting with CALL/EXECUTE, and only when nothing is unread. | Spec §3.5 asks for no round trips while paused; the driver's `autocommit` property is a round trip, and the status flag is not exposed. | A procedure that switches autocommit, called via an unusual path, could leave the toolbar toggle stale until the next such statement. |
 | 13 | MySQL warnings show as one message, "N warnings: run SHOW WARNINGS…", when a result set ends. | Non-strict truncation is silent data loss otherwise, and the count costs no round trip. | One extra message line for statements with warnings. |
 | 14 | `TINYINT(1)` shows as a number, `BIT` as an int, `YEAR` as text (datetime category), ENUM/SET as text, GEOMETRY/VECTOR as bytes. | Text-first, lossless, matching spec §3.5's table; MySQL has no real boolean type. | Booleans show as `0/1`, not ✓/✗. |
-| 15 | Profile options: reserved keys dropped (incl. `init_command`, `allow_local_infile`), values coerced (`true/false` → bool, digits → int). URL import keeps only keys mysql-connector knows. | The driver takes typed values, and `init_command` could undo READ ONLY. JDBC URLs carry Java-only parameters that would fail the connection. | An option that needs a list (e.g. `tls_versions`) cannot be given. |
+| 15 | Profile options: reserved keys dropped (incl. `init_command`, `allow_local_infile`, `get_warnings`, `raise_on_warnings`), values coerced (`true/false` → bool, digits → int). URL import keeps only keys mysql-connector knows. | The driver takes typed values, and `init_command` could undo READ ONLY. JDBC URLs carry Java-only parameters that would fail the connection. | An option that needs a list (e.g. `tls_versions`) cannot be given. |
 | 16 | `verify-full` through an SSH tunnel fails before connecting. `require` is checked with `is_secure` after connecting. The CA is used only for `verify-*`. | mysql-connector verifies against the host it connects to (127.0.0.1); spec §3.5 says fail closed. The driver silently falls back to plain TCP for require. | Tunnelled users must pick `verify-ca`. |
 | 17 | TCP keepalive is set on the driver's private socket (30/10/3), best effort. | Feature-priorities §7; the driver has no option for it. | A driver refactor could make it a no-op (logged at DEBUG). |
 | 18 | Index and FK leaves get generated DDL. New kind `foreign_key` and folder `foreign_keys`. | Spec §3.5 lists a Foreign keys folder, and every leaf opens an object tab, but `SHOW CREATE` has no index/FK form. | Two more kinds for 03b to reuse or ignore. |
@@ -3129,18 +3210,26 @@ git commit -m "build: bundle the pure mysql-connector and sqlglot's MySQL dialec
 | 21 | MySQL clause keywords drop RETURNING. `USE/FORCE/IGNORE/STRAIGHT_JOIN/PARTITION` stop alias reading for every dialect. | MySQL has no RETURNING; index hints were read as aliases. | A PG alias literally named `use` or `force` is no longer recognised. |
 | 22 | `value_condition` reuses the copy/export cell-literal renderer. Complete bytes cells become filterable (`X'…'`). The menu item is always enabled, and a `null` answer shows a toast. | DRY with formatting; the grid cannot know whether a bytes preview is complete without duplicating that logic. | One click to learn that a cut value cannot be filtered. |
 | 23 | The dependency is pinned `mysql-connector-python>=26.7.0,<27`. Poetry installs the platform wheel; the bundle excludes the C extension. | Mirrors the psycopg pin style; spec §2 chose pure mode. | The dev venv carries the unused C extension (~20 MB). |
-| 24 | Streaming speed is measured in Task 9; over 3× PG, the implementer stops and reports instead of switching. | The C extension changes the cursor classes (`_VerbatimCursor`) and packaging, which needs a plan revision. | A pause in execution if pure mode is too slow. |
+| 24 | Replaced by R-03a-P1: streaming is held to an absolute budget, not 3× PG. Over budget, the implementer stops and reports instead of switching drivers. | The pure driver's decoding is ~16× psycopg's, so the ratio rule always fires. The C extension changes the cursor classes (`_VerbatimCursor`) and packaging, which needs a plan revision. | A pause in execution if pure mode misses the budget. |
 | 25 | The lexer assumes MySQL's default sql_mode. | Detecting `ANSI_QUOTES`/`NO_BACKSLASH_ESCAPES` per session costs a round trip and makes the pure `sql/` layer session-aware. | On such servers the splitter and guards can disagree with the server about strings (documented in CLAUDE.md). |
 | 26 | Seed objects use DEFINER `dbaguy`@`%`; the event is scheduled for 2030. | The dev account can then read every definition, and the event never deletes anything. | None (dev only). |
 | 27 | `EXPLAIN [ANALYZE] FORMAT=…` is unwrapped like PG's EXPLAIN options. | Otherwise `EXPLAIN ANALYZE FORMAT=TREE DELETE …` was UNKNOWN and skipped the DELETE confirmation on the standard level. | None. |
-| 28 | `LOAD` and `HANDLER` are WRITE only in MySQL (dialect overlay). The OUTFILE/DUMPFILE rule is dialect-agnostic. | PG's `LOAD 'lib'` keeps its meaning; INTO OUTFILE exists only in MySQL anyway. | None. |
+| 28 | `LOAD` and `HANDLER` are WRITE only in MySQL (dialect overlay). The OUTFILE/DUMPFILE word rule applies in `_lexical` for every dialect, and for MySQL also before sqlglot (R-03a-P7). | PG's `LOAD 'lib'` keeps its meaning; INTO OUTFILE exists only in MySQL anyway. | None. |
 | 29 | The SchemaCache key normalisation (02a minor) is not done. | MySQL query and table tabs never send a database (no picker), so one key is used. | Duplicate snapshot builds if some path later sends a database for MySQL. |
 | 30 | `server_info` labels MariaDB servers "MariaDB …". | Spec: MariaDB works where compatible; the label avoids "MySQL 10.11". | None. |
 | 31 | The SSL tab shows MySQL names next to the shared modes; no per-engine profile fields. | `SslConfig` stays one model (spec §3.5 maps modes); one dialog for every engine. | Users read two names per mode. |
 | 32 | Cursors are constructed directly (`_VerbatimCursor(conn)`, `MySQLCursorBuffered(conn)`), never through `conn.cursor()`. | `conn.cursor()` sends a PING first: a round trip per statement, which doubles latency over a tunnel (found in the 26.7.0 source). | Same protected-API dependency as Ruling 8. |
+| R-03a-P1 | Speed rule: Task 9 streams 100,000 rows of `big_table` through the adapter in 500-row pages including `encode_row`. Budget: ≤ 2.0 s end to end, and no page over 25 ms. Over budget, stop and report; never switch drivers. The numbers go in the report; the C extension is carried as a later optimisation. | Pre-flight: the pure driver's row decoding is ~16× psycopg's, so spec §2's 3×-PG rule would always fire. The absolute budget keeps grid pages and exports responsive. | Large exports run slower than PG until the C extension carry is done. |
+| R-03a-P2 | Task 8 asserts only on schemas the `dbaguy` account can see (`information_schema`, `performance_schema`, plus the seeded `dbaguy`, `analytics`). The seed grants nothing extra. | MySQL 8 lists in `SCHEMATA` only what the account may access; extra grants would make the dev account unlike a real one. | None. |
+| R-03a-P3 | Components read capabilities through one unconditional `useEngineInfo` call at their top (`ExportDialog`, `ConnectionPicker`, `useSessionGuards`). | `useEngineInfo` wraps `useQuery`; a call inside `&&` changes the hook count when `inTransaction` flips and crashes the dialog. | None. |
+| R-03a-P4 | The "KILL sent" flag belongs to one statement. It is cleared when that statement's result finishes or closes, or its `run()` fails. Only statement paths (`run`, `fetch`, `next_result`) may turn an error into "cancelled"; commit, rollback, auto-commit and state queries never do. | Pre-flight: a sticky flag made a later failing COMMIT (or a dropped connection) show "cancelled", hiding the real error and the Reconnect button. | None (pinned by `test_a_cancel_never_relabels_later_errors`). |
+| R-03a-P5 | With SSL mode `disable` (incl. `useSSL=false`), a failed login (1045/2061, or a caching_sha2_password message) gets the hint "MySQL 8 needs TLS (SSL mode Prefer or Require) for the first password login after a server restart; or use an account with mysql_native_password." The limit is listed in CLAUDE.md. | The pure driver cannot do caching_sha2's RSA exchange, so a plain-TCP full login fails until a TLS login has filled the server cache. | The hint also appears for a genuinely wrong password in `disable` mode. |
+| R-03a-P6 | The dev `mysql` service runs with `--log-bin-trust-function-creators=1`. | The binary log is on in 8.4, so `dbaguy` (no SUPER) would get 1419 creating functions and triggers in the manual check. | None (dev only). |
+| R-03a-P7 | Small fixes: the manual check expects `flag = 1`; the bundle check relies on the Step 3 frozen-sidecar probe, not `_internal/mysql`; `measure-startup.sh` launches the app with a temp `DBAGUY_DATA_DIR`; Task 1 defines `MY` at the top of the test file; `ConnectionPicker` drops its unused `dialect`; the early-close fallback drains raw batches; `get_warnings`/`raise_on_warnings` are reserved; the OUTFILE/DUMPFILE check also runs before sqlglot for MySQL. | Pre-flight findings: each was a wrong expectation, a typecheck or NameError, a memory risk, a hidden round trip, a real-data touch, or a sqlglot-upgrade hole. | None. |
 
 ## Spec issues found while planning
 
+- §2's "switch to the C extension past 3× PG" cannot work as a stop rule. Pure-Python decoding is ~16× psycopg on localhost, so it always fires. Replaced by an absolute budget (R-03a-P1).
 - §3.2 shows the MySQL literal as `'it\\'s'`, which as written closes the string after an escaped backslash; resolved by Ruling 5.
 - §3.4 makes every `EXEC_COMMENT` statement UNKNOWN, including `/*+ … */` hints, which would block harmless hinted SELECTs on read-only profiles; narrowed by Ruling 3.
 - §3.5 says `require` = "must be TLS, unverified", which the driver cannot express (it falls back to plain); enforced after connect (Ruling 16).
