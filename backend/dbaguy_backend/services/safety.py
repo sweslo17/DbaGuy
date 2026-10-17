@@ -146,7 +146,9 @@ _MYSQL_HARMLESS_VARIABLES = frozenset({
     "sql_mode",
     "time_zone",
     "autocommit",  # the adapter recalibrates its autocommit state from the server
-    "group_concat_max_len", "max_execution_time", "sql_select_limit", "character_set_results", "lc_time_names",
+    # Not character_set_results (R-03a-F3): the adapter always decodes results as UTF-8, so another charset garbles
+    # every result until it is reset.
+    "group_concat_max_len", "max_execution_time", "sql_select_limit", "lc_time_names",
 })
 _MYSQL_SESSION_SCOPES = frozenset({"SESSION", "LOCAL"})
 

@@ -366,6 +366,8 @@ def test_catalog_query_decodes_and_never_pings(conn, monkeypatch):
 def test_catalog_constants():
     assert catalog.SYSTEM_SCHEMAS == frozenset({"information_schema", "mysql", "performance_schema", "sys"})
     assert catalog.MISSING_OBJECT_ERRNOS == frozenset({1049, 1146, 1305, 1360, 1539})
+    assert catalog.ACCESS_DENIED_ERRNOS == frozenset({1044, 1142})
+    assert catalog.UNREADABLE_DEFINITION_ERRNOS == frozenset({1142, 1227, 1356})
 
 
 # ---- fix round 1 ---------------------------------------------------------------------------------------------------
@@ -414,6 +416,27 @@ def test_a_dropped_schema_is_not_taken_for_a_refused_show_create(conn, show_crea
     show_create_refused(1142)  # what the server really answers for a table of a missing schema
     with pytest.raises(NotFound, match="Schema 'nope' not found"):
         introspection.object_detail(conn, [seg("schema", "nope"), seg("folder", "tables"), seg("table", "orders")])
+
+
+@pytest.mark.parametrize(("folder", "kind"), [("tables", "table"), ("views", "view")])
+def test_a_vanished_table_is_not_taken_for_a_refused_show_create(conn, show_create_refused, folder, kind):
+    # What a schema the account has no grant on answers for a table that is gone: 1142, not 1146 (final-wave carry).
+    show_create_refused(1142)
+    with pytest.raises(NotFound, match=f"{kind} 'nope' not found"):
+        introspection.object_detail(conn, [*DB, seg("folder", folder), seg(kind, "nope")])
+
+
+def test_a_refused_show_create_is_logged_before_the_existence_check(conn, show_create_refused, debug_log):
+    show_create_refused(1142)
+    with pytest.raises(NotFound):
+        introspection.object_detail(conn, [seg("schema", "nope"), seg("folder", "tables"), seg("table", "orders")])
+    assert any("1142" in message and "SHOW CREATE TABLE" in message for message in debug_log)
+
+
+def test_a_missing_object_of_a_dropped_schema_is_logged_before_the_existence_check(conn, debug_log):
+    with pytest.raises(NotFound, match="Schema 'nope' not found"):
+        introspection.object_detail(conn, [seg("schema", "nope"), seg("folder", "procedures"), seg("procedure", "p")])
+    assert any("NotFound" in message for message in debug_log)
 
 
 def test_not_found_errnos_are_logged_at_debug(conn, debug_log):

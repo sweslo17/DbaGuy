@@ -145,7 +145,7 @@ def decide_my(sql, level="standard", read_only=False):
     # Variables that shape how statements run or look, never whether they may write.
     "SET autocommit = 0", "SET @x = 1, autocommit = 0", "SET SESSION autocommit = 1", "SET @@autocommit := 1",
     "SET group_concat_max_len = 1000000", "SET max_execution_time = 1000", "SET SESSION sql_select_limit = 10",
-    "SET character_set_results = NULL", "SET lc_time_names = 'en_US'",
+    "SET lc_time_names = 'en_US'",
     # A read-only characteristic can only make things stricter.
     "SET SESSION TRANSACTION READ ONLY", "SET TRANSACTION READ ONLY", "SET LOCAL TRANSACTION READ ONLY",
     "set session transaction read only;",
@@ -169,6 +169,9 @@ def test_mysql_read_only_allows(sql):
     "SET @x := 1, @@global.sql_mode = ''", "SET sql_mode", "SET sql_mode =", "SET CHARACTER SET", "SET @x = 1,",
     "SET @x = /*!50000 1 */", "SET SESSION transaction_isolation = 'READ-COMMITTED'",
     "USE", "USE a b", "USE analytics; USE other", "USE (a)", "SET search_path TO public", "RESET sql_mode",
+    # R-03a-F3: results are always decoded as UTF-8, so their charset is not harmless.
+    "SET character_set_results = utf16", "SET character_set_results = NULL",
+    "SET @@session.character_set_results = 'latin1'",
 ])
 def test_mysql_read_only_blocks(sql):
     assert decide_my(sql, read_only=True) == (A.BLOCK, ["read_only"])

@@ -74,6 +74,26 @@ def test_wrong_password():
     assert "needs TLS" not in secure.value.message
 
 
+def test_time_zone_and_sql_mode_options_are_set_after_connect_before_read_only():  # R-03a-F2
+    conn = open_mysql(options={"time_zone": "+02:00", "sql_mode": "ANSI_QUOTES"}, read_only=True)
+    try:
+        result = conn.run(
+            "SELECT @@session.time_zone, @@session.sql_mode, @@session.autocommit, @@session.transaction_read_only"
+        )
+        assert result.fetch(1) == [["+02:00", "ANSI_QUOTES", 1, 1]]
+        result.close()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("option", ["time_zone", "sql_mode"])
+def test_an_option_value_shaped_like_an_injection_sets_nothing_else(option):  # R-03a-F2 (M3)
+    # Quoted, the whole value is one literal the server refuses: the connection fails, where before it opened in
+    # autocommit=0 while DbaGuy showed auto-commit on.
+    with pytest.raises(ConnectionFailed, match="time_zone / sql_mode"):
+        open_mysql(options={option: "+00:00',@@session.autocommit=0,@x='"})
+
+
 def test_server_info(conn):
     info = conn.server_info()
     assert info.version.startswith("MySQL 8.4") and info.current_database == "dbaguy"
@@ -272,6 +292,54 @@ def test_a_drain_after_a_kill_that_was_sent_is_never_cut_short(conn, monkeypatch
     assert rows.fetch(1) == [[1]]
     rows.close()
     conn.rollback()
+
+
+# A loop around a SLEEP: KILL QUERY only cuts the SLEEP it lands in, and the loop goes on sending result sets.
+KILL_SWALLOWING_LOOP = (
+    "DECLARE i INT DEFAULT 0; WHILE i < 40 DO SELECT i AS n; DO SLEEP(0.5); SET i = i + 1; END WHILE;"
+)
+
+
+def test_a_call_that_swallows_the_kill_cannot_hold_its_close(conn, monkeypatch):  # final-wave carry (Task 9)
+    monkeypatch.setattr(mysql_adapter, "_DRAIN_LIMIT_S", 1.0)  # only the waits for later result sets count
+    thread = conn.run("SELECT CONNECTION_ID()")
+    [[thread_id]] = thread.fetch(1)
+    thread.close()
+    with mysql_procedure("zz_kill_swallowing_loop", KILL_SWALLOWING_LOOP) as name:
+        try:
+            result = conn.run(f"CALL {name}()")
+            assert result.fetch(5) == [[0]]
+            started = time.monotonic()
+            result.close()  # KILL QUERY is sent, yet the loop keeps sending a result set every 0.5 s
+            assert time.monotonic() - started < 3
+            assert not conn.in_transaction()
+            with pytest.raises(StatementError) as info:
+                conn.run("SELECT 1")
+            assert info.value.code == "connection_lost"  # the Reconnect UI takes over
+        finally:
+            cleaner = mysql.connector.connect(**mysql_driver_kwargs())  # the dropped client's CALL may run on a while
+            with suppress(mysql.connector.Error):
+                cleaner.cmd_query(f"KILL {thread_id}")
+            cleaner.close()
+
+
+def test_next_set_within_restores_the_cursors_read_timeout(monkeypatch):  # final-wave carry (Task 9)
+    raw = mysql.connector.connect(**mysql_driver_kwargs())
+    try:
+        cursor = mysql_adapter._VerbatimCursor(raw)
+        cursor._read_timeout = 7
+        assert cursor.next_set_within(0.5) is False  # nothing pending
+        assert cursor._read_timeout == 7
+
+        def lost(self):
+            raise mysql.connector.errors.ReadTimeoutError("timed out")
+
+        monkeypatch.setattr(mysql_adapter._VerbatimCursor, "nextset", lost)
+        with pytest.raises(mysql.connector.errors.ReadTimeoutError):
+            cursor.next_set_within(0.5)
+        assert cursor._read_timeout == 7
+    finally:
+        raw.close()
 
 
 def test_a_client_read_timeout_drops_the_connection(monkeypatch):  # fix round 2: a reply left half read

@@ -315,10 +315,15 @@ def _server_ddl(conn: MySQLConnection, schema: str, kind: NodeKind, name: str) -
     except mysql.connector.Error as exc:
         if exc.errno not in catalog.UNREADABLE_DEFINITION_ERRNOS:
             raise
-        _require_schema(conn, schema)  # a dropped schema answers 1142 as well; that one is NotFound
         logger.debug(
             "MySQL error {} on SHOW CREATE {} {}.{}: no server DDL ({})", exc.errno, word, schema, name, exc.msg
         )
+        # A dropped schema answers 1142 as well, and so does a vanished table of a schema the account has no grant
+        # on: those are NotFound, not an object without readable DDL.
+        if kind in _HAS_FOLDERS:
+            _require_table(conn, schema, name, kind)
+        else:
+            _require_schema(conn, schema)
         if kind == NodeKind.VIEW:
             return _view_definition_ddl(conn, schema, name), True
         return None, False
@@ -379,10 +384,11 @@ def object_detail(conn: MySQLConnection, path: list[PathSegment]) -> ObjectDetai
         return _detail(conn, path, schema)
     except mysql.connector.Error as exc:
         missing = exc.errno in catalog.MISSING_OBJECT_ERRNOS
+        kind, name = path[-1].kind, path[-1].name
+        if missing:
+            logger.debug("MySQL error {} on {} {}.{} mapped to NotFound ({})", exc.errno, kind, schema, name, exc.msg)
         if missing or exc.errno in catalog.ACCESS_DENIED_ERRNOS:
             _require_schema(conn, schema)  # the server words a dropped schema in several ways: say so plainly
         if missing:
-            kind, name = path[-1].kind, path[-1].name
-            logger.debug("MySQL error {} on {} {}.{} mapped to NotFound ({})", exc.errno, kind, schema, name, exc.msg)
             raise NotFound(f"{kind} '{name}' not found") from exc
         raise  # MetadataService retries once, then reports QueryFailed

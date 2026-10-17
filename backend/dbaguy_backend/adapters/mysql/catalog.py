@@ -16,9 +16,10 @@ MISSING_OBJECT_ERRNOS = frozenset({1049, 1146, 1305, 1360, 1539})
 # What the server says about a schema that is gone, depending on the statement and on the account's grants: access
 # denied to the database (1044) or to the table (1142). Not found, but not an error DbaGuy can tell apart by itself.
 ACCESS_DENIED_ERRNOS = frozenset({1044, 1142})
-# SHOW CREATE refused: access denied to the table or view (1142: no SHOW VIEW), or a view that references something
-# that no longer exists or that its definer may not use (1356). The object is there; its server DDL is not readable.
-UNREADABLE_DEFINITION_ERRNOS = frozenset({1142, 1356})
+# SHOW CREATE refused: access denied to the table or view (1142: no SHOW VIEW), a privilege the statement needs (1227:
+# PROCESS, for some information_schema tables), or a view that references something that no longer exists or that its
+# definer may not use (1356). The object is there; its server DDL is not readable.
+UNREADABLE_DEFINITION_ERRNOS = frozenset({1142, 1227, 1356})
 
 
 def _decode(value: Any) -> Any:

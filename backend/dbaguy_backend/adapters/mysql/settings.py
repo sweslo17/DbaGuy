@@ -11,6 +11,7 @@ from mysql.connector.constants import DEFAULT_CONFIGURATION, ClientFlag
 
 from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.profiles import ServerProfile, ServerProfileDraft, SslConfig, SslMode
+from ...sql.dialects import Dialect, quote_literal
 from ..base import MALFORMED_URL_MESSAGE, URL_ENCODING_HINT, Endpoint, ParsedUrl
 
 URL_SCHEMES = ("mysql", "mysql+mysqlconnector", "mysql+pymysql")
@@ -34,6 +35,10 @@ RESERVED_OPTIONS = frozenset({
     # The connection charset: rows are decoded as UTF-8 (types._text), so another one would garble CJK text.
     "charset", "collation",
 })
+# Profile options DbaGuy applies itself, never through the driver (R-03a-F2): the driver pastes them unquoted into its
+# own `SET @@session.<name> = '<value>'` at connect, so a value holding a quote ran more than the setting (an imported
+# URL left the session in autocommit=0). The adapter sets them right after connecting, as quoted literals.
+SESSION_OPTIONS = ("time_zone", "sql_mode")
 _SSL_MODES: dict[str, SslMode] = {  # MySQL ssl-mode, Connector/J sslMode and libpq sslmode spellings
     "disabled": "disable", "disable": "disable", "preferred": "prefer", "prefer": "prefer",
     "required": "require", "require": "require", "verify-ca": "verify-ca", "verify-identity": "verify-full",
@@ -73,6 +78,10 @@ def _is_reserved(key: str) -> bool:
     return key.lower() in RESERVED_OPTIONS
 
 
+def _is_session_option(key: str) -> bool:
+    return key.lower() in SESSION_OPTIONS
+
+
 def _option_value(value: str) -> str | int | bool:
     """Profile options are strings; the driver wants real booleans and numbers. Options that take a list, such as
     `tls_versions`, are given in the driver's own string form: `[TLSv1.2,TLSv1.3]`."""
@@ -88,10 +97,25 @@ def _driver_options(options: Mapping[str, str]) -> dict[str, Any]:
     ignored = [key for key in options if _is_reserved(key)]
     if ignored:
         logger.warning("Ignoring reserved MySQL connection options: {}", ", ".join(sorted(ignored)))
-    coerced = {key: _option_value(value) for key, value in options.items() if not _is_reserved(key)}
+    coerced = {
+        key: _option_value(value) for key, value in options.items()
+        if not _is_reserved(key) and not _is_session_option(key)
+    }
     if _CONNECT_TIMEOUT_ALIAS in coerced:
         coerced.setdefault("connection_timeout", coerced.pop(_CONNECT_TIMEOUT_ALIAS))
     return coerced
+
+
+def session_settings(options: Mapping[str, str]) -> str | None:
+    """The one statement that applies the profile's `time_zone` and `sql_mode` options after connecting (R-03a-F2), or
+    None when it sets neither. Values are quoted literals; an empty value leaves the server's default, as the driver
+    did. Doubled quotes are read back exactly in every sql_mode, so no value can end its literal early."""
+    given = {key.lower(): value for key, value in options.items() if _is_session_option(key)}
+    items = [
+        f"SESSION {name} = {quote_literal(Dialect.MYSQL, given[name])}"
+        for name in SESSION_OPTIONS if given.get(name, "").strip()
+    ]
+    return "SET " + ", ".join(items) if items else None
 
 
 def requires_tls(ssl: SslConfig) -> bool:
@@ -112,7 +136,10 @@ def _tls_params(ssl: SslConfig, endpoint: Endpoint) -> dict[str, Any]:
     params: dict[str, Any] = {}
     if ssl.mode in _VERIFYING_MODES:  # the CA only matters when the certificate is checked
         params["ssl_verify_cert"] = True
-        if ssl.ca_file:  # without one the driver uses the system trust store
+        # Without a CA file the driver trusts only OpenSSL's default CA bundle (the path compiled into the bundled
+        # OpenSSL, Homebrew's cert.pem), not the macOS Keychain: a publicly trusted certificate passes on a machine that
+        # has that file, one from an internal company CA never does. It fails closed.
+        if ssl.ca_file:
             params["ssl_ca"] = os.path.expanduser(ssl.ca_file)
     if ssl.mode == "verify-full":
         params["ssl_verify_identity"] = True
@@ -190,7 +217,8 @@ def _flag(value: str) -> bool | None:
 
 def _jdbc_ssl_mode(flags: Mapping[str, bool]) -> SslMode | None:
     """Connector/J's switches when the URL names no ssl-mode. A pasted URL never gets weaker TLS than it asked for:
-    `verifyServerCertificate` means verify-ca (the system trust store, no fallback), `requireSSL` at least require."""
+    `verifyServerCertificate` means verify-ca (without a CA file: OpenSSL's default CA bundle, not the macOS Keychain;
+    it fails closed, never falls back), `requireSSL` at least require."""
     if flags.get("usessl") is False:
         return "disable"
     if flags.get("verifyservercertificate"):

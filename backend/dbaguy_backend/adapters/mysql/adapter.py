@@ -35,7 +35,7 @@ from ..base import (
 from ..positions import offset_to_line_col
 from . import catalog, introspection
 from . import schema as mysql_schema
-from .settings import URL_SCHEMES, connect_params, kill_params, parse_mysql_url, requires_tls
+from .settings import URL_SCHEMES, connect_params, kill_params, parse_mysql_url, requires_tls, session_settings
 from .types import column_meta, row_converter
 
 _CONNECTION_LOST_ERRNOS = frozenset({1053, 2006, 2013, 2055, 4031})  # shutdown, gone away, lost, lost at, idle kick
@@ -43,7 +43,9 @@ _QUERY_INTERRUPTED = 1317
 _DRAIN_BATCH = 1000  # rows read and dropped at a time when discarding the rest of a result
 # When the KILL cannot be sent, discarding the rest of a result gives up after this long and drops the connection: an
 # endless, stalled or trickling stream would otherwise hold the session forever (Reconnect beats a wedged tab). After a
-# KILL that was sent there is no limit: the server stops, and only what it already sent is left (R-03a-T9f).
+# KILL that was sent, reading rows has no limit: the server stops, and only what it already sent is left (R-03a-T9f).
+# Waiting for a CALL's next result set is still limited to this long in total: a SLEEP in the procedure swallows the
+# KILL, so a loop around it would hold the close until the procedure ends.
 _DRAIN_LIMIT_S = 10.0
 _FAST_BATCH_S = 0.01  # without a KILL, batches grow from one row only while each one comes back this fast
 _DRAIN_REPORT_MS = 200  # a discard slower than this is logged with its row count
@@ -78,9 +80,13 @@ class _VerbatimCursor(MySQLCursorRaw):
         self._handle_result(self._connection.cmd_query(statement))
 
     def next_set_within(self, seconds: float | None) -> bool:
-        """nextset() that waits at most `seconds` for the next result set to start (ReadTimeoutError after that)."""
-        self._read_timeout = seconds
-        return bool(self.nextset())
+        """nextset() that waits at most `seconds` for the next result set to start (ReadTimeoutError after that). The
+        cursor's own read timeout is restored afterwards, also when it raises."""
+        previous, self._read_timeout = self._read_timeout, seconds
+        try:
+            return bool(self.nextset())
+        finally:
+            self._read_timeout = previous
 
 
 class MysqlResult(StatementResult):
@@ -193,18 +199,19 @@ class MysqlConnection(DatabaseConnection):
     def finish(self, cursor: _VerbatimCursor, more_results: bool) -> None:
         """End a result: stop the statement if anything is still to come, then read and drop what is left, including
         later result sets of a CALL (otherwise the next statement reads them as its own answer). The transaction is
-        untouched, unless the KILL could not be sent and the rest would not end (see `_discard`). The statement is over
-        afterwards, so its "KILL sent" flag is cleared.
+        untouched, unless the connection is dropped because the rest would not end (see `_discard`). The statement is
+        over afterwards, so its "KILL sent" flag is cleared.
 
         Caveat: a SLEEP inside a procedure swallows KILL QUERY (it returns early and the procedure goes on to its next
-        statement), so a CALL can keep sending results after the KILL; they are read and dropped like the rest."""
+        statement), so a CALL can keep sending results after the KILL; they are read and dropped like the rest, until
+        the waits for them add up to `_DRAIN_LIMIT_S`."""
         try:
             # R-03a-T9a: a CALL closed between two result sets is still running, possibly towards a write.
             # R-03a-T9d: KILL even when this statement was already cancelled. That KILL may have reached the server
             # just before the statement began, and been ignored; a redundant one costs only a short side connection.
             if self._conn.unread_result or (more_results and self._conn.have_next_result):
                 sent = self.kill_query("close of a partly read result")
-                self._discard(cursor, more_results, limit_s=None if sent else _DRAIN_LIMIT_S)
+                self._discard(cursor, more_results, killed=sent)
         except mysql.connector.Error as exc:
             if self._note_lost(exc):
                 logger.warning("Discarding the rest of a MySQL result failed: {}", exc)
@@ -219,54 +226,72 @@ class MysqlConnection(DatabaseConnection):
             with suppress(mysql.connector.Error):
                 cursor.close()
 
-    def _discard(self, cursor: _VerbatimCursor, more_results: bool, limit_s: float | None) -> None:
+    def _discard(self, cursor: _VerbatimCursor, more_results: bool, killed: bool) -> None:
         """Read and drop the rest of the statement in raw batches (R-03a-P7: never held at once, never converted).
 
-        `limit_s` (only when no KILL was sent): every read waits at most for the time left, batches start at one row
-        and grow only while rows come fast, and once the time is up the connection is dropped. So neither a stream
-        that never ends, nor one that stalls or trickles, nor a CALL working between result sets can hold the session.
+        Once `_DRAIN_LIMIT_S` is used up the connection is dropped. Without a KILL (it could not be sent) the limit
+        covers everything: every read waits at most for the time left, and batches start at one row and grow only
+        while rows come fast. So neither a stream that never ends, nor one that stalls or trickles, nor a CALL working
+        between result sets can hold the session. After a KILL that was sent, reading rows is not limited (only what
+        the server already sent is left, R-03a-T9f); the limit covers only the waits for a CALL's next result set, so
+        a procedure that loops around a SLEEP (which swallows the KILL) cannot hold the session either.
         """
         started = time.monotonic()
-        deadline = None if limit_s is None else started + limit_s
-        batch = _DRAIN_BATCH if deadline is None else 1
+        deadline = None if killed else started + _DRAIN_LIMIT_S  # the whole drain, without a KILL
+        waiting_left = _DRAIN_LIMIT_S  # after a KILL: what is left for waiting on later result sets
+        batch = _DRAIN_BATCH if killed else 1
         drained = 0
+        waiting = False  # in a wait limited here (a ReadTimeoutError elsewhere is the profile's own read_timeout)
         try:
             while True:
                 while self._conn.unread_result:
                     left = None if deadline is None else deadline - time.monotonic()
                     if left is not None and left <= 0:
-                        self._give_up(drained)
+                        self._give_up(drained, killed)
                         return
                     read_started = time.monotonic()
+                    waiting = deadline is not None
                     rows, _ = self._conn.get_rows(count=batch, raw=True, read_timeout=left)
+                    waiting = False
                     drained += len(rows)
                     if deadline is not None:  # a trickle is then read row by row, each read bounded by the time left
                         fast = time.monotonic() - read_started < _FAST_BATCH_S
                         batch = min(batch * 2, _DRAIN_BATCH) if fast else 1
-                if not more_results:
+                if not (more_results and self._conn.have_next_result):
                     break
-                left = None if deadline is None else deadline - time.monotonic()
-                if left is not None and left <= 0:
-                    self._give_up(drained)
+                left = waiting_left if deadline is None else deadline - time.monotonic()
+                if left <= 0:
+                    self._give_up(drained, killed)
                     return
-                if not cursor.next_set_within(left):
+                wait_started, waiting = time.monotonic(), True
+                more = cursor.next_set_within(left)
+                waiting = False
+                if deadline is None:
+                    waiting_left -= time.monotonic() - wait_started
+                if not more:
                     break
         except mysql.connector.errors.ReadTimeoutError:
-            if deadline is None:
+            if not waiting:
                 raise  # the profile's own read_timeout: a lost connection, handled by finish()
-            self._give_up(drained)
+            self._give_up(drained, killed)
         finally:
             elapsed_ms = (time.monotonic() - started) * 1000  # the drain alone: the KILL's connection is not counted
             if elapsed_ms > _DRAIN_REPORT_MS:
                 logger.info("Discarded {:,} rows of a closed MySQL result in {:.0f} ms", drained, elapsed_ms)
 
-    def _give_up(self, drained: int) -> None:
-        """The rest of a result would not end and no KILL could stop it: drop the connection, so the next call reports
-        `connection_lost` (and the Reconnect UI) instead of the session hanging."""
-        logger.warning(
-            "Discarding a MySQL result without KILL took over {:.0f} s ({:,} rows); closing the connection of thread {}",
-            _DRAIN_LIMIT_S, drained, self._thread_id,
-        )
+    def _give_up(self, drained: int, killed: bool) -> None:
+        """The rest of a result would not end (without a KILL), or a CALL kept sending result sets after one: drop the
+        connection, so the next call reports `connection_lost` (and the Reconnect UI) instead of the session hanging."""
+        if killed:
+            logger.warning(
+                "A MySQL CALL kept sending result sets {:.0f} s after KILL QUERY ({:,} rows); closing the "
+                "connection of thread {}", _DRAIN_LIMIT_S, drained, self._thread_id,
+            )
+        else:
+            logger.warning(
+                "Discarding a MySQL result without KILL took over {:.0f} s ({:,} rows); closing the connection of "
+                "thread {}", _DRAIN_LIMIT_S, drained, self._thread_id,
+            )
         self._drop()
 
     def _drop(self) -> None:
@@ -489,9 +514,15 @@ class MysqlAdapter(DatabaseAdapter):
         try:
             if requires_tls(profile.ssl) and not conn.is_secure:
                 raise ConnectionFailed(f"The server does not offer TLS, which ssl mode '{profile.ssl.mode}' requires")
+            if settings := session_settings(profile.options):  # R-03a-F2: quoted, never pasted in by the driver
+                try:
+                    conn.cmd_query(settings)
+                except mysql.connector.Error as exc:
+                    message = f"Could not apply the time_zone / sql_mode connection options: {exc}"
+                    raise ConnectionFailed(message) from exc
             if profile.read_only:
-                # After connect(): the driver interpolates `sql_mode`/`time_zone` options into its own SET at connect,
-                # and the server enforces READ ONLY for writes hidden in functions or procedures too.
+                # Last: nothing sent at connect may undo it, and the server enforces READ ONLY for writes hidden in
+                # functions or procedures too.
                 try:
                     conn.cmd_query(_READ_ONLY_SESSION)
                 except mysql.connector.Error as exc:

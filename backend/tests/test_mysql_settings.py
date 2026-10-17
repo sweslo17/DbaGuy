@@ -5,7 +5,9 @@ from loguru import logger
 from mysql.connector.constants import ClientFlag
 
 from dbaguy_backend.adapters.base import Endpoint
-from dbaguy_backend.adapters.mysql.settings import connect_params, kill_params, parse_mysql_url, requires_tls
+from dbaguy_backend.adapters.mysql.settings import (
+    connect_params, kill_params, parse_mysql_url, requires_tls, session_settings,
+)
 from dbaguy_backend.domain.errors import ConnectionFailed, ValidationFailed
 from dbaguy_backend.domain.profiles import ServerProfile, SslConfig
 
@@ -254,3 +256,30 @@ def test_more_options_the_driver_could_use_to_redirect_or_read_files_are_reserve
 def test_list_options_are_given_in_the_drivers_bracketed_string_form():
     params = connect_params(profile(options={"tls_versions": "[TLSv1.2,TLSv1.3]"}), DIRECT, None, None)
     assert params["tls_versions"] == "[TLSv1.2,TLSv1.3]"  # the driver parses this form itself
+
+
+# ---- R-03a-F2: time_zone and sql_mode are set by the adapter, quoted ----
+
+INJECTION = "+00:00',@@session.autocommit=0,@x='"  # what the review's imported URL carried (M3)
+
+
+def test_time_zone_and_sql_mode_never_reach_the_driver():  # it pastes them unquoted into its own SET
+    options = {"time_zone": INJECTION, "SQL_MODE": "ANSI", "compress": "true"}
+    params = connect_params(profile(options=options), DIRECT, None, None)
+    assert not {"time_zone", "sql_mode", "SQL_MODE"} & params.keys() and params["compress"] is True
+
+
+def test_session_settings_are_one_statement_of_quoted_literals():
+    assert session_settings({}) is None and session_settings({"compress": "true", "time_zone": "  "}) is None
+    assert session_settings({"sql_mode": "ANSI", "time_zone": "+08:00"}) == (
+        "SET SESSION time_zone = '+08:00', SESSION sql_mode = 'ANSI'"
+    )
+    assert session_settings({"time_zone": INJECTION}) == (
+        "SET SESSION time_zone = '+00:00'',@@session.autocommit=0,@x='''"
+    )
+    assert session_settings({"Sql_Mode": r"a\'b"}) == r"SET SESSION sql_mode = 'a\\''b'"
+
+
+def test_url_import_keeps_time_zone_and_sql_mode_as_profile_options():
+    parsed = parse_mysql_url("mysql://h/db?time_zone=%2B00:00'%2C@@session.autocommit%3D0%2C@x%3D'&sql_mode=ANSI")
+    assert parsed.profile.options == {"time_zone": INJECTION, "sql_mode": "ANSI"}
