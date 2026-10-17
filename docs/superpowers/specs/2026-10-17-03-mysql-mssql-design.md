@@ -77,7 +77,7 @@ MariaDB 專屬功能（相容的部分能用就好，不另測）、MySQL 5.7 �
 | 客戶端指令 | — | — | `DELIMITER x` | `GO [n]` |
 | body 追蹤 | `begin_atomic` | `trigger` | `compound`（CREATE PROCEDURE/FUNCTION/TRIGGER/EVENT 內的 BEGIN…END） | `tsql_block`（BEGIN…END、BEGIN TRY/CATCH） |
 
-- `quote_ident(dialect, name)`、`quote_literal(dialect, value)`、`bool_literal(dialect, value)`、`bytes_literal(dialect, hex)` 成為唯一的常值與識別字來源：MySQL `` `a``b` ``、`'it''s \\ x'`（`'` 與 `\` 都加倍，任何 sql_mode 都讀回原值）、`TRUE/FALSE`、`X'0102'`；T-SQL `[a]]b]`、`N'中文'`、`1/0`、`0x0102`。`formatting._BOOL_SQL`／`_BYTES_SQL` 改為呼叫這些函式。
+- `quote_ident(dialect, name)`、`quote_literal(dialect, value)`、`bool_literal(dialect, value)`、`bytes_literal(dialect, hex)` 成為唯一的常值與識別字來源：MySQL `` `a``b` ``、`'it''s \\ x'`（`'` 與 `\` 都加倍；預設 sql_mode 讀回原值，`NO_BACKSLASH_ESCAPES` 下反斜線會變成兩個，見 plan 03a Ruling 5、25）、`TRUE/FALSE`、`X'0102'`；T-SQL `[a]]b]`、`N'中文'`、`1/0`、`0x0102`。`formatting._BOOL_SQL`／`_BYTES_SQL` 改為呼叫這些函式。
 - 保留字表：MySQL 8.4、T-SQL 各一份（只放需要加引號的字）。
 
 ### 3.3 切分（`sql/lexer.py`、`sql/splitter.py`）
