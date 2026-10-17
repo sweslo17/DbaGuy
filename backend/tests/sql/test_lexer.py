@@ -108,6 +108,10 @@ def test_mysql_comments():
     assert kinds("x -- c\ny", MY)[1] == (K.COMMENT, "-- c")
     assert kinds("x --\ty", MY)[1] == (K.COMMENT, "--\ty")
     assert kinds("x --", MY)[-1] == (K.COMMENT, "--")
+    assert kinds("x --\x7fy", MY)[1] == (K.COMMENT, "--\x7fy")  # DEL is a control character
+    # only an ASCII space or control character counts: U+00A0 and U+2003 are whitespace to Python, not to the server
+    for odd_space in ("\u00a0", "\u2003"):
+        assert kinds(f"x --{odd_space}y", MY) == [(K.WORD, "x"), (K.OTHER, "-"), (K.OTHER, "-"), (K.WORD, "y")]
     assert kinds("-- c\r; x", MY)[0] == (K.COMMENT, "-- c\r; x")  # a line comment ends at LF only
     assert kinds("/* a /* b */ c */", MY)[0] == (K.COMMENT, "/* a /* b */")  # no nesting
     assert kinds("a # b") == [(K.WORD, "a"), (K.OTHER, "#"), (K.WORD, "b")]  # PostgreSQL: an operator
@@ -151,6 +155,7 @@ def test_scan_with_a_custom_delimiter():
     assert scanned("1253", "5") == [(K.NUMBER, "12"), (K.DELIMITER, "5"), (K.NUMBER, "3")]
     tokens = list(scan("xx SELECT", MY, 3))
     assert (tokens[0].start, tokens[0].text) == (3, "SELECT")
+    assert [t.text for t in scan("abc", MY, 0, "")] == ["abc"]  # an empty delimiter is no delimiter
 
 
 def test_mysql_offsets_cover_the_text():

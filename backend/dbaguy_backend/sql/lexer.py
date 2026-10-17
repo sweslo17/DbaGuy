@@ -79,8 +79,15 @@ def _starts_line_comment(text: str, i: int, rules: LexRules) -> bool:
         return False
     if not rules.dash_comment_needs_space:
         return True
+    # The server wants an ASCII space or control character (0x00-0x20, 0x7f) or the end: not U+00A0, not U+2003.
     following = text[i + 2:i + 3]
-    return following == "" or following.isspace() or ord(following) < 32
+    return following == "" or ord(following) <= 0x20 or ord(following) == 0x7F
+
+
+def _cut_at_delimiter(text: str, begin: int, end: int, delimiter: str) -> int:
+    """`end`, or where the first `delimiter` starting in (begin, end) begins: the token stops there."""
+    cut = text.find(delimiter, begin + 1, end + len(delimiter) - 1)
+    return end if cut < 0 else cut
 
 
 def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = None) -> Iterator[Token]:
@@ -95,15 +102,11 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
     delimiter = delimiter or None  # an empty terminator would match everywhere without advancing
     n = len(text)
     i = start
-
-    def ends_here(j: int) -> bool:
-        return delimiter is not None and text.startswith(delimiter, j)
-
     while i < n:
         ch = text[i]
         begin = i
         terminated = True
-        if ends_here(i):
+        if delimiter is not None and text.startswith(delimiter, i):
             i += len(delimiter)
             kind = TokenKind.DELIMITER
         elif ch.isspace():
@@ -154,14 +157,18 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
             i = n if close_at < 0 else close_at + len(tag.group(0))
             kind = TokenKind.STRING
         elif ch == rules.variable_prefix:  # "" never equals a character
-            while i < n and text[i] == ch and not ends_here(i):  # @ or @@
+            while i < n and text[i] == ch:  # @ or @@
                 i += 1
-            while i < n and _ident_char(text[i]) and not ends_here(i):
+            while i < n and _ident_char(text[i]):
                 i += 1
+            if delimiter is not None:
+                i = _cut_at_delimiter(text, begin, i, delimiter)
             kind = TokenKind.WORD
         elif _ident_start(ch):
-            while i < n and _ident_char(text[i]) and not ends_here(i):
+            while i < n and _ident_char(text[i]):
                 i += 1
+            if delimiter is not None:
+                i = _cut_at_delimiter(text, begin, i, delimiter)
             if text[begin:i] in rules.escape_string_prefixes and i < n and text[i] == "'":
                 i, terminated = _scan_string(text, i, "'", backslash=True)
                 kind = TokenKind.STRING
@@ -169,8 +176,9 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
                 kind = TokenKind.WORD
         elif ch.isdigit() or (ch == "." and i + 1 < n and text[i + 1].isdigit()):
             match = _NUMBER.match(text, i)
-            end = match.end() if match else i + 1
-            i = next((j for j in range(i + 1, end) if ends_here(j)), end)
+            i = match.end() if match else i + 1
+            if delimiter is not None:
+                i = _cut_at_delimiter(text, begin, i, delimiter)
             kind = TokenKind.NUMBER
         else:
             i += 1
@@ -184,12 +192,14 @@ def tokenize(text: str, dialect: Dialect) -> list[Token]:
 
 
 def first_token(text: str, dialect: Dialect) -> Token | None:
-    """First token that is neither whitespace nor a comment; stops scanning there. None if there is none."""
+    """First token that is neither whitespace nor a comment; stops scanning there. None if there is none.
+    A MySQL executable comment (`/*! … */`, `/*+ … */`) is code, so it can be that token."""
     return next((token for token in scan(text, dialect) if token.kind not in INSIGNIFICANT), None)
 
 
 def first_keyword(text: str, dialect: Dialect) -> str:
     """Upper-cased text of the first token when that token is a WORD; "" otherwise
-    (empty text, "(", a quoted identifier or a string)."""
+    (empty text, "(", a quoted identifier, a string or a MySQL executable comment:
+    `first_keyword("/*! x */ select 1", MYSQL)` is "")."""
     token = first_token(text, dialect)
     return token.upper if token is not None and token.kind == TokenKind.WORD else ""
