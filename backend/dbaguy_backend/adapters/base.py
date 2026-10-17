@@ -19,6 +19,9 @@ class Endpoint:
 @dataclass(frozen=True)
 class AdapterCapabilities:
     per_database_connection: bool = False  # PostgreSQL: one connection can only see one database
+    # PostgreSQL: cancelling a statement aborts the transaction around it (the export-cancel warning)
+    cancel_aborts_transaction: bool = False
+    server_read_only: bool = True  # the database can enforce a read-only session; SQL Server cannot (03b)
 
 
 @dataclass(frozen=True)
@@ -170,7 +173,9 @@ class DatabaseAdapter(ABC):
     def info(self) -> EngineInfo:
         return EngineInfo(
             engine=self.engine, default_port=self.default_port, url_schemes=list(self.url_schemes),
-            dialect=self.dialect,
+            dialect=self.dialect, per_database_connection=self.capabilities.per_database_connection,
+            cancel_aborts_transaction=self.capabilities.cancel_aborts_transaction,
+            server_read_only=self.capabilities.server_read_only,
         )
 
     def relation_path(self, database: str | None, schema: str, name: str, kind: RelationKind) -> list[PathSegment]:

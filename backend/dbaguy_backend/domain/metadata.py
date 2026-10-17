@@ -20,6 +20,8 @@ class NodeKind(StrEnum):
     TYPE = "type"
     INDEX = "index"
     TRIGGER = "trigger"
+    EVENT = "event"
+    FOREIGN_KEY = "foreign_key"
     COLUMN = "column"
 
 
@@ -34,6 +36,8 @@ class Folder(StrEnum):
     COLUMNS = "columns"
     INDEXES = "indexes"
     TRIGGERS = "triggers"
+    EVENTS = "events"
+    FOREIGN_KEYS = "foreign_keys"
     PARTITIONS = "partitions"
 
 

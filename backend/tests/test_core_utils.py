@@ -111,3 +111,18 @@ def test_registry_dispatch():
     with pytest.raises(ValidationFailed):
         registry.parse_url("nope://x")
     assert registry.engines()[0].engine == Engine.SQLITE
+
+
+def test_registry_strips_a_jdbc_prefix_before_choosing_the_adapter():
+    seen = []
+
+    class Recording(FakeAdapter):
+        def parse_url(self, url):
+            seen.append(url)
+            return super().parse_url(url)
+
+    registry = AdapterRegistry([Recording()])
+    assert registry.parse_url("  JDBC:fake:///tmp/x ").profile.name == "fake"
+    assert seen == ["fake:///tmp/x"]
+    with pytest.raises(ValidationFailed):
+        registry.parse_url("jdbc:nope://x")

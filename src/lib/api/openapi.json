@@ -2824,6 +2824,18 @@
           },
           "dialect": {
             "$ref": "#/components/schemas/Dialect"
+          },
+          "per_database_connection": {
+            "type": "boolean",
+            "title": "Per Database Connection"
+          },
+          "cancel_aborts_transaction": {
+            "type": "boolean",
+            "title": "Cancel Aborts Transaction"
+          },
+          "server_read_only": {
+            "type": "boolean",
+            "title": "Server Read Only"
           }
         },
         "type": "object",
@@ -2831,7 +2843,10 @@
           "engine",
           "default_port",
           "url_schemes",
-          "dialect"
+          "dialect",
+          "per_database_connection",
+          "cancel_aborts_transaction",
+          "server_read_only"
         ],
         "title": "EngineInfo"
       },

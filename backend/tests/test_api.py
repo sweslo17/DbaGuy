@@ -84,7 +84,11 @@ def test_import_url_and_validation(client):
 
 
 def test_engines(client):
-    assert {e["engine"] for e in client.get("/system/engines", headers=AUTH).json()} == {"postgres", "sqlite"}
+    engines = {e["engine"]: e for e in client.get("/system/engines", headers=AUTH).json()}
+    assert set(engines) == {"postgres", "sqlite"}
+    assert engines["postgres"]["per_database_connection"] and engines["postgres"]["cancel_aborts_transaction"]
+    assert not engines["sqlite"]["per_database_connection"] and not engines["sqlite"]["cancel_aborts_transaction"]
+    assert engines["postgres"]["server_read_only"] and engines["sqlite"]["server_read_only"]
 
 
 def test_metadata_and_session_over_websocket(client, sqlite_profile_id):

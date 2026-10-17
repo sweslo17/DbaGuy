@@ -830,6 +830,12 @@ export interface components {
             /** Url Schemes */
             url_schemes: string[];
             dialect: components["schemas"]["Dialect"];
+            /** Per Database Connection */
+            per_database_connection: boolean;
+            /** Cancel Aborts Transaction */
+            cancel_aborts_transaction: boolean;
+            /** Server Read Only */
+            server_read_only: boolean;
         };
         /** ErrorEvent */
         ErrorEvent: {

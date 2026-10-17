@@ -1,8 +1,11 @@
+import re
 from collections.abc import Iterable
 
 from ..domain.errors import UnsupportedEngine, ValidationFailed
 from ..domain.profiles import Engine, EngineInfo
 from .base import DatabaseAdapter, ParsedUrl
+
+_JDBC_PREFIX = re.compile(r"^jdbc:", re.IGNORECASE)  # connection strings pasted from JDBC tools
 
 
 class AdapterRegistry:
@@ -23,11 +26,12 @@ class AdapterRegistry:
             raise UnsupportedEngine(f"Engine '{engine}' is not supported yet") from None
 
     def parse_url(self, url: str) -> ParsedUrl:
-        scheme = url.split(":", 1)[0].strip().lower() if ":" in url else ""
+        url = _JDBC_PREFIX.sub("", url.strip(), count=1)
+        scheme = url.split(":", 1)[0].lower() if ":" in url else ""
         adapter = self._by_scheme.get(scheme)
         if adapter is None:
             raise ValidationFailed(f"Unsupported URL scheme '{scheme}'")
-        return adapter.parse_url(url.strip())
+        return adapter.parse_url(url)
 
     def engines(self) -> list[EngineInfo]:
         return [adapter.info() for adapter in self._by_engine.values()]
