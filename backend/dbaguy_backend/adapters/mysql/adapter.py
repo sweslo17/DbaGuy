@@ -44,8 +44,10 @@ _DRAIN_BATCH = 1000  # rows read and dropped at a time when discarding the rest 
 # When the KILL cannot be sent, discarding the rest of a result gives up after this long and drops the connection: an
 # endless, stalled or trickling stream would otherwise hold the session forever (Reconnect beats a wedged tab). After a
 # KILL that was sent, reading rows has no limit: the server stops, and only what it already sent is left (R-03a-T9f).
-# Waiting for a CALL's next result set is still limited to this long in total: a SLEEP in the procedure swallows the
-# KILL, so a loop around it would hold the close until the procedure ends.
+# Nor has waiting for the end of the statement: the server may still be finishing what it killed (a slow rollback, a
+# CONTINUE HANDLER, a SLEEP or two). Only once a CALL sends another result set after the KILL (a SLEEP in the procedure
+# swallowed it) are the waits for further result sets limited to this long in total, so a loop around that SLEEP
+# cannot hold the close until the procedure ends (R-03a-F5).
 _DRAIN_LIMIT_S = 10.0
 _FAST_BATCH_S = 0.01  # without a KILL, batches grow from one row only while each one comes back this fast
 _DRAIN_REPORT_MS = 200  # a discard slower than this is logged with its row count
@@ -204,7 +206,7 @@ class MysqlConnection(DatabaseConnection):
 
         Caveat: a SLEEP inside a procedure swallows KILL QUERY (it returns early and the procedure goes on to its next
         statement), so a CALL can keep sending results after the KILL; they are read and dropped like the rest, until
-        the waits for them add up to `_DRAIN_LIMIT_S`."""
+        the waits for the ones after the first add up to `_DRAIN_LIMIT_S`."""
         try:
             # R-03a-T9a: a CALL closed between two result sets is still running, possibly towards a write.
             # R-03a-T9d: KILL even when this statement was already cancelled. That KILL may have reached the server
@@ -233,12 +235,15 @@ class MysqlConnection(DatabaseConnection):
         covers everything: every read waits at most for the time left, and batches start at one row and grow only
         while rows come fast. So neither a stream that never ends, nor one that stalls or trickles, nor a CALL working
         between result sets can hold the session. After a KILL that was sent, reading rows is not limited (only what
-        the server already sent is left, R-03a-T9f); the limit covers only the waits for a CALL's next result set, so
-        a procedure that loops around a SLEEP (which swallows the KILL) cannot hold the session either.
+        the server already sent is left, R-03a-T9f), and neither is waiting while the server finishes the killed
+        statement. A result set arriving after the KILL proves a SLEEP in the procedure swallowed it: from then on the
+        waits for further result sets are limited, so a procedure looping around that SLEEP cannot hold the session
+        either (R-03a-F5).
         """
         started = time.monotonic()
         deadline = None if killed else started + _DRAIN_LIMIT_S  # the whole drain, without a KILL
-        waiting_left = _DRAIN_LIMIT_S  # after a KILL: what is left for waiting on later result sets
+        # After a KILL: None (no limit) until a result set arrives anyway, then what is left for waiting on later ones.
+        waiting_left: float | None = None
         batch = _DRAIN_BATCH if killed else 1
         drained = 0
         waiting = False  # in a wait limited here (a ReadTimeoutError elsewhere is the profile's own read_timeout)
@@ -260,16 +265,19 @@ class MysqlConnection(DatabaseConnection):
                 if not (more_results and self._conn.have_next_result):
                     break
                 left = waiting_left if deadline is None else deadline - time.monotonic()
-                if left <= 0:
+                if left is not None and left <= 0:
                     self._give_up(drained, killed)
                     return
-                wait_started, waiting = time.monotonic(), True
+                wait_started, waiting = time.monotonic(), left is not None
                 more = cursor.next_set_within(left)
                 waiting = False
-                if deadline is None:
-                    waiting_left -= time.monotonic() - wait_started
                 if not more:
                     break
+                if deadline is None:  # after a KILL, and another result set came: a SLEEP swallowed the KILL
+                    if waiting_left is None:
+                        waiting_left = _DRAIN_LIMIT_S  # the limit starts now: that wait was the server finishing up
+                    else:
+                        waiting_left -= time.monotonic() - wait_started
         except mysql.connector.errors.ReadTimeoutError:
             if not waiting:
                 raise  # the profile's own read_timeout: a lost connection, handled by finish()
@@ -284,8 +292,9 @@ class MysqlConnection(DatabaseConnection):
         connection, so the next call reports `connection_lost` (and the Reconnect UI) instead of the session hanging."""
         if killed:
             logger.warning(
-                "A MySQL CALL kept sending result sets {:.0f} s after KILL QUERY ({:,} rows); closing the "
-                "connection of thread {}", _DRAIN_LIMIT_S, drained, self._thread_id,
+                "A MySQL CALL went on sending result sets after KILL QUERY (a SLEEP in it swallows the KILL), and the "
+                "waits for more reached {:.0f} s ({:,} rows discarded); closing the connection of thread {}",
+                _DRAIN_LIMIT_S, drained, self._thread_id,
             )
         else:
             logger.warning(

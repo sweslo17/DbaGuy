@@ -102,7 +102,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
   - SSL mode `disable`（含匯入的 `useSSL=false`）時，pure driver 做不了 caching_sha2_password 的完整登入，所以 server 重啟後第一次用密碼登入會失敗（Access denied）。錯誤訊息附提示：第一次登入要用 TLS（SSL mode Prefer 或 Require），或改用 mysql_native_password 的帳號。帳密真的打錯時也會出現這個提示。
   - 取消剛好在語句結束時送到，會回報成已取消（實際已執行完）。
   - Procedure 裡的 `SLEEP()` 會吞掉 KILL QUERY（提早回傳，procedure 接著跑下一句），所以取消或關閉這種 CALL 時，後面的結果仍會送來，被讀掉丟棄。
-  - 關閉暫停中的結果時的 drain：KILL QUERY 送出後，讀列不設時間上限，但能讀的只剩 server 已經送出的列（本機 125 萬列約 3.7 秒，TLS 4.1 秒）。10 秒上限只用在兩處，超過就放棄這條連線（顯示 Reconnect）：KILL 送不出去時的整個 drain；以及 KILL 之後等待 CALL 下一個 result set 的時間合計（例如 procedure 在迴圈裡 `SLEEP()`，吞掉 KILL 後還一直送結果）。
+  - 關閉暫停中的結果時的 drain：KILL QUERY 送出後，讀列不設時間上限，但能讀的只剩 server 已經送出的列（本機 125 萬列約 3.7 秒，TLS 4.1 秒）；等 server 把被 KILL 的語句收尾（慢的 rollback、CONTINUE HANDLER、後面幾個 `SLEEP()`）也不設上限。10 秒上限只用在兩處，超過就放棄這條連線（顯示 Reconnect，交易也跟著沒了）：KILL 送不出去時的整個 drain；以及 KILL 之後 CALL 又送來 result set（代表 KILL 被 `SLEEP()` 吞掉）之後，再等下一個 result set 的時間合計（例如 procedure 在迴圈裡 `SLEEP()`，一直送結果）。
   - Pure driver 的串流以絕對預算驗收（10 萬列 ≤ 2.0 秒、500 列一頁 ≤ 25 ms），不跟 PG 比：本機實測 10 萬列 0.59–0.60 秒、最慢一頁 3.5 ms。上面的 drain 與大量匯出若嫌慢，之後的優化是 C extension 或 bulk read（carry）。
   - Table／view 超過 10,000 個的 server，補全用的 snapshot 只載入目前的 database（連線沒指定 database 就不載入）。這是縮小範圍，不是大小上限：目前的 database 本身再大也會整個載入。
   - Tab 不會跟著 `USE` 切換：補全的預設 schema 一直是 metadata 連線的 database（profile 的 database），`USE` 之後補全建議的未加前綴名稱可能屬於另一個 database。從 History 重開的 MySQL tab 會連到當時記錄的 database，UI 沒有 database picker 可以改；schema snapshot 每個 profile 只有一份（`SchemaCache` 對沒有 per-database 連線的 engine 忽略 database）。

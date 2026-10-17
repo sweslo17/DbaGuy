@@ -323,6 +323,34 @@ def test_a_call_that_swallows_the_kill_cannot_hold_its_close(conn, monkeypatch):
             cleaner.close()
 
 
+# What a KILL leaves behind without another result set: the server finishes the CALL (here a second SLEEP), and the
+# close waits for that without a limit (R-03a-F5).
+KILLED_THEN_A_TAIL = "SELECT 1 AS first; DO SLEEP(2); DO SLEEP(2);"
+
+
+def test_a_killed_call_that_only_finishes_its_tail_keeps_the_connection(conn, monkeypatch):  # R-03a-F5
+    monkeypatch.setattr(mysql_adapter, "_DRAIN_LIMIT_S", 1.0)
+    conn.set_autocommit(False)
+    conn.run("CREATE TEMPORARY TABLE zz_tx (id INT)").close()
+    conn.run("INSERT INTO zz_tx VALUES (1)").close()
+    with mysql_procedure("zz_killed_then_a_tail", KILLED_THEN_A_TAIL) as name:
+        try:
+            result = conn.run(f"CALL {name}()")
+            assert result.fetch(5) == [[1]]
+            started = time.monotonic()
+            result.close()  # the KILL cuts the first SLEEP short; the second runs its 2 s, then the CALL ends
+            assert 1.5 < time.monotonic() - started < 4  # past the 1 s limit, and still not given up
+            assert conn.in_transaction()  # the connection and its transaction survive
+            rows = conn.run("SELECT COUNT(*) FROM zz_tx")
+            assert rows.fetch(1) == [[1]]
+            rows.close()
+            assert_next_statement_gets_its_own_rows(conn)
+        finally:
+            # The transaction holds the procedure's metadata lock: end it before the procedure is dropped.
+            with suppress(StatementError):
+                conn.rollback()
+
+
 def test_next_set_within_restores_the_cursors_read_timeout(monkeypatch):  # final-wave carry (Task 9)
     raw = mysql.connector.connect(**mysql_driver_kwargs())
     try:
