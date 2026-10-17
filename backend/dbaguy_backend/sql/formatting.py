@@ -22,7 +22,9 @@ from ..adapters.values import encode_value
 from ..domain.column_category import ColumnCategory
 from ..domain.errors import ValidationFailed
 from ..domain.formats import FormatColumn, FormatKind, RowFormatOptions
-from .dialects import NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, qualified, quote_ident, quote_literal
+from .dialects import (
+    NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, json_literal, qualified, quote_ident, quote_literal,
+)
 
 __all__ = [
     "FormatColumn", "FormatKind", "FormatResult", "RowFormatOptions", "RowWriter", "format_rows", "open_writer",
@@ -226,8 +228,9 @@ def value_condition(dialect: Dialect, column: str, value: Any, category: ColumnC
     """The "Filter by this value" condition (spec §3.7) for one encoded grid cell, in the dialect's syntax.
 
     The database decides what matches, by the column's collation: MySQL's default collations ignore case, accents and
-    trailing spaces, so the filter can return more rows than the one clicked. None when the cell is only a preview
-    (cut text or bytes): no condition can be built from it."""
+    trailing spaces, so the filter can return more rows than the one clicked. A JSON cell is compared as JSON where the
+    dialect needs it said (MySQL). None when the cell is only a preview (cut text or bytes): no condition can be built
+    from it."""
     name = quote_ident(dialect, column)
     if value is None:
         return f"{name} IS NULL"
@@ -237,6 +240,8 @@ def value_condition(dialect: Dialect, column: str, value: Any, category: ColumnC
         raise ValidationFailed(f"Not a grid cell: {malformed}") from None
     if isinstance(cell, _Truncated) or (isinstance(cell, _Binary) and cell.truncated):
         return None
+    if category == ColumnCategory.JSON and isinstance(cell, str):
+        return f"{name} = {json_literal(dialect, cell)}"
     return f"{name} = {_SqlLiterals(dialect)(cell, FormatColumn(name=column, category=category))}"
 
 

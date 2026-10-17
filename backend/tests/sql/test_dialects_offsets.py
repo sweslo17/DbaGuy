@@ -1,7 +1,8 @@
 import pytest
 
 from dbaguy_backend.sql.dialects import (
-    Dialect, bool_literal, bytes_literal, force_quote_ident, needs_quote, qualified, quote_ident, quote_literal,
+    Dialect, bool_literal, bytes_literal, force_quote_ident, json_literal, needs_quote, qualified, quote_ident,
+    quote_literal,
 )
 from dbaguy_backend.sql.offsets import Utf16Index
 
@@ -51,6 +52,9 @@ def test_literals_per_dialect():
     assert [bool_literal(d, True) for d in (PG, LITE, MY)] == ["TRUE", "1", "TRUE"]
     assert [bool_literal(d, False) for d in (PG, LITE, MY)] == ["FALSE", "0", "FALSE"]
     assert [bytes_literal(d, "dead") for d in (PG, LITE, MY)] == ["'\\xdead'::bytea", "X'dead'", "X'dead'"]
+    assert [json_literal(d, '{"a": 1}') for d in (PG, LITE, MY)] == [
+        """'{"a": 1}'""", """'{"a": 1}'""", """CAST('{"a": 1}' AS JSON)""",
+    ]
 
 
 @pytest.mark.parametrize("dialect", list(Dialect))
@@ -64,6 +68,7 @@ def test_every_dialect_has_an_entry_in_every_dialect_table(dialect):  # tripwire
         "dialects._RESERVED": dialects._RESERVED,
         "dialects._BOOL_LITERALS": dialects._BOOL_LITERALS,
         "dialects._BYTES_LITERALS": dialects._BYTES_LITERALS,
+        "dialects._JSON_LITERALS": dialects._JSON_LITERALS,
         "sqlglot_rules.SQLGLOT_DIALECT": sqlglot_rules.SQLGLOT_DIALECT,
         "completion.STATEMENT_KEYWORDS": completion.STATEMENT_KEYWORDS,
         "completion.CLAUSE_KEYWORDS": completion.CLAUSE_KEYWORDS,

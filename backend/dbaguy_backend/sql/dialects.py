@@ -122,6 +122,11 @@ _BOOL_LITERALS: dict[Dialect, tuple[str, str]] = {
 _BYTES_LITERALS: dict[Dialect, str] = {  # {} is the hex
     Dialect.POSTGRES: "'\\x{}'::bytea", Dialect.SQLITE: "X'{}'", Dialect.MYSQL: "X'{}'",
 }
+_JSON_LITERALS: dict[Dialect, str] = {  # {} is a string literal holding the JSON text
+    Dialect.POSTGRES: "{}", Dialect.SQLITE: "{}",
+    # A JSON column compares a plain string as a JSON string scalar, so `doc = '{"a": 1}'` would match nothing.
+    Dialect.MYSQL: "CAST({} AS JSON)",
+}
 NUMERIC_LITERAL = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?", re.ASCII)  # text that can be written as a bare number
 
 
@@ -157,3 +162,8 @@ def bool_literal(dialect: Dialect, value: bool) -> str:
 
 def bytes_literal(dialect: Dialect, hex_digits: str) -> str:
     return _BYTES_LITERALS[dialect].format(hex_digits)
+
+
+def json_literal(dialect: Dialect, text: str) -> str:
+    """A JSON document given as its text, written so that the dialect compares it as JSON."""
+    return _JSON_LITERALS[dialect].format(quote_literal(dialect, text))

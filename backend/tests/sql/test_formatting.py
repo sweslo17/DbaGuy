@@ -73,6 +73,12 @@ def test_insert_in_mysql():
     (MY, "data", {"$type": "bytes", "size": 2, "preview": "dead"}, C.BINARY, "data = X'dead'"),
     (MY, "data", {"$type": "bytes", "size": 100, "preview": "dead"}, C.BINARY, None),  # only a preview
     (MY, "body", {"$type": "text", "preview": "x", "size": 70000, "truncated": True}, C.TEXT, None),
+    # MySQL compares a JSON column with a plain string as a JSON string scalar: the text is cast to JSON instead
+    (MY, "doc", '{"a": [1, 2], "b": null}', C.JSON, """doc = CAST('{"a": [1, 2], "b": null}' AS JSON)"""),
+    (MY, "doc", '{"q": "it\'s \\\\ x"}', C.JSON, r"""doc = CAST('{"q": "it''s \\\\ x"}' AS JSON)"""),
+    (MY, "doc", None, C.JSON, "doc IS NULL"),
+    (PG, "doc", '{"a": 1}', C.JSON, """doc = '{"a": 1}'"""),
+    (LITE, "doc", '{"a": 1}', C.JSON, """doc = '{"a": 1}'"""),
 ])
 def test_value_condition(dialect, column, value, category, expected):
     assert value_condition(dialect, column, value, category) == expected
