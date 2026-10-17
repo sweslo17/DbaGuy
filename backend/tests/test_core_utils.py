@@ -7,7 +7,7 @@ import pytest
 from dbaguy_backend.adapters.base import DatabaseAdapter, ParsedUrl
 from dbaguy_backend.adapters.positions import offset_to_line_col
 from dbaguy_backend.adapters.registry import AdapterRegistry
-from dbaguy_backend.adapters.sql_text import first_keyword, qualified_pg, quote_ident_pg, quote_literal
+from dbaguy_backend.adapters.sql_text import first_keyword, qualified_pg, quote_ident_pg, quote_literal_pg
 from dbaguy_backend.adapters.values import MAX_SAFE_INT, TEXT_LIMIT, encode_value
 from dbaguy_backend.domain.errors import UnsupportedEngine, ValidationFailed
 from dbaguy_backend.domain.execution import ClientCommand, ServerEvent
@@ -70,7 +70,7 @@ def test_quote_helpers():
     assert quote_ident_pg("Order Items") == '"Order Items"'
     assert quote_ident_pg('a"b') == '"a""b"'
     assert qualified_pg("sales", "orders") == "sales.orders"
-    assert quote_literal("it's") == "'it''s'"
+    assert quote_literal_pg("it's") == "'it''s'"
 
 
 def test_first_keyword():

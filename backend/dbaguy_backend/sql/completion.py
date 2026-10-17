@@ -76,16 +76,18 @@ _CLAUSES = (
 STATEMENT_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.POSTGRES: _STARTERS,
     Dialect.SQLITE: (*_STARTERS, "PRAGMA"),
+    Dialect.MYSQL: (*_STARTERS, "SHOW", "USE", "REPLACE", "CALL"),
 }
 CLAUSE_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.POSTGRES: (*_CLAUSES, "ILIKE"),
     Dialect.SQLITE: (*_CLAUSES, "GLOB"),
+    Dialect.MYSQL: (*(word for word in _CLAUSES if word != "RETURNING"), "ON DUPLICATE KEY UPDATE"),
 }
 
 _COLUMN_CLAUSES = frozenset(
     "SELECT WHERE HAVING SET BY RETURNING WHEN THEN ELSE CASE DISTINCT USING ON".split()
 )
-_NO_ITEMS_INSIDE = (TokenKind.STRING, TokenKind.COMMENT, TokenKind.QUOTED)
+_NO_ITEMS_INSIDE = (TokenKind.STRING, TokenKind.COMMENT, TokenKind.QUOTED, TokenKind.EXEC_COMMENT)
 
 
 # --- candidates --------------------------------------------------------------------------------------------------
@@ -258,7 +260,7 @@ def _is_closed(token: Token, dialect: Dialect) -> bool:
 def _inside_literal(token: Token | None, offset: int, dialect: Dialect) -> bool:
     if token is None or token.kind not in _NO_ITEMS_INSIDE:
         return False
-    if offset < token.end or token.text.startswith("--"):  # a line comment runs up to (not over) the newline
+    if offset < token.end or token.text.startswith(("--", "#")):  # a line comment runs up to (not over) the newline
         return True
     return not _is_closed(token, dialect)
 

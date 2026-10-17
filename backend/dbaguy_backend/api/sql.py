@@ -13,13 +13,14 @@ from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..container import AppContainer
+from ..domain.column_category import ColumnCategory
 from ..domain.errors import ValidationFailed
 from ..domain.formats import FormatColumn, FormatKind, RowFormatOptions
 from ..domain.metadata import PathSegment
 from ..services.safety import GuardDecision
 from ..sql.completion import CompletionItem, DescribeResult, SnapshotIndex, complete, describe_at
 from ..sql.dialects import Dialect
-from ..sql.formatting import FormatResult, format_rows
+from ..sql.formatting import FormatResult, format_rows, value_condition
 from ..sql.offsets import Utf16Index
 from ..sql.select_builder import SortKey, build_browse_select
 from ..sql.splitter import split
@@ -84,6 +85,17 @@ class FormatRowsRequest(_Input):
     columns: list[FormatColumn]
     rows: list[list[Any]] = Field(max_length=100_000)  # the grid's encoded cells
     options: RowFormatOptions = Field(default_factory=RowFormatOptions)
+
+
+class ValueConditionRequest(_Input):
+    dialect: Dialect
+    column: str
+    value: Any  # one grid cell as encode_row sent it: null, boolean, number, text, or a bytes/text object
+    category: ColumnCategory
+
+
+class ValueConditionResponse(BaseModel):
+    condition: str | None  # None: the cell is only a preview, so no condition matches it exactly
 
 
 class BrowseSelectRequest(_Input):
@@ -175,3 +187,8 @@ def format_rows_for_copy(body: FormatRowsRequest) -> FormatResult:
 def browse_select(body: BrowseSelectRequest, container: AppContainer = Depends(get_container)) -> BrowseSelectResponse:
     dialect = _profile_dialect(container, body.profile_id)
     return BrowseSelectResponse(sql=build_browse_select(dialect, body.path, body.where, body.order_by, body.count))
+
+
+@router.post("/value-condition", response_model=ValueConditionResponse)
+def value_condition_for_filter(body: ValueConditionRequest) -> ValueConditionResponse:
+    return ValueConditionResponse(condition=value_condition(body.dialect, body.column, body.value, body.category))

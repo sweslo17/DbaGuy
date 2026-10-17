@@ -22,22 +22,22 @@ from ..adapters.values import encode_value
 from ..domain.column_category import ColumnCategory
 from ..domain.errors import ValidationFailed
 from ..domain.formats import FormatColumn, FormatKind, RowFormatOptions
-from .dialects import Dialect, qualified, quote_ident, quote_literal
+from .dialects import NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, qualified, quote_ident, quote_literal
 
-__all__ = ["FormatColumn", "FormatKind", "FormatResult", "RowFormatOptions", "RowWriter", "format_rows", "open_writer"]
+__all__ = [
+    "FormatColumn", "FormatKind", "FormatResult", "RowFormatOptions", "RowWriter", "format_rows", "open_writer",
+    "value_condition",
+]
 
 Source = Literal["encoded", "raw"]
 
 _ELLIPSIS = "…"
 _DEFAULT_TABLE = "table_name"
-_NUMERIC = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?", re.ASCII)
-# _NUMERIC without the leading zeros that JSON forbids
+# NUMERIC_LITERAL without the leading zeros that JSON forbids
 _JSON_NUMBER = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?")
 _HEX_BYTES = re.compile(r"(?:[0-9a-fA-F]{2})*")
 _NEWLINES = re.compile(r"\r\n|\r|\n")
 _TSV_SPECIAL = frozenset('\t\n\r"')
-_BOOL_SQL = {Dialect.POSTGRES: ("TRUE", "FALSE"), Dialect.SQLITE: ("1", "0")}
-_BYTES_SQL = {Dialect.POSTGRES: "'\\x{}'::bytea", Dialect.SQLITE: "X'{}'"}  # {} is the hex
 
 
 class FormatResult(BaseModel):
@@ -209,17 +209,32 @@ class _SqlLiterals:
             case None:
                 return "NULL"
             case bool():
-                return _BOOL_SQL[self._dialect][0 if cell else 1]
+                return bool_literal(self._dialect, cell)
             case _Truncated() | _Binary(truncated=True):
                 self.truncated += 1
                 return "NULL"
             case _Binary():
-                return _BYTES_SQL[self._dialect].format(cell.hex)
+                return bytes_literal(self._dialect, cell.hex)
             case int() | float():
                 return str(cell)
             case _:
-                numeric = column.category == ColumnCategory.NUMBER and _NUMERIC.fullmatch(cell)
-                return cell if numeric else quote_literal(cell)
+                numeric = column.category == ColumnCategory.NUMBER and NUMERIC_LITERAL.fullmatch(cell)
+                return cell if numeric else quote_literal(self._dialect, cell)
+
+
+def value_condition(dialect: Dialect, column: str, value: Any, category: ColumnCategory) -> str | None:
+    """"Filter by this value" (spec §3.7): a condition that matches one encoded grid cell exactly, in the dialect's
+    syntax. None when the cell is only a preview (cut text or bytes): no condition matches it."""
+    name = quote_ident(dialect, column)
+    if value is None:
+        return f"{name} IS NULL"
+    try:
+        cell = _normalise_encoded(value)
+    except _MalformedCell as malformed:
+        raise ValidationFailed(f"Not a grid cell: {malformed}") from None
+    if isinstance(cell, _Truncated) or (isinstance(cell, _Binary) and cell.truncated):
+        return None
+    return f"{name} = {_SqlLiterals(dialect)(cell, FormatColumn(name=column, category=category))}"
 
 
 def _tsv_field(text: str) -> str:

@@ -1984,6 +1984,65 @@
           }
         }
       }
+    },
+    "/sql/value-condition": {
+      "post": {
+        "tags": [
+          "sql"
+        ],
+        "summary": "Value Condition For Filter",
+        "operationId": "value_condition_for_filter_sql_value_condition_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ValueConditionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValueConditionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -5034,6 +5093,52 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "ValueConditionRequest": {
+        "properties": {
+          "dialect": {
+            "$ref": "#/components/schemas/Dialect"
+          },
+          "column": {
+            "type": "string",
+            "title": "Column"
+          },
+          "value": {
+            "title": "Value"
+          },
+          "category": {
+            "$ref": "#/components/schemas/ColumnCategory"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "dialect",
+          "column",
+          "value",
+          "category"
+        ],
+        "title": "ValueConditionRequest"
+      },
+      "ValueConditionResponse": {
+        "properties": {
+          "condition": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Condition"
+          }
+        },
+        "type": "object",
+        "required": [
+          "condition"
+        ],
+        "title": "ValueConditionResponse"
       },
       "WorkspaceState": {
         "properties": {

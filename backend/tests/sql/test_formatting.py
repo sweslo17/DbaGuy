@@ -8,9 +8,11 @@ import pytest
 from dbaguy_backend.domain.errors import ValidationFailed
 from dbaguy_backend.domain.execution import ColumnCategory as C
 from dbaguy_backend.sql.dialects import Dialect
-from dbaguy_backend.sql.formatting import FormatColumn, FormatKind as F, RowFormatOptions, format_rows, open_writer
+from dbaguy_backend.sql.formatting import (
+    FormatColumn, FormatKind as F, RowFormatOptions, format_rows, open_writer, value_condition,
+)
 
-PG, LITE = Dialect.POSTGRES, Dialect.SQLITE
+PG, LITE, MY = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL
 COLS = [FormatColumn(name="id", category=C.NUMBER), FormatColumn(name="note", category=C.TEXT),
         FormatColumn(name="ok", category=C.BOOL)]
 ROWS = [[1, "a\tb", True], ["9007199254740993", None, False]]
@@ -43,6 +45,42 @@ def test_insert_per_dialect_and_truncation_warning():
     assert result.warnings and "truncated" in result.warnings[0]
     lite = fmt(F.INSERT, rows=[[1, "x", False]], dialect=LITE)
     assert lite.text == "INSERT INTO table_name (id, note, ok) VALUES (1, 'x', 0);"
+
+
+def test_insert_in_mysql():
+    rows = [[1, "it's \\ ok", True], [2, None, False]]
+    result = fmt(F.INSERT, rows=rows, dialect=MY, table_schema="dbaguy", table_name="Order Items")
+    assert result.text.splitlines() == [
+        r"INSERT INTO dbaguy.`Order Items` (id, note, ok) VALUES (1, 'it''s \\ ok', TRUE);",
+        "INSERT INTO dbaguy.`Order Items` (id, note, ok) VALUES (2, NULL, FALSE);",
+    ]
+    cols = [FormatColumn(name="b", category=C.BINARY)]
+    assert fmt(F.INSERT, rows=[[b"\xde\xad"]], cols=cols, source="raw", dialect=MY).text.endswith("(X'dead');")
+
+
+@pytest.mark.parametrize("dialect, column, value, category, expected", [
+    (PG, "note", None, C.TEXT, "note IS NULL"),
+    (PG, "Select", "it's", C.TEXT, "\"Select\" = 'it''s'"),
+    (PG, "ok", True, C.BOOL, "ok = TRUE"),
+    (LITE, "ok", False, C.BOOL, "ok = 0"),
+    (MY, "flag", True, C.BOOL, "flag = TRUE"),
+    (MY, "order", 42, C.NUMBER, "`order` = 42"),
+    (MY, "ratio", 1.5, C.NUMBER, "ratio = 1.5"),
+    (MY, "amount", "12345678901234567890.1234567890", C.NUMBER, "amount = 12345678901234567890.1234567890"),
+    (MY, "code", "1e3; DROP TABLE t", C.NUMBER, "code = '1e3; DROP TABLE t'"),  # not a number: a string
+    (MY, "note", "it's \\ back", C.TEXT, r"note = 'it''s \\ back'"),
+    (MY, "a`b", "x", C.TEXT, "`a``b` = 'x'"),
+    (MY, "data", {"$type": "bytes", "size": 2, "preview": "dead"}, C.BINARY, "data = X'dead'"),
+    (MY, "data", {"$type": "bytes", "size": 100, "preview": "dead"}, C.BINARY, None),  # only a preview
+    (MY, "body", {"$type": "text", "preview": "x", "size": 70000, "truncated": True}, C.TEXT, None),
+])
+def test_value_condition(dialect, column, value, category, expected):
+    assert value_condition(dialect, column, value, category) == expected
+
+
+def test_value_condition_rejects_an_object_that_is_not_a_cell():
+    with pytest.raises(ValidationFailed):
+        value_condition(MY, "x", {"$type": "nope"}, C.TEXT)
 
 
 def test_raw_values_for_export():
