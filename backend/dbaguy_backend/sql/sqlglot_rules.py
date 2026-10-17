@@ -29,6 +29,8 @@ SQLGLOT_DIALECT: dict[Dialect, type[SqlglotDialect]] = {
 # Text sqlglot does not understand (RecursionError: absurd nesting). Anything else is unexpected, e.g. a sqlglot bug.
 EXPECTED_FAILURES = (ParseError, TokenError, RecursionError)
 _DML = (exp.Insert, exp.Update, exp.Delete, exp.Merge)
+# SELECT … INTO <table>; MySQL's INTO only fills variables or writes a file
+INTO_CREATES_A_TABLE: frozenset[Dialect] = frozenset({Dialect.POSTGRES, Dialect.SQLITE})
 
 
 def parse(sql: str, dialect: Dialect) -> list[exp.Expression]:
@@ -52,7 +54,7 @@ def _unfiltered_dml(node: exp.Expression) -> list[DangerReason]:
     return list(dict.fromkeys(reasons))
 
 
-def classify_expression(node: exp.Expression) -> Classification | None:
+def classify_expression(node: exp.Expression, dialect: Dialect) -> Classification | None:
     """The classification of one parsed statement; None when the tree says nothing useful (e.g. a Command)."""
     if isinstance(node, exp.Drop):
         return Classification(kind=StatementKind.DDL, dangerous_reasons=[DangerReason.DROP])
@@ -70,7 +72,7 @@ def classify_expression(node: exp.Expression) -> Classification | None:
     if isinstance(node, (exp.Set, exp.Use)):
         return Classification(kind=StatementKind.SESSION)
     if isinstance(node, exp.Query):
-        if node.find(exp.Into):  # SELECT ... INTO creates a table
+        if node.find(exp.Into) and dialect in INTO_CREATES_A_TABLE:
             return Classification(kind=StatementKind.DDL)
         writes = any(isinstance(child, _DML) for child in node.walk())
         locks = node.find(exp.Lock) is not None  # FOR UPDATE/SHARE, also inside a CTE or subquery

@@ -122,3 +122,57 @@ def test_read_only_still_blocks_every_other_setting(sql):
 def test_the_setting_allow_list_is_postgres_only():
     decision = policy.check("SET search_path TO x", Dialect.SQLITE, "standard", read_only=True)
     assert (decision.action, decision.reasons) == (A.BLOCK, ["read_only"])
+
+
+# ---- read-only MySQL connections: harmless session statements only ----
+
+MY = Dialect.MYSQL
+
+
+def decide_my(sql, level="standard", read_only=False):
+    decision = policy.check(sql, MY, level, read_only)
+    return decision.action, decision.reasons
+
+
+@pytest.mark.parametrize("sql", [
+    "USE analytics", "USE `my db`", "SET NAMES utf8mb4", "SET NAMES 'utf8mb4' COLLATE 'utf8mb4_bin'",
+    "SET CHARACTER SET utf8mb4", "SET CHARSET utf8mb4", "SET @x = 1", "SET @x := (SELECT MAX(id) FROM t), @y = 2",
+    "SET @'odd name' = 1", "SET sql_mode = ''", "SET SESSION sql_mode = 'ANSI'", "SET LOCAL time_zone = 'UTC'",
+    "SET @@sql_mode = 'TRADITIONAL'", "SET @@session.time_zone = '+00:00'", "SET @@local.sql_mode := ''",
+    "SELECT a INTO @x FROM t", "START TRANSACTION", "START TRANSACTION READ ONLY",
+    "SELECT /*+ MAX_EXECUTION_TIME(1000) */ * FROM t",
+    "set @x = 1;", "/* report */ SET SESSION SQL_MODE = ''", "SET @x = (SELECT 1, 2)",
+])
+def test_mysql_read_only_allows(sql):
+    assert decide_my(sql, read_only=True) == (A.RUN, [])
+
+
+@pytest.mark.parametrize("sql", [
+    "SET SESSION TRANSACTION READ WRITE", "SET TRANSACTION READ WRITE",
+    "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED", "SET SESSION transaction_read_only = 0",
+    "SET transaction_read_only = OFF", "SET @@session.transaction_read_only = 0", "SET GLOBAL sql_mode = ''",
+    "SET @@global.time_zone = '+00:00'", "SET PERSIST sql_mode = ''", "SET autocommit = 0",
+    "SET @x = 1, autocommit = 0", "SET NAMES", "SET sql_mode = ''; DELETE FROM t", "START TRANSACTION READ WRITE",
+    "INSERT INTO t VALUES (1)", "SELECT * FROM t INTO OUTFILE '/tmp/x'", "SELECT * INTO DUMPFILE '/tmp/x' FROM t",
+    "/*!40000 DELETE FROM t */", "/*!40101 SET NAMES utf8 */", "LOAD DATA INFILE '/x' INTO TABLE t",
+    "HANDLER t OPEN", "DO SLEEP(1)", "CALL p()", "DELIMITER $$",
+    # Nothing that is not plainly a harmless variable, and nothing hidden next to one.
+    "SET ROLE admin", "SET PASSWORD = 'x'", "SET DEFAULT ROLE ALL TO u", "SET @x = 1; SET @y = 2",
+    "SET @x := 1, @@global.sql_mode = ''", "SET sql_mode", "SET sql_mode =", "SET CHARACTER SET", "SET @x = 1,",
+    "SET @x = /*!50000 1 */", "SET max_execution_time = 1000", "SET SESSION transaction_isolation = 'READ-COMMITTED'",
+    "USE", "USE a b", "USE analytics; USE other", "USE (a)", "SET search_path TO public", "RESET sql_mode",
+])
+def test_mysql_read_only_blocks(sql):
+    assert decide_my(sql, read_only=True) == (A.BLOCK, ["read_only"])
+
+
+def test_mysql_version_comments_are_unknown_statements():
+    assert decide_my("/*!40101 SET NAMES utf8 */", "strict") == (A.CONFIRM, ["strict_unknown"])
+    assert decide_my("SELECT /*+ BKA(t) */ * FROM t", "strict") == (A.RUN, [])
+
+
+def test_the_mysql_allow_list_does_not_leak_into_the_other_engines():
+    for dialect in (PG, Dialect.SQLITE):
+        for sql in ("SET @x = 1", "USE analytics", "SET NAMES utf8mb4"):
+            decision = policy.check(sql, dialect, "standard", read_only=True)
+            assert (decision.action, decision.reasons) == (A.BLOCK, ["read_only"])

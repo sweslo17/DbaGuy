@@ -7,7 +7,7 @@ from loguru import logger
 # The models live in the domain (the execution protocol carries them); re-exported here for the sql/ callers.
 from ..domain.classification import Classification, DangerReason, StatementKind
 from .dialects import Dialect
-from .lexer import INSIGNIFICANT, TokenKind, tokenize
+from .lexer import INSIGNIFICANT, Token, TokenKind, tokenize
 from .splitter import split
 
 __all__ = ["Classification", "DangerReason", "StatementKind", "classify", "warm_up"]
@@ -32,6 +32,10 @@ _KEYWORD_KIND: dict[str, StatementKind] = {
         StatementKind.SESSION,
     ),
 }
+# Keywords whose meaning differs by dialect, consulted before _KEYWORD_KIND (spec §3.4).
+_DIALECT_KEYWORD_KIND: dict[Dialect, dict[str, StatementKind]] = {
+    Dialect.MYSQL: {"LOAD": StatementKind.WRITE, "HANDLER": StatementKind.WRITE},
+}
 # Least to most cautious: when a script mixes kinds, the strictest one decides (unknown is the most cautious).
 _SEVERITY = (
     StatementKind.READ,
@@ -44,21 +48,39 @@ _SEVERITY = (
 _ANALYZE = ("ANALYZE", "ANALYSE")  # PostgreSQL accepts both spellings; EXPLAIN ANALYZE really executes the statement
 
 
+def _has_version_comment(tokens: list[Token]) -> bool:
+    """MySQL runs the text of `/*! … */` as code, so nothing in it can be judged (spec §3.4). `/*+ … */` holds only
+    optimizer hints, which never change what a statement does."""
+    return any(t.kind == TokenKind.EXEC_COMMENT and t.text.startswith("/*!") for t in tokens)
+
+
+def _words(tokens: list[Token]) -> list[str]:
+    return [t.upper for t in tokens if t.kind == TokenKind.WORD]
+
+
+def _writes_server_file(words: list[str]) -> bool:
+    """SELECT … INTO OUTFILE|DUMPFILE writes a file on the database server, which a READ ONLY session allows."""
+    return any(a == "INTO" and b in ("OUTFILE", "DUMPFILE") for a, b in zip(words, words[1:]))
+
+
 def _lexical(sql: str, dialect: Dialect) -> Classification:
     tokens = tokenize(sql, dialect)
-    words = [t.upper for t in tokens if t.kind == TokenKind.WORD]
+    words = _words(tokens)
     if not words:
         return Classification(kind=StatementKind.UNKNOWN)
     first = words[0]
     if first == "PRAGMA":  # `PRAGMA x = y` sets, `PRAGMA x` reads (an "=" inside a string or comment does not count)
         assigns = any(t.kind == TokenKind.OTHER and t.text == "=" for t in tokens)
         return Classification(kind=StatementKind.SESSION if assigns else StatementKind.READ)
-    kind = _KEYWORD_KIND.get(first, StatementKind.UNKNOWN)
+    kind = _DIALECT_KEYWORD_KIND.get(dialect, {}).get(first) or _KEYWORD_KIND.get(first, StatementKind.UNKNOWN)
     if kind == StatementKind.READ and first in ("SELECT", "WITH"):
-        # Data-modifying CTEs and locking reads are writes even when sqlglot could not parse them.
+        # Data-modifying CTEs, locking reads and file writes are writes even when sqlglot could not parse them.
         has_dml = any(w in ("INSERT", "UPDATE", "DELETE", "MERGE") for w in words[1:])
-        locks = any(a == "FOR" and b in ("UPDATE", "SHARE", "NO", "KEY") for a, b in zip(words, words[1:]))
-        if has_dml or locks:
+        locks = any(
+            (a == "FOR" and b in ("UPDATE", "SHARE", "NO", "KEY")) or (a, b) == ("LOCK", "IN")
+            for a, b in zip(words, words[1:])
+        )
+        if has_dml or locks or _writes_server_file(words):
             kind = StatementKind.WRITE
     reasons: list[DangerReason] = []
     if first == "DROP":
@@ -89,9 +111,15 @@ def _explain_inner(sql: str, dialect: Dialect) -> str | None:
             elif tokens[i].upper in _ANALYZE:
                 analyze = True
             i += 1
-    while i < len(tokens) and tokens[i].upper in (*_ANALYZE, "VERBOSE", "QUERY", "PLAN"):
-        analyze = analyze or tokens[i].upper in _ANALYZE
-        i += 1
+    while i < len(tokens):
+        word = tokens[i].upper
+        if word == "FORMAT" and i + 1 < len(tokens) and tokens[i + 1].text == "=":
+            i += 3  # MySQL: EXPLAIN [ANALYZE] FORMAT = TREE|JSON|TRADITIONAL …
+        elif word in (*_ANALYZE, "VERBOSE", "QUERY", "PLAN"):
+            analyze = analyze or word in _ANALYZE
+            i += 1
+        else:
+            break
     if not analyze or i >= len(tokens):
         return None
     return sql[tokens[i].start:]
@@ -123,7 +151,7 @@ def _from_sqlglot(sql: str, dialect: Dialect) -> list[Classification | None] | N
         logger.warning("sqlglot is unavailable ({}); classifying by keywords only", type(exc).__name__)
         return None
     try:
-        return [rules.classify_expression(node) for node in rules.parse(sql, dialect)]
+        return [rules.classify_expression(node, dialect) for node in rules.parse(sql, dialect)]
     except rules.EXPECTED_FAILURES as exc:
         logger.debug("sqlglot could not parse the statement ({}); using the keyword rules", type(exc).__name__)
     except Exception as exc:  # e.g. a dialect missing from an app bundle, or a sqlglot bug
@@ -133,6 +161,25 @@ def _from_sqlglot(sql: str, dialect: Dialect) -> list[Classification | None] | N
 
 def _classify_statement(sql: str, dialect: Dialect, has_body: bool = False) -> Classification:
     """One statement as the splitter sees it; `has_body`: it holds a routine or trigger body."""
+    tokens = tokenize(sql, dialect)
+    if _has_version_comment(tokens):
+        return Classification(kind=StatementKind.UNKNOWN)
+    result = _classify_text(sql, dialect, has_body)
+    # R-03a-P7: decided after sqlglot too, as a floor. sqlglot 30.23 cannot parse INTO OUTFILE (so _lexical sees it
+    # today), but a sqlglot that parses it as exp.Into would make it a plain READ for MySQL (INTO_CREATES_A_TABLE
+    # excludes it). A floor, not an early return: `CREATE PROCEDURE … INTO OUTFILE` stays DDL, and a DDL result is
+    # what refreshes the schema afterwards.
+    if (
+        dialect is Dialect.MYSQL
+        and _writes_server_file(_words(tokens))
+        and _SEVERITY.index(result.kind) < _SEVERITY.index(StatementKind.WRITE)
+    ):
+        return Classification(kind=StatementKind.WRITE, dangerous_reasons=result.dangerous_reasons)
+    return result
+
+
+def _classify_text(sql: str, dialect: Dialect, has_body: bool) -> Classification:
+    """The rules for one statement without a version comment: EXPLAIN ANALYZE unwrapped, then sqlglot, then keywords."""
     while (inner := _explain_inner(sql, dialect)) is not None:  # EXPLAIN ANALYZE runs the statement it explains
         sql = inner
     found = _from_sqlglot(sql, dialect)

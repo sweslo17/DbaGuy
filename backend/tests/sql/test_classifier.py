@@ -11,7 +11,7 @@ from loguru import logger
 from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect as SqlglotDialect
 
-from dbaguy_backend.domain.classification import DangerReason
+from dbaguy_backend.domain.classification import Classification, DangerReason
 from dbaguy_backend.sql import classifier
 from dbaguy_backend.sql.classifier import StatementKind as K
 from dbaguy_backend.sql.classifier import classify, warm_up
@@ -109,6 +109,97 @@ def test_postgres(sql, kind, reasons):
 )
 def test_sqlite(sql, kind):
     assert classify(sql, LITE).kind == kind
+
+
+@pytest.mark.parametrize(("sql", "kind", "reasons"), [
+    ("SELECT a INTO @x FROM t", K.READ, []),
+    ("SELECT a, b INTO @x, @y FROM t WHERE id = 1", K.READ, []),
+    ("SELECT * FROM t INTO OUTFILE '/tmp/x'", K.WRITE, []),
+    ("SELECT * INTO DUMPFILE '/tmp/x' FROM t", K.WRITE, []),
+    ("SELECT * FROM t LOCK IN SHARE MODE", K.WRITE, []),
+    ("LOAD DATA INFILE '/x' INTO TABLE t", K.WRITE, []),
+    ("LOAD XML INFILE '/x' INTO TABLE t", K.WRITE, []),
+    ("HANDLER t OPEN", K.WRITE, []),
+    ("DO SLEEP(1)", K.WRITE, []),
+    ("REPLACE INTO t VALUES (1)", K.WRITE, []),
+    ("CALL p(1)", K.WRITE, []),
+    ("/*!40101 SET NAMES utf8 */", K.UNKNOWN, []),
+    ("SELECT 1 /*! , (SELECT 1 FROM t FOR UPDATE) */", K.UNKNOWN, []),
+    ("/*!50000 DELETE FROM t */", K.UNKNOWN, []),
+    ("SELECT /*+ MAX_EXECUTION_TIME(1000) */ * FROM t", K.READ, []),
+    ("SELECT 'x\\'; DROP TABLE t; -- '", K.READ, []),
+    ("SHOW CREATE TABLE t", K.READ, []),
+    ("TABLE t", K.READ, []),
+    ("UPDATE t SET a = 1", K.WRITE, ["update_without_where"]),
+    ("DELETE t FROM t JOIN u ON t.id = u.id", K.WRITE, ["delete_without_where"]),
+    ("ALTER TABLE t DROP COLUMN a", K.DDL, ["alter_drop"]),
+    ("CREATE DEFINER=`root`@`%` PROCEDURE p() BEGIN DELETE FROM t; DROP TABLE u; END", K.DDL, []),
+    ("EXPLAIN ANALYZE FORMAT=TREE DELETE FROM t", K.WRITE, ["delete_without_where"]),
+    ("EXPLAIN FORMAT=JSON SELECT 1", K.READ, []),
+    ("SET SESSION TRANSACTION READ WRITE", K.SESSION, []),
+    ("SET NAMES utf8mb4", K.SESSION, []),
+    ("USE analytics", K.SESSION, []),
+    ("START TRANSACTION READ ONLY", K.TRANSACTION, []),
+    ("FLUSH TABLES", K.UNKNOWN, []),
+    ("SELECT 1; DELETE FROM t", K.WRITE, ["delete_without_where"]),
+    # Optimizer hints are not code for the server (plan Ruling 3): the statement is judged as if they were not there.
+    ("UPDATE /*+ NO_MERGE(t) */ t SET a = 1", K.WRITE, ["update_without_where"]),
+    ("INSERT /*+ SET_VAR(sort_buffer_size = 16M) */ INTO t VALUES (1)", K.WRITE, []),
+    ("DELETE /*+ MAX_EXECUTION_TIME(1000) */ FROM t WHERE id = 1", K.WRITE, []),
+    # A version comment is code whether or not sqlglot parses the rest, and wherever it appears.
+    ("/*!50000 DROP TABLE t */ SELECT 1", K.UNKNOWN, []),
+    ("SELECT 1 /*!50000 , 2 */", K.UNKNOWN, []),
+    ("SELECT 1; /*!50000 DELETE FROM t */", K.UNKNOWN, []),
+    ("SELECT 1 /*! unterminated", K.UNKNOWN, []),
+    ("EXPLAIN /*!50000 ANALYZE */ DELETE FROM t", K.UNKNOWN, []),
+    # INTO OUTFILE follows more than SELECT.
+    ("TABLE t INTO OUTFILE '/tmp/x'", K.WRITE, []),
+    ("VALUES ROW(1) INTO DUMPFILE '/tmp/x'", K.WRITE, []),
+    ("(SELECT 1) INTO OUTFILE '/tmp/x'", K.WRITE, []),
+    ("WITH c AS (SELECT 1) SELECT * FROM c INTO OUTFILE '/tmp/x'", K.WRITE, []),
+    ("SELECT 1 INTO @a; SELECT 2 INTO OUTFILE '/tmp/x'", K.WRITE, []),
+    # Text that only looks like one of the rules.
+    ("SELECT 'INTO OUTFILE', 'LOCK IN SHARE MODE' FROM t", K.READ, []),
+    ("SELECT 1 /* INTO OUTFILE */", K.READ, []),
+    ("SELECT `into`, `outfile` FROM t", K.READ, []),
+    ("SELECT 1 -- /*!50000 DROP TABLE t */", K.READ, []),
+    ("SELECT '/*!50000 DROP TABLE t */'", K.READ, []),
+])
+def test_mysql(sql, kind, reasons):
+    result = classify(sql, MY)
+    assert (result.kind, list(result.dangerous_reasons)) == (kind, reasons)
+
+
+def test_select_into_still_creates_a_table_in_postgres():
+    assert classify("SELECT * INTO n FROM t", PG).kind == K.DDL
+    assert classify("SELECT * INTO n FROM t", LITE).kind == K.DDL
+
+
+def test_load_and_handler_mean_a_write_only_in_mysql():
+    assert classify("LOAD 'plpgsql'", PG).kind == K.UNKNOWN  # PostgreSQL's LOAD loads a library
+    assert classify("HANDLER t OPEN", PG).kind == K.UNKNOWN
+
+
+@pytest.mark.parametrize("dialect", [PG, LITE])
+def test_a_mysql_version_comment_is_just_a_comment_elsewhere(dialect):
+    assert classify("/*!50000 DROP TABLE t */ SELECT 1", dialect).kind == K.READ
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT * FROM t INTO OUTFILE '/tmp/x'", "SELECT * INTO DUMPFILE '/tmp/x' FROM t",
+    "SELECT 1 INTO /* c */ OUTFILE '/tmp/x'", "select * from t into\n  outfile '/tmp/x'",
+])
+def test_into_outfile_is_a_write_even_when_sqlglot_parses_it(sql, monkeypatch):
+    # R-03a-P7: sqlglot 30.23 cannot parse it, but a sqlglot that does (as exp.Into, which MySQL's rules ignore)
+    # must not turn it into a read.
+    monkeypatch.setattr(classifier, "_from_sqlglot", lambda text, dialect: [Classification(kind=K.READ)])
+    assert classify(sql, MY).kind == K.WRITE
+
+
+def test_a_routine_that_writes_a_file_is_still_a_ddl_statement():
+    # The kind decides whether the schema is refreshed afterwards: CREATE stays DDL.
+    assert classify("CREATE PROCEDURE p() SELECT * FROM t INTO OUTFILE '/tmp/x'", MY).kind == K.DDL
+    assert classify("CREATE PROCEDURE p() BEGIN SELECT * FROM t INTO OUTFILE '/tmp/x'; END", MY).kind == K.DDL
 
 
 def test_never_raises_on_garbage():

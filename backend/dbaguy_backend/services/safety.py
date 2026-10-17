@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from enum import StrEnum
 
 from pydantic import BaseModel
@@ -71,7 +72,8 @@ class SafetyPolicy:
         if classification.kind == StatementKind.TRANSACTION:
             return not any(t.kind == TokenKind.WORD and t.upper == "WRITE" for t in tokens)
         if classification.kind == StatementKind.SESSION:
-            return _harmless_pg_setting(sql, dialect)
+            check = _HARMLESS_SESSION.get(dialect)
+            return check is not None and check(sql)
         return False
 
     @staticmethod
@@ -91,19 +93,17 @@ def _setting_name(token: Token) -> str:
     return token.text.strip('"').lower() if token.kind == TokenKind.QUOTED else ""
 
 
-def _harmless_pg_setting(sql: str, dialect: Dialect) -> bool:
+def _harmless_pg_setting(sql: str) -> bool:
     """One PostgreSQL statement that changes only a harmless setting: `SET [SESSION|LOCAL] <name> {TO|=} <value>`,
     `SET [SESSION|LOCAL] TIME ZONE <value>` or `RESET <name>`, `RESET TIME ZONE`.
 
     Never SET TRANSACTION, SET SESSION CHARACTERISTICS, SET ROLE, SET SESSION AUTHORIZATION, RESET ALL or a setting
     outside the list (notably transaction_read_only and default_transaction_read_only).
     """
-    if dialect != Dialect.POSTGRES:
-        return False
-    spans = split(sql, dialect)
+    spans = split(sql, Dialect.POSTGRES)
     if len(spans) != 1:
         return False
-    tokens = [t for t in tokenize(spans[0].text, dialect) if t.kind not in INSIGNIFICANT]
+    tokens = [t for t in tokenize(spans[0].text, Dialect.POSTGRES) if t.kind not in INSIGNIFICANT]
     words = [t.upper if t.kind == TokenKind.WORD else "" for t in tokens]
     if words[:1] == ["RESET"]:
         named = len(tokens) == 2 and _setting_name(tokens[1]) in _PG_HARMLESS_SETTINGS
@@ -118,3 +118,66 @@ def _harmless_pg_setting(sql: str, dialect: Dialect) -> bool:
     assign = tokens[rest + 1] if rest + 1 < len(tokens) else None
     assigns = assign is not None and (assign.upper == "TO" or (assign.kind == TokenKind.OTHER and assign.text == "="))
     return assigns and len(tokens) > rest + 2  # a value follows
+
+
+_MYSQL_HARMLESS_VARIABLES = frozenset({"sql_mode", "time_zone"})
+_MYSQL_SESSION_SCOPES = frozenset({"SESSION", "LOCAL"})
+
+
+def _top_level_items(tokens: list[Token]) -> list[list[Token]]:
+    """`tokens` split at commas outside parentheses."""
+    items: list[list[Token]] = [[]]
+    depth = 0
+    for token in tokens:
+        depth += (token.kind == TokenKind.LPAREN) - (token.kind == TokenKind.RPAREN)
+        if token.kind == TokenKind.COMMA and depth == 0:
+            items.append([])
+        else:
+            items[-1].append(token)
+    return items
+
+
+def _harmless_mysql_assignment(tokens: list[Token]) -> bool:
+    """One item of a MySQL SET: NAMES …, CHARACTER SET …, CHARSET …, a user variable (`@x = …`), or the session's
+    sql_mode or time_zone (`[SESSION|LOCAL] name`, `@@name`, `@@session.name`, `@@local.name`), with `=` or `:=`."""
+    words = [t.upper if t.kind == TokenKind.WORD else "" for t in tokens]
+    if words[:1] in (["NAMES"], ["CHARSET"]):
+        return len(tokens) > 1
+    if words[:2] == ["CHARACTER", "SET"]:
+        return len(tokens) > 2
+    operator = next((k for k, t in enumerate(tokens) if t.kind == TokenKind.OTHER and t.text == "="), None)
+    if operator is None or operator + 1 >= len(tokens):
+        return False  # not an assignment, or nothing assigned
+    target = tokens[:operator - 1] if operator > 0 and tokens[operator - 1].text == ":" else tokens[:operator]
+    if target and target[0].upper in _MYSQL_SESSION_SCOPES:
+        target = target[1:]
+    name = "".join(t.text for t in target).lower()
+    if name.startswith("@") and not name.startswith("@@"):
+        return True  # a user variable
+    for prefix in ("@@session.", "@@local.", "@@"):
+        if name.startswith(prefix):
+            name = name.removeprefix(prefix)
+            break
+    return name in _MYSQL_HARMLESS_VARIABLES
+
+
+def _harmless_mysql_session(sql: str) -> bool:
+    """One MySQL statement that only shapes how statements run or look (spec §3.4): `USE db`, or a SET whose every
+    item is harmless. Never anything about transactions (`SET … TRANSACTION …`, transaction_read_only), GLOBAL or
+    PERSIST scopes, or other system variables."""
+    spans = split(sql, Dialect.MYSQL)
+    if len(spans) != 1:
+        return False
+    tokens = [t for t in tokenize(spans[0].text, Dialect.MYSQL) if t.kind not in INSIGNIFICANT]
+    words = [t.upper if t.kind == TokenKind.WORD else "" for t in tokens]
+    if words[:1] == ["USE"]:
+        return len(tokens) == 2 and tokens[1].kind in (TokenKind.WORD, TokenKind.QUOTED)
+    if words[:1] != ["SET"] or "TRANSACTION" in words or any(t.kind == TokenKind.EXEC_COMMENT for t in tokens):
+        return False
+    return all(_harmless_mysql_assignment(item) for item in _top_level_items(tokens[1:]))
+
+
+_HARMLESS_SESSION: dict[Dialect, Callable[[str], bool]] = {
+    Dialect.POSTGRES: _harmless_pg_setting,
+    Dialect.MYSQL: _harmless_mysql_session,
+}  # a dialect without an entry (SQLite) allows no SESSION statement on a read-only connection
