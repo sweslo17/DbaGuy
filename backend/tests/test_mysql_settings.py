@@ -49,7 +49,7 @@ def test_parse_url_details():
 
 def test_parse_url_keeps_only_driver_options_and_never_the_connection_keys():
     parsed = parse_mysql_url(
-        "mysql://good/db?host=evil&port=1&init_command=SET%20x%3D1&allow_local_infile=true&passwd=x&ssl_ca=/x"
+        "mysql://good/db?host=evil&port=1&init_command=SET%20x%3D1&allow_local_infile=true&password1=x&ssl_ca=/x"
         "&get_warnings=true&charset=latin1&compress=true&nonsense=1"
     )
     assert parsed.profile.host == "good" and parsed.profile.port is None
@@ -62,7 +62,7 @@ def test_parse_url_keeps_only_driver_options_and_never_the_connection_keys():
     ("mysql://h:abc/app", "port"),
     ("mysql://h:99999999/app", "port"),
     ("mysql://h:0/app", "port"),
-    ("mysql://[bad/app", "Invalid MySQL URL"),
+    ("mysql://[bad/app", "host or port part of the URL is malformed"),
     ("mysql://h/app?ssl-mode=bogus", "ssl-mode"),
 ])
 def test_parse_url_errors(url, message):
@@ -175,3 +175,75 @@ def test_every_connection_gets_its_own_conn_attrs():
     first = connect_params(profile(), DIRECT, None, None)
     first["conn_attrs"]["_client_name"] = "x"
     assert connect_params(profile(), DIRECT, None, None)["conn_attrs"] == {"program_name": "DbaGuy"}
+
+
+@pytest.mark.parametrize("query, mode", [
+    ("useSSL=true&requireSSL=true&verifyServerCertificate=true", "verify-ca"),
+    ("verifyServerCertificate=true", "verify-ca"),
+    ("VERIFYSERVERCERTIFICATE=TRUE&useSSL=true", "verify-ca"),
+    ("useSSL=true&requireSSL=true", "require"),
+    ("requireSSL=true", "require"),
+    ("REQUIRE_SSL=True", "require"),
+    ("useSSL=true", "require"),
+    ("useSSL=true&verifyServerCertificate=false", "require"),
+    ("useSSL=false&requireSSL=true&verifyServerCertificate=true", "disable"),
+    ("useSSL=false", "disable"),
+    ("requireSSL=false&verifyServerCertificate=false", "prefer"),  # nothing asked for: the default
+    ("sslMode=PREFERRED&verifyServerCertificate=true&requireSSL=true", "prefer"),  # an explicit mode wins
+])
+def test_jdbc_tls_switches_never_import_weaker_than_asked(query, mode):
+    parsed = parse_mysql_url(f"mysql://h/db?{query}")
+    assert parsed.profile.ssl.mode == mode
+    assert parsed.profile.options == {}  # the switches are consumed, not kept as driver options
+
+
+def test_tls_files_and_the_libpq_spelling_of_the_ca():
+    parsed = parse_mysql_url("mysql://h/db?sslmode=verify-ca&sslrootcert=/tmp/root.pem")
+    assert (parsed.profile.ssl.mode, parsed.profile.ssl.ca_file) == ("verify-ca", "/tmp/root.pem")
+
+
+def test_passwd_and_username_are_the_query_spellings_of_password_and_user():
+    parsed = parse_mysql_url("mysql://h/db?username=u&passwd=x&connection_timeout=5")
+    assert (parsed.profile.username, parsed.password, parsed.profile.options) == ("u", "x", {"connection_timeout": "5"})
+    both = parse_mysql_url("mysql://a:b@h/db?username=u&passwd=x")
+    assert (both.profile.username, both.password) == ("a", "b")
+
+
+@pytest.mark.parametrize("url", [
+    "mysql://h,h2/db",
+    "mysql://h1:3306,h2:3307/db",
+    "mysql://u:p@h1,h2:3306/db",
+    "mysql://address=(host=h)(port=3306)/db",
+    "mysql://u:p@address=(host=h)(port=3306)/db",
+    "mysql://(host=h,port=3306)/db",
+    "mysql://address=(host=h)(port=3306)(user=u)(password=hunter2@x)/db",
+])
+def test_host_lists_are_rejected_without_echoing_the_authority(url):
+    with pytest.raises(ValidationFailed, match="one host") as info:
+        parse_mysql_url(url)
+    assert "hunter2" not in info.value.message and "host=h" not in info.value.message
+
+
+def test_user_info_may_hold_the_characters_host_lists_use():
+    parsed = parse_mysql_url("mysql://u:p(w,d@host/db")
+    assert (parsed.profile.host, parsed.password) == ("host", "p(w,d")
+
+
+@pytest.mark.parametrize("url", ["mysql://root:hunter2\uff20db.example.com:3306/app", "mysql://u:hunter2/x@host/db"])
+def test_a_password_that_breaks_the_authority_is_never_echoed_and_the_message_says_what_to_do(url):
+    with pytest.raises(ValidationFailed, match="Percent-encode") as info:
+        parse_mysql_url(url)
+    assert "hunter2" not in info.value.message
+
+
+def test_more_options_the_driver_could_use_to_redirect_or_read_files_are_reserved():
+    options = {"dns_srv": "true", "failover": "[{}]", "openid_token_file": "/etc/passwd", "compress": "true"}
+    params = connect_params(profile(options=options), DIRECT, None, None)
+    assert not {"dns_srv", "failover", "openid_token_file"} & params.keys() and params["compress"] is True
+    query = "dns_srv=true&failover=x&openid_token_file=/etc/passwd&compress=true"
+    assert parse_mysql_url(f"mysql://good/db?{query}").profile.options == {"compress": "true"}
+
+
+def test_list_options_are_given_in_the_drivers_bracketed_string_form():
+    params = connect_params(profile(options={"tls_versions": "[TLSv1.2,TLSv1.3]"}), DIRECT, None, None)
+    assert params["tls_versions"] == "[TLSv1.2,TLSv1.3]"  # the driver parses this form itself
