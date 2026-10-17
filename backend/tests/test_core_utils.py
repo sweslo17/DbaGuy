@@ -130,10 +130,11 @@ def test_registry_strips_a_jdbc_prefix_before_choosing_the_adapter():
 
 
 def test_default_registry_reads_jdbc_urls():
-    # the MySQL row (jdbc:mysql://...) joins this test when the MySQL adapter is registered
     registry = default_registry()
     assert registry.parse_url("jdbc:postgresql://me@h:5433/app").profile.port == 5433
     assert registry.parse_url("jdbc:sqlite:/tmp/x.db").profile.path == "/tmp/x.db"
+    mysql = registry.parse_url("jdbc:mysql://me@h:3307/app?useSSL=false").profile
+    assert (mysql.engine, mysql.port, mysql.database, mysql.ssl.mode) == ("mysql", 3307, "app", "disable")
 
 
 @pytest.mark.parametrize("url", [
@@ -141,6 +142,8 @@ def test_default_registry_reads_jdbc_urls():
     "postgresql://h:99999999/db",  # out of range
     "postgres://[bad/db",  # malformed authority
     "jdbc:postgresql://h:abc/db",
+    "mysql://[bad/db",
+    "jdbc:mysql://[bad/db",
 ])
 def test_default_registry_turns_a_malformed_url_into_a_validation_error(url):
     with pytest.raises(ValidationFailed, match="host or port part of the URL is malformed"):

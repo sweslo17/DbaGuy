@@ -3,6 +3,7 @@ from collections.abc import Callable
 
 from loguru import logger
 
+from .adapters.mysql.adapter import MysqlAdapter
 from .adapters.postgres.adapter import PostgresAdapter
 from .adapters.registry import AdapterRegistry
 from .adapters.sqlite.adapter import SqliteAdapter
@@ -28,7 +29,7 @@ _HOUSEKEEPING_INTERVAL_S = 15  # also the resolution of the idle-transaction war
 
 
 def default_registry() -> AdapterRegistry:
-    return AdapterRegistry([PostgresAdapter(), SqliteAdapter()])
+    return AdapterRegistry([PostgresAdapter(), MysqlAdapter(), SqliteAdapter()])
 
 
 class AppContainer:

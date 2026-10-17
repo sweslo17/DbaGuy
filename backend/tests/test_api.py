@@ -84,10 +84,14 @@ def test_import_url_and_validation(client):
     assert invalid.status_code == 422 and invalid.json()["error"]["code"] == "validation_failed"
 
 
-@pytest.mark.parametrize("url", ["postgres://h:abc/db", "postgres://h:99999999/db", "postgres://[bad/db", "sqlite://[bad/x.db"])
+@pytest.mark.parametrize("url", [
+    "postgres://h:abc/db", "postgres://h:99999999/db", "postgres://[bad/db", "sqlite://[bad/x.db",
+    "mysql://h:abc/db", "jdbc:mysql://h:99999999/db", "mysql://[bad/db",
+])
 def test_import_url_with_a_malformed_authority_is_a_validation_error_not_a_500(client, url):
     response = client.post("/profiles/import-url", json={"url": url}, headers=AUTH)
     assert response.status_code == 422 and response.json()["error"]["code"] == "validation_failed"
+    assert "Unsupported URL scheme" not in response.json()["error"]["message"]  # the engine's own parser said no
 
 
 def test_import_url_never_echoes_the_password_of_a_malformed_url(client):
@@ -104,10 +108,14 @@ def test_import_url_never_echoes_the_password_of_a_malformed_url(client):
 
 def test_engines(client):
     engines = {e["engine"]: e for e in client.get("/system/engines", headers=AUTH).json()}
-    assert set(engines) == {"postgres", "sqlite"}
+    assert set(engines) == {"postgres", "mysql", "sqlite"}
     assert engines["postgres"]["per_database_connection"] and engines["postgres"]["cancel_aborts_transaction"]
     assert not engines["sqlite"]["per_database_connection"] and not engines["sqlite"]["cancel_aborts_transaction"]
     assert engines["postgres"]["server_read_only"] and engines["sqlite"]["server_read_only"]
+    mysql = engines["mysql"]
+    assert (mysql["per_database_connection"], mysql["cancel_aborts_transaction"], mysql["server_read_only"]) == (
+        False, False, True,
+    )
 
 
 def test_metadata_and_session_over_websocket(client, sqlite_profile_id):
