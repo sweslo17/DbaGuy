@@ -1,6 +1,8 @@
 import re
 from collections.abc import Iterable
 
+from pydantic import ValidationError
+
 from ..domain.errors import UnsupportedEngine, ValidationFailed
 from ..domain.profiles import Engine, EngineInfo
 from .base import DatabaseAdapter, ParsedUrl
@@ -31,7 +33,14 @@ class AdapterRegistry:
         adapter = self._by_scheme.get(scheme)
         if adapter is None:
             raise ValidationFailed(f"Unsupported URL scheme '{scheme}'")
-        return adapter.parse_url(url)
+        try:
+            return adapter.parse_url(url)
+        except ValidationError as exc:  # the parsed parts do not make a valid profile, e.g. a port outside 1-65535
+            first = exc.errors()[0]
+            field = ".".join(str(part) for part in first["loc"])
+            raise ValidationFailed(f"Invalid connection URL: {field}: {first['msg']}") from None
+        except ValueError as exc:  # urllib: a port that is not a number or out of range, a malformed host
+            raise ValidationFailed(f"Invalid connection URL: {exc}") from None
 
     def engines(self) -> list[EngineInfo]:
         return [adapter.info() for adapter in self._by_engine.values()]

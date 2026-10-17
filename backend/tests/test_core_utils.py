@@ -9,9 +9,10 @@ from dbaguy_backend.adapters.positions import offset_to_line_col
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sql_text import first_keyword, qualified_pg, quote_ident_pg, quote_literal_pg
 from dbaguy_backend.adapters.values import MAX_SAFE_INT, TEXT_LIMIT, encode_value
+from dbaguy_backend.container import default_registry
 from dbaguy_backend.domain.errors import UnsupportedEngine, ValidationFailed
 from dbaguy_backend.domain.execution import ClientCommand, ServerEvent
-from dbaguy_backend.domain.profiles import Engine, SqliteProfileDraft
+from dbaguy_backend.domain.profiles import Engine, ServerProfileDraft, SqliteProfileDraft
 from dbaguy_backend.sql.dialects import Dialect
 from pydantic import TypeAdapter
 
@@ -126,3 +127,30 @@ def test_registry_strips_a_jdbc_prefix_before_choosing_the_adapter():
     assert seen == ["fake:///tmp/x"]
     with pytest.raises(ValidationFailed):
         registry.parse_url("jdbc:nope://x")
+
+
+def test_default_registry_reads_jdbc_urls():
+    # the MySQL row (jdbc:mysql://...) joins this test when the MySQL adapter is registered
+    registry = default_registry()
+    assert registry.parse_url("jdbc:postgresql://me@h:5433/app").profile.port == 5433
+    assert registry.parse_url("jdbc:sqlite:/tmp/x.db").profile.path == "/tmp/x.db"
+
+
+@pytest.mark.parametrize("url", [
+    "postgres://h:abc/db",  # not a number
+    "postgresql://h:99999999/db",  # out of range
+    "postgres://[bad/db",  # malformed authority
+    "jdbc:postgresql://h:abc/db",
+])
+def test_default_registry_turns_a_malformed_url_into_a_validation_error(url):
+    with pytest.raises(ValidationFailed, match="Invalid connection URL"):
+        default_registry().parse_url(url)
+
+
+def test_registry_turns_a_rejected_draft_into_a_readable_validation_error():
+    class Rejecting(FakeAdapter):
+        def parse_url(self, url):
+            return ParsedUrl(profile=ServerProfileDraft(engine="postgres", name="x", host="h", port=0))  # pydantic rejects
+
+    with pytest.raises(ValidationFailed, match=r"Invalid connection URL: port"):
+        AdapterRegistry([Rejecting()]).parse_url("fake://h:0")
