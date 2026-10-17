@@ -5,6 +5,7 @@ import mysql.connector
 import pytest
 
 from dbaguy_backend.adapters.base import Endpoint, StatementCancelled, StatementError
+from dbaguy_backend.adapters.mysql import adapter as mysql_adapter
 from dbaguy_backend.adapters.mysql.adapter import MysqlAdapter
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.values import encode_row
@@ -23,14 +24,26 @@ from dbaguy_backend.storage.paths import profiles_file
 from dbaguy_backend.storage.profile_store import ProfileStore
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
 from tests.support import (
-    BASTION_PORT, MYSQL_HOST, MYSQL_PASSWORD, MYSQL_PORT, make_mysql_profile, mysql_driver_kwargs, requires_mysql,
-    requires_mysql_bastion,
+    BASTION_PORT, MYSQL_HOST, MYSQL_PASSWORD, MYSQL_PORT, make_mysql_profile, mysql_driver_kwargs, mysql_procedure,
+    requires_mysql, requires_mysql_bastion,
 )
 from tests.test_ssh_tunnel import TEST_SSH_OPTIONS
 
 pytestmark = requires_mysql
 ENDPOINT = Endpoint(MYSQL_HOST, MYSQL_PORT)
 ENDLESS = "SELECT a.id FROM big_table a CROSS JOIN big_table b"  # 10^10 rows: the server streams until stopped
+# A SLEEP inside a procedure swallows KILL QUERY: it returns early and the procedure goes on to its next statement.
+SLEEP_BETWEEN = "SELECT 1 AS first; DO SLEEP(3); SELECT 2 AS second;"
+# About 4 s of server work that KILL QUERY does interrupt, then a write that must not happen once the CALL is closed.
+LONG_THEN_WRITE = (
+    "SELECT 1 AS first; "
+    "SELECT COUNT(*) INTO @zz_n FROM (SELECT a.id FROM big_table a CROSS JOIN big_table b LIMIT 20000000) t; "
+    "INSERT INTO zz_written VALUES (1);"
+)
+
+
+def refuse(**_):
+    raise mysql.connector.errors.InterfaceError("side connection refused")
 
 
 def open_mysql(**overrides):
@@ -158,6 +171,70 @@ def test_closing_a_fully_sent_result_does_not_poison_the_next_statement(conn):  
         assert conn.run("SELECT 7").fetch(1) == [[7]]
 
 
+def assert_next_statement_gets_its_own_rows(conn):
+    result = conn.run("SELECT 'next' AS n")
+    assert [c.name for c in result.columns()] == ["n"] and result.fetch(5) == [["next"]]
+    result.close()
+
+
+def test_a_cancelled_call_is_read_to_its_end(conn):  # fix round 1: the CALL's later sets and final OK
+    result = conn.run("CALL two_results(50)")
+    assert len(result.fetch(10)) == 10
+    conn.cancel()
+    with pytest.raises(StatementCancelled):
+        result.fetch(10)
+    result.close()
+    assert_next_statement_gets_its_own_rows(conn)
+
+
+def test_cancelling_a_call_between_its_result_sets_keeps_the_protocol_in_step(conn):  # fix round 1
+    with mysql_procedure("zz_sleep_between", SLEEP_BETWEEN) as name:
+        result = conn.run(f"CALL {name}()")
+        assert result.fetch(5) == [[1]]
+        threading.Timer(0.5, conn.cancel).start()
+        started = time.monotonic()
+        with pytest.raises(StatementCancelled):
+            result.next_result()  # the SLEEP ends early, SELECT 2 still arrives: it is a cancel all the same
+        result.close()
+        assert time.monotonic() - started < 2.5
+        assert_next_statement_gets_its_own_rows(conn)
+
+
+def test_closing_a_call_at_a_result_set_boundary_stops_the_procedure(conn):  # R-03a-T9a
+    conn.run("CREATE TEMPORARY TABLE zz_written (id INT)").close()
+    with mysql_procedure("zz_long_then_write", LONG_THEN_WRITE) as name:
+        result = conn.run(f"CALL {name}()")
+        assert result.fetch(5) == [[1]]  # the first set is read to its end; the procedure is still working
+        started = time.monotonic()
+        result.close()
+        assert time.monotonic() - started < 2
+    written = conn.run("SELECT COUNT(*) FROM zz_written")
+    assert written.fetch(1) == [[0]]  # KILL QUERY stopped it before its INSERT
+    written.close()
+    assert_next_statement_gets_its_own_rows(conn)
+
+
+def test_a_drain_that_cannot_end_gives_up_the_connection(conn, monkeypatch):  # fix round 1: never wedge
+    monkeypatch.setattr(mysql_adapter, "_DRAIN_LIMIT_S", 0.5)
+    result = conn.run(ENDLESS)
+    assert len(result.fetch(100)) == 100
+    monkeypatch.setattr(mysql.connector, "connect", refuse)  # the KILL cannot be sent: the stream never ends
+    started = time.monotonic()
+    result.close()
+    assert time.monotonic() - started < 3
+    with pytest.raises(StatementError) as info:
+        conn.run("SELECT 1")
+    assert info.value.code == "connection_lost"  # the Reconnect UI takes over
+
+
+def test_text_that_is_not_valid_unicode_is_a_statement_error(conn):  # fix round 1: a lone surrogate
+    with pytest.raises(StatementError) as info:
+        conn.run("SELECT 1,\n  '\ud800'")
+    assert info.value.code == "invalid_text"
+    assert (info.value.position.line, info.value.position.column) == (2, 4)
+    assert conn.run("SELECT 1").fetch(1) == [[1]]
+
+
 def test_cancel_with_nothing_running_is_harmless(conn):  # Review Focus 4
     conn.cancel()
     assert conn.run("SELECT 1").fetch(1) == [[1]]
@@ -217,9 +294,6 @@ def test_cancel_a_running_statement(conn):
 
 
 def test_a_cancel_whose_kill_cannot_be_sent_lets_the_statement_finish(conn, monkeypatch):  # Ruling 10
-    def refuse(**_):
-        raise mysql.connector.errors.InterfaceError("side connection refused")
-
     monkeypatch.setattr(mysql.connector, "connect", refuse)  # only the KILL connection: `conn` is already open
     threading.Timer(0.2, conn.cancel).start()
     result = conn.run("SELECT SLEEP(0.6)")
@@ -276,6 +350,58 @@ def test_manual_commit_mode_and_transaction_state(conn):
     assert conn.autocommit()
 
 
+def test_a_deadlock_rollback_clears_the_transaction_flag(conn):  # R-03a-T9b: ERR packets carry no status flags
+    owner = mysql.connector.connect(**mysql_driver_kwargs(autocommit=True))
+    owner.cmd_query("DROP TABLE IF EXISTS zz_deadlock")
+    owner.cmd_query("CREATE TABLE zz_deadlock (id INT PRIMARY KEY, v INT)")
+    owner.cmd_query("INSERT INTO zz_deadlock VALUES (1, 0), (2, 0)")
+    other = mysql.connector.connect(**mysql_driver_kwargs())
+    blocked = threading.Thread(target=other.cmd_query, args=("UPDATE zz_deadlock SET v = 2 WHERE id = 1",))
+    try:
+        conn.set_autocommit(False)
+        conn.run("UPDATE zz_deadlock SET v = 1 WHERE id = 1").close()
+        assert conn.in_transaction()
+        other.cmd_query("START TRANSACTION")
+        # More rows changed: InnoDB rolls back the smaller transaction, ours.
+        other.cmd_query("INSERT INTO zz_deadlock SELECT id + 10, 0 FROM big_table WHERE id <= 100")
+        other.cmd_query("UPDATE zz_deadlock SET v = 2 WHERE id = 2")
+        blocked.start()
+        time.sleep(0.3)  # `other` now waits for our lock on row 1
+        with pytest.raises(StatementError) as info:
+            conn.run("UPDATE zz_deadlock SET v = 1 WHERE id = 2")
+        assert info.value.code == "1213"
+        assert not conn.in_transaction()  # the server rolled our transaction back
+    finally:
+        if blocked.ident is not None:
+            blocked.join(5)
+        other.close()
+        conn.rollback()
+        owner.cmd_query("DROP TABLE IF EXISTS zz_deadlock")
+        owner.close()
+
+
+def test_a_failing_ddl_has_committed_and_the_flag_says_so(conn):  # R-03a-T9b
+    owner = mysql.connector.connect(**mysql_driver_kwargs(autocommit=True))
+    owner.cmd_query("DROP TABLE IF EXISTS zz_implicit")
+    owner.cmd_query("CREATE TABLE zz_implicit (id INT)")
+    try:
+        conn.set_autocommit(False)
+        conn.run("INSERT INTO zz_implicit VALUES (1)").close()
+        assert conn.in_transaction()
+        with pytest.raises(StatementError) as info:
+            conn.run("CREATE TABLE zz_implicit (id INT)")  # MySQL commits before it runs DDL, even DDL that fails
+        assert info.value.code == "1050"
+        assert not conn.in_transaction()
+        conn.rollback()
+        rows = conn.run("SELECT COUNT(*) FROM zz_implicit")
+        assert rows.fetch(1) == [[1]]  # committed: the rollback could not undo it
+        rows.close()
+    finally:
+        conn.rollback()
+        owner.cmd_query("DROP TABLE IF EXISTS zz_implicit")
+        owner.close()
+
+
 def test_read_only_profile_is_read_only_in_the_database():
     conn = open_mysql(read_only=True)
     try:
@@ -323,6 +449,42 @@ def test_value_condition_finds_a_json_cell(conn):  # Task 3 carry: the grid's "F
         found = conn.run(f"SELECT id FROM json_cells WHERE {condition}")
         assert found.fetch(10) == [[row_id]], condition
         found.close()
+
+
+@pytest.mark.parametrize("table, column", [
+    ("edge_values", "zero_dt"), ("types_demo", "born"), ("edge_values", "part_zero"), ("types_demo", "seen"),
+])
+def test_value_condition_finds_a_zero_date_cell(conn, table, column):  # R-03a-T9c
+    cell = conn.run(f"SELECT {column} FROM {table} WHERE id = 1")
+    [[value]] = [encode_row(row) for row in cell.fetch(1)]
+    cell.close()
+    condition = value_condition(Dialect.MYSQL, column, value, ColumnCategory.DATETIME)
+    found = conn.run(f"SELECT id FROM {table} WHERE {condition}")
+    assert found.fetch(5) == [[1]], condition
+    found.close()
+
+
+def test_a_zero_date_literal_is_what_mysql_refuses(conn):  # why R-03a-T9c compares the text
+    with pytest.raises(StatementError) as info:
+        conn.run("SELECT id FROM edge_values WHERE zero_dt = '0000-00-00 00:00:00'")
+    assert info.value.code == "1525"
+
+
+def test_a_cancelled_statement_is_killed_once(conn, monkeypatch):  # fix round 1: no second KILL on close
+    kills = []
+    send = conn.kill_query
+    monkeypatch.setattr(conn, "kill_query", lambda why: kills.append(why) or send(why))
+    threading.Timer(0.3, conn.cancel).start()
+    with pytest.raises(StatementCancelled):
+        conn.run("SELECT SLEEP(30)")
+    result = conn.run(ENDLESS)
+    result.fetch(100)
+    conn.cancel()
+    with pytest.raises(StatementCancelled):
+        result.fetch(100)
+    result.close()
+    assert kills == ["cancel", "cancel"]
+    assert_next_statement_gets_its_own_rows(conn)
 
 
 def test_a_killed_connection_is_reported_as_lost(conn):

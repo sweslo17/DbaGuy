@@ -9,7 +9,9 @@ from dbaguy_backend.domain.execution import (
 )
 from dbaguy_backend.sessions.worker import SessionWorker
 from tests.fake_db import FakeLease
-from tests.support import MYSQL_HOST, MYSQL_PASSWORD, MYSQL_PORT, make_mysql_profile, requires_mysql
+from tests.support import (
+    MYSQL_HOST, MYSQL_PASSWORD, MYSQL_PORT, make_mysql_profile, mysql_procedure, requires_mysql,
+)
 from tests.test_sessions import Recorder, finished, paused
 
 pytestmark = requires_mysql
@@ -102,3 +104,16 @@ def test_a_call_paused_between_its_result_sets_keeps_the_protocol_in_step(mysql_
     assert [e.rows for e in rec.of("p", "rows")][-2:] == [[[501, "row 501"]], [[100000]]]
     assert not run(worker, rec, "n", "SELECT 1").cancelled
     assert rec.of("n", "rows")[0].rows == [[1]]
+
+
+def test_cancelling_a_call_during_its_sleep_leaves_the_next_statement_its_own_rows(mysql_worker):  # fix round 1
+    worker, rec = mysql_worker
+    # A SLEEP inside a procedure swallows KILL QUERY: the procedure goes on and still sends SELECT 2.
+    with mysql_procedure("zz_sleep_between", "SELECT 1 AS first; DO SLEEP(3); SELECT 2 AS second;") as name:
+        worker.submit(ExecuteCommand(request_id="c", sql=f"CALL {name}()"))
+        rec.wait_for(lambda e: e.type == "result_set_end" and e.request_id == "c", timeout=10)
+        time.sleep(0.3)  # the worker is now waiting for the next result set, during the SLEEP
+        worker.cancel("c")
+        assert rec.wait_for(finished("c"), timeout=10).cancelled
+    run(worker, rec, "n", "SELECT 'next' AS n")
+    assert rec.of("n", "rows")[0].rows == [["next"]]

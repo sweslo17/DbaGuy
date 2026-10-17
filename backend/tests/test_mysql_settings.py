@@ -53,7 +53,7 @@ def test_parse_url_keeps_only_driver_options_and_never_the_connection_keys():
         "&get_warnings=true&charset=latin1&compress=true&nonsense=1"
     )
     assert parsed.profile.host == "good" and parsed.profile.port is None
-    assert parsed.profile.options == {"charset": "latin1", "compress": "true"}
+    assert parsed.profile.options == {"compress": "true"}  # charset is reserved: rows are always decoded as UTF-8
     assert parsed.password is None
 
 
@@ -101,10 +101,14 @@ def test_option_values_are_coerced_and_reserved_keys_are_matched_case_insensitiv
     options = {"CHARSET": "latin1", "read_timeout": "-1", "use_unicode": "FALSE", "collation": "007x", "HOST": "evil",
                "Init_Command": "SELECT 1"}
     params = connect_params(profile(options=options), DIRECT, None, None)
-    assert params["read_timeout"] == -1 and params["use_unicode"] is False and params["collation"] == "007x"
-    assert params["CHARSET"] == "latin1"  # unknown to the driver as written: it rejects it at connect, not here
+    assert params["read_timeout"] == -1 and params["use_unicode"] is False
     assert params["host"] == "db.example.com"
-    assert not {"HOST", "Init_Command", "init_command"} & params.keys()
+    assert not {"HOST", "Init_Command", "init_command", "CHARSET", "collation"} & params.keys()
+
+
+def test_the_connection_charset_is_always_utf8mb4():  # row text is decoded as UTF-8 whatever the profile says
+    params = connect_params(profile(options={"charset": "latin1", "collation": "latin1_swedish_ci"}), DIRECT, None, None)
+    assert params["charset"] == "utf8mb4" and "collation" not in params
 
 
 def test_connect_timeout_is_the_driver_alias_of_connection_timeout():

@@ -47,3 +47,5 @@ def setup_logging(level: str, log_dir: Path | None) -> None:
         std_logger = logging.getLogger(name)
         std_logger.handlers = [InterceptHandler()]
         std_logger.propagate = False
+    # mysql-connector logs its authentication plugin choice at INFO, three lines per connect.
+    logging.getLogger("mysql.connector").setLevel(logging.WARNING)

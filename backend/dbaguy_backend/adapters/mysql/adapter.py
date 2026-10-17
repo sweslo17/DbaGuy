@@ -32,6 +32,7 @@ from ..base import (
     StatementResult,
     transaction_open_error,
 )
+from ..positions import offset_to_line_col
 from . import catalog, introspection
 from . import schema as mysql_schema
 from .settings import URL_SCHEMES, connect_params, kill_params, parse_mysql_url, requires_tls
@@ -40,6 +41,10 @@ from .types import column_meta, row_converter
 _CONNECTION_LOST_ERRNOS = frozenset({1053, 2006, 2013, 2055, 4031})  # shutdown, gone away, lost, lost at, idle kick
 _QUERY_INTERRUPTED = 1317
 _DRAIN_BATCH = 1000  # rows read and dropped at a time when discarding the rest of a result
+# Discarding the rest of a result gives up after this long and drops the connection instead: when the KILL cannot be
+# sent, an endless stream would otherwise hold the session forever (Reconnect beats a wedged tab).
+_DRAIN_LIMIT_S = 10.0
+_DRAIN_REPORT_MS = 200  # a discard slower than this is logged with its row count
 _TLS_LOGIN_HINT = (  # R-03a-P5: the pure driver cannot finish a caching_sha2_password full login over plain TCP
     "MySQL 8 needs TLS (SSL mode Prefer or Require) for the first password login after a server restart; "
     "or use an account with mysql_native_password."
@@ -51,6 +56,10 @@ _AT_LINE = re.compile(r" at line (\d+)\s*$")
 _MENTIONS_AUTOCOMMIT = re.compile(r"autocommit", re.IGNORECASE)
 _MAY_SET_AUTOCOMMIT = frozenset({"CALL", "EXECUTE"})  # a procedure or prepared statement may switch it too
 _READ_ONLY_SESSION = "SET SESSION TRANSACTION READ ONLY"
+# ERR packets carry no status flags, but a server error can end the transaction: a deadlock rolls it back, and DDL
+# commits it before it runs, even DDL that then fails. This statement reads the flags again (R-03a-T9b).
+_STATUS_PROBE = "DO 0"
+INVALID_TEXT = "invalid_text"
 
 
 class _VerbatimCursor(MySQLCursorRaw):
@@ -69,7 +78,9 @@ class MysqlResult(StatementResult):
     def __init__(self, owner: "MysqlConnection", cursor: _VerbatimCursor) -> None:
         self._owner, self._cursor = owner, cursor
         self._closed = False
-        self._failed = False  # after a driver error, never ask for another result set: its flags may be stale
+        # After an error packet the statement is over: never ask for another result set (the flags are stale then).
+        # A cancel seen after a successful read is not a failure: the rest of the statement is still on the wire.
+        self._failed = False
         self._load_columns()
 
     def _load_columns(self) -> None:
@@ -80,7 +91,7 @@ class MysqlResult(StatementResult):
 
     def _translate(self, exc: mysql.connector.Error) -> StatementError:
         self._failed = True
-        return self._owner.translate_error(exc, statement=True)
+        return self._owner.statement_error(exc)
 
     def columns(self) -> list[ColumnMeta] | None:
         return self._columns
@@ -93,8 +104,7 @@ class MysqlResult(StatementResult):
         except mysql.connector.Error as exc:
             raise self._translate(exc) from exc
         if self._owner.killed():  # rows that reached us after KILL QUERY: the statement was cancelled
-            self._failed = True
-            raise StatementCancelled()
+            raise StatementCancelled()  # not `_failed`: close() still reads it to its end (later sets, the final OK)
         return [self._convert(row) for row in rows]
 
     def affected_rows(self) -> int | None:
@@ -108,8 +118,7 @@ class MysqlResult(StatementResult):
             more = bool(self._cursor.nextset())
         except mysql.connector.Error as exc:
             raise self._translate(exc) from exc
-        if self._owner.killed():
-            self._failed = True
+        if self._owner.killed():  # e.g. a SLEEP in the procedure swallowed the KILL and the next set came anyway
             raise StatementCancelled()
         if more:
             self._load_columns()
@@ -172,25 +181,74 @@ class MysqlConnection(DatabaseConnection):
         return bool(self._conn.unread_result)
 
     def finish(self, cursor: _VerbatimCursor, more_results: bool) -> None:
-        """End a result: stop the statement if rows are still coming, then read and drop what is left, including later
-        result sets of a CALL (otherwise: "Commands out of sync"). The transaction is untouched. If the KILL cannot be
-        sent, everything left is read in raw batches (never held in memory at once, never converted), which is slow for a
-        huge result but keeps the transaction. The statement is over afterwards, so its "KILL sent" flag is cleared."""
+        """End a result: stop the statement if anything is still to come, then read and drop what is left, including
+        later result sets of a CALL (otherwise the next statement reads them as its own answer). The transaction is
+        untouched. If the KILL cannot be sent, the rest is read in raw batches (never held in memory at once, never
+        converted); past `_DRAIN_LIMIT_S` (checked between batches) the connection is dropped instead. The statement is
+        over afterwards, so its "KILL sent" flag is cleared.
+
+        Caveat: a SLEEP inside a procedure swallows KILL QUERY (it returns early and the procedure goes on to its next
+        statement), so a CALL can keep sending results after the KILL; they are read and dropped like the rest."""
+        started = time.monotonic()
+        drained = 0
         try:
-            if self._conn.unread_result:
+            # R-03a-T9a: a CALL closed between two result sets is still running, possibly towards a write. A statement
+            # already cancelled has had its KILL: another one would only open another connection. (Should that KILL
+            # have reached the server just before the statement began, it was ignored; the drain limit bounds that.)
+            still_coming = self._conn.unread_result or (more_results and self._conn.have_next_result)
+            if still_coming and not self._killed.is_set():
                 self.kill_query("close of a partly read result")
             while True:
                 while self._conn.unread_result:
-                    self._conn.get_rows(count=_DRAIN_BATCH, raw=True)  # R-03a-P7: raw batches, not consume_results()
+                    if time.monotonic() - started > _DRAIN_LIMIT_S:
+                        self._give_up(drained)
+                        return
+                    rows, _ = self._conn.get_rows(count=_DRAIN_BATCH, raw=True)  # R-03a-P7: not consume_results()
+                    drained += len(rows)
                 if not more_results or not cursor.nextset():
                     break
         except mysql.connector.Error as exc:
-            if exc.errno != _QUERY_INTERRUPTED:  # 1317 is the KILL we just sent
+            if _is_lost(exc):
                 logger.warning("Discarding the rest of a MySQL result failed: {}", exc)
+            else:  # the end of a killed or failing statement (1317, 1213, 3141…): expected here
+                logger.debug("A discarded MySQL result ended with {}: {}", exc.errno, exc.msg)
+                # A killed SELECT leaves the flags as they were; a failing statement, or a killed CALL (whose last
+                # flags still say "more results"), may not.
+                if exc.errno != _QUERY_INTERRUPTED or self._conn.have_next_result:
+                    self._read_status()
         finally:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            if elapsed_ms > _DRAIN_REPORT_MS:
+                logger.info("Discarded {:,} rows of a closed MySQL result in {:.0f} ms", drained, elapsed_ms)
             self._killed.clear()  # R-03a-P4: the flag belongs to this statement only
             with suppress(mysql.connector.Error):
                 cursor.close()
+
+    def _give_up(self, drained: int) -> None:
+        """The rest of a result would not end: drop the connection, so the next call reports `connection_lost`."""
+        logger.warning(
+            "Discarding a MySQL result took over {:.0f} s ({:,} rows); closing the connection of thread {}",
+            _DRAIN_LIMIT_S, drained, self._thread_id,
+        )
+        self._conn.shutdown()
+        self._conn.unread_result = False  # the next command then fails on the closed socket ("lost"), not "unread"
+
+    def _read_status(self) -> None:
+        """Refresh the transaction and more-results flags after an error packet (see `_STATUS_PROBE`)."""
+        if self._conn.unread_result:
+            return
+        try:
+            self._conn.cmd_query(_STATUS_PROBE)
+        except mysql.connector.Error as exc:
+            logger.debug("Could not re-read the MySQL status flags on thread {}: {}", self._thread_id, exc)
+
+    def statement_error(self, exc: mysql.connector.Error) -> StatementError:
+        """The error of the user's statement (run, fetch, next result). A server error may have ended the transaction
+        (R-03a-T9b), so the status flags are read again; never after a cancel or a lost connection."""
+        error = self.translate_error(exc, statement=True)
+        if exc.sqlstate and not isinstance(error, StatementCancelled) and error.code != "connection_lost":
+            self._read_status()
+        return error
 
     def translate_error(self, exc: mysql.connector.Error, statement: bool = False) -> StatementError:
         """`statement`: the error comes from the user's statement (run, fetch, next result), the only place a cancel can
@@ -198,8 +256,7 @@ class MysqlConnection(DatabaseConnection):
         if statement and (self._killed.is_set() or exc.errno == _QUERY_INTERRUPTED):
             return StatementCancelled()
         text = exc.msg or str(exc)
-        # errno -1 OperationalError: "MySQL Connection not available" (the socket is already gone)
-        if exc.errno in _CONNECTION_LOST_ERRNOS or (isinstance(exc, mysql.connector.errors.OperationalError) and exc.errno == -1):
+        if _is_lost(exc):
             return StatementError(f"Connection to the server was lost: {text}", code="connection_lost")
         message = text + (f"\nSQLSTATE: {exc.sqlstate}" if exc.sqlstate else "")
         line = _AT_LINE.search(text)
@@ -215,8 +272,8 @@ class MysqlConnection(DatabaseConnection):
         cursor = _VerbatimCursor(self._conn)  # not conn.cursor(): that sends a PING first, one round trip per statement
         try:
             cursor.execute_verbatim(sql)
-        except mysql.connector.Error as exc:
-            error = self.translate_error(exc, statement=True)
+        except (mysql.connector.Error, UnicodeEncodeError) as exc:
+            error = self.statement_error(exc) if isinstance(exc, mysql.connector.Error) else _invalid_text(sql, exc)
             self._killed.clear()  # the statement is over: its flag must not reach the next call (R-03a-P4)
             with suppress(mysql.connector.Error):
                 cursor.close()
@@ -300,6 +357,22 @@ class MysqlConnection(DatabaseConnection):
             self._conn.close()
         except (mysql.connector.Error, OSError):
             self._conn.shutdown()
+
+
+def _is_lost(exc: mysql.connector.Error) -> bool:
+    # errno -1 OperationalError: "MySQL Connection not available" (the socket is already gone)
+    return exc.errno in _CONNECTION_LOST_ERRNOS or (
+        isinstance(exc, mysql.connector.errors.OperationalError) and exc.errno == -1
+    )
+
+
+def _invalid_text(sql: str, exc: UnicodeEncodeError) -> StatementError:
+    """A lone surrogate (half of an emoji, e.g. from a broken paste) cannot be sent as UTF-8."""
+    line, column = offset_to_line_col(sql, exc.start + 1)
+    return StatementError(
+        f"The statement contains a character that is not valid text (U+{ord(sql[exc.start]):04X}); delete it and "
+        "retype it", code=INVALID_TEXT, position=ErrorPosition(line=line, column=column),
+    )
 
 
 def _enable_keepalive(conn: MySQLConnection) -> None:

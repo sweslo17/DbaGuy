@@ -78,6 +78,15 @@ def test_insert_in_mysql():
     (MY, "doc", '{"q": "it\'s \\\\ x"}', C.JSON, r"""doc = CAST('{"q": "it''s \\\\ x"}' AS JSON)"""),
     (MY, "doc", None, C.JSON, "doc IS NULL"),
     (PG, "doc", '{"a": 1}', C.JSON, """doc = '{"a": 1}'"""),
+    # MySQL keeps dates with a zero part that its default sql_mode rejects as literals (1525): compare the text
+    (MY, "zero_dt", "0000-00-00 00:00:00", C.DATETIME, "CAST(zero_dt AS CHAR) = '0000-00-00 00:00:00'"),
+    (MY, "born", "0000-00-00", C.DATETIME, "CAST(born AS CHAR) = '0000-00-00'"),
+    (MY, "part_zero", "2026-00-15", C.DATETIME, "CAST(part_zero AS CHAR) = '2026-00-15'"),
+    (MY, "Due Day", "2026-10-00 08:00:00.5", C.DATETIME, "CAST(`Due Day` AS CHAR) = '2026-10-00 08:00:00.5'"),
+    (MY, "seen", "2026-10-17 00:00:00", C.DATETIME, "seen = '2026-10-17 00:00:00'"),  # a real date keeps its index
+    (MY, "lasted", "-00:30:00", C.DATETIME, "lasted = '-00:30:00'"),  # TIME
+    (MY, "yr", "2000", C.DATETIME, "yr = '2000'"),
+    (PG, "born", "0000-00-00", C.DATETIME, "born = '0000-00-00'"),  # only MySQL has zero dates
     (LITE, "doc", '{"a": 1}', C.JSON, """doc = '{"a": 1}'"""),
 ])
 def test_value_condition(dialect, column, value, category, expected):

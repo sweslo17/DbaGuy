@@ -69,6 +69,7 @@ def test_every_dialect_has_an_entry_in_every_dialect_table(dialect):  # tripwire
         "dialects._BOOL_LITERALS": dialects._BOOL_LITERALS,
         "dialects._BYTES_LITERALS": dialects._BYTES_LITERALS,
         "dialects._JSON_LITERALS": dialects._JSON_LITERALS,
+        "dialects._ZERO_DATE_AS_TEXT": dialects._ZERO_DATE_AS_TEXT,
         "sqlglot_rules.SQLGLOT_DIALECT": sqlglot_rules.SQLGLOT_DIALECT,
         "completion.STATEMENT_KEYWORDS": completion.STATEMENT_KEYWORDS,
         "completion.CLAUSE_KEYWORDS": completion.CLAUSE_KEYWORDS,

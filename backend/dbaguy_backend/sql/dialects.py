@@ -127,6 +127,12 @@ _JSON_LITERALS: dict[Dialect, str] = {  # {} is a string literal holding the JSO
     # A JSON column compares a plain string as a JSON string scalar, so `doc = '{"a": 1}'` would match nothing.
     Dialect.MYSQL: "CAST({} AS JSON)",
 }
+# MySQL keeps dates with a zero year, month or day (`0000-00-00`, `2026-00-15`) that its default sql_mode refuses as
+# literals (1525), so such a value is compared with the column's text instead; other dialects have no zero dates.
+_ZERO_DATE_AS_TEXT: dict[Dialect, str | None] = {
+    Dialect.POSTGRES: None, Dialect.SQLITE: None, Dialect.MYSQL: "CAST({} AS CHAR)",
+}
+_ZERO_DATE = re.compile(r"(?:0000-\d\d-\d\d|\d{4}-00-\d\d|\d{4}-\d\d-00)(?:$|[ T])", re.ASCII)
 NUMERIC_LITERAL = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?", re.ASCII)  # text that can be written as a bare number
 
 
@@ -167,3 +173,10 @@ def bytes_literal(dialect: Dialect, hex_digits: str) -> str:
 def json_literal(dialect: Dialect, text: str) -> str:
     """A JSON document given as its text, written so that the dialect compares it as JSON."""
     return _JSON_LITERALS[dialect].format(quote_literal(dialect, text))
+
+
+def zero_date_as_text(dialect: Dialect, column_sql: str, value: str) -> str | None:
+    """`column_sql` as text when `value` is a date with a zero part the dialect cannot write as a literal; None when
+    the plain comparison works (and keeps using the column's index)."""
+    template = _ZERO_DATE_AS_TEXT[dialect]
+    return template.format(column_sql) if template is not None and _ZERO_DATE.match(value) else None

@@ -31,6 +31,8 @@ RESERVED_OPTIONS = frozenset({
     "username", "read_default_file", "webauthn_callback",
     # Redirect the target (an SRV lookup, a failover list) or read a file the profile did not name.
     "dns_srv", "failover", "openid_token_file",
+    # The connection charset: rows are decoded as UTF-8 (types._text), so another one would garble CJK text.
+    "charset", "collation",
 })
 _SSL_MODES: dict[str, SslMode] = {  # MySQL ssl-mode, Connector/J sslMode and libpq sslmode spellings
     "disabled": "disable", "disable": "disable", "preferred": "prefer", "prefer": "prefer",

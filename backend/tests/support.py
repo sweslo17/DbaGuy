@@ -2,6 +2,8 @@
 
 import os
 import socket
+from collections.abc import Iterator
+from contextlib import contextmanager
 from uuid import uuid4
 
 import mysql.connector
@@ -69,6 +71,20 @@ def _mysql_ready() -> bool:
         return True
     except (mysql.connector.Error, OSError):
         return False
+
+
+@contextmanager
+def mysql_procedure(name: str, body: str) -> Iterator[str]:
+    """A stored procedure in the dev `dbaguy` database for one test, dropped afterwards. `name` starts with `zz_`."""
+    assert name.startswith("zz_")
+    owner = mysql.connector.connect(**mysql_driver_kwargs(autocommit=True))
+    try:
+        owner.cmd_query(f"DROP PROCEDURE IF EXISTS {name}")
+        owner.cmd_query(f"CREATE PROCEDURE {name}() BEGIN {body} END")
+        yield name
+    finally:
+        owner.cmd_query(f"DROP PROCEDURE IF EXISTS {name}")
+        owner.close()
 
 
 PG_AVAILABLE = _pg_ready()

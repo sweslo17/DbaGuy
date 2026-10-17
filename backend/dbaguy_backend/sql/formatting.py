@@ -24,6 +24,7 @@ from ..domain.errors import ValidationFailed
 from ..domain.formats import FormatColumn, FormatKind, RowFormatOptions
 from .dialects import (
     NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, json_literal, qualified, quote_ident, quote_literal,
+    zero_date_as_text,
 )
 
 __all__ = [
@@ -229,8 +230,8 @@ def value_condition(dialect: Dialect, column: str, value: Any, category: ColumnC
 
     The database decides what matches, by the column's collation: MySQL's default collations ignore case, accents and
     trailing spaces, so the filter can return more rows than the one clicked. A JSON cell is compared as JSON where the
-    dialect needs it said (MySQL). None when the cell is only a preview (cut text or bytes): no condition can be built
-    from it."""
+    dialect needs it said (MySQL), and a MySQL date with a zero part as text (R-03a-T9c). None when the cell is only a
+    preview (cut text or bytes): no condition can be built from it."""
     name = quote_ident(dialect, column)
     if value is None:
         return f"{name} IS NULL"
@@ -242,6 +243,8 @@ def value_condition(dialect: Dialect, column: str, value: Any, category: ColumnC
         return None
     if category == ColumnCategory.JSON and isinstance(cell, str):
         return f"{name} = {json_literal(dialect, cell)}"
+    if category == ColumnCategory.DATETIME and isinstance(cell, str) and (text := zero_date_as_text(dialect, name, cell)):
+        return f"{text} = {quote_literal(dialect, cell)}"
     return f"{name} = {_SqlLiterals(dialect)(cell, FormatColumn(name=column, category=category))}"
 
 

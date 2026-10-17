@@ -1,3 +1,4 @@
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -60,3 +61,13 @@ def test_file_logging_starts_no_helper_process(tmp_path: Path) -> None:
                             cwd=Path(__file__).resolve().parent.parent)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "[]", f"helper processes: {result.stdout}"
+
+
+def test_the_mysql_drivers_connect_chatter_stays_out_of_the_log(capsys) -> None:
+    setup_logging("DEBUG", None)
+    driver = logging.getLogger("mysql.connector")
+    driver.info("plugin_name: caching_sha2_password")  # three of these per connect otherwise
+    driver.warning("MFA terminated with a no ok packet")
+    stderr_text = capsys.readouterr().err
+    logger.remove()
+    assert "plugin_name" not in stderr_text and "MFA terminated" in stderr_text
