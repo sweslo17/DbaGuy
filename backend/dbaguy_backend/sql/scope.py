@@ -10,9 +10,13 @@ from .lexer import Token, TokenKind
 
 IDENT = (TokenKind.WORD, TokenKind.QUOTED)
 BEFORE_NAME = frozenset({"ONLY", "LATERAL", "IF", "NOT", "EXISTS"})  # FROM ONLY t, DROP TABLE IF EXISTS t
-# Words that introduce a relation; UPDATE does not after FOR / FOR NO KEY / ON CONFLICT DO.
-_RELATION_KEYWORDS = frozenset({"FROM", "JOIN", "UPDATE", "INTO", "TABLE"})
-_NOT_A_TABLE_UPDATE = frozenset({"FOR", "KEY", "DO"})
+# Words that introduce a relation. Two of them are also words of another construct, told apart by the word before:
+# UPDATE after FOR / FOR NO KEY / ON CONFLICT DO, and MySQL's STRAIGHT_JOIN as a SELECT modifier (a join otherwise).
+_RELATION_KEYWORDS = frozenset({"FROM", "JOIN", "STRAIGHT_JOIN", "UPDATE", "INTO", "TABLE"})
+_NOT_A_RELATION_AFTER = {
+    "UPDATE": frozenset({"FOR", "KEY", "DO"}),
+    "STRAIGHT_JOIN": frozenset({"SELECT", "ALL", "DISTINCT", "DISTINCTROW", "HIGH_PRIORITY"}),
+}
 _ALIAS_STOP = frozenset(
     """ON WHERE JOIN LEFT RIGHT INNER OUTER FULL CROSS NATURAL GROUP ORDER LIMIT OFFSET SET USING UNION EXCEPT
     INTERSECT WINDOW HAVING VALUES RETURNING LATERAL SELECT FROM AS FOR DEFAULT WITH FETCH TABLESAMPLE WITHOUT
@@ -88,7 +92,7 @@ def word(tokens: list[Token], i: int) -> str:
 
 def introduces_relation(tokens: list[Token], i: int) -> bool:
     keyword = word(tokens, i)
-    return keyword in _RELATION_KEYWORDS and not (keyword == "UPDATE" and word(tokens, i - 1) in _NOT_A_TABLE_UPDATE)
+    return keyword in _RELATION_KEYWORDS and word(tokens, i - 1) not in _NOT_A_RELATION_AFTER.get(keyword, ())
 
 
 def enclosing_group(tokens: list[Token]) -> int:

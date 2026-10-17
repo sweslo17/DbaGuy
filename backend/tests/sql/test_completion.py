@@ -312,3 +312,38 @@ def test_mysql_comments_silence_completion_only_while_the_cursor_is_in_them():
     assert complete("SELECT 1 /*+ x */ FRO", 21, MY, None).items[0].label == "FROM"  # after a hint
     text = "SELECT 1 # note\nSEL"
     assert complete(text, len(text), MY, None).items[0].label == "SELECT"  # the # comment ended at the newline
+
+
+def test_full_join_is_not_offered_where_the_dialect_has_none():
+    assert "FULL JOIN" not in CLAUSE_KEYWORDS[MY]
+    assert "FULL JOIN" in CLAUSE_KEYWORDS[PG] and "FULL JOIN" in CLAUSE_KEYWORDS[LITE]
+
+
+def _scope_relations(sql):
+    significant = [t for t in tokenize(sql, MY) if t.kind not in INSIGNIFICANT]
+    return [(r.name, r.alias) for r in scope_at(significant, len(sql)).relations]
+
+
+def test_mysql_straight_join_introduces_a_relation():
+    assert _scope_relations("SELECT * FROM a STRAIGHT_JOIN b x WHERE ") == [("a", None), ("b", "x")]
+    assert _scope_relations("SELECT * FROM a USE INDEX (i) STRAIGHT_JOIN b WHERE ") == [("a", None), ("b", None)]
+
+
+def test_mysql_straight_join_as_a_select_modifier_is_not_a_join():
+    assert _scope_relations("SELECT STRAIGHT_JOIN x.id FROM t x WHERE ") == [("t", "x")]
+    assert _scope_relations("SELECT DISTINCT HIGH_PRIORITY STRAIGHT_JOIN id FROM t WHERE ") == [("t", None)]
+
+
+def test_mysql_completion_after_straight_join():
+    snapshot = SchemaSnapshot(
+        database=None, default_schema="dbaguy", search_path=["dbaguy"], built_at=datetime.now(UTC),
+        schemas=[SnapshotSchema(name="dbaguy", relations=[
+            table("orders", [("id", "int")]), table("users", [("id", "int")]),
+        ])],
+    )
+    my_index = SnapshotIndex(snapshot, MY)
+    after_join = "WITH cte AS (SELECT 1 AS k) SELECT * FROM orders STRAIGHT_JOIN "
+    assert {"users", "cte"} <= {i.label for i in complete(after_join, len(after_join), MY, my_index).items}
+    after_modifier = "SELECT STRAIGHT_JOIN "
+    items = complete(after_modifier, len(after_modifier), MY, my_index).items
+    assert "users" not in [i.label for i in items]  # a select-list position, not a relation position

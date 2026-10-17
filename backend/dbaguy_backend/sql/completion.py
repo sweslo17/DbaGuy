@@ -81,12 +81,15 @@ STATEMENT_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
 CLAUSE_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.POSTGRES: (*_CLAUSES, "ILIKE"),
     Dialect.SQLITE: (*_CLAUSES, "GLOB"),
-    Dialect.MYSQL: (*(word for word in _CLAUSES if word != "RETURNING"), "ON DUPLICATE KEY UPDATE"),
+    Dialect.MYSQL: (  # no RETURNING and no FULL JOIN
+        *(word for word in _CLAUSES if word not in ("RETURNING", "FULL JOIN")), "ON DUPLICATE KEY UPDATE",
+    ),
 }
 
 _COLUMN_CLAUSES = frozenset(
     "SELECT WHERE HAVING SET BY RETURNING WHEN THEN ELSE CASE DISTINCT USING ON".split()
 )
+_CTE_KEYWORDS = ("FROM", "JOIN", "STRAIGHT_JOIN")  # after these a CTE name can be a relation
 _NO_ITEMS_INSIDE = (TokenKind.STRING, TokenKind.COMMENT, TokenKind.QUOTED, TokenKind.EXEC_COMMENT)
 
 
@@ -430,7 +433,7 @@ def _candidates(before: list[Token], statement: list[Token], offset: int, dialec
     if index is None:
         return _keywords(dialect, "clause") if context != "relations" else []
     if context == "relations":  # CTEs first: they win ties against schema relations
-        ctes = _cte_candidates(dialect, statement) if keyword in ("FROM", "JOIN") else []
+        ctes = _cte_candidates(dialect, statement) if keyword in _CTE_KEYWORDS else []
         return chain(ctes, index.relation_candidates, index.schema_candidates)
     scope = scope_at(statement, offset)
     joins = _join_candidates(scope, before, index) if context == "join" else []

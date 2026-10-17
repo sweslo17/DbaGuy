@@ -57,12 +57,19 @@ def test_literals_per_dialect():
 def test_every_dialect_has_an_entry_in_every_dialect_table(dialect):  # tripwire for 03b's T-SQL
     from dbaguy_backend.sql import completion, dialects, sqlglot_rules
 
-    tables = [
-        dialects.RULES, dialects._IDENT_QUOTES, dialects._SIMPLE_IDENT, dialects._RESERVED, dialects._BOOL_LITERALS,
-        dialects._BYTES_LITERALS, sqlglot_rules.SQLGLOT_DIALECT, completion.STATEMENT_KEYWORDS,
-        completion.CLAUSE_KEYWORDS,
-    ]
-    assert all(dialect in table for table in tables)
+    tables = {
+        "dialects.RULES": dialects.RULES,
+        "dialects._IDENT_QUOTES": dialects._IDENT_QUOTES,
+        "dialects._SIMPLE_IDENT": dialects._SIMPLE_IDENT,
+        "dialects._RESERVED": dialects._RESERVED,
+        "dialects._BOOL_LITERALS": dialects._BOOL_LITERALS,
+        "dialects._BYTES_LITERALS": dialects._BYTES_LITERALS,
+        "sqlglot_rules.SQLGLOT_DIALECT": sqlglot_rules.SQLGLOT_DIALECT,
+        "completion.STATEMENT_KEYWORDS": completion.STATEMENT_KEYWORDS,
+        "completion.CLAUSE_KEYWORDS": completion.CLAUSE_KEYWORDS,
+    }
+    missing = [name for name, table in tables.items() if dialect not in table]
+    assert not missing, f"{dialect} has no entry in: {missing}"
 
 
 def test_utf16_round_trip_with_astral_characters():

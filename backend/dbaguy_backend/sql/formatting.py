@@ -223,8 +223,11 @@ class _SqlLiterals:
 
 
 def value_condition(dialect: Dialect, column: str, value: Any, category: ColumnCategory) -> str | None:
-    """"Filter by this value" (spec §3.7): a condition that matches one encoded grid cell exactly, in the dialect's
-    syntax. None when the cell is only a preview (cut text or bytes): no condition matches it."""
+    """The "Filter by this value" condition (spec §3.7) for one encoded grid cell, in the dialect's syntax.
+
+    The database decides what matches, by the column's collation: MySQL's default collations ignore case, accents and
+    trailing spaces, so the filter can return more rows than the one clicked. None when the cell is only a preview
+    (cut text or bytes): no condition can be built from it."""
     name = quote_ident(dialect, column)
     if value is None:
         return f"{name} IS NULL"
