@@ -9,6 +9,7 @@ macOS 上自用的 SQL IDE（side project）。支援 PostgreSQL、MySQL、SQLit
 - **MSSQL 公司少用**：遇到真正卡點就擱置，否則照做。
 - **範圍以 [feature-priorities.md](docs/research/2026-10-15-feature-priorities.md) 為準**（§3 MoSCoW、§4 Couchbase、§8 使用者回覆），嚴守 Won't 清單，不要包山包海。
 - 遵守 `~/.claude/CLAUDE.md`：SOLID、DRY、loguru 分層 log、選用新版且相依性乾淨的套件、完成後回頭檢查正確性。
+- **每個階段回頭檢視時（task review、最終 review、子專案收尾），除了對照 plan 是否完整，也要對照 [feature-priorities.md](docs/research/2026-10-15-feature-priorities.md) 整理的痛點與需求**：§2 品質需求 Q1–Q6（輕快低記憶體、穩定不丟工作、可信任、聚焦 80% 情境、多引擎、macOS 慣例）、§3 Must 與該子專案相關的列、§8 使用者回覆。說明這階段解決了哪些、有沒有踩到或退步，避免做出沒解決痛點的玩具。
 
 ## 技術選型
 
