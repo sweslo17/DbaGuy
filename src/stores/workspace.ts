@@ -136,7 +136,7 @@ function unbindTabs(ids: Set<string>): string[] {
 
 /**
  * The connection being worked with: the active tab's, else the one selected in the explorer. A new query tab from the
- * command palette starts on it, and quick open searches its objects.
+ * command palette or the empty workspace starts on it, and quick open searches its objects.
  */
 export function workingProfileId(s: Pick<WorkspaceState, "tabs" | "activeTabId" | "selectedProfileId">): string | null {
   return s.tabs.find((t) => t.id === s.activeTabId)?.profileId ?? s.selectedProfileId;
@@ -222,3 +222,9 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
     set({ tabs, activeTabId, sidebarTab });
   },
 }));
+
+/** Opens a new query tab on the connection being worked with (`workingProfileId`) and returns its id. */
+export function openNewQuery(): string {
+  const workspace = useWorkspace.getState();
+  return workspace.openQuery(workingProfileId(workspace), null);
+}

@@ -15,6 +15,7 @@ import { QueryTab } from "../query/QueryTab";
 import { relationOf } from "../table-data/filterValue";
 import { TableDataTab } from "../table-data/TableDataTab";
 import { isClosePending, requestCloseTab } from "./closeGuards";
+import { WelcomeScreen } from "./WelcomeScreen";
 
 /** The attribute that marks a tab's content with its tab id. */
 const TAB_PANEL = "data-tab-panel";
@@ -152,9 +153,7 @@ export function Workspace() {
         </button>
       </div>
       <div className="min-h-0 flex-1">
-        {!active && (
-          <p className="p-6 text-center text-muted">Open a table from the sidebar, or right-click a connection → New Query</p>
-        )}
+        {!active && <WelcomeScreen />}
         {/* Tabs stay mounted while hidden so their sessions and editors keep their state; closing a tab unmounts it.
             A tab whose content throws shows the error in its place; the other tabs carry on. */}
         {tabs.map((tab) => (

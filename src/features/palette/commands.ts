@@ -2,7 +2,7 @@ import type { QueryClient } from "@tanstack/react-query";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
 import type { AppSettings } from "@/lib/api/types";
-import { useWorkspace, workingProfileId, type Tab } from "@/stores/workspace";
+import { openNewQuery, useWorkspace, type Tab } from "@/stores/workspace";
 import { refreshSchema } from "../explorer/refreshSchema";
 import { HISTORY_VIEW } from "../history/useHistory";
 import { readQueryTabActions, type QueryTabActionId, type QueryTabActions } from "../query/tabActions";
@@ -97,10 +97,7 @@ export const COMMANDS: readonly PaletteCommand[] = [
     label: "New query",
     enabled: always,
     // On the active tab's connection, else the one selected in the explorer.
-    run: () => {
-      const workspace = useWorkspace.getState();
-      workspace.openQuery(workingProfileId(workspace), null);
-    },
+    run: () => void openNewQuery(),
   },
   tabCommand("run", "Run", SHORTCUTS.run),
   tabCommand("runAll", "Run all", SHORTCUTS.runAll),
