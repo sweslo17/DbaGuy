@@ -36,6 +36,21 @@ _KEYWORD_KIND: dict[str, StatementKind] = {
 _DIALECT_KEYWORD_KIND: dict[Dialect, dict[str, StatementKind]] = {
     Dialect.MYSQL: {"LOAD": StatementKind.WRITE, "HANDLER": StatementKind.WRITE},
 }
+# MySQL: sqlglot reads every `START …` as a transaction, and so does _KEYWORD_KIND (START REPLICA, START
+# GROUP_REPLICATION, …). A statement counts as a TRANSACTION only when it begins with one of these; anything else is
+# UNKNOWN (R-03a-T4). A dialect without an entry (PostgreSQL, SQLite) has no restriction.
+_TRANSACTION_STARTS: dict[Dialect, tuple[tuple[str, ...], ...]] = {
+    Dialect.MYSQL: (
+        ("BEGIN",), ("START", "TRANSACTION"), ("COMMIT",), ("ROLLBACK",), ("SAVEPOINT",), ("RELEASE", "SAVEPOINT"),
+    ),
+}
+# The keywords that open an EXPLAIN. In MySQL DESCRIBE and DESC are synonyms: `DESCRIBE ANALYZE DELETE …` runs the
+# DELETE, while `DESC t` and `DESCRIBE t` only list the columns (no ANALYZE follows).
+_EXPLAIN_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
+    Dialect.POSTGRES: ("EXPLAIN",),
+    Dialect.SQLITE: ("EXPLAIN",),
+    Dialect.MYSQL: ("EXPLAIN", "DESCRIBE", "DESC"),
+}
 # Least to most cautious: when a script mixes kinds, the strictest one decides (unknown is the most cautious).
 _SEVERITY = (
     StatementKind.READ,
@@ -54,8 +69,27 @@ def _has_version_comment(tokens: list[Token]) -> bool:
     return any(t.kind == TokenKind.EXEC_COMMENT and t.text.startswith("/*!") for t in tokens)
 
 
+def _is_hint(token: Token) -> bool:
+    """A MySQL optimizer hint `/*+ … */`: for the server a plain comment wherever it does not follow SELECT, INSERT,
+    UPDATE or DELETE, such as between the words of EXPLAIN."""
+    return token.kind == TokenKind.EXEC_COMMENT and token.text.startswith("/*+")
+
+
 def _words(tokens: list[Token]) -> list[str]:
     return [t.upper for t in tokens if t.kind == TokenKind.WORD]
+
+
+def _takes_row_locks(words: list[str]) -> bool:
+    """FOR UPDATE, FOR SHARE, FOR NO KEY UPDATE, FOR KEY SHARE, or MySQL's LOCK IN SHARE MODE."""
+    return any(
+        (a == "FOR" and b in ("UPDATE", "SHARE", "NO", "KEY")) or (a, b) == ("LOCK", "IN")
+        for a, b in zip(words, words[1:])
+    )
+
+
+def _begins_a_transaction_statement(words: list[str], dialect: Dialect) -> bool:
+    starts = _TRANSACTION_STARTS.get(dialect)
+    return starts is None or any(tuple(words[:len(start)]) == start for start in starts)
 
 
 def _writes_server_file(words: list[str]) -> bool:
@@ -76,12 +110,10 @@ def _lexical(sql: str, dialect: Dialect) -> Classification:
     if kind == StatementKind.READ and first in ("SELECT", "WITH"):
         # Data-modifying CTEs, locking reads and file writes are writes even when sqlglot could not parse them.
         has_dml = any(w in ("INSERT", "UPDATE", "DELETE", "MERGE") for w in words[1:])
-        locks = any(
-            (a == "FOR" and b in ("UPDATE", "SHARE", "NO", "KEY")) or (a, b) == ("LOCK", "IN")
-            for a, b in zip(words, words[1:])
-        )
-        if has_dml or locks or _writes_server_file(words):
+        if has_dml or _takes_row_locks(words) or _writes_server_file(words):
             kind = StatementKind.WRITE
+    elif kind == StatementKind.SESSION and first == "SET" and _takes_row_locks(words):
+        kind = StatementKind.WRITE  # SET @x = (SELECT … FOR UPDATE)
     reasons: list[DangerReason] = []
     if first == "DROP":
         reasons.append(DangerReason.DROP)
@@ -94,8 +126,8 @@ def _lexical(sql: str, dialect: Dialect) -> Classification:
 
 def _explain_inner(sql: str, dialect: Dialect) -> str | None:
     """For EXPLAIN ANALYZE ..., return the analysed statement text; None for plain EXPLAIN."""
-    tokens = [t for t in tokenize(sql, dialect) if t.kind not in INSIGNIFICANT]
-    if not tokens or tokens[0].upper != "EXPLAIN":
+    tokens = [t for t in tokenize(sql, dialect) if t.kind not in INSIGNIFICANT and not _is_hint(t)]
+    if not tokens or tokens[0].upper not in _EXPLAIN_KEYWORDS[dialect]:
         return None
     i, analyze = 1, False
     if i < len(tokens) and tokens[i].kind == TokenKind.LPAREN:  # EXPLAIN (ANALYZE, BUFFERS) ...
@@ -164,14 +196,17 @@ def _classify_statement(sql: str, dialect: Dialect, has_body: bool = False) -> C
     tokens = tokenize(sql, dialect)
     if _has_version_comment(tokens):
         return Classification(kind=StatementKind.UNKNOWN)
+    words = _words(tokens)
     result = _classify_text(sql, dialect, has_body)
+    if result.kind == StatementKind.TRANSACTION and not _begins_a_transaction_statement(words, dialect):
+        return Classification(kind=StatementKind.UNKNOWN)
     # R-03a-P7: decided after sqlglot too, as a floor. sqlglot 30.23 cannot parse INTO OUTFILE (so _lexical sees it
     # today), but a sqlglot that parses it as exp.Into would make it a plain READ for MySQL (INTO_CREATES_A_TABLE
     # excludes it). A floor, not an early return: `CREATE PROCEDURE … INTO OUTFILE` stays DDL, and a DDL result is
     # what refreshes the schema afterwards.
     if (
         dialect is Dialect.MYSQL
-        and _writes_server_file(_words(tokens))
+        and _writes_server_file(words)
         and _SEVERITY.index(result.kind) < _SEVERITY.index(StatementKind.WRITE)
     ):
         return Classification(kind=StatementKind.WRITE, dangerous_reasons=result.dangerous_reasons)
@@ -190,7 +225,11 @@ def _classify_text(sql: str, dialect: Dialect, has_body: bool) -> Classification
     if has_body:  # sqlglot does not know routine/trigger bodies and cuts them at their inner `;`
         return _lexical(sql, dialect)
     # The splitter saw one statement where sqlglot sees several: judge every one, never just the first.
-    return _combine([c or Classification(kind=StatementKind.UNKNOWN) for c in found])
+    results = [c or Classification(kind=StatementKind.UNKNOWN) for c in found]
+    if dialect in _TRANSACTION_STARTS:  # the caller's leading-words check can vouch for the first statement only
+        unknown = Classification(kind=StatementKind.UNKNOWN)
+        results = [unknown if r.kind == StatementKind.TRANSACTION else r for r in results]
+    return _combine(results)
 
 
 def _combine(results: list[Classification]) -> Classification:

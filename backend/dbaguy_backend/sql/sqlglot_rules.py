@@ -70,7 +70,9 @@ def classify_expression(node: exp.Expression, dialect: Dialect) -> Classificatio
     if isinstance(node, (exp.Transaction, exp.Commit, exp.Rollback)):
         return Classification(kind=StatementKind.TRANSACTION)
     if isinstance(node, (exp.Set, exp.Use)):
-        return Classification(kind=StatementKind.SESSION)
+        # SET @x = (SELECT … FOR UPDATE) takes row locks, like any locking read
+        locks = node.find(exp.Lock) is not None
+        return Classification(kind=StatementKind.WRITE if locks else StatementKind.SESSION)
     if isinstance(node, exp.Query):
         if node.find(exp.Into) and dialect in INTO_CREATES_A_TABLE:
             return Classification(kind=StatementKind.DDL)

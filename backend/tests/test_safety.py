@@ -142,6 +142,14 @@ def decide_my(sql, level="standard", read_only=False):
     "SELECT a INTO @x FROM t", "START TRANSACTION", "START TRANSACTION READ ONLY",
     "SELECT /*+ MAX_EXECUTION_TIME(1000) */ * FROM t",
     "set @x = 1;", "/* report */ SET SESSION SQL_MODE = ''", "SET @x = (SELECT 1, 2)",
+    # Variables that shape how statements run or look, never whether they may write.
+    "SET autocommit = 0", "SET @x = 1, autocommit = 0", "SET SESSION autocommit = 1", "SET @@autocommit := 1",
+    "SET group_concat_max_len = 1000000", "SET max_execution_time = 1000", "SET SESSION sql_select_limit = 10",
+    "SET character_set_results = NULL", "SET lc_time_names = 'en_US'",
+    # A read-only characteristic can only make things stricter.
+    "SET SESSION TRANSACTION READ ONLY", "SET TRANSACTION READ ONLY", "SET LOCAL TRANSACTION READ ONLY",
+    "set session transaction read only;",
+    "DELIMITER $$\nSET @x = 1$$\nDELIMITER ;",
 ])
 def test_mysql_read_only_allows(sql):
     assert decide_my(sql, read_only=True) == (A.RUN, [])
@@ -151,18 +159,59 @@ def test_mysql_read_only_allows(sql):
     "SET SESSION TRANSACTION READ WRITE", "SET TRANSACTION READ WRITE",
     "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED", "SET SESSION transaction_read_only = 0",
     "SET transaction_read_only = OFF", "SET @@session.transaction_read_only = 0", "SET GLOBAL sql_mode = ''",
-    "SET @@global.time_zone = '+00:00'", "SET PERSIST sql_mode = ''", "SET autocommit = 0",
-    "SET @x = 1, autocommit = 0", "SET NAMES", "SET sql_mode = ''; DELETE FROM t", "START TRANSACTION READ WRITE",
+    "SET @@global.time_zone = '+00:00'", "SET PERSIST sql_mode = ''",
+    "SET NAMES", "SET sql_mode = ''; DELETE FROM t", "START TRANSACTION READ WRITE",
     "INSERT INTO t VALUES (1)", "SELECT * FROM t INTO OUTFILE '/tmp/x'", "SELECT * INTO DUMPFILE '/tmp/x' FROM t",
     "/*!40000 DELETE FROM t */", "/*!40101 SET NAMES utf8 */", "LOAD DATA INFILE '/x' INTO TABLE t",
     "HANDLER t OPEN", "DO SLEEP(1)", "CALL p()", "DELIMITER $$",
     # Nothing that is not plainly a harmless variable, and nothing hidden next to one.
     "SET ROLE admin", "SET PASSWORD = 'x'", "SET DEFAULT ROLE ALL TO u", "SET @x = 1; SET @y = 2",
     "SET @x := 1, @@global.sql_mode = ''", "SET sql_mode", "SET sql_mode =", "SET CHARACTER SET", "SET @x = 1,",
-    "SET @x = /*!50000 1 */", "SET max_execution_time = 1000", "SET SESSION transaction_isolation = 'READ-COMMITTED'",
+    "SET @x = /*!50000 1 */", "SET SESSION transaction_isolation = 'READ-COMMITTED'",
     "USE", "USE a b", "USE analytics; USE other", "USE (a)", "SET search_path TO public", "RESET sql_mode",
 ])
 def test_mysql_read_only_blocks(sql):
+    assert decide_my(sql, read_only=True) == (A.BLOCK, ["read_only"])
+
+
+@pytest.mark.parametrize("sql", [
+    # Not transactions: the server starts or stops replication, which a read-only profile must never do.
+    "START REPLICA", "START SLAVE", "START GROUP_REPLICATION", "STOP REPLICA", "STOP GROUP_REPLICATION",
+    "START REPLICA UNTIL SOURCE_LOG_FILE = 'x', SOURCE_LOG_POS = 4", "START", "XA START 'a'",
+    # EXPLAIN's synonyms and a hint between its words do not hide the statement that really runs.
+    "DESCRIBE ANALYZE DELETE FROM t", "DESC ANALYZE DELETE FROM t", "EXPLAIN /*+ x */ ANALYZE DELETE FROM t",
+    "EXPLAIN FORMAT=TREE /*+ x */ ANALYZE DELETE FROM t", "DESCRIBE ANALYZE FORMAT=TREE DELETE t FROM t JOIN u ON 1",
+    "/*+ x */ EXPLAIN ANALYZE DELETE FROM t",
+    # A SET value that takes row locks is a locking read.
+    "SET @x = (SELECT id FROM t FOR UPDATE)", "SET @x := (SELECT id FROM t LOCK IN SHARE MODE)",
+    "SET @x = (SELECT id FROM t FOR SHARE), @y = 1", "SET sql_mode = (SELECT 1 FOR UPDATE)",
+    # Two statements in one span (a custom DELIMITER can make that) are never one harmless SET.
+    "DELIMITER $$\nSET @x = 1; SET transaction_read_only = 0$$\nDELIMITER ;",
+    "DELIMITER $$\nSET @x = 1; SET @y = 2$$\nDELIMITER ;",
+    "DELIMITER $$\nUSE a; USE b$$\nDELIMITER ;",
+    # Only a read-only characteristic, on its own, at the session level.
+    "SET GLOBAL TRANSACTION READ ONLY", "SET PERSIST TRANSACTION READ ONLY", "SET SESSION TRANSACTION",
+    "SET SESSION TRANSACTION READ", "SET SESSION TRANSACTION READ ONLY, READ WRITE",
+    "SET SESSION TRANSACTION READ ONLY, ISOLATION LEVEL SERIALIZABLE", "SET TRANSACTION READ ONLY READ WRITE",
+    "SET autocommit = 0, transaction_read_only = 0", "SET @@session.autocommit = 0; SET GLOBAL sql_mode = ''",
+])
+def test_mysql_read_only_blocks_what_the_review_found(sql):
+    assert decide_my(sql, read_only=True) == (A.BLOCK, ["read_only"])
+
+
+@pytest.mark.parametrize("sql", [
+    "START TRANSACTION READ ONLY", "START TRANSACTION", "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT a",
+    "RELEASE SAVEPOINT a", "ROLLBACK TO SAVEPOINT a", "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY",
+])
+def test_mysql_read_only_still_allows_transactions(sql):
+    assert decide_my(sql, read_only=True) == (A.RUN, [])
+
+
+@pytest.mark.parametrize("sql", [
+    "START TRANSACTION READ WRITE", "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ WRITE",
+    "START TRANSACTION READ WRITE, WITH CONSISTENT SNAPSHOT",
+])
+def test_mysql_read_only_still_blocks_a_read_write_transaction(sql):
     assert decide_my(sql, read_only=True) == (A.BLOCK, ["read_only"])
 
 

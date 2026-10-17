@@ -86,6 +86,26 @@ class SafetyPolicy:
         return dangers
 
 
+def _single_statement_tokens(sql: str, dialect: Dialect) -> list[Token] | None:
+    """The significant tokens of `sql` when it is exactly one statement, else None.
+
+    A `;` still inside the span (a MySQL custom DELIMITER line can make that happen) means more than one statement,
+    whatever the splitter says; only trailing ones are dropped.
+    """
+    spans = split(sql, dialect)
+    if len(spans) != 1:
+        return None
+    tokens = [t for t in tokenize(spans[0].text, dialect) if t.kind not in INSIGNIFICANT]
+    while tokens and tokens[-1].kind == TokenKind.SEMI:
+        tokens.pop()
+    return None if any(t.kind == TokenKind.SEMI for t in tokens) else tokens
+
+
+def _keywords(tokens: list[Token]) -> list[str]:
+    """One entry per token: its upper-cased text if it is a word, "" otherwise (so positions line up with `tokens`)."""
+    return [t.upper if t.kind == TokenKind.WORD else "" for t in tokens]
+
+
 def _setting_name(token: Token) -> str:
     """A configuration parameter's name as PostgreSQL compares it: case-insensitive, quotes or not; "" if not a name."""
     if token.kind == TokenKind.WORD:
@@ -100,11 +120,10 @@ def _harmless_pg_setting(sql: str) -> bool:
     Never SET TRANSACTION, SET SESSION CHARACTERISTICS, SET ROLE, SET SESSION AUTHORIZATION, RESET ALL or a setting
     outside the list (notably transaction_read_only and default_transaction_read_only).
     """
-    spans = split(sql, Dialect.POSTGRES)
-    if len(spans) != 1:
+    tokens = _single_statement_tokens(sql, Dialect.POSTGRES)
+    if tokens is None:
         return False
-    tokens = [t for t in tokenize(spans[0].text, Dialect.POSTGRES) if t.kind not in INSIGNIFICANT]
-    words = [t.upper if t.kind == TokenKind.WORD else "" for t in tokens]
+    words = _keywords(tokens)
     if words[:1] == ["RESET"]:
         named = len(tokens) == 2 and _setting_name(tokens[1]) in _PG_HARMLESS_SETTINGS
         return named or words[1:] == ["TIME", "ZONE"]
@@ -120,7 +139,15 @@ def _harmless_pg_setting(sql: str) -> bool:
     return assigns and len(tokens) > rest + 2  # a value follows
 
 
-_MYSQL_HARMLESS_VARIABLES = frozenset({"sql_mode", "time_zone"})
+# Session variables that shape how statements run or look, never whether they may write.
+_MYSQL_HARMLESS_VARIABLES = frozenset({
+    # NO_BACKSLASH_ESCAPES and ANSI_QUOTES make the lexer (which assumes the default mode) and the server disagree
+    # about strings; that is accepted (plan Ruling 25).
+    "sql_mode",
+    "time_zone",
+    "autocommit",  # the adapter recalibrates its autocommit state from the server
+    "group_concat_max_len", "max_execution_time", "sql_select_limit", "character_set_results", "lc_time_names",
+})
 _MYSQL_SESSION_SCOPES = frozenset({"SESSION", "LOCAL"})
 
 
@@ -138,9 +165,9 @@ def _top_level_items(tokens: list[Token]) -> list[list[Token]]:
 
 
 def _harmless_mysql_assignment(tokens: list[Token]) -> bool:
-    """One item of a MySQL SET: NAMES …, CHARACTER SET …, CHARSET …, a user variable (`@x = …`), or the session's
-    sql_mode or time_zone (`[SESSION|LOCAL] name`, `@@name`, `@@session.name`, `@@local.name`), with `=` or `:=`."""
-    words = [t.upper if t.kind == TokenKind.WORD else "" for t in tokens]
+    """One item of a MySQL SET: NAMES …, CHARACTER SET …, CHARSET …, a user variable (`@x = …`), or one of the
+    harmless session variables (`[SESSION|LOCAL] name`, `@@name`, `@@session.name`, `@@local.name`), with `=` or `:=`."""
+    words = _keywords(tokens)
     if words[:1] in (["NAMES"], ["CHARSET"]):
         return len(tokens) > 1
     if words[:2] == ["CHARACTER", "SET"]:
@@ -163,16 +190,21 @@ def _harmless_mysql_assignment(tokens: list[Token]) -> bool:
 
 def _harmless_mysql_session(sql: str) -> bool:
     """One MySQL statement that only shapes how statements run or look (spec §3.4): `USE db`, or a SET whose every
-    item is harmless. Never anything about transactions (`SET … TRANSACTION …`, transaction_read_only), GLOBAL or
+    item is harmless. The only thing it allows about transactions is `SET [SESSION|LOCAL] TRANSACTION READ ONLY`,
+    which can only make things stricter; never `SET … TRANSACTION …` otherwise, transaction_read_only, GLOBAL or
     PERSIST scopes, or other system variables."""
-    spans = split(sql, Dialect.MYSQL)
-    if len(spans) != 1:
+    tokens = _single_statement_tokens(sql, Dialect.MYSQL)
+    if tokens is None:
         return False
-    tokens = [t for t in tokenize(spans[0].text, Dialect.MYSQL) if t.kind not in INSIGNIFICANT]
-    words = [t.upper if t.kind == TokenKind.WORD else "" for t in tokens]
+    words = _keywords(tokens)
     if words[:1] == ["USE"]:
         return len(tokens) == 2 and tokens[1].kind in (TokenKind.WORD, TokenKind.QUOTED)
-    if words[:1] != ["SET"] or "TRANSACTION" in words or any(t.kind == TokenKind.EXEC_COMMENT for t in tokens):
+    if words[:1] != ["SET"] or any(t.kind == TokenKind.EXEC_COMMENT for t in tokens):
+        return False
+    scoped = 2 if words[1:2] and words[1] in _MYSQL_SESSION_SCOPES else 1
+    if words[scoped:] == ["TRANSACTION", "READ", "ONLY"]:
+        return True
+    if "TRANSACTION" in words:
         return False
     return all(_harmless_mysql_assignment(item) for item in _top_level_items(tokens[1:]))
 

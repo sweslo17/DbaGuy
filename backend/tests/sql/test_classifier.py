@@ -158,6 +158,60 @@ def test_sqlite(sql, kind):
     ("(SELECT 1) INTO OUTFILE '/tmp/x'", K.WRITE, []),
     ("WITH c AS (SELECT 1) SELECT * FROM c INTO OUTFILE '/tmp/x'", K.WRITE, []),
     ("SELECT 1 INTO @a; SELECT 2 INTO OUTFILE '/tmp/x'", K.WRITE, []),
+    # DESCRIBE and DESC are EXPLAIN's synonyms (the statement they analyse really runs); `DESC t` is a plain read.
+    ("DESCRIBE ANALYZE DELETE FROM t", K.WRITE, ["delete_without_where"]),
+    ("DESC ANALYZE DELETE FROM t", K.WRITE, ["delete_without_where"]),
+    ("DESCRIBE ANALYZE FORMAT=TREE DELETE t FROM t JOIN u ON t.id = u.id", K.WRITE, ["delete_without_where"]),
+    ("DESC FORMAT=TREE ANALYZE UPDATE t SET a = 1", K.WRITE, ["update_without_where"]),
+    ("DESCRIBE ANALYZE SELECT 1", K.READ, []),
+    ("DESCRIBE SELECT 1", K.READ, []),
+    ("DESCRIBE t", K.READ, []),
+    ("DESC t", K.READ, []),
+    ("DESC t col", K.READ, []),
+    ("DESCRIBE `analyze`", K.READ, []),
+    # A `/*+ … */` hint is a plain comment between the words of EXPLAIN; a `/*!` is code and still decides.
+    ("EXPLAIN /*+ x */ ANALYZE DELETE FROM t", K.WRITE, ["delete_without_where"]),
+    ("EXPLAIN FORMAT=TREE /*+ x */ ANALYZE DELETE FROM t", K.WRITE, ["delete_without_where"]),
+    ("EXPLAIN ANALYZE /*+ x */ DELETE FROM t", K.WRITE, ["delete_without_where"]),
+    ("/*+ x */ EXPLAIN ANALYZE DELETE FROM t", K.WRITE, ["delete_without_where"]),
+    ("DESCRIBE /*+ x */ ANALYZE DELETE FROM t", K.WRITE, ["delete_without_where"]),
+    ("EXPLAIN /*+ x */ SELECT 1", K.READ, []),
+    ("EXPLAIN FORMAT=TREE /*!50000 ANALYZE */ DELETE FROM t", K.UNKNOWN, []),
+    # Only these start a transaction statement in MySQL; any other START (REPLICA, SLAVE, GROUP_REPLICATION, …) and
+    # the PostgreSQL/SQLite spellings END and ABORT are unknown (R-03a-T4), whichever path (sqlglot, keywords) saw them.
+    ("START REPLICA", K.UNKNOWN, []),
+    ("START SLAVE", K.UNKNOWN, []),
+    ("START GROUP_REPLICATION", K.UNKNOWN, []),
+    ("START REPLICA UNTIL SOURCE_LOG_FILE = 'x', SOURCE_LOG_POS = 4", K.UNKNOWN, []),
+    ("START REPLICA IO_THREAD FOR CHANNEL 'c'", K.UNKNOWN, []),
+    ("/* c */ start replica", K.UNKNOWN, []),
+    ("START", K.UNKNOWN, []),
+    ("END", K.UNKNOWN, []),
+    ("ABORT", K.UNKNOWN, []),
+    ("RELEASE a", K.UNKNOWN, []),
+    ("XA START 'a'", K.UNKNOWN, []),
+    ("BEGIN", K.TRANSACTION, []),
+    ("BEGIN WORK", K.TRANSACTION, []),
+    ("START TRANSACTION", K.TRANSACTION, []),
+    ("start transaction", K.TRANSACTION, []),
+    ("START TRANSACTION READ ONLY", K.TRANSACTION, []),
+    ("START TRANSACTION READ WRITE", K.TRANSACTION, []),
+    ("START TRANSACTION WITH CONSISTENT SNAPSHOT", K.TRANSACTION, []),
+    ("/* c */ BEGIN", K.TRANSACTION, []),
+    ("COMMIT", K.TRANSACTION, []),
+    ("COMMIT AND CHAIN", K.TRANSACTION, []),
+    ("ROLLBACK", K.TRANSACTION, []),
+    ("ROLLBACK TO SAVEPOINT a", K.TRANSACTION, []),
+    ("SAVEPOINT a", K.TRANSACTION, []),
+    ("RELEASE SAVEPOINT a", K.TRANSACTION, []),
+    # A SET whose value takes row locks is a locking read, like any SELECT … FOR UPDATE.
+    ("SET @x = (SELECT id FROM t FOR UPDATE)", K.WRITE, []),
+    ("SET @x := (SELECT id FROM t LOCK IN SHARE MODE)", K.WRITE, []),
+    ("SET @x = (SELECT id FROM t FOR SHARE), @y = 1", K.WRITE, []),
+    ("SET @x = (SELECT id FROM t FOR UPDATE SKIP LOCKED)", K.WRITE, []),
+    ("SET @x = (SELECT MAX(id) FROM t), @y = 2", K.SESSION, []),
+    ("SET @x = INSERT('abc', 1, 2, 'x')", K.SESSION, []),
+    ("SET autocommit = 0", K.SESSION, []),
     # Text that only looks like one of the rules.
     ("SELECT 'INTO OUTFILE', 'LOCK IN SHARE MODE' FROM t", K.READ, []),
     ("SELECT 1 /* INTO OUTFILE */", K.READ, []),
@@ -194,6 +248,22 @@ def test_into_outfile_is_a_write_even_when_sqlglot_parses_it(sql, monkeypatch):
     # must not turn it into a read.
     monkeypatch.setattr(classifier, "_from_sqlglot", lambda text, dialect: [Classification(kind=K.READ)])
     assert classify(sql, MY).kind == K.WRITE
+
+
+@pytest.mark.parametrize(("sql", "dialect"), [
+    ("START TRANSACTION", PG), ("BEGIN", PG), ("END", PG), ("ABORT", PG), ("RELEASE a", PG), ("SAVEPOINT a", PG),
+    ("START TRANSACTION", LITE), ("BEGIN", LITE), ("END", LITE), ("RELEASE a", LITE), ("SAVEPOINT a", LITE),
+])
+def test_the_mysql_transaction_starts_do_not_narrow_the_other_dialects(sql, dialect):
+    assert classify(sql, dialect).kind == K.TRANSACTION
+
+
+def test_a_start_that_is_not_a_transaction_hides_nowhere_in_one_span(monkeypatch):
+    # Defence in depth: the leading words vouch only for the first statement of a span the splitter failed to cut.
+    monkeypatch.setattr(classifier, "split", lambda sql, dialect: [StatementSpan(0, len(sql), len(sql), sql)])
+    assert classify("START TRANSACTION; START REPLICA", MY).kind == K.UNKNOWN
+    assert classify("SELECT 1; START REPLICA", MY).kind == K.UNKNOWN
+    assert classify("BEGIN; SELECT 1", PG).kind == K.TRANSACTION  # no restriction outside MySQL
 
 
 def test_a_routine_that_writes_a_file_is_still_a_ddl_statement():
