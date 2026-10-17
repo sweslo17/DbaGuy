@@ -192,11 +192,10 @@ class MysqlConnection(DatabaseConnection):
         started = time.monotonic()
         drained = 0
         try:
-            # R-03a-T9a: a CALL closed between two result sets is still running, possibly towards a write. A statement
-            # already cancelled has had its KILL: another one would only open another connection. (Should that KILL
-            # have reached the server just before the statement began, it was ignored; the drain limit bounds that.)
-            still_coming = self._conn.unread_result or (more_results and self._conn.have_next_result)
-            if still_coming and not self._killed.is_set():
+            # R-03a-T9a: a CALL closed between two result sets is still running, possibly towards a write.
+            # R-03a-T9d: KILL even when this statement was already cancelled. That KILL may have reached the server
+            # just before the statement began, and been ignored; a redundant one costs only a short side connection.
+            if self._conn.unread_result or (more_results and self._conn.have_next_result):
                 self.kill_query("close of a partly read result")
             while True:
                 while self._conn.unread_result:

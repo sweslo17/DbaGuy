@@ -470,20 +470,20 @@ def test_a_zero_date_literal_is_what_mysql_refuses(conn):  # why R-03a-T9c compa
     assert info.value.code == "1525"
 
 
-def test_a_cancelled_statement_is_killed_once(conn, monkeypatch):  # fix round 1: no second KILL on close
-    kills = []
-    send = conn.kill_query
-    monkeypatch.setattr(conn, "kill_query", lambda why: kills.append(why) or send(why))
-    threading.Timer(0.3, conn.cancel).start()
+def test_a_cancel_that_reached_the_server_before_its_statement_still_stops_it(conn, monkeypatch):  # R-03a-T9d
+    monkeypatch.setattr(mysql_adapter, "_DRAIN_LIMIT_S", 2.0)
+    send = mysql_adapter._VerbatimCursor.execute_verbatim
+
+    def cancel_first(cursor, sql):  # the cancel lands after run() began, before the server has the statement:
+        conn.cancel()  # its KILL finds an idle session and is ignored, so the statement runs on
+        send(cursor, sql)
+
+    monkeypatch.setattr(mysql_adapter._VerbatimCursor, "execute_verbatim", cancel_first)
+    started = time.monotonic()
     with pytest.raises(StatementCancelled):
-        conn.run("SELECT SLEEP(30)")
-    result = conn.run(ENDLESS)
-    result.fetch(100)
-    conn.cancel()
-    with pytest.raises(StatementCancelled):
-        result.fetch(100)
-    result.close()
-    assert kills == ["cancel", "cancel"]
+        conn.run(ENDLESS)  # the rows come back after the cancel: closing them must KILL again, not drain 10^10 rows
+    assert time.monotonic() - started < 1.5
+    monkeypatch.undo()
     assert_next_statement_gets_its_own_rows(conn)
 
 
