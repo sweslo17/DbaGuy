@@ -47,6 +47,14 @@ export interface ExecuteOptions {
   history?: boolean;
 }
 
+export interface SessionControllerOptions {
+  /**
+   * Whether cancelling a statement aborts the open transaction on this session's engine (`cancelAbortsTransaction`),
+   * read each time it matters. Without it a cancel is assumed to abort it, the cautious choice.
+   */
+  cancelAbortsTransaction?: () => boolean;
+}
+
 export const PAGE_SIZE = 500;
 const MAX_SESSION_MESSAGES = 50;
 const SESSION_GONE = "The session is no longer available.";
@@ -112,6 +120,7 @@ export class SessionController {
   constructor(
     readonly profileId: string,
     private readonly database: string | null,
+    private readonly options: SessionControllerOptions = {},
   ) {}
 
   /**
@@ -263,14 +272,21 @@ export class SessionController {
   /**
    * Commands are only sent while the socket is open, so a request still unfinished when the socket opens was sent
    * before it closed: the events it still needed are gone for good and it can never complete. End it, and cancel
-   * it so it stops blocking the next statement — except inside a transaction, where a cancel would abort the whole
-   * transaction: there it is only marked interrupted and the user decides.
+   * it so it stops blocking the next statement — except inside a transaction on an engine where a cancel aborts the
+   * whole transaction (PostgreSQL): there it is only marked interrupted and the user decides.
    */
   private onOpen(): void {
     const { executions, state } = this.store.getState();
     const orphans = Object.values(executions).filter(unfinished);
     this.store.setState({ phase: "open", executions: orphans.length ? interruptAll(executions) : executions });
-    if (!state?.inTransaction) orphans.forEach((orphan) => this.send({ type: "cancel", request_id: orphan.requestId }));
+    const cancelKeepsTransaction = !state?.inTransaction || !this.cancelAbortsTransaction();
+    if (cancelKeepsTransaction) {
+      orphans.forEach((orphan) => this.send({ type: "cancel", request_id: orphan.requestId }));
+    }
+  }
+
+  private cancelAbortsTransaction(): boolean {
+    return this.options.cancelAbortsTransaction?.() ?? true;
   }
 
   private onEvent(event: ServerEvent): void {
