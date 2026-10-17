@@ -17,9 +17,32 @@ services:
       timeout: 3s
       retries: 30
 
+  mysql:
+    image: mysql:8.4
+    # Lets the non-SUPER dev account create functions and triggers (the binary log is on by default in 8.4: error 1419).
+    command: ["--log-bin-trust-function-creators=1"]
+    environment:
+      MYSQL_ROOT_PASSWORD: dbaguy
+      MYSQL_USER: dbaguy
+      MYSQL_PASSWORD: dbaguy
+      MYSQL_DATABASE: dbaguy
+    ports:
+      - "127.0.0.1:33067:3306"
+    volumes:
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Healthy means "the dbaguy account can log in over TCP". The image's temporary init server has no networking,
+      # so this passes only after the seed scripts have run and the real server is up.
+      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -udbaguy -pdbaguy dbaguy -e 'SELECT 1' >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 3s
+      retries: 90
+      start_period: 20s
+
   bastion:
     build: ./bastion
     ports:
       - "127.0.0.1:2222:22"
     depends_on:
       - postgres
+      - mysql
