@@ -2,6 +2,8 @@
 # Launch DbaGuy.app, measure time until the UI's first health check reaches the backend, report memory, quit.
 set -euo pipefail
 APP="${1:-src-tauri/target/release/bundle/macos/DbaGuy.app}"
+DATA_DIR="${DBAGUY_DATA_DIR:-$(mktemp -d)}"
+echo "data dir: $DATA_DIR"
 LOG="$HOME/Library/Logs/DbaGuy/backend.log"
 APP_PATTERN="DbaGuy.app/Contents/MacOS"
 BACKEND_PATTERN="Contents/Resources/backend/dbaguy-backend"
@@ -32,7 +34,7 @@ quit_app() {
 mkdir -p "$(dirname "$LOG")" && touch "$LOG"
 before=$(wc -l < "$LOG")
 start=$(now)
-open -n "$APP"
+open -n --env "DBAGUY_DATA_DIR=$DATA_DIR" "$APP"
 reached=0
 for _ in $(seq 1 1200); do
   # Process substitution, not a pipe: under `pipefail` grep -q closing early would turn a match into a failure.

@@ -2,8 +2,8 @@ import threading
 
 import pytest
 
-from dbaguy_backend.config import Settings
-from dbaguy_backend.container import AppContainer
+from dbaguy_backend.config import Settings, default_data_dir
+from dbaguy_backend.container import AppContainer, keychain_service
 from dbaguy_backend.domain.settings import SafetySettings
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
 
@@ -12,6 +12,27 @@ from dbaguy_backend.storage.secret_store import InMemorySecretStore
 def container(tmp_path):
     settings = Settings(token="t", data_dir=tmp_path / "data", log_to_file=False)
     return AppContainer(settings, secret_store=InMemorySecretStore())
+
+
+def test_only_the_app_data_dir_uses_the_app_keychain_service(tmp_path):
+    assert keychain_service(default_data_dir()) == "app.dbaguy"
+    assert keychain_service(default_data_dir() / "scripts" / "..") == "app.dbaguy"  # same directory, other spelling
+    # scripts/dev.sh's dev/data, tests and ad-hoc sidecars (DBAGUY_DATA_DIR elsewhere) never share the app's entries
+    assert keychain_service(tmp_path / "data") == "app.dbaguy.dev"
+    assert keychain_service(default_data_dir() / "nested") == "app.dbaguy.dev"
+    assert keychain_service(default_data_dir().with_name("DbaGuy-dev")) == "app.dbaguy.dev"
+
+
+def test_the_container_opens_the_keychain_service_of_its_data_dir(tmp_path, monkeypatch):
+    services: list[str] = []
+
+    def keyring_store(service: str) -> InMemorySecretStore:  # never touches the real Keychain
+        services.append(service)
+        return InMemorySecretStore()
+
+    monkeypatch.setattr("dbaguy_backend.container.KeyringSecretStore", keyring_store)
+    AppContainer(Settings(token="t", data_dir=tmp_path / "data", log_to_file=False))
+    assert services == ["app.dbaguy.dev"]
 
 
 def test_building_the_app_creates_no_history_file(container, tmp_path):

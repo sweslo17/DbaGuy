@@ -25,12 +25,16 @@ def _account(profile_id: UUID, kind: SecretKind) -> str:
     return f"profile:{profile_id}:{kind.value}"
 
 
+APP_KEYCHAIN_SERVICE = "app.dbaguy"
+DEV_KEYCHAIN_SERVICE = "app.dbaguy.dev"
+
+
 class KeyringSecretStore:
-    """Secrets in the macOS Keychain (service `app.dbaguy`)."""
+    """Secrets in the macOS Keychain, as generic passwords of one service (`APP_KEYCHAIN_SERVICE` for the app,
+    `DEV_KEYCHAIN_SERVICE` for every other data dir)."""
 
-    SERVICE = "app.dbaguy"
-
-    def __init__(self) -> None:
+    def __init__(self, service: str) -> None:
+        self.service = service
         if sys.platform == "darwin":
             # Backend auto-discovery fails inside a PyInstaller bundle, so set it explicitly.
             from keyring.backends import macOS
@@ -39,19 +43,19 @@ class KeyringSecretStore:
 
     def get(self, profile_id: UUID, kind: SecretKind) -> str | None:
         try:
-            return keyring.get_password(self.SERVICE, _account(profile_id, kind))
+            return keyring.get_password(self.service, _account(profile_id, kind))
         except KeyringError as exc:
             raise SecretStoreError(f"Keychain read failed: {exc}") from exc
 
     def set(self, profile_id: UUID, kind: SecretKind, value: str) -> None:
         try:
-            keyring.set_password(self.SERVICE, _account(profile_id, kind), value)
+            keyring.set_password(self.service, _account(profile_id, kind), value)
         except KeyringError as exc:
             raise SecretStoreError(f"Keychain write failed: {exc}") from exc
 
     def delete(self, profile_id: UUID, kind: SecretKind) -> None:
         try:
-            keyring.delete_password(self.SERVICE, _account(profile_id, kind))
+            keyring.delete_password(self.service, _account(profile_id, kind))
         except PasswordDeleteError:
             pass
         except KeyringError as exc:

@@ -1,5 +1,6 @@
 import threading
 from collections.abc import Callable
+from pathlib import Path
 
 from loguru import logger
 
@@ -7,7 +8,7 @@ from .adapters.mysql.adapter import MysqlAdapter
 from .adapters.postgres.adapter import PostgresAdapter
 from .adapters.registry import AdapterRegistry
 from .adapters.sqlite.adapter import SqliteAdapter
-from .config import Settings
+from .config import Settings, default_data_dir
 from .connectivity.ssh_tunnel import SshTunnelManager
 from .services.connection_service import ConnectionService
 from .services.history_service import HistoryService
@@ -23,13 +24,26 @@ from .sessions.manager import SessionManager
 from .sql.classifier import warm_up
 from .storage.paths import default_scripts_dir, history_file, profiles_file, settings_file, workspace_file
 from .storage.profile_store import ProfileStore
-from .storage.secret_store import KeyringSecretStore, SecretStore
+from .storage.secret_store import APP_KEYCHAIN_SERVICE, DEV_KEYCHAIN_SERVICE, KeyringSecretStore, SecretStore
 
 _HOUSEKEEPING_INTERVAL_S = 15  # also the resolution of the idle-transaction warning and rollback
 
 
 def default_registry() -> AdapterRegistry:
     return AdapterRegistry([PostgresAdapter(), MysqlAdapter(), SqliteAdapter()])
+
+
+def keychain_service(data_dir: Path) -> str:
+    """The Keychain service for passwords saved with this data dir. Only the app's own data dir uses the app's service;
+    any other (scripts/dev.sh's dev/data, tests, ad-hoc sidecars) gets a separate one, so a dev run never reads,
+    overwrites or leaves behind entries of the user's real connections."""
+    return APP_KEYCHAIN_SERVICE if data_dir.resolve() == default_data_dir().resolve() else DEV_KEYCHAIN_SERVICE
+
+
+def _keychain_store(data_dir: Path) -> KeyringSecretStore:
+    service = keychain_service(data_dir)
+    logger.info("Saved passwords use Keychain service {}", service)
+    return KeyringSecretStore(service)
 
 
 class AppContainer:
@@ -41,7 +55,8 @@ class AppContainer:
         self.settings = settings
         self.registry = registry or default_registry()
         data_dir = settings.data_dir
-        self.profiles = ProfileService(ProfileStore(profiles_file(data_dir)), secret_store or KeyringSecretStore())
+        secrets = secret_store or _keychain_store(data_dir)
+        self.profiles = ProfileService(ProfileStore(profiles_file(data_dir)), secrets)
         # `settings` is the process Settings (token, data dir); `app_settings` is the user's preferences.
         self.app_settings = SettingsService(settings_file(data_dir), default_scripts_dir(data_dir))
         self.workspace = WorkspaceService(workspace_file(data_dir))
