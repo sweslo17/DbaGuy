@@ -34,6 +34,9 @@ quit_app() {
 mkdir -p "$(dirname "$LOG")" && touch "$LOG"
 before=$(wc -l < "$LOG")
 start=$(now)
+# `open` starts the app through LaunchServices, which does not pass this shell's environment on: `--env` is the only way
+# to hand the app (and the sidecar, which inherits its environment) the temp DBAGUY_DATA_DIR. Without it the app would
+# use the real data dir and the real Keychain service. `-n` starts a new instance.
 open -n --env "DBAGUY_DATA_DIR=$DATA_DIR" "$APP"
 reached=0
 for _ in $(seq 1 1200); do
