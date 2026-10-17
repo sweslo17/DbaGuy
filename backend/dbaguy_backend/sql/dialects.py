@@ -1,29 +1,61 @@
 import re
 from dataclasses import dataclass
+from enum import StrEnum
 
 from ..domain.dialect import Dialect  # the key of every rule table in sql/; imported from here by the sql modules
+
+
+class BodyRule(StrEnum):
+    """Which statements hold a body whose inner `;` does not end the statement (see splitter)."""
+
+    BEGIN_ATOMIC = "begin_atomic"  # PostgreSQL: CREATE [OR REPLACE] FUNCTION|PROCEDURE … BEGIN ATOMIC … END
+    TRIGGER = "trigger"  # SQLite: CREATE [TEMP|TEMPORARY] TRIGGER … BEGIN … END
+    COMPOUND = "compound"  # MySQL: CREATE … PROCEDURE|FUNCTION|TRIGGER|EVENT … BEGIN … END, nested blocks
+
+
+class ClientCommand(StrEnum):
+    """A line the client consumes itself: the server never sees it."""
+
+    DELIMITER = "delimiter"  # MySQL: `DELIMITER $$` changes the statement terminator
 
 
 @dataclass(frozen=True)
 class LexRules:
     nested_block_comments: bool
-    line_comment_end: re.Pattern[str]  # ends a `--` comment: LF or CR (PostgreSQL), LF only (SQLite)
-    dollar_quotes: bool
-    escape_string_prefixes: frozenset[str]  # e.g. E'...' in PostgreSQL
+    line_comment_end: re.Pattern[str]  # ends a `--` or `#` comment
+    dash_comment_needs_space: bool  # MySQL: `--` starts a comment only before whitespace, a control char or the end
+    hash_comments: bool  # MySQL: `#` starts a line comment
+    executable_comments: bool  # MySQL: `/*! … */` and `/*+ … */` are code (EXEC_COMMENT), not comments
+    dollar_quotes: bool  # PostgreSQL $tag$…$tag$ strings
+    dollar_params: bool  # PostgreSQL $1 parameters
+    escape_string_prefixes: frozenset[str]  # PostgreSQL E'…': backslash escapes in that string only
+    backslash_escapes: bool  # MySQL (default sql_mode): backslash escapes in every string
+    string_quotes: frozenset[str]  # characters that open a string
     identifier_quotes: tuple[tuple[str, str], ...]  # (open, close)
-    block_bodies: frozenset[str]  # "begin_atomic" (PG SQL-standard bodies), "trigger" (SQLite trigger bodies)
+    variable_prefix: str  # starts a variable word (MySQL "@": @x, @@session.x); "" for none
+    body_rule: BodyRule
+    client_command: ClientCommand | None = None
 
 
 RULES: dict[Dialect, LexRules] = {
     Dialect.POSTGRES: LexRules(
-        nested_block_comments=True, line_comment_end=re.compile(r"[\n\r]"), dollar_quotes=True,
-        escape_string_prefixes=frozenset({"e", "E"}), identifier_quotes=(('"', '"'),),
-        block_bodies=frozenset({"begin_atomic"}),
+        nested_block_comments=True, line_comment_end=re.compile(r"[\n\r]"), dash_comment_needs_space=False,
+        hash_comments=False, executable_comments=False, dollar_quotes=True, dollar_params=True,
+        escape_string_prefixes=frozenset({"e", "E"}), backslash_escapes=False, string_quotes=frozenset("'"),
+        identifier_quotes=(('"', '"'),), variable_prefix="", body_rule=BodyRule.BEGIN_ATOMIC,
     ),
     Dialect.SQLITE: LexRules(
-        nested_block_comments=False, line_comment_end=re.compile(r"\n"), dollar_quotes=False,
-        escape_string_prefixes=frozenset(), identifier_quotes=(('"', '"'), ("[", "]"), ("`", "`")),
-        block_bodies=frozenset({"trigger"}),
+        nested_block_comments=False, line_comment_end=re.compile(r"\n"), dash_comment_needs_space=False,
+        hash_comments=False, executable_comments=False, dollar_quotes=False, dollar_params=False,
+        escape_string_prefixes=frozenset(), backslash_escapes=False, string_quotes=frozenset("'"),
+        identifier_quotes=(('"', '"'), ("[", "]"), ("`", "`")), variable_prefix="", body_rule=BodyRule.TRIGGER,
+    ),
+    Dialect.MYSQL: LexRules(
+        nested_block_comments=False, line_comment_end=re.compile(r"\n"), dash_comment_needs_space=True,
+        hash_comments=True, executable_comments=True, dollar_quotes=False, dollar_params=False,
+        escape_string_prefixes=frozenset(), backslash_escapes=True, string_quotes=frozenset("'\""),
+        identifier_quotes=(("`", "`"),), variable_prefix="@", body_rule=BodyRule.COMPOUND,
+        client_command=ClientCommand.DELIMITER,
     ),
 }
 

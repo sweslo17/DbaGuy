@@ -1,6 +1,6 @@
 import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-import { PostgreSQL, sql, SQLite, StandardSQL, type SQLDialect } from "@codemirror/lang-sql";
+import { MySQL, PostgreSQL, sql, SQLite, StandardSQL, type SQLDialect } from "@codemirror/lang-sql";
 import { bracketMatching, indentOnInput, indentUnit } from "@codemirror/language";
 import { highlightSelectionMatches, search, searchKeymap } from "@codemirror/search";
 import { Compartment, EditorState, Prec, type Extension, type StateEffect } from "@codemirror/state";
@@ -43,7 +43,7 @@ export function editorOptions(editor: EditorSettings, dialect: Dialect | null, r
   };
 }
 
-const SQL_DIALECTS: Record<Dialect, SQLDialect> = { postgres: PostgreSQL, sqlite: SQLite };
+const SQL_DIALECTS: Record<Dialect, SQLDialect> = { postgres: PostgreSQL, sqlite: SQLite, mysql: MySQL };
 
 /**
  * A part of the configuration that changes while the editor lives: it sits in its own compartment and is swapped

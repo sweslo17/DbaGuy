@@ -760,7 +760,7 @@ export interface components {
          * @description The SQL dialect of an engine: how its statements are split, classified, completed and quoted.
          * @enum {string}
          */
-        Dialect: "postgres" | "sqlite";
+        Dialect: "postgres" | "sqlite" | "mysql";
         /** DiscardCommand */
         DiscardCommand: {
             /**

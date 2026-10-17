@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from .dialects import RULES, Dialect
+from .dialects import RULES, BodyRule, Dialect
 from .lexer import INSIGNIFICANT, Token, TokenKind, tokenize
 
 _ROUTINES = frozenset({"FUNCTION", "PROCEDURE"})
@@ -27,8 +27,8 @@ class _BodyTracker:
     tokens of one statement.
     """
 
-    def __init__(self, kinds: frozenset[str]) -> None:
-        self._kinds = kinds
+    def __init__(self, rule: BodyRule) -> None:
+        self._rule = rule
         self.reset()
 
     def reset(self) -> None:
@@ -60,10 +60,10 @@ class _BodyTracker:
                 self.depth -= 1
 
     def _opens_body(self, word: str) -> bool:
-        if word == "ATOMIC" and "begin_atomic" in self._kinds:
+        if word == "ATOMIC" and self._rule is BodyRule.BEGIN_ATOMIC:
             after_begin = self._prev is not None and self._prev.kind == TokenKind.WORD and self._prev.upper == "BEGIN"
             return after_begin and self._creates_routine()
-        if word == "BEGIN" and "trigger" in self._kinds:
+        if word == "BEGIN" and self._rule is BodyRule.TRIGGER:
             return self._creates_trigger()
         return False
 
@@ -93,7 +93,7 @@ def _emit(
 
 
 def split(text: str, dialect: Dialect) -> list[StatementSpan]:
-    tracker = _BodyTracker(RULES[dialect].block_bodies)
+    tracker = _BodyTracker(RULES[dialect].body_rule)
     spans: list[StatementSpan] = []
     current: list[Token] = []
     for token in tokenize(text, dialect):

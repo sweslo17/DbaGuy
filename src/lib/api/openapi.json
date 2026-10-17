@@ -2664,7 +2664,8 @@
         "type": "string",
         "enum": [
           "postgres",
-          "sqlite"
+          "sqlite",
+          "mysql"
         ],
         "title": "Dialect",
         "description": "The SQL dialect of an engine: how its statements are split, classified, completed and quoted."

@@ -11,6 +11,7 @@ import logging
 import sqlglot
 from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect as SqlglotDialect
+from sqlglot.dialects.mysql import MySQL
 from sqlglot.dialects.postgres import Postgres
 from sqlglot.dialects.sqlite import SQLite
 from sqlglot.errors import ParseError, TokenError
@@ -22,7 +23,9 @@ from .dialects import Dialect
 # (CALL, LOCK, REPLACE INTO, ...) and would put statement text into the log above DEBUG.
 logging.getLogger("sqlglot").setLevel(logging.CRITICAL)
 
-SQLGLOT_DIALECT: dict[Dialect, type[SqlglotDialect]] = {Dialect.POSTGRES: Postgres, Dialect.SQLITE: SQLite}
+SQLGLOT_DIALECT: dict[Dialect, type[SqlglotDialect]] = {
+    Dialect.POSTGRES: Postgres, Dialect.SQLITE: SQLite, Dialect.MYSQL: MySQL,
+}
 # Text sqlglot does not understand (RecursionError: absurd nesting). Anything else is unexpected, e.g. a sqlglot bug.
 EXPECTED_FAILURES = (ParseError, TokenError, RecursionError)
 _DML = (exp.Insert, exp.Update, exp.Delete, exp.Merge)
