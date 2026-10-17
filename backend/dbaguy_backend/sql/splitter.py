@@ -1,11 +1,16 @@
+import re
 from dataclasses import dataclass
 
-from .dialects import RULES, BodyRule, Dialect
-from .lexer import INSIGNIFICANT, Token, TokenKind, tokenize
+from .dialects import RULES, BodyRule, ClientCommand, Dialect
+from .lexer import INSIGNIFICANT, Token, TokenKind, scan
 
 _ROUTINES = frozenset({"FUNCTION", "PROCEDURE"})
 _TEMPORARY = frozenset({"TEMP", "TEMPORARY"})
 _HEAD = 4  # CREATE OR REPLACE FUNCTION: the longest statement head the body rules read
+_COMPOUND_OBJECTS = frozenset({"PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"})
+_UNCOUNTED_BLOCKS = frozenset({"IF", "LOOP", "WHILE", "REPEAT"})  # their END … closes no counted block
+_PROGRAM_HEAD = 16  # significant tokens: CREATE OR REPLACE DEFINER = `u` @ `h` SQL SECURITY INVOKER PROCEDURE …
+_DELIMITER_ARGUMENT = re.compile(r"[ \t]+(\S+)[^\n]*")  # after the word DELIMITER: the terminator, then the line
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +86,66 @@ class _BodyTracker:
         return self._head_word(0) == "CREATE" and created == "TRIGGER"
 
 
+def _creates_stored_program(head: list[Token]) -> bool:
+    """CREATE [OR REPLACE] [DEFINER = account] [SQL SECURITY {DEFINER|INVOKER}] PROCEDURE|FUNCTION|TRIGGER|EVENT.
+    The account is user, 'user'@'host', `user`@`host`, user@host or CURRENT_USER[()], in any quoting."""
+    words = [t.upper if t.kind == TokenKind.WORD else "" for t in head]
+    if words[:1] != ["CREATE"]:
+        return False
+    i = 1
+    if words[i:i + 2] == ["OR", "REPLACE"]:
+        i += 2
+    if words[i:i + 1] == ["DEFINER"]:  # skip "=" and the account, up to the next keyword this grammar allows
+        i = next((j for j in range(i + 1, len(words)) if words[j] in _COMPOUND_OBJECTS or words[j] == "SQL"), len(words))
+    if words[i:i + 2] == ["SQL", "SECURITY"]:
+        i += 3
+    return i < len(words) and words[i] in _COMPOUND_OBJECTS
+
+
+class _CompoundTracker:
+    """MySQL stored-program bodies, nested blocks included.
+
+    BEGIN and CASE open a block and END closes one. `END IF|LOOP|WHILE|REPEAT` closes a block that was never counted
+    (IF() and REPEAT() are also functions), so the END before such a word is taken back. `END CASE` closes the CASE
+    that its END already closed. Labels (`lbl: BEGIN … END lbl`) need nothing special. Only the first BEGIN of a
+    stored program opens a body. A word right after a dot is a name, never a keyword (`NEW.begin`, `ev.end`), and
+    executable comments are skipped in the program's head (`CREATE /*!50003 DEFINER=… */ PROCEDURE`). A routine
+    without BEGIN … END whose statement uses an unqualified column named `begin`, or a body that uses one named `end`,
+    still merges with what follows; the server then rejects the merged text (multi-statements are off), so nothing
+    runs.
+    """
+
+    def __init__(self) -> None:
+        self.depth = 0
+        self.has_body = False
+        self._head: list[Token] = []
+        self._after_end = False
+        self._after_dot = False
+
+    def feed(self, token: Token) -> None:
+        if len(self._head) < _PROGRAM_HEAD and token.kind != TokenKind.EXEC_COMMENT:
+            self._head.append(token)
+        after_end, after_dot = self._after_end, self._after_dot
+        self._after_end, self._after_dot = False, token.kind == TokenKind.DOT
+        word = "" if after_dot or token.kind != TokenKind.WORD else token.upper
+        if after_end and word in _UNCOUNTED_BLOCKS:
+            self.depth += 1  # that END closed an IF/LOOP/WHILE/REPEAT, not a counted block
+        elif after_end and word == "CASE":
+            pass  # END CASE: its END already closed the CASE
+        elif self.depth == 0:
+            if word == "BEGIN" and _creates_stored_program(self._head):
+                self.depth, self.has_body = 1, True
+        elif word in ("BEGIN", "CASE"):
+            self.depth += 1
+        elif word == "END":
+            self.depth -= 1
+            self._after_end = True
+
+
+def _tracker(rule: BodyRule) -> _BodyTracker | _CompoundTracker:
+    return _CompoundTracker() if rule is BodyRule.COMPOUND else _BodyTracker(rule)
+
+
 def _emit(
     spans: list[StatementSpan], text: str, tokens: list[Token], terminator_end: int | None, has_body: bool
 ) -> None:
@@ -92,18 +157,43 @@ def _emit(
     spans.append(StatementSpan(start, end, terminator, text[start:end], has_body))
 
 
+def _delimiter_line(text: str, token: Token, current: list[Token]) -> re.Match[str] | None:
+    """A MySQL `DELIMITER x` line: the word DELIMITER is first on its line and no statement has started."""
+    if token.kind != TokenKind.WORD or token.upper != "DELIMITER":
+        return None
+    if any(t.kind not in INSIGNIFICANT for t in current):
+        return None
+    line_start = text.rfind("\n", 0, token.start) + 1
+    if text[line_start:token.start].strip(" \t"):
+        return None
+    return _DELIMITER_ARGUMENT.match(text, token.end)
+
+
 def split(text: str, dialect: Dialect) -> list[StatementSpan]:
-    tracker = _BodyTracker(RULES[dialect].body_rule)
+    rules = RULES[dialect]
+    commands = rules.client_command is ClientCommand.DELIMITER
     spans: list[StatementSpan] = []
-    current: list[Token] = []
-    for token in tokenize(text, dialect):
-        if token.kind == TokenKind.SEMI and tracker.depth == 0:
-            _emit(spans, text, current, token.end, tracker.has_body)
-            current = []
-            tracker.reset()
-            continue
-        current.append(token)
-        if token.kind not in INSIGNIFICANT:
-            tracker.feed(token)
-    _emit(spans, text, current, None, tracker.has_body)
-    return spans
+    delimiter: str | None = None  # set by a DELIMITER line; None: `;` ends statements (outside bodies)
+    start = 0
+    while True:
+        tracker = _tracker(rules.body_rule)
+        current: list[Token] = []
+        restart: int | None = None
+        for token in scan(text, dialect, start, delimiter):
+            if commands and (line := _delimiter_line(text, token, current)):
+                delimiter = None if line.group(1) == ";" else line.group(1)
+                restart = line.end()  # the line is consumed: it belongs to no statement and never reaches the server
+                break
+            if token.kind == TokenKind.DELIMITER or (
+                delimiter is None and token.kind == TokenKind.SEMI and tracker.depth == 0
+            ):
+                _emit(spans, text, current, token.end, tracker.has_body)
+                current, tracker = [], _tracker(rules.body_rule)
+                continue
+            current.append(token)
+            if token.kind not in INSIGNIFICANT:
+                tracker.feed(token)  # also under a custom delimiter: has_body tells the classifier about bodies
+        if restart is None:
+            _emit(spans, text, current, None, tracker.has_body)
+            return spans
+        start = restart

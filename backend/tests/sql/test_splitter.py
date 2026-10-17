@@ -1,7 +1,7 @@
 from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.splitter import split
 
-PG, LITE = Dialect.POSTGRES, Dialect.SQLITE
+PG, LITE, MY = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL
 
 
 def texts(sql, dialect=PG):
@@ -114,3 +114,128 @@ def test_sqlite_trigger_forms_and_a_case_in_the_when_clause():
     spans = split(f"{temp}; {when}; SELECT 1", LITE)
     assert [s.text for s in spans] == [temp, when, "SELECT 1"]
     assert [s.has_body for s in spans] == [True, True, False]
+
+
+def test_mysql_delimiter_lines_are_consumed_and_change_the_terminator():
+    sql = (
+        "DELIMITER $$\n"
+        "CREATE PROCEDURE p()\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND$$\n"
+        "DELIMITER ;\n"
+        "CALL p();\nSELECT 3"
+    )
+    spans = split(sql, MY)
+    assert [s.text for s in spans] == ["CREATE PROCEDURE p()\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND", "CALL p()", "SELECT 3"]
+    assert sql[spans[0].end:spans[0].terminator_end] == "$$"
+    assert spans[0].has_body and not spans[1].has_body
+    assert sql[spans[1].start:spans[1].terminator_end] == "CALL p();"
+
+
+def test_a_custom_delimiter_ends_statements_only_outside_literals_and_comments():
+    sql = "delimiter //\nSELECT 'a//b'; SELECT 2 /* // */ //\nSELECT 3 // -- the rest is a comment\nSELECT `x//y`//"
+    # a span ends at its last significant token: the trailing comment stays outside, as for `;`
+    assert texts(sql, MY) == ["SELECT 'a//b'; SELECT 2", "SELECT 3", "SELECT `x//y`"]
+
+
+def test_delimiter_is_a_command_only_first_on_its_line_at_a_statement_start():
+    assert texts("SELECT 1; DELIMITER $$\nSELECT 2", MY) == ["SELECT 1", "DELIMITER $$\nSELECT 2"]
+    assert texts("SELECT delimiter FROM t; SELECT 2", MY) == ["SELECT delimiter FROM t", "SELECT 2"]
+    assert texts("SELECT 1\nDELIMITER $$\n", MY) == ["SELECT 1\nDELIMITER $$"]  # inside a statement: SQL, not a command
+    assert texts("  -- setup\n  DELIMITER $$  -- comment\nSELECT 1$$", MY) == ["SELECT 1"]
+
+
+_PROC = (
+    "CREATE DEFINER=`root`@`%` PROCEDURE p(IN n INT)\n"
+    "lbl: BEGIN\n"
+    "  DECLARE i INT DEFAULT 0;\n"
+    "  WHILE i < n DO SET i = i + 1; END WHILE;\n"
+    "  IF i > 1 THEN SELECT 'x;y'; ELSEIF i = 1 THEN SELECT 1; ELSE SELECT 2; END IF;\n"
+    "  CASE i WHEN 1 THEN SELECT 1; ELSE BEGIN SELECT 2; END; END CASE;\n"
+    "  REPEAT SET i = i - 1; UNTIL i = 0 END REPEAT;\n"
+    "  inner_loop: LOOP LEAVE inner_loop; END LOOP inner_loop;\n"
+    "  SELECT CASE WHEN i = 0 THEN 'z' END;\n"
+    "END lbl"
+)
+
+
+def test_mysql_compound_bodies_keep_their_semicolons_without_delimiter():
+    spans = split(f"{_PROC};\nSELECT 9;", MY)
+    assert [s.text for s in spans] == [_PROC, "SELECT 9"]
+    assert spans[0].has_body
+
+
+def test_mysql_trigger_event_and_function_bodies():
+    trg = "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW BEGIN SET NEW.a = 1; SET NEW.b = 2; END"
+    ev = "CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO BEGIN DELETE FROM log; END"
+    fn = "CREATE FUNCTION f(x INT) RETURNS TEXT DETERMINISTIC BEGIN RETURN IF(x > 0, REPEAT('a', x), ''); END"
+    assert texts(f"{trg}; {ev}; {fn}; SELECT 1", MY) == [trg, ev, fn, "SELECT 1"]
+
+
+def test_mysql_nothing_else_opens_a_body():
+    assert texts("CREATE TABLE t (event INT, begin INT); DROP TABLE x", MY) == [
+        "CREATE TABLE t (event INT, begin INT)", "DROP TABLE x",
+    ]
+    assert texts("BEGIN; INSERT INTO t VALUES (1); COMMIT", MY) == ["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"]
+    trg = "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW SET NEW.begin = 1"  # a column named begin
+    assert texts(f"{trg}; DROP TABLE x", MY) == [trg, "DROP TABLE x"]
+    assert texts("CREATE PROCEDURE p() SELECT 1; DROP TABLE x", MY) == ["CREATE PROCEDURE p() SELECT 1", "DROP TABLE x"]
+
+
+def test_mysql_strings_and_comments_hide_semicolons():
+    sql = "SELECT 'x\\'; DROP TABLE t; -- ' AS a; SELECT \"q;\" # c; d\n, 2; SELECT 1--1; SELECT 3"
+    assert texts(sql, MY) == [
+        "SELECT 'x\\'; DROP TABLE t; -- ' AS a", "SELECT \"q;\" # c; d\n, 2", "SELECT 1--1", "SELECT 3",
+    ]
+    # PostgreSQL has no backslash escapes in plain strings: the same text splits where its server splits it
+    assert texts("SELECT 'x\\'; DROP TABLE t", PG) == ["SELECT 'x\\'", "DROP TABLE t"]
+
+
+def test_mysqldump_style_script_with_crlf():  # Review Focus 2
+    dump = (
+        "/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;\r\n"
+        "DELIMITER ;;\r\n"
+        "/*!50003 CREATE*/ /*!50017 DEFINER=`root`@`localhost`*/ /*!50003 TRIGGER trg BEFORE INSERT ON t FOR EACH ROW "
+        "BEGIN SET NEW.a = 1; END */;;\r\n"
+        "DELIMITER ;\r\n"
+        "INSERT INTO t VALUES (1);\r\n"
+    )
+    assert texts(dump, MY) == [
+        "/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */",
+        "/*!50003 CREATE*/ /*!50017 DEFINER=`root`@`localhost`*/ /*!50003 TRIGGER trg BEFORE INSERT ON t FOR EACH ROW "
+        "BEGIN SET NEW.a = 1; END */",
+        "INSERT INTO t VALUES (1)",
+    ]
+
+
+def test_offsets_under_a_custom_delimiter_with_cjk_and_emoji():
+    sql = "DELIMITER $$\nSELECT '中😀'$$\nDELIMITER ;\nSELECT 2;"
+    spans = split(sql, MY)
+    assert [sql[s.start:s.end] for s in spans] == ["SELECT '中😀'", "SELECT 2"]
+    assert sql[spans[0].end:spans[0].terminator_end] == "$$"
+
+
+def test_executable_comments_are_statements_in_mysql_only():
+    assert texts("/*!40101 SET NAMES utf8 */; SELECT 1", MY) == ["/*!40101 SET NAMES utf8 */", "SELECT 1"]
+    assert texts("/*! x */; SELECT 1", PG) == ["SELECT 1"]
+
+
+def test_mysql_executable_comments_in_a_stored_program_head_are_looked_past():
+    # mysqldump version-gates the DEFINER clause; the rest of the program is plain or inside a comment too
+    proc = "CREATE /*!50003 DEFINER=`u`@`h` */ PROCEDURE p() BEGIN SELECT 1; SELECT 2; END"
+    spans = split(f"{proc}; SELECT 3", MY)
+    assert [s.text for s in spans] == [proc, "SELECT 3"]
+    assert spans[0].has_body
+    both = (
+        "CREATE /*!50003 DEFINER=`u`@`h` */ /*!50003 SQL SECURITY INVOKER */ "
+        "FUNCTION f() RETURNS INT BEGIN RETURN 1; END"
+    )
+    assert texts(f"{both}; SELECT 3", MY) == [both, "SELECT 3"]
+    hidden = "CREATE /*!50003 DEFINER=`u`@`h` */ /*!50003 PROCEDURE p() BEGIN SELECT 1; SELECT 2; END */"
+    assert texts(f"{hidden}; SELECT 3", MY) == [hidden, "SELECT 3"]
+
+
+def test_mysql_a_word_after_a_dot_is_a_name_never_a_block_keyword():
+    trg = (
+        "CREATE TRIGGER trg BEFORE UPDATE ON ev FOR EACH ROW "
+        "BEGIN IF NEW.end < NEW.start THEN SET NEW.end = NEW.start; END IF; SELECT ev.end FROM ev; END"
+    )
+    assert texts(f"{trg}; SELECT 1", MY) == [trg, "SELECT 1"]
