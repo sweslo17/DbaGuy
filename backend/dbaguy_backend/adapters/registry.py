@@ -8,6 +8,7 @@ from ..domain.profiles import Engine, EngineInfo
 from .base import MALFORMED_URL_MESSAGE, DatabaseAdapter, ParsedUrl
 
 _JDBC_PREFIX = re.compile(r"^jdbc:", re.IGNORECASE)  # connection strings pasted from JDBC tools
+_SCHEME = re.compile(r"[a-z][a-z0-9+.-]{0,30}")
 
 
 class AdapterRegistry:
@@ -32,7 +33,10 @@ class AdapterRegistry:
         scheme = url.split(":", 1)[0].lower() if ":" in url else ""
         adapter = self._by_scheme.get(scheme)
         if adapter is None:
-            raise ValidationFailed(f"Unsupported URL scheme '{scheme}'")
+            # Echo the scheme only when it looks like one: a pasted key=value string would otherwise put its
+            # password into the message (and the "rejected" log line).
+            shown = f" '{scheme}'" if _SCHEME.fullmatch(scheme) else ""
+            raise ValidationFailed(f"Unsupported URL scheme{shown}")
         try:
             return adapter.parse_url(url)
         except ValidationError as exc:  # the parsed parts do not make a valid profile, e.g. a port outside 1-65535

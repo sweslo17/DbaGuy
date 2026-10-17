@@ -185,6 +185,9 @@ def test_every_connection_gets_its_own_conn_attrs():
     ("requireSSL=true", "require"),
     ("REQUIRE_SSL=True", "require"),
     ("useSSL=true", "require"),
+    ("useSSL=yes&verifyServerCertificate=yes", "verify-ca"),  # Connector/J booleans also take yes/no
+    ("requireSSL=YES", "require"),
+    ("useSSL=no", "disable"),
     ("useSSL=true&verifyServerCertificate=false", "require"),
     ("useSSL=false&requireSSL=true&verifyServerCertificate=true", "disable"),
     ("useSSL=false", "disable"),

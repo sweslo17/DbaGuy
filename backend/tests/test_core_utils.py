@@ -166,3 +166,19 @@ def test_a_password_in_a_malformed_url_is_not_echoed(url):
     with pytest.raises(ValidationFailed, match="Percent-encode") as info:
         default_registry().parse_url(url)
     assert "hunter2" not in info.value.message
+
+
+@pytest.mark.parametrize("pasted", [
+    "password=hunter2 host=h:5432",  # a libpq key=value string
+    "Password=hunter2;Server=tcp:h,1433",  # an ADO.NET connection string
+])
+def test_an_unsupported_paste_never_echoes_what_precedes_the_colon(pasted):
+    with pytest.raises(ValidationFailed) as error:
+        default_registry().parse_url(pasted)
+    assert "hunter2" not in str(error.value)
+    assert str(error.value) == "Unsupported URL scheme"
+
+
+def test_an_unsupported_scheme_that_looks_like_one_is_named():
+    with pytest.raises(ValidationFailed, match="Unsupported URL scheme 'redis'"):
+        default_registry().parse_url("redis://h")

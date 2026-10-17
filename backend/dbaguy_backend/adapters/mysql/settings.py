@@ -179,8 +179,11 @@ def _fold(key: str) -> str:
 _JDBC_SSL_FLAGS = frozenset({"usessl", "requiressl", "verifyservercertificate"})
 
 
+_FLAGS = {"true": True, "yes": True, "false": False, "no": False}
+
+
 def _flag(value: str) -> bool | None:
-    return {"true": True, "false": False}.get(value.strip().lower())
+    return _FLAGS.get(value.strip().lower())  # Connector/J's booleans also take yes/no
 
 
 def _jdbc_ssl_mode(flags: Mapping[str, bool]) -> SslMode | None:
