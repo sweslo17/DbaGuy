@@ -5,7 +5,7 @@ import type { ColumnMeta, Dialect, PathSegment } from "@/lib/api/types";
 export const RELATION_KINDS: ReadonlySet<string> = new Set(["table", "view", "materialized_view", "partition"]);
 
 export interface Relation {
-  /** The path's database segment (PostgreSQL); null when the engine has none (SQLite). */
+  /** The path's database segment (PostgreSQL); null when the engine has none (SQLite, MySQL: schemas are the root). */
   database: string | null;
   schema: string | null;
   name: string;

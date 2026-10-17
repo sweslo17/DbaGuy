@@ -1,10 +1,11 @@
 import { ChevronDown, ChevronRight, Loader2, RefreshCw, SquareTerminal } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import type { MenuItem } from "@/components/ui/ContextMenu";
 import { Tabs } from "@/components/ui/Tabs";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
+import type { ColumnMeta, Dialect } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { plural } from "@/lib/format";
 import { useWorkspace, type TableTabState } from "@/stores/workspace";
@@ -105,6 +106,47 @@ function SqlRow({ sql, onOpen }: { sql: string; onOpen: () => void }) {
   );
 }
 
+/**
+ * "Filter by this value" (spec §3.7): each activation asks the backend for its cell's condition. The newest activation
+ * applies every condition still pending (its own and those of the activations it superseded), in click order, onto the
+ * latest filter; a superseded activation's response is ignored, so overlapping clicks never drop a condition and never
+ * apply out of order.
+ */
+function useFilterByValue(filter: string, applyFilter: (text: string) => void) {
+  // The filter the next conditions go onto: the applied one, or the one just requested while its SELECT is being built
+  // (the applied filter changes only once that build is done). Synced on change only, so a re-render in between
+  // cannot put the older filter back.
+  const latestFilter = useRef(filter);
+  useLayoutEffect(() => {
+    latestFilter.current = filter;
+  }, [filter]);
+  const apply = useRef(applyFilter);
+  useLayoutEffect(() => {
+    apply.current = applyFilter;
+  });
+  const pending = useRef<Promise<string | null>[]>([]);
+  const activations = useRef(0);
+
+  return useCallback(async (dialect: Dialect, column: ColumnMeta, value: unknown) => {
+    const ticket = ++activations.current;
+    pending.current.push(valueCondition(dialect, column, value));
+    const outcomes = await Promise.allSettled(pending.current);
+    if (ticket !== activations.current) return; // superseded: the newer activation applies this condition too
+    pending.current = [];
+    let next = latestFilter.current;
+    let cut = false;
+    for (const outcome of outcomes) {
+      if (outcome.status === "rejected") toast("error", errorMessage(outcome.reason));
+      else if (outcome.value === null) cut = true;
+      else next = addCondition(next, outcome.value);
+    }
+    if (cut) toast("info", CUT_VALUE_MESSAGE);
+    if (next === latestFilter.current) return;
+    latestFilter.current = next;
+    apply.current(next);
+  }, []);
+}
+
 /** The Data view: filter, sort, count and the paged rows of the relation, on the tab's own session. */
 function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   const table = useTableData(tab, active);
@@ -126,6 +168,7 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   const columns = set?.columns;
   const rows = set?.rows;
   const firstPagePending = execution?.status === "running" && !current;
+  const filterByValue = useFilterByValue(state.filter, applyFilter);
   // An export runs on this session: filter, sort and refresh would only wait behind it.
   const exporting = isExporting(snapshot);
 
@@ -154,19 +197,10 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
       if (!column || !rows || row >= rows.length || !dialect || exporting) {
         return [{ label: FILTER_BY_VALUE, disabled: true }];
       }
-      // The backend builds the condition (quoting by dialect); null: the cell is cut, so nothing matches it exactly.
-      const filterByValue = async () => {
-        try {
-          const condition = await valueCondition(dialect, column, rows[row][col]);
-          if (condition === null) toast("info", CUT_VALUE_MESSAGE);
-          else applyFilter(addCondition(state.filter, condition));
-        } catch (error) {
-          toast("error", errorMessage(error));
-        }
-      };
-      return [{ label: FILTER_BY_VALUE, onSelect: () => void filterByValue() }];
+      const value = rows[row][col];
+      return [{ label: FILTER_BY_VALUE, onSelect: () => void filterByValue(dialect, column, value) }];
     },
-    [columns, rows, dialect, applyFilter, state.filter, exporting],
+    [columns, rows, dialect, exporting, filterByValue],
   );
   // Export writes the current browse SELECT (filter, sort and refresh wait while it runs).
   const exportSource = useMemo(

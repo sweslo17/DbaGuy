@@ -15,7 +15,7 @@ import { useNow } from "@/lib/useNow";
 import { useEngineInfo } from "../connections/hooks";
 import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
 import type { SessionController } from "../session/SessionController";
-import { EXPORT_CANCEL_ABORTS_TRANSACTION } from "../session/transactions";
+import { cancelAbortsTransaction, EXPORT_CANCEL_ABORTS_TRANSACTION } from "../session/transactions";
 import { COPY_FORMAT_LABELS } from "./copy";
 
 type TableName = { schema: string | null; name: string };
@@ -156,8 +156,7 @@ export function ExportDialog({
   const execution = useStore(controller.store, (s) => (running ? s.executions[running.requestId] : undefined));
   const connected = useStore(controller.store, (s) => s.phase === "open");
   const inTransaction = useStore(controller.store, (s) => !!s.state?.inTransaction && !s.state.transactionFailed);
-  // Unknown engine (still loading): assume the cancel aborts the transaction, so the warning errs on the safe side.
-  const cancelAbortsTransaction = inTransaction && (engine?.cancel_aborts_transaction ?? true);
+  const abortsTransaction = inTransaction && cancelAbortsTransaction(engine);
   const pathInput = useRef<HTMLInputElement>(null);
   const isOpen = useRef(open);
   useEffect(() => {
@@ -234,7 +233,7 @@ export function ExportDialog({
     controller.cancel(running.requestId);
     setCancelling(true);
   };
-  const askCancel = () => (cancelAbortsTransaction ? setConfirmCancel(true) : cancel());
+  const askCancel = () => (abortsTransaction ? setConfirmCancel(true) : cancel());
 
   /**
    * A running export keeps the dialog open (Escape and outside clicks do nothing, Cancel stops it) while the session is
@@ -256,7 +255,7 @@ export function ExportDialog({
   // Export keeps its slot (disabled while running), so a double click on it never lands on Cancel.
   const footer = (
     <>
-      {running && connected && cancelAbortsTransaction && (
+      {running && connected && abortsTransaction && (
         <span className="mr-auto self-center text-[12px] text-warning">{EXPORT_CANCEL_ABORTS_TRANSACTION}</span>
       )}
       {running && connected ? (
@@ -277,7 +276,7 @@ export function ExportDialog({
   return (
     <Dialog open={open} onOpenChange={changeOpen} title="Export result" width={520} footer={footer}>
       <ConfirmDialog
-        open={confirmCancel && cancelAbortsTransaction && !!running && connected}
+        open={confirmCancel && abortsTransaction && !!running && connected}
         onOpenChange={setConfirmCancel}
         title="Cancel the export?"
         message={`${EXPORT_CANCEL_ABORTS_TRANSACTION}: afterwards it can only be rolled back.`}
