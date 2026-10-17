@@ -9,6 +9,10 @@ _TEMPORARY = frozenset({"TEMP", "TEMPORARY"})
 _HEAD = 4  # CREATE OR REPLACE FUNCTION: the longest statement head the body rules read
 _COMPOUND_OBJECTS = frozenset({"PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"})
 _UNCOUNTED_BLOCKS = frozenset({"IF", "LOOP", "WHILE", "REPEAT"})  # their END … closes no counted block
+_BEGIN, _CASE_STATEMENT, _CASE_EXPRESSION = "BEGIN", "CASE statement", "CASE expression"  # the kinds of open block
+_BLOCK_ENDS = frozenset({";", "BEGIN"})  # an END right after one of these closes a block; elsewhere it is a name
+_STATEMENT_STARTS = frozenset({";", "BEGIN", "THEN", "ELSE", "DO", "LOOP", "REPEAT"})  # a statement begins after these
+_NAME_TOKENS = (TokenKind.WORD, TokenKind.QUOTED, TokenKind.STRING)  # a user or host name, in any quoting
 _PROGRAM_HEAD = 16  # significant tokens: CREATE OR REPLACE DEFINER = `u` @ `h` SQL SECURITY INVOKER PROCEDURE …
 _DELIMITER_ARGUMENT = re.compile(r"[ \t]+(\S+)[^\n]*")  # after the word DELIMITER: the terminator, then the line
 
@@ -86,60 +90,99 @@ class _BodyTracker:
         return self._head_word(0) == "CREATE" and created == "TRIGGER"
 
 
+def _after_account(head: list[Token], i: int) -> int:
+    """`head[i]` follows the word DEFINER: skips `= account`, the account being user, 'user'@'host', `user`@`host`,
+    user@host or CURRENT_USER[()], and returns the index after it. The lexer reads `@host` as one word, and a bare
+    `@` as a word of its own that a quoted host follows."""
+    if i >= len(head) or head[i].text != "=":
+        return i
+    i += 1
+    if i >= len(head) or head[i].kind not in _NAME_TOKENS:
+        return i
+    user, i = head[i], i + 1
+    if user.kind == TokenKind.WORD and user.upper == "CURRENT_USER":
+        return i + 2 if [t.kind for t in head[i:i + 2]] == [TokenKind.LPAREN, TokenKind.RPAREN] else i
+    if i < len(head) and head[i].kind == TokenKind.WORD and head[i].text.startswith("@"):
+        bare_at = head[i].text == "@"
+        i += 1
+        if bare_at and i < len(head) and head[i].kind in _NAME_TOKENS:
+            i += 1
+    return i
+
+
 def _creates_stored_program(head: list[Token]) -> bool:
-    """CREATE [OR REPLACE] [DEFINER = account] [SQL SECURITY {DEFINER|INVOKER}] PROCEDURE|FUNCTION|TRIGGER|EVENT.
-    The account is user, 'user'@'host', `user`@`host`, user@host or CURRENT_USER[()], in any quoting."""
+    """CREATE [OR REPLACE] [DEFINER = account] [SQL SECURITY {DEFINER|INVOKER}] PROCEDURE|FUNCTION|TRIGGER|EVENT."""
     words = [t.upper if t.kind == TokenKind.WORD else "" for t in head]
     if words[:1] != ["CREATE"]:
         return False
     i = 1
     if words[i:i + 2] == ["OR", "REPLACE"]:
         i += 2
-    if words[i:i + 1] == ["DEFINER"]:  # skip "=" and the account, up to the next keyword this grammar allows
-        i = next((j for j in range(i + 1, len(words)) if words[j] in _COMPOUND_OBJECTS or words[j] == "SQL"), len(words))
+    if words[i:i + 1] == ["DEFINER"]:
+        i = _after_account(head, i + 1)
     if words[i:i + 2] == ["SQL", "SECURITY"]:
         i += 3
     return i < len(words) and words[i] in _COMPOUND_OBJECTS
 
 
 class _CompoundTracker:
-    """MySQL stored-program bodies, nested blocks included.
+    """MySQL stored-program bodies, nested blocks included. Only CREATE PROCEDURE|FUNCTION|TRIGGER|EVENT opens one:
+    `ALTER EVENT … DO BEGIN … END` is not tracked and needs a DELIMITER line.
 
-    BEGIN and CASE open a block and END closes one. `END IF|LOOP|WHILE|REPEAT` closes a block that was never counted
-    (IF() and REPEAT() are also functions), so the END before such a word is taken back. `END CASE` closes the CASE
-    that its END already closed. Labels (`lbl: BEGIN … END lbl`) need nothing special. Only the first BEGIN of a
-    stored program opens a body. A word right after a dot is a name, never a keyword (`NEW.begin`, `ev.end`), and
-    executable comments are skipped in the program's head (`CREATE /*!50003 DEFINER=… */ PROCEDURE`). A routine
-    without BEGIN … END whose statement uses an unqualified column named `begin`, or a body that uses one named `end`,
-    still merges with what follows; the server then rejects the merged text (multi-statements are off), so nothing
-    runs.
+    A stack of the open blocks: BEGIN, CASE statement, CASE expression. The first BEGIN of a stored program opens its
+    body. A CASE is a statement where one can begin (after `;`, BEGIN, THEN, ELSE, DO, LOOP or REPEAT, and not inside
+    an expression) and an expression anywhere else. END closes a CASE expression, and a BEGIN or CASE statement only
+    right after `;` or an opening BEGIN (an empty block), the one place the grammar puts it. Anywhere else a bare
+    `end` is a column or variable name (`SELECT start, end FROM ev`) and closes nothing; inside a CASE expression it
+    closes the expression early and the real END then closes nothing, which balances. `END IF|LOOP|WHILE|REPEAT`
+    closes a block that was never counted (IF() and REPEAT() are also functions), so the block that END closed is put
+    back. `END CASE` closes the CASE that its END already closed. Labels (`lbl: BEGIN … END lbl`) need nothing
+    special. A word right after a dot is a name, never a keyword (`NEW.begin`, `ev.end`), and executable comments are
+    skipped in the program's head (`CREATE /*!50003 DEFINER=… */ PROCEDURE`).
+
+    Wrong guesses fail on the safe side. A name `begin` inside a body keeps a block open, so the statement merges with
+    what follows; the server then rejects the merged text (multi-statements are off), so nothing runs. So does a CASE
+    that opens right after a name `end` closed its enclosing CASE expression early (`CASE WHEN end THEN CASE …`). A
+    routine without BEGIN … END whose statement uses an unqualified column named `begin` merges the same way.
+
+    The remaining limit: a routine whose whole body is a bare control-flow statement without BEGIN
+    (`FOR EACH ROW IF … END IF`) is split at its inner `;` unless a DELIMITER line is used.
     """
 
     def __init__(self) -> None:
-        self.depth = 0
+        self._blocks: list[str] = []
         self.has_body = False
         self._head: list[Token] = []
-        self._after_end = False
+        self._after_end: str | None = None  # the kind of block the previous END closed
         self._after_dot = False
+        self._previous = ""  # the previous token: ";" for a semicolon, the upper-cased word for a word, else ""
+
+    @property
+    def depth(self) -> int:
+        return len(self._blocks)
 
     def feed(self, token: Token) -> None:
         if len(self._head) < _PROGRAM_HEAD and token.kind != TokenKind.EXEC_COMMENT:
             self._head.append(token)
-        after_end, after_dot = self._after_end, self._after_dot
-        self._after_end, self._after_dot = False, token.kind == TokenKind.DOT
+        closed, after_dot, previous = self._after_end, self._after_dot, self._previous
+        self._after_end, self._after_dot = None, token.kind == TokenKind.DOT
         word = "" if after_dot or token.kind != TokenKind.WORD else token.upper
-        if after_end and word in _UNCOUNTED_BLOCKS:
-            self.depth += 1  # that END closed an IF/LOOP/WHILE/REPEAT, not a counted block
-        elif after_end and word == "CASE":
+        self._previous = ";" if token.kind == TokenKind.SEMI else word
+        if closed and word in _UNCOUNTED_BLOCKS:
+            self._blocks.append(closed)  # that END closed an IF/LOOP/WHILE/REPEAT, not a counted block
+        elif closed and word == "CASE":
             pass  # END CASE: its END already closed the CASE
-        elif self.depth == 0:
+        elif not self._blocks:
             if word == "BEGIN" and _creates_stored_program(self._head):
-                self.depth, self.has_body = 1, True
-        elif word in ("BEGIN", "CASE"):
-            self.depth += 1
-        elif word == "END":
-            self.depth -= 1
-            self._after_end = True
+                self._blocks.append(_BEGIN)
+                self.has_body = True
+        elif word == "BEGIN":
+            self._blocks.append(_BEGIN)
+        elif word == "CASE":
+            statement = self._blocks[-1] != _CASE_EXPRESSION and previous in _STATEMENT_STARTS
+            self._blocks.append(_CASE_STATEMENT if statement else _CASE_EXPRESSION)
+        elif word == "END" and (self._blocks[-1] == _CASE_EXPRESSION or previous in _BLOCK_ENDS):
+            self._after_end = self._blocks.pop()
 
 
 def _tracker(rule: BodyRule) -> _BodyTracker | _CompoundTracker:

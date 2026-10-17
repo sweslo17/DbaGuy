@@ -18,7 +18,7 @@ from dbaguy_backend.sql.classifier import classify, warm_up
 from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.splitter import StatementSpan
 
-PG, LITE = Dialect.POSTGRES, Dialect.SQLITE
+PG, LITE, MY = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL
 
 
 @pytest.mark.parametrize(
@@ -235,3 +235,11 @@ def test_several_statements_sqlglot_finds_in_one_span_are_each_classified(monkey
     result = classify("SELECT 1; DROP TABLE t; UPDATE u SET a = 1", PG)
     assert (result.kind, result.dangerous_reasons) == (K.DDL, ["drop", "update_without_where"])
     assert classify("SELECT 1; LISTEN x", PG).kind == K.UNKNOWN  # a statement sqlglot cannot judge is not a read
+
+
+def test_a_single_statement_inside_delimiter_lines_is_classified_without_them():
+    routine = "DELIMITER $$\nCREATE PROCEDURE p()\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND$$\nDELIMITER ;"
+    assert classify(routine, MY).kind is K.DDL
+    wrapped = "DELIMITER $$\nDELETE FROM t$$\nDELIMITER ;"  # the danger of the statement is not lost to the wrapper
+    assert classify(wrapped, MY) == classify("DELETE FROM t", MY)
+    assert classify(wrapped, MY).dangerous_reasons == [DangerReason.DELETE_WITHOUT_WHERE]

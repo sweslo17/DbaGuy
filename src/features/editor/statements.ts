@@ -11,7 +11,10 @@ import type { Dialect } from "@/lib/api/types";
  * CodeMirror positions use.
  */
 
-/** UTF-16 offsets into the document: [from, to) is the statement, `terminatorEnd` is after its `;` (or `to`). */
+/**
+ * UTF-16 offsets into the document: [from, to) is the statement, `terminatorEnd` is after its `;` or custom
+ * delimiter (or `to`).
+ */
 export interface StatementRange {
   from: number;
   to: number;

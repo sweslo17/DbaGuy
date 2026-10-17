@@ -1,3 +1,5 @@
+import pytest
+
 from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.splitter import split
 
@@ -239,3 +241,99 @@ def test_mysql_a_word_after_a_dot_is_a_name_never_a_block_keyword():
         "BEGIN IF NEW.end < NEW.start THEN SET NEW.end = NEW.start; END IF; SELECT ev.end FROM ev; END"
     )
     assert texts(f"{trg}; SELECT 1", MY) == [trg, "SELECT 1"]
+
+
+def test_mysql_an_unqualified_end_inside_a_body_is_an_identifier():  # R-03a-T2: never a half statement
+    proc = "CREATE PROCEDURE p() BEGIN SELECT start, end FROM ev; DELETE FROM x; END"
+    spans = split(f"{proc}; SELECT 3", MY)
+    assert [s.text for s in spans] == [proc, "SELECT 3"]
+    assert spans[0].has_body
+    body = (
+        "CREATE PROCEDURE p() BEGIN SELECT end FROM ev; UPDATE ev SET end = 1 WHERE end > 2; SET @x = end; "
+        "SELECT IF(end, 1, 2), (end); DELETE FROM x; END"
+    )
+    assert texts(f"{body}; SELECT 3", MY) == [body, "SELECT 3"]
+
+
+def test_mysql_end_closes_a_block_only_after_a_semicolon_or_an_opening_begin():
+    empty = "CREATE PROCEDURE p() lbl: BEGIN BEGIN END; DELETE FROM x; BEGIN END; END lbl"
+    assert texts(f"{empty}; SELECT 3", MY) == [empty, "SELECT 3"]
+    # a CASE expression closes with a bare END, inside a body and next to an identifier named end
+    case = (
+        "CREATE PROCEDURE p() BEGIN SELECT CASE WHEN a THEN 1 ELSE CASE WHEN b THEN 2 END END AS c, end FROM ev; "
+        "DELETE FROM x; END"
+    )
+    assert texts(f"{case}; SELECT 3", MY) == [case, "SELECT 3"]
+    # IF / WHILE / LOOP / REPEAT inside a CASE statement and inside a BEGIN block: their END takes nothing with it
+    nested = (
+        "CREATE PROCEDURE p() BEGIN CASE i WHEN 1 THEN IF x THEN SELECT 1; END IF; WHILE y DO SELECT 2; END WHILE; "
+        "ELSE BEGIN IF z THEN SELECT 3; END IF; END; END CASE; DELETE FROM x; END"
+    )
+    assert texts(f"{nested}; SELECT 3", MY) == [nested, "SELECT 3"]
+
+
+@pytest.mark.parametrize(
+    "account",
+    [
+        "sql@localhost", "`sql`@`%`", "'sql'@'%'", "CURRENT_USER", "CURRENT_USER()", "procedure@h", "''@'%'",
+        "`u` @ `h`", "u@h",
+    ],
+)
+def test_mysql_definer_accounts_in_every_form(account):
+    proc = f"CREATE DEFINER={account} PROCEDURE p() BEGIN SELECT 1; SELECT 2; END"
+    spans = split(f"{proc}; SELECT 3", MY)
+    assert [s.text for s in spans] == [proc, "SELECT 3"]
+    assert spans[0].has_body
+
+
+def test_mysql_the_definer_skip_stops_at_the_end_of_the_account():
+    view = "CREATE DEFINER=u@h VIEW v AS SELECT event, begin FROM t"
+    spans = split(f"{view}; SELECT 2", MY)
+    assert [s.text for s in spans] == [view, "SELECT 2"]
+    assert not spans[0].has_body
+    secure = "CREATE DEFINER=`u`@`h` SQL SECURITY INVOKER VIEW v AS SELECT procedure_name, begin FROM t"
+    assert texts(f"{secure}; SELECT 2", MY) == [secure, "SELECT 2"]
+
+
+def test_mysql_delimiter_edge_lines():
+    # no argument: not a command, so the server gets (and rejects) it as it is
+    assert texts("DELIMITER\nSELECT 1; SELECT 2", MY) == ["DELIMITER\nSELECT 1", "SELECT 2"]
+    assert texts("DELIMITER  \nSELECT 1", MY) == ["DELIMITER  \nSELECT 1"]
+    # at the end of the text, with and without a line break
+    assert texts("SELECT 1;\nDELIMITER $$", MY) == ["SELECT 1"]
+    assert texts("SELECT 1;\nDELIMITER $$\n", MY) == ["SELECT 1"]
+    assert texts("DELIMITER $$\nSELECT 1$$\nDELIMITER ;", MY) == ["SELECT 1"]
+    # any letter case
+    assert texts("Delimiter $$\nSELECT 1; SELECT 2$$\nDELIMITER ;\nSELECT 3", MY) == ["SELECT 1; SELECT 2", "SELECT 3"]
+    assert texts("dElImItEr //\nSELECT 1//", MY) == ["SELECT 1"]
+
+
+def test_mysql_an_identifier_named_end_inside_a_case_never_closes_an_outer_block():
+    stmt_case = (  # a CASE statement: its branches hold statements, one of them reads a column named end
+        "CREATE PROCEDURE p() BEGIN CASE x WHEN 1 THEN SELECT end FROM ev; ELSE SELECT 2; END CASE; "
+        "DELETE FROM x; END"
+    )
+    expr_in_stmt = (
+        "CREATE PROCEDURE p() BEGIN CASE x WHEN 1 THEN SELECT CASE WHEN end THEN 1 END; END CASE; DELETE FROM x; END"
+    )
+    nested = (  # a CASE statement right after THEN and ELSE, in an IF
+        "CREATE PROCEDURE p() BEGIN IF a THEN CASE WHEN end THEN SELECT end; END CASE; "
+        "ELSE CASE b WHEN 1 THEN SET v = end; END CASE; END IF; DELETE FROM x; END"
+    )
+    in_expr = (
+        "CREATE PROCEDURE p() BEGIN SELECT CASE WHEN end THEN end ELSE 0 END; "
+        "SELECT CASE WHEN a THEN CASE WHEN b THEN end END ELSE end END; DELETE FROM x; END"
+    )
+    for proc in (stmt_case, expr_in_stmt, nested, in_expr):
+        assert texts(f"{proc}; SELECT 3", MY) == [proc, "SELECT 3"], proc
+
+
+def test_mysql_what_the_tracker_cannot_tell_apart_merges_and_never_splits_a_body():
+    # a name `begin` inside the body, and a CASE that opens after a name `end` closed its CASE expression: the
+    # statement keeps a block open and merges with what follows (the server rejects that), it is never cut inside
+    for proc in (
+        "CREATE PROCEDURE p() BEGIN SELECT begin FROM ev; DELETE FROM x; END",
+        "CREATE PROCEDURE p() BEGIN SELECT CASE WHEN end THEN CASE a WHEN 1 THEN 2 END END; DELETE FROM x; END",
+    ):
+        first = split(f"{proc}; SELECT 3", MY)[0]
+        assert first.end >= len(proc), proc

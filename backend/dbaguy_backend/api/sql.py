@@ -45,7 +45,7 @@ class SplitRequest(_Input):
 class StatementRange(BaseModel):
     start: int  # UTF-16
     end: int  # UTF-16, without the terminator
-    terminator_end: int  # UTF-16, after the `;` (or `end` when there is none)
+    terminator_end: int  # UTF-16, after the `;` or the custom delimiter (or `end` when there is none)
 
 
 class SplitResponse(BaseModel):

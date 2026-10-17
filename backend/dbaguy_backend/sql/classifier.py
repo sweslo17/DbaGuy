@@ -160,9 +160,11 @@ def classify(sql: str, dialect: Dialect) -> Classification:
     reasons), so a dangerous statement cannot hide behind a harmless first one.
     """
     spans = split(sql, dialect)
-    if len(spans) > 1:
-        return _combine([_classify_statement(span.text, dialect, span.has_body) for span in spans])
-    return _classify_statement(sql, dialect, has_body=bool(spans) and spans[0].has_body)
+    if not spans:
+        return _classify_statement(sql, dialect)
+    # The statement text, not the input: a MySQL `DELIMITER $$` line and its terminator are not part of the statement.
+    results = [_classify_statement(span.text, dialect, span.has_body) for span in spans]
+    return results[0] if len(results) == 1 else _combine(results)
 
 
 def warm_up() -> None:
