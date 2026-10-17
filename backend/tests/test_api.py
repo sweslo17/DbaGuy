@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 import pytest
 import uvicorn
 from fastapi.testclient import TestClient
+from loguru import logger
 from starlette.websockets import WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect
@@ -87,6 +88,18 @@ def test_import_url_and_validation(client):
 def test_import_url_with_a_malformed_authority_is_a_validation_error_not_a_500(client, url):
     response = client.post("/profiles/import-url", json={"url": url}, headers=AUTH)
     assert response.status_code == 422 and response.json()["error"]["code"] == "validation_failed"
+
+
+def test_import_url_never_echoes_the_password_of_a_malformed_url(client):
+    logged: list[str] = []
+    sink = logger.add(lambda message: logged.append(str(message)), level="DEBUG")
+    try:
+        response = client.post("/profiles/import-url", json={"url": "postgres://root:hunter2\uff20db:5432/app"}, headers=AUTH)
+    finally:
+        logger.remove(sink)
+    assert response.status_code == 422 and "Percent-encode" in response.json()["error"]["message"]
+    assert "hunter2" not in response.text
+    assert any("rejected" in line for line in logged) and "hunter2" not in "".join(logged)
 
 
 def test_engines(client):

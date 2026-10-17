@@ -143,14 +143,26 @@ def test_default_registry_reads_jdbc_urls():
     "jdbc:postgresql://h:abc/db",
 ])
 def test_default_registry_turns_a_malformed_url_into_a_validation_error(url):
-    with pytest.raises(ValidationFailed, match="Invalid connection URL"):
+    with pytest.raises(ValidationFailed, match="host or port part of the URL is malformed"):
         default_registry().parse_url(url)
 
 
-def test_registry_turns_a_rejected_draft_into_a_readable_validation_error():
+def test_registry_turns_a_rejected_draft_into_a_validation_error_that_names_only_the_field():
     class Rejecting(FakeAdapter):
         def parse_url(self, url):
-            return ParsedUrl(profile=ServerProfileDraft(engine="postgres", name="x", host="h", port=0))  # pydantic rejects
+            # pydantic rejects it, and its own text quotes the offending input
+            return ParsedUrl(profile=ServerProfileDraft(engine="postgres", name="x", host="h", database=["hunter2"]))
 
-    with pytest.raises(ValidationFailed, match=r"Invalid connection URL: port"):
-        AdapterRegistry([Rejecting()]).parse_url("fake://h:0")
+    with pytest.raises(ValidationFailed, match="invalid value for 'database'") as info:
+        AdapterRegistry([Rejecting()]).parse_url("fake://h")
+    assert "hunter2" not in info.value.message
+
+
+@pytest.mark.parametrize("url", [
+    "postgres://root:hunter2\uff20db.example.com:5432/app",  # a fullwidth "＠" typed by an IME
+    "postgres://root:hunter2/x@db.example.com/app",  # an unencoded "/" cuts the authority short
+])
+def test_a_password_in_a_malformed_url_is_not_echoed(url):
+    with pytest.raises(ValidationFailed, match="Percent-encode") as info:
+        default_registry().parse_url(url)
+    assert "hunter2" not in info.value.message

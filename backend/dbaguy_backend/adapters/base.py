@@ -30,6 +30,12 @@ class ParsedUrl:
     password: str | None = None
 
 
+# Fixed on purpose, never urllib's own text: that quotes the authority, which holds the password (a fullwidth "＠"
+# typed by an IME is enough), and the message reaches the API response and the log.
+URL_ENCODING_HINT = "Percent-encode special characters in the user name and password."
+MALFORMED_URL_MESSAGE = f"The host or port part of the URL is malformed. {URL_ENCODING_HINT}"
+
+
 class StatementError(Exception):
     """A statement failed. Adapters translate driver errors into this."""
 
