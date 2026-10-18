@@ -380,7 +380,7 @@ def test_a_statement_without_columns_cannot_be_exported_and_its_result_is_closed
     worker, conn, rec = make_worker(check=reads)
     result = FakeResult(0)
     result.columns = lambda: None
-    conn.run = lambda sql: result
+    conn.run = lambda sql, options=None: result
     export(worker, rec, "x", "anything", tmp_path / "n.csv")
     assert rec.of("x", "error")[0].code == "export_requires_select" and result.closed
     assert list(tmp_path.iterdir()) == []
@@ -444,7 +444,7 @@ class EndlessResult(FakeResult):
 
 def test_closing_the_session_stops_a_running_export(make_worker, tmp_path):
     worker, conn, rec = make_worker(check=reads)
-    conn.run = lambda sql: EndlessResult()
+    conn.run = lambda sql, options=None: EndlessResult()
     worker.submit(ExportCommand(request_id="x", sql="endless", format=FormatKind.CSV, path=str(tmp_path / "n.csv")))
     rec.wait_for(lambda e: e.type == "progress" and e.request_id == "x")
     started = time.monotonic()

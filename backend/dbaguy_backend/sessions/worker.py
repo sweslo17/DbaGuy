@@ -1,10 +1,11 @@
+import itertools
 import queue
 import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -15,7 +16,10 @@ from pydantic import BaseModel
 
 from ..adapters.base import (
     FAILED_COMMIT_MESSAGE,
+    AdapterCapabilities,
     DatabaseConnection,
+    RawJsonRows,
+    RunOptions,
     StatementCancelled,
     StatementError,
     StatementResult,
@@ -38,6 +42,7 @@ from ..domain.execution import (
     MessageEvent,
     MessageSeverity,
     ProgressEvent,
+    QueryContext,
     ResultSetEndEvent,
     ResultSetEvent,
     RollbackCommand,
@@ -46,12 +51,21 @@ from ..domain.execution import (
     SessionStateEvent,
     SetAutocommitCommand,
     StartedEvent,
+    StatementParams,
 )
 from ..domain.formats import FormatColumn, FormatKind
 from ..services.safety import GuardAction, GuardDecision
 from ..sql.dialects import Dialect
-from ..sql.formatting import open_writer
+from ..sql.formatting import (
+    RAW_JSON_FORMATS,
+    RawJsonWriter,
+    RowWriter,
+    open_raw_json_writer,
+    open_writer,
+    unsupported_reason,
+)
 from ..storage.atomic_file import atomic_text_file
+from .options import run_options
 from .session_state import SessionStateTracker
 
 T = TypeVar("T")
@@ -63,6 +77,17 @@ _STOP = object()
 _EXPORT_CHUNK = 1000  # rows fetched, written and checked for a cancel at a time
 _PROGRESS_EVERY = 10_000  # an export reports its row count each time it passes a multiple of this
 _EXPORT_SELECT_ONLY = "Only a statement that returns rows (SELECT, WITH, VALUES…) can be exported"
+
+
+def paused_result_closed_text(limit_s: float) -> str:
+    """The warning a paused result gets when the worker closes it for idling past the engine's limit."""
+    return (f"Closed this result after {limit_s / 60:g} min without loading more rows, to free the query node — "
+            "run the statement again to load more")
+
+
+def _param_names(params: StatementParams) -> str:
+    """`$name, $1, …`: what the log may say about parameters (never their values, spec §5)."""
+    return ", ".join([*(f"${n}" for n in params.named), *(f"${i}" for i in range(1, len(params.positional) + 1))])
 
 
 def _discard_event(_: BaseModel) -> None:
@@ -80,6 +105,7 @@ class ExecutionRecord:
     rows: int  # rows sent plus affected rows
     status: Literal["ok", "error", "cancelled", "timeout"]
     error: str | None = None
+    query_context: QueryContext | None = None  # the request's own (engines with `capabilities.query_context`)
 
 
 def _read_only_message(kind: StatementKind) -> str:
@@ -112,6 +138,7 @@ class WorkerHooks:
     check: Callable[[str, bool], GuardDecision] = _run_everything  # (sql, confirmed)
     on_record: Callable[[ExecutionRecord], None] = _ignore
     on_schema_change: Callable[[], None] = _ignore
+    capabilities: AdapterCapabilities = AdapterCapabilities()  # which run() options the engine takes; idle limits
 
 
 @dataclass
@@ -130,9 +157,19 @@ class _Request:
     first_page_ms: int | None = None  # set at the first pause
     timer_armed: bool = False  # guarded by the worker's _state_lock
     timed_out: bool = False
+    query_context: QueryContext | None = None  # what run() received, for the history
 
     def elapsed_ms(self) -> int:
         return int((time.monotonic() - self.started) * 1000)
+
+
+@dataclass(frozen=True)
+class _PausedMark:
+    """One pause of the open result: the idle close acts only while the mark it saw is still the current one."""
+
+    token: int  # tells two pauses of the same request apart
+    request_id: str
+    since: float  # the worker's clock when the pause began
 
 
 @dataclass
@@ -153,17 +190,18 @@ class SessionWorker:
     """Owns one connection and one thread; every driver call happens on that thread.
 
     Locking: `_queue_lock` guards `_closed` and every enqueue, so nothing can land behind the stop marker.
-    `_state_lock` guards `_running_request`, `_cancel_requested`, `_queued` and `_Request.timer_armed`; it is held
-    across `connection.cancel()`, so a cancel can never hit a statement other than the one it was meant for (the
-    worker changes the running request under it). `_tracker` has its own leaf lock for the session state that other
+    `_state_lock` guards `_running_request`, `_cancel_requested`, `_queued`, `_paused` and `_Request.timer_armed`; it
+    is held across `connection.cancel()`, so a cancel can never hit a statement other than the one it was meant for
+    (the worker changes the running request under it). `_tracker` has its own leaf lock for the session state that other
     threads read; `_state_send_lock` keeps a replayed state from overtaking a newer one.
 
     Every request ends with exactly one `finished`, and a `session_state` immediately before it.
     """
 
-    def __init__(self, name: str, opener: Callable[[], Any]) -> None:
+    def __init__(self, name: str, opener: Callable[[], Any], clock: Callable[[], float] = time.monotonic) -> None:
         self.name = name
         self._opener = opener
+        self._clock = clock  # measures how long a result has been paused
         self._queue: queue.Queue = queue.Queue()
         self._thread = threading.Thread(target=self._run, name=f"session-{name}", daemon=True)
         self._lease: Any = None
@@ -181,6 +219,9 @@ class SessionWorker:
         self._cancels = 0  # Cancels (and a timeout) that reached the running request: a Cancel after one forces
         self._queued: dict[str, bool] = {}  # requests waiting in the queue -> cancelled before they started
         self._open_exec: _OpenExecution | None = None
+        # The open result is paused waiting for Load more since then (set by _pause, cleared when it resumes or ends)
+        self._paused: _PausedMark | None = None
+        self._pause_tokens = itertools.count(1)  # worker thread only
         self._closed = False
         self._hooks = WorkerHooks()
         self._tracker = SessionStateTracker()
@@ -290,6 +331,22 @@ class SessionWorker:
                 self._put(lambda: self._idle_rollback(idle.token, rollback_after_s))
             except SessionBusy:
                 pass  # closing: closing the connection ends the transaction anyway
+
+    def check_paused_result(self) -> None:
+        """Close the paused result once it has waited for Load more longer than the engine allows (capability
+        `paused_result_max_idle_s`; Couchbase: a paused request holds a query servicer, R-04-6). Any thread; the close
+        itself runs on the worker thread, and only if the result is still in the same pause by then."""
+        limit = self._hooks.capabilities.paused_result_max_idle_s
+        if limit is None:
+            return
+        with self._state_lock:
+            mark = self._paused
+        if mark is None or self._clock() - mark.since < limit:
+            return
+        try:
+            self._put(lambda: self._close_idle_paused(mark, limit))
+        except SessionBusy:
+            pass  # closing: the worker finishes the open result itself
 
     def close(self) -> None:
         if not self._begin_close():
@@ -410,8 +467,15 @@ class SessionWorker:
             self._running_request = request_id
             self._cancel_requested = False
             self._cancels = 0
+            if request_id is not None:  # a Load more ends the idle stretch; `_set_running(None)` after a pause must not
+                self._paused = None
             self._tracker.activity(busy=request_id is not None)
         return cancel_requested
+
+    def _clear_paused(self) -> None:
+        """The open result ends or resumes: it is not waiting for Load more any more."""
+        with self._state_lock:
+            self._paused = None
 
     def _take_cancel_request(self) -> bool:
         """Whether a cancel reached the running request since it started (clears it)."""
@@ -430,6 +494,7 @@ class SessionWorker:
             self._running_request = request_id
             self._cancel_requested = False
             self._cancels = 0
+            self._paused = None  # the result a new request replaces has already been finished (_discard_open)
             self._tracker.activity(busy=True)
         return None
 
@@ -455,14 +520,17 @@ class SessionWorker:
             return
         try:
             _check_text(cmd.sql)
+            options = run_options(cmd, self._hooks.capabilities)  # before the policy: a refused request never asks
             if not self._passes_policy(req, cmd.confirmed):
                 return
             self._raise_if_cancelled()  # cancelled during the policy check: the driver had nothing to interrupt
-            logger.debug("[{}] execute {}: {}", self.name, cmd.request_id, cmd.sql[:2000])
+            self._log_statement("execute", cmd.request_id, cmd.sql, options)
             req.ran = True
+            req.query_context = options.query_context
+            options = replace(options, retry_safe=req.kind == StatementKind.READ)  # D-04-14: only a read is resent
             with self._timeout(req):
                 self._listen(req.request_id)
-                result = self.connection.run(cmd.sql)
+                result = self.connection.run(cmd.sql, options)
                 self._open_exec = _OpenExecution(req=req, result=result)
                 self._pump(self._open_exec, cmd.page_size)
         except StatementError as exc:
@@ -472,6 +540,12 @@ class SessionWorker:
             self._fail(req, StatementError(f"Internal error: {exc}"))
         finally:
             self._set_running(None)
+
+    def _log_statement(self, what: str, request_id: str, sql: str, options: RunOptions) -> None:
+        """The SQL text and the parameter names, at DEBUG; never parameter values (spec §5)."""
+        logger.debug("[{}] {} {}: {}", self.name, what, request_id, sql[:2000])
+        if options.params is not None:
+            logger.debug("[{}] {} parameters: {}", self.name, request_id, _param_names(options.params))
 
     def _decide(self, req: _Request, confirmed: bool) -> GuardDecision:
         decision = self._hooks.check(req.sql, confirmed)
@@ -551,6 +625,8 @@ class SessionWorker:
         if self._set_running(None):
             self._discard(ex.request_id, cancelled=True)
             return
+        with self._state_lock:  # before any event: the idle check may start counting now
+            self._paused = _PausedMark(next(self._pause_tokens), ex.request_id, self._clock())
         # In manual-commit mode the statement opened a transaction that a paused result keeps open: report it now,
         # not only at `finished`, so the client and the idle check see it.
         self._refresh_state(began_at=ex.req.started_at)
@@ -589,7 +665,9 @@ class SessionWorker:
                     self._send(AffectedEvent(request_id=ex.request_id, index=ex.index, rows=affected))
             else:
                 if not ex.columns_sent:
-                    self._send(ResultSetEvent(request_id=ex.request_id, index=ex.index, columns=columns))
+                    self._send(ResultSetEvent(
+                        request_id=ex.request_id, index=ex.index, columns=columns, presentation=result.presentation(),
+                    ))
                     ex.columns_sent = True
                 while budget > 0:
                     want = min(budget, _CHUNK)
@@ -628,12 +706,13 @@ class SessionWorker:
             return
         try:
             _check_text(cmd.sql)
+            options = replace(run_options(cmd, self._hooks.capabilities), retry_safe=True)  # an export is always a read
             target = self._check_export(cmd, req)
             self._raise_if_cancelled()  # cancelled during the checks: the driver had nothing to interrupt
             logger.info("[{}] export {} as {} to {}", self.name, cmd.request_id, cmd.format, target)
-            logger.debug("[{}] export {}: {}", self.name, cmd.request_id, cmd.sql[:2000])
+            self._log_statement("export", cmd.request_id, cmd.sql, options)
             req.ran = True
-            written = self._write_export(cmd, target, req)
+            written = self._write_export(cmd, target, req, options)
         except StatementError as exc:
             self._fail_export(req, cmd, exc)
         except OSError as exc:
@@ -659,6 +738,8 @@ class SessionWorker:
 
     def _check_export(self, cmd: ExportCommand, req: _Request) -> Path:
         """Reject what an export cannot do, before anything runs or is written. Returns the file to write."""
+        if (reason := unsupported_reason(cmd.format, self._hooks.dialect)) is not None:  # e.g. SQL++ INSERT
+            raise StatementError(reason, code="unsupported_format")
         if cmd.format == FormatKind.IN_LIST:
             raise StatementError("An IN list cannot be exported; copy it from the grid", code="unsupported_format")
         target = Path(cmd.path).expanduser()
@@ -670,26 +751,33 @@ class SessionWorker:
             raise StatementError(_EXPORT_SELECT_ONLY, code="export_requires_select")
         return target
 
-    def _write_export(self, cmd: ExportCommand, target: Path, req: _Request) -> int:
+    def _write_export(self, cmd: ExportCommand, target: Path, req: _Request, options: RunOptions) -> int:
         """Run the statement and write its whole result, raw values, into `target`. Returns the rows written.
 
         A failed or cancelled export removes its partial file instead of finishing the document, so the writer's
         `close()` runs only when every row is in.
         """
         self._listen(req.request_id)
-        result = self.connection.run(cmd.sql)
+        result = self.connection.run(cmd.sql, options)
         try:
             columns = result.columns()
             if columns is None:
                 raise StatementError(_EXPORT_SELECT_ONLY, code="export_requires_select")
             written = 0
             with atomic_text_file(target) as fp:
-                writer = open_writer(
-                    cmd.format, fp, [FormatColumn(name=c.name, category=c.category) for c in columns],
-                    cmd.options, self._hooks.dialect,
-                )
+                writer: RowWriter | RawJsonWriter
+                fetch: Callable[[int], list[Any]]
+                if isinstance(result, RawJsonRows) and cmd.format in RAW_JSON_FORMATS:
+                    # Couchbase JSON / JSONL: the server's row text, never re-encoded (R-04-15)
+                    writer, fetch = open_raw_json_writer(cmd.format, fp), result.fetch_raw
+                else:
+                    writer = open_writer(
+                        cmd.format, fp, [FormatColumn(name=c.name, category=c.category) for c in columns],
+                        cmd.options, self._hooks.dialect,
+                    )
+                    fetch = result.fetch
                 while True:
-                    rows = result.fetch(_EXPORT_CHUNK)
+                    rows = fetch(_EXPORT_CHUNK)
                     self._raise_if_cancelled()
                     if not rows:
                         break
@@ -775,6 +863,19 @@ class SessionWorker:
             text=f"Rolled back the transaction after {after_s / 60:g} min idle",
         ))
 
+    def _close_idle_paused(self, mark: _PausedMark, limit_s: float) -> None:
+        with self._state_lock:
+            still = self._paused == mark
+        execution = self._open_exec
+        if self._closed or not still or execution is None or execution.request_id != mark.request_id:
+            return  # a Load more, a new statement, a discard or closing came first: the result is not idle any more
+        logger.info("[{}] closed paused result {} after {:.0f} s without Load more (limit {:g} s)", self.name,
+                    mark.request_id, self._clock() - mark.since, limit_s)
+        self._send(MessageEvent(
+            request_id=mark.request_id, severity=MessageSeverity.WARNING, text=paused_result_closed_text(limit_s),
+        ))
+        self._finish(execution)
+
     @staticmethod
     def _cancel_text(req: _Request, default: str) -> str:
         return f"Timed out after {req.timeout_s:g} s" if req.timed_out else default
@@ -830,7 +931,7 @@ class SessionWorker:
             self._notify("history", self._hooks.on_record, ExecutionRecord(
                 request_id=req.request_id, sql=req.sql, started_at=req.started_at,
                 elapsed_ms=req.first_page_ms if req.first_page_ms is not None else req.elapsed_ms(),
-                rows=req.rows, status=status, error=error.message if error else None,
+                rows=req.rows, status=status, error=error.message if error else None, query_context=req.query_context,
             ))
         ddl_done = error is None and not cancelled and req.kind == StatementKind.DDL
         self._send_finished(
@@ -845,12 +946,14 @@ class SessionWorker:
             logger.warning("Error closing result on {}: {}", self.name, exc)
 
     def _finish(self, ex: _OpenExecution, cancelled: bool = False) -> None:
+        self._clear_paused()
         self._set_running(None)  # before `finished` goes out: from then on a cancel must not reach the connection
         self._open_exec = None
         self._close_result(ex.result)
         self._complete(ex.req, cancelled=cancelled)
 
     def _fail(self, req: _Request, exc: StatementError) -> None:
+        self._clear_paused()
         self._set_running(None)
         if self._open_exec is not None:
             self._close_result(self._open_exec.result)

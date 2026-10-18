@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+from dbaguy_backend.adapters.base import AdapterCapabilities, RawJsonRows, RunOptions
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager, write_askpass_script
@@ -16,7 +17,9 @@ from dbaguy_backend.domain.execution import (
     ExportCommand,
     FetchMoreCommand,
     MessageSeverity,
+    QueryContext,
     ServerMessage,
+    StatementParams,
 )
 from dbaguy_backend.domain.formats import FormatKind
 from dbaguy_backend.domain.profiles import ProfileUpsertRequest
@@ -25,10 +28,11 @@ from dbaguy_backend.services.profile_service import ProfileService
 from dbaguy_backend.services.safety import GuardAction, GuardDecision
 from dbaguy_backend.sessions.manager import SessionCreateRequest, SessionManager
 from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks
+from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.storage.paths import profiles_file
 from dbaguy_backend.storage.profile_store import ProfileStore
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
-from tests.fake_db import FakeConnection, FakeLease
+from tests.fake_db import FakeConnection, FakeLease, FakeResult
 from tests.fake_ssh import run_in_thread, wait_until
 from tests.test_sessions import Recorder, finished, paused
 
@@ -433,3 +437,262 @@ def test_an_export_routes_live_messages_to_its_own_request(messaging_worker, tmp
     texts = [e.text for e in rec.of("e", "message")]
     assert texts[0] == "before rows 4" and texts[-1].startswith("Exported 4 rows")
     assert conn.listener is None and len(conn.listeners) == 2
+
+
+# ---- 7. per-request options, presentation, idle close of paused results, raw JSON export (04a) ----
+
+CONTEXT = QueryContext(bucket="dbaguy", scope="app")
+
+
+def _policy(sql, confirmed):  # `rows …` reads; anything else writes
+    kind = StatementKind.READ if sql.startswith("rows") else StatementKind.WRITE
+    return GuardDecision(action=GuardAction.RUN, classification=Classification(kind=kind))
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def make_worker(connection=None, clock=None, recorder=None, **capabilities):
+    lease = FakeLease(connection)
+    worker = SessionWorker("fake", lambda: lease, clock=clock or Clock())
+    worker.start()
+    worker.configure(WorkerHooks(check=_policy, capabilities=AdapterCapabilities(**capabilities)))
+    recorder = recorder or Recorder()
+    worker.set_emitter(recorder)
+    return worker, lease.connection, recorder
+
+
+def test_unsupported_options_never_reach_the_connection():
+    worker, conn, rec = make_worker()
+    try:
+        worker.submit(ExecuteCommand(request_id="c", sql="rows 1", query_context=CONTEXT))
+        rec.wait_for(finished("c"))
+        assert rec.of("c", "error")[0].code == "unsupported_option" and conn.runs == []
+    finally:
+        worker.close()
+
+
+def test_options_and_retry_safety_reach_run():
+    worker, conn, rec = make_worker(query_context=True, parameters=True)
+    try:
+        params = StatementParams(named={"n": "1"})
+        worker.submit(ExecuteCommand(request_id="r", sql="rows 1", query_context=CONTEXT, params=params))
+        rec.wait_for(finished("r"))
+        worker.submit(ExecuteCommand(request_id="w", sql="begin"))
+        rec.wait_for(finished("w"))
+        assert conn.options == [RunOptions(query_context=CONTEXT, params=params, retry_safe=True), RunOptions()]
+        worker.submit(ExecuteCommand(request_id="bad", sql="rows 1", params=StatementParams(positional=["x"])))
+        rec.wait_for(finished("bad"))
+        assert rec.of("bad", "error")[0].code == "invalid_params" and len(conn.runs) == 2
+    finally:
+        worker.close()
+
+
+class PlanConnection(FakeConnection):
+    def run(self, sql, options=None):
+        result = super().run(sql, options)
+        result.presentation = lambda: "plan"
+        return result
+
+
+def test_presentation_reaches_the_result_set_event():
+    worker, _, rec = make_worker(PlanConnection())
+    try:
+        execute(worker, "x", "rows 1")
+        rec.wait_for(finished("x"))
+        assert rec.of("x", "result_set")[0].presentation == "plan"
+    finally:
+        worker.close()
+
+
+def test_the_history_record_carries_the_requests_query_context():  # P37: `_complete` fills ExecutionRecord.query_context
+    worker, _, rec = make_worker(query_context=True)
+    records = []
+    worker.configure(WorkerHooks(check=_policy, capabilities=AdapterCapabilities(query_context=True),
+                                 on_record=records.append))
+    try:
+        worker.submit(ExecuteCommand(request_id="h", sql="rows 1", query_context=CONTEXT))
+        rec.wait_for(finished("h"))
+        worker.submit(ExecuteCommand(request_id="n", sql="rows 1"))  # no context: the record says so
+        rec.wait_for(finished("n"))
+        assert [r.query_context for r in records] == [CONTEXT, None]
+    finally:
+        worker.close()
+
+
+CLOSED = ("Closed this result after 2 min without loading more rows, to free the query node — run the statement again "
+          "to load more")
+
+
+def test_an_idle_paused_result_is_closed_after_the_limit():
+    clock = Clock()
+    worker, _, rec = make_worker(clock=clock, paused_result_max_idle_s=120.0)
+    try:
+        execute(worker, "p", "rows 1200")
+        rec.wait_for(paused("p", 500))
+        clock.now += 119
+        worker.check_paused_result()  # below the limit it queues nothing, so this is already settled
+        assert not rec.of("p", "finished")
+        clock.now += 2
+        worker.check_paused_result()
+        rec.wait_for(finished("p"))
+        assert rec.of("p", "message")[-1].text == CLOSED  # loaded rows stay; the client marks the set partial
+        worker.submit(FetchMoreCommand(request_id="p"))
+        rec.wait_for(lambda e: e.type == "error" and e.code == "no_open_result")
+    finally:
+        worker.close()
+
+
+def test_engines_without_a_limit_keep_paused_results():
+    clock = Clock()
+    worker, _, rec = make_worker(clock=clock)
+    try:
+        execute(worker, "p", "rows 1200")
+        rec.wait_for(paused("p", 500))
+        clock.now += 10_000
+        worker.check_paused_result()
+        worker.submit(FetchMoreCommand(request_id="p"))
+        rec.wait_for(paused("p", 1000))
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("fetch_first", [True, False])
+def test_idle_close_and_fetch_more_race_either_way(fetch_first):  # Review Focus 3
+    clock = Clock()
+    rec = HoldingRecorder(lambda e: e.type == "result_set_end" and e.has_more)
+    worker, _, _ = make_worker(clock=clock, recorder=rec, paused_result_max_idle_s=120.0)
+    try:
+        execute(worker, "p", "rows 900")
+        assert rec.holding.wait(5)  # the worker thread is inside the pause; its mark is set
+        clock.now += 121
+        if fetch_first:
+            worker.submit(FetchMoreCommand(request_id="p"))
+            worker.check_paused_result()
+        else:
+            worker.check_paused_result()
+            worker.submit(FetchMoreCommand(request_id="p"))
+        rec.proceed.set()
+        worker.call(lambda c: None)  # a barrier: both queued tasks have run
+        texts = [e.text for e in rec.of("p", "message")]
+        if fetch_first:  # the Load more won: every row arrived and the close found nothing to do
+            assert sum(len(e.rows) for e in rec.of("p", "rows")) == 900 and CLOSED not in texts
+            assert len(rec.of("p", "finished")) == 1
+        else:  # the close won: the Load more finds no open result
+            assert CLOSED in texts and rec.of("p", "error")[0].code == "no_open_result"
+    finally:
+        worker.close()
+
+
+def _barrier(worker):
+    """Wait until every task queued so far has run, without discarding the open result (as `call()` would)."""
+    done = threading.Event()
+    worker._put(done.set)
+    assert done.wait(5)
+
+
+def test_a_close_queued_for_an_earlier_pause_spares_the_next_one():  # the token: same request, a later pause
+    clock = Clock()
+    rec = HoldingRecorder(lambda e: e.type == "result_set_end" and e.has_more)
+    worker, _, _ = make_worker(clock=clock, recorder=rec, paused_result_max_idle_s=120.0)
+    try:
+        execute(worker, "p", "rows 1200")
+        assert rec.holding.wait(5)  # paused at 500
+        clock.now += 121
+        worker.submit(FetchMoreCommand(request_id="p"))
+        worker.check_paused_result()  # queued behind the Load more, for the pause at 500
+        rec.proceed.set()
+        rec.wait_for(paused("p", 1000))  # the Load more paused again, a new idle stretch from now
+        _barrier(worker)
+        assert not rec.of("p", "finished") and CLOSED not in [e.text for e in rec.of("p", "message")]
+        clock.now += 121
+        worker.check_paused_result()
+        rec.wait_for(finished("p"))
+        assert rec.of("p", "message")[-1].text == CLOSED
+    finally:
+        worker.close()
+
+
+def test_a_new_statement_that_came_first_ends_the_paused_result_normally():
+    clock = Clock()
+    rec = HoldingRecorder(lambda e: e.type == "result_set_end" and e.has_more)
+    worker, _, _ = make_worker(clock=clock, recorder=rec, paused_result_max_idle_s=120.0)
+    try:
+        execute(worker, "p", "rows 900")
+        assert rec.holding.wait(5)
+        clock.now += 121
+        execute(worker, "q", "rows 1")
+        worker.check_paused_result()
+        rec.proceed.set()
+        rec.wait_for(finished("q"))
+        _barrier(worker)
+        assert len(rec.of("p", "finished")) == 1 and CLOSED not in [e.text for e in rec.of("p", "message")]
+        assert not rec.of("q", "message")  # the close does not land on the next request either
+    finally:
+        worker.close()
+
+
+def test_the_pause_mark_lives_only_while_the_result_waits():  # resumed or ended: nothing for the idle check to see
+    rec = HoldingRecorder(lambda e: e.type == "result_set_end" and not e.has_more)
+    worker, _, _ = make_worker(recorder=rec, paused_result_max_idle_s=120.0)
+    try:
+        execute(worker, "p", "rows 700")
+        rec.wait_for(paused("p", 500))
+        assert worker._paused is not None and worker._paused.request_id == "p"
+        worker.submit(FetchMoreCommand(request_id="p"))
+        assert rec.holding.wait(5)  # loading the rest: not idle
+        assert worker._paused is None
+        rec.proceed.set()
+        rec.wait_for(finished("p"))
+        execute(worker, "c", "rows 700")
+        rec.wait_for(paused("c", 500))
+        worker.cancel("c")  # a discarded result
+        rec.wait_for(finished("c"))
+        assert worker._paused is None
+    finally:
+        worker.close()
+
+
+class RawResult(FakeResult, RawJsonRows):
+    def fetch_raw(self, n):
+        taken, self._rows = self._rows[:n], self._rows[n:]
+        return [f'{{"n": {value},\n "s": "a b"}}' for value in taken]
+
+
+class RawConnection(FakeConnection):
+    def run(self, sql, options=None):
+        self.runs.append(sql)
+        self.options.append(options)
+        return RawResult(int(sql.split()[1]))
+
+
+def test_a_raw_json_export_writes_the_server_text(tmp_path):
+    worker, conn, rec = make_worker(RawConnection())
+    try:
+        target = tmp_path / "out.jsonl"
+        worker.submit(ExportCommand(request_id="j", sql="rows 3", format="jsonl", path=str(target)))
+        rec.wait_for(finished("j"))
+        assert target.read_text().splitlines() == ['{"n":0,"s":"a b"}', '{"n":1,"s":"a b"}', '{"n":2,"s":"a b"}']
+        assert conn.options[-1].retry_safe  # an export is a read
+        csv = tmp_path / "out.csv"
+        worker.submit(ExportCommand(request_id="c", sql="rows 2", format="csv", path=str(csv)))
+        rec.wait_for(finished("c"))
+        assert csv.read_text() == "n\n0\n1\n"  # other formats go by the columns
+    finally:
+        worker.close()
+
+
+def test_an_export_format_the_dialect_cannot_write_is_refused(tmp_path):
+    worker, conn, rec = make_worker()
+    worker.configure(WorkerHooks(dialect=Dialect.SQLPP, check=_policy))
+    try:
+        worker.submit(ExportCommand(request_id="i", sql="rows 1", format="insert", path=str(tmp_path / "x.sql")))
+        rec.wait_for(finished("i"))
+        assert rec.of("i", "error")[0].code == "unsupported_format" and conn.runs == []
+    finally:
+        worker.close()

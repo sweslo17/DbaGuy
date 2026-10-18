@@ -28,7 +28,8 @@ from .storage.paths import default_scripts_dir, history_file, profiles_file, set
 from .storage.profile_store import ProfileStore
 from .storage.secret_store import APP_KEYCHAIN_SERVICE, DEV_KEYCHAIN_SERVICE, KeyringSecretStore, SecretStore
 
-_HOUSEKEEPING_INTERVAL_S = 15  # also the resolution of the idle-transaction warning and rollback
+# also the resolution of the idle-transaction warning and rollback, and of closing idle paused results
+_HOUSEKEEPING_INTERVAL_S = 15
 
 
 def default_registry(freetds_conf: Path | None = None) -> AdapterRegistry:
@@ -96,6 +97,7 @@ class AppContainer:
         self._guarded("Session reaping", self.sessions.reap_idle)
         self._guarded("Metadata reaping", self.metadata.reap_idle)
         self._guarded("Idle-transaction check", self._check_idle_transactions)
+        self._guarded("Paused-result check", self.sessions.check_paused_results)
 
     def _check_idle_transactions(self) -> None:
         safety = self.app_settings.get().safety  # read on every pass: a changed setting applies without a restart
