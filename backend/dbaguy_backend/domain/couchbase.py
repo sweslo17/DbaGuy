@@ -109,6 +109,6 @@ class FieldSample(BaseModel):
     requested: int  # the sample size asked for
     documents: int  # documents read
     cut_at_bytes: bool  # stopped at SAMPLE_MAX_BYTES before `requested` documents
-    paths_capped: bool  # more than FIELD_PATHS_MAX paths: the later ones are left out
+    paths_capped: bool  # paths left out: more than FIELD_PATHS_MAX of them, or a key over FIELD_KEY_MAX_CHARS
     elapsed_ms: int
     fields: list[FieldPath]

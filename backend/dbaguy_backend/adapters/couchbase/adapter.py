@@ -295,10 +295,10 @@ class CouchbaseConnection(DatabaseConnection, FieldSampling):
         result = self._internal_result(sampling.sample_statement(keyspace), {"n": str(size)}, None)
         try:
             while rows := result.fetch_raw(1):
-                try:
-                    collector.add(*sampling.split_sample_row(rows[0]))
-                except ValueError:  # the statement selects `t` and `d` of every row: anything else is not the service
-                    raise StatementError(PROTOCOL_ERROR, code="protocol_error") from None
+                try:  # the row is decoded once, here: its document goes to the collector as decoded
+                    collector.add_decoded(*sampling.parse_sample_row(rows[0]))
+                except (ValueError, RecursionError):  # the statement selects `t` and `d` of every row: anything else
+                    raise StatementError(PROTOCOL_ERROR, code="protocol_error") from None  # is not the service
                 read += len(rows[0])  # characters, as the `*` peek counts (ruling P12)
                 if read > sampling.SAMPLE_MAX_BYTES:  # read now, not at import: a test lowers it
                     cut = collector.documents < size

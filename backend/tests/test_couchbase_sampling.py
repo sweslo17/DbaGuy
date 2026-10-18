@@ -1,6 +1,8 @@
 """Sample fields (R-04-11): field paths derived in Python from documents read with a plain SELECT, never INFER; binary
 documents count as binary; the sample stops at 32 MiB; results are cached per profile and keyspace."""
 
+import json
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
@@ -8,10 +10,11 @@ from loguru import logger
 
 from dbaguy_backend.adapters.couchbase import sampling
 from dbaguy_backend.adapters.couchbase.adapter import CouchbaseConnection
-from dbaguy_backend.adapters.couchbase.sampling import FieldCollector, sample_statement, split_sample_row
-from dbaguy_backend.domain.couchbase import Keyspace
+from dbaguy_backend.adapters.base import FieldSampling
+from dbaguy_backend.adapters.couchbase.sampling import FieldCollector, parse_sample_row, sample_statement
+from dbaguy_backend.domain.couchbase import FieldSample, Keyspace
 from dbaguy_backend.domain.errors import ValidationFailed
-from dbaguy_backend.services.field_sample_service import FieldSampleService
+from dbaguy_backend.services.field_sample_service import SAMPLES_PER_PROFILE_MAX, FieldSampleService
 from dbaguy_backend.services.settings_service import SettingsService
 from tests.support import COUCHBASE_PASSWORD, COUCHBASE_READER, couchbase_query, requires_couchbase
 from tests.test_api import AUTH
@@ -80,9 +83,11 @@ def test_a_path_keeps_counting_after_the_cap_and_each_kind_counts_once_per_docum
     assert fields[()].docs == 3 and fields[()].types == {"object": 3} and fields[()].percent == 100.0
 
 
-def test_a_document_that_cannot_be_walked_counts_by_its_root_kind():
-    collector = collect(("json", "[" * 100_000), ("json", '{"a":1}'))  # nesting no decoder survives
-    assert by_path(collector)[()].types == {"array": 1, "object": 1} and collector.documents == 2
+def test_a_key_over_the_limit_is_left_out_with_everything_below_it():
+    edge, long = "e" * sampling.FIELD_KEY_MAX_CHARS, "k" * (sampling.FIELD_KEY_MAX_CHARS + 1)
+    collector = collect(("json", json.dumps({"ok": 1, edge: 2, long: {"inner": 3}})))
+    assert [tuple(f.path) for f in collector.fields()] == [(), ("ok",), (edge,)] and collector.paths_capped
+    assert not collect(("json", '{"a":{"b":1}}')).paths_capped
 
 
 def test_the_sample_statement_quotes_names():
@@ -92,12 +97,25 @@ def test_the_sample_statement_quotes_names():
         "dbaguy.app.`value` AS d LIMIT $n")
 
 
-def test_a_sample_row_splits_into_its_type_and_the_documents_own_text():
-    assert split_sample_row('{"t":"json","d":{"n":1.10,"big":1e400}}') == ("json", '{"n":1.10,"big":1e400}')
-    assert split_sample_row('{"t":"base64","d":"<binary (9 b)>"}') == ("base64", '"<binary (9 b)>"')
-    for bad in ('{"d":1}', '{"t":1,"d":1}', '{"t":"json"}', "[1]", "7"):
+def test_a_sample_row_is_decoded_once_into_its_type_and_document():
+    meta_type, document = parse_sample_row('{"d":{"n":1.10,"big":1e400,"s":"x","o":{"a":[1,null]}},"t":"json"}')
+    assert meta_type == "json"  # either order of the two members
+    collector = FieldCollector()
+    collector.add_decoded(meta_type, document)
+    fields = by_path(collector)
+    assert fields[("big",)].types == {"number": 1} and fields[("s",)].types == {"string": 1}
+    assert fields[("o", "a", None)].types == {"number": 1, "null": 1} and collector.documents == 1
+    binary = FieldCollector()
+    binary.add_decoded(*parse_sample_row('{"t":"base64","d":"<binary (9 b)>"}'))
+    assert [(tuple(f.path), f.types) for f in binary.fields()] == [((), {"binary": 1})]
+
+
+def test_what_is_not_a_sample_row_is_refused():
+    for bad in ('{"d":1}', '{"t":1,"d":1}', '{"t":"json"}', "[1]", "7", "{not json"):
         with pytest.raises(ValueError):
-            split_sample_row(bad)
+            parse_sample_row(bad)
+    with pytest.raises((ValueError, RecursionError)):  # nesting beyond what the decoder takes
+        parse_sample_row('{"t":"json","d":' + "[" * 100_000 + "}")
 
 
 @requires_couchbase
@@ -251,3 +269,32 @@ def test_a_connection_that_cannot_sample_is_refused_and_caches_nothing(tmp_path)
     with pytest.raises(ValidationFailed, match="cannot sample documents"):
         service.sample(profile_id, USERS, 10)
     assert service.cached(profile_id, USERS) is None
+
+
+def sample_of(keyspace: Keyspace) -> FieldSample:
+    return FieldSample(keyspace=keyspace, sampled_at=datetime.now(UTC), requested=10, documents=0, cut_at_bytes=False,
+                       paths_capped=False, elapsed_ms=0, fields=[])
+
+
+def test_the_cache_keeps_the_most_recently_used_samples_of_each_profile(tmp_path):
+    class Connection(FieldSampling):
+        def sample_fields(self, keyspace, size):
+            return sample_of(keyspace)
+
+    class Metadata:
+        def with_connection(self, profile_id, database, fn):
+            return fn(Connection())
+
+    service = FieldSampleService(Metadata(), SettingsService(tmp_path / "settings.json", tmp_path / "scripts"))
+    mine, other = uuid4(), uuid4()
+    keyspaces = [Keyspace(bucket="b", scope="s", collection=f"c{i}") for i in range(SAMPLES_PER_PROFILE_MAX + 1)]
+    for keyspace in keyspaces[:SAMPLES_PER_PROFILE_MAX]:
+        service.sample(mine, keyspace, 10)
+    service.sample(other, keyspaces[0], 10)
+    assert service.cached(mine, keyspaces[0]) is not None  # a read is a use: c1 is now the least recently used
+    service.sample(mine, keyspaces[-1], 10)  # one more than the bound
+    assert service.cached(mine, keyspaces[1]) is None
+    assert all(service.cached(mine, k) is not None for k in (keyspaces[0], keyspaces[2], keyspaces[-1]))
+    assert service.cached(other, keyspaces[0]) is not None  # another profile's samples are its own
+    service.invalidate(mine)
+    assert service.cached(mine, keyspaces[0]) is None and service.cached(other, keyspaces[0]) is not None

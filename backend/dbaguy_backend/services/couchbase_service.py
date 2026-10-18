@@ -1,40 +1,26 @@
 """What the Couchbase query workflow needs beyond a session: the contexts a tab can pick, plan analysis, index advice
 on the metadata connection (B12) and the context of a History entry (B15)."""
 
-from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Any
 from uuid import UUID
 
 from loguru import logger
 
-from ..adapters.base import DatabaseConnection, StatementError
-from ..adapters.couchbase.adapter import CouchbaseConnection, is_server_error
+from ..adapters.base import DatabaseConnection
+from ..adapters.couchbase.adapter import CouchbaseConnection
 from ..adapters.couchbase.catalog import DEFAULT
 from ..adapters.couchbase.explain import analyze, analyze_value
 from ..adapters.registry import AdapterRegistry
 from ..domain.couchbase import ContextOption, PlanNode, PlanView
-from ..domain.errors import NotFound, QueryFailed, ValidationFailed
+from ..domain.errors import NotFound, ValidationFailed
 from ..domain.execution import QueryContext
 from ..domain.history import HistoryPage
+from .metadata_errors import server_errors_are_final
 from .metadata_service import MetadataService
 from .profile_service import ProfileService
 from .schema_cache import SchemaCache
 
 _NOT_COUCHBASE = "This is not a Couchbase connection"
-
-
-@contextmanager
-def server_errors_are_final() -> Iterator[None]:
-    """Around a statement sent on a metadata connection: the server's own error answer (a numeric code) is raised as a
-    DomainError (QueryFailed, with the server's text), so the metadata call does not reconnect and send the statement
-    again. That resend is for a lost connection, and ADVISE on `app.users` panics the server (B39, A15)."""
-    try:
-        yield
-    except StatementError as exc:
-        if is_server_error(exc):
-            raise QueryFailed(exc.message) from exc
-        raise
 
 
 def _nodes(view: PlanView) -> int:
