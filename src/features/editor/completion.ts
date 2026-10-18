@@ -53,6 +53,10 @@ const TYPES: Record<CompletionItem["kind"], string> = {
   schema: "namespace",
   alias: "variable",
   join: "text",
+  bucket: "namespace",
+  scope: "namespace",
+  collection: "class",
+  field: "property",
 };
 
 /** "preserve": the typed prefix decides, all lower case → lower case, anything else (or nothing typed) → upper case. */

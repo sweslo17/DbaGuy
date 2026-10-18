@@ -795,6 +795,9 @@ export interface components {
             /** Profile Id */
             profile_id?: string | null;
             dialect?: components["schemas"]["Dialect"] | null;
+            query_context?: components["schemas"]["QueryContext"] | null;
+            /** Seen Fields */
+            seen_fields?: string[];
         };
         /** CompletionItem */
         CompletionItem: {
@@ -804,7 +807,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "keyword" | "schema" | "table" | "view" | "materialized_view" | "synonym" | "column" | "alias" | "function" | "join";
+            kind: "keyword" | "schema" | "table" | "view" | "materialized_view" | "synonym" | "column" | "alias" | "function" | "join" | "bucket" | "scope" | "collection" | "field";
             /** Detail */
             detail?: string | null;
             /** Apply */

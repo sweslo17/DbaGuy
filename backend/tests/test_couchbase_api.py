@@ -279,3 +279,26 @@ def test_a_collection_hit_opens_at_its_tree_path(canned):
     hit = cache.search(profile_id, "my.bucket.app.orders")[0]
     assert hit.kind == "collection" and (hit.database, hit.schema_name) == ("my.bucket", "app")
     assert [(s.kind, s.name) for s in hit.path] == [("bucket", "my.bucket"), ("scope", "app"), ("collection", "orders")]
+
+
+@requires_couchbase
+def test_completion_uses_the_sample_and_the_tab_context(app, cb):
+    client, _ = app
+    keyspace = {"bucket": "dbaguy", "scope": "app", "collection": "users"}
+    client.post("/couchbase/fields/sample", json={"profile_id": cb, "keyspace": keyspace}, headers=AUTH)
+    body = {"profile_id": cb, "text": "SELECT u. FROM users AS u", "cursor": 9,
+            "query_context": {"bucket": "dbaguy", "scope": "app"}, "seen_fields": ["late"]}
+    labels = [i["label"] for i in client.post("/sql/complete", json=body, headers=AUTH).json()["items"]]
+    assert "name" in labels and "u64max" in labels
+
+
+@requires_couchbase
+def test_completion_never_starts_a_sample(app, cb, monkeypatch):  # R-04-11: a sample is a user action
+    client, container = app
+    monkeypatch.setattr(container.field_samples, "sample", lambda *args, **kwargs: pytest.fail("completion sampled"))
+    body = {"profile_id": cb, "text": "SELECT u. FROM users AS u", "cursor": 9,
+            "query_context": {"bucket": "dbaguy", "scope": "app"}}
+    assert client.post("/sql/complete", json=body, headers=AUTH).json()["items"] == []  # nothing sampled yet
+    body = {**body, "text": "SELECT la FROM users AS u", "cursor": 9, "seen_fields": ["late"]}
+    items = client.post("/sql/complete", json=body, headers=AUTH).json()["items"]
+    assert [(i["label"], i["detail"]) for i in items][:1] == [("late", "seen in results")]  # what the results showed

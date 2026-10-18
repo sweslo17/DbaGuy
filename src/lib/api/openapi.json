@@ -2875,6 +2875,25 @@
                 "type": "null"
               }
             ]
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "seen_fields": {
+            "items": {
+              "type": "string",
+              "maxLength": 300
+            },
+            "type": "array",
+            "maxItems": 500,
+            "title": "Seen Fields"
           }
         },
         "additionalProperties": false,
@@ -2903,7 +2922,11 @@
               "column",
               "alias",
               "function",
-              "join"
+              "join",
+              "bucket",
+              "scope",
+              "collection",
+              "field"
             ],
             "title": "Kind"
           },

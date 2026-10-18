@@ -97,6 +97,7 @@ const KIND_LABELS: Record<string, string> = {
   event: "Event",
   foreign_key: "Foreign Key",
   column: "Column",
+  field: "Field",
 };
 
 /**

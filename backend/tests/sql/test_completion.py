@@ -211,7 +211,7 @@ def test_a_bug_degrades_to_no_items_and_is_logged_without_sql(index, monkeypatch
     def broken(*args):
         raise RuntimeError("boom with SELECT secret")
 
-    monkeypatch.setattr(completion, "_statement_bounds", broken)
+    monkeypatch.setattr(completion, "statement_bounds", broken)
     messages = []
     sink = logger.add(messages.append, level="ERROR", format="{message}")
     try:

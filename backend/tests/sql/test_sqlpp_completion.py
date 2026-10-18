@@ -1,0 +1,238 @@
+"""SQL++ completion (spec §3.12, SQL++ Should 1): keyspace paths from the snapshot, field paths from samples and from
+results seen in the tab, back-ticks for special names."""
+
+import random
+import time
+from datetime import UTC, datetime
+
+import pytest
+from loguru import logger
+
+from dbaguy_backend.domain.couchbase import FieldPath, Keyspace
+from dbaguy_backend.domain.execution import QueryContext
+from dbaguy_backend.domain.schema import SchemaSnapshot, SnapshotKeyspace
+from dbaguy_backend.sql.completion import CompletionResult, SnapshotIndex
+from dbaguy_backend.sql.dialects import Dialect
+from dbaguy_backend.sql.keyspaces import NO_KEYSPACES, KeyspaceTree
+from dbaguy_backend.sql.sqlpp_completion import _complete, _Known, complete_sqlpp
+
+KEYSPACES = [SnapshotKeyspace(bucket=b, scope=s, collection=c) for b, s, c in [
+    ("dbaguy", "_default", "_default"), ("dbaguy", "app", "events"), ("dbaguy", "app", "odd-name"),
+    ("dbaguy", "app", "orders"), ("dbaguy", "app", "users"), ("dbaguy", "app", "value"),
+    ("travel-sample", "_default", "_default"), ("travel-sample", "inventory", "airline"),
+    ("travel-sample", "inventory", "airport"), ("travel-sample", "inventory", "route"),
+]]
+INDEX = SnapshotIndex(SchemaSnapshot(database=None, default_schema=None, search_path=[], schemas=[],
+                                     built_at=datetime.now(UTC), keyspaces=KEYSPACES), Dialect.SQLPP)
+USERS = Keyspace(bucket="dbaguy", scope="app", collection="users")
+CTX = QueryContext(bucket="dbaguy", scope="app")
+
+
+def path(*segments, kind="string", docs=8):
+    return FieldPath(path=list(segments), types={kind: docs}, docs=docs, percent=docs * 10.0)
+
+
+FIELDS = {USERS: [
+    path(kind="object", docs=10), path("name"), path("age", kind="number", docs=6),
+    path("address", kind="object", docs=5), path("address", "city", docs=5), path("address", "zip", docs=3),
+    path("odd key", docs=1), path("select", kind="number", docs=1), path("tags", kind="array", docs=4),
+    path("tags", None, docs=4),
+]}
+
+
+def run(text, context=CTX, seen=()):
+    cursor = text.index("|")
+    return complete_sqlpp(text.replace("|", ""), cursor, INDEX, context, FIELDS.get, list(seen))
+
+
+def items(result):
+    return {i.label: i for i in result.items}
+
+
+def test_from_offers_the_context_scopes_collections_and_every_bucket():
+    found = items(run("SELECT * FROM |"))
+    assert {k: found[k].kind for k in ("users", "odd-name", "value", "dbaguy", "travel-sample")} == {
+        "users": "collection", "odd-name": "collection", "value": "collection", "dbaguy": "bucket",
+        "travel-sample": "bucket"}
+    assert (found["odd-name"].apply, found["value"].apply, found["travel-sample"].apply) == (
+        "`odd-name`", "`value`", "`travel-sample`")
+    assert "airline" not in found  # another scope's collection
+
+
+def test_a_bucket_only_context_offers_its_default_scope_and_no_context_only_buckets():
+    assert items(run("SELECT * FROM |", context=QueryContext(bucket="travel-sample")))["_default"].kind == "collection"
+    assert {i.kind for i in run("SELECT * FROM |", context=None).items} == {"bucket"}
+
+
+def test_after_a_bucket_the_scopes_and_after_a_scope_the_collections():
+    assert [(i.label, i.kind) for i in run("SELECT * FROM `travel-sample`.|").items] == [
+        ("_default", "scope"), ("inventory", "scope")]
+    assert [i.label for i in run("SELECT * FROM `travel-sample`.inventory.ai|").items] == ["airline", "airport"]
+
+
+@pytest.mark.parametrize("text", [
+    "SELECT * FROM a JOIN |", "SELECT * FROM a AS x NEST |", "UPDATE |", "INSERT INTO |", "UPSERT INTO |",
+    "DELETE FROM |", "MERGE INTO |", "MERGE INTO a USING |", "SELECT * FROM a, |",
+])
+def test_every_keyspace_position(text):
+    assert "users" in items(run(text))
+
+
+def test_alias_dot_offers_sampled_fields_with_back_ticks():
+    found = items(run("SELECT u.| FROM users AS u"))
+    assert set(found) == {"name", "age", "address", "odd key", "select", "tags"}
+    assert (found["odd key"].apply, found["select"].apply, found["name"].apply) == ("`odd key`", "`select`", None)
+    assert found["name"].kind == "field" and found["name"].detail == "users · string · 80%"
+
+
+def test_nested_paths_and_implicit_aliases():
+    assert set(items(run("SELECT u.address.| FROM users u"))) == {"city", "zip"}
+    assert "name" in items(run("SELECT users.| FROM users"))  # an unaliased keyspace qualifies by its name
+    assert "name" in items(run("SELECT d.| FROM dbaguy.app.users AS d", context=None))  # a full path needs no context
+    assert items(run("SELECT d.| FROM app.users AS d")) == {}  # two parts name no keyspace
+
+
+def test_one_keyspace_offers_its_fields_unqualified_then_the_fields_seen():
+    result = run("SELECT na| FROM users AS u", seen=["name", "nation"])
+    labels = [i.label for i in result.items]
+    assert labels.index("name") < labels.index("nation") and labels.count("name") == 1
+    assert items(result)["nation"].detail == "seen in results"
+
+
+def test_aliases_in_column_positions_and_no_guessing_with_two_keyspaces():
+    found = items(run("SELECT | FROM users AS u JOIN orders AS o ON KEYS u.oid"))
+    assert found["u"].kind == "alias" and found["o"].kind == "alias" and "name" not in found
+
+
+def test_unsampled_keyspaces_offer_no_fields():
+    assert items(run("SELECT o.| FROM orders AS o")) == {}
+
+
+def test_strings_and_comments_get_nothing():
+    assert run("SELECT 'FROM |' FROM users").items == []
+    assert run("SELECT * FROM users -- FROM |").items == []
+
+
+def test_keywords_at_the_start():
+    assert "ADVISE" in items(run("|"))
+
+
+# --- what the rules above leave out ---------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text", [
+    "SELECT a, |", 'SELECT * FROM users USE KEYS ["a", |', "SELECT * FROM users AS u ORDER BY u.age, |",
+    "INSERT INTO users (KEY, VALUE) VALUES ('k', {'a': 1}), |",
+    "MERGE INTO a USING b ON KEYS 1 WHEN MATCHED THEN UPDATE |",
+])
+def test_these_are_not_keyspace_positions(text):
+    assert {"bucket", "collection", "scope"}.isdisjoint(i.kind for i in run(text).items)
+
+
+def test_a_comma_after_a_join_condition_still_continues_the_from_list():
+    assert "orders" in items(run("SELECT * FROM users AS u JOIN orders AS o ON KEYS u.oid, |"))
+
+
+def test_fields_below_an_array_element_are_not_completed_and_nothing_follows_a_dot_in_an_expression():
+    assert run("SELECT u.tags[0].| FROM users AS u").items == []
+    assert run("SELECT u.tags.| FROM users AS u").items == []  # `tags` has no key below it; `tags[]` is not a key
+    assert run("SELECT (1).| FROM users AS u").items == []
+
+
+def test_a_back_ticked_alias_and_the_first_reference_of_a_name_win():
+    assert "name" in items(run("SELECT `my alias`.| FROM users AS `my alias`"))
+    assert run("SELECT x.| FROM users AS u").items == []
+    assert "name" in items(run("SELECT u.| FROM users AS u JOIN orders AS u2 ON KEYS u.oid"))
+
+
+def test_a_subquery_or_a_cte_is_one_more_source_so_nothing_is_guessed():
+    assert "name" not in items(run("SELECT | FROM (SELECT * FROM users) AS s"))
+    assert "name" not in items(run("WITH x AS (SELECT * FROM users) SELECT | FROM x"))
+    assert run("SELECT s.| FROM (SELECT * FROM users) AS s").items == []
+
+
+def test_the_fields_of_a_single_keyspace_in_any_clause_of_any_statement():
+    for text in ("UPDATE users SET na|", "DELETE FROM users WHERE na|", "SELECT COUNT(na|) FROM users"):
+        assert "name" in items(run(text)), text
+
+
+def test_seen_fields_are_offered_once_and_after_the_sampled_ones():
+    result = run("SELECT | FROM users AS u", seen=["late", "late", "name", "u", ""])
+    labels = [i.label for i in result.items]
+    assert labels.count("late") == labels.count("name") == labels.count("u") == 1 and "" not in labels
+    assert items(result)["name"].detail == "users · string · 80%" and items(result)["u"].kind == "alias"
+    assert items(run("SELECT | FROM orders AS o", seen=["a b"]))["a b"].apply == "`a b`"
+
+
+def test_without_a_snapshot_there_are_no_keyspaces_but_fields_still_come_from_the_sample():
+    cursor = len("SELECT * FROM ")
+    assert complete_sqlpp("SELECT * FROM ", cursor, None, CTX, FIELDS.get, []).items == []
+    assert "name" in {i.label for i in complete_sqlpp("SELECT u. FROM users u", 9, None, CTX, FIELDS.get, []).items}
+
+
+def test_system_keyspaces_come_last_and_a_missing_context_part_names_nothing():
+    keyspaces = [*KEYSPACES, SnapshotKeyspace(bucket="dbaguy", scope="_system", collection="_query", system=True)]
+    snapshot = SchemaSnapshot(database=None, default_schema=None, search_path=[], schemas=[],
+                              built_at=datetime.now(UTC), keyspaces=keyspaces)
+    index = SnapshotIndex(snapshot, Dialect.SQLPP)
+    scopes = complete_sqlpp("SELECT * FROM dbaguy.", 21, index, None, FIELDS.get, []).items
+    assert [i.label for i in scopes] == ["app", "_default", "_system"]  # by length, the system scope last
+    collections = complete_sqlpp("SELECT * FROM dbaguy._system.", 29, index, None, FIELDS.get, []).items
+    assert [(i.label, i.boost) for i in collections] == [("_query", -1 + 2)]  # boosted by the prefix match
+
+
+def test_a_name_too_long_for_a_keyspace_is_no_keyspace_and_does_not_fail():
+    long = "b" * 300
+    assert complete_sqlpp(f"SELECT u. FROM `{long}`.s.c AS u", 9, INDEX, None, FIELDS.get, []).items == []
+
+
+def test_a_bug_degrades_to_no_items_and_is_logged_without_sql():
+    messages = []
+    sink = logger.add(messages.append, level="ERROR", format="{message}")
+
+    def broken(keyspace):
+        raise RuntimeError("boom with SELECT secret")
+
+    try:
+        result = complete_sqlpp("SELECT u. FROM users AS u", 9, INDEX, CTX, broken, [])
+    finally:
+        logger.remove(sink)
+    assert result == CompletionResult(start=9, end=9, items=[]) and len(messages) == 1
+    assert "RuntimeError" in messages[0] and "SELECT" not in messages[0] and "boom" not in messages[0]
+
+
+_PIECES = [
+    "SELECT", "FROM", "JOIN", "NEST", "UNNEST", "UPDATE", "INTO", "USING", "THEN", "ON", "KEYS", "AS", "WHERE", "users",
+    "orders", "u", "o", "dbaguy", "app", ".", ",", "(", ")", "[", "]", "{", "}", "*", "=", "'", '"', "`", "--", "/*",
+    "*/", ";", " ", " ", "\n", "$1", "$x", "?", "\\", "`a\\`b`", "0", "1.", "USE", "LET", "ORDER", "BY", "VALUES",
+]
+
+
+def test_the_unguarded_core_survives_random_token_soup():
+    rng = random.Random(20261019)
+    for _ in range(500):
+        text = "".join(rng.choice(_PIECES) for _ in range(rng.randint(0, 20)))
+        cursor = rng.randint(0, len(text))
+        for index in (INDEX, None):
+            known = _Known(index.keyspaces if index else NO_KEYSPACES, rng.choice([CTX, None]), FIELDS.get, ["seen"])
+            _complete(text, cursor, known)
+
+
+def test_a_statement_with_thousands_of_commas_is_read_in_one_pass():
+    """Every comma asking where its clause began took minutes over a big INSERT … VALUES or an IN [ … ] list."""
+    inserts = "INSERT INTO users (KEY, VALUE) VALUES " + ", ".join(f"('k{i}', {{'a': [{i}, 2]}})" for i in range(4000))
+    started = time.perf_counter()
+    assert "RETURNING" in items(run(inserts + " RETURN|"))
+    in_list = "SELECT * FROM users AS u WHERE u.age IN [" + ", ".join(map(str, range(20000))) + "] AND u.a|"
+    assert "age" in items(run(in_list))
+    assert time.perf_counter() - started < 5
+
+
+def test_the_keyspace_tree_keeps_the_snapshot_order_and_flags_system_scopes():
+    keyspaces = [SnapshotKeyspace(bucket=b, scope=s, collection=c, system=s == "_system") for b, s, c in [
+        ("b", "s", "x"), ("a", "_system", "q"), ("b", "s", "x"), ("b", "t", "y"), ("b", "s", "z")]]
+    tree = KeyspaceTree.of(keyspaces)
+    assert tree.buckets == ("b", "a") and tree.scopes == {"b": ("s", "t"), "a": ("_system",)}
+    assert tree.collections == {("b", "s"): ("x", "z"), ("a", "_system"): ("q",), ("b", "t"): ("y",)}
+    assert tree.system_scopes == {("a", "_system")} and tree.is_system("a", "_system") and not tree.is_system("b", "s")
+    assert KeyspaceTree.of([]).buckets == ()

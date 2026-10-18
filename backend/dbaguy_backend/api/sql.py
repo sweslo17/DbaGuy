@@ -5,7 +5,7 @@ These run on every keystroke (completion) or on every selection change, so they 
 SQL text above it.
 """
 
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
@@ -14,7 +14,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..container import AppContainer
 from ..domain.column_category import ColumnCategory
+from ..domain.couchbase import FieldPath, Keyspace
 from ..domain.errors import ValidationFailed
+from ..domain.execution import QueryContext
 from ..domain.formats import FormatColumn, FormatKind, RowFormatOptions
 from ..domain.metadata import PathSegment
 from ..services.safety import GuardDecision
@@ -25,6 +27,7 @@ from ..sql.formatting import FormatResult, format_rows, value_condition
 from ..sql.offsets import Utf16Index
 from ..sql.select_builder import SortKey, build_browse_select
 from ..sql.splitter import split
+from ..sql.sqlpp_completion import FieldLookup, complete_sqlpp
 from .deps import get_container, require_token
 
 
@@ -70,6 +73,9 @@ class _TextAtCursor(_Input):
 class CompleteRequest(_TextAtCursor):
     profile_id: UUID | None = None  # without one only keywords are suggested, and `dialect` is required
     dialect: Dialect | None = None  # ignored when `profile_id` is given
+    # SQL++ only (other engines ignore them): the tab's query context, and the field names of the tab's recent results
+    query_context: QueryContext | None = None
+    seen_fields: list[Annotated[str, Field(max_length=300)]] = Field(default_factory=list, max_length=500)
 
 
 class DescribeRequest(_TextAtCursor):
@@ -153,6 +159,16 @@ def _snapshot_index(
         return None
 
 
+def _sampled_fields(container: AppContainer, profile_id: UUID | None) -> FieldLookup:
+    """The fields of a keyspace as the profile's last sample left them: completion only reads the cache, a sample is
+    made by the user (R-04-11)."""
+    def lookup(keyspace: Keyspace) -> list[FieldPath] | None:
+        sample = container.field_samples.cached(profile_id, keyspace) if profile_id is not None else None
+        return sample.fields if sample is not None else None
+
+    return lookup
+
+
 @router.post("/split", response_model=SplitResponse)
 def split_statements(body: SplitRequest) -> SplitResponse:
     index = Utf16Index(body.text)
@@ -178,7 +194,12 @@ def complete_at(body: CompleteRequest, container: AppContainer = Depends(get_con
     if body.profile_id is not None:
         snapshot_index = _snapshot_index(container, body.profile_id, body.database, wait=False)
     index = Utf16Index(body.text)
-    result = complete(body.text, index.from_utf16(body.cursor), dialect, snapshot_index)
+    cursor = index.from_utf16(body.cursor)
+    if dialect is Dialect.SQLPP:
+        fields = _sampled_fields(container, body.profile_id)
+        result = complete_sqlpp(body.text, cursor, snapshot_index, body.query_context, fields, body.seen_fields)
+    else:
+        result = complete(body.text, cursor, dialect, snapshot_index)
     logger.debug("Completion at {}: {} items{}", body.cursor, len(result.items),
                  "" if snapshot_index is not None else " (keywords only)")
     return CompletionResponse(start=index.to_utf16(result.start), end=index.to_utf16(result.end), items=result.items)

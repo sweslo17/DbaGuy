@@ -275,3 +275,22 @@ def test_sqlpp_copy_json_missing_and_the_insert_refusal(client, log_records):
     missing = {"dialect": "sqlpp", "column": "doc", "value": {"$type": "missing"}, "category": "mixed"}
     assert client.post("/sql/value-condition", json=missing, headers=AUTH).json() == {"condition": "doc IS MISSING"}
     assert not [r for r in log_records if r["level"].no >= ERROR]
+
+
+def test_sqlpp_completion_takes_a_context_and_seen_fields_and_keeps_utf16_offsets(client):
+    text = "SELECT '😀', na FROM users AS u"  # '😀' is two UTF-16 units
+    cursor = utf16_len("SELECT '😀', na")
+    body = {"dialect": "sqlpp", "text": text, "cursor": cursor, "query_context": {"bucket": "b", "scope": "s"},
+            "seen_fields": ["name", "nation"]}
+    result = client.post("/sql/complete", json=body, headers=AUTH).json()
+    assert [i["label"] for i in result["items"]][:2] == ["name", "nation"]  # no sample: only what the results showed
+    assert (result["start"], result["end"]) == (cursor - 2, cursor)
+
+
+@pytest.mark.parametrize("extra", [
+    {"seen_fields": ["x"] * 501}, {"seen_fields": ["x" * 301]}, {"query_context": {"bucket": ""}},
+    {"query_context": {"bucket": "b", "other": 1}},
+])
+def test_sqlpp_completion_bounds_its_inputs(client, extra):
+    body = {"dialect": "sqlpp", "text": "SELECT 1", "cursor": 0, **extra}
+    assert client.post("/sql/complete", json=body, headers=AUTH).status_code == 422

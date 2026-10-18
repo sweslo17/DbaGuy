@@ -1,0 +1,290 @@
+"""SQL++ completion (spec §3.12, SQL++ Should 1): keyspace paths from the schema snapshot, field paths from a manual
+sample and from the results seen in the tab, back-ticks where a name needs them.
+
+The statement's FROM lists are read here, not by `scope.py` (ruling B21): its alias rules are made for the other
+dialects, and NEST / UNNEST / LET among its stop words would break PostgreSQL's `FROM unnest(…) AS u`. The fields of a
+keyspace exist only when the user sampled it: this module only reads that cache, it never starts a sample. Pure: no
+I/O, SQL text is never logged above DEBUG. Offsets are Python code points, as in `complete()`.
+
+A statement is read as a whole, subqueries and CTE bodies included, the way `scope.py` reads it for the other dialects:
+an alias is looked up anywhere in it, and "reads exactly one keyspace" counts every FROM term in it.
+"""
+
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
+
+from ..domain.couchbase import FieldPath, Keyspace
+from ..domain.execution import QueryContext
+from .completion import (
+    SYSTEM_BOOST, Candidate, CompletionKind, CompletionResult, SnapshotIndex, by_length, clause_context,
+    filter_candidates, guarded, keywords, qualifier, word_at_cursor,
+)
+from .dialects import Dialect, quote_ident
+from .keyspaces import NO_KEYSPACES, KeyspaceTree
+from .lexer import Token, TokenKind
+from .scope import IDENT, unquote, word
+
+SQLPP = Dialect.SQLPP
+FieldLookup = Callable[[Keyspace], Sequence[FieldPath] | None]  # a keyspace's sampled field paths; None: not sampled
+
+DEFAULT = "_default"  # the default scope, and the default collection of a bucket
+SEEN_BOOST = -1  # a field seen in results ranks after the sampled ones
+_KEYSPACE_KEYWORDS = frozenset({"FROM", "JOIN", "NEST", "UPDATE", "INTO", "USING"})
+_NOT_AN_ALIAS = frozenset(
+    """USE ON WHERE JOIN LEFT INNER NEST UNNEST LET LETTING GROUP ORDER LIMIT OFFSET SET UNSET RETURNING VALUES SELECT
+    FROM UNION INTERSECT EXCEPT KEYS USING""".split()
+)
+# The words that begin a clause: a comma continues a FROM list only when the nearest of them is FROM.
+_CLAUSE_START = frozenset(
+    "FROM SELECT WHERE GROUP ORDER HAVING LIMIT OFFSET LET LETTING SET UNSET RETURNING VALUES".split()
+)
+_OPENING, _CLOSING = "([{", ")]}"
+
+
+# --- the statement's keyspace references ------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Reference:
+    """One `path [AS] alias` of a FROM list, or `(subquery) alias`."""
+
+    parts: tuple[str, ...]  # the dotted path as written, unquoted; () for a subquery
+    alias: str | None
+
+    @property
+    def name(self) -> str | None:
+        """What the statement calls it: the alias, else the last part of the path."""
+        return self.alias if self.alias is not None else self.parts[-1] if self.parts else None
+
+    @property
+    def detail(self) -> str:
+        if not self.parts:
+            return "subquery"
+        return ".".join(self.parts) if self.alias is not None else "keyspace"
+
+
+def _is_bracket(token: Token, brackets: str) -> bool:
+    return token.kind in (TokenKind.LPAREN, TokenKind.RPAREN, TokenKind.OTHER) and token.text in brackets
+
+
+def _leads(tokens: list[Token]) -> list[int]:
+    """The indexes of the tokens after which a keyspace is named: the keywords, and a comma that separates the terms of
+    a FROM list, which is a comma whose nearest clause word at its own bracket depth is FROM (`SELECT a, b` and
+    `USE KEYS ["x", "y"]` are not). One pass: a statement can hold thousands of commas."""
+    leads: list[int] = []
+    clause_words = [""]  # one per open bracket: the last clause word at that depth
+    for i, token in enumerate(tokens):
+        if _is_bracket(token, _OPENING):
+            clause_words.append("")
+        elif _is_bracket(token, _CLOSING):
+            if len(clause_words) > 1:
+                clause_words.pop()
+        elif token.kind == TokenKind.COMMA:
+            if clause_words[-1] == "FROM":
+                leads.append(i)
+        elif token.kind == TokenKind.WORD:
+            if token.upper in _CLAUSE_START:
+                clause_words[-1] = token.upper
+            if token.upper in _KEYSPACE_KEYWORDS and not (token.upper == "UPDATE" and word(tokens, i - 1) == "THEN"):
+                leads.append(i)  # MERGE … THEN UPDATE SET names no keyspace
+    return leads
+
+
+def _after_group(tokens: list[Token], i: int) -> int:
+    """The index after the parenthesis that closes the one at `i`; the end when it is never closed."""
+    depth = 0
+    for j in range(i, len(tokens)):
+        depth += (tokens[j].kind == TokenKind.LPAREN) - (tokens[j].kind == TokenKind.RPAREN)
+        if depth == 0:
+            return j + 1
+    return len(tokens)
+
+
+def _read_alias(tokens: list[Token], i: int) -> str | None:
+    if word(tokens, i) == "AS":
+        i += 1
+    if i < len(tokens) and (tokens[i].kind == TokenKind.QUOTED or
+                            (tokens[i].kind == TokenKind.WORD and tokens[i].upper not in _NOT_AN_ALIAS)):
+        return unquote(tokens[i])
+    return None
+
+
+def _read_reference(tokens: list[Token], i: int) -> _Reference | None:
+    """The reference that starts at `i`; None when there is none (a path still being typed, `FROM a.`, is none)."""
+    if i >= len(tokens):
+        return None
+    if tokens[i].kind == TokenKind.LPAREN:  # a subquery names nothing but its alias
+        alias = _read_alias(tokens, _after_group(tokens, i))
+        return _Reference((), alias) if alias is not None else None
+    if tokens[i].kind not in IDENT or word(tokens, i) in _NOT_AN_ALIAS:
+        return None
+    parts = [unquote(tokens[i])]
+    i += 1
+    while i + 1 < len(tokens) and tokens[i].kind == TokenKind.DOT and tokens[i + 1].kind in IDENT:
+        parts.append(unquote(tokens[i + 1]))
+        i += 2
+    if i < len(tokens) and tokens[i].kind == TokenKind.DOT:
+        return None
+    return _Reference(tuple(parts), _read_alias(tokens, i))
+
+
+def _references(tokens: list[Token]) -> list[_Reference]:
+    """Every keyspace reference of the statement, in the order written."""
+    found = (_read_reference(tokens, i + 1) for i in _leads(tokens))
+    return [reference for reference in found if reference is not None]
+
+
+def _keyspace_of(reference: _Reference | None, context: QueryContext | None) -> Keyspace | None:
+    """The keyspace a reference names under the tab's context (as the server reads it with that `query_context`);
+    a path of two parts names none."""
+    match reference.parts if reference is not None else ():
+        case (bucket, scope, collection):
+            names = bucket, scope, collection
+        case (collection,) if context is not None:
+            names = context.bucket, context.scope or DEFAULT, collection
+        case (bucket,):
+            names = bucket, DEFAULT, DEFAULT
+        case _:
+            return None
+    try:
+        return Keyspace(bucket=names[0], scope=names[1], collection=names[2])
+    except ValueError:  # an empty or overlong name
+        return None
+
+
+# --- candidates ---------------------------------------------------------------------------------------------------
+
+
+def _named(names: Iterable[str], kind: CompletionKind, detail: str, boost: int = 0) -> list[Candidate]:
+    return by_length(Candidate.of(name, kind, detail, quote_ident(SQLPP, name), boost) for name in names)
+
+
+def _collections(tree: KeyspaceTree, bucket: str, scope: str) -> list[Candidate]:
+    boost = SYSTEM_BOOST if tree.is_system(bucket, scope) else 0
+    return _named(tree.collections.get((bucket, scope), ()), "collection", f"collection in {bucket}.{scope}", boost)
+
+
+def _scopes(tree: KeyspaceTree, bucket: str) -> list[Candidate]:
+    return by_length(
+        Candidate.of(scope, "scope", f"scope in {bucket}", quote_ident(SQLPP, scope),
+                     SYSTEM_BOOST if tree.is_system(bucket, scope) else 0)
+        for scope in tree.scopes.get(bucket, ())
+    )
+
+
+def _keyspace_candidates(parts: list[str], tree: KeyspaceTree, context: QueryContext | None) -> list[Candidate]:
+    """Where a keyspace is named: the context's collections and every bucket; after `b.` the scopes of b, after
+    `b.s.` its collections."""
+    match parts:
+        case []:
+            here = _collections(tree, context.bucket, context.scope or DEFAULT) if context is not None else []
+            return [*here, *_named(tree.buckets, "bucket", "bucket")]
+        case [bucket]:
+            return _scopes(tree, bucket)
+        case [bucket, scope]:
+            return _collections(tree, bucket, scope)
+        case _:
+            return []
+
+
+def _field_detail(path: FieldPath, collection: str) -> str:
+    kinds = "|".join(kind for kind, _ in sorted(path.types.items(), key=lambda item: (-item[1], item[0])))
+    return f"{collection} · {kinds} · {path.percent:g}%"
+
+
+def _field_candidates(keyspace: Keyspace | None, fields: FieldLookup, below: list[str]) -> list[Candidate]:
+    """The sampled keys one level below the path `below` of a keyspace, in the order the sample first saw them. A path
+    through an array element (`items[0].x`) is not completed."""
+    paths = fields(keyspace) if keyspace is not None else None
+    if keyspace is None or not paths:
+        return []
+    depth = len(below)
+    below_here = (path for path in paths if len(path.path) == depth + 1 and path.path[:depth] == below)
+    return [
+        Candidate.of(key, "field", _field_detail(path, keyspace.collection), quote_ident(SQLPP, key))
+        for path in below_here if (key := path.path[depth]) is not None  # None: an array element
+    ]
+
+
+def _reference_candidates(references: list[_Reference]) -> list[Candidate]:
+    """What can be written before a dot: each alias, and each keyspace referred to by its own name, once."""
+    found: dict[str, Candidate] = {}
+    for reference in references:
+        if (name := reference.name) is not None and name not in found:
+            found[name] = Candidate.of(name, "alias", reference.detail, quote_ident(SQLPP, name))
+    return list(found.values())
+
+
+def _seen_candidates(seen_fields: Sequence[str], offered: set[str]) -> list[Candidate]:
+    return [
+        Candidate.of(name, "field", "seen in results", quote_ident(SQLPP, name), SEEN_BOOST)
+        for name in dict.fromkeys(seen_fields) if name and name not in offered
+    ]
+
+
+# --- entry points -------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Known:
+    """What a completion knows besides the text: the keyspaces, the tab's context and the fields."""
+
+    tree: KeyspaceTree
+    context: QueryContext | None
+    fields: FieldLookup
+    seen_fields: Sequence[str]
+
+
+def _qualified_fields(parts: list[str], statement: list[Token], known: _Known) -> list[Candidate]:
+    """`a.` / `a.b.`: the sampled fields below `b` of the keyspace `a` stands for."""
+    reference = next((r for r in _references(statement) if r.name == parts[0]), None)
+    return _field_candidates(_keyspace_of(reference, known.context), known.fields, parts[1:])
+
+
+def _column_candidates(statement: list[Token], known: _Known) -> list[Candidate]:
+    """No qualifier where a column goes: the aliases, the fields of the keyspace the statement reads when it reads
+    exactly one (never a guess between two), the fields seen in results, then the keywords."""
+    references = _references(statement)
+    aliases = _reference_candidates(references)
+    only = _keyspace_of(references[0], known.context) if len(references) == 1 else None
+    sampled = _field_candidates(only, known.fields, [])
+    offered = {candidate.label for candidate in (*aliases, *sampled)}
+    return [*aliases, *sampled, *_seen_candidates(known.seen_fields, offered), *keywords(SQLPP, "clause")]
+
+
+def _candidates(before: list[Token], statement: list[Token], known: _Known) -> Iterable[Candidate]:
+    """Everything that fits where `before` ends, unfiltered. `statement` are all the significant tokens of the
+    statement."""
+    parts = qualifier(before)
+    lead = before[:len(before) - 2 * len(parts)]  # what comes before `a.b.`
+    if lead and _leads(lead)[-1:] == [len(lead) - 1]:
+        return _keyspace_candidates(parts, known.tree, known.context)
+    if parts:
+        return _qualified_fields(parts, statement, known)
+    if before and before[-1].kind == TokenKind.DOT:
+        return []  # `a.items[0].`: only a path of plain keys goes on
+    context, _ = clause_context(before)
+    if context == "start":
+        return keywords(SQLPP, "start")
+    if context in ("clause", "relations"):  # "relations" here is a keyspace position this module does not know
+        return keywords(SQLPP, "clause")
+    return _column_candidates(statement, known)
+
+
+def complete_sqlpp(text: str, cursor: int, index: SnapshotIndex | None, context: QueryContext | None,
+                   fields: FieldLookup, seen_fields: Sequence[str]) -> CompletionResult:
+    """Completions at `cursor`, from the snapshot's keyspaces (`index`), the tab's `context`, the sampled `fields` of
+    a keyspace (only read: a sample is made by the user) and the field names `seen_fields` in recent results. Never
+    raises."""
+    cursor = min(max(cursor, 0), len(text))
+    empty = CompletionResult(start=cursor, end=cursor, items=[])
+    known = _Known(index.keyspaces if index is not None else NO_KEYSPACES, context, fields, seen_fields)
+    return guarded("SQL++ completion", cursor, empty, lambda: _complete(text, cursor, known))
+
+
+def _complete(text: str, cursor: int, known: _Known) -> CompletionResult:
+    typed = word_at_cursor(text, cursor, SQLPP)
+    if typed is None:
+        return CompletionResult(start=cursor, end=cursor, items=[])
+    candidates = _candidates(typed.before, typed.statement, known)
+    return CompletionResult(start=typed.start, end=cursor, items=filter_candidates(candidates, typed.prefix))
