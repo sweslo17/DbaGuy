@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -7,6 +8,9 @@ from ..domain.metadata import Folder, NodeKind, ObjectDetail, ObjectNode, PathSe
 from ..domain.profiles import AnyDraft, AnyProfile, Engine, EngineInfo
 from ..domain.schema import RelationKind, SchemaSnapshot
 from ..sql.dialects import Dialect
+
+
+MessageListener = Callable[[ServerMessage], None]
 
 
 @dataclass(frozen=True)
@@ -120,6 +124,11 @@ class DatabaseConnection(ABC):
     @abstractmethod
     def run(self, sql: str) -> StatementResult:
         """Execute one statement/batch (no parameters). Raises StatementError."""
+
+    def set_message_listener(self, listener: MessageListener | None) -> None:
+        """Deliver server messages (SQL Server PRINT, RAISERROR … WITH NOWAIT) to `listener` the moment they arrive,
+        on the thread running the statement, instead of through `StatementResult.take_messages()`; None stops it.
+        The default does nothing: such connections keep reporting messages through take_messages()."""
 
     @abstractmethod
     def in_transaction(self) -> bool: ...

@@ -6,6 +6,7 @@ from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -40,6 +41,7 @@ from ..domain.execution import (
     ResultSetEvent,
     RollbackCommand,
     RowsEvent,
+    ServerMessage,
     SessionStateEvent,
     SetAutocommitCommand,
     StartedEvent,
@@ -440,6 +442,7 @@ class SessionWorker:
             logger.debug("[{}] execute {}: {}", self.name, cmd.request_id, cmd.sql[:2000])
             req.ran = True
             with self._timeout(req):
+                self._listen(req.request_id)
                 result = self.connection.run(cmd.sql)
                 self._open_exec = _OpenExecution(req=req, result=result)
                 self._pump(self._open_exec, cmd.page_size)
@@ -537,6 +540,19 @@ class SessionWorker:
     def _discard_open(self) -> None:
         if self._open_exec is not None:
             self._finish(self._open_exec)
+
+    def _listen(self, request_id: str | None) -> None:
+        """Route messages the connection delivers as they arrive to `request_id`'s Messages (None: stop). Connections
+        without live messages ignore it and keep using take_messages()."""
+        listener = None if request_id is None else partial(self._send_live_message, request_id)
+        try:
+            self.connection.set_message_listener(listener)
+        except Exception:  # a session whose connection is gone still ends its request
+            logger.warning("Could not set the message listener on {}", self.name, exc_info=True)
+
+    def _send_live_message(self, request_id: str, message: ServerMessage) -> None:
+        """Called by the connection on this worker thread, from inside a driver call."""
+        self._send(MessageEvent(request_id=request_id, severity=message.severity, text=message.text))
 
     def _send_messages(self, ex: _OpenExecution) -> None:
         for message in ex.result.take_messages():
@@ -639,6 +655,7 @@ class SessionWorker:
         A failed or cancelled export removes its partial file instead of finishing the document, so the writer's
         `close()` runs only when every row is in.
         """
+        self._listen(req.request_id)
         result = self.connection.run(cmd.sql)
         try:
             columns = result.columns()
@@ -785,6 +802,7 @@ class SessionWorker:
     def _complete(self, req: _Request, *, error: StatementError | None = None, cancelled: bool = False) -> None:
         """End an execute: history record, then session state (+ schema invalidation), then `finished` — so whoever
         has seen `finished` can rely on all three."""
+        self._listen(None)  # every execute and export ends here; a paused result keeps its listener until it does
         timed_out = cancelled and req.timed_out
         if req.history and req.ran:
             status = "error" if error else "timeout" if timed_out else "cancelled" if cancelled else "ok"

@@ -10,7 +10,7 @@ from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager, write_askpass_script
 from dbaguy_backend.domain.errors import ConnectionFailed, SessionBusy, SessionNotFound
-from dbaguy_backend.domain.execution import ExecuteCommand
+from dbaguy_backend.domain.execution import ExecuteCommand, MessageSeverity, ServerMessage
 from dbaguy_backend.domain.profiles import ProfileUpsertRequest
 from dbaguy_backend.services.connection_service import ConnectionService
 from dbaguy_backend.services.profile_service import ProfileService
@@ -282,3 +282,43 @@ def test_reap_idle_skips_sessions_that_stopped_being_idle_or_are_gone(manager_en
     assert list(manager._sessions) == [busy]
     with pytest.raises(SessionNotFound):
         manager.close(stale)
+
+
+# ---- 6. messages a connection delivers while a statement runs reach that request, live ----
+
+class MessagingConnection(FakeConnection):
+    """Delivers one message from inside run(), as SQL Server delivers a PRINT before the rows."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.listener = None
+        self.listeners = []
+
+    def set_message_listener(self, listener) -> None:
+        self.listener = listener
+        self.listeners.append(listener)
+
+    def run(self, sql):
+        if self.listener is not None:
+            self.listener(ServerMessage(severity=MessageSeverity.INFO, text=f"before {sql}"))
+        return super().run(sql)
+
+
+def test_live_messages_reach_the_running_request_before_its_rows():
+    lease = FakeLease(MessagingConnection())
+    worker = SessionWorker("fake", lambda: lease)
+    worker.start()
+    rec = Recorder()
+    worker.set_emitter(rec)
+    try:
+        execute(worker, "m", "rows 3")
+        rec.wait_for(finished("m"))
+        kinds = [e.type for e in rec.events if getattr(e, "request_id", None) == "m"]
+        assert kinds.index("message") < kinds.index("result_set")
+        assert [e.text for e in rec.of("m", "message")] == ["before rows 3"]
+        assert lease.connection.listener is None  # cleared when the request ended
+        execute(worker, "n", "rows 1")
+        rec.wait_for(finished("n"))
+        assert [e.text for e in rec.of("n", "message")] == ["before rows 1"]  # each request gets its own
+    finally:
+        worker.close()
