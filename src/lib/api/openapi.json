@@ -2668,7 +2668,9 @@
           "delete_without_where",
           "drop",
           "truncate",
-          "alter_drop"
+          "alter_drop",
+          "system_keyspace",
+          "merge_delete"
         ],
         "title": "DangerReason",
         "description": "Why a statement is dangerous: the standard safety level asks before running it."
@@ -3432,6 +3434,8 @@
           "drop",
           "truncate",
           "alter_drop",
+          "system_keyspace",
+          "merge_delete",
           "strict_write",
           "strict_ddl",
           "strict_transaction",

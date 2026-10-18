@@ -331,3 +331,90 @@ def test_tsql_levels():
 ])
 def test_tsql_standard_level_keeps_danger_reasons(sql, reasons):
     assert decide_ts(sql) == (A.CONFIRM, reasons)
+
+
+# --- SQL++ (Couchbase) ---------------------------------------------------------------------------------------------
+
+SQ = Dialect.SQLPP
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT * FROM users", "EXPLAIN DELETE FROM users", "ADVISE SELECT * FROM users WHERE a = 1",
+    'INFER users WITH {"sample_size": 5}', "PREPARE p FROM UPSERT INTO users (KEY, VALUE) VALUES ('k', {})",
+    "WITH a AS (SELECT 1 AS x) SELECT a",
+])
+def test_sqlpp_reads_run_read_only(sql):
+    assert SafetyPolicy().check(sql, SQ, "standard", read_only=True).action == A.RUN
+
+
+@pytest.mark.parametrize("sql", [
+    "UPSERT INTO users (KEY, VALUE) VALUES ('k', {})", "EXECUTE p", "EXECUTE FUNCTION f()",
+    "SELECT NEXT VALUE FOR s1", "DELETE FROM system:active_requests", "CREATE INDEX i ON users(a)",
+    "MERGE INTO users u USING orders o ON KEY o.u WHEN MATCHED THEN DELETE", "SET x = 1",
+])
+def test_sqlpp_read_only_bypasses_fail_closed(sql):  # Review Focus 5
+    assert SafetyPolicy().check(sql, SQ, "standard", read_only=True).action == A.BLOCK
+
+
+@pytest.mark.parametrize("sql", [
+    # the words split by comments, line breaks and tabs
+    "DELETE/**/FROM users USE KEYS 'k'", "DELETE -- c\nFROM users", "UPSERT\tINTO users (KEY, VALUE) VALUES ('k', {})",
+    "SELECT NEXT/* c */VALUE\nFOR s1", "SELECT NEXTVAL -- c\nFOR s1", "EXECUTE -- c\nFUNCTION f()", "EXECUTE/**/p",
+    # nested, parenthesised, in a CTE, after a harmless statement
+    "(SELECT NEXT VALUE FOR s1)", "((SELECT 1) UNION (SELECT NEXTVAL FOR s1))",
+    "SELECT (SELECT NEXT VALUE FOR s1) AS n",
+    "WITH a AS (SELECT NEXT VALUE FOR s1 AS n) SELECT a.n", "(DELETE FROM users USE KEYS 'k')",
+    "SELECT 1; DELETE FROM users USE KEYS 'k'", "SELECT 1; SELECT 2; EXECUTE p",
+    # back-ticked or quoted words are no statement; a bare expression, FROM-first select, and unknown words fail closed
+    "`DELETE` FROM users", "`SELECT` 1", "NEXT VALUE FOR s1", "FROM users SELECT *", "1 + 1", "\"SELECT 1\"", "$x",
+    "SELECT 1 FROM users DELETE FROM users", "FOO BAR", "", "-- SELECT 1", "/* SELECT 1 */",
+    "UPDATE STATISTICS FOR users(name)", "ANALYZE KEYSPACE users", "FLUSH COLLECTION dbaguy.app.users",
+    "DROP COLLECTION dbaguy.app.users", "GRANT query_select ON users TO bob", "BUILD INDEX ON users(i)",
+    "DELETE FROM `\\u0073ystem`:prepareds WHERE name = 'p'", "UPDATE system:prepareds SET a = 1 WHERE b = 2",
+])
+def test_sqlpp_read_only_blocks_every_spelling_of_a_write(sql):
+    decision = SafetyPolicy().check(sql, SQ, "standard", read_only=True)
+    assert (decision.action, decision.reasons) == (A.BLOCK, [GuardReason.READ_ONLY])
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT * FROM system:active_requests", "SELECT PREV VALUE FOR s1", "SELECT 1 /* DELETE FROM users */",
+    "SELECT 'DELETE FROM users', `DELETE` FROM ks", "SELECT 1 -- ;DELETE FROM users\n",
+    "EXPLAIN SELECT NEXT VALUE FOR s1",
+    "PREPARE p FROM DELETE FROM users", "(SELECT 1) UNION (SELECT 2)", "SELECT 1;;",
+])
+def test_sqlpp_read_only_still_runs_what_only_looks_like_a_write(sql):
+    assert SafetyPolicy().check(sql, SQ, "standard", read_only=True).action == A.RUN
+
+
+def test_sqlpp_transactions_are_left_to_the_adapter():
+    # Not a safety decision (D-04-13): the policy lets BEGIN WORK through, the Couchbase adapter refuses it.
+    assert SafetyPolicy().check("BEGIN WORK", SQ, "standard", read_only=True).action == A.RUN
+
+
+@pytest.mark.parametrize("sql, reason", [
+    ("DELETE FROM users", GuardReason.DELETE_WITHOUT_WHERE),
+    ("DELETE FROM system:active_requests WHERE clientContextID = 'x'", GuardReason.SYSTEM_KEYSPACE),
+    ("DELETE FROM `\\u0073ystem`:active_requests WHERE clientContextID = 'x'", GuardReason.SYSTEM_KEYSPACE),
+    ("MERGE INTO users u USING orders o ON KEY o.u WHEN MATCHED THEN DELETE", GuardReason.MERGE_DELETE),
+    ("DROP COLLECTION dbaguy.app.users", GuardReason.DROP),
+    ("FLUSH COLLECTION dbaguy.app.users", GuardReason.TRUNCATE),
+])
+def test_sqlpp_dangers_are_confirmed_at_standard(sql, reason):
+    decision = SafetyPolicy().check(sql, SQ, "standard", read_only=False)
+    assert (decision.action, decision.reasons) == (A.CONFIRM, [reason])
+
+
+def test_targeted_sqlpp_writes_run_at_standard():
+    assert SafetyPolicy().check("DELETE FROM users USE KEYS 'k'", SQ, "standard", read_only=False).action == A.RUN
+
+
+def test_sqlpp_levels():
+    check = SafetyPolicy().check
+    assert check("DROP INDEX i ON users", SQ, "relaxed", read_only=False).action == A.RUN
+    assert check("DROP INDEX i ON users", SQ, "standard", read_only=False, confirmed=True).action == A.RUN
+    assert check("UPSERT INTO users (KEY, VALUE) VALUES ('k', {})", SQ, "standard", read_only=False).action == A.RUN
+    strict = check("UPSERT INTO users (KEY, VALUE) VALUES ('k', {})", SQ, "strict", read_only=False)
+    assert (strict.action, strict.reasons) == (A.CONFIRM, [GuardReason.STRICT_WRITE])
+    unknown = check("EXECUTE p", SQ, "strict", read_only=False)
+    assert (unknown.action, unknown.reasons) == (A.CONFIRM, [GuardReason.STRICT_UNKNOWN])

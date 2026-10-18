@@ -752,7 +752,7 @@ export interface components {
          * @description Why a statement is dangerous: the standard safety level asks before running it.
          * @enum {string}
          */
-        DangerReason: "update_without_where" | "delete_without_where" | "drop" | "truncate" | "alter_drop";
+        DangerReason: "update_without_where" | "delete_without_where" | "drop" | "truncate" | "alter_drop" | "system_keyspace" | "merge_delete";
         /** DescribeColumn */
         DescribeColumn: {
             /** Name */
@@ -1059,7 +1059,7 @@ export interface components {
          *     a statement (a read-only connection). Every `DangerReason` is one, with the same value.
          * @enum {string}
          */
-        GuardReason: "update_without_where" | "delete_without_where" | "drop" | "truncate" | "alter_drop" | "strict_write" | "strict_ddl" | "strict_transaction" | "strict_session" | "strict_unknown" | "read_only";
+        GuardReason: "update_without_where" | "delete_without_where" | "drop" | "truncate" | "alter_drop" | "system_keyspace" | "merge_delete" | "strict_write" | "strict_ddl" | "strict_transaction" | "strict_session" | "strict_unknown" | "read_only";
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
