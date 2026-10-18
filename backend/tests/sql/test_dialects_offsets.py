@@ -93,7 +93,18 @@ def test_tsql_literal_never_carries_a_raw_nul():
     assert "\x00" not in json_literal(TS, '{"a": "x\x00"}')
     [statement] = parse(f"SELECT {literal}", TS)  # and it is one valid expression, not a Command fallback
     assert type(statement).__name__ == "Select"
-    assert quote_literal(PG, "a\x00b") == "'a\x00b'" and quote_literal(MY, "a\x00b") == "'a\x00b'"  # TSQL only
+
+
+@pytest.mark.parametrize("dialect, expected, strings", [
+    (MY, "'a\\0b''c\\\\'", 1),  # the \0 escape of MySQL's default sql_mode; a real backslash stays doubled
+    (LITE, "'a' || char(0) || 'b''c\\'", 2),
+])
+def test_no_literal_carries_a_raw_nul(dialect, expected, strings):  # the worker refuses a raw NUL for every engine
+    """PostgreSQL has no entry: its text cannot hold a NUL at all."""
+    literal = quote_literal(dialect, "a\x00b'c\\")
+    assert literal == expected and "\x00" not in literal
+    tokens = [t for t in tokenize(literal, dialect) if t.kind not in INSIGNIFICANT]
+    assert all(t.terminated for t in tokens) and len([t for t in tokens if t.kind == TokenKind.STRING]) == strings
 
 
 def test_tsql_datetime_literals_are_language_neutral():  # R-03b-P10

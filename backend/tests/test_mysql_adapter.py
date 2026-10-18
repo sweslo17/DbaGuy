@@ -18,7 +18,7 @@ from dbaguy_backend.domain.metadata import PathSegment
 from dbaguy_backend.domain.profiles import SshConfig, SslConfig
 from dbaguy_backend.services.connection_service import ConnectionService
 from dbaguy_backend.services.profile_service import ProfileService, ResolvedSecrets
-from dbaguy_backend.sql.dialects import Dialect
+from dbaguy_backend.sql.dialects import Dialect, quote_literal
 from dbaguy_backend.sql.formatting import value_condition
 from dbaguy_backend.sql.select_builder import SortKey, build_browse_select
 from dbaguy_backend.storage.paths import profiles_file
@@ -626,6 +626,26 @@ def test_value_condition_finds_a_json_cell(conn):  # Task 3 carry: the grid's "F
         found = conn.run(f"SELECT id FROM json_cells WHERE {condition}")
         assert found.fetch(10) == [[row_id]], condition
         found.close()
+
+
+def test_a_cell_with_a_nul_character_round_trips_through_a_literal(conn):  # final review minor 5
+    """Copy as INSERT and "Filter by this value" build literals from cells; a raw NUL in them would be refused by the
+    worker (invalid_text), so it is written as the \\0 escape."""
+    conn.run("CREATE TEMPORARY TABLE nul_cells (id INT PRIMARY KEY, t VARCHAR(20))").close()
+    conn.run("INSERT INTO nul_cells VALUES (1, CONCAT('a', CHAR(0), 'b\\\\''c')), (2, 'ab')").close()
+    cells = conn.run("SELECT id, t FROM nul_cells ORDER BY id")
+    [[_, value], _] = [encode_row(row) for row in cells.fetch(5)]
+    cells.close()
+    assert value == "a\x00b\\'c"
+    condition = value_condition(Dialect.MYSQL, "t", value, ColumnCategory.TEXT)
+    assert "\x00" not in condition
+    found = conn.run(f"SELECT id FROM nul_cells WHERE {condition}")
+    assert found.fetch(5) == [[1]], condition
+    found.close()
+    conn.run(f"INSERT INTO nul_cells VALUES (3, {quote_literal(Dialect.MYSQL, value)})").close()  # as copy-as-INSERT
+    copied = conn.run("SELECT id FROM nul_cells WHERE t = CONCAT('a', CHAR(0), 'b\\\\''c') ORDER BY id")
+    assert copied.fetch(5) == [[1], [3]]  # the copied row holds the same value
+    copied.close()
 
 
 @pytest.mark.parametrize("table, column", [

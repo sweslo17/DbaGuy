@@ -181,11 +181,12 @@ _STRING_PREFIXES: dict[Dialect, str] = {  # T-SQL N'…': Unicode, so text outsi
 _ISO_DATETIME: dict[Dialect, bool] = {  # T-SQL: write date and time with a "T", the form no login language misreads
     Dialect.POSTGRES: False, Dialect.SQLITE: False, Dialect.MYSQL: False, Dialect.TSQL: True,
 }
-# What stands for a NUL character inside a quoted literal; None: it is written as is. pymssql hands the SQL to the
-# driver as a C string, so a raw NUL would cut the statement off (error 105). MAX keeps the concatenation from being
-# capped at 4000 characters, which would silently truncate a long value.
+# What stands for a NUL character inside a quoted literal, so the SQL never carries a raw NUL: drivers cut a C string
+# there (pymssql: error 105), and the worker refuses such text for every engine (invalid_text). T-SQL: MAX keeps the
+# concatenation from being capped at 4000 characters, which would silently truncate a long value. MySQL: the `\0`
+# escape of the default sql_mode (which the lexer assumes too). PostgreSQL: None, its text cannot hold a NUL at all.
 _NUL_IN_LITERAL: dict[Dialect, str | None] = {
-    Dialect.POSTGRES: None, Dialect.SQLITE: None, Dialect.MYSQL: None,
+    Dialect.POSTGRES: None, Dialect.SQLITE: "' || char(0) || '", Dialect.MYSQL: "\\0",
     Dialect.TSQL: "' + CAST(NCHAR(0) AS NVARCHAR(MAX)) + N'",
 }
 _DATE_SPACE_TIME = re.compile(r"(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})")
@@ -212,8 +213,8 @@ def qualified(dialect: Dialect, schema: str | None, name: str) -> str:
 
 def quote_literal(dialect: Dialect, value: str) -> str:
     """A string literal that the dialect reads back as exactly `value`: quotes are doubled, and where backslash
-    escapes exist (MySQL's default sql_mode), backslashes are doubled too. T-SQL literals carry the N prefix, and a
-    NUL character becomes a concatenation with NCHAR(0): the text is one expression, never a raw NUL."""
+    escapes exist (MySQL's default sql_mode), backslashes are doubled too. T-SQL literals carry the N prefix. A NUL
+    character never stays raw (`_NUL_IN_LITERAL`): an escape, or a concatenation that keeps the text one expression."""
     if RULES[dialect].backslash_escapes:
         value = value.replace("\\", "\\\\")
     literal = _STRING_PREFIXES[dialect] + "'" + value.replace("'", "''") + "'"
