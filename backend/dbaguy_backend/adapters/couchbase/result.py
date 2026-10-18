@@ -82,6 +82,10 @@ class EventStream:
         assert event is not NOT_READY
         return event
 
+    def queued(self) -> Event | None:
+        """The next event if one is already parsed (no I/O), without taking it."""
+        return self._events[0] if self._events else None
+
     def next_if_ready(self, max_reads: int) -> Event | None | NotReady:
         """As next(), but never waits (ruling B34): while no event is complete it reads one chunk at a time, only when
         the response is ready and at most `max_reads` times, and then gives NOT_READY. The bytes after the object are
@@ -106,6 +110,13 @@ class EventStream:
             self._ended = True
             self._read_trailer(None if max_reads is None else max_reads - reads)
         return event
+
+    def end_if_ready(self, max_reads: int) -> None:
+        """The object has closed and the bytes after it were left (a step's reads ran out, or they had not arrived yet;
+        on TLS the end of the chunked body comes in a record of its own): read them while ready, at most `max_reads`
+        times, so the connection can carry the next request. Nothing to do otherwise."""
+        if self._ended and not self.done:
+            self._read_trailer(max_reads)
 
     def _read_trailer(self, max_reads: int | None) -> None:
         """The last bytes after the object (a newline, the end of the chunked body): usually already here. The answer is
@@ -380,16 +391,23 @@ class CouchbaseResult(StatementResult, RawJsonRows):
     def read_ahead(self, budget: int) -> ReadAhead:
         """One step (see the module docstring): the events the stream already holds, then reads while the response is
         ready, at most READ_AHEAD_STEP_CHUNKS of them, until the rows held take `budget` (FULL; checked after each row,
-        so a row is never split and the events after it stay queued), the answer ends (DONE: `_end()` releases the
-        connection), or nothing more is ready (WAITING when this step read nothing and took nothing, else READING: a
-        chunk inside a long row completes no event and is still progress, B34). A failure is kept for after the held
+        so a row is never split and the rows after it stay queued; the end of the rows already parsed after the last
+        row is still taken, without reading, and after it the step reads on), the answer ends (DONE: `_end()` releases
+        the connection), or nothing more is ready (WAITING when this step read nothing and took nothing, else READING:
+        a chunk inside a long row completes no event and is still progress, B34). A failure is kept for after the held
         rows, and the step says DONE."""
         if self._ended or self._pending is not None:
             return ReadAhead(ReadAheadState.DONE, self._stream.received)
         reads, took = self._stream.reads, False
-        while self.held < budget:
+        while True:
+            if self.held < budget or self._rows_done:  # after the rows only the end's small fields come: read on
+                max_reads = READ_AHEAD_STEP_CHUNKS - (self._stream.reads - reads)
+            elif isinstance(self._stream.queued(), RowEvent | None):
+                return ReadAhead(ReadAheadState.FULL, self._stream.received)
+            else:  # full, but the end of the rows is already parsed: take it without reading (an answer in memory
+                max_reads = 0  # must not look like a stall, or the idle close would drop it)
             try:
-                event = self._stream.next_if_ready(READ_AHEAD_STEP_CHUNKS - (self._stream.reads - reads))
+                event = self._stream.next_if_ready(max_reads)
             except StatementError as exc:  # a cut connection, a protocol error, a cancel
                 self._pending = exc  # raised once the rows held before it are out (Review Focus 2)
                 return self._ahead_done()
@@ -409,7 +427,6 @@ class CouchbaseResult(StatementResult, RawJsonRows):
                 case EndEvent() | None:
                     self._end()  # an error or a stop in the answer is kept for after the held rows
                     return self._ahead_done()
-        return ReadAhead(ReadAheadState.FULL, self._stream.received)
 
     def _ahead_done(self) -> ReadAhead:
         logger.debug("Couchbase read-ahead reached the end of the answer: {} rows held ({} bytes){}", len(self._held),
@@ -418,12 +435,15 @@ class CouchbaseResult(StatementResult, RawJsonRows):
 
     def close(self) -> None:
         """Idempotent. A response read to its end leaves the connection for the next request; any other is abandoned,
-        which stops the request on the server at once (no drain, spec §3.7.2). The rows held are dropped."""
+        which stops the request on the server at once (no drain, spec §3.7.2). The rows held are dropped. An answer
+        whose object has closed but whose last bytes were left by the read-ahead reads them first if they are there
+        (a step's worth of reads, never a wait), so its connection is kept."""
         self._ended = self._rows_done = True
         self._peeked.clear()
         self._held.clear()
         self.held = 0
         try:
+            self._stream.end_if_ready(READ_AHEAD_STEP_CHUNKS)
             self._stream.close()
         finally:
             self._release()

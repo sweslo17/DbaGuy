@@ -543,10 +543,32 @@ def test_chunked_body_decodes_at_every_split():  # B33: what has arrived is deco
 
 @pytest.mark.parametrize("body, problem", [
     (b"zz\r\n", "not a hexadecimal number"), (b"-5\r\nabcde\r\n", "not a hexadecimal number"),
-    (b"3\r\nabcXY", "not followed by CRLF"), (b"0\r\n\r\nmore", "data after the last chunk"),
-    (b"1" * 5000, "too long"),
+    (b"3\r\nabcXY", "not followed by CRLF"), (b"1" * 5000, "too long"),
 ])
 def test_chunked_body_refuses_broken_framing_with_a_fixed_text(body, problem):
     with pytest.raises(ValueError, match=problem) as error:
         ChunkedBody().feed(body)
     assert "zz" not in str(error.value)  # never the peer's bytes
+
+
+def test_bytes_after_the_last_chunk_are_dropped_and_flagged():  # the body before them is whole
+    decoder = ChunkedBody()
+    assert decoder.feed(_chunked(b"abc", b"def") + b"more") == b"abcdef" and decoder.done and decoder.extra
+    clean = ChunkedBody()
+    assert clean.feed(_chunked(b"abc")) == b"abc" and clean.done and not clean.extra
+
+
+def test_an_answer_with_bytes_after_its_end_is_whole_and_its_connection_is_not_reused():
+    server = FakeQueryServer([Reply(OK, after_end=b"HTTP/1.1 200 OK\r\n"), Reply(OK)])
+    client = node(server)
+    logged = []
+    sink = logger.add(lambda message: logged.append(message.record["message"]), level="WARNING")
+    try:
+        response = send(client)
+        assert read_all(response) == OK and response.done  # not a lost connection: the statement finished
+        assert read_all(send(client)) == OK and server.connections == 2  # what followed is never read as an answer
+        assert any("sent bytes after the end of an answer" in line for line in logged)
+    finally:
+        logger.remove(sink)
+        client.close()
+        server.close()

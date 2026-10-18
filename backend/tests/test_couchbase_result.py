@@ -178,11 +178,11 @@ def test_a_non_json_answer_is_reported_by_its_status():
 OK_ONE = Reply(b'{"signature":{"a":"number"},"results":[{"a":1}],"status":"success"}')
 
 
-def fake_connection(replies, **profile_fields):
-    server = FakeQueryServer(replies)
+def fake_connection(replies, server_tls=None, client_tls=None, **profile_fields):
+    server = FakeQueryServer(replies, tls=server_tls)
     profile = make_couchbase_profile(port=server.port, **profile_fields)
     settings = connection_settings(profile, Endpoint("127.0.0.1", server.port), None)
-    client = NodeClient("127.0.0.1", server.port, auth=basic_auth("u", "p"), user_agent="t", tls=None)
+    client = NodeClient("127.0.0.1", server.port, auth=basic_auth("u", "p"), user_agent="t", tls=client_tls)
     connection = CouchbaseConnection(client, settings=settings,
                                      info=ServerInfo(engine=Engine.COUCHBASE, version="Couchbase Server test"))
     return server, connection

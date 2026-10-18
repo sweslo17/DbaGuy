@@ -2,6 +2,9 @@
 READ_AHEAD_BYTES, in order, with any error after them; and against the dev cluster, a result that fits is read to its
 end while a larger one keeps the server's request open."""
 
+import shutil
+import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -42,6 +45,26 @@ def numbers_body(count: int) -> bytes:
 
 def numbers(result, n):
     return [row[0] for row in result.fetch(n)]
+
+
+SECOND = Reply(b'{"signature":{"n":"number"},"results":[{"n":7}],"status":"success"}')
+
+
+@pytest.fixture
+def tls_pair(tmp_path):
+    """A certificate for 127.0.0.1 made now: the fake server's context, and a client context that trusts it."""
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl is not installed")
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    subprocess.run(
+        [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert), "-days", "1",
+         "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
+        check=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=60,
+    )
+    server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server.load_cert_chain(cert, key)
+    return server, ssl.create_default_context(cafile=str(cert))
 
 
 def test_parse_row_rebuilds_what_the_parser_made():  # Review Focus 2: exact literals survive the re-parse
@@ -185,6 +208,22 @@ def test_the_star_peek_comes_before_the_held_rows():  # Review Focus 2: a page s
     assert numbers(result, 5000) == list(range(100, 3000))  # the peek's rest, the held rows, then the stream
 
 
+@pytest.mark.parametrize("split_after_rows", [False, True], ids=["end-parsed", "end-in-the-next-read"])
+def test_a_last_row_that_fills_the_budget_still_ends_the_answer(split_after_rows):  # Q2: an answer in memory is no stall
+    body = numbers_body(100)
+    cut = body.index(b"]") + 1 if split_after_rows else len(body)
+    result, _, released = result_of(*[part for part in (body[:cut], body[cut:]) if part], sql="SELECT n FROM ks",
+                                    bare_star=False)
+    result.columns()
+    assert numbers(result, 1) == [0]
+    budget = sum(row_cost(f'{{"n":{i}}}') for i in range(1, 100))  # the last row fills it exactly
+    step = result.read_ahead(budget)
+    while step.state is ReadAheadState.READING:
+        step = result.read_ahead(budget)
+    assert step.state is ReadAheadState.DONE and released and result.held == budget
+    assert numbers(result, 200) == list(range(1, 100))
+
+
 def test_received_counts_what_a_load_more_read_too():  # B44: every byte of the answer, by any path
     body = numbers_body(5000)
     result, response, _ = result_of(*chunked(body, 1024), sql="SELECT n FROM ks", bare_star=False)
@@ -207,6 +246,47 @@ def test_an_answer_read_ahead_to_its_end_keeps_its_connection(chunked_body):  # 
         assert numbers(result, 5000) == list(range(10, 3000))
         assert numbers(connection.run("SELECT n FROM ks"), 10) == [7] and server.connections == 1
     finally:
+        connection.close()
+        server.close()
+
+
+@pytest.mark.parametrize("use_tls", [False, True], ids=["plain", "tls"])
+def test_an_end_that_arrives_after_the_read_ahead_keeps_the_connection(use_tls, request):  # TLS: a record of its own
+    tls = request.getfixturevalue("tls_pair") if use_tls else (None, None)
+    end = threading.Event()
+    server, connection = fake_connection([Reply(numbers_body(3000), end_hold=end), SECOND], server_tls=tls[0],
+                                         client_tls=tls[1])
+    try:
+        result = connection.run("SELECT n FROM ks")
+        result.columns()
+        wait_until(lambda: result.read_ahead(BIG).state is ReadAheadState.DONE, 5)  # the object has closed
+        end.set()  # the end of the chunked body comes after the last step
+        wait_until(connection._client._channel.readable, 5)
+        assert numbers(result, 5000) == list(range(3000))
+        assert numbers(connection.run("SELECT n FROM ks"), 10) == [7] and server.connections == 1
+    finally:
+        end.set()
+        connection.close()
+        server.close()
+
+
+def test_tls_bytes_openssl_has_already_decrypted_are_read_ahead(tls_pair):  # `pending()`: no select() sees them
+    # The head and 13 KB of body in one record (some TLS terminators fill records): http.client reads the head 8 KiB at a
+    # time, so OpenSSL keeps the rest of that record decrypted while the socket itself is empty.
+    hold = threading.Event()
+    body = numbers_body(2500)
+    server, connection = fake_connection([Reply(body, hold=hold)], server_tls=tls_pair[0], client_tls=tls_pair[1])
+    try:
+        result = connection.run("SELECT n FROM ks")
+        result.columns()
+        steps = [result.read_ahead(BIG) for _ in range(5)]
+        assert steps[-1].state is ReadAheadState.WAITING
+        assert steps[-1].received == len(body) // 2  # the whole first record, while the server holds the rest
+        hold.set()
+        wait_until(lambda: result.read_ahead(BIG).state is ReadAheadState.DONE, 5)
+        assert numbers(result, 5000) == list(range(2500))
+    finally:
+        hold.set()
         connection.close()
         server.close()
 

@@ -188,13 +188,15 @@ class ChunkedBody:
     """The chunked transfer coding (RFC 9112 §7.1) decoded from whatever bytes have arrived. A size line or a CRLF cut
     between two reads waits here for the rest, so a read never asks the socket for more than it holds (http.client's
     own decoding reads a size line to its end, which blocks when the server has sent a chunk and not the next one).
-    ValueError, with a fixed text (never the peer's bytes), when the framing is broken."""
+    ValueError, with a fixed text (never the peer's bytes), when the framing is broken. Bytes after the end are not the
+    query service either, but the body before them is whole: they are dropped and `extra` says so."""
 
     def __init__(self) -> None:
         self._buf = bytearray()
         self._left = 0  # data bytes still to come in the current chunk
         self._state = "size"  # size | data | crlf | trailer | done
         self.done = False  # the last chunk and the trailer have been read
+        self.extra = False  # bytes came after the end (dropped): the connection must not carry another request
 
     def feed(self, data: bytes) -> bytes:
         """The body bytes `data` completes (possibly none: framing only)."""
@@ -235,7 +237,8 @@ class ChunkedBody:
                 self._state = "data" if self._left else "trailer"
             else:  # done
                 if self._buf:
-                    raise ValueError("data after the last chunk")
+                    self.extra = True
+                    self._buf.clear()
                 return bytes(out)
 
 
@@ -445,7 +448,12 @@ class QueryResponse:
             self.done = True
             if self._chunked is not None:
                 self._response.close()  # as http.client does after the last chunk: the connection takes a new request
-            if self._response.will_close:
+            if self._chunked is not None and self._chunked.extra:
+                # the answer is whole, but what came after it would be read as the start of the next answer
+                logger.warning("The query node {} sent bytes after the end of an answer; its connection is not reused",
+                               _endpoint_label(self._channel.host, self._channel.port))
+                self._channel.close()
+            elif self._response.will_close:
                 self._channel.close()
             else:
                 self._channel.idle_since = self._clock()

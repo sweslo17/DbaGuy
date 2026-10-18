@@ -18,6 +18,9 @@ class Reply:
     before_head: threading.Event | None = None  # send nothing until set (a long aggregate: no status line yet)
     chunked: bool = True  # False: a `Content-Length` body (what the server sends for a small answer)
     cut: bool = False  # close the connection after the first half (a node that died mid-answer)
+    # send the end of the chunked body ("0\r\n\r\n") in a write of its own once set (with TLS: a record of its own)
+    end_hold: threading.Event | None = None
+    after_end: bytes = b""  # bytes sent right after the body, in the same write (never the query service)
 
 
 def _chunk(data: bytes) -> bytes:
@@ -26,10 +29,11 @@ def _chunk(data: bytes) -> bytes:
 
 class FakeQueryServer:
     """Serves each request with the next Reply (chunked unless told otherwise), kept alive; counts connections and
-    records request bodies."""
+    records request bodies. `tls`: a server context, so each write of up to 16 KiB is one TLS record."""
 
-    def __init__(self, replies: list[Reply]) -> None:
+    def __init__(self, replies: list[Reply], tls: ssl.SSLContext | None = None) -> None:
         self.replies = list(replies)
+        self._tls = tls
         self.bodies: list[bytes] = []
         self.connections = 0
         self._server = socket.create_server(("127.0.0.1", 0))
@@ -46,6 +50,12 @@ class FakeQueryServer:
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
     def _handle(self, conn: socket.socket) -> None:
+        if self._tls is not None:
+            try:
+                conn = self._tls.wrap_socket(conn, server_side=True)
+            except OSError:
+                conn.close()
+                return
         # The reader closes with the connection: a file object left open would keep the descriptor (and the client's
         # wait) alive after the handler ends.
         with conn, conn.makefile("rb") as reader:
@@ -71,7 +81,13 @@ class FakeQueryServer:
                         return
                     if reply.hold is not None:
                         reply.hold.wait(10)
-                    conn.sendall(frame(reply.body[half:]) + (b"0\r\n\r\n" if reply.chunked else b""))
+                    end = (b"0\r\n\r\n" if reply.chunked else b"") + reply.after_end
+                    if reply.end_hold is not None:
+                        conn.sendall(frame(reply.body[half:]))
+                        reply.end_hold.wait(10)
+                        conn.sendall(end)
+                    else:
+                        conn.sendall(frame(reply.body[half:]) + end)
                     if reply.close or reply.drop_after:
                         return
             except OSError:
