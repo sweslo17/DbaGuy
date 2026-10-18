@@ -29,9 +29,19 @@ The SQL Server image is amd64 only, so it runs under Rosetta (`platform: linux/a
 SQL Server has no init directory, so the seed runs in the one-shot `mssql-init` container (`mssql/seed.sh`, which feeds
 `mssql/init/*.sql` to `sqlcmd -C -I -b`). It skips the seed when `dbaguy.dbo.seed_done` already exists, and then stays up idle
 instead of exiting, because `docker compose up --wait` fails once a one-shot service has exited. That is what makes repeated
-`up -d --build --wait` runs succeed; `docker stop` ends the idle container at once.
+`up -d --build --wait` runs succeed; `docker stop` ends the container at once, idle or still seeding.
 
-`--wait` covers the seed because the `mssql` healthcheck looks for `seed_done`, the last table the seed creates. To re-seed:
+`--wait` covers the seed because the `mssql` healthcheck looks for `seed_done`, the last table the seed creates.
+
+A seed that was stopped or failed half-way leaves no `seed_done`. (`sqlcmd -b` stops at the first error and `mssql-init`
+exits non-zero; the error is in `docker logs dbaguy-dev-mssql-init-1`.) The next `up` runs the seed again from the start, and
+`init/00-databases.sql` first drops the databases and the login the earlier run left behind, so no manual cleanup is needed.
+Two things to expect: `--wait` does not notice the exited one-shot, it ends only when the `mssql` healthcheck gives up (about
+5 minutes, "mssql is unhealthy"), and the first `up --wait` after you fixed the seed can still report that stale unhealthy
+state. The seed has been restarted by then, so run the command once more.
+
+Editing the seed files has no effect on a seeded server: to apply an edit, or to start from an empty server, remove both
+containers and start them again:
 
 ```sh
 docker compose -f dev/docker-compose.yml rm -sfv mssql mssql-init

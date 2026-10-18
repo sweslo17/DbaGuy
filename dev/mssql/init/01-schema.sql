@@ -52,6 +52,11 @@ GO
 CREATE TABLE dbo.[Order Items] (id int IDENTITY(1, 1) PRIMARY KEY, [select] nvarchar(50), [order] int);
 CREATE TABLE dbo.[brack]]et] ([a]]b] int NOT NULL PRIMARY KEY, label nvarchar(20));
 GO
+-- CJK identifiers, a reserved word as a table name, and sql_variant values (a CJK one is the worst case for encodings).
+CREATE TABLE dbo.[客戶備註] ([編號] int PRIMARY KEY, [內容] nvarchar(50));
+CREATE TABLE dbo.[group] ([id] int PRIMARY KEY, [order] int);
+CREATE TABLE dbo.variant_cases (id int PRIMARY KEY, v sql_variant);
+GO
 CREATE TABLE dbo.job_log (id int IDENTITY(1, 1) PRIMARY KEY, message nvarchar(200), created_at datetime2 DEFAULT SYSUTCDATETIME());
 GO
 CREATE SEQUENCE sales.order_seq AS bigint START WITH 1000 INCREMENT BY 10;

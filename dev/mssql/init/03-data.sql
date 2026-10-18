@@ -17,6 +17,9 @@ INSERT INTO dbo.types_demo (id, huge, amount, price, ratio, flag, guid, born, se
     (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, CAST(N'abc' AS sql_variant), NULL);
 INSERT INTO dbo.[Order Items] ([select], [order]) VALUES (N'first', 1);
 INSERT INTO dbo.[brack]]et] ([a]]b], label) VALUES (1, N'one');
+INSERT INTO dbo.[客戶備註] ([編號], [內容]) VALUES (1, N'測試');
+INSERT INTO dbo.[group] ([id], [order]) VALUES (1, 42);
+INSERT INTO dbo.variant_cases (id, v) VALUES (1, CAST(N'中文' AS sql_variant)), (2, CAST(42 AS sql_variant));
 INSERT INTO dbo.job_log (message) VALUES (N'seeded');
 GO
 USE analytics;

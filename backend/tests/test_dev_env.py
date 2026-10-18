@@ -88,5 +88,26 @@ def test_dev_mssql_is_seeded():
         assert one("SELECT legacy FROM dbo.types_demo WHERE id = 1") == "中文"  # a Chinese_Taiwan varchar column
         assert one("SELECT label FROM dbo.[brack]]et]") == "one"
         assert one("SELECT HAS_DBACCESS('locked_away')") == 0
+        # CJK identifiers: the server stores the UTF-16 code units (checked as hex, so a symmetric client-side mix-up
+        # cannot hide), and the names and the value come back intact.
+        table = "OBJECT_ID(N'dbo.[客戶備註]')"
+        hex_of_name = "CONVERT(varchar(100), CAST(name AS varbinary(100)), 1)"
+        assert one(f"SELECT {hex_of_name} FROM sys.tables WHERE object_id = {table}") == (
+            "0x" + "客戶備註".encode("utf-16-le").hex().upper()
+        )
+        assert one(f"SELECT name FROM sys.tables WHERE object_id = {table}") == "客戶備註"
+        assert one(f"SELECT name FROM sys.columns WHERE object_id = {table} AND column_id = 1") == "編號"
+        assert one(f"SELECT name FROM sys.columns WHERE object_id = {table} AND column_id = 2") == "內容"
+        assert one("SELECT [內容] FROM dbo.[客戶備註] WHERE [編號] = 1") == "測試"
+        # A reserved word as a table name.
+        assert one("SELECT [order] FROM dbo.[group] WHERE [id] = 1") == 42
+        # sql_variant: pymssql returns a plain variant as bytes (UTF-8 text for an nvarchar one), a CAST the value.
+        base_type = "SELECT CAST(SQL_VARIANT_PROPERTY(v, 'BaseType') AS varchar(20)) FROM dbo.variant_cases WHERE id = "
+        assert one("SELECT COUNT(*) FROM dbo.variant_cases") == 2
+        assert one(base_type + "1") == "nvarchar"
+        assert one(base_type + "2") == "int"
+        assert one("SELECT CAST(v AS nvarchar(50)) FROM dbo.variant_cases WHERE id = 1") == "中文"
+        assert one("SELECT v FROM dbo.variant_cases WHERE id = 1").decode("utf-8") == "中文"
+        assert one("SELECT CAST(v AS int) FROM dbo.variant_cases WHERE id = 2") == 42
     finally:
         conn.close()
