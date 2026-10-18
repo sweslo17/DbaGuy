@@ -405,8 +405,12 @@ class NodeClient:
         reused = channel.used
         channel.used, channel.idle_since = True, None
         try:
+            # Set for every request, before the body goes out on a kept-alive channel (it may carry an internal
+            # query's deadline into a user's statement) and again once request() has connected a new one
+            if channel.conn.sock is not None:
+                channel.conn.sock.settimeout(read_timeout)
             channel.conn.request("POST", QUERY_PATH, body=body, headers=self._headers)
-            if channel.conn.sock is not None:  # set for every request: a kept-alive channel carries a user's next one
+            if channel.conn.sock is not None:
                 channel.conn.sock.settimeout(read_timeout)
             response = channel.conn.getresponse()
         except ChannelError:  # cancelled while connecting
