@@ -196,3 +196,18 @@ MSSQL 依使用者指示：遇到真正卡點（例如 Rosetta 下無法穩定�
 | MySQL 純 Python 串流太慢 | 量測 10 萬列；超過 PG 3 倍改 C extension |
 | T-SQL 以批次為單位，沒有 `GO` 的大腳本 ⌘↵ 會跑整份 | 與 SSMS 相同；執行前高亮整個範圍，使用者看得到；可選取部分執行 |
 | `information_schema` 很慢（大量表） | 10,000 關聯以上只載入目前資料庫 |
+
+## 8. 規劃階段的勘誤（03b，實測後修正，以 plan 為準）
+
+詳細理由見 [plan 03b](../plans/2026-10-18-03b-sql-server.md) 的 "Spec issues found while planning" 與 Rulings。
+
+- 欄位型別描述改用 `sys.dm_exec_describe_first_result_set`（DMF），不用 `sp_describe_first_result_set`：後者在 `XACT_ABORT ON` 的交易中出錯會 rollback 使用者的交易。DMF 在手動模式會開隱含交易，需包住。
+- Commit／Rollback 用 `WHILE @@TRANCOUNT > 0 COMMIT`，`IF` 只會關掉一層巢狀交易。
+- pymssql 的 `encryption` 只有 off／request／require，CA 與主機名驗證要靠 DbaGuy 產生的 `freetds.conf`；`request` 只加密登入（對話框標示）；verify-* 必須給 CA 檔；不支援 strict。
+- T-SQL 不需要 BEGIN…END body 追蹤（`;` 本來就不切 T-SQL）；需要的是「模組定義獨佔整個批次」。
+- sqlglot 只在語句間有 `;` 時才能逐句解析 T-SQL，所以要有自己的語句切割器（`sql/tsql.py`）再逐句分類；表格篩選守衛也要有 T-SQL 規則。
+- DB-Lib 的 20003 等連線錯誤在 `min_error_severity = 11` 下不會出現（斷線是 error 0），改用 `SELECT 1` 檢查連線是否還活著。
+- 型別：`datetime` 最多三位小數（error 241）、decimal 用純數字字串、datetimeoffset 第 7 位小數會遺失。
+- `GO 0` 不執行，`GO n` 上限 1,000。
+- 只設旗標的取消無法停止 server 扣住最後一個封包期間的後續語句（記為已知限制）；使用者開 `XACT_ABORT ON` 時，取消會 rollback 交易（SQL Server 行為）。
+- pymssql 每個批次只回報一個影響列數；批次中途出錯後看不到後續結果但批次會繼續跑（已知限制）。
