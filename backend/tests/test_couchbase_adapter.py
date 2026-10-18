@@ -454,6 +454,10 @@ def test_a_failed_connect_names_its_cause_and_the_fix(tmp_path):  # R-04a-F1: th
             open_couchbase(port=port, ssl=SslConfig(mode=mode))
         assert error.value.message == (
             "HTTP 404 Object Not Found\nThis port is not the query service (8093, or 18093 with TLS)")
+    with pytest.raises(ConnectionFailed) as error:  # plain HTTP to the TLS query port: a non-JSON 400
+        open_couchbase(port=18093, ssl=SslConfig(mode="disable"))
+    assert error.value.message.endswith(
+        "This port may expect TLS: set SSL mode to require or verify-ca (18093 is the query service over TLS)")
 
 
 @requires_couchbase_bastion

@@ -88,6 +88,11 @@ _TLS_HINTS = {
 }
 # The cluster manager (8091, 18091) answers a query request with 404; so does anything else that is not the service.
 _NOT_QUERY_SERVICE = "This port is not the query service (8093, or 18093 with TLS)"
+# A TLS port (18093, 18091) answers a plain-HTTP request with a non-JSON 400 ("Client sent an HTTP request to an HTTPS
+# server"); only said when this profile did not ask for TLS.
+_BAD_REQUEST = "http_400"
+_PLAIN_TO_TLS_PORT = ("This port may expect TLS: set SSL mode to require or verify-ca "
+                      "(18093 is the query service over TLS)")
 
 
 @dataclass(frozen=True)
@@ -408,6 +413,8 @@ class CouchbaseAdapter(DatabaseAdapter):
                     raise ConnectionFailed(f"{exc.message}\nCheck the user name and password") from exc
                 if exc.code == _NOT_FOUND:  # the answer to a query request on the cluster manager's port, say
                     raise ConnectionFailed(f"{exc.message}\n{_NOT_QUERY_SERVICE}") from exc
+                if exc.code == _BAD_REQUEST and settings.tls is None:  # plain HTTP to a TLS port
+                    raise ConnectionFailed(f"{exc.message}\n{_PLAIN_TO_TLS_PORT}") from exc
                 raise ConnectionFailed(exc.message) from exc  # TLS failures carry their hint already
             except BaseException:
                 connection.close()
