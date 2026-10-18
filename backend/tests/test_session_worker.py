@@ -780,7 +780,9 @@ class ScriptedResult(FakeResult):
 
 
 class ReadAheadConnection(FakeConnection):
-    """`rows N` returns a ScriptedResult sharing the connection's `script`."""
+    """`rows N` returns a ScriptedResult (or `result_type`) sharing the connection's `script`."""
+
+    result_type = ScriptedResult
 
     def __init__(self) -> None:
         super().__init__()
@@ -791,7 +793,7 @@ class ReadAheadConnection(FakeConnection):
         result = super().statement(sql, options)
         if not sql.startswith("rows "):
             return result
-        scripted = ScriptedResult(int(sql.split()[1]), self.script)
+        scripted = self.result_type(int(sql.split()[1]), self.script)
         self.results.append(scripted)
         return scripted
 
@@ -1010,8 +1012,13 @@ def test_a_failing_read_ahead_step_never_ends_the_worker(monkeypatch):  # B32: t
         _barrier(worker)  # the loop went on after the failure
         assert worker._thread.is_alive()
         assert [r for r in logged if r["message"] == "Session task failed on fake" and r["exception"] is not None]
+        calls = conn.results[0].calls
+        time.sleep(0.3)  # a step that failed is not repeated until the next pause (it would spin, failing each time)
+        assert conn.results[0].calls <= calls + 1 and worker.paused_read_ahead() is ReadAheadState.FULL
+        assert worker._paused.since == 1000.0  # it stopped reading: the server is held back from there (as FULL)
         worker.submit(FetchMoreCommand(request_id="p", count=500))
         rec.wait_for(paused("p", 1000))
+        wait_until(lambda: conn.results[0].calls > calls + 1)  # the next pause reads on
         worker.cancel("p")  # paused: a discard
         rec.wait_for(finished("p"))
         assert conn.results[0].closed
@@ -1021,3 +1028,104 @@ def test_a_failing_read_ahead_step_never_ends_the_worker(monkeypatch):  # B32: t
     finally:
         worker.close()
         logger.remove(sink)
+
+
+class GatedResult(ScriptedResult):
+    """A ScriptedResult whose next read-ahead step, once `gate_next` is set, sets `entered` and waits inside
+    read_ahead() for the step the test puts in `release`."""
+
+    def __init__(self, rows: int, script: queue.Queue) -> None:
+        super().__init__(rows, script)
+        self.gate_next = threading.Event()
+        self.entered = threading.Event()
+        self.release: queue.Queue = queue.Queue()
+
+    def read_ahead(self, budget: int) -> ReadAhead:
+        if not self.gate_next.is_set():
+            return super().read_ahead(budget)
+        self.gate_next.clear()
+        self.entered.set()
+        self.calls += 1
+        step = self.release.get(timeout=10)
+        self.received = step.received
+        return step
+
+
+def test_a_close_decided_on_the_old_stall_loses_to_a_step_that_ends_it():  # the mark is compared by value (E1)
+    clock = Clock()
+    connection = ReadAheadConnection()
+    connection.result_type = GatedResult
+    worker, _, rec = make_worker(connection, clock=clock, paused_result_max_idle_s=45.0, read_ahead_bytes=1 * MIB)
+    try:
+        execute(worker, "p", "rows 5000")
+        rec.wait_for(paused("p", 500))
+        connection.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB))  # stopped at 1000.0
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        worker.submit(FetchMoreCommand(request_id="p", count=500))
+        rec.wait_for(paused("p", 1000))
+        wait_until(lambda: worker._paused.since == 1000.0)  # the first step after the pause brought the stall back
+        result = connection.results[0]
+        result.gate_next.set()
+        assert result.entered.wait(5)  # a step is inside read_ahead()
+        clock.now = 1050.0
+        worker.check_paused_result()  # decided on the stall that began at 1000.0: a close is queued behind the step
+        result.release.put(ReadAhead(ReadAheadState.READING, 3 * MIB))  # 2 MiB since the stall: the server is unblocked
+        _barrier(worker)
+        assert not rec.of("p", "finished") and worker._paused.since is None
+    finally:
+        worker.close()
+
+
+def test_a_close_checked_before_the_first_step_after_a_load_more_cannot_use_the_old_stall():  # E2 (B44)
+    clock = Clock()
+    rec = HoldingRecorder(lambda e: e.type == "result_set_end" and e.has_more and e.row_count == 2500)
+    connection = ReadAheadConnection()
+    worker, _, _ = make_worker(connection, clock=clock, recorder=rec, paused_result_max_idle_s=45.0,
+                               read_ahead_bytes=1 * MIB)
+    try:
+        execute(worker, "p", "rows 5000")
+        rec.wait_for(paused("p", 500))
+        connection.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB))  # stopped at 1000.0
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1050.0
+        for _ in range(40):  # the Load more's fetch() drains 2 MiB (2 × the budget); the socket stays empty after it
+            connection.script.put(ReadAhead(ReadAheadState.WAITING, 3 * MIB))
+        worker.submit(FetchMoreCommand(request_id="p", count=2000))
+        assert rec.holding.wait(5)  # inside the pause at 2500: its mark is published, no step has run yet
+        worker.check_paused_result()  # 50 s after the stall began
+        rec.proceed.set()
+        _barrier(worker)  # a close queued by the check would run before any step
+        assert not rec.of("p", "finished")
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.WAITING)
+        worker.check_paused_result()
+        _barrier(worker)
+        assert not rec.of("p", "finished") and worker._paused.since is None
+    finally:
+        worker.close()
+
+
+class InstantResult(ScriptedResult):
+    """Answers every read-ahead step at once with `state` (no wait in the fake): only the worker paces the steps."""
+
+    state = ReadAheadState.FULL
+
+    def read_ahead(self, budget: int) -> ReadAhead:
+        self.calls += 1
+        return ReadAhead(self.state, 0)
+
+
+@pytest.mark.parametrize("state, most", [
+    (ReadAheadState.FULL, 1), (ReadAheadState.DONE, 1), (ReadAheadState.WAITING, 4),
+])
+def test_steps_stop_after_full_or_done_and_poll_after_waiting(state, most):  # E7: 0.25 s polls, never a busy loop
+    connection = ReadAheadConnection()
+    connection.result_type = type("Instant", (InstantResult,), {"state": state})
+    worker, _, rec = make_worker(connection, clock=Clock(), paused_result_max_idle_s=45.0, read_ahead_bytes=1 * MIB)
+    try:
+        execute(worker, "p", "rows 5000")
+        rec.wait_for(paused("p", 500))
+        wait_until(lambda: connection.results[0].calls >= 1)  # the step at the pause
+        time.sleep(0.6)
+        assert connection.results[0].calls <= most
+    finally:
+        worker.close()

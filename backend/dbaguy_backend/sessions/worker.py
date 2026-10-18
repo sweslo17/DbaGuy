@@ -180,7 +180,8 @@ class _PausedMark:
     token: int  # tells two pauses of the same request apart
     request_id: str
     # The worker's clock where the stall began (the idle limit counts from it): where the read-ahead stopped, or the
-    # first pause for an engine without read-ahead (R-04a-T11b). None: nothing holds the server back.
+    # first pause for an engine without read-ahead (R-04a-T11b). None: nothing holds the server back, or a pause that
+    # reads on before its first step (which publishes the stall clock's `since`).
     since: float | None
 
 
@@ -217,7 +218,8 @@ class SessionWorker:
     `result.read_ahead()` between tasks, only when none is queued. A step never blocks and touches only the open result,
     so a queued task (Cancel, Discard, Load more, a new statement, close) waits at most one step; nothing is running
     meanwhile, so a cancel queues a discard and never reaches the connection. Each step moves the paused mark's `since`
-    with the stall clock (`read_ahead.StallClock`), which the idle close counts from.
+    with the stall clock (`read_ahead.StallClock`), which the idle close counts from; a pause that reads on publishes no
+    stall until its first step. A step that fails stops the read-ahead until the next pause.
 
     Every request ends with exactly one `finished`, and a `session_state` immediately before it.
     """
@@ -363,9 +365,9 @@ class SessionWorker:
         request holds a query servicer, R-04-6) has passed on the stall clock: since where its read-ahead stopped, or,
         for an engine without read-ahead, since the result's FIRST pause (a Load more does not restart it, R-04a-T11b;
         Couchbase ends a stalled request on its own 77–86 s after the stall began, and a small refill does not unstall
-        it, A23). A result read to its end, or still reading, is never closed. Any thread; the close itself runs on the
-        worker thread, and only if the result is still in the same pause with the same stall start by then (a Load more
-        or a read-ahead step racing the close wins)."""
+        it, A23). A result read to its end, or whose read-ahead never stopped, is never closed. Any thread; the close
+        itself runs on the worker thread, and only if the result is still in the same pause with the same stall start by
+        then (a Load more or a read-ahead step racing the close wins)."""
         limit = self._hooks.capabilities.paused_result_max_idle_s
         if limit is None:
             return
@@ -485,6 +487,8 @@ class SessionWorker:
                     task()
             except Exception:
                 logger.exception("Session task failed on {}", self.name)
+                if task is _READ_AHEAD:
+                    self._stop_read_ahead()
 
     def _next_task(self) -> object:
         """The next queued task. While a paused result reads ahead the queue is never waited on for long: an empty
@@ -540,6 +544,19 @@ class SessionWorker:
         else:
             logger.debug("[{}] read-ahead of {}: {} ({} bytes read)", self.name, ex.request_id, step.state,
                          step.received)
+
+    def _stop_read_ahead(self) -> None:
+        """A read-ahead step failed in the worker's own code (a bug): step no more until the next pause, or it would
+        fail again at once (a core spinning, a log full of tracebacks). As after a failing read_ahead() (FULL), the
+        server is held back from here on: the mark keeps the stall start, or one starts now. Must never raise."""
+        ex = self._open_exec
+        if ex is None:
+            return
+        since = ex.stall.since if ex.stall.since is not None else self._clock()
+        with self._state_lock:
+            ex.ahead = ReadAheadState.FULL
+            if self._paused is not None and self._paused.request_id == ex.request_id:
+                self._paused = replace(self._paused, since=since)
 
     def _send(self, event: BaseModel) -> None:
         with self._emit_lock:
@@ -748,10 +765,14 @@ class SessionWorker:
         budget = self._hooks.capabilities.read_ahead_bytes
         if budget is None:  # no read-ahead: the server is held back from the first pause on (R-04a-T11b)
             ex.stall.update(ReadAhead(ReadAheadState.FULL), self._clock())
+        reads_on = budget is not None and ex.ahead is not ReadAheadState.DONE
         with self._state_lock:  # before any event: the idle check may look at this pause now
-            if budget is not None and ex.ahead is not ReadAheadState.DONE:
+            if reads_on:
                 ex.ahead = ReadAheadState.READING  # read on while it waits (a Load more freed room); seen with the mark
-            self._paused = _PausedMark(next(self._pause_tokens), ex.request_id, ex.stall.since)
+            # A result that reads on gets its stall back from its first step, which re-evaluates it first (the Load more
+            # may have drained enough to unblock the server, B44); until then nothing may close it on the old start.
+            since = None if reads_on else ex.stall.since
+            self._paused = _PausedMark(next(self._pause_tokens), ex.request_id, since)
         # In manual-commit mode the statement opened a transaction that a paused result keeps open: report it now,
         # not only at `finished`, so the client and the idle check see it.
         self._refresh_state(began_at=ex.req.started_at)

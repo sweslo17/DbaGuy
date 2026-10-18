@@ -30,6 +30,13 @@ def test_a_small_refill_keeps_the_stall_and_a_large_drain_ends_it():  # A23: 128
     assert clock.since == 31.0
 
 
+def test_a_full_step_that_drained_enough_ends_the_old_stall_and_starts_a_new_one():  # B2 applies to FULL too
+    clock = StallClock(reset_bytes=16 * MIB)
+    clock.update(ReadAhead(S.FULL, 8 * MIB), now=10.0)
+    clock.update(ReadAhead(S.FULL, 24 * MIB), now=30.0)  # 16 MiB read since, and full again: a new stall
+    assert clock.since == 30.0
+
+
 def test_a_new_stall_counts_its_drain_from_where_it_began():  # B2 after a reset: a small refill keeps the new stall
     clock = StallClock(reset_bytes=16 * MIB)
     clock.update(ReadAhead(S.FULL, 8 * MIB), now=10.0)
