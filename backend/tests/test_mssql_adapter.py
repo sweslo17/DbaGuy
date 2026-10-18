@@ -508,7 +508,7 @@ def test_a_cancelled_procedure_never_answers_the_next_statement(conn):
 def test_a_cancel_inside_a_batch_with_a_wait_between_selects_leaves_no_rows_behind(conn):
     threading.Timer(0.5, conn.cancel).start()
     started = time.monotonic()
-    with pytest.raises(StatementCancelled):  # the server holds set 1 while it waits: cancelled across threads
+    with pytest.raises(StatementCancelled):  # set 1 is held while the server waits; the worker cancels on its own thread
         read_all(conn, "SELECT 1 AS a; WAITFOR DELAY '00:00:30'; SELECT 2 AS b")
     assert time.monotonic() - started < 3
     assert one(conn, "SELECT 'mine' AS m") == [["mine"]]

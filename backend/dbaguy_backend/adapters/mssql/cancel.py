@@ -381,6 +381,7 @@ class CancelControl:
         unreachable: list = [None]  # since when the flag cannot reach the worker
         while self._unreached(call, progress, received, unreachable):
             self._escalate(call, self._why(call, received), forced=False)
+            unreachable[0] = None  # an escalation that could not act (socket unknown) tries again after WEDGE_S, no spin
 
     @staticmethod
     def _why(call: Call, received: list) -> _Escalation:
