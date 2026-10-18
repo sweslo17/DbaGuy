@@ -264,11 +264,11 @@ export function Explorer() {
             onDoubleClick={() => toggle(row)}
           >
             {chevron}
-            {/* Its name is written at the right edge. */}
+            {/* Its name is written at the right edge, and gives way first in a narrow sidebar: the icon already says it. */}
             <EngineIcon engine={p.engine} decorative />
             <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: profileColor(p.color) ?? "transparent" }} />
             <span className="truncate font-medium">{p.name}</span>
-            <span className="ml-auto shrink-0 text-[11px] text-muted">{ENGINE_LABELS[p.engine]}</span>
+            <span className="ml-auto min-w-0 shrink-[100] truncate pl-2 text-[11px] text-muted">{ENGINE_LABELS[p.engine]}</span>
           </div>
         );
         return (

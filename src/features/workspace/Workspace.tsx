@@ -144,25 +144,27 @@ export function Workspace() {
 
   return (
     <div className="flex h-full flex-col">
-      {/* No scrollbar of its own, whatever the system setting: one would sit inside the strip and cut off the tabs. The
-          strip scrolls by wheel, swipe, and by showing the active tab. */}
-      <div
-        role="tablist"
-        className="scrollbar-none flex h-8 shrink-0 items-end gap-px overflow-x-auto overflow-y-hidden border-b border-border bg-panel px-1"
-        onWheel={scrollSidewaysOnWheel}
-      >
-        {tabs.map((tab) => (
-          <TabLabel
-            key={tab.id}
-            tab={tab}
-            active={tab.id === activeTabId}
-            profile={tab.profileId === null ? undefined : profilesById.get(tab.profileId)}
-          />
-        ))}
+      <div className="flex h-8 shrink-0 items-end border-b border-border bg-panel">
+        {/* No scrollbar of its own, whatever the system setting: one would sit inside the strip and cut off the tabs. The
+            strip scrolls by wheel, swipe, and by showing the active tab; the New query button stays outside it, in view. */}
+        <div
+          role="tablist"
+          className="scrollbar-none flex h-full min-w-0 flex-1 items-end gap-px overflow-x-auto overflow-y-hidden px-1"
+          onWheel={scrollSidewaysOnWheel}
+        >
+          {tabs.map((tab) => (
+            <TabLabel
+              key={tab.id}
+              tab={tab}
+              active={tab.id === activeTabId}
+              profile={tab.profileId === null ? undefined : profilesById.get(tab.profileId)}
+            />
+          ))}
+        </div>
         <button
           title="New query on the connection selected in the sidebar"
           aria-label="New query"
-          className="mb-1 ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted hover:bg-hover hover:text-fg"
+          className="mb-1 mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted hover:bg-hover hover:text-fg"
           onClick={newQuery}
         >
           <Plus size={14} />
