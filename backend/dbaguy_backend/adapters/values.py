@@ -21,9 +21,25 @@ class JsonText:
 
 @final
 class MissingType:
-    """The row has no such key (SQL++ MISSING), which is not NULL (R-04-8). Use the `MISSING` instance."""
+    """The row has no such key (SQL++ MISSING), which is not NULL (R-04-8). A singleton: `MissingType()`, a copy, a
+    deep copy and an unpickled one are all the `MISSING` instance, so `value is MISSING` always holds."""
 
     __slots__ = ()
+    _instance: "MissingType | None" = None
+
+    def __new__(cls) -> "MissingType":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __reduce__(self) -> str:
+        return "MISSING"  # pickle: the module attribute, i.e. the singleton
+
+    def __copy__(self) -> "MissingType":
+        return self
+
+    def __deepcopy__(self, memo: dict) -> "MissingType":
+        return self
 
     def __repr__(self) -> str:
         return "MISSING"

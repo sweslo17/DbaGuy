@@ -210,3 +210,14 @@ def test_enable_keepalive_sets_the_timers():
     finally:
         client.close()
         server.close()
+
+
+def test_missing_stays_the_singleton_through_copies_and_pickle():
+    import copy
+    import pickle
+
+    from dbaguy_backend.adapters.values import MISSING, MissingType, encode_value
+
+    for value in (MissingType(), copy.copy(MISSING), copy.deepcopy([MISSING])[0], pickle.loads(pickle.dumps(MISSING))):
+        assert value is MISSING
+        assert encode_value(value) == {"$type": "missing"}
