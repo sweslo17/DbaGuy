@@ -7,13 +7,15 @@ export type RunMode = "default" | "all";
 
 /**
  * One statement to send: its text and where it is in the editor (UTF-16 offsets, without the `;`). `repeat` is how
- * many times it is sent (T-SQL `GO n`; 1 otherwise, 0 for `GO 0`).
+ * many times it is sent (T-SQL `GO n`; 1 otherwise, 0 for `GO 0`). `position` is its place in the run plan (0-based):
+ * what the user counts, kept when `GO 0` batches are dropped and `GO n` copies are made.
  */
 export interface PlannedStatement {
   sql: string;
   from: number;
   to: number;
   repeat: number;
+  position: number;
 }
 
 /**
@@ -30,11 +32,12 @@ export async function planRun(
   if (!selection.empty) {
     const text = view.state.sliceDoc(selection.from, selection.to);
     const ranges = await splitText(text, dialect);
-    return ranges.map((r) => ({
+    return ranges.map((r, position) => ({
       sql: text.slice(r.from, r.to),
       from: selection.from + r.from,
       to: selection.from + r.to,
       repeat: r.repeat,
+      position,
     }));
   }
   const { state, ranges } = await currentStatements(view, dialect);
@@ -42,7 +45,7 @@ export async function planRun(
   const chosen: (StatementRange | null)[] = all ? ranges : [rangeAt(ranges, state.selection.main.head)];
   return chosen
     .filter((r) => r !== null)
-    .map((r) => ({ sql: state.sliceDoc(r.from, r.to), from: r.from, to: r.to, repeat: r.repeat }));
+    .map((r, position) => ({ sql: state.sliceDoc(r.from, r.to), from: r.from, to: r.to, repeat: r.repeat, position }));
 }
 
 /**
