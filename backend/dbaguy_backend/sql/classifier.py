@@ -139,20 +139,27 @@ _TSQL_FLOOR_NOT_BEFORE: dict[str, frozenset[str]] = {"MERGE": frozenset({"JOIN",
 _TSQL_FLOOR_NOT_AFTER: dict[str, tuple[str, ...]] = {"SERIALIZABLE": ("ISOLATION", "LEVEL")}
 # SQL++ (spec §3.3.4): keyword rules only, sqlglot has no dialect for it. EXPLAIN, ADVISE, PREPARE and INFER never
 # execute what they hold. UNKNOWN (fail closed): EXECUTE (a prepared statement or a JavaScript function, either may
-# write), any other SET, FROM-first selects, bare expressions and every other word. FLUSH COLLECTION empties a
-# collection (probed on 7.6): DDL, confirmed like TRUNCATE.
+# write), any other SET, bare expressions and every other word. FROM starts a select too (`FROM ks SELECT a`, probed): a
+# READ word, scanned like SELECT and WITH. FLUSH COLLECTION empties a collection (probed on 7.6): DDL, confirmed like
+# TRUNCATE.
 _SQLPP_KIND: dict[str, StatementKind] = {
-    **dict.fromkeys(("SELECT", "WITH", "EXPLAIN", "ADVISE", "INFER", "PREPARE"), StatementKind.READ),
+    **dict.fromkeys(("SELECT", "WITH", "FROM", "EXPLAIN", "ADVISE", "INFER", "PREPARE"), StatementKind.READ),
     **dict.fromkeys(("INSERT", "UPSERT", "UPDATE", "DELETE", "MERGE"), StatementKind.WRITE),
     **dict.fromkeys(("CREATE", "DROP", "ALTER", "BUILD", "GRANT", "REVOKE", "FLUSH"), StatementKind.DDL),
 }
 _SELECT_FAMILY = ("SELECT", "WITH")
-_SQLPP_DML = frozenset({"INSERT", "UPSERT", "UPDATE", "DELETE", "MERGE"})
+_SQLPP_SELECT_FIRST = (*_SELECT_FAMILY, "FROM")  # the words a SQL++ select starts with (T-SQL has no FROM-first)
+_DML_WORDS = frozenset({"INSERT", "UPDATE", "DELETE", "MERGE"})  # the statements that write rows, in every dialect
+_SQLPP_DML = _DML_WORDS | {"UPSERT"}
 _SQLPP_SEQUENCE_ADVANCE = (("NEXT", "VALUE", "FOR"), ("NEXTVAL", "FOR"))  # PREV VALUE FOR only reads
 _SQLPP_FILTERS = (("WHERE",), ("USE", "KEYS"), ("ON", "KEYS"))  # a statement given its documents is targeted
+# A keys filter targets only what its expression names: with a subquery inside, which may name every document, it
+# filters nothing. The expression runs to the next of these words at depth 0 (R-04a-T3a).
+_SQLPP_KEYS_FILTERS = frozenset({("USE", "KEYS"), ("ON", "KEYS")})
+_SQLPP_KEYS_END = frozenset({"WHERE", "SET", "UNSET", "LIMIT", "RETURNING"})
 _TSQL_FILTERS = (("WHERE",),)
 # Where the statement `_unfiltered_dml` judges starts: the first of these words at depth 0 (after T-SQL's CTEs).
-_DML_STARTS = frozenset({"SELECT", "INSERT", "UPDATE", "DELETE", "MERGE"})
+_DML_STARTS = _DML_WORDS | {"SELECT"}
 _SQLPP_ESCAPE = re.compile(r"\\u([0-9A-Fa-f]{4})|\\(.)|``", re.DOTALL)  # \u0073, \n, \`, and a doubled back-tick
 _SQLPP_ESCAPED = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}  # any other `\x` is x
 
@@ -217,7 +224,7 @@ def _lexical(sql: str, dialect: Dialect) -> Classification:
     kind = overrides.get(first) or _KEYWORD_KIND.get(first, StatementKind.UNKNOWN)
     if kind == StatementKind.READ and first in ("SELECT", "WITH"):
         # Data-modifying CTEs, locking reads and file writes are writes even when sqlglot could not parse them.
-        has_dml = any(w in ("INSERT", "UPDATE", "DELETE", "MERGE") for w in words[1:])
+        has_dml = any(w in _DML_WORDS for w in words[1:])
         if has_dml or _takes_row_locks(words) or _writes_server_file(words):
             kind = StatementKind.WRITE
     elif kind == StatementKind.SESSION and first == "SET" and _takes_row_locks(words):
@@ -324,22 +331,41 @@ def _has_phrase(words: list[str], phrases: tuple[tuple[str, ...], ...]) -> bool:
     return any(tuple(words[k:k + len(p)]) == p for p in phrases for k in range(len(words)))
 
 
+def _has_filter(top: list[str], inner: list[str], dml: int, filters: tuple[tuple[str, ...], ...]) -> bool:
+    """Whether a filter phrase follows the DML word at `top[dml]`. A keys filter (USE KEYS, ON KEYS) holds only if no
+    SELECT is in its expression, at any depth (`inner`), up to the next depth-0 word in `_SQLPP_KEYS_END`: a SELECT
+    after that (`USE KEYS 'k' SET a = (SELECT …)`) belongs to something else."""
+    for k in range(dml + 1, len(top)):
+        for phrase in filters:
+            if tuple(top[k:k + len(phrase)]) != phrase:
+                continue
+            if phrase not in _SQLPP_KEYS_FILTERS:
+                return True
+            first = k + len(phrase)
+            end = next((j for j in range(first, len(top)) if top[j] in _SQLPP_KEYS_END), len(top))
+            if "SELECT" not in inner[first:end]:
+                return True
+    return False
+
+
 def _unfiltered_dml(tokens: list[Token], filters: tuple[tuple[str, ...], ...]) -> list[DangerReason]:
     """The danger reason of an UPDATE or DELETE (T-SQL: also one after a CTE, WITH … DELETE) with none of `filters` at
     parenthesis depth 0 after it: a filter inside a subquery or a CTE filters nothing. T-SQL filters with WHERE, SQL++
-    also with USE KEYS and ON KEYS (the phrase's words must be neighbours). Decided on the words, whatever a parser
-    makes of the rest: sqlglot cannot parse `OPTION (USE HINT …)`, nor `OPTION (MAXDOP 1)` after a CTE (self-check),
-    and has no SQL++ dialect at all."""
+    also with USE KEYS and ON KEYS (the phrase's words must be neighbours, and its expression holds no subquery).
+    Decided on the words, whatever a parser makes of the rest: sqlglot cannot parse `OPTION (USE HINT …)`, nor
+    `OPTION (MAXDOP 1)` after a CTE (self-check), and has no SQL++ dialect at all."""
     depth = 0
     top: list[str] = []  # one entry per token: its upper-cased word at depth 0, "" for any other token
+    inner: list[str] = []  # the same at any depth
     for k, token in enumerate(t for t in tokens if t.kind not in INSIGNIFICANT):
         depth = max(depth + (token.kind == TokenKind.LPAREN) - (token.kind == TokenKind.RPAREN), 0)
-        word = token.upper if token.kind == TokenKind.WORD and not depth else ""
-        if k == 0 and word and word not in ("UPDATE", "DELETE", "WITH"):
+        word = token.upper if token.kind == TokenKind.WORD else ""
+        if k == 0 and word and not depth and word not in ("UPDATE", "DELETE", "WITH"):
             return []
-        top.append(word)
+        top.append("" if depth else word)
+        inner.append(word)
     dml = next((i for i, w in enumerate(top) if w in _DML_STARTS), None)
-    if dml is None or top[dml] not in ("UPDATE", "DELETE") or _has_phrase(top[dml + 1:], filters):
+    if dml is None or top[dml] not in ("UPDATE", "DELETE") or _has_filter(top, inner, dml, filters):
         return []
     return [DangerReason.UPDATE_WITHOUT_WHERE if top[dml] == "UPDATE" else DangerReason.DELETE_WITHOUT_WHERE]
 
@@ -372,8 +398,9 @@ def _names_system_keyspace(tokens: list[Token]) -> bool:
 
 def _classify_sqlpp(tokens: list[Token]) -> Classification:
     """One SQL++ statement by its words (spec §3.3.4). Everything it does not recognise is UNKNOWN, which a read-only
-    connection blocks: only the READ words pass, and a SELECT or WITH holding a DML word or `NEXT VALUE FOR` is a
-    WRITE (SQL++ rejects DML inside a SELECT; this is a net under that, and the server's `readonly` another)."""
+    connection blocks: only the READ words pass, and a select (SELECT, WITH or FROM first) holding a DML word or
+    `NEXT VALUE FOR` is a WRITE (SQL++ rejects DML inside a SELECT; this is a net under that, and the server's
+    `readonly` another)."""
     significant = [t for t in tokens if t.kind not in INSIGNIFICANT]
     opened = next((i for i, t in enumerate(significant) if t.kind != TokenKind.LPAREN), len(significant))
     significant = significant[opened:]  # (SELECT …) UNION (SELECT …)
@@ -386,7 +413,7 @@ def _classify_sqlpp(tokens: list[Token]) -> Classification:
     if words[:2] == ["UPDATE", "STATISTICS"] or first == "ANALYZE":
         return Classification(kind=StatementKind.WRITE)  # maintenance (EE); no WHERE to miss
     kind = _SQLPP_KIND.get(first, StatementKind.UNKNOWN)
-    if first in _SELECT_FAMILY and (
+    if first in _SQLPP_SELECT_FIRST and (
         any(w in _SQLPP_DML for w in words[1:]) or _has_phrase(words, _SQLPP_SEQUENCE_ADVANCE)
     ):
         kind = StatementKind.WRITE  # NEXT VALUE FOR advances a sequence; a DML word: the safety net

@@ -341,7 +341,8 @@ SQ = Dialect.SQLPP
 @pytest.mark.parametrize("sql", [
     "SELECT * FROM users", "EXPLAIN DELETE FROM users", "ADVISE SELECT * FROM users WHERE a = 1",
     'INFER users WITH {"sample_size": 5}', "PREPARE p FROM UPSERT INTO users (KEY, VALUE) VALUES ('k', {})",
-    "WITH a AS (SELECT 1 AS x) SELECT a",
+    "WITH a AS (SELECT 1 AS x) SELECT a", "FROM users SELECT a", "FROM users u LET x = 1 WHERE u.a = x SELECT u.b",
+    "FROM users SELECT a UNION ALL FROM orders SELECT b",
 ])
 def test_sqlpp_reads_run_read_only(sql):
     assert SafetyPolicy().check(sql, SQ, "standard", read_only=True).action == A.RUN
@@ -365,8 +366,11 @@ def test_sqlpp_read_only_bypasses_fail_closed(sql):  # Review Focus 5
     "SELECT (SELECT NEXT VALUE FOR s1) AS n",
     "WITH a AS (SELECT NEXT VALUE FOR s1 AS n) SELECT a.n", "(DELETE FROM users USE KEYS 'k')",
     "SELECT 1; DELETE FROM users USE KEYS 'k'", "SELECT 1; SELECT 2; EXECUTE p",
-    # back-ticked or quoted words are no statement; a bare expression, FROM-first select, and unknown words fail closed
-    "`DELETE` FROM users", "`SELECT` 1", "NEXT VALUE FOR s1", "FROM users SELECT *", "1 + 1", "\"SELECT 1\"", "$x",
+    # a FROM-first select holding a write is no read; back-ticked or quoted words are no statement; a bare expression
+    # and unknown words fail closed
+    "FROM users SELECT NEXT VALUE FOR s1", "FROM users SELECT NEXTVAL -- c\nFOR s1", "FROM users DELETE",
+    "FROM users u WHERE u.a IN (UPDATE t SET x = 1) SELECT u.a",
+    "`DELETE` FROM users", "`SELECT` 1", "NEXT VALUE FOR s1", "1 + 1", "\"SELECT 1\"", "$x",
     "SELECT 1 FROM users DELETE FROM users", "FOO BAR", "", "-- SELECT 1", "/* SELECT 1 */",
     "UPDATE STATISTICS FOR users(name)", "ANALYZE KEYSPACE users", "FLUSH COLLECTION dbaguy.app.users",
     "DROP COLLECTION dbaguy.app.users", "GRANT query_select ON users TO bob", "BUILD INDEX ON users(i)",

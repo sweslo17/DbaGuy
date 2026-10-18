@@ -712,8 +712,7 @@ def test_sqlpp(sql, kind, reasons):
     # FLUSH COLLECTION empties a collection (probed on 7.6.12): confirmed like TRUNCATE, never run unasked
     ("FLUSH COLLECTION dbaguy.app.users", K.DDL, [D.TRUNCATE]),
     ("flush collection `users`", K.DDL, [D.TRUNCATE]),
-    # the server's `FROM x SELECT …` form and a bare expression start no recognised statement: UNKNOWN, read-only blocks
-    ("FROM users SELECT *", K.UNKNOWN, []),
+    # a bare expression starts no recognised statement: UNKNOWN, so read-only blocks it
     ("NEXT VALUE FOR s1", K.UNKNOWN, []),
     ("(NEXTVAL FOR s1)", K.UNKNOWN, []),
     ("1 + 1", K.UNKNOWN, []),
@@ -732,6 +731,38 @@ def test_sqlpp(sql, kind, reasons):
     ("SELECT * FROM (SELECT 1 AS a) AS t WHERE t.a IN (SELECT RAW 1 FROM s WHERE s.x = 1)", K.READ, []),
     ("UPDATE users SET a = (SELECT RAW 1 FROM x USE KEYS ['k'])", K.WRITE, [D.UPDATE_WITHOUT_WHERE]),
     ("DELETE FROM users LIMIT 1", K.WRITE, [D.DELETE_WITHOUT_WHERE]),
+    # R-04a-T3a: a keys filter whose expression holds a subquery may name every document, so it filters nothing; a
+    # subquery after the expression (SET, UNSET, LIMIT, RETURNING, WHERE) is something else
+    ("DELETE FROM users USE KEYS (SELECT RAW META(x).id FROM users x)", K.WRITE, [D.DELETE_WITHOUT_WHERE]),
+    ("DELETE FROM users USE KEYS ARRAY k FOR k IN (SELECT RAW META(x).id FROM users x) END", K.WRITE,
+     [D.DELETE_WITHOUT_WHERE]),
+    ("DELETE FROM users USE KEYS ['a'] || (SELECT RAW META(x).id FROM users x)", K.WRITE, [D.DELETE_WITHOUT_WHERE]),
+    ("DELETE FROM users d USE KEYS ((SELECT RAW 1)) RETURNING d.a", K.WRITE, [D.DELETE_WITHOUT_WHERE]),
+    ("UPDATE users USE KEYS (SELECT RAW META(x).id FROM users x) SET a = 1", K.WRITE, [D.UPDATE_WITHOUT_WHERE]),
+    ("UPDATE users USE KEYS (SELECT RAW META(x).id FROM users x) UNSET a", K.WRITE, [D.UPDATE_WITHOUT_WHERE]),
+    ("DELETE FROM users USE KEYS (SELECT RAW META(x).id FROM users x) WHERE x = 1", K.WRITE, []),
+    ("DELETE FROM users USE KEYS ['a'] || (SELECT RAW 1) USE KEYS 'k'", K.WRITE, []),
+    ("UPDATE users USE KEYS 'k' SET a = (SELECT RAW 1 FROM t)", K.WRITE, []),
+    ("UPDATE users USE KEYS 'k' UNSET a RETURNING (SELECT RAW 1)", K.WRITE, []),
+    ("DELETE FROM users USE KEYS ['a'] LIMIT (SELECT RAW 1)", K.WRITE, []),
+    ("DELETE FROM users USE KEYS ['a', 'b'] RETURNING (SELECT RAW 1)", K.WRITE, []),
+    ("DELETE FROM users USE KEYS $keys", K.WRITE, []),
+    ("DELETE FROM users USE KEYS (`SELECT`)", K.WRITE, []),  # a field named select is no subquery
+    ("DELETE FROM users WHERE true", K.WRITE, []),  # out of reach: a filter that filters nothing
+    # FROM-first selects (R-04a-T3b, probed): READ like SELECT, scanned for sequences and DML words the same way
+    ("FROM ks SELECT a", K.READ, []),
+    ("from ks as k let x = 1 where k.a = x group by k.b having count(*) > 1 select k.b", K.READ, []),
+    ("FROM ks USE KEYS ['a'] SELECT a", K.READ, []),
+    ("FROM ks SELECT a UNION ALL FROM ks2 SELECT b", K.READ, []),
+    ("(FROM ks SELECT a) UNION (SELECT 1)", K.READ, []),
+    ("FROM ks SELECT PREV VALUE FOR s", K.READ, []),
+    ("FROM ks SELECT NEXT VALUE FOR s", K.WRITE, []),
+    ("FROM ks SELECT NEXTVAL FOR s", K.WRITE, []),
+    ("FROM ks DELETE", K.WRITE, []),
+    ("FROM ks SELECT a UNION ALL SELECT NEXT VALUE FOR s", K.WRITE, []),
+    ("FROM ks WHERE a IN (UPDATE t SET x = 1) SELECT a", K.WRITE, []),
+    ("FROM `DELETE` SELECT a", K.READ, []),
+    ("FROM", K.READ, []),
     ("DELETE FROM users d USE (KEYS) x", K.WRITE, [D.DELETE_WITHOUT_WHERE]),  # the phrase's words are neighbours
     ("DELETE FROM users -- WHERE x\n", K.WRITE, [D.DELETE_WITHOUT_WHERE]),
     ("DELETE FROM users /* USE KEYS 'k' */ RETURNING 'WHERE', `where`", K.WRITE, [D.DELETE_WITHOUT_WHERE]),
