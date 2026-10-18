@@ -8,7 +8,8 @@ column `(other fields)` whole, so no key and no value is lost. Reading the first
 delivers those same rows first when the grid asks for rows.
 
 Cells follow spec §3.2.4: strings, true, false and null as decoded; a number as a Python number only when its literal
-reads back exactly (`1.10`, `-0`, `1E+3`, `1e400` and integers past ±(2^53−1) stay the server's text, as `JsonText`);
+reads back exactly and the grid shows it as written (`1.10`, `-0`, `1E+3`, `1e400`, integers past ±(2^53−1), and floats
+the grid would reformat, `1.0` `-0.0` `1e+16` `1e-05`, stay the server's text, as `JsonText`);
 objects and arrays as `JsonText` of the exact text; a key the row does not have as `MISSING` (not NULL).
 
 A JSON string can hold a lone surrogate (`"\\ud800"`), which decodes to a Python str that no UTF-8 encoder takes (the
@@ -70,7 +71,11 @@ def value_cell(text: str, value: Any) -> Any:
             return number
         return JsonText(text)
     as_float = float(text)  # a JSON number always parses; 1e400 gives inf, which never reads back as the text
-    return as_float if repr(as_float) == text else JsonText(text)
+    # R-04a-F2: the grid formats a number with JavaScript, which writes 1.0 as 1, -0.0 as 0, 1e+16 as 10000000000000000
+    # and 1e-05 as 0.00001. So a float is kept only when its text has no exponent and does not end in `.0`: the grid,
+    # copy and the CSV / JSON Lines exports then show the same digits.
+    plain = repr(as_float) == text and "e" not in text and "E" not in text and not text.endswith(".0")
+    return as_float if plain else JsonText(text)
 
 
 def _cell(field: RowField | None) -> Any:

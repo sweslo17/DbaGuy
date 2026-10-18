@@ -32,7 +32,11 @@ def shape_of(signature, page=(), bare_star=False, plan=False):
     ("-9007199254740991", -9007199254740991), ("-9007199254740993", J("-9007199254740993")),
     ("-9223372036854775808", J("-9223372036854775808")), ("18446744073709551615", J("18446744073709551615")),
     ("12345678901234567890", J("12345678901234567890")), ("1" * 5000, J("1" * 5000)), ("-0", J("-0")),
-    ("0.5", 0.5), ("-0.0", -0.0), ("3.141592653589793", 3.141592653589793), ("1.10", J("1.10")),
+    ("0.5", 0.5), ("3.141592653589793", 3.141592653589793), ("1.10", J("1.10")),
+    # R-04a-F2: a float the grid's JavaScript would write differently stays the server's text
+    ("1.0", J("1.0")), ("0.0", J("0.0")), ("-0.0", J("-0.0")), ("100.0", J("100.0")), ("-2.0", J("-2.0")),
+    ("1e+16", J("1e+16")), ("1e-05", J("1e-05")), ("1.5e3", J("1.5e3")), ("1E-7", J("1E-7")),
+    ("10000000000000000.0", J("10000000000000000.0")), ("0.0001", 0.0001), ("-123456789012345.67", -123456789012345.67),
     ("3.141592653589793238462643383279", J("3.141592653589793238462643383279")), ("1E+3", J("1E+3")),
     ("1e400", J("1e400")), ("1e-400", J("1e-400")),
     ('"x"', "x"), ('"[1]"', "[1]"), ("true", True), ("false", False), ("null", None),
@@ -51,6 +55,21 @@ def test_the_four_literals_a_float_or_int_would_change():  # R-04a-C13: exactly 
     assert [shape.cells(r) for r in rows(*(f'{{"a":{t}}}' for t in texts))] == [[J(t)] for t in texts]
     inside = rows('{"a":{"n":-0,"m":[1.10]}}')
     assert shape.cells(inside[0]) == [J('{"n":-0,"m":[1.10]}')]
+
+
+def test_a_kept_float_is_what_the_grid_shows():  # R-04a-F2: the grid formats with JavaScript, copy and export say the text
+    texts = ["1.0", "-0.0", "1e+16", "1e-05", "0.5", "0.0001", "123.456", "-9.75", "2.5E+2", "1.000", "100.0"]
+    for row in rows(*texts):
+        cell = value_cell(row.text, row.value)
+        if isinstance(cell, float):  # only a float whose text has neither an exponent nor a trailing `.0`
+            assert repr(cell) == row.text and not set("eE") & set(row.text) and not row.text.endswith(".0")
+        else:
+            assert cell == J(row.text)
+    assert [type(value_cell(r.text, r.value)) is float for r in rows(*texts)] == [
+        False, False, False, False, True, True, True, True, False, False, False,
+    ]
+    shape = shape_of({"a": "json"})  # in a column, like at the top level
+    assert shape.cells(rows('{"a":1.0}')[0]) == [J("1.0")] and shape.cells(rows('{"a":2.5}')[0]) == [2.5]
 
 
 def test_no_signature_has_no_columns():
