@@ -182,3 +182,22 @@ def test_tsql_sort_keys_are_bracket_quoted():
     assert build_browse_select(TS, TS_PATH, None, [SortKey(column="a]b")]) == (
         "SELECT * FROM dbo.[Order Items]\nORDER BY [a]]b] ASC"
     )
+
+
+def test_sqlpp_browse_select_reads_the_collection_with_its_meta_id():  # D-04-11, Review Focus 5
+    def path(*parts):
+        kinds = ("bucket", "scope", "collection", "index")
+        return [PathSegment(kind=kind, name=name) for kind, name in zip(kinds, parts)]
+
+    assert build_browse_select(Dialect.SQLPP, path("travel-sample", "inventory", "airline"), None, []) == (
+        "SELECT META(d).id, *\nFROM airline AS d")
+    assert build_browse_select(Dialect.SQLPP, path("dbaguy", "app", "value"), None, []).endswith("FROM `value` AS d")
+    assert build_browse_select(Dialect.SQLPP, path("dbaguy", "app", "odd-name"), None, []).endswith(
+        "FROM `odd-name` AS d")
+    assert build_browse_select(Dialect.SQLPP, path("dbaguy", "_default", "_default"), None, []).endswith(
+        "FROM _default AS d")
+    assert build_browse_select(Dialect.SQLPP, path("dbaguy", "app", "orders", "#primary"), None, []).endswith(
+        "FROM orders AS d")
+    for where, order, count in [("x = 1", [], False), (None, [SortKey(column="x")], False), (None, [], True)]:
+        with pytest.raises(ValidationFailed, match="SQL\\+\\+ in a query tab"):
+            build_browse_select(Dialect.SQLPP, path("dbaguy", "app", "orders"), where, order, count)

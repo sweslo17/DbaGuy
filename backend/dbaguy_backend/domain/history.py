@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from .execution import QueryContext
+
 HistoryStatus = Literal["ok", "error", "cancelled", "timeout"]
 
 
@@ -23,6 +25,9 @@ class HistoryRecord(BaseModel):
 
 class HistoryEntry(HistoryRecord):
     id: int
+    # Engines with a per-request query context (Couchbase): `database` parsed back. Filled when the history is read,
+    # never stored (B15: a tab reopens from this, not from `database`).
+    query_context: QueryContext | None = None
 
 
 class HistoryPage(BaseModel):

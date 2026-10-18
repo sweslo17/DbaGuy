@@ -19,9 +19,9 @@ from loguru import logger
 
 from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import QueryContext, StatementParams
-from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
+from ...domain.metadata import NodeKind, ObjectDetail, ObjectNode, PathSegment, ServerInfo, child_path
 from ...domain.profiles import AnyProfile, Engine, ServerProfile
-from ...domain.schema import SchemaSnapshot
+from ...domain.schema import RelationKind, SchemaSnapshot
 from ...sql.classifier import is_transaction_statement
 from ...sql.dialects import Dialect
 from ...sql.lexer import first_keyword
@@ -130,7 +130,7 @@ def _edition(version: str) -> Literal["enterprise", "community"] | None:
     return "community" if version.endswith("-community") else None
 
 
-def _server_error(exc: StatementError) -> bool:
+def is_server_error(exc: StatementError) -> bool:
     """An error the query service answered with (a numeric code), not a failure to reach it."""
     return exc.code is not None and exc.code.isdigit()
 
@@ -252,14 +252,16 @@ class CouchbaseConnection(DatabaseConnection):
                                     messages=warnings)
         return self._result
 
-    def query(self, statement: str, named: Mapping[str, str] | None = None) -> list[Any]:
-        """An internal statement (catalog, identification): always read-only, read to the end, rows decoded with plain
-        JSON (an int stays an int: the catalog's num_replica, R-04a-C20), and with a deadline (_INTERNAL_DEADLINE: the
-        server's `timeout` of 30 s, whose error 1080 is raised like any other, and 40 s without a byte on the client).
-        `named`: parameter names without `$` and their JSON literal texts."""
+    def query(self, statement: str, named: Mapping[str, str] | None = None, *,
+              context: QueryContext | None = None) -> list[Any]:
+        """An internal statement (catalog, identification, ADVISE): always read-only, read to the end, rows decoded with
+        plain JSON (an int stays an int: the catalog's num_replica, R-04a-C20), and with a deadline (_INTERNAL_DEADLINE:
+        the server's `timeout` of 30 s, whose error 1080 is raised like any other, and 40 s without a byte on the
+        client). `named`: parameter names without `$` and their JSON literal texts. `context`: the request's query
+        context (None: none is sent, as the catalog wants)."""
         self._close_result()
         params = StatementParams(named=dict(named)) if named else None
-        stream = self._begin(statement, context=None, params=params, readonly=True, retry_safe=True,
+        stream = self._begin(statement, context=context, params=params, readonly=True, retry_safe=True,
                              deadline=_INTERNAL_DEADLINE)
         result = start_result(stream, statement, plan=False, bare_star=False, dml=False, on_done=self._end)
         try:
@@ -312,7 +314,7 @@ class CouchbaseConnection(DatabaseConnection):
             try:
                 row = self._first_row(_IDENTIFY)
             except StatementError as exc:
-                if not _server_error(exc) or self._last_status == 401:
+                if not is_server_error(exc) or self._last_status == 401:
                     raise  # unreachable, or the login itself failed
                 # A17: a limited user may not call CURRENT_USERS() (a privilege error such as 13014 is then a login
                 # failure only if the version alone is refused too)
@@ -333,7 +335,7 @@ class CouchbaseConnection(DatabaseConnection):
         return self._info
 
     def _login_failed(self, exc: StatementError) -> bool:
-        return exc.code in _AUTH_FAILURES or (self._last_status == 401 and _server_error(exc))
+        return exc.code in _AUTH_FAILURES or (self._last_status == 401 and is_server_error(exc))
 
     # ---- no transactions (R-04-4, spec §3.7.5) ----
 
@@ -392,6 +394,18 @@ class CouchbaseAdapter(DatabaseAdapter):
 
     def parse_url(self, url: str) -> ParsedUrl:
         return parse_couchbase_url(url)
+
+    def relation_path(
+        self, database: str | None, schema: str, name: str, kind: RelationKind
+    ) -> list[PathSegment]:
+        """A collection (⌘P) opens at bucket › scope › collection; `database` is its bucket, `schema` its scope."""
+        if kind != "collection":
+            return super().relation_path(database, schema, name, kind)
+        if database is None:
+            raise ValidationFailed("A collection path needs its bucket")
+        path = child_path([], NodeKind.BUCKET, database)
+        path = child_path(path, NodeKind.SCOPE, schema)
+        return child_path(path, NodeKind.COLLECTION, name)
 
     def endpoint_target(self, profile: ServerProfile) -> tuple[str, int]:
         return endpoint_target(profile)

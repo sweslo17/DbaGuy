@@ -3,10 +3,12 @@ import os
 
 import pytest
 from loguru import logger
+from pydantic import ValidationError
 
 from dbaguy_backend.domain.errors import AlreadyExists, NotFound, StorageError, ValidationFailed
+from dbaguy_backend.domain.execution import QueryContext
 from dbaguy_backend.domain.settings import AppSettings
-from dbaguy_backend.domain.workspace import WorkspaceState
+from dbaguy_backend.domain.workspace import WorkspaceState, WorkspaceTab
 from dbaguy_backend.services import scripts_service
 from dbaguy_backend.services.scripts_service import ScriptsService
 from dbaguy_backend.services.settings_service import SettingsService
@@ -568,3 +570,19 @@ def test_an_unreadable_scripts_folder_is_a_storage_error(tmp_path):
     service = ScriptsService(lambda: tmp_path / "no-such-folder")
     with pytest.raises(StorageError):
         service.tree()
+
+
+def test_workspace_keeps_the_tab_context_and_params(tmp_path):  # Review Focus 5
+    service = WorkspaceService(tmp_path / "workspace.json")
+    state = WorkspaceState(tabs=[
+        WorkspaceTab(id="a", kind="query", query_context=QueryContext(bucket="my.bucket", scope="app"),
+                     params={"$n": "9007199254740993", "$1": '"x"', "$x": "not json yet"}),
+        WorkspaceTab(id="b", kind="query", query_context="none"),
+        WorkspaceTab(id="c", kind="query"),
+    ])
+    service.put(state)
+    assert service.get() == state
+    with pytest.raises(ValidationError):
+        WorkspaceTab(id="d", kind="query", params={"n": "1"})  # a draft is keyed by `$name` or `$n`
+    with pytest.raises(ValidationError):
+        WorkspaceTab(id="d", kind="query", query_context="all")

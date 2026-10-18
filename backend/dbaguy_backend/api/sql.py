@@ -187,6 +187,8 @@ def complete_at(body: CompleteRequest, container: AppContainer = Depends(get_con
 @router.post("/describe", response_model=DescribeResult | None)
 def describe(body: DescribeRequest, container: AppContainer = Depends(get_container)) -> DescribeResult | None:
     dialect = _profile_dialect(container, body.profile_id)
+    if dialect is Dialect.SQLPP:  # spec §3.12: a SQL++ name is a keyspace or a document path, not a column to describe
+        return None
     # An explicit user action, not a keystroke: worth waiting for a snapshot that is being built.
     snapshot_index = _snapshot_index(container, body.profile_id, body.database, wait=True)
     return describe_at(body.text, Utf16Index(body.text).from_utf16(body.cursor), dialect, snapshot_index)

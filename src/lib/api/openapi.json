@@ -952,6 +952,224 @@
         }
       }
     },
+    "/couchbase/contexts": {
+      "get": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Contexts",
+        "description": "The query contexts a tab can pick. `bucket` and `scope` name the tab's current one, listed first when the\nschema snapshot does not have it.",
+        "operationId": "contexts_couchbase_contexts_get",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Profile Id"
+            }
+          },
+          {
+            "name": "bucket",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 100
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Bucket"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 251
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ContextOption"
+                  },
+                  "title": "Response Contexts Couchbase Contexts Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/couchbase/plan": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Plan",
+        "operationId": "plan_couchbase_plan_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/couchbase/advise": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Advise",
+        "operationId": "advise_couchbase_advise_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdviseRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/settings": {
       "get": {
         "tags": [
@@ -2107,6 +2325,38 @@
   },
   "components": {
     "schemas": {
+      "AdviseRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "statement": {
+            "type": "string",
+            "maxLength": 1048576,
+            "minLength": 1,
+            "title": "Statement"
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "statement"
+        ],
+        "title": "AdviseRequest"
+      },
       "AffectedEvent": {
         "properties": {
           "type": {
@@ -2662,6 +2912,41 @@
         ],
         "title": "ConnectionTestResult"
       },
+      "ContextOption": {
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "title": "Bucket"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "listed": {
+            "type": "boolean",
+            "title": "Listed",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "bucket",
+          "text"
+        ],
+        "title": "ContextOption",
+        "description": "One entry of the query-context picker. `text` is `QueryContext(bucket, scope).text()`, so the frontend never\nquotes a name (B13)."
+      },
       "DangerReason": {
         "type": "string",
         "enum": [
@@ -2763,7 +3048,8 @@
               "table",
               "view",
               "materialized_view",
-              "synonym"
+              "synonym",
+              "collection"
             ],
             "title": "Kind"
           },
@@ -3625,6 +3911,16 @@
           "id": {
             "type": "integer",
             "title": "Id"
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -3722,6 +4018,62 @@
           "profile"
         ],
         "title": "ImportUrlResponse"
+      },
+      "IndexAdvice": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "recommended",
+              "covering",
+              "current"
+            ],
+            "title": "Kind"
+          },
+          "statement": {
+            "type": "string",
+            "title": "Statement"
+          },
+          "keyspace_alias": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Keyspace Alias"
+          },
+          "rule": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rule"
+          },
+          "update_statistics": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Update Statistics"
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind",
+          "statement"
+        ],
+        "title": "IndexAdvice"
       },
       "MessageEvent": {
         "properties": {
@@ -3934,7 +4286,8 @@
               "table",
               "view",
               "materialized_view",
-              "synonym"
+              "synonym",
+              "collection"
             ],
             "title": "Kind"
           },
@@ -3973,6 +4326,356 @@
           "name"
         ],
         "title": "PathSegment"
+      },
+      "PlanDetail": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "value"
+        ],
+        "title": "PlanDetail"
+      },
+      "PlanEstimates": {
+        "properties": {
+          "cost": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost"
+          },
+          "cardinality": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cardinality"
+          }
+        },
+        "type": "object",
+        "title": "PlanEstimates"
+      },
+      "PlanFinding": {
+        "properties": {
+          "badge": {
+            "type": "string",
+            "enum": [
+              "primary_scan",
+              "sequential_scan",
+              "intersect_scan",
+              "not_covered",
+              "slowest"
+            ],
+            "title": "Badge"
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "warning",
+              "info"
+            ],
+            "title": "Severity"
+          },
+          "node_id": {
+            "type": "integer",
+            "title": "Node Id"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          }
+        },
+        "type": "object",
+        "required": [
+          "badge",
+          "severity",
+          "node_id",
+          "text"
+        ],
+        "title": "PlanFinding"
+      },
+      "PlanNode": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "operator": {
+            "type": "string",
+            "title": "Operator"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "details": {
+            "items": {
+              "$ref": "#/components/schemas/PlanDetail"
+            },
+            "type": "array",
+            "title": "Details",
+            "default": []
+          },
+          "estimates": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlanEstimates"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stats": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlanStats"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "badges": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "primary_scan",
+                "sequential_scan",
+                "intersect_scan",
+                "not_covered",
+                "slowest"
+              ]
+            },
+            "type": "array",
+            "title": "Badges",
+            "default": []
+          },
+          "children": {
+            "items": {
+              "$ref": "#/components/schemas/PlanNode"
+            },
+            "type": "array",
+            "title": "Children",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "operator",
+          "title"
+        ],
+        "title": "PlanNode"
+      },
+      "PlanRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 4194304,
+            "title": "Text"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "title": "PlanRequest"
+      },
+      "PlanStats": {
+        "properties": {
+          "items_in": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Items In"
+          },
+          "items_out": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Items Out"
+          },
+          "exec_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exec Time"
+          },
+          "serv_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Serv Time"
+          },
+          "kern_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kern Time"
+          }
+        },
+        "type": "object",
+        "title": "PlanStats"
+      },
+      "PlanSubquery": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "correlated": {
+            "type": "boolean",
+            "title": "Correlated"
+          },
+          "root": {
+            "$ref": "#/components/schemas/PlanNode"
+          }
+        },
+        "type": "object",
+        "required": [
+          "text",
+          "correlated",
+          "root"
+        ],
+        "title": "PlanSubquery"
+      },
+      "PlanView": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "plan",
+              "profile",
+              "advice",
+              "unknown"
+            ],
+            "title": "Kind"
+          },
+          "root": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlanNode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "subqueries": {
+            "items": {
+              "$ref": "#/components/schemas/PlanSubquery"
+            },
+            "type": "array",
+            "title": "Subqueries",
+            "default": []
+          },
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/PlanFinding"
+            },
+            "type": "array",
+            "title": "Findings",
+            "default": []
+          },
+          "advice": {
+            "items": {
+              "$ref": "#/components/schemas/IndexAdvice"
+            },
+            "type": "array",
+            "title": "Advice",
+            "default": []
+          },
+          "advice_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Advice Note"
+          },
+          "statement_text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Statement Text"
+          },
+          "estimates": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlanEstimates"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "phase_times": {
+            "items": {
+              "$ref": "#/components/schemas/PlanDetail"
+            },
+            "type": "array",
+            "title": "Phase Times",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "title": "PlanView"
       },
       "ProfileEntry": {
         "properties": {
@@ -5613,6 +6316,39 @@
               }
             ],
             "title": "Autocommit"
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "string",
+                "const": "none"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Query Context"
+          },
+          "params": {
+            "anyOf": [
+              {
+                "patternProperties": {
+                  "^\\$(?:[A-Za-z_][A-Za-z0-9_]*|[1-9][0-9]{0,2})$": {
+                    "type": "string",
+                    "maxLength": 1048576
+                  }
+                },
+                "type": "object",
+                "maxProperties": 400
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Params"
           }
         },
         "additionalProperties": false,

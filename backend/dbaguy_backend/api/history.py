@@ -17,7 +17,7 @@ def search_history(
     before: int | None = None,
     container: AppContainer = Depends(get_container),
 ) -> HistoryPage:
-    return container.history.search(q, profile_id, limit, before)
+    return container.couchbase.with_query_contexts(container.history.search(q, profile_id, limit, before))
 
 
 @router.delete("", status_code=204)

@@ -1,9 +1,15 @@
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .execution import QueryContext
 from .metadata import PathSegment
+
+# A parameter panel's draft is keyed by the name as the statement writes it (`$name`, `$1`), the text as typed: valid
+# JSON or not yet (B14). Bounded like the panel itself (StatementParams: 200 named + 200 positional, 1 MiB a literal).
+ParamName = Annotated[str, Field(pattern=r"^\$(?:[A-Za-z_][A-Za-z0-9_]*|[1-9][0-9]{0,2})$")]
+ParamDraft = Annotated[str, Field(max_length=1_048_576)]
 
 
 class TextSelection(BaseModel):
@@ -27,6 +33,9 @@ class WorkspaceTab(BaseModel):
     cursor: int | None = Field(default=None, ge=0)  # UTF-16 code units
     selection: TextSelection | None = None
     autocommit: bool | None = None
+    # Couchbase: None follows the profile's default context, "none" is the user's explicit No context (B14)
+    query_context: QueryContext | Literal["none"] | None = None
+    params: dict[ParamName, ParamDraft] | None = Field(default=None, max_length=400)
 
 
 class WorkspaceState(BaseModel):

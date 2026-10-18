@@ -1,5 +1,5 @@
-"""API models of the Couchbase features: today the plan view (EXPLAIN, ADVISE and the profile of a statement as an
-operator tree with flags, index advice and timings, spec §3.10)."""
+"""API models of the Couchbase features: the plan view (EXPLAIN, ADVISE and the profile of a statement as an operator
+tree with flags, index advice and timings, spec §3.10) and the query contexts a tab can pick (§3.11.1)."""
 
 from typing import Literal
 
@@ -68,3 +68,13 @@ class PlanView(BaseModel):
     statement_text: str | None = None  # EXPLAIN's `text`, ADVISE's `query`
     estimates: PlanEstimates | None = None  # the whole plan's (EXPLAIN's top-level cost / cardinality)
     phase_times: list[PlanDetail] = []  # a profile's `phaseTimes`, in the server's order
+
+
+class ContextOption(BaseModel):
+    """One entry of the query-context picker. `text` is `QueryContext(bucket, scope).text()`, so the frontend never
+    quotes a name (B13)."""
+
+    bucket: str
+    scope: str | None = None
+    text: str
+    listed: bool = True  # False: the tab's current context, which the schema snapshot does not list

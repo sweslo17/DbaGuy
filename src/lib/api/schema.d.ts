@@ -250,6 +250,61 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/couchbase/contexts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Contexts
+         * @description The query contexts a tab can pick. `bucket` and `scope` name the tab's current one, listed first when the
+         *     schema snapshot does not have it.
+         */
+        get: operations["contexts_couchbase_contexts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/couchbase/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Plan */
+        post: operations["plan_couchbase_plan_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/couchbase/advise": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Advise */
+        post: operations["advise_couchbase_advise_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/settings": {
         parameters: {
             query?: never;
@@ -520,6 +575,17 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AdviseRequest */
+        AdviseRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Statement */
+            statement: string;
+            query_context?: components["schemas"]["QueryContext"] | null;
+        };
         /** AffectedEvent */
         AffectedEvent: {
             /**
@@ -748,6 +814,24 @@ export interface components {
             elapsed_ms: number;
         };
         /**
+         * ContextOption
+         * @description One entry of the query-context picker. `text` is `QueryContext(bucket, scope).text()`, so the frontend never
+         *     quotes a name (B13).
+         */
+        ContextOption: {
+            /** Bucket */
+            bucket: string;
+            /** Scope */
+            scope?: string | null;
+            /** Text */
+            text: string;
+            /**
+             * Listed
+             * @default true
+             */
+            listed: boolean;
+        };
+        /**
          * DangerReason
          * @description Why a statement is dangerous: the standard safety level asks before running it.
          * @enum {string}
@@ -788,7 +872,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "table" | "view" | "materialized_view" | "synonym";
+            kind: "table" | "view" | "materialized_view" | "synonym" | "collection";
             /** Columns */
             columns: components["schemas"]["DescribeColumn"][];
         };
@@ -1127,6 +1211,7 @@ export interface components {
             error?: string | null;
             /** Id */
             id: number;
+            query_context?: components["schemas"]["QueryContext"] | null;
         };
         /** HistoryPage */
         HistoryPage: {
@@ -1146,6 +1231,22 @@ export interface components {
             profile: components["schemas"]["ServerProfileDraft"] | components["schemas"]["SqliteProfileDraft"];
             /** Password */
             password?: string | null;
+        };
+        /** IndexAdvice */
+        IndexAdvice: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "recommended" | "covering" | "current";
+            /** Statement */
+            statement: string;
+            /** Keyspace Alias */
+            keyspace_alias?: string | null;
+            /** Rule */
+            rule?: string | null;
+            /** Update Statistics */
+            update_statistics?: string | null;
         };
         /** MessageEvent */
         MessageEvent: {
@@ -1233,7 +1334,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "table" | "view" | "materialized_view" | "synonym";
+            kind: "table" | "view" | "materialized_view" | "synonym" | "collection";
             /** Path */
             path: components["schemas"]["PathSegment"][];
         };
@@ -1243,6 +1344,123 @@ export interface components {
             kind: string;
             /** Name */
             name: string;
+        };
+        /** PlanDetail */
+        PlanDetail: {
+            /** Label */
+            label: string;
+            /** Value */
+            value: string;
+        };
+        /** PlanEstimates */
+        PlanEstimates: {
+            /** Cost */
+            cost?: number | null;
+            /** Cardinality */
+            cardinality?: number | null;
+        };
+        /** PlanFinding */
+        PlanFinding: {
+            /**
+             * Badge
+             * @enum {string}
+             */
+            badge: "primary_scan" | "sequential_scan" | "intersect_scan" | "not_covered" | "slowest";
+            /**
+             * Severity
+             * @enum {string}
+             */
+            severity: "warning" | "info";
+            /** Node Id */
+            node_id: number;
+            /** Text */
+            text: string;
+        };
+        /** PlanNode */
+        PlanNode: {
+            /** Id */
+            id: number;
+            /** Operator */
+            operator: string;
+            /** Title */
+            title: string;
+            /**
+             * Details
+             * @default []
+             */
+            details: components["schemas"]["PlanDetail"][];
+            estimates?: components["schemas"]["PlanEstimates"] | null;
+            stats?: components["schemas"]["PlanStats"] | null;
+            /**
+             * Badges
+             * @default []
+             */
+            badges: ("primary_scan" | "sequential_scan" | "intersect_scan" | "not_covered" | "slowest")[];
+            /**
+             * Children
+             * @default []
+             */
+            children: components["schemas"]["PlanNode"][];
+        };
+        /** PlanRequest */
+        PlanRequest: {
+            /** Text */
+            text: string;
+        };
+        /** PlanStats */
+        PlanStats: {
+            /** Items In */
+            items_in?: number | null;
+            /** Items Out */
+            items_out?: number | null;
+            /** Exec Time */
+            exec_time?: string | null;
+            /** Serv Time */
+            serv_time?: string | null;
+            /** Kern Time */
+            kern_time?: string | null;
+        };
+        /** PlanSubquery */
+        PlanSubquery: {
+            /** Text */
+            text: string;
+            /** Correlated */
+            correlated: boolean;
+            root: components["schemas"]["PlanNode"];
+        };
+        /** PlanView */
+        PlanView: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "plan" | "profile" | "advice" | "unknown";
+            root?: components["schemas"]["PlanNode"] | null;
+            /**
+             * Subqueries
+             * @default []
+             */
+            subqueries: components["schemas"]["PlanSubquery"][];
+            /**
+             * Findings
+             * @default []
+             */
+            findings: components["schemas"]["PlanFinding"][];
+            /**
+             * Advice
+             * @default []
+             */
+            advice: components["schemas"]["IndexAdvice"][];
+            /** Advice Note */
+            advice_note?: string | null;
+            /** Statement Text */
+            statement_text?: string | null;
+            estimates?: components["schemas"]["PlanEstimates"] | null;
+            /**
+             * Phase Times
+             * @default []
+             */
+            phase_times: components["schemas"]["PlanDetail"][];
         };
         /** ProfileEntry */
         ProfileEntry: {
@@ -1922,6 +2140,12 @@ export interface components {
             selection?: components["schemas"]["TextSelection"] | null;
             /** Autocommit */
             autocommit?: boolean | null;
+            /** Query Context */
+            query_context?: components["schemas"]["QueryContext"] | "none" | null;
+            /** Params */
+            params?: {
+                [key: string]: string;
+            } | null;
         };
     };
     responses: never;
@@ -2456,6 +2680,111 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ExecutionSchema"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    contexts_couchbase_contexts_get: {
+        parameters: {
+            query: {
+                profile_id: string;
+                bucket?: string | null;
+                scope?: string | null;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContextOption"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    plan_couchbase_plan_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlanView"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    advise_couchbase_advise_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdviseRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlanView"];
                 };
             };
             /** @description Validation Error */

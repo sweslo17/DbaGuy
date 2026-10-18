@@ -5,7 +5,8 @@ from pydantic import BaseModel
 
 from .metadata import PathSegment
 
-RelationKind = Literal["table", "view", "materialized_view", "synonym"]  # synonym: SQL Server, no columns
+# synonym: SQL Server, no columns; collection: Couchbase, found by ⌘P (not a relation of the snapshot's schemas)
+RelationKind = Literal["table", "view", "materialized_view", "synonym", "collection"]
 
 
 class SnapshotColumn(BaseModel):

@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from loguru import logger
 
-from .api import history, metadata, profiles, scripts, sessions, sql, system, workspace
+from .api import couchbase, history, metadata, profiles, scripts, sessions, sql, system, workspace
 from .api import settings as settings_api  # `settings` is the parameter of create_app
 from .api.errors import register_error_handlers
 from .config import Settings, load_settings
@@ -49,6 +49,7 @@ def create_app(settings: Settings, container: AppContainer | None = None) -> Fas
     app.include_router(profiles.router)
     app.include_router(metadata.router)
     app.include_router(sessions.router)
+    app.include_router(couchbase.router)
     app.include_router(settings_api.router)
     app.include_router(workspace.router)
     app.include_router(scripts.router)

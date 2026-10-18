@@ -55,6 +55,17 @@ export type ScriptFile = S["ScriptFile"];
 export type HistoryEntry = S["HistoryEntry"];
 export type HistoryPage = S["HistoryPage"];
 export type HistoryStatus = HistoryEntry["status"];
+/** Couchbase (spec §3.11.1): one entry of the query-context picker. `text` is the backend's display text for it. */
+export type ContextOption = S["ContextOption"];
+/** Couchbase (spec §3.10): an EXPLAIN, ADVISE or profile result as an operator tree with flags, advice and timings. */
+export type PlanView = S["PlanView"];
+export type PlanNode = S["PlanNode"];
+export type PlanFinding = S["PlanFinding"];
+export type PlanDetail = S["PlanDetail"];
+export type PlanSubquery = S["PlanSubquery"];
+export type IndexAdvice = S["IndexAdvice"];
+/** Couchbase (spec §3.11.2): the typed parameters of one statement, JSON literal texts by name or position. */
+export type StatementParams = S["StatementParams"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

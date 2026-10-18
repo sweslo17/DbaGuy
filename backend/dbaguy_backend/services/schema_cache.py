@@ -2,13 +2,14 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import NamedTuple
 from uuid import UUID
 
 from loguru import logger
 
 from ..adapters.base import DatabaseAdapter
 from ..adapters.registry import AdapterRegistry
-from ..domain.schema import ObjectSearchHit, SchemaSnapshot
+from ..domain.schema import ObjectSearchHit, RelationKind, SchemaSnapshot
 from ..sql.completion import SnapshotIndex
 from .metadata_service import MetadataService
 from .profile_service import ProfileService
@@ -27,6 +28,16 @@ class _Entry:
 class _Failure:
     error: Exception
     failed_at: float
+
+
+class _Match(NamedTuple):
+    database: str | None  # a relation's database; a collection's bucket
+    schema_name: str  # a relation's schema; a collection's scope
+    name: str
+    kind: RelationKind
+
+
+_SortKey = tuple[int, bool, int, int, str]  # rank, system, search-path position, name length, name
 
 
 def _is_subsequence(needle: str, text: str) -> bool:
@@ -133,7 +144,9 @@ class SchemaCache:
                     del store[key]
 
     def search(self, profile_id: UUID, q: str, database: str | None = None, limit: int = 50) -> list[ObjectSearchHit]:
-        """Tables and views whose name matches `q` (or `schema.name`): exact, prefix, substring, then subsequence."""
+        """Tables and views whose name matches `q` (or `schema.name`): exact, prefix, substring, then subsequence.
+        Couchbase collections the same way (B20): the text before the last dot has to prefix the scope or
+        `bucket.scope`, so `inventory.airl` and `travel-sample.inventory.airl` both narrow to one scope."""
         schema_part, _, name_part = q.strip().rpartition(".")
         needle, schema_needle = name_part.strip().lower(), schema_part.strip().lower()
         if not needle and not schema_needle:
@@ -141,7 +154,7 @@ class SchemaCache:
         snapshot = self.get(profile_id, database)
         adapter = self._adapter(profile_id)
         search_path = {name.lower(): position for position, name in enumerate(snapshot.search_path)}
-        scored = []
+        scored: list[tuple[_SortKey, _Match]] = []
         for schema in snapshot.schemas:
             if schema_needle and not schema.name.lower().startswith(schema_needle):
                 continue
@@ -150,15 +163,26 @@ class SchemaCache:
                 name = relation.name.lower()
                 rank = _match_rank(name, needle)
                 if rank is not None:
-                    scored.append(((rank, schema.system, path_rank, len(name), name), schema.name, relation))
+                    scored.append(((rank, schema.system, path_rank, len(name), name),
+                                   _Match(snapshot.database, schema.name, relation.name, relation.kind)))
+        for keyspace in snapshot.keyspaces:
+            scope = keyspace.scope.lower()
+            if schema_needle and not (scope.startswith(schema_needle)
+                                      or f"{keyspace.bucket.lower()}.{scope}".startswith(schema_needle)):
+                continue
+            name = keyspace.collection.lower()
+            rank = _match_rank(name, needle)
+            if rank is not None:  # no search path: every scope ranks alike
+                scored.append(((rank, keyspace.system, 0, len(name), name),
+                               _Match(keyspace.bucket, keyspace.scope, keyspace.collection, "collection")))
         scored.sort(key=lambda item: item[0])
         logger.debug("Object search {!r} in {}: {} matches", q, profile_id, len(scored))
         return [
             ObjectSearchHit(
-                database=snapshot.database, schema_name=schema_name, name=relation.name, kind=relation.kind,
-                path=adapter.relation_path(snapshot.database, schema_name, relation.name, relation.kind),
+                database=match.database, schema_name=match.schema_name, name=match.name, kind=match.kind,
+                path=adapter.relation_path(match.database, match.schema_name, match.name, match.kind),
             )
-            for _, schema_name, relation in scored[:limit]
+            for _, match in scored[:limit]
         ]
 
     def _adapter(self, profile_id: UUID) -> DatabaseAdapter:
