@@ -40,8 +40,11 @@ _MIXED_FORMS = "This URL mixes the ?a=b&c=d and ;a=b forms. Use one form."
 _KEY_VALUE = "A JDBC SQL Server URL takes key=value properties after the host"
 _OPEN_BRACE = "A {...} value in the JDBC URL is not closed"
 _FULLWIDTH_SEMICOLON = "；"  # what an IME types for ";"
-# A URL path after the host is an instance name in these schemes (JDBC, go-mssqldb) and the database in SQLAlchemy's.
+# `sqlserver://` is JDBC's and go-mssqldb's scheme; `mssql://` and `mssql+pymssql://` are SQLAlchemy's.
+# A URL path after the host is an instance name in the first (the database in SQLAlchemy's), and the drivers of the
+# first encrypt by default (mssql-jdbc 10.2+, Microsoft.Data.SqlClient, go-mssqldb), SQLAlchemy's URL asks for nothing.
 _INSTANCE_PATH_SCHEMES = frozenset({"sqlserver"})
+_ENCRYPT_BY_DEFAULT_SCHEMES = frozenset({"sqlserver"})
 
 
 # ---- profile -> pymssql ----
@@ -245,13 +248,14 @@ def _jdbc_pairs(text: str) -> Iterator[tuple[str, str]]:
         yield key, value
 
 
-def _ssl_mode(values: Mapping[str, str], jdbc: bool) -> SslMode | None:
+def _ssl_mode(values: Mapping[str, str], encrypts_by_default: bool) -> SslMode | None:
     trusts = values.get("trust", "").strip().lower() in _FLAG_ON
     value = values.get("encrypt")
     if value is None:
-        # No encrypt key. JDBC drivers (mssql-jdbc 10.2+, Microsoft.Data.SqlClient) encrypt by default, and
-        # trustServerCertificate=true asks for exactly that, unverified. A plain mssql:// URL asks for nothing.
-        return "require" if jdbc or trusts else None
+        # No encrypt key: a URL of the drivers that encrypt by default (any sqlserver:// URL, and the JDBC `;` form
+        # whatever its scheme) asks for encryption, and so does trustServerCertificate=true (unverified). A plain
+        # mssql:// URL asks for nothing.
+        return "require" if encrypts_by_default or trusts else None
     key = value.strip().lower()
     if key in _ENCRYPT_MODES:
         return _ENCRYPT_MODES[key]
@@ -317,7 +321,7 @@ def parse_mssql_url(url: str) -> ParsedUrl:
     if tds_version and _valid_tds_version(tds_version) is None:
         raise ValidationFailed(_TDS_VERSION_MESSAGE)
     ssl_fields: dict[str, Any] = {}
-    if mode := _ssl_mode(values, jdbc):
+    if mode := _ssl_mode(values, jdbc or split.scheme in _ENCRYPT_BY_DEFAULT_SCHEMES):
         ssl_fields["mode"] = mode
     draft = ServerProfileDraft(
         engine="mssql",

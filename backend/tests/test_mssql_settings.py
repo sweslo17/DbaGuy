@@ -225,12 +225,42 @@ def test_the_encrypt_table(encrypt, trust, mode):
     ("sqlserver://h;databaseName=d", "require"),  # the JDBC drivers' default is encrypt=true
     ("sqlserver://h:1433;databaseName=d;trustServerCertificate=false", "require"),
     ("sqlserver://h;", "require"),
-    ("mssql://h/db", "prefer"),  # a plain URL asks for nothing
+    ("sqlserver://host:1433", "require"),  # R-03b-T6f: any sqlserver:// URL, properties or not
+    ("sqlserver://host", "require"),
+    ("sqlserver://me@h?database=d", "require"),  # go-mssqldb's form
+    ("sqlserver://me:pw@h:1433?database=d&app+name=x", "require"),
+    ("SQLSERVER://host:1433", "require"),
+    ("mssql://h/db", "prefer"),  # SQLAlchemy's URL asks for nothing
     ("mssql://h/db?trustServerCertificate=false", "prefer"),
-    ("sqlserver://me@h?database=d", "prefer"),
+    ("mssql+pymssql://me@h:1433/db", "prefer"),
+    ("mssql://h", "prefer"),
 ])
 def test_no_encrypt_key(url, mode):
     assert parse_mssql_url(url).profile.ssl.mode == mode
+
+
+@pytest.mark.parametrize("url, mode", [
+    ("sqlserver://host:1433", "disable"), ("sqlserver://host:1433", "prefer"),
+    ("sqlserver://host?database=d", "verify-full"), ("mssql://h/db", "require"),
+])
+def test_an_explicit_encrypt_key_wins_over_the_scheme_default(url, mode):
+    key = {"disable": "disable", "prefer": "false", "verify-full": "true", "require": "require"}[mode]
+    separator = "&" if "?" in url else "?"
+    assert parse_mssql_url(f"{url}{separator}encrypt={key}").profile.ssl.mode == mode
+
+
+def test_a_jdbc_url_without_properties_asks_for_encryption_after_the_registry_strips_the_prefix():
+    # R-03b-T6f: `jdbc:sqlserver://host:1433` has no `;`, so after the strip it is told apart by its scheme alone.
+    from types import SimpleNamespace
+
+    from dbaguy_backend.adapters.mssql.settings import URL_SCHEMES
+    from dbaguy_backend.adapters.registry import AdapterRegistry
+
+    adapter = SimpleNamespace(engine="mssql", url_schemes=URL_SCHEMES, parse_url=parse_mssql_url)
+    registry = AdapterRegistry([adapter])
+    for pasted in ("jdbc:sqlserver://host:1433", "JDBC:sqlserver://host", " jdbc:sqlserver://host:1433 "):
+        assert registry.parse_url(pasted).profile.ssl.mode == "require"
+    assert registry.parse_url("mssql://host:1433/db").profile.ssl.mode == "prefer"
 
 
 @pytest.mark.parametrize("value, mode", [("off", "disable"), ("request", "prefer"), ("require", "require"),
