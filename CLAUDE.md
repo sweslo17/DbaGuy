@@ -18,7 +18,7 @@ macOS 上自用的 SQL IDE（side project）。支援 PostgreSQL、MySQL、SQLit
 | Shell | Tauri 2；Rust 端只負責視窗、選單與啟動/監控 sidecar |
 | Frontend | React + TypeScript + Vite |
 | Backend sidecar | Python 3.13、poetry、FastAPI、pydantic v2、loguru |
-| Drivers | psycopg 3（PG）、mysql-connector-python（MySQL）、pymssql（MSSQL）、couchbase 4.x（Couchbase）、sqlite3（SQLite） |
+| Drivers | psycopg 3（PG）、mysql-connector-python（MySQL）、pymssql（MSSQL）、Couchbase 走 Query Service REST（stdlib `http.client`，不用 SDK；理由見 [④ spec](docs/superpowers/specs/2026-10-18-04-couchbase-design.md) R-04-1）、sqlite3（SQLite） |
 | 本地資料 | `~/Library/Application Support/DbaGuy/`；密碼存 macOS Keychain |
 
 選型理由與各 DB 的卡點：[landscape §5](docs/research/2026-10-15-sql-ide-landscape.md)、[feature-priorities §7](docs/research/2026-10-15-feature-priorities.md)（**實作 adapter 前必讀**）。
