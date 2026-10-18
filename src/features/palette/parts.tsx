@@ -71,7 +71,7 @@ export function PaletteList({ empty, children }: { empty?: string; children: Rea
 const GROUP_HEADING =
   "[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:pt-2 [&_[cmdk-group-heading]]:pb-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted [&_[cmdk-group-heading]]:uppercase";
 
-export function PaletteGroup({ heading, children }: { heading: string; children: ReactNode }) {
+export function PaletteGroup({ heading, children }: { heading: ReactNode; children: ReactNode }) {
   return (
     <Command.Group heading={heading} className={GROUP_HEADING}>
       {children}

@@ -1,11 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { Database } from "lucide-react";
 import { useState } from "react";
+import { EngineIcon } from "@/components/EngineIcon";
 import { DropdownMenu, type MenuItem } from "@/components/ui/ContextMenu";
 import { errorMessage } from "@/lib/api/client";
 import type { ProfileEntry, SessionInfo } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
-import { ENGINE_LABELS } from "../connections/ConnectionDialog";
+import { ENGINE_LABELS } from "@/lib/engines";
 import { buildFolderTree, type FolderNode } from "../connections/folders";
 import { useEngineInfo, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
@@ -44,6 +45,8 @@ function profileItems(folder: FolderNode, current: string | null, pick: (id: str
     ...folder.folders.map((sub) => ({ label: sub.name, children: profileItems(sub, current, pick) })),
     ...folder.profiles.map(({ profile }) => ({
       label: profile.name,
+      // The engine's name is the row's shortcut text.
+      icon: <EngineIcon engine={profile.engine} decorative />,
       shortcut: ENGINE_LABELS[profile.engine],
       checked: profile.id === current,
       onSelect: () => pick(profile.id),
@@ -133,9 +136,13 @@ export function ConnectionPicker(props: ConnectionPickerProps) {
           className={cn(
             "max-w-[180px]",
             // A red profile keeps its red chip, also while disabled.
-            red ? "bg-danger font-medium text-accent-fg enabled:hover:brightness-110" : "enabled:hover:bg-hover",
+            red
+              ? // The icons take the chip's text colour: the engine's own red would vanish on it.
+                "bg-danger font-medium text-accent-fg enabled:hover:brightness-110 [&_svg]:text-accent-fg"
+              : "enabled:hover:bg-hover",
           )}
         >
+          {profile && <EngineIcon engine={profile.engine} size={12} />}
           {!red && tint && <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: tint }} />}
           <span className={cn("truncate", profile ? "font-medium" : "text-muted")}>
             {profile?.name ?? (profileId ? "…" : "Choose a connection")}

@@ -15,16 +15,9 @@ import type {
   SslConfig,
 } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
+import { ENGINE_LABELS } from "@/lib/engines";
 import { useEngines, useImportUrl, useSaveProfile, useTestConnection } from "./hooks";
 import { PROFILE_COLOR_ORDER } from "./profileColors";
-
-export const ENGINE_LABELS: Record<Engine, string> = {
-  postgres: "PostgreSQL",
-  mysql: "MySQL",
-  mssql: "SQL Server",
-  couchbase: "Couchbase",
-  sqlite: "SQLite",
-};
 
 const SSL_MODES: SslConfig["mode"][] = ["disable", "prefer", "require", "verify-ca", "verify-full"];
 /** The engine's own name for each stored mode (the stored value stays libpq-style); other engines show it raw. */

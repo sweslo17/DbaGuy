@@ -2,10 +2,11 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Ban, CircleCheck, CircleX, Search, TimerOff, Trash2, X, type LucideIcon } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { EngineIcon } from "@/components/EngineIcon";
 import { Button } from "@/components/ui/Button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { errorMessage } from "@/lib/api/client";
-import type { HistoryEntry, HistoryStatus } from "@/lib/api/types";
+import type { Engine, HistoryEntry, HistoryStatus } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { formatDuration, formatRelativeTime, plural } from "@/lib/format";
 import { isImeKeyEvent } from "@/lib/ime";
@@ -51,7 +52,27 @@ function firstLine(sql: string): string {
 const startedAt = (entry: HistoryEntry) => Date.parse(entry.started_at);
 const absoluteTime = (entry: HistoryEntry) => new Date(startedAt(entry)).toLocaleString();
 
-function HistoryRow({ entry, now, selected }: { entry: HistoryEntry; now: number; selected: boolean }) {
+/** Where an entry ran, e.g. its connection's name: led by the connection's engine icon (none once it is deleted). */
+function EntryConnection({ engine, where }: { engine: Engine | undefined; where: string }) {
+  return (
+    <span className="flex min-w-0 flex-1 items-center gap-1" title={where}>
+      {engine && <EngineIcon engine={engine} size={12} />}
+      <span className="truncate">{where}</span>
+    </span>
+  );
+}
+
+function HistoryRow({
+  entry,
+  engine,
+  now,
+  selected,
+}: {
+  entry: HistoryEntry;
+  engine: Engine | undefined;
+  now: number;
+  selected: boolean;
+}) {
   return (
     <div
       role="option"
@@ -70,9 +91,7 @@ function HistoryRow({ entry, now, selected }: { entry: HistoryEntry; now: number
           {formatRelativeTime(startedAt(entry), now)}
         </span>
         <span className="shrink-0">·</span>
-        <span className="min-w-0 flex-1 truncate" title={entry.profile_name}>
-          {entry.profile_name}
-        </span>
+        <EntryConnection engine={engine} where={entry.profile_name} />
         <span className="shrink-0 tabular-nums">{formatDuration(entry.elapsed_ms)}</span>
       </div>
     </div>
@@ -89,7 +108,15 @@ function cut(text: string, length: number): string {
  * The selected entry, below the list: its SQL (the first 20,000 characters until "Show all") and error can be
  * selected and copied.
  */
-function Preview({ entry, onClose }: { entry: HistoryEntry; onClose: () => void }) {
+function Preview({
+  entry,
+  engine,
+  onClose,
+}: {
+  entry: HistoryEntry;
+  engine: Engine | undefined;
+  onClose: () => void;
+}) {
   const [showAll, setShowAll] = useState(false);
   const shortened = !showAll && entry.sql.length > PREVIEW_CHARS;
   const facts = [STATUS[entry.status].label, formatDuration(entry.elapsed_ms)];
@@ -102,9 +129,7 @@ function Preview({ entry, onClose }: { entry: HistoryEntry; onClose: () => void 
           <StatusIcon status={entry.status} />
         </span>
         <div className="min-w-0 flex-1" data-selectable>
-          <p className="truncate" title={where}>
-            {where}
-          </p>
+          <EntryConnection engine={engine} where={where} />
           <p>
             {absoluteTime(entry)} · {facts.join(" · ")}
           </p>
@@ -206,6 +231,10 @@ export function HistoryPanel({ shown }: { shown: boolean }) {
   );
   const profiles = useProfiles();
   const scopeName = profiles.data?.find((item) => item.profile.id === scopeId)?.profile.name ?? null;
+  const engines = useMemo(
+    () => new Map(profiles.data?.map(({ profile }) => [profile.id, profile.engine])),
+    [profiles.data],
+  );
   const [onlyScope, setOnlyScope] = useState(false);
   const profileFilter = onlyScope ? scopeId : null;
 
@@ -385,7 +414,12 @@ export function HistoryPanel({ shown }: { shown: boolean }) {
                 onClick={() => setSelectedId(entry.id)}
                 onDoubleClick={(e) => activate(entry, e.altKey)}
               >
-                <HistoryRow entry={entry} now={now} selected={entry.id === selectedId} />
+                <HistoryRow
+                  entry={entry}
+                  engine={engines.get(entry.profile_id)}
+                  now={now}
+                  selected={entry.id === selectedId}
+                />
               </div>
             );
           })}
@@ -394,7 +428,14 @@ export function HistoryPanel({ shown }: { shown: boolean }) {
       {history.isFetchingNextPage && <p className="shrink-0 px-3 py-1.5 text-[11px] text-muted">Loading more…</p>}
       {/* Below the rows: a page that failed to load more is where the list ends. */}
       {entries.length > 0 && failure}
-      {selected && <Preview key={selected.id} entry={selected} onClose={() => setSelectedId(null)} />}
+      {selected && (
+        <Preview
+          key={selected.id}
+          entry={selected}
+          engine={engines.get(selected.profile_id)}
+          onClose={() => setSelectedId(null)}
+        />
+      )}
       {confirmClear && (
         <ConfirmDialog
           open

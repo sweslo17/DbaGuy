@@ -1,11 +1,13 @@
 import { Loader2, Plus, X } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { EngineIcon } from "@/components/EngineIcon";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import type { Profile } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { isDialogOpen } from "@/lib/dialogs";
 import { isImeKeyEvent } from "@/lib/ime";
 import { isCommandKey } from "@/lib/shortcuts";
+import { revealInStrip, scrollSidewaysOnWheel } from "@/lib/stripScroll";
 import { useTabStatus } from "@/stores/tabStatus";
 import { useWorkspace, type Tab } from "@/stores/workspace";
 import { useProfiles } from "../connections/hooks";
@@ -46,16 +48,23 @@ function tabTooltip(tab: Tab, profile: Profile | undefined, missing: boolean): s
 }
 
 /**
- * One tab in the strip: its connection's colour underlines it; a query tab shows a spinner while it works and a dot
- * when its script has unsaved changes. Every way of closing it goes through the close guards.
+ * One tab in the strip: its connection's engine icon leads it and its colour underlines it; a query tab shows a
+ * spinner while it works and a dot when its script has unsaved changes. Every way of closing it goes through the close
+ * guards. It scrolls itself into view when it becomes the active tab.
  */
 function TabLabel({ tab, active, profile }: { tab: Tab; active: boolean; profile: Profile | undefined }) {
   const activate = useWorkspace((s) => s.activate);
   const status = useTabStatus(tab.id);
   const tint = profileColor(profile?.color);
   const query = tab.kind === "query";
+  // However it became active (opened, ⌘1–9, ⌃Tab, the palette, the restored workspace), the strip shows it.
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (active && ref.current) revealInStrip(ref.current);
+  }, [active]);
   return (
     <div
+      ref={ref}
       role="tab"
       aria-selected={active}
       onClick={() => activate(tab.id)}
@@ -69,6 +78,7 @@ function TabLabel({ tab, active, profile }: { tab: Tab; active: boolean; profile
       style={tint ? { boxShadow: `inset 0 -2px 0 ${tint}` } : undefined}
       title={tabTooltip(tab, profile, status.missing)}
     >
+      {profile && <EngineIcon engine={profile.engine} size={12} />}
       {query && status.busy && <Loader2 size={11} className="shrink-0 animate-spin text-muted" aria-label="Running" />}
       <span className="truncate">
         {query && status.dirty && (
@@ -134,7 +144,13 @@ export function Workspace() {
 
   return (
     <div className="flex h-full flex-col">
-      <div role="tablist" className="flex h-8 shrink-0 items-end gap-px overflow-x-auto border-b border-border bg-panel px-1">
+      {/* No scrollbar of its own, whatever the system setting: one would sit inside the strip and cut off the tabs. The
+          strip scrolls by wheel, swipe, and by showing the active tab. */}
+      <div
+        role="tablist"
+        className="scrollbar-none flex h-8 shrink-0 items-end gap-px overflow-x-auto overflow-y-hidden border-b border-border bg-panel px-1"
+        onWheel={scrollSidewaysOnWheel}
+      >
         {tabs.map((tab) => (
           <TabLabel
             key={tab.id}

@@ -1,7 +1,8 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ChevronRight, Plus, RefreshCw, Server } from "lucide-react";
+import { ChevronRight, Plus, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { EngineIcon } from "@/components/EngineIcon";
 import { Button } from "@/components/ui/Button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ContextMenu } from "@/components/ui/ContextMenu";
@@ -9,8 +10,9 @@ import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
 import type { Profile, ProfileEntry } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
+import { ENGINE_LABELS } from "@/lib/engines";
 import { useWorkspace } from "@/stores/workspace";
-import { ConnectionDialog, ENGINE_LABELS } from "../connections/ConnectionDialog";
+import { ConnectionDialog } from "../connections/ConnectionDialog";
 import { findEngineInfo, useDeleteProfile, useEngines, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
 import { secretsNeeded, UnlockDialog, type SecretsNeeded } from "../connections/UnlockDialog";
@@ -262,7 +264,8 @@ export function Explorer() {
             onDoubleClick={() => toggle(row)}
           >
             {chevron}
-            <Server size={14} className="shrink-0 text-muted" />
+            {/* Its name is written at the right edge. */}
+            <EngineIcon engine={p.engine} decorative />
             <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: profileColor(p.color) ?? "transparent" }} />
             <span className="truncate font-medium">{p.name}</span>
             <span className="ml-auto shrink-0 text-[11px] text-muted">{ENGINE_LABELS[p.engine]}</span>

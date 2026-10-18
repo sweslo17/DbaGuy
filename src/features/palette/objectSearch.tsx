@@ -1,4 +1,5 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { EngineIcon } from "@/components/EngineIcon";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import { pathKey, type ObjectNode, type ObjectSearchHit, type Profile } from "@/lib/api/types";
 import { useWorkspace } from "@/stores/workspace";
@@ -61,7 +62,15 @@ export function ObjectsSection({
   const openHit = (profileId: string, hit: ObjectSearchHit) =>
     hit.kind === "collection" ? void openBrowseTab(profileId, hit.path) : openObject(profileId, hitNode(hit));
   const search = useObjectSearch(profile?.id ?? null, q);
-  const heading = profile ? `Database objects · ${profile.name}` : "Database objects";
+  const heading = profile ? (
+    // The engine's icon leads the connection's name.
+    <span className="flex items-center gap-1.5">
+      <EngineIcon engine={profile.engine} size={12} />
+      <span className="min-w-0">Database objects · {profile.name}</span>
+    </span>
+  ) : (
+    "Database objects"
+  );
   if (!profile) {
     return (
       <PaletteGroup heading={heading}>
