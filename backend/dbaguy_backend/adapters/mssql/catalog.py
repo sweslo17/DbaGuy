@@ -56,6 +56,21 @@ def rows(conn: driver.Connection, sql: str) -> list[tuple]:
     return read_rows(conn)
 
 
+def result_sets(conn: driver.Connection, sql: str) -> list[list[tuple]]:
+    """Every result set of one batch, empty ones included, in order. Several catalog queries sent as one batch cost one
+    round trip instead of one each (over an SSH tunnel that is the whole price); nothing stays unread, like read_rows."""
+    conn.execute_query(sql)
+    found = [[tuple(row) for row in conn.get_iterator(driver.ROW)]]
+    while conn.nextresult():
+        found.append([tuple(row) for row in conn.get_iterator(driver.ROW)])
+    return found
+
+
+def batch(*queries: str) -> str:
+    """Statements joined into one batch for result_sets."""
+    return ";\n".join(query.strip() for query in queries)
+
+
 def first_row(conn: driver.Connection, sql: str) -> tuple | None:
     found = rows(conn, sql)
     return found[0] if found else None

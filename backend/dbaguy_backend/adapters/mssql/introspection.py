@@ -4,9 +4,16 @@ Tree: database > schema > folder > object, and table|view > folder (columns, ind
 Every name reaches SQL through `q()`, `literal()` or `object_id_sql()` (catalog.py); a statement never takes a driver
 parameter.
 
-Whether the schema or table a call names still exists is not a query of its own: it rides on the count query of the
-level (an `exists` row) or is asked only after an answer came back empty, so the common path of every call is one round
-trip, however far the connection is (over an SSH tunnel every one counts).
+Round trips (over an SSH tunnel every one counts): every tree call is one query, because whether the schema or table a
+call names still exists rides on the level's own count query (an `exists` row) or is asked only after an answer came
+back empty. A detail that needs several catalog queries (a table's columns, keys, checks, foreign keys, indexes and
+comment) sends them as one batch.
+
+Limited accounts: without VIEW DEFINITION the catalog still lists an object's columns, constraints and indexes, but
+hides their definitions (a computed column's expression, a default, a check, an index filter) and the user-defined types
+that are not the account's own. A column then falls back to its base type and the names stay, but DDL that would
+need a hidden definition is not written: such an object has `ddl=None` and keeps its columns, never a CREATE statement
+that quietly differs from the real object.
 """
 
 from collections.abc import Callable
@@ -17,7 +24,13 @@ from loguru import logger
 from ...domain.errors import NotFound, ValidationFailed
 from ...domain.metadata import ColumnInfo, Folder, NodeKind, ObjectDetail, ObjectNode, PathSegment, make_node
 from . import driver
-from .catalog import SYSTEM_DATABASES, first_row, is_system_schema, literal, name_literal, object_id_sql, q, rows, type_sql
+from .catalog import (
+    SYSTEM_DATABASES, batch, first_row, is_system_schema, literal, name_literal, object_id_sql, q, result_sets, rows,
+    type_sql)
+
+HIDDEN = "?"  # what the tree shows for a name the account may not see
+# Their objects are system objects: listed from sys.all_views / sys.all_objects, not from the user-object views.
+_CATALOG_SCHEMAS = frozenset({"sys", "INFORMATION_SCHEMA"})
 
 _DATABASES = (
     "SELECT name FROM sys.databases WHERE HAS_DBACCESS(name) = 1 AND state = 0 "
@@ -34,15 +47,28 @@ UNION ALL SELECT 'synonyms', COUNT(*) FROM sys.synonyms WHERE schema_id = SCHEMA
 UNION ALL SELECT 'types', COUNT(*) FROM sys.types WHERE is_user_defined = 1 AND schema_id = SCHEMA_ID({s})
 UNION ALL SELECT 'exists', CASE WHEN SCHEMA_ID({s}) IS NULL THEN 0 ELSE 1 END
 """
+_CATALOG_FOLDER_COUNTS = """
+SELECT 'views', COUNT(*) FROM sys.all_views WHERE schema_id = SCHEMA_ID({s})
+UNION ALL SELECT 'functions', COUNT(*) FROM sys.all_objects WHERE schema_id = SCHEMA_ID({s}) AND type IN ('FN', 'IF', 'TF', 'FS', 'FT')
+UNION ALL SELECT 'procedures', COUNT(*) FROM sys.all_objects WHERE schema_id = SCHEMA_ID({s}) AND type IN ('P', 'PC', 'RF', 'X')
+UNION ALL SELECT 'exists', CASE WHEN SCHEMA_ID({s}) IS NULL THEN 0 ELSE 1 END
+"""
+_FUNCTION_DETAIL = "CASE WHEN type IN ('FN', 'FS') THEN 'scalar' WHEN type = 'IF' THEN 'inline table' ELSE 'table' END"
 _OBJECTS: dict[Folder, str] = {  # (name, detail)
     Folder.TABLES: "SELECT name, NULL FROM sys.tables WHERE schema_id = SCHEMA_ID({s}) ORDER BY name",
     Folder.VIEWS: "SELECT name, NULL FROM sys.views WHERE schema_id = SCHEMA_ID({s}) ORDER BY name",
-    Folder.FUNCTIONS: "SELECT name, CASE WHEN type IN ('FN', 'FS') THEN 'scalar' WHEN type = 'IF' THEN 'inline table' "
-                      "ELSE 'table' END FROM sys.objects WHERE schema_id = SCHEMA_ID({s}) "
+    Folder.FUNCTIONS: f"SELECT name, {_FUNCTION_DETAIL} FROM sys.objects WHERE schema_id = SCHEMA_ID({{s}}) "
                       "AND type IN ('FN', 'IF', 'TF', 'FS', 'FT') ORDER BY name",
     Folder.PROCEDURES: "SELECT name, NULL FROM sys.procedures WHERE schema_id = SCHEMA_ID({s}) ORDER BY name",
     Folder.SEQUENCES: "SELECT name, TYPE_NAME(user_type_id) FROM sys.sequences WHERE schema_id = SCHEMA_ID({s}) ORDER BY name",
     Folder.SYNONYMS: "SELECT name, base_object_name FROM sys.synonyms WHERE schema_id = SCHEMA_ID({s}) ORDER BY name",
+}
+_CATALOG_OBJECTS: dict[Folder, str] = {  # what `sys` and `INFORMATION_SCHEMA` hold
+    Folder.VIEWS: "SELECT name, NULL FROM sys.all_views WHERE schema_id = SCHEMA_ID({s}) ORDER BY name",
+    Folder.FUNCTIONS: f"SELECT name, {_FUNCTION_DETAIL} FROM sys.all_objects WHERE schema_id = SCHEMA_ID({{s}}) "
+                      "AND type IN ('FN', 'IF', 'TF', 'FS', 'FT') ORDER BY name",
+    Folder.PROCEDURES: "SELECT name, NULL FROM sys.all_objects WHERE schema_id = SCHEMA_ID({s}) "
+                       "AND type IN ('P', 'PC', 'RF', 'X') ORDER BY name",
 }
 _TYPE_COLUMNS = """
 SELECT t.name, t.is_table_type, bt.name, t.max_length, t.precision, t.scale, t.is_nullable
@@ -54,10 +80,12 @@ _TABLE_FOLDER_COUNTS = """
 SELECT 'indexes', COUNT(*) FROM sys.indexes WHERE object_id = {o} AND type IN (1, 2)
 UNION ALL SELECT 'foreign_keys', COUNT(*) FROM sys.foreign_keys WHERE parent_object_id = {o}
 UNION ALL SELECT 'triggers', COUNT(*) FROM sys.triggers WHERE parent_id = {o}
-UNION ALL SELECT 'exists', COUNT(*) FROM sys.objects WHERE object_id = {o} AND type = {t}
+UNION ALL SELECT 'exists', COUNT(*) FROM sys.all_objects WHERE object_id = {o} AND type = {t}
 """
+# sys.all_columns: a system view (`sys.objects`) has columns too. A user type the account may not see has no row in
+# sys.types: the column falls back to its base type (system_type_id), and `type_hidden` says so.
 _COLUMNS = """
-SELECT c.name, t.name, c.max_length, c.precision, c.scale, c.is_nullable, c.is_identity,
+SELECT c.name, COALESCE(t.name, st.name, N'?'), c.max_length, c.precision, c.scale, c.is_nullable, c.is_identity,
        CAST(ic.seed_value AS nvarchar(40)), CAST(ic.increment_value AS nvarchar(40)), cc.definition, cc.is_persisted,
        dc.name, dc.definition, CASE WHEN t.is_user_defined = 1 THEN SCHEMA_NAME(t.schema_id) END, c.collation_name,
        CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation')),
@@ -65,8 +93,11 @@ SELECT c.name, t.name, c.max_length, c.precision, c.scale, c.is_nullable, c.is_i
                          ON k.object_id = i.object_id AND k.index_id = i.index_id
                          WHERE i.is_primary_key = 1 AND k.object_id = c.object_id AND k.column_id = c.column_id)
             THEN 1 ELSE 0 END,
-       CAST(ep.value AS nvarchar(4000))
-FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id
+       CAST(ep.value AS nvarchar(4000)),
+       c.is_computed, CASE WHEN c.default_object_id <> 0 THEN 1 ELSE 0 END, CASE WHEN t.name IS NULL THEN 1 ELSE 0 END,
+       dc.is_system_named
+FROM sys.all_columns c LEFT JOIN sys.types t ON t.user_type_id = c.user_type_id
+LEFT JOIN sys.types st ON st.user_type_id = c.system_type_id
 LEFT JOIN sys.identity_columns ic ON ic.object_id = c.object_id AND ic.column_id = c.column_id
 LEFT JOIN sys.computed_columns cc ON cc.object_id = c.object_id AND cc.column_id = c.column_id
 LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
@@ -75,23 +106,25 @@ LEFT JOIN sys.extended_properties ep
 WHERE c.object_id = {o} ORDER BY c.column_id
 """
 _KEYS = """
-SELECT i.name, i.is_primary_key, i.type_desc, COL_NAME(k.object_id, k.column_id), k.is_descending_key
+SELECT i.name, i.is_primary_key, i.type_desc, COL_NAME(k.object_id, k.column_id), k.is_descending_key, kc.is_system_named
 FROM sys.indexes i JOIN sys.index_columns k ON k.object_id = i.object_id AND k.index_id = i.index_id
+LEFT JOIN sys.key_constraints kc ON kc.parent_object_id = i.object_id AND kc.unique_index_id = i.index_id
 WHERE i.object_id = {o} AND (i.is_primary_key = 1 OR i.is_unique_constraint = 1)
 ORDER BY i.is_primary_key DESC, i.name, k.key_ordinal
 """
-_CHECKS = "SELECT name, definition FROM sys.check_constraints WHERE parent_object_id = {o} ORDER BY name"
+_CHECKS = "SELECT name, definition, is_system_named FROM sys.check_constraints WHERE parent_object_id = {o} ORDER BY name"
 _FOREIGN_KEYS = """
 SELECT f.name, COL_NAME(fc.parent_object_id, fc.parent_column_id), OBJECT_SCHEMA_NAME(f.referenced_object_id),
        OBJECT_NAME(f.referenced_object_id), COL_NAME(fc.referenced_object_id, fc.referenced_column_id),
-       f.delete_referential_action_desc, f.update_referential_action_desc
+       f.delete_referential_action_desc, f.update_referential_action_desc, f.is_system_named
 FROM sys.foreign_keys f JOIN sys.foreign_key_columns fc ON fc.constraint_object_id = f.object_id
 WHERE f.parent_object_id = {o} ORDER BY f.name, fc.constraint_column_id
 """
 _INDEXES = """
 SELECT i.name, i.is_unique, i.type_desc, i.filter_definition, COL_NAME(k.object_id, k.column_id), k.is_descending_key,
-       k.is_included_column, i.is_primary_key, i.is_unique_constraint
+       k.is_included_column, i.is_primary_key, i.is_unique_constraint, kc.is_system_named, i.has_filter
 FROM sys.indexes i JOIN sys.index_columns k ON k.object_id = i.object_id AND k.index_id = i.index_id
+LEFT JOIN sys.key_constraints kc ON kc.parent_object_id = i.object_id AND kc.unique_index_id = i.index_id
 WHERE i.object_id = {o} AND i.type IN (1, 2)
 ORDER BY i.is_primary_key DESC, i.name, k.is_included_column, k.key_ordinal, k.index_column_id
 """
@@ -115,7 +148,7 @@ _TABLE_COMMENT = ("SELECT CAST(value AS nvarchar(4000)) FROM sys.extended_proper
                   "WHERE class = 1 AND major_id = {o} AND minor_id = 0 AND name = N'MS_Description'")
 _TABLE_TYPE_OBJECT = "(SELECT type_table_object_id FROM sys.table_types WHERE user_type_id = TYPE_ID({ref}))"
 # Run only when an answer came back empty, to tell an empty answer from a schema or table that is gone.
-_PRESENCE = "SELECT SCHEMA_ID({s}), (SELECT COUNT(*) FROM sys.objects WHERE object_id = {o} AND type = {t})"
+_PRESENCE = "SELECT SCHEMA_ID({s}), (SELECT COUNT(*) FROM sys.all_objects WHERE object_id = {o} AND type = {t})"
 
 _SCHEMA_FOLDERS = (
     Folder.TABLES, Folder.VIEWS, Folder.FUNCTIONS, Folder.PROCEDURES, Folder.SEQUENCES, Folder.SYNONYMS, Folder.TYPES,
@@ -134,12 +167,35 @@ _RELATION_TYPE = {NodeKind.TABLE: "U", NodeKind.VIEW: "V"}  # sys.objects.type
 _ACTIONS = {"NO_ACTION": "NO ACTION", "CASCADE": "CASCADE", "SET_NULL": "SET NULL", "SET_DEFAULT": "SET DEFAULT"}
 
 
+class _Withheld(Exception):
+    """The catalog hides a definition the generated DDL needs: there is no DDL to write (it is not an error)."""
+
+
+def _need[T](value: T | None, what: str) -> T:
+    if value is None:
+        raise _Withheld(what)
+    return value
+
+
+def _quote(name: str | None) -> str:
+    return q(_need(name, "a name"))
+
+
+def _written(kind: NodeKind | str, schema: str, name: str, build: Callable[[], str | None]) -> str | None:
+    """build(), or None when it finds a definition the account may not see."""
+    try:
+        return build()
+    except _Withheld as exc:
+        logger.debug("SQL Server DDL of {} {}.{} withheld: the catalog hides {}", kind, schema, name, exc)
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class _Column:
     """One row of _COLUMNS."""
 
     name: str
-    type_name: str
+    type_name: str  # the alias name, else the built-in type (the base type of an alias the account may not see)
     max_length: int
     precision: int
     scale: int
@@ -147,15 +203,19 @@ class _Column:
     identity: bool
     seed: str | None
     increment: str | None
-    computed: str | None
+    computed: str | None  # the expression; NULL for a plain column, and for a computed one whose text is hidden
     persisted: bool | None
     default_name: str | None
-    default: str | None
+    default: str | None  # likewise: NULL when there is none, and when it is hidden
     user_schema: str | None  # set for an alias type: the type is then written schema-qualified
     collation: str | None
     database_collation: str | None
     primary_key: bool
     comment: str | None
+    is_computed: bool
+    has_default: bool
+    type_hidden: bool  # a user-defined type that sys.types does not show to this account
+    default_system_named: bool | None
 
     def info(self) -> ColumnInfo:
         """An alias type keeps its name; a built-in type is written as T-SQL writes it."""
@@ -164,10 +224,6 @@ class _Column:
             name=self.name, type_name=type_name, nullable=bool(self.nullable), default=self.default,
             is_primary_key=bool(self.primary_key), comment=self.comment or None,
         )
-
-
-def _columns(conn: driver.Connection, object_sql: str) -> list[_Column]:
-    return [_Column(*row) for row in rows(conn, _COLUMNS.format(o=object_sql))]
 
 
 def _grouped(found: list[tuple]) -> dict[str, list[tuple]]:
@@ -251,21 +307,29 @@ def _databases(conn: driver.Connection) -> list[ObjectNode]:
 
 
 def _schemas(conn: driver.Connection, path: list[PathSegment]) -> list[ObjectNode]:
-    """Every schema, user schemas first, each group by name."""
+    """Every schema, user schemas first, each group by name. Of the system schemas only `sys` and INFORMATION_SCHEMA
+    hold anything (system views, functions, procedures); `guest` and the database roles' schemas own nothing."""
     found = [(name, is_system_schema(name, schema_id)) for name, schema_id in rows(conn, _SCHEMAS)]
     found.sort(key=lambda schema: (schema[1], schema[0].casefold(), schema[0]))
-    return [make_node(path, NodeKind.SCHEMA, name, has_children=True, system=is_system) for name, is_system in found]
+    return [
+        make_node(path, NodeKind.SCHEMA, name, has_children=not is_system or name in _CATALOG_SCHEMAS, system=is_system)
+        for name, is_system in found
+    ]
 
 
 def _schema_folders(conn: driver.Connection, path: list[PathSegment], schema: str) -> list[ObjectNode]:
-    counts = dict(rows(conn, _FOLDER_COUNTS.format(s=literal(schema))))
+    sql = _CATALOG_FOLDER_COUNTS if schema in _CATALOG_SCHEMAS else _FOLDER_COUNTS
+    counts = dict(rows(conn, sql.format(s=literal(schema))))
     if not counts["exists"]:
         raise NotFound(f"Schema '{schema}' not found")
-    return [make_node(path, NodeKind.FOLDER, folder, has_children=True) for folder in _SCHEMA_FOLDERS if counts[folder]]
+    return [make_node(path, NodeKind.FOLDER, folder, has_children=True) for folder in _SCHEMA_FOLDERS if counts.get(folder)]
 
 
 def _object_rows(conn: driver.Connection, schema: str, folder: Folder) -> list[tuple]:
     """(name, detail) of the schema's objects in a folder."""
+    if schema in _CATALOG_SCHEMAS:
+        sql = _CATALOG_OBJECTS.get(folder)
+        return rows(conn, sql.format(s=literal(schema))) if sql else []
     if folder == Folder.TYPES:
         return [
             (name, _type_detail(is_table_type, base, max_length, precision, scale))
@@ -299,6 +363,10 @@ def _table_folders(conn: driver.Connection, path: list[PathSegment], schema: str
     return [make_node(path, NodeKind.FOLDER, folder, has_children=True) for folder in folders]
 
 
+def _columns(conn: driver.Connection, object_sql: str) -> list[_Column]:
+    return [_Column(*row) for row in rows(conn, _COLUMNS.format(o=object_sql))]
+
+
 def _column_nodes(conn: driver.Connection, path: list[PathSegment], o: str) -> list[ObjectNode]:
     infos = (col.info() for col in _columns(conn, o))
     return [make_node(path, NodeKind.COLUMN, info.name, has_children=False, detail=_column_detail(info)) for info in infos]
@@ -313,11 +381,12 @@ def _index_nodes(conn: driver.Connection, path: list[PathSegment], o: str) -> li
 
 
 def _foreign_key_nodes(conn: driver.Connection, path: list[PathSegment], o: str) -> list[ObjectNode]:
+    """A key to a table the account may not see shows `?` for what it cannot name."""
     nodes = []
     for name, parts in _grouped(rows(conn, _FOREIGN_KEYS.format(o=o))).items():
-        columns = ", ".join(p[1] for p in parts)
-        ref_columns = ", ".join(p[4] for p in parts)
-        detail = f"({columns}) → {parts[0][2]}.{parts[0][3]} ({ref_columns})"
+        columns = ", ".join(p[1] or HIDDEN for p in parts)
+        ref_columns = ", ".join(p[4] or HIDDEN for p in parts)
+        detail = f"({columns}) → {parts[0][2] or HIDDEN}.{parts[0][3] or HIDDEN} ({ref_columns})"
         nodes.append(make_node(path, NodeKind.FOREIGN_KEY, name, has_children=False, detail=detail))
     return nodes
 
@@ -352,65 +421,79 @@ def _table_children(conn: driver.Connection, path: list[PathSegment], schema: st
 # ---- generated DDL -------------------------------------------------------------------------------------------------
 
 
+def _constraint(name: str, system_named: bool | None, named: bool) -> str:
+    """`CONSTRAINT [name] ` for a constraint someone named. Nothing for a table type's (it may not) nor for a name the
+    server made up (`PK__t__3213E83F…`): without it the DDL reads like the DDL a person would write."""
+    return f"CONSTRAINT {q(name)} " if named and not system_named else ""
+
+
 def _column_line(c: _Column, named: bool) -> str:
-    if c.computed is not None:
-        return f"{q(c.name)} AS {c.computed}{' PERSISTED' if c.persisted else ''}"
+    if c.is_computed:
+        line = f"{_quote(c.name)} AS {_need(c.computed, 'a computed column definition')}"
+        if c.persisted:
+            line += " PERSISTED" + ("" if c.nullable else " NOT NULL")
+        return line
+    if c.type_hidden:
+        raise _Withheld(f"the type of column {c.name}")
     type_text = f"{q(c.user_schema)}.{q(c.type_name)}" if c.user_schema else type_sql(c.type_name, c.max_length, c.precision, c.scale)
     parts = [q(c.name), type_text]
     if c.collation and c.collation != c.database_collation:
         parts.append(f"COLLATE {c.collation}")
     if c.identity:
-        parts.append(f"IDENTITY({c.seed}, {c.increment})")
+        parts.append(f"IDENTITY({_need(c.seed, 'an identity seed')}, {_need(c.increment, 'an identity increment')})")
     parts.append("NULL" if c.nullable else "NOT NULL")
-    if c.default is not None:
-        parts.append(f"CONSTRAINT {q(c.default_name)} DEFAULT {c.default}" if named else f"DEFAULT {c.default}")
+    if c.has_default:
+        default = _need(c.default, "a default definition")
+        parts.append(f"{_constraint(c.default_name, c.default_system_named, named)}DEFAULT {default}")
     return " ".join(parts)
 
 
 def _foreign_key_clause(name: str, parts: list[tuple]) -> str:
     """parts: _FOREIGN_KEYS rows of one key, in key order."""
-    _, _, ref_schema, ref_table, _, on_delete, on_update = parts[0]
-    columns = ", ".join(q(p[1]) for p in parts)
-    ref_columns = ", ".join(q(p[4]) for p in parts)
-    return (f"CONSTRAINT {q(name)} FOREIGN KEY ({columns}) REFERENCES {q(ref_schema)}.{q(ref_table)} ({ref_columns}) "
-            f"ON DELETE {_ACTIONS[on_delete]} ON UPDATE {_ACTIONS[on_update]}")
+    _, _, ref_schema, ref_table, _, on_delete, on_update, system_named = parts[0]
+    columns = ", ".join(_quote(p[1]) for p in parts)
+    ref_columns = ", ".join(_quote(p[4]) for p in parts)
+    return (f"{_constraint(name, system_named, True)}FOREIGN KEY ({columns}) "
+            f"REFERENCES {_quote(ref_schema)}.{_quote(ref_table)} ({ref_columns}) "
+            f"ON DELETE {_ACTIONS[_need(on_delete, 'an action')]} ON UPDATE {_ACTIONS[_need(on_update, 'an action')]}")
 
 
 def _index_statement(schema: str, table: str, name: str, parts: list[tuple]) -> str:
     """parts: _INDEXES rows of one index. A primary key or unique constraint becomes ALTER TABLE … ADD CONSTRAINT."""
-    keys = ", ".join(q(p[4]) + (" DESC" if p[5] else "") for p in parts if not p[6])
+    keys = ", ".join(_quote(p[4]) + (" DESC" if p[5] else "") for p in parts if not p[6])
     target = f"{q(schema)}.{q(table)}"
     is_unique, type_desc, filter_definition, is_primary, is_constraint = parts[0][1], parts[0][2], parts[0][3], parts[0][7], parts[0][8]
+    system_named, has_filter = parts[0][9], parts[0][10]
     if is_primary or is_constraint:
-        return f"ALTER TABLE {target} ADD CONSTRAINT {q(name)} {'PRIMARY KEY' if is_primary else 'UNIQUE'} {type_desc} ({keys});"
-    included = [q(p[4]) for p in parts if p[6]]
+        return f"ALTER TABLE {target} ADD {_constraint(name, system_named, True)}{'PRIMARY KEY' if is_primary else 'UNIQUE'} {type_desc} ({keys});"
+    included = [_quote(p[4]) for p in parts if p[6]]
     sql = f"CREATE {'UNIQUE ' if is_unique else ''}{type_desc} INDEX {q(name)} ON {target} ({keys})"
     if included:
         sql += f" INCLUDE ({', '.join(included)})"
-    if filter_definition:
-        sql += f" WHERE {filter_definition}"
+    if has_filter:
+        sql += f" WHERE {_need(filter_definition, 'an index filter')}"
     return sql + ";"
 
 
-def _body_lines(conn: driver.Connection, object_sql: str, columns: list[_Column], named: bool) -> list[str]:
+def _body_lines(columns: list[_Column], keys: list[tuple], checks: list[tuple], named: bool) -> list[str]:
     """Columns, then PRIMARY KEY / UNIQUE, then CHECK constraints. `named`: a table names its constraints; a table type
-    may not."""
+    may not. keys: _KEYS rows; checks: _CHECKS rows."""
     lines = [_column_line(c, named) for c in columns]
-    for name, parts in _grouped(rows(conn, _KEYS.format(o=object_sql))).items():
+    for name, parts in _grouped(keys).items():
         kind = "PRIMARY KEY" if parts[0][1] else "UNIQUE"
-        key_columns = ", ".join(q(p[3]) + (" DESC" if p[4] else "") for p in parts)
-        lines.append(f"{f'CONSTRAINT {q(name)} ' if named else ''}{kind} {parts[0][2]} ({key_columns})")
-    for name, definition in rows(conn, _CHECKS.format(o=object_sql)):
-        lines.append(f"{f'CONSTRAINT {q(name)} ' if named else ''}CHECK {definition}")
+        key_columns = ", ".join(_quote(p[3]) + (" DESC" if p[4] else "") for p in parts)
+        lines.append(f"{_constraint(name, parts[0][5], named)}{kind} {parts[0][2]} ({key_columns})")
+    for name, definition, system_named in checks:
+        lines.append(f"{_constraint(name, system_named, named)}CHECK {_need(definition, 'a check definition')}")
     return lines
 
 
-def _table_ddl(conn: driver.Connection, schema: str, table: str, columns: list[_Column]) -> str:
-    o = object_id_sql(schema, table)
-    lines = _body_lines(conn, o, columns, named=True)
-    lines += [_foreign_key_clause(name, parts) for name, parts in _grouped(rows(conn, _FOREIGN_KEYS.format(o=o))).items()]
+def _table_ddl(schema: str, table: str, columns: list[_Column], keys: list[tuple], checks: list[tuple],
+               foreign_keys: list[tuple], indexes: list[tuple]) -> str:
+    lines = _body_lines(columns, keys, checks, named=True)
+    lines += [_foreign_key_clause(name, parts) for name, parts in _grouped(foreign_keys).items()]
     statements = ["CREATE TABLE {} (\n    {}\n);".format(f"{q(schema)}.{q(table)}", ",\n    ".join(lines))]
-    for name, parts in _grouped(rows(conn, _INDEXES.format(o=o))).items():
+    for name, parts in _grouped(indexes).items():
         if not (parts[0][7] or parts[0][8]):  # constraint indexes are already in the body
             statements.append(_index_statement(schema, table, name, parts))
     return "\n".join(statements)
@@ -434,16 +517,18 @@ def _synonym_ddl(conn: driver.Connection, schema: str, name: str) -> str:
 
 
 def _type_ddl(conn: driver.Connection, schema: str, name: str) -> str | None:
-    """None for a CLR type: its assembly is not something a catalog query can write back."""
+    """One batch: the type, and what a table type's body needs (empty for an alias type). None for a CLR type: its
+    assembly is not something a catalog query can write back."""
     ref = name_literal(schema, name)
-    row = first_row(conn, _TYPE.format(ref=ref))
-    if row is None:
+    body = _TABLE_TYPE_OBJECT.format(ref=ref)
+    type_rows, column_rows, key_rows, check_rows = result_sets(conn, batch(
+        _TYPE.format(ref=ref), _COLUMNS.format(o=body), _KEYS.format(o=body), _CHECKS.format(o=body)))
+    if not type_rows:
         raise _not_found(NodeKind.TYPE, schema, name)
-    _, is_table_type, base, max_length, precision, scale, nullable = row
+    _, is_table_type, base, max_length, precision, scale, nullable = type_rows[0]
     target = f"{q(schema)}.{q(name)}"
     if is_table_type:
-        body_object = _TABLE_TYPE_OBJECT.format(ref=ref)
-        lines = _body_lines(conn, body_object, _columns(conn, body_object), named=False)
+        lines = _body_lines([_Column(*row) for row in column_rows], key_rows, check_rows, named=False)
         return "CREATE TYPE {} AS TABLE (\n    {}\n);".format(target, ",\n    ".join(lines))
     if base is None:
         logger.debug("SQL Server type {}.{} has no base type (a CLR type): no DDL", schema, name)
@@ -459,10 +544,10 @@ def _not_found(kind: NodeKind | str, schema: str, name: str) -> NotFound:
     return NotFound(f"{kind} '{name}' not found")
 
 
-def _definition(conn: driver.Connection, kind: NodeKind | str, schema: str, name: str) -> str | None:
+def _definition_row(kind: NodeKind | str, schema: str, name: str, row: tuple) -> str | None:
     """OBJECT_DEFINITION: the server's own text. NULL (an encrypted module, or an account without VIEW DEFINITION) is
     no DDL, not an error: the object is there and keeps its columns."""
-    object_id, definition = first_row(conn, _DEFINITION.format(ref=name_literal(schema, name)))
+    object_id, definition = row
     if object_id is None:
         raise _not_found(kind, schema, name)
     if definition is None:
@@ -484,30 +569,39 @@ _Detail = Callable[[driver.Connection, list[PathSegment], str], _Found]  # (conn
 
 
 def _table_detail(conn: driver.Connection, path: list[PathSegment], schema: str) -> _Found:
+    """One batch: columns, keys, checks, foreign keys, indexes and the table's comment."""
     name = path[-1].name
-    columns = _columns(conn, object_id_sql(schema, name))
-    if not columns:  # a table always has a column
+    o = object_id_sql(schema, name)
+    column_rows, keys, checks, foreign_keys, indexes, comment = result_sets(conn, batch(
+        _COLUMNS.format(o=o), _KEYS.format(o=o), _CHECKS.format(o=o), _FOREIGN_KEYS.format(o=o), _INDEXES.format(o=o),
+        _TABLE_COMMENT.format(o=o)))
+    if not column_rows:  # a table always has a column
         raise _not_found(path[-1].kind, schema, name)
-    ddl = _table_ddl(conn, schema, name, columns)
-    row = first_row(conn, _TABLE_COMMENT.format(o=object_id_sql(schema, name)))
-    return _Found(ddl, True, [c.info() for c in columns], (row[0] or None) if row else None)
+    columns = [_Column(*row) for row in column_rows]
+    ddl = _written(path[-1].kind, schema, name, lambda: _table_ddl(schema, name, columns, keys, checks, foreign_keys, indexes))
+    return _Found(ddl, ddl is not None, [c.info() for c in columns], (comment[0][0] or None) if comment else None)
 
 
 def _view_detail(conn: driver.Connection, path: list[PathSegment], schema: str) -> _Found:
+    """One batch: the definition and the columns."""
     name = path[-1].name
-    ddl = _definition(conn, path[-1].kind, schema, name)
-    return _Found(ddl, False, [c.info() for c in _columns(conn, object_id_sql(schema, name))])
+    definition_rows, column_rows = result_sets(conn, batch(
+        _DEFINITION.format(ref=name_literal(schema, name)), _COLUMNS.format(o=object_id_sql(schema, name))))
+    ddl = _definition_row(path[-1].kind, schema, name, definition_rows[0])
+    return _Found(ddl, False, [_Column(*row).info() for row in column_rows])
 
 
 def _module_detail(conn: driver.Connection, path: list[PathSegment], schema: str) -> _Found:
-    return _Found(_definition(conn, path[-1].kind, schema, path[-1].name))
+    name = path[-1].name
+    return _Found(_definition_row(path[-1].kind, schema, name, first_row(conn, _DEFINITION.format(ref=name_literal(schema, name)))))
 
 
 def _generated_detail(build: Callable[[driver.Connection, str, str], str | None]) -> _Detail:
     """A detail whose DDL a catalog query writes: build(conn, schema, name), None when there is nothing to write."""
 
     def detail(conn: driver.Connection, path: list[PathSegment], schema: str) -> _Found:
-        ddl = build(conn, schema, path[-1].name)
+        name = path[-1].name
+        ddl = _written(path[-1].kind, schema, name, lambda: build(conn, schema, name))
         return _Found(ddl, ddl is not None)
     return detail
 
@@ -521,10 +615,12 @@ def _table_leaf(path: list[PathSegment]) -> tuple[str, str]:
 
 def _index_detail(conn: driver.Connection, path: list[PathSegment], _schema: str) -> _Found:
     schema, table = _table_leaf(path)
-    parts = _grouped(rows(conn, _INDEXES.format(o=object_id_sql(schema, table)))).get(path[-1].name)
+    name = path[-1].name
+    parts = _grouped(rows(conn, _INDEXES.format(o=object_id_sql(schema, table)))).get(name)
     if parts is None:
-        raise _not_found(path[-1].kind, schema, path[-1].name)
-    return _Found(_index_statement(schema, table, path[-1].name, parts), True)
+        raise _not_found(path[-1].kind, schema, name)
+    ddl = _written(path[-1].kind, schema, name, lambda: _index_statement(schema, table, name, parts))
+    return _Found(ddl, ddl is not None)
 
 
 def _foreign_key_detail(conn: driver.Connection, path: list[PathSegment], _schema: str) -> _Found:
@@ -533,7 +629,9 @@ def _foreign_key_detail(conn: driver.Connection, path: list[PathSegment], _schem
     parts = _grouped(rows(conn, _FOREIGN_KEYS.format(o=object_id_sql(schema, table)))).get(name)
     if parts is None:
         raise _not_found(path[-1].kind, schema, name)
-    return _Found(f"ALTER TABLE {q(schema)}.{q(table)} ADD {_foreign_key_clause(name, parts)};", True)
+    ddl = _written(path[-1].kind, schema, name,
+                   lambda: f"ALTER TABLE {q(schema)}.{q(table)} ADD {_foreign_key_clause(name, parts)};")
+    return _Found(ddl, ddl is not None)
 
 
 def _column_leaf_detail(conn: driver.Connection, path: list[PathSegment], _schema: str) -> _Found:
