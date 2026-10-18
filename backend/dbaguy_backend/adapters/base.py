@@ -148,7 +148,7 @@ class RawJsonRows(ABC):
 
 
 class DatabaseConnection(ABC):
-    """All methods except cancel() must be called on the owning worker thread."""
+    """All methods except cancel(), force_cancel() and abort() must be called on the owning worker thread."""
 
     @abstractmethod
     def server_info(self) -> ServerInfo: ...
@@ -206,6 +206,19 @@ class DatabaseConnection(ABC):
     @abstractmethod
     def rollback(self) -> None:
         """Roll back the open transaction; a no-op when none is open."""
+
+    def arm_cancel(self) -> None:
+        """Called by the worker thread only, around one statement: right before its last cancel check, with no result
+        open. A cancel that arrives from now until run() takes the statement over would find nothing running (the
+        server ignores a cancel for an idle session, and an adapter must ignore one too, R-03a-P4), and the statement
+        would then run to its end. So while armed, cancel() (and force_cancel() / abort()) must keep such a cancel for
+        this statement, and run() must check on entry and raise StatementCancelled without sending anything. Once run()
+        has taken over, a cancel works as before. The default does nothing."""
+
+    def disarm_cancel(self) -> None:
+        """Called by the worker thread only, once run() has returned or raised, or the request left before run(): the
+        armed state ends and a cancel kept in it is dropped, so it can never stop a later statement. Idempotent. The
+        default does nothing."""
 
     @abstractmethod
     def cancel(self) -> None:

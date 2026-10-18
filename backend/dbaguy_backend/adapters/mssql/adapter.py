@@ -260,6 +260,7 @@ class MssqlConnection(DatabaseConnection):
         self._transaction_words: bool | None = None  # it may begin or end a transaction; worked out when first asked
         self._trancount, self._xact_state, self._implicit = state
         self._metadata_session = False  # _METADATA_SESSION is set (on a metadata connection, before its first read)
+        self._armed = False  # worker thread only: arm_cancel() began the STARTING phase; run() has not taken it over
         conn.set_msghandler(self._on_message)
 
     # ---- cancel ----
@@ -271,6 +272,21 @@ class MssqlConnection(DatabaseConnection):
     @property
     def unusable(self) -> bool:
         return self._control.unusable
+
+    def arm_cancel(self) -> None:
+        """Worker thread, before its last cancel check (Task 6b): the statement's STARTING phase begins here instead of
+        in run() (Python state under the control's lock, nothing reaches the driver), so a cancel, a repeated one or
+        closing the session from now on is kept as one during STARTING is, and the batch is never sent (R-03b-P5).
+        The worker has closed every result first."""
+        self._control.begin_statement()
+        self._armed = True
+
+    def disarm_cancel(self) -> None:
+        """Worker thread. Once run() has taken the statement over, its phase goes on (the result's own cancel handling,
+        or run() ended it); otherwise it ends here, with any cancel kept in it (R-03a-P4)."""
+        if self._armed:
+            self._armed = False
+            self._control.end_statement()
 
     def cancel(self) -> None:
         """Any thread (spec §3.6); see `cancel.CancelControl`."""
@@ -349,10 +365,15 @@ class MssqlConnection(DatabaseConnection):
 
     def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
         if self._result is not None:  # the worker closes every result first; never send over unread rows
-            self._result.close()
-        self._control.begin_statement()  # from here a cancel is kept, not dropped (R-03b-P5)
+            self._result.close()  # that ends its statement, and a phase armed meanwhile with it: begun again below
+            self._armed = False
+        if not self._armed:  # armed: the phase began at arm_cancel(), and a cancel may be kept in it already
+            self._control.begin_statement()  # from here a cancel is kept, not dropped (R-03b-P5)
+        self._armed = False
         try:
             self._check_usable()
+            if self._control.cancel_requested:  # kept during STARTING: nothing is sent, not even the state read
+                raise CancelPending()
             self._batch, self._transaction_words = sql, None
             self._refresh_state()  # the describe needs the current mode; normally fresh (the worker reads it per request)
             self._stale = True

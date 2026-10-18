@@ -26,6 +26,7 @@ from ..base import (
     StatementResult,
     transaction_open_error,
 )
+from ..cancel_window import CancelWindow
 from . import introspection
 from . import schema as sqlite_schema
 
@@ -59,18 +60,37 @@ class _CancelGate:
     starts while none is, SQLite clears the flag, so an interrupt that lands between `execute()` being entered (while
     the statement is parsed, and the worker thread gives up the GIL) and the first step is lost, and a statement that
     never ends then never stops. A cancel that arrives while the worker thread is inside a driver call (`call()`) also
-    raises a flag that SQLite's progress handler turns into an interrupt as soon as the statement runs. A cancel that
-    arrives outside any call leaves no flag behind, so it can never cancel a later statement."""
+    raises a flag that SQLite's progress handler turns into an interrupt as soon as the statement runs. The armed window
+    before run() (`arm()`, Task 6b) counts like a call: a cancel in it is kept and `statement()` raises before anything
+    runs. A cancel that arrives outside any call and outside the window leaves no flag behind, so it can never cancel a
+    later statement."""
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
         self._lock = threading.Lock()
         self._in_call = False
         self._requested = False
+        self._window = CancelWindow("SQLite")
         conn.set_progress_handler(self._interrupt_if_requested, _PROGRESS_OPS)
 
     def _interrupt_if_requested(self) -> int:  # called by SQLite on the worker thread, inside a step
         return 1 if self._requested else 0
+
+    def arm(self) -> None:
+        """Worker thread, before its last cancel check (`DatabaseConnection.arm_cancel`)."""
+        self._window.arm()
+
+    def disarm(self) -> None:
+        """Worker thread; idempotent."""
+        self._window.disarm()
+
+    @contextmanager
+    def statement(self) -> Iterator[None]:
+        """run()'s call: once inside it (a cancel from here raises the flag), take the statement over from the armed
+        window, raising StatementCancelled when a cancel was kept there; nothing has run yet."""
+        with self.call():
+            self._window.take_over()
+            yield
 
     @contextmanager
     def call(self) -> Iterator[None]:
@@ -86,6 +106,8 @@ class _CancelGate:
 
     def cancel(self) -> None:
         """Any thread."""
+        if self._window.keep():
+            return  # armed: statement() raises before anything runs
         with self._lock:
             if self._in_call:
                 self._requested = True
@@ -191,7 +213,7 @@ class SqliteConnection(DatabaseConnection):
             raise _translate(exc) from exc
 
     def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
-        with self._gate.call():  # from here a cancel sticks until the statement runs (see _CancelGate)
+        with self._gate.statement():  # from here a cancel sticks until the statement runs (see _CancelGate)
             self._begin_if_manual(sql)
             cursor = self._conn.cursor()
             try:
@@ -226,6 +248,12 @@ class SqliteConnection(DatabaseConnection):
             self._conn.rollback()
         except sqlite3.Error as exc:
             raise _translate(exc) from exc
+
+    def arm_cancel(self) -> None:
+        self._gate.arm()
+
+    def disarm_cancel(self) -> None:
+        self._gate.disarm()
 
     def cancel(self) -> None:
         self._gate.cancel()

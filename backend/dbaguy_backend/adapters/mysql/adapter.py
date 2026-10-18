@@ -33,6 +33,7 @@ from ..base import (
     invalid_text_error,
     transaction_open_error,
 )
+from ..cancel_window import CancelWindow
 from ..sockets import enable_keepalive
 from . import catalog, introspection
 from . import schema as mysql_schema
@@ -167,6 +168,8 @@ class MysqlConnection(DatabaseConnection):
         self._autocommit = True  # connections open in auto-commit mode (settings fix it)
         self._autocommit_stale = False  # a statement may have switched it: re-read once nothing is unread
         self._killed = threading.Event()  # KILL QUERY was sent for the current statement (R-03a-P4)
+        # A cancel before run() has sent anything is kept here: KILL QUERY does nothing to an idle thread (Task 6b)
+        self._window = CancelWindow("MySQL")
         self._lost = False  # the connection is gone (or was dropped): it has no transaction any more
 
     # ---- statements ----
@@ -187,7 +190,15 @@ class MysqlConnection(DatabaseConnection):
         logger.info("MySQL {}: KILL QUERY {} in {:.0f} ms", why, self._thread_id, (time.monotonic() - started) * 1000)
         return True
 
+    def arm_cancel(self) -> None:
+        self._window.arm()
+
+    def disarm_cancel(self) -> None:
+        self._window.disarm()
+
     def cancel(self) -> None:
+        if self._window.keep():
+            return  # run() has not sent the statement yet: it will not, and no KILL is needed (nor the KILL flag)
         self._killed.set()  # first: SLEEP() may return its 1 before the KILL's own reply reaches us
         if not self.kill_query("cancel"):
             self._killed.clear()  # nothing was interrupted: report what the statement really does
@@ -354,6 +365,7 @@ class MysqlConnection(DatabaseConnection):
 
     def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
         self._killed.clear()
+        self._window.take_over()  # after the clear: a cancel kept while armed sends nothing; from here one KILLs
         if _MENTIONS_AUTOCOMMIT.search(sql) or first_keyword(sql, Dialect.MYSQL) in _MAY_SET_AUTOCOMMIT:
             self._autocommit_stale = True
         cursor = _VerbatimCursor(self._conn)  # not conn.cursor(): that sends a PING first, one round trip per statement

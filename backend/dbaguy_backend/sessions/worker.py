@@ -213,8 +213,10 @@ class SessionWorker:
         self._state_lock = threading.Lock()
         self._state_send_lock = threading.Lock()
         self._running_request: str | None = None
-        # A cancel reached the running request; honoured right before run() and at the next page boundary in case no
-        # driver call was in flight to interrupt (the driver then has nothing to cancel and the request would go on).
+        # A cancel reached the running request; honoured right before run() (the connection is armed from just before
+        # that check until run() takes over, `_run_statement`), as Load more starts and at the next page boundary, in
+        # case no driver call was in flight to interrupt (the driver then has nothing to cancel and the request would
+        # go on).
         self._cancel_requested = False
         self._cancels = 0  # Cancels (and a timeout) that reached the running request: a Cancel after one forces
         self._queued: dict[str, bool] = {}  # requests waiting in the queue -> cancelled before they started
@@ -523,14 +525,10 @@ class SessionWorker:
             options = run_options(cmd, self._hooks.capabilities)  # before the policy: a refused request never asks
             if not self._passes_policy(req, cmd.confirmed):
                 return
-            self._raise_if_cancelled()  # cancelled during the policy check: the driver had nothing to interrupt
-            self._log_statement("execute", cmd.request_id, cmd.sql, options)
-            req.ran = True
             req.query_context = options.query_context
             options = replace(options, retry_safe=req.kind == StatementKind.READ)  # D-04-14: only a read is resent
             with self._timeout(req):
-                self._listen(req.request_id)
-                result = self.connection.run(cmd.sql, options)
+                result = self._run_statement(req, "execute", cmd.sql, options)
                 self._open_exec = _OpenExecution(req=req, result=result)
                 self._pump(self._open_exec, cmd.page_size)
         except StatementError as exc:
@@ -540,6 +538,25 @@ class SessionWorker:
             self._fail(req, StatementError(f"Internal error: {exc}"))
         finally:
             self._set_running(None)
+
+    def _run_statement(self, req: _Request, what: str, sql: str, options: RunOptions) -> StatementResult:
+        """The request's last cancel check, then run(). A cancel that lands between the two finds the driver idle (an
+        adapter must ignore an idle cancel, R-03a-P4), so the statement would run to its end: the connection is armed
+        before the check and keeps such a cancel, and run() then does not start (Task 6b). Disarmed on every way out,
+        once run() has returned or raised; the result's own cancel handling takes over from there."""
+        connection = self.connection
+        try:
+            connection.arm_cancel()
+            self._raise_if_cancelled()  # cancelled during the checks: the driver had nothing to interrupt
+            self._log_statement(what, req.request_id, sql, options)
+            req.ran = True
+            self._listen(req.request_id)
+            return connection.run(sql, options)
+        finally:
+            try:
+                connection.disarm_cancel()
+            except Exception:  # never lose the result (or the error) over it
+                logger.warning("Could not disarm the cancel on {}", self.name, exc_info=True)
 
     def _log_statement(self, what: str, request_id: str, sql: str, options: RunOptions) -> None:
         """The SQL text and the parameter names, at DEBUG; never parameter values (spec §5)."""
@@ -599,6 +616,7 @@ class SessionWorker:
             return
         self._set_running(cmd.request_id)
         try:
+            self._raise_if_cancelled()  # cancelled as Load more started: before the first driver call
             self._pump(execution, cmd.count)
         except StatementError as exc:
             self._fail(execution.req, exc)
@@ -708,11 +726,9 @@ class SessionWorker:
             _check_text(cmd.sql)
             options = replace(run_options(cmd, self._hooks.capabilities), retry_safe=True)  # an export is always a read
             target = self._check_export(cmd, req)
-            self._raise_if_cancelled()  # cancelled during the checks: the driver had nothing to interrupt
             logger.info("[{}] export {} as {} to {}", self.name, cmd.request_id, cmd.format, target)
-            self._log_statement("export", cmd.request_id, cmd.sql, options)
-            req.ran = True
-            written = self._write_export(cmd, target, req, options)
+            result = self._run_statement(req, "export", cmd.sql, options)
+            written = self._write_export(cmd, target, req, result)
         except StatementError as exc:
             self._fail_export(req, cmd, exc)
         except OSError as exc:
@@ -751,14 +767,13 @@ class SessionWorker:
             raise StatementError(_EXPORT_SELECT_ONLY, code="export_requires_select")
         return target
 
-    def _write_export(self, cmd: ExportCommand, target: Path, req: _Request, options: RunOptions) -> int:
-        """Run the statement and write its whole result, raw values, into `target`. Returns the rows written.
+    def _write_export(self, cmd: ExportCommand, target: Path, req: _Request, result: StatementResult) -> int:
+        """Write the statement's whole result, raw values, into `target`, then close the result. Returns the rows
+        written.
 
         A failed or cancelled export removes its partial file instead of finishing the document, so the writer's
         `close()` runs only when every row is in.
         """
-        self._listen(req.request_id)
-        result = self.connection.run(cmd.sql, options)
         try:
             columns = result.columns()
             if columns is None:

@@ -30,6 +30,7 @@ from ..base import (
     StatementResult,
     transaction_open_error,
 )
+from ..cancel_window import CancelWindow
 from ..positions import offset_to_line_col
 from ..sql_text import first_keyword
 from . import ddl, introspection
@@ -337,6 +338,8 @@ class PostgresConnection(DatabaseConnection):
             conn.read_only = True
         self._messages: deque[ServerMessage] = deque(maxlen=1000)
         self._cursor_ids = itertools.count(1)
+        # A cancel before run() has sent anything is kept here: the server ignores one for an idle backend (Task 6b)
+        self._window = CancelWindow("PostgreSQL")
         self._custom_types: dict[int, str] = {int(oid): name for oid, name in conn.execute(_CUSTOM_TYPES_SQL)}
         conn.add_notice_handler(self._on_notice)
 
@@ -466,6 +469,7 @@ class PostgresConnection(DatabaseConnection):
             logger.warning("Read-only connection: default_transaction_read_only was turned off; restored")
 
     def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
+        self._window.take_over()  # a cancel kept while armed: nothing is sent; from here a cancel goes to the server
         if self._read_only and len(split(sql, Dialect.POSTGRES)) > 1:
             # A script could switch the default off and commit between statements, which no per-call check can see.
             raise StatementError(
@@ -520,7 +524,15 @@ class PostgresConnection(DatabaseConnection):
     def transaction_failed(self) -> bool:
         return self._conn.info.transaction_status == pq.TransactionStatus.INERROR
 
+    def arm_cancel(self) -> None:
+        self._window.arm()
+
+    def disarm_cancel(self) -> None:
+        self._window.disarm()
+
     def cancel(self) -> None:
+        if self._window.keep():
+            return  # run() has not sent the statement yet: it will not (force_cancel and abort come here too)
         try:
             self._conn.cancel_safe(timeout=3.0)
         except Exception as exc:
