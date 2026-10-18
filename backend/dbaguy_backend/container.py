@@ -4,6 +4,7 @@ from pathlib import Path
 
 from loguru import logger
 
+from .adapters.couchbase.adapter import CouchbaseAdapter
 from .adapters.mssql import freetds
 from .adapters.mssql.adapter import MssqlAdapter
 from .adapters.mysql.adapter import MysqlAdapter
@@ -37,7 +38,7 @@ def default_registry(freetds_conf: Path | None = None) -> AdapterRegistry:
     written by the first SQL Server connect, so building the app never writes into the data dir (R-03b-P9)."""
     if freetds_conf is not None:
         freetds.use(freetds_conf)
-    return AdapterRegistry([PostgresAdapter(), MysqlAdapter(), MssqlAdapter(), SqliteAdapter()])
+    return AdapterRegistry([PostgresAdapter(), MysqlAdapter(), MssqlAdapter(), CouchbaseAdapter(), SqliteAdapter()])
 
 
 def keychain_service(data_dir: Path) -> str:

@@ -80,8 +80,10 @@ _EXPORT_SELECT_ONLY = "Only a statement that returns rows (SELECT, WITH, VALUES�
 
 
 def paused_result_closed_text(limit_s: float) -> str:
-    """The warning a paused result gets when the worker closes it for idling past the engine's limit."""
-    return (f"Closed this result after {limit_s / 60:g} min without loading more rows, to free the query node — "
+    """The warning a paused result gets when the worker closes it for idling past the engine's limit (whole minutes
+    as minutes, anything else in seconds: "2 min", "45 s")."""
+    after = f"{limit_s / 60:g} min" if limit_s % 60 == 0 else f"{limit_s:g} s"
+    return (f"Closed this result after {after} without loading more rows, to free the query node — "
             "run the statement again to load more")
 
 

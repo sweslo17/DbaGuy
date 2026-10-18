@@ -108,7 +108,7 @@ def test_import_url_never_echoes_the_password_of_a_malformed_url(client):
 
 def test_engines(client):
     engines = {e["engine"]: e for e in client.get("/system/engines", headers=AUTH).json()}
-    assert set(engines) == {"postgres", "mysql", "mssql", "sqlite"}
+    assert set(engines) == {"postgres", "mysql", "mssql", "couchbase", "sqlite"}
     assert engines["postgres"]["per_database_connection"] and engines["postgres"]["cancel_aborts_transaction"]
     assert not engines["sqlite"]["per_database_connection"] and not engines["sqlite"]["cancel_aborts_transaction"]
     assert engines["postgres"]["server_read_only"] and engines["sqlite"]["server_read_only"]
@@ -120,7 +120,14 @@ def test_engines(client):
     assert (mssql["per_database_connection"], mssql["cancel_aborts_transaction"], mssql["server_read_only"]) == (
         True, False, False,
     )
-    for info in engines.values():
+    couchbase = engines["couchbase"]
+    assert couchbase["dialect"] == "sqlpp" and couchbase["default_port"] == 8093 and couchbase["server_read_only"]
+    assert not couchbase["transactions"] and couchbase["query_context"] and couchbase["parameters"]
+    assert not couchbase["documents"] and not couchbase["executed_plan"] and couchbase["plan_format"] == "couchbase"
+    assert couchbase["url_schemes"] == ["couchbase", "couchbases", "http", "https"]
+    for name, info in engines.items():
+        if name == "couchbase":
+            continue
         assert info["transactions"] and info["plan_format"] is None
         assert not (info["query_context"] or info["parameters"] or info["documents"] or info["executed_plan"])
 

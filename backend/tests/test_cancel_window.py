@@ -13,6 +13,7 @@ from uuid import uuid4
 import pytest
 
 from dbaguy_backend.adapters.base import DatabaseConnection, Endpoint, StatementCancelled
+from dbaguy_backend.adapters.couchbase.adapter import CouchbaseAdapter
 from dbaguy_backend.adapters.mssql.adapter import MssqlAdapter
 from dbaguy_backend.adapters.mysql.adapter import MysqlAdapter
 from dbaguy_backend.adapters.postgres.adapter import PostgresAdapter
@@ -25,6 +26,10 @@ from dbaguy_backend.services.safety import GuardAction, GuardDecision
 from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks
 from tests.fake_db import FakeConnection, FakeLease
 from tests.support import (
+    COUCHBASE_HOST,
+    COUCHBASE_PASSWORD,
+    COUCHBASE_PORT,
+    LONG_AGGREGATE,
     MSSQL_HOST,
     MSSQL_PASSWORD,
     MSSQL_PORT,
@@ -34,9 +39,11 @@ from tests.support import (
     PG_HOST,
     PG_PASSWORD,
     PG_PORT,
+    make_couchbase_profile,
     make_mssql_profile,
     make_mysql_profile,
     make_pg_profile,
+    requires_couchbase,
     requires_mssql,
     requires_mysql,
     requires_pg,
@@ -277,12 +284,20 @@ TARGETS = {
         lambda _: MssqlAdapter().open(make_mssql_profile(), Endpoint(MSSQL_HOST, MSSQL_PORT), MSSQL_PASSWORD, None),
         "WAITFOR DELAY '00:00:30'", "WAITFOR DELAY '00:00:10'",
     ),
+    "couchbase": Target(  # R-04a-C16: the request is never sent
+        lambda _: CouchbaseAdapter().open(
+            make_couchbase_profile(), Endpoint(COUCHBASE_HOST, COUCHBASE_PORT), COUCHBASE_PASSWORD, None
+        ),
+        LONG_AGGREGATE,  # minutes
+        "SELECT COUNT(*) AS n FROM ARRAY_RANGE(0, 1000) AS a UNNEST ARRAY_RANGE(0, 10000) AS b",  # about 10 s
+    ),
 }
 ENGINES = [
     pytest.param("sqlite"),
     pytest.param("postgres", marks=requires_pg),
     pytest.param("mysql", marks=requires_mysql),
     pytest.param("mssql", marks=requires_mssql),
+    pytest.param("couchbase", marks=requires_couchbase),
 ]
 
 

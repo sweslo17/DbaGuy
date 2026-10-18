@@ -1,0 +1,386 @@
+"""Couchbase through the Query Service REST API (no SDK, R-04-1): SQL++ sent with the session's options, the response
+streamed and shaped by result.py, cancel by shutting the socket down from any thread (the server marks the request
+`closed`, R-04-5), read-only enforced by the server (`readonly=true`) as well as the classifier, and no transactions
+(R-04-4).
+
+Threads: the worker thread that owns a connection does everything except cancel(), force_cancel() and abort(), which
+only flip a flag under a leaf lock and shut down the socket duplicate of the request's channel (http.py). No other
+state is touched by two threads (the ③ lesson)."""
+
+import json
+import threading
+import time
+from collections.abc import Mapping
+from typing import Any, Literal
+from uuid import uuid4
+
+from loguru import logger
+
+from ...domain.errors import ConnectionFailed, ValidationFailed
+from ...domain.execution import QueryContext, StatementParams
+from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
+from ...domain.profiles import AnyProfile, Engine, ServerProfile
+from ...domain.schema import SchemaSnapshot
+from ...sql.classifier import is_transaction_statement
+from ...sql.dialects import Dialect
+from ...sql.lexer import first_keyword
+from ...sql.splitter import split
+from ...version import app_version
+from ..base import (
+    INVALID_TEXT,
+    AdapterCapabilities,
+    DatabaseAdapter,
+    DatabaseConnection,
+    Endpoint,
+    ParsedUrl,
+    RunOptions,
+    StatementCancelled,
+    StatementError,
+    StatementResult,
+    invalid_text_error,
+)
+from ..cancel_window import CancelWindow
+from . import catalog
+from .http import ChannelError, HttpChannel, NodeClient, QueryRequest, basic_auth, build_body, client_context_id
+from .nodes import candidate_nodes
+from .result import CouchbaseResult, EventStream, start_result
+from .rows import has_bare_star
+from .settings import (
+    QUERY_PORT,
+    URL_SCHEMES,
+    CouchbaseSettings,
+    connection_settings,
+    endpoint_target,
+    parse_couchbase_url,
+    request_context,
+)
+
+# R-04-6: a paused request holds a query servicer; the worker closes it after this (+ up to one 15 s housekeeping
+# pass). A13 (7.6.12): the server itself ends a request whose writes have stalled 77–86 s after the client stopped
+# reading (1203 "Slow/stalled client write timed out", the rest of the response cut), so the worker must close it
+# first, with its own message, well before 77 s: 45–60 s.
+PAUSED_RESULT_MAX_IDLE_S = 45.0
+TRANSACTIONS_UNSUPPORTED = "transactions_unsupported"
+_NO_TRANSACTIONS = ("SQL++ transactions (BEGIN WORK, COMMIT, ROLLBACK, SAVEPOINT) are not supported in DbaGuy yet; "
+                    "every statement commits on its own")
+_IDENTIFY = "SELECT ds_version() AS v, CURRENT_USERS() AS u"
+_VERSION = "SELECT ds_version() AS v"  # A17: for a user that may not call CURRENT_USERS()
+_DML = frozenset({"INSERT", "UPSERT", "UPDATE", "DELETE", "MERGE"})
+_PLANS = frozenset({"EXPLAIN", "ADVISE"})
+# How a wrong user name or password comes back: 7.6.12 answers 401 with JSON code 2120 "Failure to authenticate user"
+# (A14); 10000 and 13014 are the older and the privilege codes (spec §3.6.3); http_401 a 401 that is not JSON.
+_AUTH_FAILURES = frozenset({"2120", "10000", "13014", "http_401"})
+_AUTH_FAILED = "auth_failed"
+_TLS_FAILED = "tls_failed"
+_NODE_DOWN = "node_down"
+_BAD_REQUEST_TEXT = "The query context or a parameter holds a character that is not valid text"
+_REASON_LIMIT = 100
+
+
+def _transaction_statement(sql: str) -> bool:
+    """D-04-13, per statement (R-04a-C7): the worker sends one, but a text that holds several must not hide one."""
+    return any(is_transaction_statement(span.text, Dialect.SQLPP) for span in split(sql, Dialect.SQLPP))
+
+
+def _shown_reason(reason: str) -> str:
+    """An HTTP reason phrase as a message may show it: one short line (the peer chose it)."""
+    return " ".join(reason.split())[:_REASON_LIMIT]
+
+
+def _edition(version: str) -> Literal["enterprise", "community"] | None:
+    if version.endswith("-enterprise"):
+        return "enterprise"
+    return "community" if version.endswith("-community") else None
+
+
+def _server_error(exc: StatementError) -> bool:
+    """An error the query service answered with (a numeric code), not a failure to reach it."""
+    return exc.code is not None and exc.code.isdigit()
+
+
+class CouchbaseConnection(DatabaseConnection):
+    """One session's connection: one keep-alive channel to one query node (NodeClient), one request at a time. All
+    methods except cancel(), force_cancel() and abort() run on the owning worker thread."""
+
+    def __init__(self, client: NodeClient, *, settings: CouchbaseSettings, info: ServerInfo) -> None:
+        self._client = client
+        self._read_only = settings.read_only
+        self._default_context = settings.default_context
+        self._info = info
+        self._window = CancelWindow("Couchbase")  # arm_cancel / disarm_cancel (Task 6b, R-04a-C16)
+        # Guards the three fields below; never held across a blocking call. cancel() holds it over the channel's
+        # shutdown() (one non-blocking syscall under the channel's own leaf lock), so the request it flagged cannot
+        # end and a reused channel carry the next one in between (a late cancel never hits the next statement).
+        self._lock = threading.Lock()
+        self._busy = False  # from the start of a request until its response is read or abandoned
+        self._channel: HttpChannel | None = None  # what a cancel shuts down
+        self._cancelled = False  # a cancel reached the current request
+        self._result: CouchbaseResult | None = None
+        self._identified = False  # the node has answered once: from then on a failure is a lost connection
+        self._last_status: int | None = None  # the HTTP status of the last answer (a 401 is a login failure)
+        self.last_client_context_id: str | None = None
+
+    # ---- requests ----
+
+    def _begin(self, sql: str, *, context: QueryContext | None, params: StatementParams | None, readonly: bool,
+               retry_safe: bool) -> EventStream:
+        """Send one request and wait for its status line. Busy from here until the response is read or abandoned."""
+        with self._lock:
+            self._busy, self._cancelled, self._channel = True, False, None
+        try:
+            # After busy is set: a cancel from now on is either kept by the window (raised here) or flags the request
+            # (attach refuses, or the channel is shut down), so none falls in between.
+            self._window.take_over()
+            request = QueryRequest(
+                statement=sql, client_context_id=client_context_id(uuid4().hex),
+                query_context=request_context(context) if context is not None else None, readonly=readonly,
+                named=params.named if params else {}, positional=params.positional if params else (),
+            )
+            self.last_client_context_id = request.client_context_id
+            logger.debug("Couchbase request {} to {}{}", request.client_context_id, self._client.label,
+                         " (read-only)" if readonly else "")
+            body = build_body(request)
+            response = self._client.send(body, retry_safe=retry_safe, attach=self._attach)
+        except ChannelError as exc:
+            self._end()
+            raise self._channel_failure(exc) from exc
+        except UnicodeEncodeError:  # a lone surrogate in a context name or a parameter (the SQL is checked in run())
+            self._end()
+            raise StatementError(_BAD_REQUEST_TEXT, code=INVALID_TEXT) from None
+        except BaseException:
+            self._end()
+            raise
+        self._identified = True
+        self._last_status = response.status
+        logger.debug("Couchbase response {} {}", response.status, response.reason)
+        if "json" not in response.content_type.lower():  # a proxy's page, not the query service
+            response.abandon()
+            self._end()
+            status = response.status
+            raise StatementError(f"HTTP {status} {_shown_reason(response.reason)}", code=f"http_{status}")
+        return EventStream(response, cancelled=self.cancelled, node=self._client.label)
+
+    def _attach(self, channel: HttpChannel) -> None:
+        """NodeClient, worker thread, before anything is sent on `channel`."""
+        with self._lock:
+            if self._cancelled:
+                raise StatementCancelled()  # a cancel came while the request was being prepared: nothing is sent
+            self._channel = channel
+
+    def _end(self) -> None:
+        with self._lock:
+            self._busy, self._channel = False, None
+
+    def cancelled(self) -> bool:
+        """A cancel reached the current request (any thread)."""
+        with self._lock:
+            return self._cancelled
+
+    def _channel_failure(self, exc: ChannelError) -> StatementError:
+        if self.cancelled():
+            return StatementCancelled()
+        if exc.tls:
+            return StatementError(f"TLS failed: {exc}", code=_TLS_FAILED)
+        if not self._identified:  # opening: this node is down, try the next one
+            return StatementError(str(exc), code=_NODE_DOWN)
+        logger.warning("Connection to the query node {} was lost: {}", self._client.label, exc)
+        return StatementError(f"Connection to the query node was lost: {exc}", code="connection_lost")
+
+    def _close_result(self) -> None:
+        result, self._result = self._result, None
+        if result is not None:
+            result.close()
+
+    def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
+        options = options or RunOptions()
+        if _transaction_statement(sql):  # D-04-13: an engine capability, not a safety decision; nothing is sent
+            raise StatementError(_NO_TRANSACTIONS, code=TRANSACTIONS_UNSUPPORTED)
+        try:
+            sql.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise invalid_text_error(sql, exc.start) from None
+        self._close_result()
+        stream = self._begin(sql, context=options.query_context, params=options.params, readonly=self._read_only,
+                             retry_safe=options.retry_safe)
+        first = first_keyword(sql, Dialect.SQLPP)
+        self._result = start_result(stream, sql, plan=first in _PLANS, bare_star=has_bare_star(sql),
+                                    dml=first in _DML, on_done=self._end)
+        return self._result
+
+    def query(self, statement: str, named: Mapping[str, str] | None = None) -> list[Any]:
+        """An internal statement (catalog, identification): always read-only, read to the end, rows decoded with plain
+        JSON (an int stays an int: the catalog's num_replica, R-04a-C20). `named`: parameter names without `$` and
+        their JSON literal texts."""
+        self._close_result()
+        params = StatementParams(named=dict(named)) if named else None
+        stream = self._begin(statement, context=None, params=params, readonly=True, retry_safe=True)
+        result = start_result(stream, statement, plan=False, bare_star=False, dml=False, on_done=self._end)
+        try:
+            rows: list[Any] = []
+            while batch := result.fetch_raw(1000):
+                rows.extend(json.loads(text) for text in batch)
+            result.next_result()  # an error that came after the rows
+            return rows
+        finally:
+            result.close()
+
+    def arm_cancel(self) -> None:
+        self._window.arm()
+
+    def disarm_cancel(self) -> None:
+        self._window.disarm()
+
+    def cancel(self) -> None:
+        if self._window.keep():  # armed: nothing is running yet, run() will not start (Task 6b)
+            logger.info("Couchbase cancel on {}: kept until the statement would start", self._client.label)
+            return
+        started = time.monotonic()
+        with self._lock:
+            if not self._busy:
+                return  # nothing running: no flag either (P46); a cancel must never reach the next statement
+            self._cancelled = True
+            channel = self._channel
+            if channel is not None:
+                channel.shutdown()
+        logger.info("Couchbase cancel on {}: {} in {:.0f} ms", self._client.label,
+                    "connection shut down" if channel is not None else "before the request went out",
+                    (time.monotonic() - started) * 1000)
+
+    def force_cancel(self) -> None:
+        self.cancel()  # a shutdown already ends the request at once
+
+    def abort(self) -> None:
+        self.cancel()
+
+    # ---- identification ----
+
+    def _first_row(self, statement: str) -> dict[str, Any]:
+        rows = self.query(statement)
+        return rows[0] if rows and isinstance(rows[0], dict) else {}
+
+    def identify(self, username: str) -> ServerInfo:
+        """What answered (spec §3.6.3 step 4): version, edition and the current user, read-only like every internal
+        query. A login failure is raised with code `auth_failed`, whatever the server called it."""
+        try:
+            try:
+                row = self._first_row(_IDENTIFY)
+            except StatementError as exc:
+                if not _server_error(exc) or self._last_status == 401:
+                    raise  # unreachable, or the login itself failed
+                # A17: a limited user may not call CURRENT_USERS() (a privilege error such as 13014 is then a login
+                # failure only if the version alone is refused too)
+                row = {**self._first_row(_VERSION), "u": None}
+        except StatementError as exc:
+            if self._login_failed(exc):
+                raise StatementError(exc.message, code=_AUTH_FAILED) from exc
+            raise
+        version = str(row.get("v") or "")
+        users = row.get("u")
+        user = users[0] if isinstance(users, list) and users and isinstance(users[0], str) else username
+        context = self._default_context
+        self._info = ServerInfo(
+            engine=Engine.COUCHBASE, version=f"Couchbase Server {version}".rstrip(), edition=_edition(version),
+            current_user=user, current_database=context.text() if context is not None else None,
+            default_query_context=context,
+        )
+        return self._info
+
+    def _login_failed(self, exc: StatementError) -> bool:
+        return exc.code in _AUTH_FAILURES or (self._last_status == 401 and _server_error(exc))
+
+    # ---- no transactions (R-04-4, spec §3.7.5) ----
+
+    def in_transaction(self) -> bool:
+        return False
+
+    def autocommit(self) -> bool:
+        return True
+
+    def set_autocommit(self, enabled: bool) -> None:
+        if not enabled:
+            raise StatementError(_NO_TRANSACTIONS, code=TRANSACTIONS_UNSUPPORTED)
+
+    def commit(self) -> None:
+        return None
+
+    def rollback(self) -> None:
+        return None
+
+    # ---- metadata ----
+
+    def server_info(self) -> ServerInfo:
+        return self._info
+
+    def current_database(self) -> str | None:
+        return self._info.current_database
+
+    def list_children(self, path: list[PathSegment]) -> list[ObjectNode]:
+        return catalog.list_children(self.query, path)
+
+    def object_detail(self, path: list[PathSegment]) -> ObjectDetail:
+        return catalog.object_detail(self.query, path)
+
+    def schema_snapshot(self) -> SchemaSnapshot:
+        return catalog.build_snapshot(self.query)
+
+    def close(self) -> None:
+        try:
+            self._close_result()
+        finally:
+            self._client.close()
+
+
+class CouchbaseAdapter(DatabaseAdapter):
+    engine = Engine.COUCHBASE
+    url_schemes = URL_SCHEMES
+    default_port = QUERY_PORT
+    dialect = Dialect.SQLPP
+    # documents: 04c; executed plan: 04b (ruling P6)
+    capabilities = AdapterCapabilities(
+        server_read_only=True, transactions=False, query_context=True, parameters=True, documents=False,
+        executed_plan=False, plan_format="couchbase", paused_result_max_idle_s=PAUSED_RESULT_MAX_IDLE_S,
+    )
+
+    def parse_url(self, url: str) -> ParsedUrl:
+        return parse_couchbase_url(url)
+
+    def endpoint_target(self, profile: ServerProfile) -> tuple[str, int]:
+        return endpoint_target(profile)
+
+    def open(self, profile: AnyProfile, endpoint: Endpoint | None, password: str | None,
+             database: str | None) -> DatabaseConnection:
+        """Spec §3.6.3: the candidate nodes in order (discovered or given), the first that answers. A refused, timed
+        out or unknown node: the next one; a login or TLS failure: at once (another node would say the same). Runs on
+        the worker's open path; discovery is bounded by its own deadline (R-04a-C19)."""
+        if not isinstance(profile, ServerProfile) or endpoint is None:
+            raise ValidationFailed("Not a Couchbase server profile")
+        settings = connection_settings(profile, endpoint, database)
+        auth = basic_auth(settings.username, password or "")
+        nodes, how = candidate_nodes(settings, auth)
+        logger.debug("Couchbase query nodes to try: {}", ", ".join(node.label for node in nodes))
+        failures: list[str] = []
+        for node in nodes:
+            client = NodeClient(node.host, node.port, auth=auth, user_agent=f"DbaGuy/{app_version()}", tls=settings.tls,
+                                server_hostname=settings.server_hostname)
+            connection = CouchbaseConnection(client, settings=settings,
+                                             info=ServerInfo(engine=Engine.COUCHBASE, version="Couchbase Server"))
+            try:
+                info = connection.identify(settings.username)
+            except StatementError as exc:
+                connection.close()
+                if exc.code == _NODE_DOWN:
+                    logger.info("Couchbase query node {} not reachable ({})", node.label, exc.message)
+                    failures.append(f"{node.label} ({exc.message})")
+                    continue
+                if exc.code == _AUTH_FAILED:
+                    raise ConnectionFailed(f"{exc.message}\nCheck the user name and password") from exc
+                if exc.code == _TLS_FAILED:
+                    raise ConnectionFailed(f"{exc.message}\nSet the cluster's CA file in the SSL tab") from exc
+                raise ConnectionFailed(exc.message) from exc
+            except BaseException:
+                connection.close()
+                raise
+            logger.info("Connected to {} at {} via {} (tls={}{})", info.version, node.label, how, settings.tls_mode,
+                        ", read-only" if settings.read_only else "")
+            return connection
+        raise ConnectionFailed("Could not reach a query node: " + ", ".join(failures))
