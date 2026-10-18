@@ -46,7 +46,8 @@ class SplitRequest(_Input):
 class StatementRange(BaseModel):
     start: int  # UTF-16
     end: int  # UTF-16, without the terminator
-    terminator_end: int  # UTF-16, after the `;` or the custom delimiter (or `end` when there is none)
+    terminator_end: int  # UTF-16, after the `;`, the custom delimiter or the `GO` line (or `end` when there is none)
+    repeat: int  # times the statement runs: T-SQL "GO n" (0 for GO 0); 1 otherwise
 
 
 class SplitResponse(BaseModel):
@@ -144,7 +145,7 @@ def split_statements(body: SplitRequest) -> SplitResponse:
     index = Utf16Index(body.text)
     return SplitResponse(statements=[
         StatementRange(start=index.to_utf16(s.start), end=index.to_utf16(s.end),
-                       terminator_end=index.to_utf16(s.terminator_end))
+                       terminator_end=index.to_utf16(s.terminator_end), repeat=s.repeat)
         for s in split(body.text, body.dialect)
     ])
 

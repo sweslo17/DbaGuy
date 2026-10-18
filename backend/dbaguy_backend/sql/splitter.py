@@ -15,6 +15,9 @@ _STATEMENT_STARTS = frozenset({";", "BEGIN", "THEN", "ELSE", "DO", "LOOP", "REPE
 _NAME_TOKENS = (TokenKind.WORD, TokenKind.QUOTED, TokenKind.STRING)  # a user or host name, in any quoting
 _PROGRAM_HEAD = 16  # significant tokens: CREATE OR REPLACE DEFINER = `u` @ `h` SQL SECURITY INVOKER PROCEDURE …
 _DELIMITER_ARGUMENT = re.compile(r"[ \t]+(\S+)[^\n]*")  # after the word DELIMITER: the terminator, then the line
+_GO_REST = re.compile(r"(?:[ \t]+(\d+))?[ \t]*(?:--[^\r\n]*)?\r?(?=\n|\Z)")  # after GO: [count] [-- comment], line end
+_MODULES = frozenset({"PROC", "PROCEDURE", "FUNCTION", "TRIGGER", "VIEW"})
+_MAX_COUNT_DIGITS = 9  # `GO n` counts longer than this are read as 10**9
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,7 +26,8 @@ class StatementSpan:
     end: int
     terminator_end: int
     text: str
-    has_body: bool = False  # a routine or trigger body whose inner `;` did not end the statement
+    has_body: bool = False  # a routine or trigger body whose inner `;` did not end the statement (T-SQL: the batch defines a module)
+    repeat: int = 1  # T-SQL "GO n": times the batch runs (0 for GO 0)
 
 
 class _BodyTracker:
@@ -193,14 +197,15 @@ def _tracker(rule: BodyRule) -> _BodyTracker | _CompoundTracker:
 
 
 def _emit(
-    spans: list[StatementSpan], text: str, tokens: list[Token], terminator_end: int | None, has_body: bool
+    spans: list[StatementSpan], text: str, tokens: list[Token], terminator_end: int | None, has_body: bool,
+    repeat: int = 1,
 ) -> None:
     significant = [t for t in tokens if t.kind not in INSIGNIFICANT]
     if not significant:
         return
     start, end = significant[0].start, significant[-1].end
     terminator = terminator_end if terminator_end is not None else end
-    spans.append(StatementSpan(start, end, terminator, text[start:end], has_body))
+    spans.append(StatementSpan(start, end, terminator, text[start:end], has_body, repeat))
 
 
 def _delimiter_line(text: str, token: Token, started: bool) -> re.Match[str] | None:
@@ -219,8 +224,62 @@ def _delimiter_line(text: str, token: Token, started: bool) -> re.Match[str] | N
     return _DELIMITER_ARGUMENT.match(text, token.end)
 
 
+def _go_line(text: str, token: Token) -> re.Match[str] | None:
+    """A T-SQL `GO [n]` line, as sqlcmd and SSMS read it: the word GO alone on its line, optionally followed by a count
+    and a `--` comment. `GO;`, `GO2` and `GO /* c */` are not. A GO inside a string, comment or [name] is not a WORD
+    token, so it never gets here. Linear: only the spaces and tabs before the word are looked at."""
+    if token.kind != TokenKind.WORD or token.upper != "GO":
+        return None
+    i = token.start
+    while i > 0 and text[i - 1] in " \t":
+        i -= 1
+    if i > 0 and text[i - 1] != "\n":
+        return None
+    return _GO_REST.match(text, token.end)
+
+
+def _go_count(digits: str | None) -> int:
+    """The n of `GO n`, 1 without one. A count of more than 9 significant digits is read as 10**9: the run loop refuses
+    far less than that, and `int()` raises for over 4300 digits, which `/sql/split` must survive on every edit."""
+    if digits is None:
+        return 1
+    significant = digits.lstrip("0")
+    return int(significant or "0") if len(significant) <= _MAX_COUNT_DIGITS else 10**_MAX_COUNT_DIGITS
+
+
+def _defines_module(significant: list[Token]) -> bool:
+    """CREATE [OR ALTER] | ALTER  PROC|PROCEDURE|FUNCTION|TRIGGER|VIEW. T-SQL requires such a statement to be the only
+    one in its batch, so everything after it, up to the GO line, is the module's body and runs later, not now."""
+    words = [t.upper if t.kind == TokenKind.WORD else "" for t in significant[:4]]
+    if words[:3] == ["CREATE", "OR", "ALTER"]:
+        return words[3:4] != [] and words[3] in _MODULES
+    return words[:1] in (["CREATE"], ["ALTER"]) and len(words) > 1 and words[1] in _MODULES
+
+
+def _split_batches(text: str, dialect: Dialect) -> list[StatementSpan]:
+    """T-SQL: batches end at GO lines (spec §3.3); `;` never splits a batch, because variables and temporary tables
+    live as long as the batch."""
+    spans: list[StatementSpan] = []
+    start = 0
+    while True:
+        current: list[Token] = []
+        line: re.Match[str] | None = None
+        for token in scan(text, dialect, start):
+            if line := _go_line(text, token):
+                break
+            current.append(token)
+        significant = [t for t in current if t.kind not in INSIGNIFICANT]
+        if line is None:
+            _emit(spans, text, current, None, _defines_module(significant))
+            return spans
+        _emit(spans, text, current, line.end(), _defines_module(significant), _go_count(line.group(1)))
+        start = line.end()
+
+
 def split(text: str, dialect: Dialect) -> list[StatementSpan]:
     rules = RULES[dialect]
+    if rules.client_command is ClientCommand.GO:
+        return _split_batches(text, dialect)
     commands = rules.client_command is ClientCommand.DELIMITER
     spans: list[StatementSpan] = []
     delimiter: str | None = None  # set by a DELIMITER line; None: `;` ends statements (outside bodies)

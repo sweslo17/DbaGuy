@@ -1745,6 +1745,8 @@ export interface components {
             end: number;
             /** Terminator End */
             terminator_end: number;
+            /** Repeat */
+            repeat: number;
         };
         /** TextSelection */
         TextSelection: {

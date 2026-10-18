@@ -351,3 +351,53 @@ def test_delimiter_lines_are_found_in_linear_time_on_one_long_line(text):  # M5:
     started = time.perf_counter()
     split(text, MY)
     assert time.perf_counter() - started < 1.0  # ~0.2 s here; 3.4 s for the first input before M5
+
+
+TS = Dialect.TSQL
+
+
+def batches(sql):
+    return [(s.text, s.repeat) for s in split(sql, TS)]
+
+
+def test_go_lines_end_batches_and_semicolons_do_not():
+    sql = "DECLARE @x int = 1;\nSELECT @x;\nGO\nPRINT 'two'\n  go 3  -- three times\nSELECT 1; SELECT 2"
+    assert batches(sql) == [("DECLARE @x int = 1;\nSELECT @x;", 1), ("PRINT 'two'", 3), ("SELECT 1; SELECT 2", 1)]
+    first, second, _ = split(sql, TS)
+    assert sql[first.end:first.terminator_end] == "\nGO"
+    assert sql[second.end:second.terminator_end] == "\n  go 3  -- three times"
+
+
+def test_what_is_not_a_go_line():
+    for sql in ("SELECT 1\nGO;\nSELECT 2", "SELECT 1\nGO2\nSELECT 2", "SELECT 1\nGO /* c */\nSELECT 2", "SELECT 1 GO\nSELECT 2"):
+        assert batches(sql) == [(sql, 1)], sql
+    assert batches("SELECT 'a\nGO\nb'\nGO") == [("SELECT 'a\nGO\nb'", 1)]
+    assert batches("/* a /* b */\nGO\n*/ SELECT 1\nGO") == [("SELECT 1", 1)]  # nested comment: still inside it
+    assert batches("SELECT [a\nGO\nb] FROM t") == [("SELECT [a\nGO\nb] FROM t", 1)]
+    assert batches("SELECT N'x\nGO\n' AS s") == [("SELECT N'x\nGO\n' AS s", 1)]
+
+
+def test_go_edge_cases():
+    assert batches("SELECT 1\r\nGO\r\nSELECT 2\r\n") == [("SELECT 1", 1), ("SELECT 2", 1)]
+    assert batches("SELECT 1 -- x\nGO\n") == [("SELECT 1", 1)]  # a trailing comment stays outside, as for `;`
+    assert batches("GO\nGO 5\n  \nSELECT 1\nGO") == [("SELECT 1", 1)]  # empty batches give no span
+    assert batches("SELECT 1\nGO 0\nSELECT 2") == [("SELECT 1", 0), ("SELECT 2", 1)]
+    assert batches("SELECT 1\nGo 02") == [("SELECT 1", 2)]
+    sql = "SELECT N'中😀'\nGO\nSELECT 2"
+    assert [sql[s.start:s.end] for s in split(sql, TS)] == ["SELECT N'中😀'", "SELECT 2"]
+
+
+def test_module_definitions_own_the_rest_of_their_batch():
+    sql = "CREATE OR ALTER PROCEDURE p AS\nSELECT 1;\nDELETE FROM t;\nGO\nEXEC p\nGO\nALTER VIEW v AS SELECT 1 AS a"
+    spans = split(sql, TS)
+    assert [(s.has_body, s.repeat) for s in spans] == [(True, 1), (False, 1), (True, 1)]
+    assert split("/* header */ CREATE PROC q AS SELECT 1", TS)[0].has_body
+    assert not split("CREATE TABLE t (a int); CREATE VIEW v AS SELECT 1", TS)[0].has_body  # not first in the batch
+    assert [s.repeat for s in split("SELECT 1; SELECT 2", PG)] == [1, 1]  # other dialects: always 1
+
+
+def test_a_huge_go_count_does_not_crash_the_splitter():
+    assert batches("SELECT 1\nGO " + "9" * 5000) == [("SELECT 1", 10**9)]  # int() alone raises over 4300 digits
+    assert batches("SELECT 1\nGO 000000000000000000000000000003") == [("SELECT 1", 3)]  # leading zeros are no digits
+    assert batches("SELECT 1\nGO 00000000000") == [("SELECT 1", 0)]
+    assert batches("SELECT 1\nGO 999999999") == [("SELECT 1", 999_999_999)]

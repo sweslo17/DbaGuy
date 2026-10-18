@@ -5039,13 +5039,18 @@
           "terminator_end": {
             "type": "integer",
             "title": "Terminator End"
+          },
+          "repeat": {
+            "type": "integer",
+            "title": "Repeat"
           }
         },
         "type": "object",
         "required": [
           "start",
           "end",
-          "terminator_end"
+          "terminator_end",
+          "repeat"
         ],
         "title": "StatementRange"
       },

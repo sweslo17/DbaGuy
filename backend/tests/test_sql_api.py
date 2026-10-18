@@ -37,8 +37,17 @@ def labels(response):
 
 def test_split_uses_utf16_offsets(client):
     statements = client.post("/sql/split", json={"text": EMOJI_SQL, "dialect": "sqlite"}, headers=AUTH).json()["statements"]
-    assert statements[0] == {"start": 0, "end": 11, "terminator_end": 12}  # '😀' is two UTF-16 units
+    assert statements[0] == {"start": 0, "end": 11, "terminator_end": 12, "repeat": 1}  # '😀' is two UTF-16 units
     assert statements[1]["start"] == 13 and statements[1]["end"] == utf16_len(EMOJI_SQL)
+
+
+def test_split_returns_go_repeats(client):
+    body = {"text": "SELECT 1\nGO 3\nSELECT '中'", "dialect": "tsql"}
+    statements = client.post("/sql/split", json=body, headers=AUTH).json()["statements"]
+    assert statements == [
+        {"start": 0, "end": 8, "terminator_end": 13, "repeat": 3},
+        {"start": 14, "end": 24, "terminator_end": 24, "repeat": 1},
+    ]
 
 
 def test_complete_after_an_astral_character(client, sqlite_profile_id):

@@ -367,6 +367,16 @@ def test_tsql_completion_quotes_with_brackets_and_knows_its_keywords():
     assert complete("SELECT N'fro", 12, TS, index).items == []  # inside an N'' string
 
 
+def test_tsql_completion_reads_the_batch_under_the_cursor():
+    snapshot = SchemaSnapshot(
+        database="dbaguy", default_schema="dbo", search_path=["dbo"], built_at=datetime.now(UTC),
+        schemas=[SnapshotSchema(name="dbo", relations=[table("a", [("x", "int")]), table("b", [("y", "int")])])],
+    )
+    text = "SELECT * FROM a\nGO\nSELECT  FROM b"
+    labels = [i.label for i in complete(text, text.rindex("SELECT ") + 7, TS, SnapshotIndex(snapshot, TS)).items]
+    assert "y" in labels and "x" not in labels  # the first batch is not in scope
+
+
 @pytest.mark.parametrize("sql", [
     "DELETE FROM orders OUTPUT deleted.id WHERE ",
     "SELECT * FROM orders OPTION (RECOMPILE) ",
