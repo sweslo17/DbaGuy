@@ -1,10 +1,13 @@
+import json
+import random
+
 import pytest
 
 from dbaguy_backend.adapters.couchbase.rows import (
     OVERFLOW_NAME, build_shape, has_bare_star, needs_first_page, value_cell,
 )
-from dbaguy_backend.adapters.couchbase.stream import ResponseParser, RowEvent
-from dbaguy_backend.adapters.values import MISSING
+from dbaguy_backend.adapters.couchbase.stream import ResponseParser, RowEvent, split_object
+from dbaguy_backend.adapters.values import MISSING, encode_value
 from dbaguy_backend.adapters.values import JsonText as J
 from dbaguy_backend.domain.column_category import ColumnCategory as C
 
@@ -159,7 +162,7 @@ def test_no_key_and_no_value_is_lost_across_a_mixed_page():  # Review Focus 4
     assert shape.cells(page[5]) == [MISSING, MISSING, MISSING, J('{"z":9007199254740993}')]
 
 
-def test_alias_expansion_needs_one_object_alias_on_every_first_page_row():  # Review Focus 4
+def test_alias_expansion_needs_one_alias_on_every_first_page_row():  # Review Focus 4
     sig = {"id": "json", "*": "*"}
     page = rows('{"id":"e1","d":{"zeta":1,"alpha":{"z":1},"id":7}}', '{"id":"e2","d":{"alpha":2,"kind":"x"}}')
     shape = shape_of(sig, page, bare_star=True)
@@ -167,7 +170,7 @@ def test_alias_expansion_needs_one_object_alias_on_every_first_page_row():  # Re
     assert shape.cells(page[0]) == ["e1", 1, J('{"z":1}'), 7, MISSING, MISSING]
     assert names(shape_of(sig, page))[:2] == ["id", "d"]  # `d.*`, not a bare star
     mixed = rows('{"id":"e1","d":{"a":1}}', '{"id":"s1","d":"just a string"}')
-    assert names(shape_of(sig, mixed, bare_star=True)) == ["id", "d", OVERFLOW_NAME]
+    assert names(shape_of(sig, mixed, bare_star=True)) == ["id", "a", OVERFLOW_NAME]  # R-04a-T8a: any kind, one object
     two = rows('{"id":"e1","d":{"a":1},"o":{"b":2}}')
     assert names(shape_of(sig, two, bare_star=True)) == ["id", "d", "o", OVERFLOW_NAME]
     assert names(shape_of(sig, [], bare_star=True)) == ["id", OVERFLOW_NAME]  # an empty result
@@ -178,6 +181,100 @@ def test_alias_expansion_needs_the_same_alias_on_every_row():
     assert names(shape_of(sig, rows('{"a":{"x":1}}', '{"b":{"y":2}}'), bare_star=True)) == ["a", "b", OVERFLOW_NAME]
     assert names(shape_of(sig, rows('{"a":{"x":1}}', "7"), bare_star=True)) == ["a", OVERFLOW_NAME]
     assert names(shape_of(sig, rows('{"a":{"x":1}}', '{}'), bare_star=True)) == ["a", OVERFLOW_NAME]
+
+
+def test_a_non_object_alias_on_the_first_page_goes_to_the_overflow():  # R-04a-T8a: JOIN, LEFT JOIN, mixed keyspaces
+    sig = {"id": "json", "*": "*"}
+    page = rows('{"id":"e1","d":{"a":1,"b":"x"}}', '{"id":"s1","d":"just a string"}', '{"id":"n1","d":42}',
+                '{"id":"z1","d":null}', '{"id":"a1","d":[1,2]}', '{"id":"e0","d":{}}')
+    shape = shape_of(sig, page, bare_star=True)
+    assert names(shape) == ["id", "a", "b", OVERFLOW_NAME]
+    assert [shape.cells(r) for r in page] == [
+        ["e1", 1, "x", MISSING],
+        ["s1", MISSING, MISSING, J('{"d":"just a string"}')],
+        ["n1", MISSING, MISSING, J('{"d":42}')],
+        ["z1", MISSING, MISSING, J('{"d":null}')],
+        ["a1", MISSING, MISSING, J('{"d":[1,2]}')],
+        ["e0", MISSING, MISSING, MISSING],  # an empty document has nothing to show
+    ]
+
+
+def test_an_alias_with_no_member_on_the_first_page_is_one_plain_column():  # R-04a-T8a
+    sig = {"id": "json", "*": "*"}
+    scalars = rows('{"id":"e1","d":42}', '{"id":"e2","d":"x"}', '{"id":"e3","d":null}')
+    shape = shape_of(sig, scalars, bare_star=True)
+    assert [(c.name, c.type_name) for c in shape.columns] == [
+        ("id", "json"), ("d", "number|string|null"), (OVERFLOW_NAME, "object"),
+    ]
+    assert [shape.cells(r) for r in scalars] == [["e1", 42, MISSING], ["e2", "x", MISSING], ["e3", None, MISSING]]
+    later = rows('{"id":"e4","d":{"a":1}}')  # an object later: the column shows it whole, nothing is lost
+    assert shape.cells(later[0]) == ["e4", J('{"a":1}'), MISSING]
+    empties = rows('{"id":"e1","d":{}}', '{"id":"e2","d":{}}')
+    shape = shape_of(sig, empties, bare_star=True)
+    assert [(c.name, c.type_name) for c in shape.columns] == [("id", "json"), ("d", "object"), (OVERFLOW_NAME, "object")]
+    assert [shape.cells(r) for r in empties] == [["e1", J("{}"), MISSING], ["e2", J("{}"), MISSING]]
+
+
+def test_a_later_row_whose_alias_is_not_an_object_keeps_its_star_part_as_sent():  # R-04a-T8a
+    shape = shape_of({"id": "json", "*": "*"}, rows('{"id":"e1","d":{"a":1}}'), bare_star=True)
+    later = rows('{"id":"e2","d":42}', '{"id":"e3","d":{"a":2}}', '{"id":"e4","d":"s","x":1}')
+    assert [shape.cells(r) for r in later] == [
+        ["e2", MISSING, J('{"d":42}')], ["e3", 2, MISSING], ["e4", MISSING, J('{"d":"s","x":1}')],
+    ]
+
+
+def test_one_member_somewhere_on_the_first_page_is_enough_to_expand():  # R-04a-T8a
+    page = rows('{"d":{}}', '{"d":7}', '{"d":{"k":"v"}}')
+    shape = shape_of({"*": "*"}, page, bare_star=True)
+    assert names(shape) == ["k", OVERFLOW_NAME]
+    assert [shape.cells(r) for r in page] == [[MISSING, MISSING], [MISSING, J('{"d":7}')], ["v", MISSING]]
+
+
+_VALUES = ["42", '"s"', "null", "true", "0.5", "[1,2]", "{}", '{"a":1}', '{"a":1,"b":"x"}', '{"c":{"n":2}}']
+
+
+def _cell_text(cell):
+    return cell.text if isinstance(cell, J) else json.dumps(cell)
+
+
+def _reachable_texts(shape, cells):
+    """Every value text a row's cells show: the cells, and the members of the overflow object."""
+    *shown, overflow = cells
+    texts = [_cell_text(c) for c in shown if c is not MISSING]
+    if overflow is not MISSING:
+        texts += [f.text for f in split_object(overflow.text)]
+    return sorted(texts)
+
+
+@pytest.mark.parametrize("seed", range(300))
+def test_no_value_is_lost_whatever_the_aliases_are(seed):  # Review Focus 4, R-04a-T8a: random first page and later rows
+    rng = random.Random(seed)
+
+    def one(n):
+        if rng.random() < 0.1:
+            return rng.choice(["7", '"s"', "[1]", "null"])
+        fields = [f'"id":"i{n}"'] if rng.random() < 0.9 else []
+        if rng.random() < 0.9:
+            fields.append(f'"{rng.choice("dd e")}":{rng.choice(_VALUES)}')  # mostly one alias, now and then another
+        if rng.random() < 0.1:
+            fields.append(f'"x":{rng.choice(_VALUES)}')
+        return "{" + ",".join(fields) + "}"
+
+    page = rows(*(one(n) for n in range(rng.randint(0, 4))))
+    later = rows(*(one(n) for n in range(10, 10 + rng.randint(1, 8))))
+    shape = shape_of({"id": "json", "*": "*"}, page, bare_star=rng.random() < 0.8)
+    columns = [c.model_copy() for c in shape.columns]
+    for row in [*page, *later]:
+        cells = shape.cells(row)
+        assert len(cells) == len(columns)
+        if row.fields is None:  # not an object: whole, in the overflow column
+            assert cells == [MISSING] * (len(columns) - 1) + [J(row.text)]
+            continue
+        members = [m.text for f in row.fields if f.key != "id" and f.text.startswith("{") for m in split_object(f.text)]
+        own = sorted(f.text for f in row.fields)  # every field as sent
+        expanded = sorted([f.text for f in row.fields if f.key == "id"] + members)  # id and the alias object's members
+        assert _reachable_texts(shape, cells) in (own, expanded), (row.text, cells)
+    assert shape.columns == columns
 
 
 def test_alias_expansion_keeps_the_stored_order_and_exact_texts():  # Review Focus 1: u_keyorder, u_numbers
@@ -251,3 +348,53 @@ def test_only_star_signatures_are_peeked():
     assert needs_first_page({"*": "*"}, plan=False) and needs_first_page({"id": "json", "*": "*"}, plan=False)
     assert not needs_first_page({"*": "*"}, plan=True) and not needs_first_page("json", plan=False)
     assert not needs_first_page({"a": "json"}, plan=False) and not needs_first_page(None, plan=False)
+
+
+def wire_safe(shape, row_list):
+    """What the WebSocket does with a result: the columns and every row's encoded cells as UTF-8 JSON text."""
+    columns = [c.model_dump(mode="json") for c in shape.columns]
+    for row in row_list:
+        cells = [encode_value(cell) for cell in shape.cells(row)]
+        json.dumps({"columns": columns, "row": cells}, ensure_ascii=False).encode("utf-8")  # raises on a lone surrogate
+
+
+def test_a_string_with_a_lone_surrogate_is_its_literal():  # R-04a-T8b
+    texts = ['"\\ud800"', '"a\\udc00b"', '"\\udc00\\ud800"', '"\\ud83d\\ude00"', '"中"', '"\\u00e9"']
+    got = [value_cell(r.text, r.value) for r in rows(*texts)]
+    assert got == [J(texts[0]), J(texts[1]), J(texts[2]), "😀", "中", "é"]  # a valid pair is one character: a string
+    for row in rows(*texts):
+        wire_safe(shape_of("string"), [row])
+
+
+def test_lone_surrogates_in_object_signature_names_and_cells():  # R-04a-T8b
+    signature = json.loads('{"\\ud800":"json","a\\udc00":"string","ok":"string"}')
+    shape = shape_of(signature)
+    assert names(shape) == ["\\ud800", "a\\udc00", "ok"]  # the escapes as ASCII text
+    row = rows('{"\\ud800":"\\ud800","a\\udc00":"fine","ok":"x"}')[0]
+    assert shape.cells(row) == [J('"\\ud800"'), "fine", "x"]
+    wire_safe(shape, [row])
+
+
+def test_lone_surrogates_in_star_columns_and_the_overflow():  # R-04a-T8b
+    shape = shape_of({"id": "json", "*": "*"}, rows('{"id":"e","\\ud800":1,"x\\udfff":"\\ud800"}'))
+    assert names(shape) == ["id", "\\ud800", "x\\udfff", OVERFLOW_NAME]
+    first = rows('{"id":"e","\\ud800":1,"x\\udfff":"\\ud800"}')[0]
+    later = rows('{"id":"f","\\udc00":{"\\ud800":"\\ud800"},"\\ud800":2}')[0]
+    assert shape.cells(first) == ["e", 1, J('"\\ud800"'), MISSING]
+    assert shape.cells(later) == ["f", 2, MISSING, J('{"\\udc00":{"\\ud800":"\\ud800"}}')]
+    wire_safe(shape, [first, later])
+
+
+def test_lone_surrogates_in_alias_names():  # R-04a-T8b
+    page = rows('{"id":"e","\\ud800":{"id":1,"k\\udc00":"\\ud800"}}')
+    shape = shape_of({"id": "json", "*": "*"}, page, bare_star=True)
+    assert names(shape) == ["id", "\\ud800.id", "k\\udc00", OVERFLOW_NAME]  # the alias is the key with the surrogate
+    assert shape.cells(page[0]) == ["e", 1, J('"\\ud800"'), MISSING]
+    wire_safe(shape, page)
+
+
+def test_names_that_only_differ_by_a_surrogate_stay_unique():  # R-04a-T8b: the escape text is a real key too
+    page = rows('{"\\\\ud800":1,"\\ud800":2}')  # the six characters \ud800, and a lone surrogate
+    shape = shape_of({"*": "*"}, page)
+    assert names(shape) == ["\\ud800", "\\ud800 2", OVERFLOW_NAME]
+    assert shape.cells(page[0]) == [1, 2, MISSING]

@@ -9,7 +9,11 @@ delivers those same rows first when the grid asks for rows.
 
 Cells follow spec §3.2.4: strings, true, false and null as decoded; a number as a Python number only when its literal
 reads back exactly (`1.10`, `-0`, `1E+3`, `1e400` and integers past ±(2^53−1) stay the server's text, as `JsonText`);
-objects and arrays as `JsonText` of the exact text; a key the row does not have as `MISSING` (not NULL)."""
+objects and arrays as `JsonText` of the exact text; a key the row does not have as `MISSING` (not NULL).
+
+A JSON string can hold a lone surrogate (`"\\ud800"`), which decodes to a Python str that no UTF-8 encoder takes (the
+WebSocket send would fail). Such a string value becomes `JsonText` of the server's literal (the escape is kept); in a
+column name or an overflow key each lone surrogate is written as its `\\uXXXX` escape. Nothing else is changed."""
 
 import json
 import re
@@ -33,6 +37,7 @@ PLAN_COLUMN = "plan"
 _STAR = "*"
 _SIGNATURE_CATEGORY = {"number": ColumnCategory.NUMBER, "string": ColumnCategory.TEXT, "boolean": ColumnCategory.BOOL}
 _INTEGER = re.compile(r"-?\d+")
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")  # a character from a \uD800-style escape: never half of a pair
 _SAFE_DIGITS = 17  # ±(2^53 − 1) has 16 digits: longer literals are never converted (and int() has a digit limit)
 # Words that end the projection of a SELECT at its own nesting level (RAW / ELEMENT / VALUE make the rows plain values).
 _PROJECTION_ENDS = frozenset({"FROM", "LET", "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "UNION", "INTERSECT",
@@ -40,14 +45,26 @@ _PROJECTION_ENDS = frozenset({"FROM", "LET", "WHERE", "GROUP", "ORDER", "LIMIT",
 _LATE_KEYS = "Some rows have keys outside the columns (from row {:,}); export as JSON to see every key"
 
 
+def _has_lone_surrogate(text: str) -> bool:
+    return not text.isascii() and _LONE_SURROGATE.search(text) is not None
+
+
+def _escape_surrogates(text: str) -> str:
+    """`text` with each lone surrogate written as the JSON escape `\\uXXXX`: text that any UTF-8 encoder takes."""
+    if text.isascii():
+        return text
+    return _LONE_SURROGATE.sub(lambda match: f"\\u{ord(match.group()):04x}", text)
+
+
 def value_cell(text: str, value: Any) -> Any:
     """The cell for one JSON value: `text` is the server's exact text, `value` the decoded value (only used for strings,
-    true, false and null: numbers are decided from the literal, so a Python number never rounds a stored one)."""
+    true, false and null: numbers are decided from the literal, so a Python number never rounds a stored one). A string
+    with a lone surrogate is kept as its literal, as `JsonText`."""
     kind = json_kind(text)
     if kind in ("object", "array"):
         return JsonText(text)
     if kind != "number":
-        return value
+        return JsonText(text) if kind == "string" and _has_lone_surrogate(value) else value
     if _INTEGER.fullmatch(text):
         if len(text) <= _SAFE_DIGITS and str(number := int(text)) == text and abs(number) <= MAX_SAFE_INT:
             return number
@@ -61,12 +78,7 @@ def _cell(field: RowField | None) -> Any:
 
 
 def _key_text(key: str) -> str:
-    text = json.dumps(key, ensure_ascii=False)
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError:  # a key with a lone surrogate (from a \uD800 escape): keep it as the escape
-        return json.dumps(key)
-    return text
+    return _escape_surrogates(json.dumps(key, ensure_ascii=False))
 
 
 def _overflow(fields: Sequence[RowField]) -> Any:
@@ -78,7 +90,8 @@ def _overflow(fields: Sequence[RowField]) -> Any:
 
 def _signature_column(name: str, type_name: Any) -> ColumnMeta:
     text = type_name if isinstance(type_name, str) else json.dumps(type_name)
-    return ColumnMeta(name=name, type_name=text, category=_SIGNATURE_CATEGORY.get(text, ColumnCategory.MIXED))
+    return ColumnMeta(name=_escape_surrogates(name), type_name=_escape_surrogates(text),
+                      category=_SIGNATURE_CATEGORY.get(text, ColumnCategory.MIXED))
 
 
 def _unique(names: Iterable[str], taken: set[str]) -> list[str]:
@@ -200,15 +213,16 @@ class _ObjectShape(RowShape):
 
 
 def _alias_of(first_page: Sequence[RawRow], named: frozenset[str]) -> str | None:
-    """D-04-1, condition 3: the one key every first-page row got from `*`, when each holds an object. None for an
-    empty page and as soon as a row is not an object, got another number of keys, an alias that is not an object, or
-    another key than the first row's."""
+    """D-04-1, condition 3 (R-04a-T8a): the one key every first-page row got from `*`. Each row must be an object whose
+    `*` part (the fields the signature does not name) is exactly one field with that key; its value may be of any
+    kind, which keeps JOIN, LEFT JOIN and UNION results out. None for an empty page and as soon as a row does not fit.
+    Whether the alias object has members to show is the caller's question."""
     alias = None
     for row in first_page:
         if row.fields is None:
             return None
         brought = [field for field in row.fields if field.key not in named]
-        if len(brought) != 1 or json_kind(brought[0].text) != "object":
+        if len(brought) != 1:
             return None
         if alias is None:
             alias = brought[0].key
@@ -219,8 +233,10 @@ def _alias_of(first_page: Sequence[RawRow], named: frozenset[str]) -> str | None
 
 class _StarShape(RowShape):
     """A `*` in the signature: its names in order, `*` replaced by the keys the first page brought, then the overflow
-    column. With an alias (D-04-1) the keys are those of the alias object. The columns are fixed by the first page; a
-    later row's other keys, a row that is not an object, and an alias that no longer fits go to the overflow column."""
+    column. With an alias (D-04-1) the keys are those of the alias object: only when some first-page row's alias is an
+    object with members (R-04a-T8a), else the alias is one column itself. The columns are fixed by the first page; a
+    later row's other keys, a row that is not an object, and an alias that no longer fits go to the overflow column
+    (the row's whole `*` part, as sent: `{"d":42}`)."""
 
     def __init__(self, signature: dict[str, Any], *, bare_star: bool, first_page: Sequence[RawRow]) -> None:
         names = list(signature)
@@ -228,28 +244,38 @@ class _StarShape(RowShape):
         self._before, self._after = names[:at], names[at + 1:]
         self._named = frozenset(names) - {_STAR}
         self._alias = _alias_of(first_page, self._named) if bare_star else None
-        kinds: dict[str, list[str]] = {}  # key → the JSON kinds seen on the first page, in order
-        for row in first_page:
-            if row.fields is None:
-                continue
-            members, _ = self._star_part([f for f in row.fields if f.key not in self._named])
-            for member in members:
-                seen = kinds.setdefault(member.key, [])
-                if (kind := json_kind(member.text)) not in seen:
-                    seen.append(kind)
+        kinds = self._first_page_kinds(first_page)
+        if self._alias is not None and not kinds:  # no alias object has a member to show: the alias is the column
+            self._alias = None
+            kinds = self._first_page_kinds(first_page)
         self._keys = list(kinds)
         self._key_set = frozenset(kinds)
         shown = [self._shown_name(key) for key in self._keys]
+        taken = {_escape_surrogates(name) for name in self._named}
         columns = [_signature_column(name, signature[name]) for name in self._before]
         columns += [ColumnMeta(name=name, type_name="|".join(kinds[key]), category=ColumnCategory.MIXED)
-                    for name, key in zip(_unique(shown, set(self._named)), self._keys)]
+                    for name, key in zip(_unique(shown, taken), self._keys)]
         columns += [_signature_column(name, signature[name]) for name in self._after]
         [overflow] = _unique([OVERFLOW_NAME], {column.name for column in columns})
         super().__init__([*columns, ColumnMeta(name=overflow, type_name="object", category=ColumnCategory.MIXED)])
 
+    def _first_page_kinds(self, first_page: Sequence[RawRow]) -> dict[str, list[str]]:
+        """Each key the first page shows in the `*` part, in first-appearance order, with its values' JSON kinds."""
+        kinds: dict[str, list[str]] = {}
+        for row in first_page:
+            if row.fields is None:
+                continue
+            members, _ = self._star_part([field for field in row.fields if field.key not in self._named])
+            for member in members:
+                seen = kinds.setdefault(member.key, [])
+                if (kind := json_kind(member.text)) not in seen:
+                    seen.append(kind)
+        return kinds
+
     def _shown_name(self, key: str) -> str:
         """The column name of an expanded key: `alias.key` when a projected name has it already (D-04-1)."""
-        return f"{self._alias}.{key}" if self._alias is not None and key in self._named else key
+        shown = f"{self._alias}.{key}" if self._alias is not None and key in self._named else key
+        return _escape_surrogates(shown)
 
     def _star_part(self, brought: list[RowField]) -> tuple[list[RowField], list[RowField]]:
         """What `*` brought, as (the members the columns may show, the fields that stay whole): without an alias the
