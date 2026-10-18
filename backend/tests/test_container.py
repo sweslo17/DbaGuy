@@ -1,7 +1,9 @@
+import os
 import threading
 
 import pytest
 
+from dbaguy_backend.adapters.mssql import freetds
 from dbaguy_backend.config import Settings, default_data_dir
 from dbaguy_backend.container import AppContainer, keychain_service
 from dbaguy_backend.domain.settings import SafetySettings
@@ -55,6 +57,19 @@ def test_the_container_opens_the_keychain_service_of_its_data_dir(tmp_path, monk
 def test_building_the_app_creates_no_history_file(container, tmp_path):
     # Building the app, e.g. only to dump its OpenAPI schema, must not create the history database
     assert not (tmp_path / "data" / "history.db").exists()
+
+
+def test_building_the_app_writes_no_freetds_conf(container, tmp_path):  # R-03b-P9
+    assert not (tmp_path / "data" / "freetds").exists()
+
+
+def test_the_app_only_records_where_freetds_conf_goes(tmp_path, monkeypatch):  # R-03b-P9
+    monkeypatch.setenv("FREETDSCONF", "before")
+    monkeypatch.setattr(freetds, "_active", None)
+    monkeypatch.setattr(freetds, "_location", None)
+    AppContainer(Settings(token="t", data_dir=tmp_path / "data", log_to_file=False), secret_store=InMemorySecretStore())
+    assert freetds._location == tmp_path / "data" / "freetds" / "freetds.conf"
+    assert not (tmp_path / "data" / "freetds").exists() and os.environ["FREETDSCONF"] == "before"
 
 
 def test_close_stops_every_service_in_order_even_when_one_fails(container):

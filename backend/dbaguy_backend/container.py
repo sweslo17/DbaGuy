@@ -4,6 +4,7 @@ from pathlib import Path
 
 from loguru import logger
 
+from .adapters.mssql import freetds
 from .adapters.mysql.adapter import MysqlAdapter
 from .adapters.postgres.adapter import PostgresAdapter
 from .adapters.registry import AdapterRegistry
@@ -29,7 +30,11 @@ from .storage.secret_store import APP_KEYCHAIN_SERVICE, DEV_KEYCHAIN_SERVICE, Ke
 _HOUSEKEEPING_INTERVAL_S = 15  # also the resolution of the idle-transaction warning and rollback
 
 
-def default_registry() -> AdapterRegistry:
+def default_registry(freetds_conf: Path | None = None) -> AdapterRegistry:
+    """`freetds_conf` is where SQL Server logins get DbaGuy's freetds.conf. It is only recorded here: the file is
+    written by the first SQL Server connect, so building the app never writes into the data dir (R-03b-P9)."""
+    if freetds_conf is not None:
+        freetds.use(freetds_conf)
     return AdapterRegistry([PostgresAdapter(), MysqlAdapter(), SqliteAdapter()])
 
 
@@ -53,8 +58,8 @@ class AppContainer:
         self, settings: Settings, secret_store: SecretStore | None = None, registry: AdapterRegistry | None = None
     ) -> None:
         self.settings = settings
-        self.registry = registry or default_registry()
         data_dir = settings.data_dir
+        self.registry = registry or default_registry(data_dir / "freetds" / "freetds.conf")
         secrets = secret_store or _keychain_store(data_dir)
         self.profiles = ProfileService(ProfileStore(profiles_file(data_dir)), secrets)
         # `settings` is the process Settings (token, data dir); `app_settings` is the user's preferences.
