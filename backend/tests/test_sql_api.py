@@ -294,3 +294,12 @@ def test_sqlpp_completion_takes_a_context_and_seen_fields_and_keeps_utf16_offset
 def test_sqlpp_completion_bounds_its_inputs(client, extra):
     body = {"dialect": "sqlpp", "text": "SELECT 1", "cursor": 0, **extra}
     assert client.post("/sql/complete", json=body, headers=AUTH).status_code == 422
+
+
+def test_sqlpp_completion_inside_back_ticks_replaces_the_whole_name_in_utf16(client):
+    text = "SELECT '😀', `` FROM ks AS u"  # '😀' is two UTF-16 units
+    cursor = utf16_len("SELECT '😀', `")
+    body = {"dialect": "sqlpp", "text": text, "cursor": cursor}
+    result = client.post("/sql/complete", json=body, headers=AUTH).json()
+    assert [i["label"] for i in result["items"]] == ["u"]  # no keyword inside a name
+    assert (result["start"], result["end"]) == (cursor - 1, cursor + 1)

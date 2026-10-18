@@ -15,6 +15,7 @@ from typing import Any
 
 from loguru import logger
 
+from ...domain.couchbase import DEFAULT
 from ...domain.errors import NotFound
 from ...domain.metadata import NodeKind, ObjectDetail, ObjectNode, PathSegment, make_node
 from ...domain.schema import SchemaSnapshot, SnapshotKeyspace
@@ -24,7 +25,6 @@ from ...sql.dialects import Dialect, force_quote_ident, quote_literal
 # result rows.
 Query = Callable[[str, Mapping[str, str]], list[Any]]
 
-DEFAULT = "_default"
 SYSTEM_SCOPE = "_system"  # never listed by any catalog on 7.6.12 (R-04a-C5): handled for the servers that do list it
 
 _BUCKETS = "SELECT RAW b.name FROM system:buckets AS b ORDER BY b.name"

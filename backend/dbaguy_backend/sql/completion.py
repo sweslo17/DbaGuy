@@ -25,7 +25,7 @@ CompletionKind = Literal[
     "keyword", "schema", "table", "view", "materialized_view", "synonym", "column", "alias", "function", "join",
     "bucket", "scope", "collection", "field",  # Couchbase (sql/sqlpp_completion.py)
 ]
-_Context = Literal["start", "clause", "relations", "columns", "join"]
+ClauseContext = Literal["start", "clause", "relations", "columns", "join"]
 MAX_ITEMS = 300
 _JOIN_BOOST = 3
 SYSTEM_BOOST = -1
@@ -290,7 +290,7 @@ def inside_literal(token: Token | None, offset: int, dialect: Dialect) -> bool:
 # --- context -----------------------------------------------------------------------------------------------------
 
 
-def clause_context(before: list[Token]) -> tuple[_Context, str]:
+def clause_context(before: list[Token]) -> tuple[ClauseContext, str]:
     """Clause the cursor is in, and its keyword, from the last clause keyword at the cursor's parenthesis depth
     (AND/OR/NOT and other words are passed over): "relations", "clause" (a relation was just named), "join" (right
     after ON), "columns" (also inside an unclosed parenthesis) or "start" (no clause yet)."""
@@ -504,20 +504,34 @@ class WordAtCursor:
     statement: list[Token]  # the statement's significant tokens
     before: list[Token]  # those that end before the partial word
     prefix: str
+    end: int  # where the text the items replace ends: the cursor, or the end of a quoted name
+    quoted: bool = False  # the partial word is inside a quoted name (`quoted_names`): the items replace all of it
 
 
-def word_at_cursor(text: str, cursor: int, dialect: Dialect) -> WordAtCursor | None:
-    """None inside a string, a comment or a quoted name, where nothing is suggested."""
+def _inside_quoted_name(token: Token, offset: int) -> bool:
+    """The cursor is after the opening quote of a quoted name and before its closing one (or the name never closes)."""
+    return token.kind == TokenKind.QUOTED and (offset < token.end or not token.terminated)
+
+
+def word_at_cursor(text: str, cursor: int, dialect: Dialect, quoted_names: bool = False) -> WordAtCursor | None:
+    """None inside a string, a comment or a quoted name, where nothing is suggested. With `quoted_names`, a quoted name
+    under the cursor is the partial word instead: what is typed after its opening quote is the prefix, and the items
+    replace the whole name, both quotes included."""
     base, end = statement_bounds(text, cursor, dialect)
     tokens = tokenize(text[base:end], dialect)
     offset = cursor - base
     at = token_before(tokens, offset)
+    statement = significant(tokens)
+    if quoted_names and at is not None and _inside_quoted_name(at, offset):
+        before = [token for token in statement if token.end <= at.start]
+        name_end = at.end if at.terminated else offset
+        return WordAtCursor(base + at.start, at.start, statement, before, text[base + at.start + 1:cursor],
+                            base + name_end, quoted=True)
     if inside_literal(at, offset, dialect):
         return None
     word_start = at.start if at is not None and at.kind == TokenKind.WORD else offset
-    statement = significant(tokens)
     before = [token for token in statement if token.end <= word_start]
-    return WordAtCursor(base + word_start, word_start, statement, before, text[base + word_start:cursor])
+    return WordAtCursor(base + word_start, word_start, statement, before, text[base + word_start:cursor], cursor)
 
 
 def _complete(text: str, cursor: int, dialect: Dialect, index: SnapshotIndex | None) -> CompletionResult:
@@ -525,7 +539,7 @@ def _complete(text: str, cursor: int, dialect: Dialect, index: SnapshotIndex | N
     if word is None:
         return CompletionResult(start=cursor, end=cursor, items=[])
     candidates = _candidates(word.before, word.statement, word.word_start, dialect, index)
-    return CompletionResult(start=word.start, end=cursor, items=filter_candidates(candidates, word.prefix))
+    return CompletionResult(start=word.start, end=word.end, items=filter_candidates(candidates, word.prefix))
 
 
 def describe_at(text: str, cursor: int, dialect: Dialect, index: SnapshotIndex | None) -> DescribeResult | None:

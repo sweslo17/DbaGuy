@@ -260,6 +260,86 @@ def test_a_statement_with_thousands_of_commas_is_read_in_one_pass():
     assert time.perf_counter() - started < 5
 
 
+def test_seen_fields_rank_before_every_keyword_with_or_without_a_prefix():
+    """No sample is the common tab: its seen fields must not sit below AS / ALL / AND / … (or below 56 keywords)."""
+    plain = run("SELECT | FROM orders AS o", seen=["age", "zip"])
+    labels = [i.label for i in plain.items]
+    assert labels[:3] == ["o", "age", "zip"] and {i.kind for i in plain.items[3:]} == {"keyword"}
+    typed = run("SELECT * FROM orders AS o WHERE a|", seen=["age", "zip"])  # AS, ALL, AND, ANY, ASC, ARRAY match too
+    assert (typed.items[0].label, typed.items[0].detail) == ("age", "seen in results")
+    assert typed.items[1].kind == "keyword"
+    sampled = [i.label for i in run("SELECT | FROM users AS u", seen=["late"]).items]
+    assert sampled.index("name") < sampled.index("late") < sampled.index("AS")  # sampled, then seen, then keywords
+
+
+def test_matching_the_parentheses_of_a_pasted_statement_is_one_pass():
+    """`_after_group` walked to each parenthesis's end: 20,000 unclosed `FROM (` took 83 s."""
+    started = time.perf_counter()
+    unclosed = "SELECT * FROM (" * 20000
+    assert run(unclosed + "|").items  # keywords
+    nested = "SELECT * FROM (" * 4000 + "SELECT 1 FROM users AS u" + ") AS s" * 4000 + " WHERE s.|"
+    assert run(nested).items == []
+    assert time.perf_counter() - started < 3
+
+
+def test_a_quoted_name_under_the_cursor_is_a_prefix_and_the_items_replace_all_of_it():
+    sql = "SELECT * FROM `trav`"
+    result = run("SELECT * FROM `trav|`")
+    assert (result.start, result.end) == (sql.index("`"), len(sql))  # both quotes
+    assert items(result)["travel-sample"].apply == "`travel-sample`" and not {i.kind for i in result.items} & {"keyword"}
+    assert [i.label for i in result.items] == ["travel-sample"]
+    middle = run("SELECT * FROM `tra|vel`")  # inside a closed name: the whole name goes
+    assert [i.label for i in middle.items] == ["travel-sample"] and (middle.start, middle.end) == (14, 22)
+
+
+def test_the_auto_closed_back_ticks_are_filled_with_a_name():
+    result = run("SELECT * FROM `|`")
+    assert (result.start, result.end) == (14, 16) and "users" in items(result) and "dbaguy" in items(result)
+    assert all(i.kind != "keyword" for i in result.items) and items(result)["odd-name"].apply == "`odd-name`"
+    assert items(result)["events"].apply is None  # a name that needs no quotes: the label replaces the quotes too
+
+
+def test_an_unclosed_back_tick_takes_the_name_up_to_the_cursor_only():
+    text = "SELECT * FROM `trav FROM x"
+    result = complete_sqlpp(text, 19, INDEX, CTX, FIELDS.get, [])
+    assert [i.label for i in result.items] == ["travel-sample"] and (result.start, result.end) == (14, 19)
+
+
+def test_back_ticked_names_after_a_dot_and_in_columns():
+    assert [i.label for i in run("SELECT * FROM `travel-sample`.inv|").items] == ["inventory"]
+    after = run("SELECT * FROM `travel-sample`.`inv|`")
+    assert [(i.label, i.kind) for i in after.items] == [("inventory", "scope")] and (after.start, after.end) == (30, 35)
+    field = run("SELECT u.`odd k|` FROM users AS u")
+    assert [(i.label, i.apply) for i in field.items] == [("odd key", "`odd key`")] and (field.start, field.end) == (9, 16)
+    columns = run("SELECT `|` FROM users AS u")
+    assert [i.label for i in columns.items][:2] == ["u", "name"] and all(i.kind != "keyword" for i in columns.items)
+    assert run("`|").items == []  # at the start only keywords fit: none of them is a name
+
+
+def test_after_a_closed_back_ticked_name_the_keywords_come_back():
+    labels = [i.label for i in run("SELECT * FROM `travel-sample`|").items]
+    assert "WHERE" in labels and "travel-sample" not in labels
+
+
+def test_an_alias_is_the_innermost_one_that_defines_it():
+    assert items(run("SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders u WHERE u.|)")) == {}  # orders: unsampled
+    assert "name" in items(run("SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE u.|)"))  # the outer one
+    assert "name" in items(run("WITH x AS (SELECT * FROM orders u) SELECT u.| FROM users u"))  # not the CTE's
+    assert "name" in items(run("SELECT COUNT(u.|) FROM users u"))  # a function's parenthesis is no scope of its own
+    assert "name" in items(run("SELECT u.| FROM (SELECT * FROM orders u) AS s, users u"))
+
+
+def test_a_from_that_is_no_keyspace_adds_no_alias_and_no_source():
+    found = items(run("SELECT EXTRACT(year FROM u.d), | FROM users AS u"))
+    assert "d" not in found and "name" in found  # the one keyspace is still users
+    found = items(run("SELECT TRIM(BOTH 'x' FROM u.name) AS t, | FROM users AS u"))
+    assert "name" in found and "u" in found
+    hinted = items(run("SELECT | FROM users AS u USE INDEX (ix USING GSI)"))
+    assert "GSI" not in hinted and "name" in hinted
+    assert "name" in items(run("SELECT * FROM (FROM users AS u SELECT u.|)"))  # a FROM-first subquery names one
+    assert "users" in items(run("SELECT * FROM (FROM orders AS o, |"))
+
+
 def test_the_keyspace_tree_keeps_the_snapshot_order_and_flags_system_scopes():
     keyspaces = [SnapshotKeyspace(bucket=b, scope=s, collection=c, system=s == "_system") for b, s, c in [
         ("b", "s", "x"), ("a", "_system", "q"), ("b", "s", "x"), ("b", "t", "y"), ("b", "s", "z")]]

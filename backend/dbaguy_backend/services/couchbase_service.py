@@ -8,10 +8,9 @@ from loguru import logger
 
 from ..adapters.base import DatabaseConnection
 from ..adapters.couchbase.adapter import CouchbaseConnection
-from ..adapters.couchbase.catalog import DEFAULT
 from ..adapters.couchbase.explain import analyze, analyze_value
 from ..adapters.registry import AdapterRegistry
-from ..domain.couchbase import ContextOption, PlanNode, PlanView
+from ..domain.couchbase import DEFAULT, ContextOption, PlanNode, PlanView
 from ..domain.errors import NotFound, ValidationFailed
 from ..domain.execution import QueryContext
 from ..domain.history import HistoryPage

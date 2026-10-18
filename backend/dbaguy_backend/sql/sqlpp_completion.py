@@ -7,13 +7,17 @@ keyspace exist only when the user sampled it: this module only reads that cache,
 I/O, SQL text is never logged above DEBUG. Offsets are Python code points, as in `complete()`.
 
 A statement is read as a whole, subqueries and CTE bodies included, the way `scope.py` reads it for the other dialects:
-an alias is looked up anywhere in it, and "reads exactly one keyspace" counts every FROM term in it.
+"reads exactly one keyspace" counts every FROM term in it, and an alias is the one the innermost group (parenthesis)
+around the cursor defines, else the first one of that name anywhere.
+
+Inside a back-ticked name (`` `trav| `` or the auto-closed `` `|` ``) the typed text is the prefix and the items replace
+the whole name, quotes included, with the name quoted as `quote_ident` says: only names are offered there.
 """
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
-from ..domain.couchbase import FieldPath, Keyspace
+from ..domain.couchbase import DEFAULT, FieldPath, Keyspace
 from ..domain.execution import QueryContext
 from .completion import (
     SYSTEM_BOOST, Candidate, CompletionKind, CompletionResult, SnapshotIndex, by_length, clause_context,
@@ -27,8 +31,7 @@ from .scope import IDENT, unquote, word
 SQLPP = Dialect.SQLPP
 FieldLookup = Callable[[Keyspace], Sequence[FieldPath] | None]  # a keyspace's sampled field paths; None: not sampled
 
-DEFAULT = "_default"  # the default scope, and the default collection of a bucket
-SEEN_BOOST = -1  # a field seen in results ranks after the sampled ones
+SEEN_BOOST = 0  # a field seen in results follows the sampled ones (the same kind); every keyword comes after both
 _KEYSPACE_KEYWORDS = frozenset({"FROM", "JOIN", "NEST", "UPDATE", "INTO", "USING"})
 _NOT_AN_ALIAS = frozenset(
     """USE ON WHERE JOIN LEFT INNER NEST UNNEST LET LETTING GROUP ORDER LIMIT OFFSET SET UNSET RETURNING VALUES SELECT
@@ -50,6 +53,7 @@ class _Reference:
 
     parts: tuple[str, ...]  # the dotted path as written, unquoted; () for a subquery
     alias: str | None
+    group: int  # offset of the innermost "(" around the reference, -1 at the top level (as `ScopeRelation.group`)
 
     @property
     def name(self) -> str | None:
@@ -63,6 +67,39 @@ class _Reference:
         return ".".join(self.parts) if self.alias is not None else "keyspace"
 
 
+@dataclass(frozen=True, slots=True)
+class _Parens:
+    """Where the parentheses of a token list are open, from one pass: matching them again for each of thousands of
+    parentheses in a pasted statement would be quadratic."""
+
+    group: list[int]  # per token: the offset of the innermost "(" open before it, -1 at the top level
+    after: dict[int, int]  # per "(" (its token index): the index after its ")", the end when it never closes
+    chain: list[int]  # the "(" still open at the end, innermost first, then -1: the groups a cursor there is in
+
+    @classmethod
+    def of(cls, tokens: list[Token]) -> "_Parens":
+        group: list[int] = []
+        after: dict[int, int] = {}
+        open_parens: list[int] = []  # token indexes
+        for i, token in enumerate(tokens):
+            group.append(tokens[open_parens[-1]].start if open_parens else -1)
+            if token.kind == TokenKind.LPAREN:
+                open_parens.append(i)
+            elif token.kind == TokenKind.RPAREN and open_parens:
+                after[open_parens.pop()] = i + 1
+        after.update((i, len(tokens)) for i in open_parens)
+        return cls(group, after, [*(tokens[i].start for i in reversed(open_parens)), -1])
+
+
+@dataclass(slots=True)
+class _Level:
+    """What one bracket depth of a statement has shown so far."""
+
+    clause: str = ""  # its last clause word
+    query: bool = False  # it is a query: it has a SELECT, or opened with FROM (`(FROM a SELECT …)`)
+    first: bool = True  # nothing yet after its opening bracket
+
+
 def _is_bracket(token: Token, brackets: str) -> bool:
     return token.kind in (TokenKind.LPAREN, TokenKind.RPAREN, TokenKind.OTHER) and token.text in brackets
 
@@ -70,34 +107,33 @@ def _is_bracket(token: Token, brackets: str) -> bool:
 def _leads(tokens: list[Token]) -> list[int]:
     """The indexes of the tokens after which a keyspace is named: the keywords, and a comma that separates the terms of
     a FROM list, which is a comma whose nearest clause word at its own bracket depth is FROM (`SELECT a, b` and
-    `USE KEYS ["x", "y"]` are not). One pass: a statement can hold thousands of commas."""
+    `USE KEYS ["x", "y"]` are not). Only the statement itself and its subqueries name keyspaces: the FROM of
+    `EXTRACT(year FROM d)` and the USING of `USE INDEX (ix USING GSI)` do not. One pass: a statement can hold thousands
+    of commas."""
     leads: list[int] = []
-    clause_words = [""]  # one per open bracket: the last clause word at that depth
+    levels = [_Level()]  # the statement's own level first
     for i, token in enumerate(tokens):
+        level = levels[-1]
         if _is_bracket(token, _OPENING):
-            clause_words.append("")
-        elif _is_bracket(token, _CLOSING):
-            if len(clause_words) > 1:
-                clause_words.pop()
-        elif token.kind == TokenKind.COMMA:
-            if clause_words[-1] == "FROM":
+            level.first = False
+            levels.append(_Level())
+            continue
+        if _is_bracket(token, _CLOSING):
+            if len(levels) > 1:
+                levels.pop()
+            continue
+        upper = token.upper if token.kind == TokenKind.WORD else ""
+        if upper == "SELECT" or (upper == "FROM" and level.first):
+            level.query = True
+        if len(levels) == 1 or level.query:
+            if token.kind == TokenKind.COMMA and level.clause == "FROM":
                 leads.append(i)
-        elif token.kind == TokenKind.WORD:
-            if token.upper in _CLAUSE_START:
-                clause_words[-1] = token.upper
-            if token.upper in _KEYSPACE_KEYWORDS and not (token.upper == "UPDATE" and word(tokens, i - 1) == "THEN"):
+            elif upper in _CLAUSE_START:
+                level.clause = upper
+            if upper in _KEYSPACE_KEYWORDS and not (upper == "UPDATE" and word(tokens, i - 1) == "THEN"):
                 leads.append(i)  # MERGE … THEN UPDATE SET names no keyspace
+        level.first = False
     return leads
-
-
-def _after_group(tokens: list[Token], i: int) -> int:
-    """The index after the parenthesis that closes the one at `i`; the end when it is never closed."""
-    depth = 0
-    for j in range(i, len(tokens)):
-        depth += (tokens[j].kind == TokenKind.LPAREN) - (tokens[j].kind == TokenKind.RPAREN)
-        if depth == 0:
-            return j + 1
-    return len(tokens)
 
 
 def _read_alias(tokens: list[Token], i: int) -> str | None:
@@ -109,13 +145,13 @@ def _read_alias(tokens: list[Token], i: int) -> str | None:
     return None
 
 
-def _read_reference(tokens: list[Token], i: int) -> _Reference | None:
+def _read_reference(tokens: list[Token], i: int, group: int, parens: _Parens) -> _Reference | None:
     """The reference that starts at `i`; None when there is none (a path still being typed, `FROM a.`, is none)."""
     if i >= len(tokens):
         return None
     if tokens[i].kind == TokenKind.LPAREN:  # a subquery names nothing but its alias
-        alias = _read_alias(tokens, _after_group(tokens, i))
-        return _Reference((), alias) if alias is not None else None
+        alias = _read_alias(tokens, parens.after[i])
+        return _Reference((), alias, group) if alias is not None else None
     if tokens[i].kind not in IDENT or word(tokens, i) in _NOT_AN_ALIAS:
         return None
     parts = [unquote(tokens[i])]
@@ -125,13 +161,25 @@ def _read_reference(tokens: list[Token], i: int) -> _Reference | None:
         i += 2
     if i < len(tokens) and tokens[i].kind == TokenKind.DOT:
         return None
-    return _Reference(tuple(parts), _read_alias(tokens, i))
+    return _Reference(tuple(parts), _read_alias(tokens, i), group)
 
 
 def _references(tokens: list[Token]) -> list[_Reference]:
     """Every keyspace reference of the statement, in the order written."""
-    found = (_read_reference(tokens, i + 1) for i in _leads(tokens))
+    parens = _Parens.of(tokens)
+    found = (_read_reference(tokens, i + 1, parens.group[i], parens) for i in _leads(tokens))
     return [reference for reference in found if reference is not None]
+
+
+def _alias_at(name: str, references: list[_Reference], before: list[Token]) -> _Reference | None:
+    """What `name` stands for at the end of `before`: the reference of that name in the innermost group around it that
+    has one (an inner `FROM orders u` hides an outer `FROM users u`), else the first of that name anywhere."""
+    named = [reference for reference in references if reference.name == name]
+    for group in _Parens.of(before).chain:
+        for reference in named:
+            if reference.group == group:
+                return reference
+    return named[0] if named else None
 
 
 def _keyspace_of(reference: _Reference | None, context: QueryContext | None) -> Keyspace | None:
@@ -240,9 +288,10 @@ class _Known:
     seen_fields: Sequence[str]
 
 
-def _qualified_fields(parts: list[str], statement: list[Token], known: _Known) -> list[Candidate]:
+def _qualified_fields(parts: list[str], before: list[Token], statement: list[Token],
+                      known: _Known) -> list[Candidate]:
     """`a.` / `a.b.`: the sampled fields below `b` of the keyspace `a` stands for."""
-    reference = next((r for r in _references(statement) if r.name == parts[0]), None)
+    reference = _alias_at(parts[0], _references(statement), before)
     return _field_candidates(_keyspace_of(reference, known.context), known.fields, parts[1:])
 
 
@@ -265,7 +314,7 @@ def _candidates(before: list[Token], statement: list[Token], known: _Known) -> I
     if lead and _leads(lead)[-1:] == [len(lead) - 1]:
         return _keyspace_candidates(parts, known.tree, known.context)
     if parts:
-        return _qualified_fields(parts, statement, known)
+        return _qualified_fields(parts, before, statement, known)
     if before and before[-1].kind == TokenKind.DOT:
         return []  # `a.items[0].`: only a path of plain keys goes on
     context, _ = clause_context(before)
@@ -288,8 +337,10 @@ def complete_sqlpp(text: str, cursor: int, index: SnapshotIndex | None, context:
 
 
 def _complete(text: str, cursor: int, known: _Known) -> CompletionResult:
-    typed = word_at_cursor(text, cursor, SQLPP)
+    typed = word_at_cursor(text, cursor, SQLPP, quoted_names=True)
     if typed is None:
         return CompletionResult(start=cursor, end=cursor, items=[])
     candidates = _candidates(typed.before, typed.statement, known)
-    return CompletionResult(start=typed.start, end=cursor, items=filter_candidates(candidates, typed.prefix))
+    if typed.quoted:  # a back-ticked word is a name, never a keyword
+        candidates = (candidate for candidate in candidates if candidate.kind != "keyword")
+    return CompletionResult(start=typed.start, end=typed.end, items=filter_candidates(candidates, typed.prefix))

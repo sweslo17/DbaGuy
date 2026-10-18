@@ -7,6 +7,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+DEFAULT = "_default"  # the name of a bucket's default scope, and of its default collection
+
 PlanBadge = Literal["primary_scan", "sequential_scan", "intersect_scan", "not_covered", "slowest"]
 
 
