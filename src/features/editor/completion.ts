@@ -47,6 +47,7 @@ const TYPES: Record<CompletionItem["kind"], string> = {
   table: "class",
   view: "class",
   materialized_view: "class",
+  synonym: "class",
   column: "property",
   function: "function",
   schema: "namespace",

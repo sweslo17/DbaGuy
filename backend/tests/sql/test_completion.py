@@ -10,11 +10,13 @@ from dbaguy_backend.domain.schema import (
 )
 from dbaguy_backend.sql import completion
 from dbaguy_backend.sql.completion import (
-    CompletionResult, DescribeResult, SnapshotIndex, _complete, _describe, complete, describe_at,
+    CLAUSE_KEYWORDS, CompletionResult, DescribeResult, SnapshotIndex, _complete, _describe, complete, describe_at,
 )
 from dbaguy_backend.sql.dialects import Dialect
+from dbaguy_backend.sql.lexer import INSIGNIFICANT, tokenize
+from dbaguy_backend.sql.scope import scope_at, unquote
 
-PG, LITE = Dialect.POSTGRES, Dialect.SQLITE
+PG, LITE, MY, TS = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL
 
 
 def table(name, columns, pk=None, fks=None, kind="table"):
@@ -224,11 +226,12 @@ def test_a_bug_degrades_to_no_items_and_is_logged_without_sql(index, monkeypatch
 _FUZZ_PIECES = [
     "SELECT", "FROM", "JOIN", "ON", "WITH", "RECURSIVE", "AS", "NOT", "MATERIALIZED", "DISTINCT", "UPDATE", "FOR",
     "INTO", "TABLE", "ONLY", "WHERE", "AND", "users", "orders", "sales", "u", "x", "id", ".", ",", "(", ")", "*", "=",
-    "'", '"', "[", "`", "--", "/*", "*/", ";", " ", "\n", "$$", "$1", "1.",
+    "'", '"', "[", "`", "--", "/*", "*/", ";", " ", "\n", "$$", "$1", "1.", "#", "@x", "/*!", "\\'", "DELIMITER",
+    "GO", "N'", "#t", "]]", "@@x",
 ]
 
 
-@pytest.mark.parametrize("dialect", [PG, LITE])
+@pytest.mark.parametrize("dialect", list(Dialect))
 def test_unguarded_cores_survive_random_token_soup(index, dialect):
     rng = random.Random(20261016)
     for _ in range(300):
@@ -280,3 +283,110 @@ def test_describe_on_a_cte_name_is_none(index):
     sql = "WITH users AS (SELECT 1 AS a) SELECT * FROM users"
     assert describe_at(sql, sql.rindex("users") + 1, PG, index) is None  # the CTE shadows the table
     assert describe_at(sql, sql.index("users") + 1, PG, index) is None  # its definition
+
+
+def test_mysql_completion_quotes_with_backticks_and_knows_its_keywords():
+    snapshot = SchemaSnapshot(
+        database=None, default_schema="dbaguy", search_path=["dbaguy"], built_at=datetime.now(UTC),
+        schemas=[SnapshotSchema(name="dbaguy", relations=[table("Order Items", [("select", "varchar(50)"), ("id", "int")])])],
+    )
+    index = SnapshotIndex(snapshot, MY)
+    item = next(i for i in complete("SELECT * FROM Ord", 17, MY, index).items if i.label == "Order Items")
+    assert item.apply == "`Order Items`"
+    text = "SELECT `Order Items`. FROM `Order Items`"
+    items = complete(text, text.index(". ") + 1, MY, index).items
+    assert [i.label for i in items] == ["select", "id"] and items[0].apply == "`select`"
+    assert "SHOW" in [i.label for i in complete("SHO", 3, MY, None).items]
+    assert "ON DUPLICATE KEY UPDATE" in CLAUSE_KEYWORDS[MY] and "RETURNING" not in CLAUSE_KEYWORDS[MY]
+    assert complete("SELECT 1 # fro", 14, MY, index).items == []  # inside a # comment
+    assert complete("SELECT /*! fro", 14, MY, index).items == []  # inside an executable comment
+
+
+def test_mysql_index_hints_are_not_aliases():
+    sql = "SELECT * FROM orders USE INDEX (ix) WHERE "
+    [ref] = scope_at([t for t in tokenize(sql, MY) if t.kind not in INSIGNIFICANT], len(sql)).relations
+    assert (ref.name, ref.alias) == ("orders", None)
+
+
+def test_mysql_comments_silence_completion_only_while_the_cursor_is_in_them():
+    assert complete("SELECT /*! fro */ 1", 14, MY, None).items == []  # inside a terminated executable comment
+    assert complete("SELECT 1 /*+ x */ FRO", 21, MY, None).items[0].label == "FROM"  # after a hint
+    text = "SELECT 1 # note\nSEL"
+    assert complete(text, len(text), MY, None).items[0].label == "SELECT"  # the # comment ended at the newline
+
+
+def test_full_join_is_not_offered_where_the_dialect_has_none():
+    assert "FULL JOIN" not in CLAUSE_KEYWORDS[MY]
+    assert "FULL JOIN" in CLAUSE_KEYWORDS[PG] and "FULL JOIN" in CLAUSE_KEYWORDS[LITE]
+
+
+def _scope_relations(sql):
+    significant = [t for t in tokenize(sql, MY) if t.kind not in INSIGNIFICANT]
+    return [(r.name, r.alias) for r in scope_at(significant, len(sql)).relations]
+
+
+def test_mysql_straight_join_introduces_a_relation():
+    assert _scope_relations("SELECT * FROM a STRAIGHT_JOIN b x WHERE ") == [("a", None), ("b", "x")]
+    assert _scope_relations("SELECT * FROM a USE INDEX (i) STRAIGHT_JOIN b WHERE ") == [("a", None), ("b", None)]
+
+
+def test_mysql_straight_join_as_a_select_modifier_is_not_a_join():
+    assert _scope_relations("SELECT STRAIGHT_JOIN x.id FROM t x WHERE ") == [("t", "x")]
+    assert _scope_relations("SELECT DISTINCT HIGH_PRIORITY STRAIGHT_JOIN id FROM t WHERE ") == [("t", None)]
+
+
+def test_mysql_completion_after_straight_join():
+    snapshot = SchemaSnapshot(
+        database=None, default_schema="dbaguy", search_path=["dbaguy"], built_at=datetime.now(UTC),
+        schemas=[SnapshotSchema(name="dbaguy", relations=[
+            table("orders", [("id", "int")]), table("users", [("id", "int")]),
+        ])],
+    )
+    my_index = SnapshotIndex(snapshot, MY)
+    after_join = "WITH cte AS (SELECT 1 AS k) SELECT * FROM orders STRAIGHT_JOIN "
+    assert {"users", "cte"} <= {i.label for i in complete(after_join, len(after_join), MY, my_index).items}
+    after_modifier = "SELECT STRAIGHT_JOIN "
+    items = complete(after_modifier, len(after_modifier), MY, my_index).items
+    assert "users" not in [i.label for i in items]  # a select-list position, not a relation position
+
+
+def test_tsql_completion_quotes_with_brackets_and_knows_its_keywords():
+    snapshot = SchemaSnapshot(
+        database="dbaguy", default_schema="dbo", search_path=["dbo"], built_at=datetime.now(UTC),
+        schemas=[SnapshotSchema(name="dbo", relations=[table("Order Items", [("select", "nvarchar(50)"), ("a]b", "int")])])],
+    )
+    index = SnapshotIndex(snapshot, TS)
+    item = next(i for i in complete("SELECT * FROM Ord", 17, TS, index).items if i.label == "Order Items")
+    assert item.apply == "[Order Items]"
+    text = "SELECT [Order Items]. FROM [Order Items]"
+    items = complete(text, text.index(". ") + 1, TS, index).items
+    assert [(i.label, i.apply) for i in items] == [("select", "[select]"), ("a]b", "[a]]b]")]
+    assert {"TOP", "OUTPUT", "CROSS APPLY", "OUTER APPLY", "FETCH NEXT"} <= set(CLAUSE_KEYWORDS[TS])
+    assert "LIMIT" not in CLAUSE_KEYWORDS[TS] and "RETURNING" not in CLAUSE_KEYWORDS[TS]
+    assert "EXEC" in [i.label for i in complete("EXE", 3, TS, None).items]
+    assert complete("SELECT N'fro", 12, TS, index).items == []  # inside an N'' string
+
+
+def test_tsql_completion_reads_the_batch_under_the_cursor():
+    snapshot = SchemaSnapshot(
+        database="dbaguy", default_schema="dbo", search_path=["dbo"], built_at=datetime.now(UTC),
+        schemas=[SnapshotSchema(name="dbo", relations=[table("a", [("x", "int")]), table("b", [("y", "int")])])],
+    )
+    text = "SELECT * FROM a\nGO\nSELECT  FROM b"
+    labels = [i.label for i in complete(text, text.rindex("SELECT ") + 7, TS, SnapshotIndex(snapshot, TS)).items]
+    assert "y" in labels and "x" not in labels  # the first batch is not in scope
+
+
+@pytest.mark.parametrize("sql", [
+    "DELETE FROM orders OUTPUT deleted.id WHERE ",
+    "SELECT * FROM orders OPTION (RECOMPILE) ",
+])
+def test_tsql_output_and_option_are_not_aliases(sql):
+    [ref] = scope_at([t for t in tokenize(sql, TS) if t.kind not in INSIGNIFICANT], len(sql)).relations
+    assert (ref.name, ref.alias) == ("orders", None)
+
+
+@pytest.mark.parametrize("dialect", [TS, LITE])  # Ruling 4: ]] is one ] in every dialect with brackets
+def test_unquote_undoubles_a_closing_bracket(dialect):
+    [token] = tokenize("[a]]b]", dialect)
+    assert unquote(token) == "a]b"

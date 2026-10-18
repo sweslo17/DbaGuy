@@ -18,7 +18,12 @@ function FlaggedItem({ item }: { item: FlaggedStatement }) {
   return (
     <li className="rounded-md border border-border bg-panel px-2.5 py-2">
       <div className="mb-1.5 flex flex-wrap items-center gap-1.5 text-[11px]">
-        <span className="text-muted">Statement {item.index + 1}</span>
+        <span className="text-muted">Statement {item.statement.position + 1}</span>
+        {item.statement.repeat > 1 && (
+          <span className="rounded bg-border px-1.5 py-px text-muted">
+            runs {item.statement.repeat.toLocaleString("en-US")} times (GO {item.statement.repeat})
+          </span>
+        )}
         {blocked && <span className="rounded bg-danger/15 px-1.5 py-px text-danger">{BLOCKED_TEXT}</span>}
         {item.decision.reasons
           .filter((reason) => !(blocked && reason === "read_only")) // the chip before says it

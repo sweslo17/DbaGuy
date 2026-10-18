@@ -5,11 +5,12 @@ import time
 import pytest
 from loguru import logger
 
+from dbaguy_backend.adapters.base import AdapterCapabilities
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager, write_askpass_script
 from dbaguy_backend.domain.errors import ConnectionFailed
-from dbaguy_backend.domain.profiles import ProfileUpsertRequest
+from dbaguy_backend.domain.profiles import Engine, ProfileUpsertRequest
 from dbaguy_backend.services.connection_service import ConnectionService
 from dbaguy_backend.services.metadata_service import MetadataService
 from dbaguy_backend.services.profile_service import ProfileService
@@ -148,6 +149,43 @@ def test_a_remembered_failure_does_not_pile_up_tracebacks(env, monkeypatch):
             depth, tb = depth + 1, tb.tb_next
         depths.append(depth)
     assert depths[1:] == [depths[1]] * 4  # raising the stored exception again must not extend its traceback
+
+
+def count_builds(cache, monkeypatch, database_seen_by_the_connection=lambda database: database):
+    real = cache._metadata.with_connection
+    builds: list[str | None] = []
+
+    def counted(profile_id, database, fn):
+        builds.append(database)
+        return real(profile_id, database_seen_by_the_connection(database), fn)
+
+    monkeypatch.setattr(cache._metadata, "with_connection", counted)
+    return builds
+
+
+def test_a_named_database_shares_the_snapshot_without_per_database_connections(env, monkeypatch):  # M1
+    # MySQL and SQLite: one connection sees every database, so a request naming one (a MySQL tab reopened from the
+    # history) must not build a second snapshot of the same server.
+    cache, pid, _, _ = env
+    builds = count_builds(cache, monkeypatch)
+    first = cache.get(pid)
+    assert cache.get(pid, "analytics") is first and cache.peek(pid, "other") is first
+    assert cache.index(pid, "analytics") is cache.index(pid)
+    assert [h.name for h in cache.search(pid, "orders", database="analytics")] == ["orders"]
+    assert builds == [None]
+    cache.invalidate(pid, "analytics")
+    assert cache.peek(pid) is None
+
+
+def test_engines_with_a_connection_per_database_keep_a_snapshot_per_database(env, monkeypatch):
+    cache, pid, _, _ = env
+    adapter = cache._registry.get(Engine.SQLITE)  # stands in for PostgreSQL here
+    monkeypatch.setattr(adapter, "capabilities", AdapterCapabilities(per_database_connection=True))
+    builds = count_builds(cache, monkeypatch, database_seen_by_the_connection=lambda database: None)
+    assert cache.get(pid, "a") is not cache.get(pid, "b")
+    assert builds == ["a", "b"]
+    cache.invalidate(pid, "a")
+    assert cache.peek(pid, "a") is None and cache.peek(pid, "b") is not None
 
 
 def test_concurrent_gets_share_one_build(env, monkeypatch):

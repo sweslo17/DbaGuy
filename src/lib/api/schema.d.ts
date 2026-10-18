@@ -479,6 +479,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sql/value-condition": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Value Condition For Filter */
+        post: operations["value_condition_for_filter_sql_value_condition_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -655,7 +672,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "keyword" | "schema" | "table" | "view" | "materialized_view" | "column" | "alias" | "function" | "join";
+            kind: "keyword" | "schema" | "table" | "view" | "materialized_view" | "synonym" | "column" | "alias" | "function" | "join";
             /** Detail */
             detail?: string | null;
             /** Apply */
@@ -751,7 +768,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "table" | "view" | "materialized_view";
+            kind: "table" | "view" | "materialized_view" | "synonym";
             /** Columns */
             columns: components["schemas"]["DescribeColumn"][];
         };
@@ -760,7 +777,7 @@ export interface components {
          * @description The SQL dialect of an engine: how its statements are split, classified, completed and quoted.
          * @enum {string}
          */
-        Dialect: "postgres" | "sqlite";
+        Dialect: "postgres" | "sqlite" | "mysql" | "tsql";
         /** DiscardCommand */
         DiscardCommand: {
             /**
@@ -813,6 +830,12 @@ export interface components {
             /** Url Schemes */
             url_schemes: string[];
             dialect: components["schemas"]["Dialect"];
+            /** Per Database Connection */
+            per_database_connection: boolean;
+            /** Cancel Aborts Transaction */
+            cancel_aborts_transaction: boolean;
+            /** Server Read Only */
+            server_read_only: boolean;
         };
         /** ErrorEvent */
         ErrorEvent: {
@@ -1154,7 +1177,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "table" | "view" | "materialized_view";
+            kind: "table" | "view" | "materialized_view" | "synonym";
             /** Path */
             path: components["schemas"]["PathSegment"][];
         };
@@ -1722,6 +1745,8 @@ export interface components {
             end: number;
             /** Terminator End */
             terminator_end: number;
+            /** Repeat */
+            repeat: number;
         };
         /** TextSelection */
         TextSelection: {
@@ -1742,6 +1767,20 @@ export interface components {
             input?: unknown;
             /** Context */
             ctx?: Record<string, never>;
+        };
+        /** ValueConditionRequest */
+        ValueConditionRequest: {
+            dialect: components["schemas"]["Dialect"];
+            /** Column */
+            column: string;
+            /** Value */
+            value: unknown;
+            category: components["schemas"]["ColumnCategory"];
+        };
+        /** ValueConditionResponse */
+        ValueConditionResponse: {
+            /** Condition */
+            condition: string | null;
         };
         /**
          * WorkspaceState
@@ -2927,6 +2966,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["BrowseSelectResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    value_condition_for_filter_sql_value_condition_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ValueConditionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ValueConditionResponse"];
                 };
             };
             /** @description Validation Error */

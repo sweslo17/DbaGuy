@@ -21,7 +21,7 @@ from .scope import (
 from .splitter import split
 
 CompletionKind = Literal[
-    "keyword", "schema", "table", "view", "materialized_view", "column", "alias", "function", "join"
+    "keyword", "schema", "table", "view", "materialized_view", "synonym", "column", "alias", "function", "join"
 ]
 _Context = Literal["start", "clause", "relations", "columns", "join"]
 MAX_ITEMS = 300
@@ -30,8 +30,8 @@ _SYSTEM_BOOST = -1
 _PREFIX_BOOST, _SUBSTRING_BOOST = 2, 1
 # Tie-break after the boost. Relation kinds share a rank so a short view is not buried under every table.
 _KIND_ORDER: dict[str, int] = {
-    "join": 0, "alias": 1, "column": 2, "table": 3, "view": 3, "materialized_view": 3, "schema": 4, "function": 5,
-    "keyword": 6,
+    "join": 0, "alias": 1, "column": 2, "table": 3, "view": 3, "materialized_view": 3, "synonym": 3, "schema": 4,
+    "function": 5, "keyword": 6,
 }
 
 
@@ -76,16 +76,26 @@ _CLAUSES = (
 STATEMENT_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.POSTGRES: _STARTERS,
     Dialect.SQLITE: (*_STARTERS, "PRAGMA"),
+    Dialect.MYSQL: (*_STARTERS, "SHOW", "USE", "REPLACE", "CALL"),
+    Dialect.TSQL: (*(word for word in _STARTERS if word != "EXPLAIN"), "EXEC", "DECLARE", "PRINT", "USE", "MERGE", "SET"),
 }
 CLAUSE_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.POSTGRES: (*_CLAUSES, "ILIKE"),
     Dialect.SQLITE: (*_CLAUSES, "GLOB"),
+    Dialect.MYSQL: (  # no RETURNING and no FULL JOIN
+        *(word for word in _CLAUSES if word not in ("RETURNING", "FULL JOIN")), "ON DUPLICATE KEY UPDATE",
+    ),
+    Dialect.TSQL: (  # no LIMIT and no RETURNING: TOP, OFFSET … FETCH and OUTPUT instead
+        *(word for word in _CLAUSES if word not in ("LIMIT", "RETURNING")), "TOP", "OUTPUT", "CROSS APPLY",
+        "OUTER APPLY", "FETCH NEXT", "ROWS ONLY", "WITH (NOLOCK)",
+    ),
 }
 
 _COLUMN_CLAUSES = frozenset(
     "SELECT WHERE HAVING SET BY RETURNING WHEN THEN ELSE CASE DISTINCT USING ON".split()
 )
-_NO_ITEMS_INSIDE = (TokenKind.STRING, TokenKind.COMMENT, TokenKind.QUOTED)
+_CTE_KEYWORDS = ("FROM", "JOIN", "STRAIGHT_JOIN")  # after these a CTE name can be a relation
+_NO_ITEMS_INSIDE = (TokenKind.STRING, TokenKind.COMMENT, TokenKind.QUOTED, TokenKind.EXEC_COMMENT)
 
 
 # --- candidates --------------------------------------------------------------------------------------------------
@@ -258,7 +268,7 @@ def _is_closed(token: Token, dialect: Dialect) -> bool:
 def _inside_literal(token: Token | None, offset: int, dialect: Dialect) -> bool:
     if token is None or token.kind not in _NO_ITEMS_INSIDE:
         return False
-    if offset < token.end or token.text.startswith("--"):  # a line comment runs up to (not over) the newline
+    if offset < token.end or token.text.startswith(("--", "#")):  # a line comment runs up to (not over) the newline
         return True
     return not _is_closed(token, dialect)
 
@@ -428,7 +438,7 @@ def _candidates(before: list[Token], statement: list[Token], offset: int, dialec
     if index is None:
         return _keywords(dialect, "clause") if context != "relations" else []
     if context == "relations":  # CTEs first: they win ties against schema relations
-        ctes = _cte_candidates(dialect, statement) if keyword in ("FROM", "JOIN") else []
+        ctes = _cte_candidates(dialect, statement) if keyword in _CTE_KEYWORDS else []
         return chain(ctes, index.relation_candidates, index.schema_candidates)
     scope = scope_at(statement, offset)
     joins = _join_candidates(scope, before, index) if context == "join" else []

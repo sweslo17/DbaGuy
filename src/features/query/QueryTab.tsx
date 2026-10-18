@@ -282,7 +282,6 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
         connection={{
           profileId: tab.profileId,
           database: tab.database,
-          dialect,
           phase,
           session: snapshot?.info ?? null,
           sessionFailed: !!snapshot?.error,

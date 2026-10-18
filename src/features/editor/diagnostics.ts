@@ -76,12 +76,17 @@ export function trackedSpan(state: EditorState, index: number): Span | null {
   return state.field(trackedField, false)?.[index] ?? null;
 }
 
-/** Marks [from, to) as an error with `message` (shown on hover), next to the marks already there. */
+/**
+ * Marks [from, to) as an error with `message` (shown on hover), next to the marks already there. The same mark twice
+ * (each run of a failing `GO n` batch) is kept once.
+ */
 export function addErrorMark(view: EditorView, from: number, to: number, message: string): void {
   const length = view.state.doc.length;
   const start = Math.min(from, length);
   const mark: Diagnostic = { from: start, to: Math.min(Math.max(to, start), length), severity: "error", message };
-  view.dispatch(setDiagnostics(view.state, [...currentMarks(view.state), mark]));
+  const marks = currentMarks(view.state);
+  if (marks.some((m) => m.from === mark.from && m.to === mark.to && m.message === mark.message)) return;
+  view.dispatch(setDiagnostics(view.state, [...marks, mark]));
 }
 
 const WORD = /[\p{L}\p{N}_$]/u;

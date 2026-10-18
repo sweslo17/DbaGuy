@@ -8,6 +8,7 @@ from ..domain.errors import ValidationFailed
 from ..domain.metadata import NodeKind, PathSegment
 from .dialects import Dialect, qualified, quote_ident
 from .lexer import INSIGNIFICANT, TokenKind, tokenize
+from .tsql import statements
 
 _RELATION_KINDS = frozenset({NodeKind.TABLE, NodeKind.VIEW, NodeKind.MATERIALIZED_VIEW, NodeKind.PARTITION})
 _TRAILING = INSIGNIFICANT | {TokenKind.SEMI}
@@ -34,14 +35,23 @@ def _single_expression(where: str | None, dialect: Dialect) -> str | None:
     - Every comment becomes one space, so what we send never depends on where the database ends a comment
       (PostgreSQL ends `--` at CR as well as LF).
     - An unterminated string, quoted identifier or block comment would swallow the ORDER BY appended after it: rejected.
+    - MySQL executable comments (`/*! … */`, `/*+ … */`) are code to the server, not comments: turning one into
+      a space would silently change the filter, and passing it through would run code (a `;` included) that looks
+      like a comment: rejected.
+    - T-SQL needs no `;` between statements: a filter the T-SQL statement cutter splits in two is rejected.
     """
     tokens = tokenize(where or "", dialect)
     if not all(token.terminated for token in tokens):
         raise ValidationFailed("The filter has an unterminated string, quoted name or comment")
+    if any(token.kind == TokenKind.EXEC_COMMENT for token in tokens):
+        raise ValidationFailed("Executable comments (/*! … */, /*+ … */) are not allowed in a filter")
     while tokens and tokens[-1].kind in _TRAILING:
         tokens.pop()
     if any(token.kind == TokenKind.SEMI for token in tokens):
         raise ValidationFailed("A filter must be a single expression")
+    # T-SQL needs no `;` before a second statement: `id = 1 DELETE FROM t` would run the DELETE.
+    if dialect is Dialect.TSQL and len(statements([t for t in tokens if t.kind not in INSIGNIFICANT])) > 1:
+        raise ValidationFailed("A filter must be a single expression: this one holds another T-SQL statement")
     return "".join(" " if token.kind == TokenKind.COMMENT else token.text for token in tokens).strip() or None
 
 

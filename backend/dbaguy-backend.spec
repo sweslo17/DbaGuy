@@ -2,6 +2,16 @@
 # Build with: .venv/bin/pyinstaller --noconfirm --clean dbaguy-backend.spec
 from PyInstaller.utils.hooks import collect_submodules
 
+# mysql-connector runs pure Python in DbaGuy (use_pure=True): leave its C extension and the parts that need other
+# packages (Django, asyncio API, OpenTelemetry, Kerberos/LDAP/OCI/OpenID/WebAuthn plugins) out of the bundle.
+_MYSQL_LEFT_OUT = (
+    "mysql.connector.connection_cext", "mysql.connector.cursor_cext", "mysql.connector.aio", "mysql.connector.django",
+    "mysql.connector.opentelemetry.instrumentation", "mysql.connector.plugins.authentication_kerberos_client",
+    "mysql.connector.plugins.authentication_ldap_sasl_client", "mysql.connector.plugins.authentication_oci_client",
+    "mysql.connector.plugins.authentication_openid_connect_client",
+    "mysql.connector.plugins.authentication_webauthn_client",
+)
+
 hiddenimports = [
     *collect_submodules("uvicorn"),
     *collect_submodules("dbaguy_backend"),
@@ -17,13 +27,28 @@ hiddenimports = [
     "sqlglot.generators.postgres",
     "sqlglot.generators.sqlite",
     "sqlglot.typing.postgres",
+    "sqlglot.dialects.mysql",
+    "sqlglot.parsers.mysql",
+    "sqlglot.generators.mysql",
+    "sqlglot.typing.mysql",
+    "sqlglot.dialects.tsql",
+    "sqlglot.parsers.tsql",
+    "sqlglot.generators.tsql",
+    "sqlglot.typing.tsql",
+    # pymssql has FreeTDS linked into _mssql*.so; the OpenSSL it loads comes from pymssql/.dylibs (@loader_path) and is
+    # collected as a binary dependency. pyinstaller-hooks-contrib's hook only names _mssql: naming both extensions keeps
+    # a hook change from dropping one.
+    "pymssql._mssql",
+    "pymssql._pymssql",
+    # Keeps the locales (loaded with importlib) and the native/caching_sha2/sha256/clear-password auth plugins.
+    *collect_submodules("mysql.connector", filter=lambda name: not name.startswith(_MYSQL_LEFT_OUT)),
 ]
 
 a = Analysis(
     ["entry.py"],
     pathex=["."],
     hiddenimports=hiddenimports,
-    excludes=["tkinter", "pytest", "PyInstaller"],
+    excludes=["tkinter", "pytest", "PyInstaller", "_mysql_connector", *_MYSQL_LEFT_OUT],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

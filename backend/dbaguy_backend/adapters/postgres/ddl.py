@@ -2,7 +2,7 @@ import psycopg
 
 from ...domain.errors import NotFound, ValidationFailed
 from ...domain.metadata import NodeKind, ObjectDetail, PathSegment
-from ..sql_text import qualified_pg, quote_ident_pg, quote_literal
+from ..sql_text import qualified_pg, quote_ident_pg, quote_literal_pg
 from .introspection import PgColumn, relation_oid, table_columns
 
 _CONSTRAINTS_SQL = """
@@ -67,9 +67,10 @@ def table_ddl(conn: psycopg.Connection, schema: str, name: str) -> tuple[str, li
         blocks.append("\n".join(indexes))
     comments = []
     if comment:
-        comments.append(f"COMMENT ON TABLE {qname} IS {quote_literal(comment)};")
+        comments.append(f"COMMENT ON TABLE {qname} IS {quote_literal_pg(comment)};")
     comments += [
-        f"COMMENT ON COLUMN {qname}.{quote_ident_pg(c.name)} IS {quote_literal(c.comment)};" for c in columns if c.comment
+        f"COMMENT ON COLUMN {qname}.{quote_ident_pg(c.name)} IS {quote_literal_pg(c.comment)};"
+        for c in columns if c.comment
     ]
     if comments:
         blocks.append("\n".join(comments))
@@ -114,7 +115,7 @@ def _type_ddl(conn: psycopg.Connection, qname: str) -> str:
         qname,
     )
     if typtype == "e":
-        labels = [quote_literal(label) for (label,) in conn.execute(
+        labels = [quote_literal_pg(label) for (label,) in conn.execute(
             "SELECT enumlabel FROM pg_enum WHERE enumtypid = %(oid)s ORDER BY enumsortorder", {"oid": oid})]
         return f"CREATE TYPE {qname} AS ENUM ({', '.join(labels)});"
     if typtype == "d":

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, unwrap } from "@/lib/api/client";
-import type { Dialect, ProfileDraft, ProfileSecretsInput } from "@/lib/api/types";
+import type { Dialect, EngineInfo, ProfileDraft, ProfileSecretsInput } from "@/lib/api/types";
 import { invalidateExplorer } from "../explorer/explorerCache";
 
 export const profilesKey = ["profiles"] as const;
@@ -21,12 +21,20 @@ export function useEngines() {
   });
 }
 
-/** SQL dialect of a profile's engine; null without a profile and until profiles and engines are loaded. */
-export function useDialect(profileId: string | null): Dialect | null {
+/**
+ * What a profile's engine is and can do (dialect, capabilities); null without a profile and until profiles and engines
+ * are loaded. It wraps queries, so call it unconditionally at the top of a component and derive booleans afterwards.
+ */
+export function useEngineInfo(profileId: string | null): EngineInfo | null {
   const profiles = useProfiles();
   const engines = useEngines();
   const engine = profiles.data?.find((entry) => entry.profile.id === profileId)?.profile.engine;
-  return engines.data?.find((info) => info.engine === engine)?.dialect ?? null;
+  return engines.data?.find((info) => info.engine === engine) ?? null;
+}
+
+/** SQL dialect of a profile's engine; null without a profile and until profiles and engines are loaded. */
+export function useDialect(profileId: string | null): Dialect | null {
+  return useEngineInfo(profileId)?.dialect ?? null;
 }
 
 export function useSaveProfile() {

@@ -22,22 +22,25 @@ from ..adapters.values import encode_value
 from ..domain.column_category import ColumnCategory
 from ..domain.errors import ValidationFailed
 from ..domain.formats import FormatColumn, FormatKind, RowFormatOptions
-from .dialects import Dialect, qualified, quote_ident, quote_literal
+from .dialects import (
+    NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, datetime_literal, json_literal, qualified, quote_ident,
+    quote_literal, zero_date_as_text,
+)
 
-__all__ = ["FormatColumn", "FormatKind", "FormatResult", "RowFormatOptions", "RowWriter", "format_rows", "open_writer"]
+__all__ = [
+    "FormatColumn", "FormatKind", "FormatResult", "RowFormatOptions", "RowWriter", "format_rows", "open_writer",
+    "value_condition",
+]
 
 Source = Literal["encoded", "raw"]
 
 _ELLIPSIS = "…"
 _DEFAULT_TABLE = "table_name"
-_NUMERIC = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?", re.ASCII)
-# _NUMERIC without the leading zeros that JSON forbids
+# NUMERIC_LITERAL without the leading zeros that JSON forbids
 _JSON_NUMBER = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?")
 _HEX_BYTES = re.compile(r"(?:[0-9a-fA-F]{2})*")
 _NEWLINES = re.compile(r"\r\n|\r|\n")
 _TSV_SPECIAL = frozenset('\t\n\r"')
-_BOOL_SQL = {Dialect.POSTGRES: ("TRUE", "FALSE"), Dialect.SQLITE: ("1", "0")}
-_BYTES_SQL = {Dialect.POSTGRES: "'\\x{}'::bytea", Dialect.SQLITE: "X'{}'"}  # {} is the hex
 
 
 class FormatResult(BaseModel):
@@ -209,17 +212,42 @@ class _SqlLiterals:
             case None:
                 return "NULL"
             case bool():
-                return _BOOL_SQL[self._dialect][0 if cell else 1]
+                return bool_literal(self._dialect, cell)
             case _Truncated() | _Binary(truncated=True):
                 self.truncated += 1
                 return "NULL"
             case _Binary():
-                return _BYTES_SQL[self._dialect].format(cell.hex)
+                return bytes_literal(self._dialect, cell.hex)
             case int() | float():
                 return str(cell)
+            case _ if column.category == ColumnCategory.DATETIME:
+                return datetime_literal(self._dialect, cell)
             case _:
-                numeric = column.category == ColumnCategory.NUMBER and _NUMERIC.fullmatch(cell)
-                return cell if numeric else quote_literal(cell)
+                numeric = column.category == ColumnCategory.NUMBER and NUMERIC_LITERAL.fullmatch(cell)
+                return cell if numeric else quote_literal(self._dialect, cell)
+
+
+def value_condition(dialect: Dialect, column: str, value: Any, category: ColumnCategory) -> str | None:
+    """The "Filter by this value" condition (spec §3.7) for one encoded grid cell, in the dialect's syntax.
+
+    The database decides what matches, by the column's collation: MySQL's default collations ignore case, accents and
+    trailing spaces, so the filter can return more rows than the one clicked. A JSON cell is compared as JSON where the
+    dialect needs it said (MySQL), and a MySQL date with a zero part as text (R-03a-T9c). None when the cell is only a
+    preview (cut text or bytes): no condition can be built from it."""
+    name = quote_ident(dialect, column)
+    if value is None:
+        return f"{name} IS NULL"
+    try:
+        cell = _normalise_encoded(value)
+    except _MalformedCell as malformed:
+        raise ValidationFailed(f"Not a grid cell: {malformed}") from None
+    if isinstance(cell, _Truncated) or (isinstance(cell, _Binary) and cell.truncated):
+        return None
+    if category == ColumnCategory.JSON and isinstance(cell, str):
+        return f"{name} = {json_literal(dialect, cell)}"
+    if category == ColumnCategory.DATETIME and isinstance(cell, str) and (text := zero_date_as_text(dialect, name, cell)):
+        return f"{text} = {quote_literal(dialect, cell)}"
+    return f"{name} = {_SqlLiterals(dialect)(cell, FormatColumn(name=column, category=category))}"
 
 
 def _tsv_field(text: str) -> str:

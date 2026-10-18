@@ -534,7 +534,7 @@ class PostgresAdapter(DatabaseAdapter):
     url_schemes = ("postgres", "postgresql")
     default_port = 5432
     dialect = Dialect.POSTGRES
-    capabilities = AdapterCapabilities(per_database_connection=True)
+    capabilities = AdapterCapabilities(per_database_connection=True, cancel_aborts_transaction=True)
 
     def parse_url(self, url: str) -> ParsedUrl:
         parsed = urlparse(url)

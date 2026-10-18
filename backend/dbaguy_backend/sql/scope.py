@@ -10,13 +10,18 @@ from .lexer import Token, TokenKind
 
 IDENT = (TokenKind.WORD, TokenKind.QUOTED)
 BEFORE_NAME = frozenset({"ONLY", "LATERAL", "IF", "NOT", "EXISTS"})  # FROM ONLY t, DROP TABLE IF EXISTS t
-# Words that introduce a relation; UPDATE does not after FOR / FOR NO KEY / ON CONFLICT DO.
-_RELATION_KEYWORDS = frozenset({"FROM", "JOIN", "UPDATE", "INTO", "TABLE"})
-_NOT_A_TABLE_UPDATE = frozenset({"FOR", "KEY", "DO"})
+# Words that introduce a relation. Two of them are also words of another construct, told apart by the word before:
+# UPDATE after FOR / FOR NO KEY / ON CONFLICT DO, and MySQL's STRAIGHT_JOIN as a SELECT modifier (a join otherwise).
+_RELATION_KEYWORDS = frozenset({"FROM", "JOIN", "STRAIGHT_JOIN", "UPDATE", "INTO", "TABLE"})
+_NOT_A_RELATION_AFTER = {
+    "UPDATE": frozenset({"FOR", "KEY", "DO"}),
+    "STRAIGHT_JOIN": frozenset({"SELECT", "ALL", "DISTINCT", "DISTINCTROW", "HIGH_PRIORITY"}),
+}
+# USE…PARTITION: MySQL hints. OUTPUT OPTION APPLY: T-SQL (DELETE … OUTPUT, … OPTION (…), CROSS|OUTER APPLY)
 _ALIAS_STOP = frozenset(
     """ON WHERE JOIN LEFT RIGHT INNER OUTER FULL CROSS NATURAL GROUP ORDER LIMIT OFFSET SET USING UNION EXCEPT
     INTERSECT WINDOW HAVING VALUES RETURNING LATERAL SELECT FROM AS FOR DEFAULT WITH FETCH TABLESAMPLE WITHOUT
-    STRICT ADD ALTER DROP RENAME""".split()
+    STRICT ADD ALTER DROP RENAME USE FORCE IGNORE STRAIGHT_JOIN PARTITION OUTPUT OPTION APPLY""".split()
 )
 _CLOSING_QUOTE = {opening: closing for rules in RULES.values() for opening, closing in rules.identifier_quotes}
 # Select-list parsing for CTE output names.
@@ -73,13 +78,13 @@ class Scope:
 
 
 def unquote(token: Token) -> str:
-    """`"a""b"` → `a"b`, `[a b]` → `a b`, `` `a` `` → `a`; an unterminated quote yields what was typed so far."""
+    """`"a""b"` → `a"b`, `[a]]b]` → `a]b`, `` `a` `` → `a`; an unterminated quote yields what was typed so far."""
     text = token.text
     close = _CLOSING_QUOTE.get(text[:1]) if token.kind == TokenKind.QUOTED else None
     if close is None:
         return text
     inner = text[1:-1] if len(text) > 1 and text.endswith(close) else text[1:]
-    return inner if close == "]" else inner.replace(close * 2, close)
+    return inner.replace(close * 2, close)
 
 
 def word(tokens: list[Token], i: int) -> str:
@@ -88,7 +93,7 @@ def word(tokens: list[Token], i: int) -> str:
 
 def introduces_relation(tokens: list[Token], i: int) -> bool:
     keyword = word(tokens, i)
-    return keyword in _RELATION_KEYWORDS and not (keyword == "UPDATE" and word(tokens, i - 1) in _NOT_A_TABLE_UPDATE)
+    return keyword in _RELATION_KEYWORDS and word(tokens, i - 1) not in _NOT_A_RELATION_AFTER.get(keyword, ())
 
 
 def enclosing_group(tokens: list[Token]) -> int:

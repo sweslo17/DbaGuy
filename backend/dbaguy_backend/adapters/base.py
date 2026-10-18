@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -7,6 +8,10 @@ from ..domain.metadata import Folder, NodeKind, ObjectDetail, ObjectNode, PathSe
 from ..domain.profiles import AnyDraft, AnyProfile, Engine, EngineInfo
 from ..domain.schema import RelationKind, SchemaSnapshot
 from ..sql.dialects import Dialect
+from .positions import offset_to_line_col
+
+
+MessageListener = Callable[[ServerMessage], None]
 
 
 @dataclass(frozen=True)
@@ -19,12 +24,21 @@ class Endpoint:
 @dataclass(frozen=True)
 class AdapterCapabilities:
     per_database_connection: bool = False  # PostgreSQL: one connection can only see one database
+    # PostgreSQL: cancelling a statement aborts the transaction around it (the export-cancel warning)
+    cancel_aborts_transaction: bool = False
+    server_read_only: bool = True  # the database can enforce a read-only session; SQL Server cannot (03b)
 
 
 @dataclass(frozen=True)
 class ParsedUrl:
     profile: AnyDraft
     password: str | None = None
+
+
+# Fixed on purpose, never urllib's own text: that quotes the authority, which holds the password (a fullwidth "＠"
+# typed by an IME is enough), and the message reaches the API response and the log.
+URL_ENCODING_HINT = "Percent-encode special characters in the user name and password."
+MALFORMED_URL_MESSAGE = f"The host or port part of the URL is malformed. {URL_ENCODING_HINT}"
 
 
 class StatementError(Exception):
@@ -44,6 +58,19 @@ FAILED_COMMIT_MESSAGE = "The transaction had failed, so COMMIT rolled it back"
 
 def transaction_open_error() -> StatementError:
     return StatementError("Commit or roll back the open transaction first", code=TRANSACTION_OPEN)
+
+
+INVALID_TEXT = "invalid_text"
+
+
+def invalid_text_error(sql: str, index: int) -> StatementError:
+    """The character at `index` cannot be sent: a lone surrogate (half of an emoji, e.g. from a broken paste) is not
+    UTF-8, and drivers cut the text at U+0000 (so a filter after it would be lost)."""
+    line, column = offset_to_line_col(sql, index + 1)
+    return StatementError(
+        f"The statement contains a character that is not valid text (U+{ord(sql[index]):04X}); delete it and "
+        "retype it", code=INVALID_TEXT, position=ErrorPosition(line=line, column=column),
+    )
 
 
 class StatementCancelled(StatementError):
@@ -75,7 +102,8 @@ class StatementResult(ABC):
 
     @abstractmethod
     def take_messages(self) -> list[ServerMessage]:
-        """Server messages (NOTICE, PRINT…) received since the last call."""
+        """Server messages (NOTICE, PRINT…) received since the last call. Messages the connection delivers to its
+        message listener (`DatabaseConnection.set_message_listener`) are not returned here as well."""
 
     @abstractmethod
     def close(self) -> None:
@@ -112,6 +140,16 @@ class DatabaseConnection(ABC):
     def run(self, sql: str) -> StatementResult:
         """Execute one statement/batch (no parameters). Raises StatementError."""
 
+    def set_message_listener(self, listener: MessageListener | None) -> None:
+        """Deliver server messages (SQL Server PRINT, RAISERROR … WITH NOWAIT) to `listener` the moment they arrive,
+        on the thread running the statement, instead of through `StatementResult.take_messages()`; None stops it.
+        The default does nothing: such connections keep reporting messages through take_messages().
+
+        While a listener is set, the adapter delivers each message live and `take_messages()` must not return the same
+        messages. With no listener set, messages may be buffered for `take_messages()` or dropped, as the adapter
+        decides; an adapter must not let messages from internal queries (commit/rollback, state refresh, metadata)
+        reach a later request."""
+
     @abstractmethod
     def in_transaction(self) -> bool: ...
 
@@ -139,6 +177,16 @@ class DatabaseConnection(ABC):
     def cancel(self) -> None:
         """Best-effort cancel of the running statement. Safe to call from any thread."""
 
+    def force_cancel(self) -> None:
+        """A repeated Cancel of the same running request (never a timeout): an adapter whose cancel can fail to end
+        the statement may now drop the connection instead. Safe to call from any thread. Default: cancel()."""
+        self.cancel()
+
+    def abort(self) -> None:
+        """The session is closing (its close guard has already asked about an open transaction): stop the running
+        statement now, dropping the connection if need be. Safe to call from any thread. Default: cancel()."""
+        self.cancel()
+
     @abstractmethod
     def close(self) -> None: ...
 
@@ -152,6 +200,7 @@ class DatabaseAdapter(ABC):
 
     _FOLDER_FOR_KIND: ClassVar[dict[str, str]] = {
         "table": Folder.TABLES, "view": Folder.VIEWS, "materialized_view": Folder.MATERIALIZED_VIEWS,
+        "synonym": Folder.SYNONYMS,
     }
 
     @abstractmethod
@@ -170,7 +219,9 @@ class DatabaseAdapter(ABC):
     def info(self) -> EngineInfo:
         return EngineInfo(
             engine=self.engine, default_port=self.default_port, url_schemes=list(self.url_schemes),
-            dialect=self.dialect,
+            dialect=self.dialect, per_database_connection=self.capabilities.per_database_connection,
+            cancel_aborts_transaction=self.capabilities.cancel_aborts_transaction,
+            server_read_only=self.capabilities.server_read_only,
         )
 
     def relation_path(self, database: str | None, schema: str, name: str, kind: RelationKind) -> list[PathSegment]:

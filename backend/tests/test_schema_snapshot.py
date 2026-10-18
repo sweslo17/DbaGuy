@@ -85,6 +85,11 @@ def test_relation_paths_and_dialects():
         ("schema", "main"), ("folder", "views"), ("view", "v"),
     ]
     assert pg.info().dialect == Dialect.POSTGRES and lite.info().dialect == Dialect.SQLITE
+    pg_info, lite_info = pg.info(), lite.info()
+    assert (pg_info.per_database_connection, pg_info.cancel_aborts_transaction, pg_info.server_read_only) == (True, True, True)
+    assert (lite_info.per_database_connection, lite_info.cancel_aborts_transaction, lite_info.server_read_only) == (
+        False, False, True,
+    )
 
 
 def test_sqlite_snapshot_resolves_foreign_keys_without_column_names(tmp_path):

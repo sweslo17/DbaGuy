@@ -7,11 +7,12 @@ import pytest
 from dbaguy_backend.adapters.base import DatabaseAdapter, ParsedUrl
 from dbaguy_backend.adapters.positions import offset_to_line_col
 from dbaguy_backend.adapters.registry import AdapterRegistry
-from dbaguy_backend.adapters.sql_text import first_keyword, qualified_pg, quote_ident_pg, quote_literal
+from dbaguy_backend.adapters.sql_text import first_keyword, qualified_pg, quote_ident_pg, quote_literal_pg
 from dbaguy_backend.adapters.values import MAX_SAFE_INT, TEXT_LIMIT, encode_value
+from dbaguy_backend.container import default_registry
 from dbaguy_backend.domain.errors import UnsupportedEngine, ValidationFailed
 from dbaguy_backend.domain.execution import ClientCommand, ServerEvent
-from dbaguy_backend.domain.profiles import Engine, SqliteProfileDraft
+from dbaguy_backend.domain.profiles import Engine, ServerProfileDraft, SqliteProfileDraft
 from dbaguy_backend.sql.dialects import Dialect
 from pydantic import TypeAdapter
 
@@ -70,7 +71,7 @@ def test_quote_helpers():
     assert quote_ident_pg("Order Items") == '"Order Items"'
     assert quote_ident_pg('a"b') == '"a""b"'
     assert qualified_pg("sales", "orders") == "sales.orders"
-    assert quote_literal("it's") == "'it''s'"
+    assert quote_literal_pg("it's") == "'it''s'"
 
 
 def test_first_keyword():
@@ -111,3 +112,78 @@ def test_registry_dispatch():
     with pytest.raises(ValidationFailed):
         registry.parse_url("nope://x")
     assert registry.engines()[0].engine == Engine.SQLITE
+
+
+def test_registry_strips_a_jdbc_prefix_before_choosing_the_adapter():
+    seen = []
+
+    class Recording(FakeAdapter):
+        def parse_url(self, url):
+            seen.append(url)
+            return super().parse_url(url)
+
+    registry = AdapterRegistry([Recording()])
+    assert registry.parse_url("  JDBC:fake:///tmp/x ").profile.name == "fake"
+    assert seen == ["fake:///tmp/x"]
+    with pytest.raises(ValidationFailed):
+        registry.parse_url("jdbc:nope://x")
+
+
+def test_default_registry_reads_jdbc_urls():
+    registry = default_registry()
+    assert registry.parse_url("jdbc:postgresql://me@h:5433/app").profile.port == 5433
+    assert registry.parse_url("jdbc:sqlite:/tmp/x.db").profile.path == "/tmp/x.db"
+    mysql = registry.parse_url("jdbc:mysql://me@h:3307/app?useSSL=false").profile
+    assert (mysql.engine, mysql.port, mysql.database, mysql.ssl.mode) == ("mysql", 3307, "app", "disable")
+    mssql = registry.parse_url("jdbc:sqlserver://h:1444;databaseName=app;encrypt=false").profile
+    assert (mssql.engine, mssql.port, mssql.database, mssql.ssl.mode) == ("mssql", 1444, "app", "prefer")
+
+
+@pytest.mark.parametrize("url", [
+    "postgres://h:abc/db",  # not a number
+    "postgresql://h:99999999/db",  # out of range
+    "postgres://[bad/db",  # malformed authority
+    "jdbc:postgresql://h:abc/db",
+    "mysql://[bad/db",
+    "jdbc:mysql://[bad/db",
+])
+def test_default_registry_turns_a_malformed_url_into_a_validation_error(url):
+    with pytest.raises(ValidationFailed, match="host or port part of the URL is malformed"):
+        default_registry().parse_url(url)
+
+
+def test_registry_turns_a_rejected_draft_into_a_validation_error_that_names_only_the_field():
+    class Rejecting(FakeAdapter):
+        def parse_url(self, url):
+            # pydantic rejects it, and its own text quotes the offending input
+            return ParsedUrl(profile=ServerProfileDraft(engine="postgres", name="x", host="h", database=["hunter2"]))
+
+    with pytest.raises(ValidationFailed, match="invalid value for 'database'") as info:
+        AdapterRegistry([Rejecting()]).parse_url("fake://h")
+    assert "hunter2" not in info.value.message
+
+
+@pytest.mark.parametrize("url", [
+    "postgres://root:hunter2\uff20db.example.com:5432/app",  # a fullwidth "＠" typed by an IME
+    "postgres://root:hunter2/x@db.example.com/app",  # an unencoded "/" cuts the authority short
+])
+def test_a_password_in_a_malformed_url_is_not_echoed(url):
+    with pytest.raises(ValidationFailed, match="Percent-encode") as info:
+        default_registry().parse_url(url)
+    assert "hunter2" not in info.value.message
+
+
+@pytest.mark.parametrize("pasted", [
+    "password=hunter2 host=h:5432",  # a libpq key=value string
+    "Password=hunter2;Server=tcp:h,1433",  # an ADO.NET connection string
+])
+def test_an_unsupported_paste_never_echoes_what_precedes_the_colon(pasted):
+    with pytest.raises(ValidationFailed) as error:
+        default_registry().parse_url(pasted)
+    assert "hunter2" not in str(error.value)
+    assert str(error.value) == "Unsupported URL scheme"
+
+
+def test_an_unsupported_scheme_that_looks_like_one_is_named():
+    with pytest.raises(ValidationFailed, match="Unsupported URL scheme 'redis'"):
+        default_registry().parse_url("redis://h")

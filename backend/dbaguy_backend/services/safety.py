@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from enum import StrEnum
 
 from pydantic import BaseModel
@@ -8,6 +9,7 @@ from ..sql.classifier import classify
 from ..sql.dialects import Dialect
 from ..sql.lexer import INSIGNIFICANT, Token, TokenKind, tokenize
 from ..sql.splitter import split
+from ..sql.tsql import statements
 
 _SET_CONFIG = "SET_CONFIG"  # a SELECT can call it to switch default_transaction_read_only off
 # Settings a read-only PostgreSQL session may still change: they shape how statements run and look, never whether
@@ -71,7 +73,8 @@ class SafetyPolicy:
         if classification.kind == StatementKind.TRANSACTION:
             return not any(t.kind == TokenKind.WORD and t.upper == "WRITE" for t in tokens)
         if classification.kind == StatementKind.SESSION:
-            return _harmless_pg_setting(sql, dialect)
+            check = _HARMLESS_SESSION.get(dialect)
+            return check is not None and check(sql)
         return False
 
     @staticmethod
@@ -84,6 +87,26 @@ class SafetyPolicy:
         return dangers
 
 
+def _single_statement_tokens(sql: str, dialect: Dialect) -> list[Token] | None:
+    """The significant tokens of `sql` when it is exactly one statement, else None.
+
+    A `;` still inside the span (a MySQL custom DELIMITER line can make that happen) means more than one statement,
+    whatever the splitter says; only trailing ones are dropped.
+    """
+    spans = split(sql, dialect)
+    if len(spans) != 1:
+        return None
+    tokens = [t for t in tokenize(spans[0].text, dialect) if t.kind not in INSIGNIFICANT]
+    while tokens and tokens[-1].kind == TokenKind.SEMI:
+        tokens.pop()
+    return None if any(t.kind == TokenKind.SEMI for t in tokens) else tokens
+
+
+def _keywords(tokens: list[Token]) -> list[str]:
+    """One entry per token: its upper-cased text if it is a word, "" otherwise (so positions line up with `tokens`)."""
+    return [t.upper if t.kind == TokenKind.WORD else "" for t in tokens]
+
+
 def _setting_name(token: Token) -> str:
     """A configuration parameter's name as PostgreSQL compares it: case-insensitive, quotes or not; "" if not a name."""
     if token.kind == TokenKind.WORD:
@@ -91,20 +114,17 @@ def _setting_name(token: Token) -> str:
     return token.text.strip('"').lower() if token.kind == TokenKind.QUOTED else ""
 
 
-def _harmless_pg_setting(sql: str, dialect: Dialect) -> bool:
+def _harmless_pg_setting(sql: str) -> bool:
     """One PostgreSQL statement that changes only a harmless setting: `SET [SESSION|LOCAL] <name> {TO|=} <value>`,
     `SET [SESSION|LOCAL] TIME ZONE <value>` or `RESET <name>`, `RESET TIME ZONE`.
 
     Never SET TRANSACTION, SET SESSION CHARACTERISTICS, SET ROLE, SET SESSION AUTHORIZATION, RESET ALL or a setting
     outside the list (notably transaction_read_only and default_transaction_read_only).
     """
-    if dialect != Dialect.POSTGRES:
+    tokens = _single_statement_tokens(sql, Dialect.POSTGRES)
+    if tokens is None:
         return False
-    spans = split(sql, dialect)
-    if len(spans) != 1:
-        return False
-    tokens = [t for t in tokenize(spans[0].text, dialect) if t.kind not in INSIGNIFICANT]
-    words = [t.upper if t.kind == TokenKind.WORD else "" for t in tokens]
+    words = _keywords(tokens)
     if words[:1] == ["RESET"]:
         named = len(tokens) == 2 and _setting_name(tokens[1]) in _PG_HARMLESS_SETTINGS
         return named or words[1:] == ["TIME", "ZONE"]
@@ -118,3 +138,134 @@ def _harmless_pg_setting(sql: str, dialect: Dialect) -> bool:
     assign = tokens[rest + 1] if rest + 1 < len(tokens) else None
     assigns = assign is not None and (assign.upper == "TO" or (assign.kind == TokenKind.OTHER and assign.text == "="))
     return assigns and len(tokens) > rest + 2  # a value follows
+
+
+# Session variables that shape how statements run or look, never whether they may write.
+_MYSQL_HARMLESS_VARIABLES = frozenset({
+    # NO_BACKSLASH_ESCAPES and ANSI_QUOTES make the lexer (which assumes the default mode) and the server disagree
+    # about strings; that is accepted (plan Ruling 25).
+    "sql_mode",
+    "time_zone",
+    "autocommit",  # the adapter recalibrates its autocommit state from the server
+    # Not character_set_results (R-03a-F3): the adapter always decodes results as UTF-8, so another charset garbles
+    # every result until it is reset.
+    "group_concat_max_len", "max_execution_time", "sql_select_limit", "lc_time_names",
+})
+_MYSQL_SESSION_SCOPES = frozenset({"SESSION", "LOCAL"})
+
+
+def _top_level_items(tokens: list[Token]) -> list[list[Token]]:
+    """`tokens` split at commas outside parentheses."""
+    items: list[list[Token]] = [[]]
+    depth = 0
+    for token in tokens:
+        depth += (token.kind == TokenKind.LPAREN) - (token.kind == TokenKind.RPAREN)
+        if token.kind == TokenKind.COMMA and depth == 0:
+            items.append([])
+        else:
+            items[-1].append(token)
+    return items
+
+
+def _harmless_mysql_assignment(tokens: list[Token]) -> bool:
+    """One item of a MySQL SET: NAMES …, CHARACTER SET …, CHARSET …, a user variable (`@x = …`), or one of the
+    harmless session variables (`[SESSION|LOCAL] name`, `@@name`, `@@session.name`, `@@local.name`), with `=` or `:=`."""
+    words = _keywords(tokens)
+    if words[:1] in (["NAMES"], ["CHARSET"]):
+        return len(tokens) > 1
+    if words[:2] == ["CHARACTER", "SET"]:
+        return len(tokens) > 2
+    operator = next((k for k, t in enumerate(tokens) if t.kind == TokenKind.OTHER and t.text == "="), None)
+    if operator is None or operator + 1 >= len(tokens):
+        return False  # not an assignment, or nothing assigned
+    target = tokens[:operator - 1] if operator > 0 and tokens[operator - 1].text == ":" else tokens[:operator]
+    if target and target[0].upper in _MYSQL_SESSION_SCOPES:
+        target = target[1:]
+    name = "".join(t.text for t in target).lower()
+    if name.startswith("@") and not name.startswith("@@"):
+        return True  # a user variable
+    for prefix in ("@@session.", "@@local.", "@@"):
+        if name.startswith(prefix):
+            name = name.removeprefix(prefix)
+            break
+    return name in _MYSQL_HARMLESS_VARIABLES
+
+
+def _harmless_mysql_session(sql: str) -> bool:
+    """One MySQL statement that only shapes how statements run or look (spec §3.4): `USE db`, or a SET whose every
+    item is harmless. The only thing it allows about transactions is `SET [SESSION|LOCAL] TRANSACTION READ ONLY`,
+    which can only make things stricter; never `SET … TRANSACTION …` otherwise, transaction_read_only, GLOBAL or
+    PERSIST scopes, or other system variables."""
+    tokens = _single_statement_tokens(sql, Dialect.MYSQL)
+    if tokens is None:
+        return False
+    words = _keywords(tokens)
+    if words[:1] == ["USE"]:
+        return len(tokens) == 2 and tokens[1].kind in (TokenKind.WORD, TokenKind.QUOTED)
+    if words[:1] != ["SET"] or any(t.kind == TokenKind.EXEC_COMMENT for t in tokens):
+        return False
+    scoped = 2 if words[1:2] and words[1] in _MYSQL_SESSION_SCOPES else 1
+    if words[scoped:] == ["TRANSACTION", "READ", "ONLY"]:
+        return True
+    if "TRANSACTION" in words:
+        return False
+    return all(_harmless_mysql_assignment(item) for item in _top_level_items(tokens[1:]))
+
+
+_TSQL_HARMLESS_OPTIONS = frozenset({
+    "NOCOUNT", "ARITHABORT", "QUOTED_IDENTIFIER", "DATEFORMAT", "LANGUAGE", "LOCK_TIMEOUT",
+    "DATEFIRST", "TEXTSIZE", "DEADLOCK_PRIORITY", "CONCAT_NULL_YIELDS_NULL", "NUMERIC_ROUNDABORT",  # fix round 1
+})
+_TSQL_HARMLESS_PREFIXES = ("ANSI_", "SHOWPLAN_")
+_TSQL_NOT_HARMLESS = frozenset({"ANSI_DEFAULTS"})  # it turns IMPLICIT_TRANSACTIONS on (R-03b-T3a)
+_TSQL_STATISTICS = frozenset({"IO", "TIME", "PROFILE", "XML"})
+
+
+def _harmless_tsql_option(item: list[Token]) -> bool:
+    name = item[0].upper if len(item) == 1 and item[0].kind == TokenKind.WORD else ""
+    harmless = name in _TSQL_HARMLESS_OPTIONS or name.startswith(_TSQL_HARMLESS_PREFIXES)
+    return harmless and name not in _TSQL_NOT_HARMLESS
+
+
+def _harmless_tsql_setting(tokens: list[Token]) -> bool:
+    """One T-SQL statement that only shapes how statements run or look (spec §3.4): `USE db`, `SET @var = …`,
+    `SET TRANSACTION ISOLATION LEVEL …`, `SET STATISTICS IO|TIME|PROFILE|XML[, …] <value>`, or
+    `SET <option>[, <option>…] <value>` whose options are NOCOUNT, ANSI_* (not ANSI_DEFAULTS), ARITHABORT,
+    QUOTED_IDENTIFIER, DATEFORMAT, LANGUAGE, LOCK_TIMEOUT, SHOWPLAN_*, DATEFIRST, TEXTSIZE, DEADLOCK_PRIORITY,
+    CONCAT_NULL_YIELDS_NULL or NUMERIC_ROUNDABORT. Never IMPLICIT_TRANSACTIONS, XACT_ABORT, ROWCOUNT, IDENTITY_INSERT
+    or anything else."""
+    words = _keywords(tokens)
+    if words[:1] == ["USE"]:
+        return len(tokens) == 2 and tokens[1].kind in (TokenKind.WORD, TokenKind.QUOTED)
+    if words[:1] != ["SET"] or len(tokens) < 3:
+        return False
+    if words[1].startswith("@") and not words[1].startswith("@@"):
+        return True
+    if words[1:4] == ["TRANSACTION", "ISOLATION", "LEVEL"]:
+        return len(tokens) > 4
+    # the value is the last token, or a sign and a number (SET LOCK_TIMEOUT -1, SET DEADLOCK_PRIORITY -5)
+    signed = tokens[-1].kind == TokenKind.NUMBER and tokens[-2].kind == TokenKind.OTHER and tokens[-2].text in "+-"
+    items = _top_level_items(tokens[1:-2 if signed else -1])  # the options
+    if words[1] == "STATISTICS":  # SET STATISTICS IO, TIME ON: the first item holds the word STATISTICS
+        names = [items[0][1:], *items[1:]]
+        return all(len(n) == 1 and n[0].kind == TokenKind.WORD and n[0].upper in _TSQL_STATISTICS for n in names)
+    return all(_harmless_tsql_option(item) for item in items)
+
+
+def _harmless_tsql_session(sql: str) -> bool:
+    """A T-SQL text classified SESSION holds no write, DDL or unknown statement (or it would be classified so): it is
+    allowed read-only when every session statement in it, in every batch, is harmless."""
+    for span in split(sql, Dialect.TSQL):
+        tokens = [t for t in tokenize(span.text, Dialect.TSQL) if t.kind not in INSIGNIFICANT]
+        for piece in statements(tokens):
+            text = span.text[piece[0].start:piece[-1].end]
+            if classify(text, Dialect.TSQL).kind == StatementKind.SESSION and not _harmless_tsql_setting(piece):
+                return False
+    return True
+
+
+_HARMLESS_SESSION: dict[Dialect, Callable[[str], bool]] = {
+    Dialect.POSTGRES: _harmless_pg_setting,
+    Dialect.MYSQL: _harmless_mysql_session,
+    Dialect.TSQL: _harmless_tsql_session,
+}  # a dialect without an entry (SQLite) allows no SESSION statement on a read-only connection

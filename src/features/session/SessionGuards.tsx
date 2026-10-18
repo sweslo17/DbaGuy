@@ -3,8 +3,14 @@ import { useStore } from "zustand";
 import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
 import { toast } from "@/components/ui/Toast";
+import { useEngineInfo } from "../connections/hooks";
 import { busy, isExporting, type SessionController } from "./SessionController";
-import { endTransaction, EXPORT_CANCEL_ABORTS_TRANSACTION, type TransactionEnd } from "./transactions";
+import {
+  cancelAbortsTransaction,
+  endTransaction,
+  EXPORT_CANCEL_ABORTS_TRANSACTION,
+  type TransactionEnd,
+} from "./transactions";
 
 /**
  * Why the tab's session is about to go away: the tab closes, the tab switches to another connection, or the tab stays
@@ -12,8 +18,9 @@ import { endTransaction, EXPORT_CANCEL_ABORTS_TRANSACTION, type TransactionEnd }
  */
 export type GuardIntent = "close" | "switch" | "disconnect";
 
+/** `abortsTransaction`: stopping the export would abort the open transaction (only where the engine does that). */
 type Prompt =
-  { kind: "export"; intent: GuardIntent; inTransaction: boolean } | { kind: "transaction"; intent: GuardIntent };
+  { kind: "export"; intent: GuardIntent; abortsTransaction: boolean } | { kind: "transaction"; intent: GuardIntent };
 
 type Choice = "stop" | TransactionEnd | "cancel";
 
@@ -70,11 +77,13 @@ async function stopExports(controller: SessionController): Promise<void> {
  * be rendered by the tab; an unanswered question is answered "no" when the tab goes away.
  */
 export function useSessionGuards(controller: SessionController | null, subject: string) {
+  const engine = useEngineInfo(controller?.profileId ?? null);
+  const cancelAborts = cancelAbortsTransaction(engine);
   const [asking, setAsking] = useState<Asking | null>(null);
   const answer = useRef<((go: boolean) => void) | null>(null);
-  const latest = useRef({ controller, subject });
+  const latest = useRef({ controller, subject, cancelAborts });
   useLayoutEffect(() => {
-    latest.current = { controller, subject };
+    latest.current = { controller, subject, cancelAborts };
   });
   useEffect(() => () => answer.current?.(false), []);
 
@@ -96,11 +105,11 @@ export function useSessionGuards(controller: SessionController | null, subject: 
 
   const exportStep = useCallback(
     async (intent: GuardIntent): Promise<boolean> => {
-      const session = latest.current.controller;
+      const { controller: session, cancelAborts } = latest.current;
       const snapshot = session?.store.getState() ?? null;
       if (!session || !isExporting(snapshot)) return true;
       const inTransaction = !!snapshot?.state?.inTransaction && !snapshot.state.transactionFailed;
-      return ask({ kind: "export", intent, inTransaction }, session);
+      return ask({ kind: "export", intent, abortsTransaction: inTransaction && cancelAborts }, session);
     },
     [ask],
   );
@@ -173,7 +182,8 @@ function GuardDialog({
   let footer;
   if (prompt.kind === "export") {
     title = `Stop the export and ${verb}?`;
-    message = `An export is still running in ${subject}.${prompt.inTransaction ? ` ${EXPORT_CANCEL_ABORTS_TRANSACTION}.` : ""}`;
+    const abortNote = prompt.abortsTransaction ? ` ${EXPORT_CANCEL_ABORTS_TRANSACTION}.` : "";
+    message = `An export is still running in ${subject}.${abortNote}`;
     footer = (
       <>
         <Button variant="ghost" autoFocus onClick={() => onChoose("cancel")}>

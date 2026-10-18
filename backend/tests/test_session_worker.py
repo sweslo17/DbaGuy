@@ -9,13 +9,22 @@ import pytest
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager, write_askpass_script
+from dbaguy_backend.domain.classification import Classification, StatementKind
 from dbaguy_backend.domain.errors import ConnectionFailed, SessionBusy, SessionNotFound
-from dbaguy_backend.domain.execution import ExecuteCommand
+from dbaguy_backend.domain.execution import (
+    ExecuteCommand,
+    ExportCommand,
+    FetchMoreCommand,
+    MessageSeverity,
+    ServerMessage,
+)
+from dbaguy_backend.domain.formats import FormatKind
 from dbaguy_backend.domain.profiles import ProfileUpsertRequest
 from dbaguy_backend.services.connection_service import ConnectionService
 from dbaguy_backend.services.profile_service import ProfileService
+from dbaguy_backend.services.safety import GuardAction, GuardDecision
 from dbaguy_backend.sessions.manager import SessionCreateRequest, SessionManager
-from dbaguy_backend.sessions.worker import SessionWorker
+from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks
 from dbaguy_backend.storage.paths import profiles_file
 from dbaguy_backend.storage.profile_store import ProfileStore
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
@@ -114,6 +123,66 @@ def test_cancel_of_a_running_statement_reaches_the_connection_once(started_worke
     worker.cancel("r")
     assert recorder.wait_for(finished("r")).cancelled is True
     assert conn.cancel_calls == 1
+
+
+def test_a_repeated_cancel_of_the_same_request_is_a_forced_one(started_worker):  # R-03b-T8a: the second Cancel
+    worker, conn, recorder = started_worker(Recorder())
+    execute(worker, "r", "hold")  # a statement a plain cancel does not stop
+    assert conn.blocked.wait(5)
+    worker.cancel("r")
+    time.sleep(0.2)
+    assert conn.interruptions == ["cancel"] and not recorder.of("r", "finished")
+    worker.cancel("r")
+    assert recorder.wait_for(finished("r"))
+    assert conn.interruptions == ["cancel", "force"]
+    conn.blocked.clear()
+    execute(worker, "s", "hold")  # the count belongs to one request: a new one starts again at a plain cancel
+    assert conn.blocked.wait(5)
+    worker.cancel("s")
+    time.sleep(0.2)
+    assert conn.interruptions == ["cancel", "force", "cancel"]
+    worker.cancel("s")
+    assert recorder.wait_for(finished("s"))
+
+
+def test_closing_the_session_aborts_the_running_statement(started_worker):  # R-03b-T8a: closing the tab forces
+    worker, conn, recorder = started_worker(Recorder())
+    execute(worker, "r", "hold")
+    assert conn.blocked.wait(5)
+    worker.close()
+    assert conn.interruptions == ["abort"] and conn.closed
+
+
+def test_a_timeout_never_forces(started_worker):  # a statement timeout behaves like the first Cancel only
+    worker, conn, recorder = started_worker(Recorder())
+    worker.submit(ExecuteCommand(request_id="t", sql="block", timeout_s=0.2))
+    assert recorder.wait_for(finished("t")).timed_out
+    assert conn.interruptions == ["cancel"]
+
+
+def test_a_cancel_after_a_timeout_forces(started_worker):  # R-03b-T8h: the warning after a timeout says "press Cancel"
+    worker, conn, recorder = started_worker(Recorder())
+    worker.submit(ExecuteCommand(request_id="t", sql="hold", timeout_s=0.2))
+    assert conn.blocked.wait(5)
+    time.sleep(0.4)
+    assert conn.interruptions == ["cancel"] and not recorder.of("t", "finished")
+    worker.cancel("t")
+    recorder.wait_for(finished("t"))
+    assert conn.interruptions == ["cancel", "force"] and recorder.of("t", "error")[0].code == "connection_lost"
+
+
+@pytest.mark.parametrize("sql, column", [("rows 3\x00", 7), ("SELECT 1;\n-- a\x00 b", 5)])
+def test_text_with_a_nul_character_never_reaches_the_connection(started_worker, sql, column):  # Important 3
+    worker, conn, recorder = started_worker(Recorder())
+    execute(worker, "n", sql)
+    done = recorder.wait_for(finished("n"))
+    [error] = recorder.of("n", "error")
+    assert error.code == "invalid_text" and "U+0000" in error.message
+    assert error.position.column == column and not done.cancelled
+    assert conn.runs == []  # drivers cut C strings at NUL: whatever follows it would be lost silently
+    worker.submit(ExportCommand(request_id="e", sql=sql, path="/tmp/never-written.csv", format=FormatKind.CSV))
+    recorder.wait_for(finished("e"))
+    assert recorder.of("e", "error")[0].code == "invalid_text" and conn.runs == []
 
 
 # ---- 5. queued and paused work can be cancelled; close() does not run the backlog ----
@@ -282,3 +351,85 @@ def test_reap_idle_skips_sessions_that_stopped_being_idle_or_are_gone(manager_en
     assert list(manager._sessions) == [busy]
     with pytest.raises(SessionNotFound):
         manager.close(stale)
+
+
+# ---- 6. messages a connection delivers while a statement runs reach that request, live ----
+
+class MessagingConnection(FakeConnection):
+    """Delivers one message from inside run(), as SQL Server delivers a PRINT before the rows."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.listener = None
+        self.listeners = []
+
+    def set_message_listener(self, listener) -> None:
+        self.listener = listener
+        self.listeners.append(listener)
+
+    def run(self, sql):
+        if self.listener is not None:
+            self.listener(ServerMessage(severity=MessageSeverity.INFO, text=f"before {sql}"))
+        return super().run(sql)
+
+
+@pytest.fixture
+def messaging_worker():
+    """A started worker on a MessagingConnection, with a recorder attached: (worker, connection, recorder)."""
+    lease = FakeLease(MessagingConnection())
+    worker = SessionWorker("fake", lambda: lease)
+    worker.start()
+    recorder = Recorder()
+    worker.set_emitter(recorder)
+    yield worker, lease.connection, recorder
+    worker.close()
+
+
+def test_live_messages_reach_the_running_request_before_its_rows(messaging_worker):
+    worker, conn, rec = messaging_worker
+    execute(worker, "m", "rows 3")
+    rec.wait_for(finished("m"))
+    kinds = [e.type for e in rec.events if getattr(e, "request_id", None) == "m"]
+    assert kinds.index("message") < kinds.index("result_set")
+    assert [e.text for e in rec.of("m", "message")] == ["before rows 3"]
+    assert conn.listener is None  # cleared when the request ended
+    execute(worker, "n", "rows 1")
+    rec.wait_for(finished("n"))
+    assert [e.text for e in rec.of("n", "message")] == ["before rows 1"]  # each request gets its own
+
+
+def test_a_paused_result_keeps_its_listener_across_fetch_more(messaging_worker):
+    worker, conn, rec = messaging_worker
+    execute(worker, "p", "rows 3", page_size=1)
+    rec.wait_for(lambda e: e.type == "result_set_end" and e.request_id == "p" and e.has_more)
+    listener = conn.listener
+    assert listener is not None  # paused, still the open request's
+    worker.submit(FetchMoreCommand(request_id="p", count=10))
+    rec.wait_for(finished("p"))
+    assert conn.listeners == [listener, None]  # set once at the start, cleared once at the end, untouched in between
+    assert [e.text for e in rec.of("p", "message")] == ["before rows 3"]
+
+
+@pytest.mark.parametrize("how", ["fail", "cancel"])
+def test_a_failed_or_cancelled_request_clears_its_listener(messaging_worker, how):
+    worker, conn, rec = messaging_worker
+    execute(worker, "x", "fail boom" if how == "fail" else "block")
+    if how == "cancel":
+        assert conn.blocked.wait(5)
+        worker.cancel("x")
+    done = rec.wait_for(finished("x"))
+    assert done.cancelled is (how == "cancel")
+    assert [e.text for e in rec.of("x", "message") if e.text.startswith("before")] == [f"before {conn.runs[-1]}"]
+    assert conn.listener is None and len(conn.listeners) == 2
+
+
+def test_an_export_routes_live_messages_to_its_own_request(messaging_worker, tmp_path):
+    worker, conn, rec = messaging_worker
+    allow_read = GuardDecision(action=GuardAction.RUN, classification=Classification(kind=StatementKind.READ))
+    worker.configure(WorkerHooks(check=lambda sql, confirmed: allow_read))
+    worker.submit(ExportCommand(request_id="e", sql="rows 4", format=FormatKind.CSV, path=str(tmp_path / "out.csv")))
+    rec.wait_for(finished("e"))
+    assert not rec.of("e", "error")
+    texts = [e.text for e in rec.of("e", "message")]
+    assert texts[0] == "before rows 4" and texts[-1].startswith("Exported 4 rows")
+    assert conn.listener is None and len(conn.listeners) == 2

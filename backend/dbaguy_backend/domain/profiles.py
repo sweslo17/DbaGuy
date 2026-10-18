@@ -134,3 +134,7 @@ class EngineInfo(BaseModel):
     default_port: int | None
     url_schemes: list[str]
     dialect: Dialect
+    per_database_connection: bool
+    # PostgreSQL: cancelling a statement aborts the transaction around it (the export-cancel warning)
+    cancel_aborts_transaction: bool
+    server_read_only: bool  # the database can enforce a read-only session; SQL Server cannot (03b)

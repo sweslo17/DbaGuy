@@ -1,4 +1,4 @@
-from ..sql.dialects import PG_RESERVED, Dialect, qualified, quote_ident, quote_literal  # noqa: F401  (re-exported)
+from ..sql.dialects import Dialect, force_quote_ident, qualified, quote_ident, quote_literal
 from ..sql.lexer import TokenKind, first_token
 
 
@@ -13,7 +13,17 @@ def qualified_pg(schema: str, name: str) -> str:
 
 def quote_ident_sqlite(name: str) -> str:
     """Always quote: introspection SQL interpolates arbitrary names."""
-    return '"' + name.replace('"', '""') + '"'
+    return force_quote_ident(Dialect.SQLITE, name)
+
+
+def quote_ident_mysql(name: str) -> str:
+    """Always backtick-quote: introspection SQL interpolates arbitrary names."""
+    return force_quote_ident(Dialect.MYSQL, name)
+
+
+def quote_literal_pg(value: str) -> str:
+    """A PostgreSQL string literal (quotes doubled; the server reads backslashes literally)."""
+    return quote_literal(Dialect.POSTGRES, value)
 
 
 def first_keyword(sql: str) -> str:

@@ -1,12 +1,24 @@
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
+import type { EngineInfo } from "@/lib/api/types";
 import { INTERRUPTED_MESSAGE, type ExecutionState } from "./execution";
 import type { SessionController } from "./SessionController";
 
 export type TransactionEnd = "commit" | "rollback";
 
-/** Cancelling an export cancels its statement, which aborts the transaction it runs in (PostgreSQL). */
+/**
+ * Cancelling an export cancels its statement, which aborts the transaction it runs in on engines whose
+ * `cancel_aborts_transaction` is true (PostgreSQL); elsewhere the transaction survives and this is never shown.
+ */
 export const EXPORT_CANCEL_ABORTS_TRANSACTION = "Cancelling the export aborts the open transaction";
+
+/**
+ * Whether cancelling a statement (an export) aborts the open transaction on this engine. An unknown engine (profiles or
+ * engines still loading) counts as yes, so the warning and the confirmation err on the safe side.
+ */
+export function cancelAbortsTransaction(engine: EngineInfo | null): boolean {
+  return engine?.cancel_aborts_transaction ?? true;
+}
 
 /** What a message's severity shows as when it becomes a toast. */
 export function toastKind(severity: string): "info" | "warning" | "error" {

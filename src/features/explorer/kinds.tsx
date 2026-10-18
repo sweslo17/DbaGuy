@@ -1,6 +1,8 @@
 import {
   Braces,
+  CalendarClock,
   Columns3,
+  CornerDownRight,
   Database,
   Eye,
   Folder,
@@ -8,6 +10,7 @@ import {
   Hash,
   KeyRound,
   Layers,
+  Link2,
   ListTree,
   Shapes,
   Split,
@@ -27,9 +30,12 @@ const KIND_ICONS: Record<string, LucideIcon> = {
   function: FunctionSquare,
   procedure: Workflow,
   sequence: Hash,
+  synonym: CornerDownRight,
   type: Shapes,
   index: KeyRound,
   trigger: Zap,
+  event: CalendarClock,
+  foreign_key: Link2,
   column: Columns3,
 };
 /** Folder nodes show the icon of the objects they contain. */
@@ -40,10 +46,13 @@ const FOLDER_ICONS: Record<string, LucideIcon> = {
   functions: FunctionSquare,
   procedures: Workflow,
   sequences: Hash,
+  synonyms: CornerDownRight,
   types: Shapes,
   columns: Columns3,
   indexes: KeyRound,
   triggers: Zap,
+  events: CalendarClock,
+  foreign_keys: Link2,
   partitions: Split,
 };
 const FOLDER_LABELS: Record<string, string> = {
@@ -53,10 +62,13 @@ const FOLDER_LABELS: Record<string, string> = {
   functions: "Functions",
   procedures: "Procedures",
   sequences: "Sequences",
+  synonyms: "Synonyms",
   types: "Types",
   columns: "Columns",
   indexes: "Indexes",
   triggers: "Triggers",
+  events: "Events",
+  foreign_keys: "Foreign Keys",
   partitions: "Partitions",
 };
 const KIND_LABELS: Record<string, string> = {
@@ -69,9 +81,12 @@ const KIND_LABELS: Record<string, string> = {
   function: "Function",
   procedure: "Procedure",
   sequence: "Sequence",
+  synonym: "Synonym",
   type: "Type",
   index: "Index",
   trigger: "Trigger",
+  event: "Event",
+  foreign_key: "Foreign Key",
   column: "Column",
 };
 

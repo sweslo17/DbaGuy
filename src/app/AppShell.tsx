@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Settings } from "lucide-react";
 import { useEffect, useRef, type ReactNode } from "react";
 import { Group, Panel, useDefaultLayout } from "react-resizable-panels";
+import symbol from "@/assets/symbol-64.png";
 import { PanelHandle } from "@/components/ui/PanelHandle";
 import { Toaster } from "@/components/ui/Toast";
 import { openSettings, SettingsDialogHost } from "@/features/settings/SettingsDialog";
@@ -34,6 +35,14 @@ export function AppShell({ sidebar, workspace }: { sidebar: ReactNode; workspace
         data-tauri-drag-region
         className="flex h-[38px] shrink-0 items-center border-b border-border bg-panel pl-[80px] pr-3"
       >
+        {/* Decorative, and part of the drag region: it must never swallow a window drag. */}
+        <img
+          src={symbol}
+          alt=""
+          draggable={false}
+          data-tauri-drag-region
+          className="pointer-events-none mr-1.5 h-[18px] w-[18px] shrink-0"
+        />
         <span data-tauri-drag-region className="text-[12px] font-semibold text-muted">
           DbaGuy
         </span>

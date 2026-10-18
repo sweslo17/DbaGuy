@@ -47,7 +47,10 @@ def _match_rank(name: str, needle: str) -> int | None:
 
 
 class SchemaCache:
-    """Schema snapshots per (profile, database), rebuilt after `ttl_s` or on invalidation.
+    """Schema snapshots per (profile, database), rebuilt after `ttl_s` or on invalidation. Only engines with one
+    connection per database (PostgreSQL) keep one per database; for the others (MySQL, SQLite) the database a request
+    names is ignored, like the metadata connection the snapshot is built on, so a request naming one never builds a
+    second snapshot of the same server.
 
     A failed build is remembered for `failure_ttl_s` and re-raised without reconnecting: completion asks for the
     snapshot on every keystroke, and an unreachable server must not cost a connect timeout each time.
@@ -73,13 +76,21 @@ class SchemaCache:
     def _key(profile_id: UUID, database: str | None) -> _Key:
         return (profile_id, database or "")
 
+    def _scope(self, profile_id: UUID, database: str | None) -> str | None:
+        """The database that keys the snapshot: None for an engine whose one connection sees every database (the
+        profile is looked up only when a database is named)."""
+        if not database or self._adapter(profile_id).capabilities.per_database_connection:
+            return database
+        return None
+
     def peek(self, profile_id: UUID, database: str | None = None) -> SchemaSnapshot | None:
+        key = self._key(profile_id, self._scope(profile_id, database))
         with self._lock:
-            entry = self._entries.get(self._key(profile_id, database))
+            entry = self._entries.get(key)
         return entry.snapshot if entry else None
 
     def get(self, profile_id: UUID, database: str | None = None) -> SchemaSnapshot:
-        snapshot = self._snapshot(profile_id, database, wait=True)
+        snapshot = self._snapshot(profile_id, self._scope(profile_id, database), wait=True)
         assert snapshot is not None  # waiting always ends in a snapshot or an exception
         return snapshot
 
@@ -90,6 +101,7 @@ class SchemaCache:
         do not pile up behind a slow or unreachable server: it answers from the expired snapshot being replaced, or
         None when there is none.
         """
+        database = self._scope(profile_id, database)
         snapshot = self._snapshot(profile_id, database, wait)
         if snapshot is None:
             return None
@@ -113,6 +125,7 @@ class SchemaCache:
 
     def invalidate(self, profile_id: UUID, database: str | None = None) -> None:
         """Forget the snapshot (and any remembered failure) of one database, or of every database of the profile."""
+        database = self._scope(profile_id, database)
         with self._lock:
             self._epoch += 1
             for store in (self._entries, self._failures):

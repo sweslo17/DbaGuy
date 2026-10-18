@@ -6,6 +6,7 @@ from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -18,6 +19,7 @@ from ..adapters.base import (
     StatementCancelled,
     StatementError,
     StatementResult,
+    invalid_text_error,
 )
 from ..adapters.values import encode_row
 from ..domain.classification import Classification, StatementKind
@@ -40,6 +42,7 @@ from ..domain.execution import (
     ResultSetEvent,
     RollbackCommand,
     RowsEvent,
+    ServerMessage,
     SessionStateEvent,
     SetAutocommitCommand,
     StartedEvent,
@@ -85,6 +88,16 @@ def _read_only_message(kind: StatementKind) -> str:
 
 def _run_everything(sql: str, confirmed: bool) -> GuardDecision:
     return GuardDecision(action=GuardAction.RUN, classification=Classification(kind=StatementKind.UNKNOWN))
+
+
+def _check_text(sql: str) -> None:
+    """Drivers cut the text at U+0000 (C strings): `DELETE FROM t<NUL> WHERE id = 1` would pass the safety check as
+    written and reach the server without its WHERE. Refused before the check, for every engine."""
+    if (index := sql.find("\x00")) >= 0:
+        raise invalid_text_error(sql, index)
+
+
+Interruption = Literal["cancel", "force", "abort"]  # a Cancel or a timeout; a repeated Cancel; closing the session
 
 
 def _ignore(*_: object) -> None:
@@ -165,6 +178,7 @@ class SessionWorker:
         # A cancel reached the running request; honoured right before run() and at the next page boundary in case no
         # driver call was in flight to interrupt (the driver then has nothing to cancel and the request would go on).
         self._cancel_requested = False
+        self._cancels = 0  # Cancels (and a timeout) that reached the running request: a Cancel after one forces
         self._queued: dict[str, bool] = {}  # requests waiting in the queue -> cancelled before they started
         self._open_exec: _OpenExecution | None = None
         self._closed = False
@@ -247,8 +261,9 @@ class SessionWorker:
         """Cancel a request: stop it if it is running, skip it if it is still queued, close it if it is paused."""
         with self._state_lock:
             if self._running_request == request_id:
-                logger.info("Cancelling request {} on {}", request_id, self.name)
-                self._interrupt_running()
+                self._cancels += 1
+                logger.info("Cancelling request {} on {}{}", request_id, self.name, " (again)" if self._cancels > 1 else "")
+                self._interrupt_running("force" if self._cancels > 1 else "cancel")
                 return
             if request_id in self._queued:
                 logger.info("Request {} on {} cancelled before it started", request_id, self.name)
@@ -281,7 +296,7 @@ class SessionWorker:
             return
         with self._state_lock:
             if self._running_request is not None and self._lease is not None:
-                self._interrupt_running()
+                self._interrupt_running("abort")
         if self._thread.ident is not None:
             self._thread.join(timeout=10)
             if self._thread.is_alive():
@@ -296,17 +311,19 @@ class SessionWorker:
             self._queue.put(_STOP)
         return True
 
-    def _interrupt_running(self) -> None:
+    def _interrupt_running(self, how: Interruption = "cancel") -> None:
         """Stop the running request: flag it, for when no driver call is in flight, and interrupt the driver.
-        The caller holds `_state_lock`."""
+        The caller holds `_state_lock`; the connection's cancel methods return without waiting for the driver."""
         self._cancel_requested = True
-        self._cancel_connection()
+        self._cancel_connection(how)
 
-    def _cancel_connection(self) -> None:
+    def _cancel_connection(self, how: Interruption) -> None:
+        connection = self.connection
+        interrupt = {"cancel": connection.cancel, "force": connection.force_cancel, "abort": connection.abort}[how]
         try:
-            self.connection.cancel()
+            interrupt()
         except Exception:
-            logger.warning("Cancel failed on {}", self.name, exc_info=True)
+            logger.warning("Cancel ({}) failed on {}", how, self.name, exc_info=True)
 
     def _put(self, task: Callable[[], None]) -> None:
         with self._queue_lock:
@@ -332,6 +349,7 @@ class SessionWorker:
                 return  # paused or over: the timeout no longer applies
             logger.info("Request {} on {} timed out after {:g} s", req.request_id, self.name, req.timeout_s)
             req.timed_out = True
+            self._cancels += 1  # a timeout is a first Cancel only, but the user's next Cancel then forces
             self._interrupt_running()
 
     # ---- worker thread ----
@@ -391,6 +409,7 @@ class SessionWorker:
             cancel_requested = self._cancel_requested
             self._running_request = request_id
             self._cancel_requested = False
+            self._cancels = 0
             self._tracker.activity(busy=request_id is not None)
         return cancel_requested
 
@@ -410,6 +429,7 @@ class SessionWorker:
                 return "Session closed before the query started"
             self._running_request = request_id
             self._cancel_requested = False
+            self._cancels = 0
             self._tracker.activity(busy=True)
         return None
 
@@ -434,12 +454,14 @@ class SessionWorker:
         if not self._start_request(req):
             return
         try:
+            _check_text(cmd.sql)
             if not self._passes_policy(req, cmd.confirmed):
                 return
             self._raise_if_cancelled()  # cancelled during the policy check: the driver had nothing to interrupt
             logger.debug("[{}] execute {}: {}", self.name, cmd.request_id, cmd.sql[:2000])
             req.ran = True
             with self._timeout(req):
+                self._listen(req.request_id)
                 result = self.connection.run(cmd.sql)
                 self._open_exec = _OpenExecution(req=req, result=result)
                 self._pump(self._open_exec, cmd.page_size)
@@ -538,9 +560,23 @@ class SessionWorker:
         if self._open_exec is not None:
             self._finish(self._open_exec)
 
+    def _listen(self, request_id: str | None) -> None:
+        """Route messages the connection delivers as they arrive to `request_id`'s Messages (None: stop). Connections
+        without live messages ignore it and keep using take_messages()."""
+        listener = None if request_id is None else partial(self._send_live_message, request_id)
+        try:
+            self.connection.set_message_listener(listener)
+        except Exception:  # a session whose connection is gone still ends its request
+            logger.warning("Could not set the message listener on {}", self.name, exc_info=True)
+
+    def _send_live_message(self, request_id: str, message: ServerMessage) -> None:
+        """Send one server message to `request_id`'s Messages. A connection calls it, through its listener, on this
+        worker thread from inside a driver call; `_send_messages` calls it for messages taken from the result."""
+        self._send(MessageEvent(request_id=request_id, severity=message.severity, text=message.text))
+
     def _send_messages(self, ex: _OpenExecution) -> None:
         for message in ex.result.take_messages():
-            self._send(MessageEvent(request_id=ex.request_id, severity=message.severity, text=message.text))
+            self._send_live_message(ex.request_id, message)
 
     def _pump(self, ex: _OpenExecution, budget: int) -> None:
         result = ex.result
@@ -591,6 +627,7 @@ class SessionWorker:
         if not self._start_request(req):
             return
         try:
+            _check_text(cmd.sql)
             target = self._check_export(cmd, req)
             self._raise_if_cancelled()  # cancelled during the checks: the driver had nothing to interrupt
             logger.info("[{}] export {} as {} to {}", self.name, cmd.request_id, cmd.format, target)
@@ -639,6 +676,7 @@ class SessionWorker:
         A failed or cancelled export removes its partial file instead of finishing the document, so the writer's
         `close()` runs only when every row is in.
         """
+        self._listen(req.request_id)
         result = self.connection.run(cmd.sql)
         try:
             columns = result.columns()
@@ -785,6 +823,7 @@ class SessionWorker:
     def _complete(self, req: _Request, *, error: StatementError | None = None, cancelled: bool = False) -> None:
         """End an execute: history record, then session state (+ schema invalidation), then `finished` — so whoever
         has seen `finished` can rely on all three."""
+        self._listen(None)  # every execute and export ends here; a paused result keeps its listener until it does
         timed_out = cancelled and req.timed_out
         if req.history and req.ran:
             status = "error" if error else "timeout" if timed_out else "cancelled" if cancelled else "ok"

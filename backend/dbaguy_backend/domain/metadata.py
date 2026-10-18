@@ -17,9 +17,12 @@ class NodeKind(StrEnum):
     FUNCTION = "function"
     PROCEDURE = "procedure"
     SEQUENCE = "sequence"
+    SYNONYM = "synonym"
     TYPE = "type"
     INDEX = "index"
     TRIGGER = "trigger"
+    EVENT = "event"
+    FOREIGN_KEY = "foreign_key"
     COLUMN = "column"
 
 
@@ -30,10 +33,13 @@ class Folder(StrEnum):
     FUNCTIONS = "functions"
     PROCEDURES = "procedures"
     SEQUENCES = "sequences"
+    SYNONYMS = "synonyms"
     TYPES = "types"
     COLUMNS = "columns"
     INDEXES = "indexes"
     TRIGGERS = "triggers"
+    EVENTS = "events"
+    FOREIGN_KEYS = "foreign_keys"
     PARTITIONS = "partitions"
 
 

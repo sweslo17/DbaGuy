@@ -8,9 +8,11 @@ import pytest
 from dbaguy_backend.domain.errors import ValidationFailed
 from dbaguy_backend.domain.execution import ColumnCategory as C
 from dbaguy_backend.sql.dialects import Dialect
-from dbaguy_backend.sql.formatting import FormatColumn, FormatKind as F, RowFormatOptions, format_rows, open_writer
+from dbaguy_backend.sql.formatting import (
+    FormatColumn, FormatKind as F, RowFormatOptions, format_rows, open_writer, value_condition,
+)
 
-PG, LITE = Dialect.POSTGRES, Dialect.SQLITE
+PG, LITE, MY, TS = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL
 COLS = [FormatColumn(name="id", category=C.NUMBER), FormatColumn(name="note", category=C.TEXT),
         FormatColumn(name="ok", category=C.BOOL)]
 ROWS = [[1, "a\tb", True], ["9007199254740993", None, False]]
@@ -43,6 +45,78 @@ def test_insert_per_dialect_and_truncation_warning():
     assert result.warnings and "truncated" in result.warnings[0]
     lite = fmt(F.INSERT, rows=[[1, "x", False]], dialect=LITE)
     assert lite.text == "INSERT INTO table_name (id, note, ok) VALUES (1, 'x', 0);"
+
+
+def test_insert_in_mysql():
+    rows = [[1, "it's \\ ok", True], [2, None, False]]
+    result = fmt(F.INSERT, rows=rows, dialect=MY, table_schema="dbaguy", table_name="Order Items")
+    assert result.text.splitlines() == [
+        r"INSERT INTO dbaguy.`Order Items` (id, note, ok) VALUES (1, 'it''s \\ ok', TRUE);",
+        "INSERT INTO dbaguy.`Order Items` (id, note, ok) VALUES (2, NULL, FALSE);",
+    ]
+    cols = [FormatColumn(name="b", category=C.BINARY)]
+    assert fmt(F.INSERT, rows=[[b"\xde\xad"]], cols=cols, source="raw", dialect=MY).text.endswith("(X'dead');")
+
+
+def test_insert_in_tsql():
+    rows = [[1, "it's 中文", True], [2, None, False]]
+    result = fmt(F.INSERT, rows=rows, dialect=TS, table_schema="dbo", table_name="Order Items")
+    assert result.text.splitlines() == [
+        "INSERT INTO dbo.[Order Items] (id, note, ok) VALUES (1, N'it''s 中文', 1);",
+        "INSERT INTO dbo.[Order Items] (id, note, ok) VALUES (2, NULL, 0);",
+    ]
+    cols = [FormatColumn(name="b", category=C.BINARY)]
+    assert fmt(F.INSERT, rows=[[b"\xde\xad"]], cols=cols, source="raw", dialect=TS).text.endswith("(0xdead);")
+    seen = [FormatColumn(name="seen", category=C.DATETIME)]
+    assert fmt(F.INSERT, rows=[["2026-10-18 12:34:56.123"]], cols=seen, dialect=TS).text.endswith(
+        "(N'2026-10-18T12:34:56.123');")  # R-03b-P10
+
+
+@pytest.mark.parametrize("dialect, column, value, category, expected", [
+    (PG, "note", None, C.TEXT, "note IS NULL"),
+    (PG, "Select", "it's", C.TEXT, "\"Select\" = 'it''s'"),
+    (PG, "ok", True, C.BOOL, "ok = TRUE"),
+    (LITE, "ok", False, C.BOOL, "ok = 0"),
+    (MY, "flag", True, C.BOOL, "flag = TRUE"),
+    (MY, "order", 42, C.NUMBER, "`order` = 42"),
+    (MY, "ratio", 1.5, C.NUMBER, "ratio = 1.5"),
+    (MY, "amount", "12345678901234567890.1234567890", C.NUMBER, "amount = 12345678901234567890.1234567890"),
+    (MY, "code", "1e3; DROP TABLE t", C.NUMBER, "code = '1e3; DROP TABLE t'"),  # not a number: a string
+    (MY, "note", "it's \\ back", C.TEXT, r"note = 'it''s \\ back'"),
+    (MY, "a`b", "x", C.TEXT, "`a``b` = 'x'"),
+    (MY, "data", {"$type": "bytes", "size": 2, "preview": "dead"}, C.BINARY, "data = X'dead'"),
+    (MY, "data", {"$type": "bytes", "size": 100, "preview": "dead"}, C.BINARY, None),  # only a preview
+    (MY, "body", {"$type": "text", "preview": "x", "size": 70000, "truncated": True}, C.TEXT, None),
+    # MySQL compares a JSON column with a plain string as a JSON string scalar: the text is cast to JSON instead
+    (MY, "doc", '{"a": [1, 2], "b": null}', C.JSON, """doc = CAST('{"a": [1, 2], "b": null}' AS JSON)"""),
+    (MY, "doc", '{"q": "it\'s \\\\ x"}', C.JSON, r"""doc = CAST('{"q": "it''s \\\\ x"}' AS JSON)"""),
+    (MY, "doc", None, C.JSON, "doc IS NULL"),
+    (PG, "doc", '{"a": 1}', C.JSON, """doc = '{"a": 1}'"""),
+    # MySQL keeps dates with a zero part that its default sql_mode rejects as literals (1525): compare the text
+    (MY, "zero_dt", "0000-00-00 00:00:00", C.DATETIME, "CAST(zero_dt AS CHAR) = '0000-00-00 00:00:00'"),
+    (MY, "born", "0000-00-00", C.DATETIME, "CAST(born AS CHAR) = '0000-00-00'"),
+    (MY, "part_zero", "2026-00-15", C.DATETIME, "CAST(part_zero AS CHAR) = '2026-00-15'"),
+    (MY, "Due Day", "2026-10-00 08:00:00.5", C.DATETIME, "CAST(`Due Day` AS CHAR) = '2026-10-00 08:00:00.5'"),
+    (MY, "seen", "2026-10-17 00:00:00", C.DATETIME, "seen = '2026-10-17 00:00:00'"),  # a real date keeps its index
+    (MY, "lasted", "-00:30:00", C.DATETIME, "lasted = '-00:30:00'"),  # TIME
+    (MY, "yr", "2000", C.DATETIME, "yr = '2000'"),
+    (PG, "born", "0000-00-00", C.DATETIME, "born = '0000-00-00'"),  # only MySQL has zero dates
+    (LITE, "doc", '{"a": 1}', C.JSON, """doc = '{"a": 1}'"""),
+    (TS, "flag", True, C.BOOL, "flag = 1"),
+    (TS, "order", 42, C.NUMBER, "[order] = 42"),
+    (TS, "note", "it's", C.TEXT, "note = N'it''s'"),
+    (TS, "seen", "2026-10-18 12:34:56.123", C.DATETIME, "seen = N'2026-10-18T12:34:56.123'"),
+    (TS, "born", "2026-10-18", C.DATETIME, "born = N'2026-10-18'"),
+    (MY, "seen", "2026-10-18 12:34:56", C.DATETIME, "seen = '2026-10-18 12:34:56'"),
+    (TS, "data", {"$type": "bytes", "size": 2, "preview": "dead"}, C.BINARY, "data = 0xdead"),
+])
+def test_value_condition(dialect, column, value, category, expected):
+    assert value_condition(dialect, column, value, category) == expected
+
+
+def test_value_condition_rejects_an_object_that_is_not_a_cell():
+    with pytest.raises(ValidationFailed):
+        value_condition(MY, "x", {"$type": "nope"}, C.TEXT)
 
 
 def test_raw_values_for_export():

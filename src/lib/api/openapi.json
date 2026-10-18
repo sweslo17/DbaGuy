@@ -1984,6 +1984,65 @@
           }
         }
       }
+    },
+    "/sql/value-condition": {
+      "post": {
+        "tags": [
+          "sql"
+        ],
+        "summary": "Value Condition For Filter",
+        "operationId": "value_condition_for_filter_sql_value_condition_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ValueConditionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValueConditionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2362,6 +2421,7 @@
               "table",
               "view",
               "materialized_view",
+              "synonym",
               "column",
               "alias",
               "function",
@@ -2639,7 +2699,8 @@
             "enum": [
               "table",
               "view",
-              "materialized_view"
+              "materialized_view",
+              "synonym"
             ],
             "title": "Kind"
           },
@@ -2664,7 +2725,9 @@
         "type": "string",
         "enum": [
           "postgres",
-          "sqlite"
+          "sqlite",
+          "mysql",
+          "tsql"
         ],
         "title": "Dialect",
         "description": "The SQL dialect of an engine: how its statements are split, classified, completed and quoted."
@@ -2764,6 +2827,18 @@
           },
           "dialect": {
             "$ref": "#/components/schemas/Dialect"
+          },
+          "per_database_connection": {
+            "type": "boolean",
+            "title": "Per Database Connection"
+          },
+          "cancel_aborts_transaction": {
+            "type": "boolean",
+            "title": "Cancel Aborts Transaction"
+          },
+          "server_read_only": {
+            "type": "boolean",
+            "title": "Server Read Only"
           }
         },
         "type": "object",
@@ -2771,7 +2846,10 @@
           "engine",
           "default_port",
           "url_schemes",
-          "dialect"
+          "dialect",
+          "per_database_connection",
+          "cancel_aborts_transaction",
+          "server_read_only"
         ],
         "title": "EngineInfo"
       },
@@ -3658,7 +3736,8 @@
             "enum": [
               "table",
               "view",
-              "materialized_view"
+              "materialized_view",
+              "synonym"
             ],
             "title": "Kind"
           },
@@ -4963,13 +5042,18 @@
           "terminator_end": {
             "type": "integer",
             "title": "Terminator End"
+          },
+          "repeat": {
+            "type": "integer",
+            "title": "Repeat"
           }
         },
         "type": "object",
         "required": [
           "start",
           "end",
-          "terminator_end"
+          "terminator_end",
+          "repeat"
         ],
         "title": "StatementRange"
       },
@@ -5033,6 +5117,52 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "ValueConditionRequest": {
+        "properties": {
+          "dialect": {
+            "$ref": "#/components/schemas/Dialect"
+          },
+          "column": {
+            "type": "string",
+            "title": "Column"
+          },
+          "value": {
+            "title": "Value"
+          },
+          "category": {
+            "$ref": "#/components/schemas/ColumnCategory"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "dialect",
+          "column",
+          "value",
+          "category"
+        ],
+        "title": "ValueConditionRequest"
+      },
+      "ValueConditionResponse": {
+        "properties": {
+          "condition": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Condition"
+          }
+        },
+        "type": "object",
+        "required": [
+          "condition"
+        ],
+        "title": "ValueConditionResponse"
       },
       "WorkspaceState": {
         "properties": {

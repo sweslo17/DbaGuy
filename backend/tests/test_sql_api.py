@@ -37,8 +37,17 @@ def labels(response):
 
 def test_split_uses_utf16_offsets(client):
     statements = client.post("/sql/split", json={"text": EMOJI_SQL, "dialect": "sqlite"}, headers=AUTH).json()["statements"]
-    assert statements[0] == {"start": 0, "end": 11, "terminator_end": 12}  # '😀' is two UTF-16 units
+    assert statements[0] == {"start": 0, "end": 11, "terminator_end": 12, "repeat": 1}  # '😀' is two UTF-16 units
     assert statements[1]["start"] == 13 and statements[1]["end"] == utf16_len(EMOJI_SQL)
+
+
+def test_split_returns_go_repeats(client):
+    body = {"text": "SELECT '😀'\nGO 3\nSELECT '中'", "dialect": "tsql"}  # '😀' is two UTF-16 units, '中' one
+    statements = client.post("/sql/split", json=body, headers=AUTH).json()["statements"]
+    assert statements == [
+        {"start": 0, "end": 11, "terminator_end": 16, "repeat": 3},
+        {"start": 17, "end": 27, "terminator_end": 27, "repeat": 1},
+    ]
 
 
 def test_complete_after_an_astral_character(client, sqlite_profile_id):
@@ -228,3 +237,11 @@ def test_a_snapshot_index_bug_is_logged_and_completion_falls_back_to_keywords(
     errors = [r for r in log_records if r["level"].no >= ERROR]
     assert len(errors) == 1 and "completion index" in errors[0]["message"]
     assert errors[0]["exception"] is not None and errors[0]["exception"].type is RuntimeError  # with the traceback
+
+
+def test_value_condition_endpoint(client):
+    body = {"dialect": "mysql", "column": "order", "value": "it's", "category": "text"}
+    assert client.post("/sql/value-condition", json=body, headers=AUTH).json() == {"condition": "`order` = 'it''s'"}
+    preview = {**body, "value": {"$type": "text", "preview": "x", "size": 70000, "truncated": True}}
+    assert client.post("/sql/value-condition", json=preview, headers=AUTH).json() == {"condition": None}
+    assert client.post("/sql/value-condition", json={**body, "extra": 1}, headers=AUTH).status_code == 422
