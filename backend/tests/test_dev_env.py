@@ -1,18 +1,27 @@
+import http.client
+import json
+
 import mysql.connector
 import psycopg
 import pytest
 from pymssql import _mssql
 
+from tests.fake_ssh import wait_until
 from tests.support import (
+    COUCHBASE_HOST,
+    COUCHBASE_PORT,
     COUCHBASE_READER,
     PG_HOST,
     PG_PASSWORD,
     PG_PORT,
     PG_USER,
+    _basic,
     couchbase_query,
     couchbase_query_text,
     mssql_connect,
     mysql_driver_kwargs,
+    plan_fixture,
+    request_active,
     requires_couchbase,
     requires_mssql,
     requires_mysql,
@@ -143,3 +152,30 @@ def test_dev_couchbase_is_seeded():
     # `namespace` and `namespace_id`, A22).
     reader = couchbase_query("SELECT RAW k.name FROM system:keyspaces AS k", user=COUCHBASE_READER)
     assert reader["results"] == ["users"]  # the limited user sees only its own keyspace (survey §5.1)
+
+
+@requires_couchbase
+def test_request_active_follows_a_request():
+    ident = "dbaguy-t1-active"
+    conn = http.client.HTTPConnection(COUCHBASE_HOST, COUCHBASE_PORT, timeout=30)
+    body = json.dumps({"statement": "SELECT RAW a * 1000 + b FROM ARRAY_RANGE(0, 100000) AS a "
+                                    "UNNEST ARRAY_RANGE(0, 1000) AS b", "client_context_id": ident})
+    conn.request("POST", "/query/service", body=body,
+                 headers={"Authorization": _basic("dbaguy", "dbaguy"), "Content-Type": "application/json"})
+    response = conn.getresponse()
+    response.read1(1024)  # the request runs: rows are streaming, the client stops reading
+    try:
+        assert request_active(ident)
+    finally:
+        conn.close()  # the server stops the request once the connection goes
+    wait_until(lambda: not request_active(ident), 10)
+
+
+@pytest.mark.parametrize("name, key", [
+    ("explain_covered", "plan"), ("explain_fetch", "plan"), ("explain_primary", "plan"),
+    ("explain_sequential", "plan"), ("explain_intersect", "plan"), ("explain_join", "plan"),
+    ("explain_subquery", "~subqueries"), ("advise_indexes", "advice"), ("advise_covering", "advice"),
+    ("advise_none", "advice"), ("profile_timings", "executionTimings"), ("profile_join", "executionTimings"),
+])
+def test_plan_fixtures_hold_the_server_shapes(name, key):  # files only: no cluster needed
+    assert key in json.loads(plan_fixture(name))

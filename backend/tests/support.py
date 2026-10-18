@@ -252,6 +252,20 @@ def completed_request_state(client_context_id: str) -> str | None:
     return None
 
 
+PLAN_FIXTURES = Path(__file__).parent / "fixtures" / "couchbase"
+
+
+def plan_fixture(name: str) -> str:
+    """A plan, advice or profile text as the dev cluster sent it (captured by 04b Task 1)."""
+    return (PLAN_FIXTURES / f"{name}.json").read_text(encoding="utf-8")
+
+
+def request_active(client_context_id: str) -> bool:
+    """Whether the query service is running that request now (system:active_requests, admin)."""
+    statement = "SELECT RAW r.state FROM system:active_requests AS r WHERE r.clientContextID = $id"
+    return bool(couchbase_query(statement, {"$id": client_context_id})["results"])
+
+
 def _couchbase_ready() -> bool:
     if not _port_open(COUCHBASE_PORT):
         return False
