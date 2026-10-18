@@ -681,6 +681,58 @@ def test_a_batch_that_may_hold_a_transaction_is_never_dropped_by_the_first_cance
     assert state.get("out") == "connection_lost" and state["message"] == mssql_adapter_cancel.ABORTED_MESSAGE
 
 
+PADDED = "SELECT a.id, REPLICATE('x', 2000) AS pad FROM dbo.big_table a CROSS JOIN dbo.big_table b"
+
+
+def test_a_double_click_on_cancel_keeps_the_transaction(conn):  # R-03b-T8i
+    """The first Cancel stops the 2 KB-row stream (the worker's own cancel then reads what is in flight, about half
+    a second); the second one, 100 ms later, must not drop the connection and roll the transaction back."""
+    one(conn, "BEGIN TRAN")
+    for i in range(5):
+        thread, state = stream_in_thread(conn, PADDED)
+        time.sleep(0.3)
+        conn.cancel()
+        time.sleep(0.1)
+        conn.force_cancel()  # what the worker sends for the second click
+        thread.join(10)
+        assert state.get("out") == "cancelled", (i, state)
+        assert conn.in_transaction() and one(conn, "SELECT 'mine' AS m") == [["mine"]]
+    conn.rollback()
+
+
+BIG_VALUES = "SELECT n, REPLICATE(CAST('x' AS varchar(max)), 80000000) AS big FROM (VALUES (1), (2)) v(n)"
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_a_cancel_while_one_big_value_arrives_waits_for_the_row(conn, manual):  # fix round 3, minor 2
+    """An 80 MB value takes over two seconds to arrive: bytes, but no complete row. The cancel waits for the row (the
+    worker then stops before the next one) instead of dropping the connection or blaming row counts."""
+    conn.set_autocommit(not manual)
+    heard: list = []
+    conn.set_message_listener(lambda m: heard.append(m.text))
+    result = conn.run(BIG_VALUES)
+    state: dict = {}
+
+    def reader():
+        try:
+            while result.fetch(1):
+                pass
+            state["out"] = "ran"
+        except StatementError as exc:
+            state["out"] = exc.code
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    time.sleep(0.2)
+    conn.cancel()
+    thread.join(15)
+    assert state.get("out") == "cancelled" and heard == []
+    result.close()
+    conn.set_message_listener(None)
+    assert one(conn, "SELECT 'mine' AS m") == [["mine"]]
+    conn.rollback()
+
+
 @pytest.fixture
 def locked_row():
     """##zz_lockrows (5,000 rows) with row 3000 locked by another session's open transaction."""

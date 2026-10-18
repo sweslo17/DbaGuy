@@ -69,6 +69,17 @@ BUSY_WARNING = (
     "This batch cannot be stopped safely while it streams row counts. Press Cancel again to drop the connection — the "
     "server rolls back the open transaction. (SET NOCOUNT ON makes such batches cancellable.)"
 )
+# The same two texts when what kept the connection busy was not row counts (a row read that receives no bytes it can
+# show as progress, or a platform without the socket's byte counter).
+BUSY_DATA_DROPPED_MESSAGE = (
+    "The connection was dropped to stop the batch: the server kept sending data, so it could not be cancelled safely. "
+    "Statements it had already completed stay committed (auto-commit); the statement that was running, and any "
+    "transaction the batch itself opened, were rolled back. Reconnect to go on."
+)
+BUSY_DATA_WARNING = (
+    "This batch cannot be stopped safely while the server keeps sending data. Press Cancel again to drop the "
+    "connection — the server rolls back the open transaction."
+)
 _BUSY_REASON = "no safe moment to send the cancel and no transaction to lose: the batch kept the connection busy"
 
 
@@ -129,6 +140,7 @@ class Call:
     watched: bool = False  # a canceller thread looks after this call
     warned: bool = False  # no safe moment came and a transaction may be open: the request was told (R-03b-T8h)
     attention: str | None = None  # how a cancel was sent during this call ("across threads", "from a message")
+    attention_at: float | None = None  # when that cancel went out
     across_sent_at: float | None = None
     across_done_at: float | None = None
 
@@ -153,6 +165,7 @@ class CancelControl:
         self._call: Call | None = None
         self._socket: _Socket | None = None
         self.aborted: str | None = None  # why the socket was shut down
+        self._aborted_message = ABORTED_MESSAGE  # what the statement it stopped reports
         self.poisoned = False  # a dbcancel() may still run on another thread: the driver must never be touched again
 
     # ---- worker thread ----
@@ -163,7 +176,7 @@ class CancelControl:
 
     @property
     def aborted_message(self) -> str:
-        return BUSY_DROPPED_MESSAGE if self.aborted == _BUSY_REASON else ABORTED_MESSAGE
+        return self._aborted_message
 
     def begin_statement(self) -> None:
         """The flag belongs to one statement (R-03a-P4): from here a cancel is kept, not dropped (R-03b-P5)."""
@@ -227,7 +240,7 @@ class CancelControl:
             if (call is None or not self.cancel_requested or call.kind is CallKind.STOP or call.attention is not None
                     or call.thread != threading.get_ident()):
                 return
-            call.attention = "from a message"
+            call.attention, call.attention_at = "from a message", time.monotonic()
         try:
             self._conn.cancel()
         except Exception as exc:  # never raise into the driver
@@ -271,14 +284,18 @@ class CancelControl:
         ).start()
 
     def force_cancel(self) -> None:
-        """A repeated Cancel of the same request: when a cancel was already sent for the driver call still running
-        (across threads, from a message, or the worker's own), or the request was warned that it cannot be stopped
-        safely, drop the connection; otherwise (the first second of a cancel) cancel as usual."""
+        """A repeated Cancel of the same request. It drops the connection only when the request was warned that it
+        cannot be stopped safely, or when a cancel sent for the driver call still running (across threads, from a
+        message, or the worker's own) went out at least WEDGE_S ago. A double click lands well inside that second,
+        while the worker's own cancel may still be reading a stream to its acknowledgement: it acts as a plain cancel
+        then (R-03b-T8i)."""
         with self._lock:
             call = self._call
-            if call is not None and (call.kind is CallKind.STOP or call.attention is not None or call.warned):
-                self._shutdown("forced by a second cancel", call)
-                return
+            if call is not None:
+                sent_at = call.started if call.kind is CallKind.STOP else call.attention_at
+                if call.warned or (sent_at is not None and time.monotonic() - sent_at >= WEDGE_S):
+                    self._shutdown("forced by a second cancel", call)
+                    return
         self.cancel()
 
     def abort(self) -> None:
@@ -293,35 +310,46 @@ class CancelControl:
 
     # ---- the canceller thread ----
 
-    def _reachable(self, call: Call, progress: list) -> bool:
+    def _reachable(self, call: Call, progress: list, bytes_arrived: bool) -> bool:
         """Whether the worker will see the flag by itself. Caller holds the lock. `progress` is [rows, when]."""
         if call.kind is CallKind.EXECUTE:
             return call.answered_at is None  # sending, or inside the wait callback
         if call.kind is CallKind.ROWS:
             now = time.monotonic()
-            if call.rows != progress[0]:
+            # Rows keep coming, or the bytes of one big row do: the worker stops when the row is complete.
+            if call.rows != progress[0] or bytes_arrived:
                 progress[0], progress[1] = call.rows, now
-            return now - progress[1] < GRACE_S  # rows keep coming: it stops before the next one
+            return now - progress[1] < GRACE_S
         return False
 
     def _watch(self, call: Call, flagged_at: float) -> None:
+        try:
+            self._watch_call(call, flagged_at)
+        except Exception:  # never die silently: a later Cancel starts a new watcher
+            logger.exception("The SQL Server cancel watcher of SPID {} failed", self._spid)
+            with self._lock:
+                call.watched = False
+
+    def _watch_call(self, call: Call, flagged_at: float) -> None:
         """Send the cancel across threads at a safe moment. When none comes within WEDGE_S, drop the connection if no
         transaction can be open, otherwise warn the request once and keep looking (R-03b-T8h)."""
         progress = [call.rows, flagged_at]
         quiet: list = [None, flagged_at]  # [bytes received, since when unchanged]
         unreachable: list = [None]  # since when the flag cannot reach the worker
         while (outcome := self._safe_moment(call, progress, quiet, unreachable)) == "deadline":
-            holds = self._may_hold_transaction()  # outside the lock: it may lex the batch
+            holds = self._holds_transaction()  # outside the lock: it may lex the batch
+            # Row counts (DONE tokens) are what a call between result sets receives without a row or a message.
+            counts = call.kind in (CallKind.EXECUTE, CallKind.NEXT_SET)
             with self._lock:
                 if self._call is not call or self.aborted is not None or call.attention is not None:
                     return
                 if not holds:
-                    self._shutdown(_BUSY_REASON, call)
+                    self._shutdown(_BUSY_REASON, call, BUSY_DROPPED_MESSAGE if counts else BUSY_DATA_DROPPED_MESSAGE)
                     return
                 call.warned = True
             logger.info("SQL Server cancel of SPID {} found no safe moment and a transaction may be open: the request "
                         "is warned, a second Cancel drops the connection", self._spid)
-            self._warn(BUSY_WARNING)
+            self._warn(BUSY_WARNING if counts else BUSY_DATA_WARNING)
         if outcome != "send":
             return
         try:
@@ -335,6 +363,15 @@ class CancelControl:
         logger.info("SQL Server cancel sent to SPID {} across threads while it waited for data ({}), in {:.0f} ms",
                     self._spid, call.kind, (call.across_done_at - call.across_sent_at) * 1000)
 
+    def _holds_transaction(self) -> bool:
+        """`may_hold_transaction()`, with a failure counted as "may": a Cancel never rolls work back by mistake."""
+        try:
+            return bool(self._may_hold_transaction())
+        except Exception as exc:
+            logger.warning("Could not tell whether SQL Server SPID {} holds a transaction ({}): assuming it may",
+                           self._spid, type(exc).__name__)
+            return True
+
     def _safe_moment(self, call: Call, progress: list, quiet: list, unreachable: list) -> str:
         """Watch the call until it ends ("gone"), a safe moment for a cross-thread cancel comes ("send", marked on the
         call), or, unless the request was warned already, WEDGE_S pass without one ("deadline")."""
@@ -342,25 +379,27 @@ class CancelControl:
             while self._call is call and self.aborted is None and call.attention is None:
                 now = time.monotonic()
                 received = _received(self._socket.fd) if self._socket is not None else None
+                bytes_arrived = False
                 if received is not None:
                     total, unread = received
+                    bytes_arrived = quiet[0] is not None and total != quiet[0]
                     if total != quiet[0] or unread:
                         quiet[0], quiet[1] = total, now
-                if self._reachable(call, progress):
+                if self._reachable(call, progress, bytes_arrived):
                     unreachable[0] = None
                 else:
                     unreachable[0] = unreachable[0] or now
                     if received is not None and now - quiet[1] >= GRACE_S:
-                        call.attention, call.across_sent_at = "across threads", now
+                        call.attention, call.attention_at, call.across_sent_at = "across threads", now, now
                         return "send"
                     if not call.warned and now - unreachable[0] >= WEDGE_S:
                         return "deadline"
                 self._changed.wait(_WATCH_S)
         return "gone"
 
-    def _shutdown(self, reason: str, call: Call) -> None:
+    def _shutdown(self, reason: str, call: Call, message: str = ABORTED_MESSAGE) -> None:
         """Caller holds the lock. Shut the socket down (never close it): the worker's reads end, its driver call
-        fails, and the server ends the session."""
+        fails, and the server ends the session; the statement reports `message`."""
         if self.aborted is not None:
             return
         known = self._socket
@@ -373,7 +412,7 @@ class CancelControl:
         except OSError as exc:
             logger.warning("Dropping SQL Server SPID {} ({}) failed: {}", self._spid, reason, exc)
             return
-        self.aborted = reason
+        self.aborted, self._aborted_message = reason, message
         self.cancel_requested = True
         self._changed.notify_all()
         logger.warning("Dropped the connection of SQL Server SPID {} to stop its {} ({}), {:.0f} ms into the call",

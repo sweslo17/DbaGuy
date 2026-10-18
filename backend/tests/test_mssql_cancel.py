@@ -8,7 +8,8 @@ import time
 import pytest
 
 from dbaguy_backend.adapters.mssql.cancel import (
-    ABORTED_MESSAGE, BUSY_DROPPED_MESSAGE, BUSY_WARNING, GRACE_S, WEDGE_S, CallKind, CancelControl, CancelPending,
+    ABORTED_MESSAGE, BUSY_DATA_DROPPED_MESSAGE, BUSY_DATA_WARNING, BUSY_DROPPED_MESSAGE, BUSY_WARNING, GRACE_S, WEDGE_S,
+    CallKind, CancelControl, CancelPending,
 )
 
 
@@ -69,14 +70,27 @@ def test_a_pending_cancel_keeps_the_batch_from_starting(unix_pair):  # R-03b-P5
     assert driver.cancels == []
 
 
-def test_a_second_cancel_while_the_workers_own_cancel_runs_drops_the_connection(unix_pair):
+def test_a_double_click_never_drops_but_a_second_cancel_a_second_later_does(unix_pair):  # R-03b-T8i
     control, driver = control_on(unix_pair[0])
     control.force_cancel()  # nothing sent yet: an ordinary cancel
     assert control.cancel_requested and control.aborted is None
-    with control.call(CallKind.STOP):  # the worker's own dbcancel(), waiting for the server's acknowledgement
+    with control.call(CallKind.STOP):  # the worker's own dbcancel(), reading a stream up to the acknowledgement
+        time.sleep(0.1)
+        control.force_cancel()  # a double click: the cancel that went out is younger than WEDGE_S
+        assert control.aborted is None
+        time.sleep(WEDGE_S)
         control.force_cancel()
     assert control.aborted == "forced by a second cancel" and dropped(unix_pair[1])
-    assert driver.cancels == []  # never a cancel() from this thread
+    assert control.aborted_message == ABORTED_MESSAGE and driver.cancels == []  # never a cancel() from this thread
+
+
+def test_a_second_cancel_soon_after_a_cancel_from_a_message_waits_too(unix_pair):  # R-03b-T8i
+    control, driver = control_on(unix_pair[0])
+    with control.call(CallKind.EXECUTE):
+        control.cancel()
+        control.on_message()  # the cancel goes out from the message handler
+        control.force_cancel()
+        assert control.aborted is None and len(driver.cancels) == 1
 
 
 def test_closing_the_session_drops_a_call_in_progress_and_only_flags_otherwise(unix_pair):
@@ -144,6 +158,47 @@ def test_a_busy_connection_that_may_hold_a_transaction_is_warned_and_waits_for_a
         control.force_cancel()  # the user's next Cancel
     assert control.aborted == "forced by a second cancel" and control.aborted_message == ABORTED_MESSAGE
     assert warnings == [BUSY_WARNING] and driver.cancels == []
+
+
+def test_the_bytes_of_one_big_row_count_as_progress(tcp_pair):  # 300 MB in one value: no row completes for seconds
+    warnings: list[str] = []
+    control, driver = control_on(tcp_pair[0], may_hold_transaction=lambda: False, warn=warnings.append)
+    with control.call(CallKind.ROWS):  # no row completes, but its bytes keep arriving
+        control.cancel()
+        Chatter(tcp_pair).run_until(lambda: False, WEDGE_S + 0.5)
+        assert control.aborted is None and warnings == [] and driver.cancels == []
+    # the row is complete: the worker sees the flag before the next one
+
+
+@pytest.mark.parametrize("holds, expected", [(False, "dropped"), (True, "warned")])
+def test_a_row_read_without_a_safe_moment_is_not_blamed_on_row_counts(unix_pair, holds, expected):
+    """Without the socket's byte counter (an AF_UNIX pair here) a stalled row read finds no safe moment: the text
+    names the data the server keeps sending, not row counts."""
+    warnings: list[str] = []
+    control, _ = control_on(unix_pair[0], may_hold_transaction=lambda: holds, warn=warnings.append)
+    with control.call(CallKind.ROWS):
+        control.cancel()
+        started = time.monotonic()
+        while control.aborted is None and not warnings and time.monotonic() - started < WEDGE_S + 1:
+            time.sleep(0.02)
+        if expected == "dropped":
+            assert control.aborted_message == BUSY_DATA_DROPPED_MESSAGE and warnings == []
+        else:
+            assert warnings == [BUSY_DATA_WARNING] and control.aborted is None
+            control.abort()
+
+
+def test_a_failing_transaction_check_counts_as_a_transaction(tcp_pair):
+    def broken() -> bool:
+        raise RuntimeError("no state")
+
+    warnings: list[str] = []
+    control, _ = control_on(tcp_pair[0], may_hold_transaction=broken, warn=warnings.append)
+    with control.call(CallKind.NEXT_SET):
+        control.cancel()
+        Chatter(tcp_pair).run_until(lambda: bool(warnings), WEDGE_S + 1)
+        assert warnings == [BUSY_WARNING] and control.aborted is None  # warned, never dropped by itself
+        control.abort()
 
 
 def test_rows_that_keep_coming_need_no_cancel_across_threads(tcp_pair):
