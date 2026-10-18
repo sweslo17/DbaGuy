@@ -4,7 +4,6 @@ name the parameter, never its value (spec §4)."""
 
 import json
 import re
-from decimal import Decimal
 from typing import NoReturn
 
 from ..adapters.base import AdapterCapabilities, RunOptions, StatementError
@@ -31,8 +30,8 @@ def _check_literal(label: str, literal: str) -> None:
         raise _invalid(f"Parameter {label} holds a character that is not valid text") from None
     if size > MAX_PARAM_BYTES:
         raise _invalid(f"Parameter {label} is larger than 1 MiB")
-    try:  # parse_int=str: an integer beyond Python's digit limit is still a literal the server reads
-        json.loads(literal, parse_int=str, parse_float=Decimal, parse_constant=_reject_constant)
+    try:  # numbers as text: only the shape is checked here, the server judges range (M10); Decimal raises on 1e99999…
+        json.loads(literal, parse_int=str, parse_float=str, parse_constant=_reject_constant)
     except (ValueError, RecursionError):
         raise _invalid(f'Parameter {label} is not a JSON value (a string needs double quotes: "text")') from None
 
@@ -43,7 +42,7 @@ def check_params(params: StatementParams) -> None:
     for name, literal in params.named.items():
         if not _NAME.fullmatch(name):
             raise _invalid(f"${name[:40]} is not a parameter name: use letters, digits and _")
-        _check_literal(f"${name}", literal)
+        _check_literal(f"${name[:40]}", literal)
     for index, literal in enumerate(params.positional, start=1):
         _check_literal(f"${index}", literal)
 

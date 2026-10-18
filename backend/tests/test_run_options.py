@@ -45,7 +45,9 @@ def test_invalid_params_name_the_parameter_never_the_value(params, label, value)
 
 def test_valid_params_pass_unchanged():
     params = StatementParams(
-        named={"n": "9007199254740993", "big": "1" * 5000, "s": '"中文"'}, positional=['[1, {"a": null}]', " true "],
+        named={"n": "9007199254740993", "big": "1" * 5000, "s": '"中文"', "huge": "1e99999999999999999999999999",
+               "tiny": "-1.5E-99999999999999999999999999"},
+        positional=['[1, {"a": null}]', " true "],
     )
     assert run_options(execute(params=params, query_context=CONTEXT), CB) == RunOptions(query_context=CONTEXT, params=params)
 
