@@ -4,12 +4,16 @@ import pytest
 from pymssql import _mssql
 
 from tests.support import (
+    COUCHBASE_READER,
     PG_HOST,
     PG_PASSWORD,
     PG_PORT,
     PG_USER,
+    couchbase_query,
+    couchbase_query_text,
     mssql_connect,
     mysql_driver_kwargs,
+    requires_couchbase,
     requires_mssql,
     requires_mysql,
     requires_pg,
@@ -111,3 +115,31 @@ def test_dev_mssql_is_seeded():
         assert one("SELECT CAST(v AS int) FROM dbo.variant_cases WHERE id = 2") == 42
     finally:
         conn.close()
+
+
+U_NUMBERS = (
+    '{"big":9007199254740993,"i64max":9223372036854775807,"i64min":-9223372036854775808,'
+    '"u64max":18446744073709551615,"beyond":12345678901234567890,"dec":1.10,'
+    '"pi":3.141592653589793238462643383279,"sci":1E+3,"tiny":1e-400,"huge":1e400,"half":0.5}'
+)
+
+
+@requires_couchbase
+def test_dev_couchbase_is_seeded():
+    def one(statement, **kw):
+        return couchbase_query(statement, **kw)["results"][0]
+
+    assert one("SELECT RAW COUNT(*) FROM dbaguy.app.events") == 20_000
+    assert one('SELECT RAW COUNT(*) FROM system:keyspaces AS k WHERE k.`bucket` = "dbaguy" AND k.`scope` = "many"') == 300
+    assert one('SELECT RAW i.state FROM system:indexes AS i WHERE i.name = "idx_users_deferred"') == "deferred"
+    assert one('SELECT RAW d FROM dbaguy.app.events AS d USE KEYS "e101000"')["late"]
+    # Stored byte for byte, and passed through unchanged by SELECT RAW (survey §4)
+    assert U_NUMBERS in couchbase_query_text('SELECT RAW d FROM dbaguy.app.users AS d USE KEYS "u_numbers"')
+    types = couchbase_query('SELECT RAW META(d).type FROM dbaguy.app.blobs AS d USE KEYS ["bin1", "txt1", "j1"]')
+    assert sorted(types["results"]) == ["base64", "base64", "json"]  # A20
+    assert one('SELECT RAW META(d).expiration FROM dbaguy.app.users AS d USE KEYS "u_ttl"') == 4102444800  # A21
+    assert one('SELECT RAW LENGTH(d.blob) FROM dbaguy.app.users AS d USE KEYS "u_big"') == 5 * 1024 * 1024
+    # No `namespace` predicate (P35): every keyspace is in the one namespace `default` (the 7.6.12 rows carry both
+    # `namespace` and `namespace_id`, A22).
+    reader = couchbase_query("SELECT RAW k.name FROM system:keyspaces AS k", user=COUCHBASE_READER)
+    assert reader["results"] == ["users"]  # the limited user sees only its own keyspace (survey §5.1)

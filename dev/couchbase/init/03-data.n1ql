@@ -1,0 +1,21 @@
+-- 20,000 events, keys in number order (e100000…e119999). Every 7th has no amount (MISSING); from e101000 on, every
+-- 1000th that is not a multiple of 7 has an extra key `late`, which the first page (500 rows) never shows.
+UPSERT INTO dbaguy.app.events (KEY k, VALUE v)
+SELECT "e" || TO_STRING(100000 + i) AS k,
+       CASE WHEN i % 7 = 0 THEN {"id": i, "kind": "view", "at": MILLIS_TO_STR(1760000000000 + i * 1000)}
+            WHEN i >= 1000 AND i % 1000 = 0
+              THEN {"id": i, "kind": "buy", "amount": i * 1.5, "at": MILLIS_TO_STR(1760000000000 + i * 1000),
+                    "late": {"note": "a key the first page does not show"}}
+            ELSE {"id": i, "kind": "click", "amount": i * 1.5, "at": MILLIS_TO_STR(1760000000000 + i * 1000)}
+       END AS v
+FROM ARRAY_RANGE(0, 20000) AS i;
+UPSERT INTO dbaguy.app.orders (KEY k, VALUE v)
+SELECT "o" || TO_STRING(i) AS k,
+       {"id": i, "user": "u" || TO_STRING(i % 5 + 1), "amount": i * 1.5,
+        "status": CASE WHEN i % 3 = 0 THEN "closed" ELSE "open" END} AS v
+FROM ARRAY_RANGE(0, 500) AS i;
+UPSERT INTO dbaguy.app.users (KEY, VALUE) VALUES ("u_big", {"n": 1, "blob": REPEAT("x", 5242880)});
+-- A21: an absolute expiry (2100-01-01): a relative TTL above 30 days is read as a Unix time, and a long-lived dev
+-- cluster would lose a short one (ruling P8).
+UPSERT INTO dbaguy.app.users (KEY, VALUE, OPTIONS) VALUES ("u_ttl", {"name": "Expires in 2100"}, {"expiration": 4102444800});
+UPSERT INTO dbaguy.app.noindex (KEY, VALUE) VALUES ("n_1", {"note": "no index: read by a sequential scan"});

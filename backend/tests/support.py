@@ -1,9 +1,16 @@
 """Shared helpers for tests that need the dev databases from dev/docker-compose.yml."""
 
+import base64
+import http.client
+import json
 import os
 import socket
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import mysql.connector
@@ -26,6 +33,15 @@ MSSQL_PORT = int(os.environ.get("DBAGUY_TEST_MSSQL_PORT", "14337"))
 MSSQL_USER = "dbaguy"
 MSSQL_PASSWORD = "Dbaguy_dev1"
 MSSQL_SA_PASSWORD = "Dbaguy_dev1"
+COUCHBASE_HOST = "127.0.0.1"
+COUCHBASE_PORT = int(os.environ.get("DBAGUY_TEST_COUCHBASE_PORT", "8093"))
+COUCHBASE_TLS_PORT = 18093
+COUCHBASE_MANAGER_PORT = 8091
+COUCHBASE_USER = "dbaguy"
+COUCHBASE_PASSWORD = "dbaguy"
+COUCHBASE_READER = "dbaguy_reader"  # query_select + data_reader on dbaguy.app.users only
+# Minutes of server work and no row until the end: what a cancel must stop (spec §1 success criteria).
+LONG_AGGREGATE = "SELECT COUNT(*) AS n FROM ARRAY_RANGE(0, 100000) AS a UNNEST ARRAY_RANGE(0, 100000) AS b"
 BASTION_PORT = 2222
 SKIP_REASON = "dev databases not running: docker compose -f dev/docker-compose.yml up -d --build --wait"
 
@@ -133,9 +149,81 @@ def mysql_procedure(name: str, body: str) -> Iterator[str]:
         owner.close()
 
 
+def _basic(user: str, password: str) -> str:
+    return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+
+
+def couchbase_query_text(
+    statement: str,
+    params: dict[str, Any] | None = None,
+    *,
+    user: str = COUCHBASE_USER,
+    password: str = COUCHBASE_PASSWORD,
+    timeout: float = 60.0,
+) -> str:
+    """One SQL++ request to the dev cluster's query service, answered as the raw response text. `timeout` (seconds) is
+    the HTTP timeout: the import-time readiness check uses a short one (P48)."""
+    conn = http.client.HTTPConnection(COUCHBASE_HOST, COUCHBASE_PORT, timeout=timeout)
+    try:
+        body = json.dumps({"statement": statement, **(params or {})})
+        conn.request(
+            "POST",
+            "/query/service",
+            body=body,
+            headers={"Authorization": _basic(user, password), "Content-Type": "application/json"},
+        )
+        return conn.getresponse().read().decode("utf-8")
+    finally:
+        conn.close()
+
+
+def couchbase_query(statement: str, params: dict[str, Any] | None = None, **options: Any) -> dict[str, Any]:
+    """`options`: `user`, `password`, `timeout` of couchbase_query_text."""
+    return json.loads(couchbase_query_text(statement, params, **options), parse_float=Decimal)
+
+
+def couchbase_ca_file(directory: Path) -> Path:
+    """The cluster's CA certificates, fetched now (none is committed), as a PEM file in `directory`."""
+    conn = http.client.HTTPConnection(COUCHBASE_HOST, COUCHBASE_MANAGER_PORT, timeout=10)
+    try:
+        conn.request(
+            "GET", "/pools/default/trustedCAs", headers={"Authorization": _basic(COUCHBASE_USER, COUCHBASE_PASSWORD)}
+        )
+        cas = json.loads(conn.getresponse().read())
+    finally:
+        conn.close()
+    path = directory / "couchbase-ca.pem"
+    path.write_text("".join(ca["pem"] for ca in cas))
+    return path
+
+
+def completed_request_state(client_context_id: str) -> str | None:
+    """How the server ended a request (`closed`, `stopped`, `completed`, …), from system:completed_requests. The log
+    holds requests over 1 s (and failed ones), and an entry can take a moment to appear: polled for up to 3 s."""
+    statement = "SELECT RAW r.state FROM system:completed_requests AS r WHERE r.clientContextID = $id"
+    for _ in range(30):
+        found = couchbase_query(statement, {"$id": client_context_id})["results"]
+        if found:
+            return found[0]
+        time.sleep(0.1)
+    return None
+
+
+def _couchbase_ready() -> bool:
+    if not _port_open(COUCHBASE_PORT):
+        return False
+    try:
+        # A short timeout (P48): this runs at import, and a slow query service must not stall every pytest start for 60 s
+        done = couchbase_query('SELECT RAW COUNT(*) FROM dbaguy._default._default USE KEYS "seed_done"', timeout=5)
+        return done.get("results") == [1]
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+
+
 PG_AVAILABLE = _pg_ready()
 MYSQL_AVAILABLE = _mysql_ready()
 MSSQL_AVAILABLE = _mssql_ready()
+COUCHBASE_AVAILABLE = _couchbase_ready()
 BASTION_AVAILABLE = _port_open(BASTION_PORT)
 requires_pg = pytest.mark.skipif(not PG_AVAILABLE, reason=SKIP_REASON)
 requires_mysql = pytest.mark.skipif(not MYSQL_AVAILABLE, reason=SKIP_REASON)
@@ -143,6 +231,8 @@ requires_bastion = pytest.mark.skipif(not (PG_AVAILABLE and BASTION_AVAILABLE), 
 requires_mysql_bastion = pytest.mark.skipif(not (MYSQL_AVAILABLE and BASTION_AVAILABLE), reason=SKIP_REASON)
 requires_mssql = pytest.mark.skipif(not MSSQL_AVAILABLE, reason=SKIP_REASON)
 requires_mssql_bastion = pytest.mark.skipif(not (MSSQL_AVAILABLE and BASTION_AVAILABLE), reason=SKIP_REASON)
+requires_couchbase = pytest.mark.skipif(not COUCHBASE_AVAILABLE, reason=SKIP_REASON)
+requires_couchbase_bastion = pytest.mark.skipif(not (COUCHBASE_AVAILABLE and BASTION_AVAILABLE), reason=SKIP_REASON)
 
 
 def make_pg_profile(**overrides) -> ServerProfile:
@@ -185,6 +275,21 @@ def make_mssql_profile(**overrides) -> ServerProfile:
         "database": "dbaguy",
         "username": MSSQL_USER,
         "ssl": SslConfig(mode="prefer"),
+    }
+    data.update(overrides)
+    return ServerProfile(**data)
+
+
+def make_couchbase_profile(**overrides) -> ServerProfile:
+    data = {
+        "id": uuid4(),
+        "name": "dev couchbase",
+        "engine": "couchbase",
+        "host": COUCHBASE_HOST,
+        "port": None,  # the default query port: node discovery runs (D-04-6)
+        "database": "dbaguy.app",
+        "username": COUCHBASE_USER,
+        "ssl": SslConfig(mode="disable"),
     }
     data.update(overrides)
     return ServerProfile(**data)
