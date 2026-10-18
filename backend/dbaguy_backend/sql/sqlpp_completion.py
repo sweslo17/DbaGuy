@@ -135,11 +135,15 @@ def _references(tokens: list[Token]) -> list[_Reference]:
 
 
 def _keyspace_of(reference: _Reference | None, context: QueryContext | None) -> Keyspace | None:
-    """The keyspace a reference names under the tab's context (as the server reads it with that `query_context`);
-    a path of two parts names none."""
+    """The keyspace a reference names under the tab's context, as the server reads it with that `query_context`: a path
+    of three parts as written; one part a collection of the context's scope (`_default` of its bucket without one); two
+    parts `scope.collection` of the context's bucket under a bucket-only context (ruling B47), and none otherwise
+    (under a scope the server calls it ambiguous, and without a context there is no bucket)."""
     match reference.parts if reference is not None else ():
         case (bucket, scope, collection):
             names = bucket, scope, collection
+        case (scope, collection) if context is not None and context.scope is None:
+            names = context.bucket, scope, collection
         case (collection,) if context is not None:
             names = context.bucket, context.scope or DEFAULT, collection
         case (bucket,):
@@ -174,13 +178,14 @@ def _scopes(tree: KeyspaceTree, bucket: str) -> list[Candidate]:
 
 def _keyspace_candidates(parts: list[str], tree: KeyspaceTree, context: QueryContext | None) -> list[Candidate]:
     """Where a keyspace is named: the context's collections and every bucket; after `b.` the scopes of b, after
-    `b.s.` its collections."""
+    `b.s.` its collections. Under a bucket-only context `s.` is also a scope of the context's bucket (ruling B47)."""
     match parts:
         case []:
             here = _collections(tree, context.bucket, context.scope or DEFAULT) if context is not None else []
             return [*here, *_named(tree.buckets, "bucket", "bucket")]
-        case [bucket]:
-            return _scopes(tree, bucket)
+        case [first]:
+            in_bucket = context is not None and context.scope is None
+            return [*_scopes(tree, first), *(_collections(tree, context.bucket, first) if in_bucket else [])]
         case [bucket, scope]:
             return _collections(tree, bucket, scope)
         case _:

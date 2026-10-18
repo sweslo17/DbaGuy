@@ -92,6 +92,38 @@ def test_nested_paths_and_implicit_aliases():
     assert items(run("SELECT d.| FROM app.users AS d")) == {}  # two parts name no keyspace
 
 
+BUCKET = QueryContext(bucket="dbaguy")  # no scope
+
+
+def test_under_a_bucket_only_context_a_two_part_path_is_scope_dot_collection():  # ruling B47, as the server reads it
+    assert [(i.label, i.kind) for i in run("SELECT * FROM app.|", context=BUCKET).items] == [
+        ("users", "collection"), ("value", "collection"), ("events", "collection"), ("orders", "collection"),
+        ("odd-name", "collection")]
+    assert [i.label for i in run("SELECT * FROM app.us|", context=BUCKET).items] == ["users"]
+    assert "users" in items(run("SELECT * FROM a JOIN app.|", context=BUCKET))
+    # the first part may still be a bucket: its scopes are offered as before
+    assert [(i.label, i.kind) for i in run("SELECT * FROM dbaguy.|", context=BUCKET).items] == [
+        ("app", "scope"), ("_default", "scope")]
+    assert items(run("SELECT * FROM `travel-sample`.|", context=BUCKET))["inventory"].kind == "scope"
+
+
+def test_under_a_bucket_only_context_a_scope_dot_collection_alias_has_the_sampled_fields():
+    found = items(run("SELECT u.| FROM app.users AS u", context=BUCKET))
+    assert set(found) == set(items(run("SELECT u.| FROM users AS u")))
+    assert found["name"].detail == "users · string · 80%"
+    assert "name" in items(run("SELECT users.| FROM app.users", context=BUCKET))  # by its last part
+    assert "name" in items(run("SELECT | FROM app.users AS u", context=BUCKET))  # the only keyspace, unqualified
+    assert items(run("SELECT u.| FROM app.orders AS u", context=BUCKET)) == {}  # not sampled
+    assert items(run("SELECT u.| FROM users AS u", context=BUCKET)) == {}  # one part: `dbaguy._default.users`
+    assert items(run("SELECT u.| FROM x.y.z AS u", context=BUCKET)) == {}
+
+
+def test_under_a_scoped_context_or_none_a_two_part_path_names_nothing():  # the server: ambiguous / no bucket
+    assert run("SELECT * FROM app.|").items == [] and run("SELECT * FROM app.|", context=None).items == []
+    assert items(run("SELECT d.| FROM app.users AS d")) == {}
+    assert items(run("SELECT d.| FROM app.users AS d", context=None)) == {}
+
+
 def test_one_keyspace_offers_its_fields_unqualified_then_the_fields_seen():
     result = run("SELECT na| FROM users AS u", seen=["name", "nation"])
     labels = [i.label for i in result.items]
