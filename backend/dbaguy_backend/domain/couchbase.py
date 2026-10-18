@@ -48,7 +48,7 @@ class IndexAdvice(BaseModel):
     kind: Literal["recommended", "covering", "current"]
     statement: str  # `index_statement`, fully qualified: it can be copied and run as it is
     keyspace_alias: str | None = None
-    rule: str | None = None  # `recommending_rule`; for a current index its `index_status`
+    rule: str | None = None  # `recommending_rule` (a covering index: `index_property`); a current index: `index_status`
     update_statistics: str | None = None
 
 

@@ -27,6 +27,7 @@ from dbaguy_backend.domain.couchbase import (
 )
 
 DETAIL_MAX_CHARS = 300  # a detail longer than this ends with "…", the "…" being the 300th character
+MAX_PLAN_DEPTH = 200  # deeper than any plan the server writes, and shallower than what pydantic can serialize (~250)
 
 # What an operator's children are, in this order; any other key whose value is an operator (or a list of operators)
 # comes after them, so an operator the survey did not see still has its subtree walked.
@@ -40,6 +41,8 @@ _NOT_DETAILS = frozenset({"as", "alias", "namespace", "index_id", "bucket", "sco
 _ALIAS_TITLED = frozenset({"Fetch", "Join", "NestedLoopJoin", "HashJoin", "Nest", "NestedLoopNest", "Unnest", "KeyScan",
                            "ExpressionScan", "CountScan"})
 
+_SYSTEM_NAMESPACE = "#system"  # system:keyspaces and the like: an index cannot be created there
+_CONTAINERS = frozenset({"Sequence", "Parallel"})  # their time is their children's, not work of their own
 _PRIMARY_SCANS = frozenset({"PrimaryScan", "PrimaryScan3"})
 _SEQUENTIAL_INDEX = "#sequentialscan"
 _SEQUENTIAL_USING = "sequentialscan"
@@ -48,7 +51,10 @@ _INDEX_SCANS = frozenset({"IndexScan", "IndexScan2", "IndexScan3", "IntersectSca
                           "UnionScan", "DistinctScan"})
 _BADGE_ORDER: tuple[str, ...] = get_args(PlanBadge)
 
-_RULE_KEY = {"current": "index_status", "recommended": "recommending_rule", "covering": "recommending_rule"}
+# What an index advice's `rule` is, first one present: a covering index has an `index_property` ("ORDER pushdown")
+# where a recommended one has the `recommending_rule`.
+_RULE_KEYS = {"current": ("index_status",), "recommended": ("recommending_rule", "index_property"),
+              "covering": ("recommending_rule", "index_property")}
 
 # Go writes microseconds as "\u00b5s" (U+00B5, the micro sign); U+03BC, the Greek letter, is accepted too.
 _NS_PER_UNIT = {"h": 3_600_000_000_000, "m": 60_000_000_000, "s": 1_000_000_000, "ms": 1_000_000, "us": 1_000,
@@ -67,11 +73,15 @@ def analyze(text: str) -> PlanView:
     return analyze_value(value)
 
 
+class _TooDeep(RecursionError):
+    """A plan nested deeper than `MAX_PLAN_DEPTH`: the same answer as one nested deeper than the interpreter follows."""
+
+
 def analyze_value(value: Any) -> PlanView:
     """Like `analyze()`, for a value that is already decoded."""
     try:
         return _analyze(value)
-    except RecursionError:  # an answer nested deeper than the interpreter follows is not one the server wrote
+    except RecursionError:  # (also `_TooDeep`) an answer nested that deep is not one the server wrote
         return PlanView(kind="unknown")
 
 
@@ -151,9 +161,9 @@ def _index_advice(kind: str, entries: Any) -> list[IndexAdvice]:
     for entry in entries if isinstance(entries, list) else ():
         statement = entry.get("index_statement") if isinstance(entry, dict) else None
         if isinstance(statement, str) and statement:
+            rule = next((text for key in _RULE_KEYS[kind] if (text := _string(entry.get(key)))), None)
             found.append(IndexAdvice(kind=kind, statement=statement,
-                                     keyspace_alias=_string(entry.get("keyspace_alias")),
-                                     rule=_string(entry.get(_RULE_KEY[kind])),
+                                     keyspace_alias=_string(entry.get("keyspace_alias")), rule=rule,
                                      update_statistics=_string(entry.get("update_statistics"))))
     return found
 
@@ -171,7 +181,9 @@ class _Builder:
         self._next_id = 0
         self._uncovered: set[int] = set()  # id() of the index scans a later fetch of the same alias makes uncovered
 
-    def build(self, op: dict[str, Any]) -> PlanNode:
+    def build(self, op: dict[str, Any], depth: int = 1) -> PlanNode:
+        if depth > MAX_PLAN_DEPTH:
+            raise _TooDeep
         node_id = self._next_id
         self._next_id += 1
         operator: str = op["#operator"]
@@ -179,7 +191,7 @@ class _Builder:
         self._uncovered |= _uncovered_scans(_operators(op.get("~children")))
         found = self._flag(node_id, op, operator, title)
         self.findings.extend(found)
-        children = [self.build(child) for child in _children(op)]
+        children = [self.build(child, depth + 1) for child in _children(op)]
         return PlanNode(id=node_id, operator=operator, title=title, details=_details(op),
                         estimates=_estimates(op.get("optimizer_estimates")), stats=_stats(op),
                         badges=[finding.badge for finding in found], children=children)
@@ -190,13 +202,16 @@ class _Builder:
         def finding(badge: PlanBadge, severity: Literal["warning", "info"], text: str) -> PlanFinding:
             return PlanFinding(badge=badge, severity=severity, node_id=node_id, text=text)
 
-        found = []
+        found: list[PlanFinding] = []
+        if op.get("namespace") == _SYSTEM_NAMESPACE:
+            return found
         keyspace = _keyspace(op) or "the keyspace"
         sequential = op.get("index") == _SEQUENTIAL_INDEX or op.get("using") == _SEQUENTIAL_USING
-        if operator in _PRIMARY_SCANS and not sequential:
+        bounded = op.get("limit") is not None  # a pushed-down LIMIT stops the scan: it reads no more than that
+        if operator in _PRIMARY_SCANS and not sequential and not bounded:
             found.append(finding("primary_scan", "warning", f"Primary scan of {keyspace}: every document key is read; "
                                                             "an index on the filtered fields would avoid it"))
-        if operator == "PrimaryScan3" and sequential:
+        if operator == "PrimaryScan3" and sequential and not bounded:
             found.append(finding("sequential_scan", "warning",
                                  f"Sequential scan of {keyspace}: no index is used, every document is read"))
         if operator in _INTERSECT_SCANS:
@@ -204,14 +219,16 @@ class _Builder:
                                  "Several indexes are scanned and intersected; one composite index is usually faster"))
         if id(op) in self._uncovered:
             found.append(finding("not_covered", "info", f"{title} does not cover the query: each match is fetched "
-                                                        "from the data service (expected for SELECT *)"))
+                                                        "from the data service (the index lacks fields the query "
+                                                        "needs, as with SELECT *)"))
         return found
 
 
 def _slowest(root: PlanNode) -> list[PlanFinding]:
     """The operators whose own time (`execTime` + `servTime`) is more than half of all the operators' time; each gets
-    the `slowest` badge. With no time at all, none does."""
-    nodes = list(_preorder(root))
+    the `slowest` badge. A Sequence or Parallel is not an operator here: its time includes what it waits for. With no
+    time at all, none does."""
+    nodes = [node for node in _preorder(root) if node.operator not in _CONTAINERS]
     times = {node.id: _own_ns(node) for node in nodes}
     total = sum(times.values())
     found = []

@@ -176,3 +176,87 @@ def test_advice_takes_several_infos_and_the_distinct_scan_is_checked_like_the_ot
         {"#operator": "DistinctScan", "scan": {"#operator": "IndexScan3", "index": "i", "as": "a"}},
         {"#operator": "Fetch", "as": "a"}]}})
     assert flags(analyze(plan)) == [("not_covered", "info", "DistinctScan")]
+
+
+# --- Fix round 1: shapes the review found live ----------------------------------------------------------------------
+
+
+def plan_of(*children: dict) -> str:
+    return json.dumps({"plan": {"#operator": "Sequence", "~children": list(children)}, "text": "SELECT 1"})
+
+
+def test_a_pushed_down_limit_bounds_the_scan():
+    # SELECT * FROM dbaguy.app.users u LIMIT 5, trimmed: the scan carries the limit and stops after 5 keys
+    live = plan_of(
+        {"#operator": "PrimaryScan3", "as": "u", "bucket": "dbaguy", "index": "#primary", "keyspace": "users",
+         "limit": "5", "namespace": "default", "scope": "app", "using": "gsi"},
+        {"#operator": "Fetch", "as": "u", "bucket": "dbaguy", "keyspace": "users", "namespace": "default",
+         "scope": "app"},
+        {"#operator": "Limit", "expr": "5"})
+    assert analyze(live).findings == []
+    sequential = plan_of({"#operator": "PrimaryScan3", "as": "n", "index": "#sequentialscan", "keyspace": "noindex",
+                          "limit": "1", "using": "sequentialscan"})
+    assert analyze(sequential).findings == []
+
+
+def test_a_system_keyspace_is_never_flagged():
+    live = plan_of({"#operator": "PrimaryScan", "index": "#primary", "keyspace": "keyspaces", "namespace": "#system",
+                    "using": "system"},
+                   {"#operator": "Fetch", "keyspace": "keyspaces", "namespace": "#system"})
+    assert analyze(live).findings == []
+
+
+def timed(operator: str, exec_time: str, serv_time: str | None = None, **fields) -> dict:
+    stats = {"execTime": exec_time, **({"servTime": serv_time} if serv_time else {})}
+    return {"#operator": operator, "#stats": stats, **fields}
+
+
+def test_a_wrapper_is_never_the_slowest_operator():
+    # UNION ALL of two scans, trimmed from a live profile: the second Sequence (414 ms) only waits for its Fetch
+    # (375 ms of its own); counted as operators, the wrappers would keep the Fetch under half of the total
+    root = timed("Authorize", "1.166µs", "6.709µs", **{"~child": timed("Sequence", "2.458µs", **{"~children": [
+        timed("UnionAll", "833ns", **{"~children": [
+            timed("Sequence", "4.276342ms", **{"~children": [
+                timed("PrimaryScan3", "8.309582ms", "5.15803ms", **{"as": "r", "keyspace": "route", "index": "p_r"}),
+                timed("Fetch", "23.638261ms", "351.75715ms", **{"as": "r", "keyspace": "route"}),
+                timed("Filter", "13.548384ms", condition="(100 < (`r`.`distance`))"),
+                timed("InitialProject", "27.556968ms")]}),
+            timed("Sequence", "414.563644ms", **{"~children": [
+                timed("PrimaryScan3", "81.159µs", "835.625µs", **{"as": "a", "keyspace": "airline", "index": "p_a"}),
+                timed("Fetch", "187.382µs", "7.549264ms", **{"as": "a", "keyspace": "airline"})]})]}),
+        timed("Stream", "18.426473ms")]})})
+    view = analyze(json.dumps({"executionTimings": root, "phaseTimes": {"run": "420ms"}}))
+    assert [f.text for f in view.findings if f.badge == "slowest"] == ["Fetch · r took 82% of the operators' time"]
+    assert all("slowest" not in n.badges for n in walk(view.root) if n.operator in ("Sequence", "Parallel"))
+
+
+def chain(depth: int) -> dict:
+    nested: dict = {"#operator": "Leaf"}
+    for _ in range(depth - 1):
+        nested = {"#operator": "Wrap", "~child": nested}
+    return nested
+
+
+def test_a_plan_nested_past_the_cap_is_unknown_and_one_at_the_cap_serializes():
+    at_cap = analyze(json.dumps({"plan": chain(200), "text": "t"}))
+    assert at_cap.kind == "plan" and len(at_cap.model_dump_json()) > 0
+    assert analyze(json.dumps({"plan": chain(201)})).kind == "unknown"
+    too_deep = analyze(json.dumps({"plan": chain(300), "text": "t"}))
+    assert too_deep.kind == "unknown" and too_deep.model_dump_json()  # pydantic's own limit is near 250
+
+
+def test_a_covering_index_keeps_its_property_as_the_reason():
+    view = analyze(json.dumps({"#operator": "Advise", "query": "q", "advice": {"adviseinfo": {
+        "current_indexes": [{"index_statement": "CREATE PRIMARY INDEX p ON k"}],
+        "recommended_indexes": {
+            "covering_indexes": [{"index_property": "ORDER pushdown", "index_statement": "CREATE INDEX c ON k(a, b)"}],
+            "indexes": [{"index_property": "x", "recommending_rule": "rule", "index_statement": "CREATE INDEX i"}],
+        }}}}))
+    assert [(a.kind, a.rule) for a in view.advice] == [("current", None), ("recommended", "rule"),
+                                                      ("covering", "ORDER pushdown")]
+
+
+def test_the_uncovered_note_says_what_is_missing():
+    (finding,) = analyze(plan_fixture("explain_fetch")).findings
+    assert finding.text == ("IndexScan3 · idx_orders_amount does not cover the query: each match is fetched from the "
+                            "data service (the index lacks fields the query needs, as with SELECT *)")
