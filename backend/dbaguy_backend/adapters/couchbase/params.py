@@ -1,13 +1,17 @@
 """Parameter literals whose numbers the query service would change (R-04-10, spec §3.5.4). Pure: no I/O, no logging.
 
 The request body carries each literal exactly as typed (http.build_body), but the query service reads a JSON number as
-an int64 only when it is an integer that fits; anything else becomes a float64 (A26: `18446744073709551615` comes back
-as `18446744073709552000`, `3.141592653589793238462643383279` as `3.141592653589793`, `1.10` as `1.1`). A parameter
-is flagged when that changes a value (ruling B11): an integer outside int64, or a decimal / exponent number whose
-float64 is a different value (`1.10`, `0.1`, `1E+3`, `-0.0` are not: their float64 is the value written). The warning
-names the parameter, never its value (spec §4, ruling B10)."""
+an int64 only when it is an integer that fits; anything else becomes a float64, which it then shows as an int64 (its
+exact integer) when it is whole and within ±2⁶³, else by its shortest repr (A26 and the 04b Task 4 review, live on
+7.6.12: `18446744073709551615` → `18446744073709552000`, `3.141592653589793238462643383279` → `3.141592653589793`,
+`1.10` → `1.1`, `1.2345678901234568e18` → `1234567890123456768`; `1e20` and `1234567890123456768.0` come back as
+written). A parameter is flagged when the value shown differs from the value written (ruling B11; `1.10`, `0.1`,
+`1E+3`, `-0.0` are not flagged). 2⁶³ itself overflows the int64 (what comes back depends on the platform): flagged. A
+number beyond a double (`1e400`) is refused by the server; `sessions.options.check_params` refuses it before (B46).
+The warning names the parameter, never its value (spec §4, ruling B10)."""
 
 import json
+import math
 from decimal import Decimal, InvalidOperation
 from typing import NoReturn
 
@@ -47,18 +51,25 @@ def _number_texts(literal: str) -> tuple[list[str], list[str]] | None:
 
 
 def _integer_changes(text: str) -> bool:
-    return len(text) > _INT64_TEXT_MAX or not INT64_MIN <= int(text) <= INT64_MAX
+    """An integer that fits int64 is read as one; any other is read as a double."""
+    fits = len(text) <= _INT64_TEXT_MAX and INT64_MIN <= int(text) <= INT64_MAX
+    return not fits and _double_changes(text)
 
 
-def _decimal_changes(text: str) -> bool:
-    """The float64 the text reads as (its shortest repr) is not the value written. `1e400` reads as inf, `1e-400` as
-    0.0: both changes."""
+def _double_changes(text: str) -> bool:
+    """The value the server shows for the double `text` reads as differs from the value written (module docstring).
+    `1e400` reads as inf (a change; refused before it is sent, B46), `1e-400` as 0.0 (a change)."""
+    value = float(text)
+    if math.isinf(value):
+        return True
     try:
         written = Decimal(text)
-    except InvalidOperation:  # an exponent past ±10**18 (Decimal's own limit): the value is 0 or no float64's
+    except InvalidOperation:  # an exponent past ±10**18 (Decimal's own limit): the double is 0.0 here (inf is above)
         mantissa = text.lower().partition("e")[0]
         return any(digit in mantissa for digit in "123456789")
-    return Decimal(repr(float(text))) != written
+    if value.is_integer() and abs(value) <= 2.0**63:  # shown as an int64: its exact integer
+        return value == 2.0**63 or Decimal(int(value)) != written
+    return Decimal(repr(value)) != written
 
 
 def changes_as_double(literal: str) -> bool:
@@ -68,7 +79,7 @@ def changes_as_double(literal: str) -> bool:
     if numbers is None:
         return False
     integers, decimals = numbers
-    return any(map(_integer_changes, integers)) or any(map(_decimal_changes, decimals))
+    return any(map(_integer_changes, integers)) or any(map(_double_changes, decimals))
 
 
 def parameter_warnings(params: StatementParams | None) -> list[ServerMessage]:
