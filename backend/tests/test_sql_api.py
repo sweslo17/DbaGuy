@@ -259,3 +259,19 @@ def test_value_condition_endpoint(client):
     preview = {**body, "value": {"$type": "text", "preview": "x", "size": 70000, "truncated": True}}
     assert client.post("/sql/value-condition", json=preview, headers=AUTH).json() == {"condition": None}
     assert client.post("/sql/value-condition", json={**body, "extra": 1}, headers=AUTH).status_code == 422
+
+
+def test_sqlpp_copy_json_missing_and_the_insert_refusal(client, log_records):
+    columns = [{"name": "doc", "category": "mixed"}, {"name": "n", "category": "number"}]
+    rows = [[{"$type": "json", "text": '{"b": 1.10, "a": 9007199254740993}'}, 5], [{"$type": "missing"}, 6]]
+    body = {"dialect": "sqlpp", "kind": "jsonl", "columns": columns, "rows": rows}
+    assert client.post("/sql/format-rows", json=body, headers=AUTH).json()["text"].splitlines() == [
+        '{"doc": {"b": 1.10, "a": 9007199254740993}, "n": 5}', '{"n": 6}',
+    ]
+    insert = client.post("/sql/format-rows", json={**body, "kind": "insert"}, headers=AUTH)
+    assert insert.status_code == 422
+    error = insert.json()["error"]
+    assert error["code"] == "unsupported_format" and error["message"] == "INSERT statements are not offered for Couchbase"
+    missing = {"dialect": "sqlpp", "column": "doc", "value": {"$type": "missing"}, "category": "mixed"}
+    assert client.post("/sql/value-condition", json=missing, headers=AUTH).json() == {"condition": "doc IS MISSING"}
+    assert not [r for r in log_records if r["level"].no >= ERROR]
