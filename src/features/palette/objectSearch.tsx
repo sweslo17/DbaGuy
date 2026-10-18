@@ -2,15 +2,17 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import { pathKey, type ObjectNode, type ObjectSearchHit, type Profile } from "@/lib/api/types";
 import { useWorkspace } from "@/stores/workspace";
+import { useEngineInfo } from "../connections/hooks";
 import { openBrowseTab } from "../explorer/browse";
 import { kindIcon } from "../explorer/kinds";
 import { objectSearchKey } from "./objectSearchKey";
 import { PaletteGroup, PaletteItem, PaletteNote, type Choose } from "./parts";
 
 /*
- * Quick open's database objects (spec §4.10, ruling R-02c-16): the tables, views and collections of the connection
- * being worked with, found by the backend (`GET /metadata/search`, a fuzzy match over its schema snapshot) and listed
- * in its order. A table or view opens as the explorer would open it; a collection (Couchbase) opens a browse tab.
+ * Quick open's database objects (spec §4.10, ruling R-02c-16): the tables and views of the connection being worked
+ * with (its collections too, for Couchbase), found by the backend (`GET /metadata/search`, a fuzzy match over its
+ * schema snapshot) and listed in its order. A table or view opens as the explorer would open it; a collection opens a
+ * browse tab.
  */
 
 const OBJECT_LIMIT = 50;
@@ -54,6 +56,8 @@ export function ObjectsSection({
   choose: Choose;
 }) {
   const openObject = useWorkspace((s) => s.openObject);
+  // Only an engine with a query context (Couchbase) has collections to find; the others keep their wording.
+  const collections = !!useEngineInfo(profile?.id ?? null)?.query_context;
   const openHit = (profileId: string, hit: ObjectSearchHit) =>
     hit.kind === "collection" ? void openBrowseTab(profileId, hit.path) : openObject(profileId, hitNode(hit));
   const search = useObjectSearch(profile?.id ?? null, q);
@@ -68,7 +72,9 @@ export function ObjectsSection({
   if (!q) {
     return (
       <PaletteGroup heading={heading}>
-        <PaletteNote>Type to search tables, views and collections</PaletteNote>
+        <PaletteNote>
+          {collections ? "Type to search tables, views and collections" : "Type to search tables and views"}
+        </PaletteNote>
       </PaletteGroup>
     );
   }
@@ -85,7 +91,9 @@ export function ObjectsSection({
         </div>
       )}
       {!search.isError && hits.length === 0 && !waiting && (
-        <PaletteNote>No table, view or collection matches “{q}”</PaletteNote>
+        <PaletteNote>
+          {collections ? "No table, view or collection matches" : "No table or view matches"} “{q}”
+        </PaletteNote>
       )}
       {hits.map((hit) => {
         // The explorer path names the object uniquely: database, schema, kind and name.

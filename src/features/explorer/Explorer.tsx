@@ -82,18 +82,21 @@ export function Explorer() {
     overscan: 20,
   });
 
-  /**
-   * Selects a row; its connection becomes the workspace's selected profile (the default of a new query tab). A node of
-   * a connection whose engine has a query context (Couchbase) also sets the context of the active query tab on it
-   * (spec §3.11.1); a connection's own row only selects it.
-   */
+  /** Selects a row; its connection becomes the workspace's selected profile (the default of a new query tab). */
   const selectRow = (row: TreeRow) => {
     setSelected(row.key);
     const profileId = rowProfileId(row);
     if (profileId) selectProfile(profileId);
-    if (row.type === "node" && findEngineInfo(entries, engines, row.profileId)?.query_context) {
-      applyTreeContext(row.profileId, row.node.path);
-    }
+  };
+
+  /**
+   * A pointer click on a node: selects it and, for a connection whose engine has a query context (Couchbase), sets the
+   * context of the active query tab on it (spec §3.11.1, ruling B48). Only a click does: walking the tree with the
+   * keyboard (`selectRow` alone) never retargets the open tab.
+   */
+  const clickNode = (row: Extract<TreeRow, { type: "node" }>) => {
+    selectRow(row);
+    if (findEngineInfo(entries, engines, row.profileId)?.query_context) applyTreeContext(row.profileId, row.node.path);
   };
 
   const toggle = useCallback(
@@ -287,7 +290,7 @@ export function Explorer() {
             className={cn(base, row.node.system && "opacity-60")}
             style={pad}
             title={row.node.detail ? `${label} — ${row.node.detail}` : label}
-            onClick={() => selectRow(row)}
+            onClick={() => clickNode(row)}
             onDoubleClick={() => activate(row)}
           >
             {chevron}
