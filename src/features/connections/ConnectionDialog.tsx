@@ -62,6 +62,7 @@ const SSL_FILE_FIELDS = [
 ] as const;
 /** SQL Server has no client certificates: only the CA file is offered (values stored earlier stay as they are). */
 const CA_FILE_ONLY_ENGINES: readonly Engine[] = ["mssql"];
+/** Shown under "Read-only connection" for engines whose server cannot enforce it (spec §3.4). */
 const SERVER_READ_ONLY_NOTE =
   "SQL Server cannot enforce read-only on the connection: DbaGuy blocks write statements itself. For a hard guarantee, use a login that can only read.";
 
