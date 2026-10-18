@@ -185,7 +185,7 @@ class StatementParams(BaseModel):       # extra="forbid"
     positional: list[str] = []          # $1、$2…／? 依序；最多 200 個
 ```
 
-- 名稱需符合 `[A-Za-z_][A-Za-z0-9_]*`；每個 literal 最多 1 MiB，且必須是合法 JSON（`json.loads(parse_float=Decimal, parse_constant=拒絕)`），否則 worker 回 `invalid_params`（訊息指出哪個參數，不含值）。
+- 名稱需符合 `[A-Za-z_][A-Za-z0-9_]*`；每個 literal 最多 1 MiB，且必須是合法 JSON（`json.loads(parse_int=str, parse_float=str, parse_constant=拒絕)`：只檢查形狀，數值範圍交給 server；`Decimal` 遇到 `1e99999…` 會丟 `InvalidOperation`，04a Task 6 review 修正），否則 worker 回 `invalid_params`（訊息指出哪個參數，不含值）。
 - `ExecuteCommand` 新增 `query_context: QueryContext | None = None`、`params: StatementParams | None = None`、`profile_plan: bool = False`。
 - `ExportCommand` 新增 `query_context`、`params`（匯出重跑同一句，必須同 context、同參數）。
 - `ResultSetEvent` 新增 `presentation: Literal["grid", "plan"] = "grid"`。
