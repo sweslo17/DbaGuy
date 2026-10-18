@@ -28,6 +28,11 @@ const ROW_HEIGHT = 22;
 const CONTAINER_KINDS = new Set(["folder", "database", "schema", "bucket", "scope"]);
 /** A Couchbase collection holds documents: double-click browses them (ruling B19); its detail is in its menu. */
 const BROWSABLE_KIND = "collection";
+/**
+ * A click on a node sets the active tab's context only this long after it, the double-click interval: a double-click
+ * on a collection opens a browse tab and must not retarget the tab that was open.
+ */
+const CONTEXT_CLICK_DELAY_MS = 250;
 
 type ErrorRow = Extract<TreeRow, { type: "error" }>;
 
@@ -91,14 +96,33 @@ export function Explorer() {
     if (profileId) selectProfile(profileId);
   };
 
+  // The one context change a click is waiting to make (see `clickNode`); gone with the Explorer.
+  const pendingContext = useRef<number | null>(null);
+  const cancelPendingContext = useCallback(() => {
+    if (pendingContext.current !== null) window.clearTimeout(pendingContext.current);
+    pendingContext.current = null;
+  }, []);
+  useEffect(() => cancelPendingContext, [cancelPendingContext]);
+
+  /** `selectRow` for a pointer click: a click that follows another one takes the place of its pending context change. */
+  const selectByClick = (row: TreeRow) => {
+    cancelPendingContext();
+    selectRow(row);
+  };
+
   /**
    * A pointer click on a node: selects it and, for a connection whose engine has a query context (Couchbase), sets the
-   * context of the active query tab on it (spec §3.11.1, ruling B48). Only a click does: walking the tree with the
+   * context of the active query tab on it (spec §3.11.1, ruling B48), `CONTEXT_CLICK_DELAY_MS` later: a double-click
+   * (`activate` on a collection) cancels it, and so does the next click. Only a click does: walking the tree with the
    * keyboard (`selectRow` alone) never retargets the open tab.
    */
   const clickNode = (row: Extract<TreeRow, { type: "node" }>) => {
-    selectRow(row);
-    if (findEngineInfo(entries, engines, row.profileId)?.query_context) applyTreeContext(row.profileId, row.node.path);
+    selectByClick(row);
+    if (!findEngineInfo(entries, engines, row.profileId)?.query_context) return;
+    pendingContext.current = window.setTimeout(() => {
+      pendingContext.current = null;
+      applyTreeContext(row.profileId, row.node.path);
+    }, CONTEXT_CLICK_DELAY_MS);
   };
 
   const toggle = useCallback(
@@ -118,6 +142,7 @@ export function Explorer() {
 
   const activate = (row: TreeRow) => {
     if (row.type === "node" && row.node.kind === BROWSABLE_KIND) {
+      cancelPendingContext(); // the browse tab has its own context: the open tab keeps its
       void openBrowseTab(row.profileId, row.node.path);
     } else if (row.type === "node" && !CONTAINER_KINDS.has(row.node.kind)) {
       openObject(row.profileId, row.node);
@@ -245,7 +270,7 @@ export function Explorer() {
       case "folder": {
         const Icon = kindIcon("folder");
         return (
-          <div {...aria} className={base} style={pad} onClick={() => selectRow(row)} onDoubleClick={() => toggle(row)}>
+          <div {...aria} className={base} style={pad} onClick={() => selectByClick(row)} onDoubleClick={() => toggle(row)}>
             {chevron}
             <Icon size={14} className="shrink-0 text-muted" />
             <span className="truncate">{row.name}</span>
@@ -259,8 +284,8 @@ export function Explorer() {
             {...aria}
             className={base}
             style={pad}
-            onClick={() => selectRow(row)}
-            onContextMenu={() => selectRow(row)}
+            onClick={() => selectByClick(row)}
+            onContextMenu={() => selectByClick(row)}
             onDoubleClick={() => toggle(row)}
           >
             {chevron}

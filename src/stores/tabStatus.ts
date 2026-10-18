@@ -21,6 +21,11 @@ export function useTabStatus(tabId: string): TabStatus {
   return useStatuses((statuses) => statuses[tabId] ?? IDLE);
 }
 
+/** Whether the tab reports a run, an export or a page in progress; for code outside React (a tree click). */
+export function isTabBusy(tabId: string): boolean {
+  return (useStatuses.getState()[tabId] ?? IDLE).busy;
+}
+
 /**
  * Sets the given fields of a tab's status (undefined ones keep their value). Cheap when nothing changes, so it may be
  * called on every keystroke. Only for a mounted tab: the entry goes when it unmounts (`useReportTabStatus`).

@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { api, unwrap } from "@/lib/api/client";
 import type { PathSegment, QueryContext } from "@/lib/api/types";
+import { isTabBusy } from "@/stores/tabStatus";
 import { useWorkspace } from "@/stores/workspace";
 import type { ExecutionState } from "../session/execution";
 import type { RunState } from "./useQueryRunner";
@@ -57,14 +58,15 @@ export function useContextOptions(profileId: string | null, current: QueryContex
 
 /**
  * A click on a tree node (spec §3.11.1): when the active tab is a query tab on the node's connection, its context
- * becomes the node's bucket and scope. Nothing otherwise, and nothing for a node outside any bucket.
+ * becomes the node's bucket and scope. Nothing otherwise, nothing for a node outside any bucket, and nothing while the
+ * tab is busy (the picker is disabled then, and the statements still to run keep the context the run started with).
  */
 export function applyTreeContext(profileId: string, path: PathSegment[]): void {
   const context = contextOfPath(path);
   if (!context) return;
   const { tabs, activeTabId, updateTab } = useWorkspace.getState();
   const tab = tabs.find((t) => t.id === activeTabId);
-  if (tab?.kind !== "query" || tab.profileId !== profileId) return;
+  if (tab?.kind !== "query" || tab.profileId !== profileId || isTabBusy(tab.id)) return;
   if (typeof tab.queryContext === "object" && sameContext(tab.queryContext, context)) return;
   updateTab(tab.id, "query", { queryContext: context });
 }
