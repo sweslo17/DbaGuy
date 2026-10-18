@@ -815,7 +815,10 @@ class SessionWorker:
             else:
                 if not ex.columns_sent:
                     presentation = result.presentation()
-                    ex.text_limit = PLAN_TEXT_LIMIT if presentation == "plan" else TEXT_LIMIT  # a plan is drawn whole
+                    plan = presentation == "plan"
+                    ex.text_limit = PLAN_TEXT_LIMIT if plan else TEXT_LIMIT  # a plan is drawn whole
+                    if plan:  # B45: never paused before its first row (a profile after a page the rows filled)
+                        budget = max(budget, 1)
                     self._send(ResultSetEvent(
                         request_id=ex.request_id, index=ex.index, columns=columns, presentation=presentation,
                     ))

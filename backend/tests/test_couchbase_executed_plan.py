@@ -143,6 +143,44 @@ def profiled_in(chunks: list[bytes], profile: bool = True):
                         profile=profile)
 
 
+class SetsResult(FakeResult):
+    """Result sets read in order, each `(presentation, rows)`."""
+
+    def __init__(self, *sets):
+        super().__init__(0)
+        self.sets = list(sets)
+
+    def columns(self):
+        return PLAN_COLUMNS
+
+    def presentation(self):
+        return self.sets[0][0]
+
+    def fetch(self, n):
+        presentation, rows = self.sets[0]
+        self.sets[0] = presentation, rows[n:]
+        return rows[:n]
+
+    def next_result(self):
+        self.sets.pop(0)
+        return bool(self.sets)
+
+
+def sets_worker(*sets):
+    """A worker whose every statement gives `SetsResult(*sets)`."""
+
+    class Connection(FakeConnection):
+        def statement(self, sql, options):
+            super().statement(sql, options)
+            return SetsResult(*sets)
+
+    return make_worker(Connection())
+
+
+def ends(rec, rid):
+    return [(e.index, e.row_count, e.has_more) for e in rec.of(rid, "result_set_end")]
+
+
 def step_until_settled(result, budget: int) -> list[ReadAheadState]:
     states = [result.read_ahead(budget).state]
     while states[-1] is ReadAheadState.READING:
@@ -267,33 +305,7 @@ def test_the_plan_text_limit_is_the_longest_text_sent_whole():
 
 def test_a_plan_cell_stays_whole_after_a_load_more_and_the_next_set_is_cut_again():  # B37
     big = JsonText('"' + "x" * 100_000 + '"')
-
-    class PlanThenGrid(FakeResult):
-        def __init__(self):
-            super().__init__(0)
-            self.sets = [("plan", [[big], [big]]), ("grid", [[big]])]
-
-        def columns(self):
-            return PLAN_COLUMNS
-
-        def presentation(self):
-            return self.sets[0][0]
-
-        def fetch(self, n):
-            presentation, rows = self.sets[0]
-            self.sets[0] = presentation, rows[n:]
-            return rows[:n]
-
-        def next_result(self):
-            self.sets.pop(0)
-            return bool(self.sets)
-
-    class Connection(FakeConnection):
-        def statement(self, sql, options):
-            super().statement(sql, options)
-            return PlanThenGrid()
-
-    worker, _, rec = make_worker(Connection())
+    worker, _, rec = sets_worker(("plan", [[big], [big]]), ("grid", [[big]]))
     try:
         execute(worker, "x", "anything", page_size=1)
         rec.wait_for(paused("x", 1))
@@ -319,3 +331,31 @@ def test_a_profile_follows_rows_loaded_after_a_full_read_ahead(cb_worker):
     assert values == list(range(200_000))
     profile = json.loads(rec.of("f", "rows")[-1].rows[0][0]["text"])
     assert profile["executionTimings"]["#operator"] == "Authorize" and "phaseTimes" in profile
+
+
+@pytest.mark.parametrize("second, expected_ends", [
+    (("plan", [[JsonText("{}")]]), [(0, 2, False), (1, 1, False)]),  # the profile's one row, in the same page
+    (("plan", [[JsonText("{}")]] * 2), [(0, 2, False), (1, 1, True)]),  # its first row, then the page pauses
+    (("grid", [[JsonText("{}")]]), [(0, 2, False), (1, 0, True)]),  # any other set pages as before
+], ids=["plan", "plan-of-two-rows", "grid"])
+def test_a_plan_set_after_a_full_page_comes_with_its_first_row(second, expected_ends):  # B45
+    worker, _, rec = sets_worker(("grid", [[1], [2]]), second)
+    try:
+        execute(worker, "x", "anything", page_size=2)
+        rec.wait_for(lambda e: e.type == "result_set_end" and e.request_id == "x" and e.index == 1)
+        assert ends(rec, "x") == expected_ends
+        second_rows = [row for event in rec.of("x", "rows") if event.index == 1 for row in event.rows]
+        assert second_rows == ([[{"$type": "json", "text": "{}"}]] if second[0] == "plan" else [])
+    finally:
+        worker.close()
+
+
+@requires_couchbase
+def test_a_profile_after_rows_that_fill_the_page_comes_with_its_row(cb_worker):  # B45: LIMIT 500 at page size 500
+    worker, rec = cb_worker
+    worker.submit(ExecuteCommand(request_id="x", sql="SELECT RAW a FROM ARRAY_RANGE(0, 500) AS a", page_size=500,
+                                 profile_plan=True))
+    rec.wait_for(finished("x"), timeout=30)
+    assert ends(rec, "x") == [(0, 500, False), (1, 1, False)]
+    profile = json.loads(rec.of("x", "rows")[-1].rows[0][0]["text"])
+    assert profile["executionTimings"]["#operator"] == "Authorize"
