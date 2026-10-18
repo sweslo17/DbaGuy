@@ -57,6 +57,17 @@ def test_an_empty_socket_changes_nothing():  # B42: draining the socket is not t
     assert clock.since == 10.0
 
 
+def test_enough_bytes_drained_end_the_stall_even_on_an_empty_socket():  # B44: a byte fact, not the emptiness signal
+    clock = StallClock(reset_bytes=16 * MIB)
+    clock.update(ReadAhead(S.FULL, 8 * MIB), now=10.0)
+    clock.update(ReadAhead(S.WAITING, 9 * MIB), now=20.0)  # a small Load more, then an empty socket
+    assert clock.since == 10.0
+    clock.update(ReadAhead(S.WAITING, 24 * MIB), now=30.0)  # a Load more drained 16 MiB, then an empty socket
+    assert clock.since is None
+    clock.update(ReadAhead(S.WAITING, 24 * MIB), now=40.0)  # and an empty socket still never starts one
+    assert clock.since is None
+
+
 def test_without_read_ahead_the_stall_starts_at_the_first_pause_and_never_restarts():  # R-04a-T11b
     clock = StallClock(reset_bytes=None)
     clock.update(ReadAhead(S.FULL), now=10.0)

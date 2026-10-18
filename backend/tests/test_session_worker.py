@@ -6,6 +6,7 @@ import threading
 import time
 
 import pytest
+from loguru import logger
 
 from dbaguy_backend.adapters.base import AdapterCapabilities, RawJsonRows, ReadAhead, ReadAheadState, RunOptions
 from dbaguy_backend.adapters.registry import AdapterRegistry
@@ -28,6 +29,7 @@ from dbaguy_backend.services.connection_service import ConnectionService
 from dbaguy_backend.services.profile_service import ProfileService
 from dbaguy_backend.services.safety import GuardAction, GuardDecision
 from dbaguy_backend.sessions.manager import SessionCreateRequest, SessionManager
+from dbaguy_backend.sessions.read_ahead import StallClock
 from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks
 from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.storage.paths import profiles_file
@@ -959,3 +961,63 @@ def test_engines_without_read_ahead_never_read_ahead():
         assert connection.results[0].calls == 0 and worker.paused_read_ahead() is None
     finally:
         worker.close()
+
+
+def test_a_load_more_that_drains_twice_the_budget_ends_the_stall_even_on_an_empty_socket():  # B44
+    clock = Clock()
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        execute(worker, "p", "rows 5000")
+        rec.wait_for(paused("p", 500))
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB))  # stopped at 1000.0
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1040.0
+        for _ in range(40):  # the Load more's fetch() drains 2 MiB (2 × the budget); the socket stays empty after it
+            conn.script.put(ReadAhead(ReadAheadState.WAITING, 3 * MIB))
+        worker.submit(FetchMoreCommand(request_id="p", count=2000))
+        rec.wait_for(paused("p", 2500))
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.WAITING)
+        clock.now = 1045.0  # 45 s after the stall began, but the server has been unblocked since
+        worker.check_paused_result()
+        _barrier(worker)
+        clock.now = 1100.0
+        worker.check_paused_result()
+        _barrier(worker)
+        assert not rec.of("p", "finished")
+        worker.submit(FetchMoreCommand(request_id="p", count=500))
+        rec.wait_for(paused("p", 3000))
+    finally:
+        worker.close()
+
+
+def test_a_failing_read_ahead_step_never_ends_the_worker(monkeypatch):  # B32: the step runs inside the loop's try
+    real_update, failed = StallClock.update, threading.Event()
+
+    def update_failing_once(self, step, now):
+        if not failed.is_set():
+            failed.set()
+            raise RuntimeError("bug in the worker's own step")
+        real_update(self, step, now)
+
+    monkeypatch.setattr(StallClock, "update", update_failing_once)
+    logged = []
+    sink = logger.add(lambda m: logged.append(m.record), level="ERROR")
+    worker, conn, rec = read_ahead_worker(Clock())
+    try:
+        execute(worker, "p", "rows 2000")
+        rec.wait_for(paused("p", 500))
+        assert failed.wait(5)
+        _barrier(worker)  # the loop went on after the failure
+        assert worker._thread.is_alive()
+        assert [r for r in logged if r["message"] == "Session task failed on fake" and r["exception"] is not None]
+        worker.submit(FetchMoreCommand(request_id="p", count=500))
+        rec.wait_for(paused("p", 1000))
+        worker.cancel("p")  # paused: a discard
+        rec.wait_for(finished("p"))
+        assert conn.results[0].closed
+        execute(worker, "n", "rows 1")
+        rec.wait_for(finished("n"))
+        assert worker._thread.is_alive()
+    finally:
+        worker.close()
+        logger.remove(sink)

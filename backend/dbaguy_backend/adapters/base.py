@@ -107,8 +107,9 @@ class ReadAheadState(StrEnum):
     """Where one read-ahead step of a paused result left it (`StatementResult.read_ahead`)."""
 
     READING = "reading"  # took rows the server had sent; more may be on the socket
-    # The step read nothing: nothing is on the socket now. It says nothing about the server's own stall clock (an
-    # emptied socket does not mean the server's pending write completed, A23), so the stall clock ignores it (B42).
+    # The step read nothing: nothing is on the socket now. Emptiness says nothing about the server's own stall clock (an
+    # emptied socket does not mean the server's pending write completed, A23), so it neither starts nor ends a stall
+    # (B42); only its `received` counts (enough bytes drained since the stall, e.g. by a Load more, ends it, B44).
     WAITING = "waiting"
     FULL = "full"  # the budget is used up: reading stopped, the server will be held back from here
     DONE = "done"  # the whole answer is in memory, or ended in an error kept for later: nothing can stall
@@ -116,7 +117,8 @@ class ReadAheadState(StrEnum):
 
 @dataclass(frozen=True)
 class ReadAhead:
-    """One read-ahead step: its state, and the bytes of the server's answer read so far by any path (cumulative)."""
+    """One read-ahead step: its state, and the bytes of the server's answer read so far by any path (cumulative: rows
+    taken by `fetch()` / `fetch_raw()` count too, B44)."""
 
     state: ReadAheadState
     received: int = 0
