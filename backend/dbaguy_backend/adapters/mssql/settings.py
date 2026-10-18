@@ -1,6 +1,7 @@
 """How a SQL Server profile becomes pymssql._mssql.connect arguments, and a SQL Server URL a profile draft. Pure: no I/O."""
 
 import os
+import re
 import unicodedata
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ _URL_HINT = "e.g. mssql://user@host:1433/db or jdbc:sqlserver://host:1433;databa
 _INVALID_PORT = "Invalid port in the SQL Server URL"
 _NO_WINDOWS_LOGIN = "Windows and Azure AD logins are not supported: use a SQL login"
 _MIXED_FORMS = "This URL mixes the ?a=b&c=d and ;a=b forms. Use one form."
+_NAME_MESSAGE = "A name in this URL holds ; & ? = or @. Type it in the connection dialog instead."
 _KEY_VALUE = "A JDBC SQL Server URL takes key=value properties after the host"
 _OPEN_BRACE = "A {...} value in the JDBC URL is not closed"
 _FULLWIDTH_SEMICOLON = "；"  # what an IME types for ";"
@@ -152,6 +154,12 @@ _ENCRYPT_ON = frozenset({"true", "yes", "mandatory"})
 _SEPARATORS = ";&?"
 _ASSIGNMENT = "="
 _STORED_TEXT = frozenset({"user", "database", "server"})
+# A password with a `?`, `#`, `;k=v` or `/` in it ends the authority early: the digits before it become the port and
+# the user name the host. What follows then holds the `@` that really ended the authority, so no `@` is allowed in a
+# fragment, a key, a path, or the value of any property but these, whose values are names or the password.
+_AT_ALLOWED = frozenset({"user", "password", "database"})
+_DECODE_ROUNDS = 3  # `%253B` is `%3B` is `;`: a part is decoded until it stops changing, at most this often
+_PAIR_SHAPE = re.compile(r"[;&?].*=")  # a separator and later a "=": the rest of a URL, not a name
 
 
 def _fold(key: str) -> str:
@@ -159,27 +167,47 @@ def _fold(key: str) -> str:
     return "".join(key.lower().split()).replace("-", "").replace("_", "")
 
 
+def _variants(text: str) -> Iterator[str]:
+    """The text as written and decoded again and again until it stops changing (bounded), each after NFKC: so the
+    fullwidth ；＆？＝＠ and U+2047 (`??`) count, and so do `%3B` and `%253B`."""
+    for _ in range(_DECODE_ROUNDS + 1):
+        yield unicodedata.normalize("NFKC", text)
+        decoded = unquote(text)
+        if decoded == text:
+            return
+        text = decoded
+
+
 def _holds(chars: str, text: str) -> bool:
-    """Whether `text` holds one of `chars` as written, percent-decoded, or in a lookalike form: checked after NFKC, so
-    the fullwidth ；＆？＝＠ and U+2047 (`??`) count, and after percent-decoding, so `%3B` does."""
-    return any(c in chars for variant in (text, unquote(text)) for c in unicodedata.normalize("NFKC", variant))
+    return any(c in chars for variant in _variants(text) for c in variant)
 
 
-def _reject_mixed_forms(*texts: str, assignment: bool = False) -> None:
+def _written(char: str, text: str) -> bool:
+    """Whether `text` holds `char` as typed (after NFKC), not merely percent-encoded."""
+    return char in unicodedata.normalize("NFKC", text)
+
+
+def _reject_separators(*texts: str, assignment: bool = False, at: bool = False, key: bool = False) -> None:
     """A part of a URL that holds the separators of the other form is the rest of a URL, not a value:
     `?encrypt=true;password=x` would otherwise import `true;password=x`, the password in a field that is stored in
-    plain text. Every part but the password's own value goes through this. Fixed text: the part may hold the password."""
-    separators = _SEPARATORS + (_ASSIGNMENT if assignment else "")
-    if any(_holds(separators, text) for text in texts):
-        raise ValidationFailed(_MIXED_FORMS)
+    plain text. Every part but the password's own value goes through this. Fixed text: the part may hold the password.
+    A part that holds a separator and later a `=` is a pair (the mixed-forms text); a single name that holds a
+    character the URL cannot carry (`R&D`) gets the text that says to type it in the dialog."""
+    chars = _SEPARATORS + (_ASSIGNMENT if assignment else "") + ("@" if at else "")
+    for text in texts:
+        for variant in _variants(text):
+            if any(c in chars for c in variant):
+                raise ValidationFailed(_MIXED_FORMS if key or _PAIR_SHAPE.search(variant) else _NAME_MESSAGE)
 
 
 def _check_pair(key: str, raw_key: str, raw_value: str) -> None:
     """`key` is the decoded key, which names the property; the password's value is the one thing allowed anything."""
     name = _KEY_NAMES.get(_fold(key))
-    _reject_mixed_forms(raw_key)
+    _reject_separators(raw_key, key=True)
     if name != "password":
-        _reject_mixed_forms(raw_value, assignment=name in _STORED_TEXT)
+        _reject_separators(raw_value, assignment=name in _STORED_TEXT)
+    if _written("@", raw_key) or (name not in _AT_ALLOWED and _written("@", raw_value)):
+        raise ValidationFailed(MALFORMED_URL_MESSAGE)
 
 
 def _split_authority(text: str) -> tuple[SplitResult, int | None]:
@@ -321,9 +349,10 @@ def parse_mssql_url(url: str) -> ParsedUrl:
     # The authority and the path: a host that holds `=` is `Password=x;Server=h` after a scheme, a path that holds `@`
     # is a password with a `/` in it that ended the authority early (`u:12345/x@h/db` would split into host `u`).
     host_text = split.hostname or ""
-    if _holds("=", host_text) or _holds("@", split.path):
+    if _holds("=", host_text) or _written("@", split.path) or _written("@", split.fragment):
         raise ValidationFailed(MALFORMED_URL_MESSAGE)
-    _reject_mixed_forms(host_text, split.path, split.username or "", assignment=True)
+    _reject_separators(host_text, split.username or "", assignment=True)
+    _reject_separators(split.path, assignment=True, at=True)
     if values.get("instance", "").strip() or (split.scheme in _INSTANCE_PATH_SCHEMES and split.path.strip("/")):
         raise ValidationFailed(_NAMED_INSTANCE)
     host = unquote(split.hostname) if split.hostname else values.get("server", "")
