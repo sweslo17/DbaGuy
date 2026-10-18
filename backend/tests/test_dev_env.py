@@ -1,13 +1,16 @@
 import mysql.connector
 import psycopg
 import pytest
+from pymssql import _mssql
 
 from tests.support import (
     PG_HOST,
     PG_PASSWORD,
     PG_PORT,
     PG_USER,
+    mssql_connect,
     mysql_driver_kwargs,
+    requires_mssql,
     requires_mysql,
     requires_pg,
 )
@@ -67,3 +70,23 @@ def test_dev_mysql_has_edge_values_and_unusual_names(mysql_one):
     ) == "E7B7A8E8999F"
     assert mysql_one("SELECT HEX(`內容`) FROM `客戶備註`") == "E6B8ACE8A9A6"
     assert mysql_one("SELECT `order` FROM `group`") == 42
+
+
+@requires_mssql
+def test_dev_mssql_is_seeded():
+    conn = mssql_connect()
+    try:
+
+        def one(sql):
+            conn.execute_query(sql)
+            return [row[0] for row in conn.get_iterator(_mssql.ROW_FORMAT_TUPLE)][0]
+
+        assert one("SELECT COUNT(*) FROM dbo.big_table") == 100_000
+        assert one("SELECT COUNT(*) FROM analytics.dbo.page_views") == 50
+        assert one("SELECT COUNT(*) FROM sys.procedures") == 3
+        assert one("SELECT name FROM dbo.customers WHERE id = 2") == "林小明"
+        assert one("SELECT legacy FROM dbo.types_demo WHERE id = 1") == "中文"  # a Chinese_Taiwan varchar column
+        assert one("SELECT label FROM dbo.[brack]]et]") == "one"
+        assert one("SELECT HAS_DBACCESS('locked_away')") == 0
+    finally:
+        conn.close()

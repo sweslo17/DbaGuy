@@ -39,6 +39,36 @@ services:
       retries: 90
       start_period: 20s
 
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64  # Rosetta on Apple Silicon (OrbStack); ready in about 15-30 s
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: Dbaguy_dev1
+    ports:
+      - "127.0.0.1:14337:1433"
+    healthcheck:
+      # Healthy means "seeded": `up --wait` does not wait for the one-shot mssql-init, so this checks the seed's last
+      # step (dbaguy.dbo.seed_done) instead of the server alone.
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -b -Q \"SET NOCOUNT ON; IF OBJECT_ID('dbaguy.dbo.seed_done') IS NULL RAISERROR('not seeded', 16, 1)\" >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 100
+      start_period: 30s
+
+  mssql-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    depends_on:
+      - mssql
+    environment:
+      MSSQL_SA_PASSWORD: Dbaguy_dev1
+    volumes:
+      - ./mssql:/mssql:ro
+    entrypoint: ["/bin/bash", "/mssql/seed.sh"]  # seeds once, then stays up idle (R-03b-P1)
+    restart: "no"
+
   bastion:
     build: ./bastion
     ports:
@@ -46,3 +76,4 @@ services:
     depends_on:
       - postgres
       - mysql
+      - mssql
