@@ -156,6 +156,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
 - Couchbase：
   - 欄位：沒有 `*` 的結果，首頁之後才出現、signature 以外的 key 只有一則 WARNING（JSON／JSONL 匯出看得到全部）；`*` 的結果多一欄 `(other fields)`，而且第一批列要等首頁（≤ 500 列／8 MiB）讀完才出現。
   - CSV／TSV 裡 NULL 與 MISSING 都是空字串，要分辨用 JSON 匯出。
+  - 數字原文只在 server 原樣轉送時保留：整份文件（`SELECT d`、`SELECT RAW d`、`*`）照存的原文；投影單一欄位（`SELECT d.dec`）由 server 重新編碼（7.6.12：`1.10`→`1.1`、`1E+3`→`1000`、`1e-400`→`0`、`1e400`→字串 `"<binary (5 b)>"`），含 `1e400` 的文件 `d.*` 回 `{}`。DbaGuy 顯示的就是 server 送來的值。
   - TLS：只信任 OpenSSL 預設的 CA bundle（不讀 macOS 鑰匙圈，打包版不一定找得到預設 bundle），verify-ca／verify-full 通常要給 cluster 的 CA 檔（失敗時的提示依 SSL 錯誤的種類：憑證沒有這個 host 名稱／發行者未知或自簽／這個 port 不是 TLS，其他只顯示 OpenSSL 的原文；連到 8091／18091 這類不是 query service 的 port 會收到 404，訊息指出 port 不對）；SSL mode `prefer`＝`disable`（Couchbase 的 TLS 在另一個 port，沒有東西可以試），也就是明文 HTTP，連線對話框有提示。
   - 多節點探索、`alternateAddresses`、Reconnect 換 node 只用 fixture 與單節點 dev 驗過（公司 cluster 的檢查清單）；探索在 worker 開連線時阻塞，每個 seed 最多 3 秒，DNS 與 connect 不會被取消打斷。
   - 暫停：活躍使用 Load more 的結果也在第一次暫停後 45–60 秒關閉（列保留）；放得進 buffer 的結果可以一直 Load more 要等 04b 的預讀。server 在 77–86 秒的自砍是 7.6.12 實測，別的版本沒量。
