@@ -7,6 +7,7 @@ import pytest
 
 from dbaguy_backend.adapters.base import Endpoint, StatementCancelled, StatementError
 from dbaguy_backend.adapters.mssql import adapter as mssql_adapter
+from dbaguy_backend.adapters.mssql import cancel as mssql_adapter_cancel
 from dbaguy_backend.adapters.mssql import catalog, driver
 from dbaguy_backend.adapters.mssql.adapter import MssqlAdapter
 from dbaguy_backend.adapters.registry import AdapterRegistry
@@ -620,7 +621,7 @@ def test_cancelling_chatty_batches_never_hangs(kind, iterations):  # Critical: e
                 result.close()
                 outcome.append("ran")
             except StatementError as exc:
-                outcome.append(exc.code)
+                outcome.extend([exc.code, exc.message])
 
         runner = threading.Thread(target=attempt, daemon=True)
         runner.start()
@@ -630,7 +631,8 @@ def test_cancelling_chatty_batches_never_hangs(kind, iterations):  # Critical: e
         assert not runner.is_alive(), f"{kind}: hung in iteration {i}"
         assert outcome[0] in ("cancelled", "connection_lost"), outcome
         outcomes.append(outcome[0])
-        if outcome[0] == "connection_lost":
+        if outcome[0] == "connection_lost":  # auto-commit, nothing open before: dropped by itself, and told so (T8h)
+            assert outcome[1] == mssql_adapter_cancel.BUSY_DROPPED_MESSAGE
             connection.close()
             connection = None
         else:
@@ -639,6 +641,44 @@ def test_cancelling_chatty_batches_never_hangs(kind, iterations):  # Critical: e
         connection.close()
     if kind == "nowait":  # the cancel goes out from the message handler: the session stays
         assert outcomes.count("cancelled") == iterations
+
+
+@pytest.mark.parametrize("setup, batch", [
+    ("manual", "EXEC #zz_work"),  # manual commit: the batch's work is in an open transaction
+    ("open", "EXEC #zz_work"),  # auto-commit, but a transaction was open before the batch
+    ("word", "BEGIN TRAN; EXEC #zz_work"),  # auto-commit, the batch opens one itself
+])
+def test_a_batch_that_may_hold_a_transaction_is_never_dropped_by_the_first_cancel(conn, setup, batch):  # T8h
+    one(conn, CHATTY["dml"])
+    if setup == "manual":
+        conn.set_autocommit(False)
+    elif setup == "open":
+        one(conn, "BEGIN TRAN")
+    heard: list = []
+    conn.set_message_listener(lambda m: heard.append((m.severity, m.text)))
+    for _ in range(3):  # a rare quiet moment cancels the loop cleanly instead: try again
+        heard.clear()
+        thread, state = stream_in_thread(conn, batch)
+        time.sleep(0.3)
+        conn.cancel()
+        deadline = time.monotonic() + 4
+        while ("warning", mssql_adapter_cancel.BUSY_WARNING) not in heard and "out" not in state:
+            assert time.monotonic() < deadline, "neither a warning nor an end"
+            time.sleep(0.05)
+        if "out" not in state:
+            break
+        assert state["out"] == "cancelled"
+        conn.rollback()
+        if setup == "open":
+            one(conn, "BEGIN TRAN")
+    else:
+        pytest.skip("the loop found a quiet moment three times")
+    time.sleep(0.5)
+    assert thread.is_alive() and "out" not in state  # warned, still running: nothing was rolled back
+    assert [text for severity, text in heard if severity == "warning"] == [mssql_adapter_cancel.BUSY_WARNING]
+    conn.force_cancel()  # the second Cancel
+    thread.join(5)
+    assert state.get("out") == "connection_lost" and state["message"] == mssql_adapter_cancel.ABORTED_MESSAGE
 
 
 @pytest.fixture

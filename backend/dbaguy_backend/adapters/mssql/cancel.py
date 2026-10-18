@@ -20,8 +20,11 @@ So a cancel never makes two threads use the driver, except in that one situation
   without progress such as a row lock): once the socket has received nothing for GRACE_S and nothing waits unread, the
   worker is blocked waiting for data, and dbcancel() goes out from a canceller thread, holding no lock.
 - Still running WEDGE_S after the cancel without such a moment (a chatty batch without messages, e.g. a NOCOUNT OFF
-  loop): the socket is shut down. Never closed from another thread: closing under a reading thread aborts FreeTDS.
-  A second Cancel or closing the session also shuts it down once a cancel was sent and has not ended the call.
+  loop): when no transaction can be open, the socket is shut down. When one may be (manual commit, @@TRANCOUNT > 0
+  before the batch, a transaction word in it), a Cancel must never silently roll the user's work back (R-03b-T8h):
+  the request gets one warning and the cancel waits on; a second Cancel or closing the session drops the connection.
+  A second Cancel or closing the session also drops it once a cancel was sent and has not ended the call. The socket
+  is shut down, never closed from another thread: closing under a reading thread aborts FreeTDS.
 A shut-down connection reports connection_lost; the server ends the session and rolls back its transaction.
 
 Residual risk: data arriving within the microseconds between the quiet check and dbcancel() can still wedge the
@@ -37,7 +40,7 @@ import struct
 import termios
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -47,7 +50,7 @@ from loguru import logger
 from . import driver
 
 GRACE_S = 0.05  # the socket received nothing this long: the worker is blocked waiting for data
-WEDGE_S = 1.0  # a cancel that found no safe moment in this time drops the connection
+WEDGE_S = 1.0  # a cancel that found no safe moment in this time drops the connection, or warns (R-03b-T8h)
 _POLL_MS = 50  # the wait callback's polling step: how soon it sees the flag
 _WATCH_S = 0.01  # how often the canceller looks again
 _TCP_CONNECTION_INFO = 0x106  # macOS <netinet/tcp.h>; struct tcp_connection_info, tcpi_rxbytes at offset 88
@@ -55,6 +58,18 @@ _TCP_INFO_SIZE, _RXBYTES_AT = 112, 88
 ABORTED_MESSAGE = (
     "The connection was dropped to stop the statement; the server rolled back any open transaction. Reconnect to go on"
 )
+# In auto-commit mode with no transaction open before the batch: its completed statements are committed already.
+BUSY_DROPPED_MESSAGE = (
+    "The connection was dropped to stop the batch: it kept streaming row counts, so it could not be cancelled safely. "
+    "Statements it had already completed stay committed (auto-commit); the statement that was running, and any "
+    "transaction the batch itself opened, were rolled back. Reconnect to go on. SET NOCOUNT ON makes such batches "
+    "cancellable."
+)
+BUSY_WARNING = (
+    "This batch cannot be stopped safely while it streams row counts. Press Cancel again to drop the connection — the "
+    "server rolls back the open transaction. (SET NOCOUNT ON makes such batches cancellable.)"
+)
+_BUSY_REASON = "no safe moment to send the cancel and no transaction to lose: the batch kept the connection busy"
 
 
 class CallKind(StrEnum):
@@ -112,6 +127,7 @@ class Call:
     rows: int = 0
     ended_at: float | None = None
     watched: bool = False  # a canceller thread looks after this call
+    warned: bool = False  # no safe moment came and a transaction may be open: the request was told (R-03b-T8h)
     attention: str | None = None  # how a cancel was sent during this call ("across threads", "from a message")
     across_sent_at: float | None = None
     across_done_at: float | None = None
@@ -120,9 +136,16 @@ class Call:
 class CancelControl:
     """The cancel state of one connection: the flag, the driver call in progress, the socket, and the canceller."""
 
-    def __init__(self, conn: driver.Connection, spid: int) -> None:
+    def __init__(
+        self, conn: driver.Connection, spid: int, *, may_hold_transaction: Callable[[], bool] = lambda: True,
+        warn: Callable[[str], None] = lambda text: None,
+    ) -> None:
+        """`may_hold_transaction`: whether the running batch may have a transaction to lose (called on the canceller
+        thread while the worker is inside the driver). `warn`: tells the running request (thread-safe)."""
         self._conn = conn
         self._spid = spid
+        self._may_hold_transaction = may_hold_transaction
+        self._warn = warn
         self._lock = threading.Lock()
         self._changed = threading.Condition(self._lock)
         self._in_statement = False
@@ -137,6 +160,10 @@ class CancelControl:
     @property
     def unusable(self) -> bool:
         return self.aborted is not None or self.poisoned
+
+    @property
+    def aborted_message(self) -> str:
+        return BUSY_DROPPED_MESSAGE if self.aborted == _BUSY_REASON else ABORTED_MESSAGE
 
     def begin_statement(self) -> None:
         """The flag belongs to one statement (R-03a-P4): from here a cancel is kept, not dropped (R-03b-P5)."""
@@ -245,10 +272,11 @@ class CancelControl:
 
     def force_cancel(self) -> None:
         """A repeated Cancel of the same request: when a cancel was already sent for the driver call still running
-        (across threads, from a message, or the worker's own), drop the connection; otherwise cancel as usual."""
+        (across threads, from a message, or the worker's own), or the request was warned that it cannot be stopped
+        safely, drop the connection; otherwise (the first second of a cancel) cancel as usual."""
         with self._lock:
             call = self._call
-            if call is not None and (call.kind is CallKind.STOP or call.attention is not None):
+            if call is not None and (call.kind is CallKind.STOP or call.attention is not None or call.warned):
                 self._shutdown("forced by a second cancel", call)
                 return
         self.cancel()
@@ -277,33 +305,25 @@ class CancelControl:
         return False
 
     def _watch(self, call: Call, flagged_at: float) -> None:
-        """Send the cancel across threads at a safe moment, or drop the connection when none comes."""
+        """Send the cancel across threads at a safe moment. When none comes within WEDGE_S, drop the connection if no
+        transaction can be open, otherwise warn the request once and keep looking (R-03b-T8h)."""
         progress = [call.rows, flagged_at]
-        quiet = [None, flagged_at]  # [bytes received, since when unchanged]
-        unreachable_since: float | None = None
-        with self._lock:
-            while self._call is call and self.aborted is None and call.attention is None:
-                now = time.monotonic()
-                received = _received(self._socket.fd) if self._socket is not None else None
-                if received is not None:
-                    total, unread = received
-                    if total != quiet[0] or unread:
-                        quiet[0], quiet[1] = total, now
-                is_quiet = received is not None and now - quiet[1] >= GRACE_S
-                if self._reachable(call, progress):
-                    unreachable_since = None
-                else:
-                    unreachable_since = unreachable_since or now
-                    if is_quiet:
-                        call.attention, call.across_sent_at = "across threads", now
-                        break
-                    if now - unreachable_since >= WEDGE_S:
-                        self._shutdown("no safe moment to send the cancel: the statement kept the connection busy",
-                                       call)
-                        return
-                self._changed.wait(_WATCH_S)
-            else:
-                return
+        quiet: list = [None, flagged_at]  # [bytes received, since when unchanged]
+        unreachable: list = [None]  # since when the flag cannot reach the worker
+        while (outcome := self._safe_moment(call, progress, quiet, unreachable)) == "deadline":
+            holds = self._may_hold_transaction()  # outside the lock: it may lex the batch
+            with self._lock:
+                if self._call is not call or self.aborted is not None or call.attention is not None:
+                    return
+                if not holds:
+                    self._shutdown(_BUSY_REASON, call)
+                    return
+                call.warned = True
+            logger.info("SQL Server cancel of SPID {} found no safe moment and a transaction may be open: the request "
+                        "is warned, a second Cancel drops the connection", self._spid)
+            self._warn(BUSY_WARNING)
+        if outcome != "send":
+            return
         try:
             self._conn.cancel()  # the worker is the network reader: FreeTDS only wakes it
         except Exception as exc:  # never let a cancel raise
@@ -314,6 +334,29 @@ class CancelControl:
             self._changed.notify_all()
         logger.info("SQL Server cancel sent to SPID {} across threads while it waited for data ({}), in {:.0f} ms",
                     self._spid, call.kind, (call.across_done_at - call.across_sent_at) * 1000)
+
+    def _safe_moment(self, call: Call, progress: list, quiet: list, unreachable: list) -> str:
+        """Watch the call until it ends ("gone"), a safe moment for a cross-thread cancel comes ("send", marked on the
+        call), or, unless the request was warned already, WEDGE_S pass without one ("deadline")."""
+        with self._lock:
+            while self._call is call and self.aborted is None and call.attention is None:
+                now = time.monotonic()
+                received = _received(self._socket.fd) if self._socket is not None else None
+                if received is not None:
+                    total, unread = received
+                    if total != quiet[0] or unread:
+                        quiet[0], quiet[1] = total, now
+                if self._reachable(call, progress):
+                    unreachable[0] = None
+                else:
+                    unreachable[0] = unreachable[0] or now
+                    if received is not None and now - quiet[1] >= GRACE_S:
+                        call.attention, call.across_sent_at = "across threads", now
+                        return "send"
+                    if not call.warned and now - unreachable[0] >= WEDGE_S:
+                        return "deadline"
+                self._changed.wait(_WATCH_S)
+        return "gone"
 
     def _shutdown(self, reason: str, call: Call) -> None:
         """Caller holds the lock. Shut the socket down (never close it): the worker's reads end, its driver call

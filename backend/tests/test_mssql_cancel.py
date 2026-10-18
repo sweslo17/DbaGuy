@@ -7,7 +7,9 @@ import time
 
 import pytest
 
-from dbaguy_backend.adapters.mssql.cancel import GRACE_S, WEDGE_S, CallKind, CancelControl, CancelPending
+from dbaguy_backend.adapters.mssql.cancel import (
+    ABORTED_MESSAGE, BUSY_DROPPED_MESSAGE, BUSY_WARNING, GRACE_S, WEDGE_S, CallKind, CancelControl, CancelPending,
+)
 
 
 class FakeDriver:
@@ -36,9 +38,9 @@ def tcp_pair():
         sock.close()
 
 
-def control_on(sock: socket.socket) -> tuple[CancelControl, FakeDriver]:
+def control_on(sock: socket.socket, **options) -> tuple[CancelControl, FakeDriver]:
     driver = FakeDriver()
-    control = CancelControl(driver, spid=1)  # type: ignore[arg-type]
+    control = CancelControl(driver, spid=1, **options)  # type: ignore[arg-type]
     control.note_socket(sock.fileno())
     control.begin_statement()
     return control, driver
@@ -98,25 +100,50 @@ def test_a_cancel_reaches_a_waiting_worker_across_threads_once_the_socket_is_qui
     assert control.aborted is None
 
 
-def test_a_busy_connection_without_a_safe_moment_is_dropped(tcp_pair):  # a NOCOUNT OFF loop: data never stops
-    control, driver = control_on(tcp_pair[0])
-    busy, stop = tcp_pair[1], threading.Event()
+class Chatter:
+    """Keeps data arriving on the connection's socket (a NOCOUNT OFF loop never lets it go quiet)."""
 
-    def chatter():
-        while not stop.is_set():
-            busy.sendall(b"x" * 256)
+    def __init__(self, pair) -> None:
+        self._reader, self._sender = pair
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._send, daemon=True)
+
+    def _send(self) -> None:
+        while not self._stop.is_set():
+            self._sender.sendall(b"x" * 256)
             time.sleep(0.005)
 
-    sender = threading.Thread(target=chatter, daemon=True)
-    with control.call(CallKind.NEXT_SET):
-        sender.start()
+    def run_until(self, done, limit: float) -> float:
+        """Keep reading what arrives (as the worker does) until `done()` or `limit` seconds; returns the time taken."""
+        self._thread.start()
         started = time.monotonic()
+        while not done() and time.monotonic() - started < limit:
+            self._reader.recv(65536)
+        self._stop.set()
+        return time.monotonic() - started
+
+
+def test_a_busy_connection_without_a_safe_moment_is_dropped_when_no_transaction_can_be_open(tcp_pair):
+    control, driver = control_on(tcp_pair[0], may_hold_transaction=lambda: False)
+    with control.call(CallKind.NEXT_SET):
         control.cancel()
-        while control.aborted is None and time.monotonic() - started < WEDGE_S + 2:
-            tcp_pair[0].recv(65536)  # the worker keeps reading what arrives
-        stop.set()
-    assert control.aborted and "no safe moment" in control.aborted and driver.cancels == []
-    assert WEDGE_S <= time.monotonic() - started < WEDGE_S + 1
+        took = Chatter(tcp_pair).run_until(lambda: control.aborted is not None, WEDGE_S + 2)
+    assert control.aborted and "no transaction to lose" in control.aborted and driver.cancels == []
+    assert control.aborted_message == BUSY_DROPPED_MESSAGE and WEDGE_S <= took < WEDGE_S + 1
+
+
+def test_a_busy_connection_that_may_hold_a_transaction_is_warned_and_waits_for_a_second_cancel(tcp_pair):  # T8h
+    warnings: list[str] = []
+    control, driver = control_on(tcp_pair[0], may_hold_transaction=lambda: True, warn=warnings.append)
+    with control.call(CallKind.NEXT_SET):
+        control.cancel()
+        Chatter(tcp_pair).run_until(lambda: False, WEDGE_S + 1)
+        assert warnings == [BUSY_WARNING] and control.aborted is None  # told once, never dropped by itself
+        control.cancel()  # a timeout after the warning is a first Cancel only
+        assert control.aborted is None
+        control.force_cancel()  # the user's next Cancel
+    assert control.aborted == "forced by a second cancel" and control.aborted_message == ABORTED_MESSAGE
+    assert warnings == [BUSY_WARNING] and driver.cancels == []
 
 
 def test_rows_that_keep_coming_need_no_cancel_across_threads(tcp_pair):

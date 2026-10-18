@@ -48,7 +48,7 @@ from ..base import (
 )
 from . import catalog, driver, freetds, introspection
 from . import schema as mssql_schema
-from .cancel import ABORTED_MESSAGE, Call, CallKind, CancelControl, CancelledWhileWaiting, CancelPending
+from .cancel import Call, CallKind, CancelControl, CancelledWhileWaiting, CancelPending
 from .settings import CONNECT_TIMEOUT_S, URL_SCHEMES, connect_params, parse_mssql_url
 from .types import ColumnKind, described_kind, guessed_kinds, row_converter
 
@@ -233,7 +233,9 @@ class MssqlConnection(DatabaseConnection):
         self._spid = spid
         self._database = database
         self._read_only = read_only  # application-level only (spec §3.4): logged, never enforced here
-        self._control = CancelControl(conn, spid)
+        self._control = CancelControl(
+            conn, spid, may_hold_transaction=self._may_hold_transaction, warn=self._warn_running_request,
+        )
         if socket_fd is not None:
             self._control.note_socket(socket_fd)
         self._result: MssqlResult | None = None  # the open result until it is read to its end or closed
@@ -266,6 +268,19 @@ class MssqlConnection(DatabaseConnection):
 
     def abort(self) -> None:
         self._control.abort()
+
+    def _may_hold_transaction(self) -> bool:
+        """Whether the running batch may have a transaction to lose (R-03b-T8h): manual commit, one open before it (the
+        state was read when it started), or a transaction word in its text. The canceller thread asks, while the
+        worker is inside the driver and changes none of this."""
+        if self._implicit or self._trancount > 0:
+            return True
+        if self._transaction_words is None:
+            self._transaction_words = _mentions_transaction(self._batch)
+        return self._transaction_words
+
+    def _warn_running_request(self, text: str) -> None:
+        self.note(ServerMessage(severity=MessageSeverity.WARNING, text=text))
 
     def row_call(self) -> AbstractContextManager[Call]:
         return self._control.call(CallKind.ROWS)
@@ -310,7 +325,7 @@ class MssqlConnection(DatabaseConnection):
     def _lost_error(self) -> StatementError:
         self._lost = True
         if self._control.aborted is not None:
-            return StatementError(ABORTED_MESSAGE, code="connection_lost")
+            return StatementError(self._control.aborted_message, code="connection_lost")
         return StatementError("Connection to the server was lost", code="connection_lost")
 
     def _check_usable(self) -> None:

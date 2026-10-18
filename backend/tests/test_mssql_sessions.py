@@ -5,6 +5,7 @@ import pytest
 from dbaguy_backend.adapters.base import Endpoint
 from dbaguy_backend.adapters.mssql import adapter as mssql_adapter
 from dbaguy_backend.adapters.mssql.adapter import MssqlAdapter
+from dbaguy_backend.adapters.mssql.cancel import BUSY_WARNING
 from dbaguy_backend.domain.execution import CommitCommand, ExecuteCommand, SetAutocommitCommand
 from dbaguy_backend.sessions.worker import SessionWorker
 from tests.fake_db import FakeLease
@@ -177,3 +178,26 @@ def test_a_timeout_stops_a_select_blocked_on_a_row_lock(mssql_worker):  # Import
         locker.set_autocommit(True)
         locker.run("DROP TABLE ##zz_locktimeout").close()
         locker.close()
+
+
+def test_a_timeout_on_a_batch_that_may_hold_a_transaction_warns_and_the_next_cancel_drops(mssql_worker):  # T8h
+    worker, rec = mssql_worker
+    command(worker, rec, SetAutocommitCommand(request_id="m", enabled=False))
+    run(worker, rec, "p", "CREATE PROCEDURE #zz_busy AS BEGIN DECLARE @t TABLE (a int); DECLARE @i int = 0; "
+                          "WHILE @i < 3000000 BEGIN INSERT @t VALUES (@i); SET @i += 1; END; SELECT 'done' AS d; END")
+    for attempt in range(3):  # a rare quiet moment lets the timeout cancel cleanly: try again
+        rid = f"b{attempt}"
+        worker.submit(ExecuteCommand(request_id=rid, sql="EXEC #zz_busy", timeout_s=0.3))
+        event = rec.wait_for(lambda e: getattr(e, "request_id", None) == rid and (
+            e.type == "finished" or (e.type == "message" and e.text == BUSY_WARNING)), timeout=10)
+        if event.type == "message":
+            break
+        assert event.cancelled and event.timed_out
+    else:
+        pytest.skip("the loop found a quiet moment three times")
+    assert event.severity == "warning"
+    time.sleep(0.5)
+    assert not rec.of(rid, "finished")  # the timeout only warned: the transaction's work is still there
+    worker.cancel(rid)  # the user's Cancel after the timeout drops the connection
+    done = rec.wait_for(finished(rid), timeout=10)
+    assert rec.of(rid, "error")[0].code == "connection_lost" and not done.in_transaction

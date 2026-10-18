@@ -178,7 +178,7 @@ class SessionWorker:
         # A cancel reached the running request; honoured right before run() and at the next page boundary in case no
         # driver call was in flight to interrupt (the driver then has nothing to cancel and the request would go on).
         self._cancel_requested = False
-        self._cancels = 0  # Cancel commands that reached the running request: the second one forces
+        self._cancels = 0  # Cancels (and a timeout) that reached the running request: a Cancel after one forces
         self._queued: dict[str, bool] = {}  # requests waiting in the queue -> cancelled before they started
         self._open_exec: _OpenExecution | None = None
         self._closed = False
@@ -349,6 +349,7 @@ class SessionWorker:
                 return  # paused or over: the timeout no longer applies
             logger.info("Request {} on {} timed out after {:g} s", req.request_id, self.name, req.timeout_s)
             req.timed_out = True
+            self._cancels += 1  # a timeout is a first Cancel only, but the user's next Cancel then forces
             self._interrupt_running()
 
     # ---- worker thread ----

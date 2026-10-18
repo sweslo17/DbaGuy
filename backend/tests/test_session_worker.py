@@ -160,6 +160,17 @@ def test_a_timeout_never_forces(started_worker):  # a statement timeout behaves 
     assert conn.interruptions == ["cancel"]
 
 
+def test_a_cancel_after_a_timeout_forces(started_worker):  # R-03b-T8h: the warning after a timeout says "press Cancel"
+    worker, conn, recorder = started_worker(Recorder())
+    worker.submit(ExecuteCommand(request_id="t", sql="hold", timeout_s=0.2))
+    assert conn.blocked.wait(5)
+    time.sleep(0.4)
+    assert conn.interruptions == ["cancel"] and not recorder.of("t", "finished")
+    worker.cancel("t")
+    recorder.wait_for(finished("t"))
+    assert conn.interruptions == ["cancel", "force"] and recorder.of("t", "error")[0].code == "connection_lost"
+
+
 @pytest.mark.parametrize("sql, column", [("rows 3\x00", 7), ("SELECT 1;\n-- a\x00 b", 5)])
 def test_text_with_a_nul_character_never_reaches_the_connection(started_worker, sql, column):  # Important 3
     worker, conn, recorder = started_worker(Recorder())
