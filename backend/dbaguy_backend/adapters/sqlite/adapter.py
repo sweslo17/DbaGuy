@@ -1,4 +1,7 @@
 import sqlite3
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
@@ -26,6 +29,7 @@ from . import introspection
 from . import schema as sqlite_schema
 
 _PEEK_ROWS = 200
+_PROGRESS_OPS = 10_000  # VM instructions between two looks at the cancel flag: ~0.3% slower, stops within ~0.1 ms
 # Statements that control the transaction themselves or cannot run inside one: manual mode does not BEGIN for them.
 _NO_AUTO_BEGIN = frozenset(
     {"BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE", "VACUUM", "PRAGMA", "ATTACH", "DETACH"}
@@ -49,9 +53,49 @@ def _category(value: Any) -> tuple[str, ColumnCategory]:
     return "", ColumnCategory.OTHER
 
 
+class _CancelGate:
+    """Makes a cancel reliable. `sqlite3_interrupt()` only stops a statement that is already running: when a statement
+    starts while none is, SQLite clears the flag, so an interrupt that lands between `execute()` being entered (while
+    the statement is parsed, and the worker thread gives up the GIL) and the first step is lost, and a statement that
+    never ends then never stops. A cancel that arrives while the worker thread is inside a driver call (`call()`) also
+    raises a flag that SQLite's progress handler turns into an interrupt as soon as the statement runs. A cancel that
+    arrives outside any call leaves no flag behind, so it can never cancel a later statement."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._lock = threading.Lock()
+        self._in_call = False
+        self._requested = False
+        conn.set_progress_handler(self._interrupt_if_requested, _PROGRESS_OPS)
+
+    def _interrupt_if_requested(self) -> int:  # called by SQLite on the worker thread, inside a step
+        return 1 if self._requested else 0
+
+    @contextmanager
+    def call(self) -> Iterator[None]:
+        """Around every driver call that can run a statement (`execute`, `fetchmany`); worker thread only."""
+        with self._lock:
+            self._in_call = True
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._in_call = False
+                self._requested = False
+
+    def cancel(self) -> None:
+        """Any thread."""
+        with self._lock:
+            if self._in_call:
+                self._requested = True
+            self._conn.interrupt()  # also stops what the progress handler cannot reach, e.g. a long sort
+
+
 class SqliteStatementResult(StatementResult):
-    def __init__(self, cursor: sqlite3.Cursor) -> None:
+    def __init__(self, cursor: sqlite3.Cursor, gate: _CancelGate) -> None:
+        """Called by `run()` inside `gate.call()`, right after `execute()`, so reading the first rows is covered too."""
         self._cursor = cursor
+        self._gate = gate
         self._buffer: list[tuple[Any, ...]] = []
         self._columns: list[ColumnMeta] | None = None
         self._closed = False
@@ -77,7 +121,8 @@ class SqliteStatementResult(StatementResult):
         self._buffer = self._buffer[n:]
         if len(rows) < n and not self._closed:
             try:
-                rows.extend(self._cursor.fetchmany(n - len(rows)))
+                with self._gate.call():
+                    rows.extend(self._cursor.fetchmany(n - len(rows)))
             except sqlite3.Error as exc:
                 raise _translate(exc) from exc
         return [list(r) for r in rows]
@@ -105,6 +150,7 @@ class SqliteConnection(DatabaseConnection):
         self._conn = conn  # isolation_level=None: the driver never begins a transaction on its own
         self._path = path
         self._manual = False  # manual-commit mode: run() begins a transaction in front of every statement
+        self._gate = _CancelGate(conn)
 
     def server_info(self) -> ServerInfo:
         return ServerInfo(engine=Engine.SQLITE, version=sqlite3.sqlite_version, current_database="main")
@@ -144,14 +190,15 @@ class SqliteConnection(DatabaseConnection):
             raise _translate(exc) from exc
 
     def run(self, sql: str) -> StatementResult:
-        self._begin_if_manual(sql)
-        cursor = self._conn.cursor()
-        try:
-            cursor.execute(sql)
-        except sqlite3.Error as exc:
-            cursor.close()
-            raise _translate(exc) from exc
-        return SqliteStatementResult(cursor)
+        with self._gate.call():  # from here a cancel sticks until the statement runs (see _CancelGate)
+            self._begin_if_manual(sql)
+            cursor = self._conn.cursor()
+            try:
+                cursor.execute(sql)
+                return SqliteStatementResult(cursor, self._gate)
+            except sqlite3.Error as exc:
+                cursor.close()
+                raise _translate(exc) from exc
 
     def in_transaction(self) -> bool:
         return self._conn.in_transaction
@@ -180,7 +227,7 @@ class SqliteConnection(DatabaseConnection):
             raise _translate(exc) from exc
 
     def cancel(self) -> None:
-        self._conn.interrupt()
+        self._gate.cancel()
 
     def close(self) -> None:
         self._conn.close()

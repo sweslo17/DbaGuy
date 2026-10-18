@@ -115,6 +115,38 @@ def test_cancel_long_query(db_path):
     conn.close()
 
 
+ENDLESS = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c"
+
+
+def test_cancel_landing_as_run_starts_is_not_lost(db_path, monkeypatch):
+    """sqlite3_interrupt() does nothing while no statement runs, and a statement clears it when it starts: a cancel that
+    arrived while run() was still parsing the statement used to vanish, and an endless statement then never stopped."""
+    conn = open_conn(db_path)
+    # the cancel lands right after run() is entered, before the statement is parsed and stepped
+    monkeypatch.setattr(conn, "_begin_if_manual", lambda sql: conn.cancel())
+    watchdog = threading.Timer(3, conn.cancel)  # a lost cancel must fail this test, not hang the suite
+    watchdog.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(StatementCancelled):
+            conn.run(ENDLESS)
+        assert time.monotonic() - started < 2, "the cancel was lost; only the watchdog stopped the statement"
+    finally:
+        watchdog.cancel()
+        conn.close()
+
+
+def test_a_cancel_with_nothing_running_does_not_cancel_the_next_statement(db_path):
+    conn = open_conn(db_path)
+    try:
+        conn.cancel()
+        # long enough for SQLite's progress handler (every 10 000 instructions) to look at a stale flag
+        sql = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 200000) SELECT count(*) FROM c"
+        assert conn.run(sql).fetch(1) == [[200000]]
+    finally:
+        conn.close()
+
+
 def test_missing_file(tmp_path):
     with pytest.raises(ConnectionFailed):
         open_conn(tmp_path / "missing.db")
