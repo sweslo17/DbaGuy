@@ -47,10 +47,10 @@ From `docs/research/2026-10-15-feature-priorities.md`. Every task review and the
   - `adapters/couchbase/http.py`: `CONNECT_TIMEOUT_S = 10.0` (connect and TLS handshake; reads afterwards are blocking with no timeout), `KEEPALIVE_REUSE_S = 30.0`, `READ_CHUNK = 64 * 1024`, path `/query/service`.
   - `adapters/couchbase/nodes.py`: `DISCOVERY_TIMEOUT_S = 3.0`.
   - `adapters/couchbase/settings.py`: query ports 8093 / 18093 (TLS), manager ports 8091 / 18091 (TLS), `default_port = 8093`.
-  - `client_context_id` = `"dbaguy-" + request_id` with every character outside `[A-Za-z0-9_-]` removed, cut to 64 characters.
+  - `client_context_id` = `"dbaguy-" + uuid4().hex` (`run()` receives no request id, ruling P30) with every character outside `[A-Za-z0-9_-]` removed, cut to 64 characters; `client_context_id()` takes any id string (P47).
   - TCP keepalive 30 s idle, 10 s interval, 3 probes, through the shared `adapters/sockets.enable_keepalive()`.
 - Request body (spec §3.4.1): assembled as text, parameter literals embedded unchanged; `readonly: true` for every request of a read-only profile and for every internal query (catalog, probes); `query_context` as `default:` + quoted parts; **never** send `timeout` or `scan_consistency`; header `User-Agent: DbaGuy/<app_version()>`.
-- Only the worker thread that owns a connection sends, reads or closes its HTTP connection. Another thread may only call `cancel()` / `force_cancel()` / `abort()`, which shut down a dup of the socket taken at connect time; never `SSLSocket.shutdown()`, never closing the shared socket object from another thread (the ③ lesson: no driver state is touched by two threads).
+- Only the worker thread that owns a connection sends, reads or closes its HTTP connection. Another thread may only call `cancel()` / `force_cancel()` / `abort()`, which shut down a dup of the socket taken at connect time; never `SSLSocket.shutdown()` (one exception, ruling P41, spec §9: only if Task 1's A10 probe shows that shutting down the duplicated TCP descriptor does not end a blocked TLS read, `HttpChannel.shutdown()` also shuts down the TLS socket, and then any exception the reader gets while the cancel flag is set counts as cancelled), never closing the shared socket object from another thread (the ③ lesson: no driver state is touched by two threads).
 - Logging is loguru, per spec §5. INFO: connection (host:port, chosen node, TLS mode, discovery outcome, edition, version), session open/close, cancel (how, ms), paused-result auto-close. WARNING: connection lost mid-request, malformed response (offset and field name only), ignored option keys, dropped URL parameter keys, keys outside the columns after the first page. DEBUG: SQL text (first 2000 characters, as the worker), request id and `client_context_id`, parameter **names**, HTTP status, metrics. **Never**: the `Authorization` header, passwords, parameter values, document or row contents.
 - DbaGuy's own errors are fixed texts that never echo SQL, documents, parameter values, URLs or passwords; server errors are shown as sent (M10).
 - Literals and identifiers come only from `sql/dialects.py` (SQL++: `quote_ident` / `force_quote_ident` / `keyspace_path` / `quote_literal` = JSON). Catalog queries use named parameters, never spliced names (spec §3.8). `sql/` stays pure: no I/O, every dialect table is a dict keyed by `Dialect`, SQL text never logged above DEBUG. Offsets crossing HTTP are UTF-16, converted only through `sql/offsets.py` (`Utf16Index`, `utf16_column`).
@@ -159,8 +159,8 @@ Task order follows dependencies. The dev cluster (1) comes first: its probes dec
 - Consumes: the R-03b-P1 one-shot pattern (`dev/mssql/seed.sh`: idle ending, TERM trap, `run`).
 - Produces, in `tests/support.py`:
   - `COUCHBASE_HOST = "127.0.0.1"`, `COUCHBASE_PORT = int(os.environ.get("DBAGUY_TEST_COUCHBASE_PORT", "8093"))`, `COUCHBASE_TLS_PORT = 18093`, `COUCHBASE_MANAGER_PORT = 8091`, `COUCHBASE_USER = "dbaguy"`, `COUCHBASE_PASSWORD = "dbaguy"`, `COUCHBASE_READER = "dbaguy_reader"`;
-  - `couchbase_query_text(statement: str, params: dict[str, Any] | None = None, *, user: str = COUCHBASE_USER, password: str = COUCHBASE_PASSWORD) -> str` — POSTs `{"statement": …, **params}` to `/query/service` with stdlib `http.client` and returns the raw response text;
-  - `couchbase_query(statement, params=None, *, user=…, password=…) -> dict[str, Any]` — the same, parsed with `json.loads(…, parse_float=Decimal)`;
+  - `couchbase_query_text(statement: str, params: dict[str, Any] | None = None, *, user: str = COUCHBASE_USER, password: str = COUCHBASE_PASSWORD, timeout: float = 60.0) -> str` — POSTs `{"statement": …, **params}` to `/query/service` with stdlib `http.client` (HTTP timeout `timeout` seconds; the import-time `_couchbase_ready()` uses 5, P48) and returns the raw response text;
+  - `couchbase_query(statement, params=None, *, user=…, password=…, timeout=…) -> dict[str, Any]` — the same, parsed with `json.loads(…, parse_float=Decimal)`;
   - `couchbase_ca_file(directory: Path) -> Path` — writes the cluster CA(s) from `GET /pools/default/trustedCAs` (admin) to `directory / "couchbase-ca.pem"`;
   - `completed_request_state(client_context_id: str) -> str | None` — `state` of that request in `system:completed_requests` (admin), polled for up to 3 s;
   - `LONG_AGGREGATE = "SELECT COUNT(*) AS n FROM ARRAY_RANGE(0, 100000) AS a UNNEST ARRAY_RANGE(0, 100000) AS b"` (minutes of server work, no rows until the end);
@@ -172,7 +172,7 @@ Task order follows dependencies. The dev cluster (1) comes first: its probes dec
   - indexes: `#primary` on `app.users`, `app.orders`, `app.events`; `idx_orders_amount ON app.orders(amount DESC)`; `idx_users_deferred ON app.users(name) WITH {"defer_build": true}` (state `deferred`); none on `app.noindex`;
   - `app.events`: 20,000 documents with keys `e100000` … `e119999` (key order = number order); every 7th (`i % 7 = 0`) has no `amount`; `i ≥ 1000 AND i % 1000 = 0` and not a multiple of 7 has an extra key `late` (first at `e101000`, row 1,001 in key order);
   - `app.users` (stored byte for byte through the console docs endpoint): `u1` … `u5` (mixed shapes), `u_numbers`, `u_keyorder` (a newline and odd spacing in its text), non-object `s1` (string), `a1` (array), `n1` (number); plus `u_big` (5 MiB string field) and `u_ttl` (expiration 4102444800 = 2100-01-01, ruling P8) through SQL++;
-  - `app.orders`: `o0` … `o499`; `app.blobs`: `bin1` (binary), `txt1` (text, not JSON), `j1` (JSON); `app.noindex`: `n_1`; `` app.`value` ``: `v1`; `` app.`odd-name` ``: `x1`;
+  - `app.orders`: `o0` … `o499`; `app.blobs`: `bin1` (binary), `txt1` (text, not JSON), `j1` (JSON) — `bin1` / `txt1` only if Step 5's image check shows `cbc` can write them (P40); `app.noindex`: `n_1`; `` app.`value` ``: `v1`; `` app.`odd-name` ``: `x1`;
   - `dbaguy._default._default::seed_done` (written last).
 
 The exact document texts (the tests compare them byte for byte):
@@ -215,10 +215,12 @@ def test_dev_couchbase_is_seeded():
     assert sorted(types["results"]) == ["base64", "base64", "json"]  # A20
     assert one('SELECT RAW META(d).expiration FROM dbaguy.app.users AS d USE KEYS "u_ttl"') == 4102444800  # A21
     assert one('SELECT RAW LENGTH(d.blob) FROM dbaguy.app.users AS d USE KEYS "u_big"') == 5 * 1024 * 1024
-    reader = couchbase_query('SELECT RAW k.name FROM system:keyspaces AS k WHERE k.namespace = "default"',
-                             user=COUCHBASE_READER)
+    # No `namespace` predicate (P35): the 7.x rows call that field `namespace_id`, so `k.namespace` matches nothing.
+    reader = couchbase_query("SELECT RAW k.name FROM system:keyspaces AS k", user=COUCHBASE_READER)
     assert reader["results"] == ["users"]  # the limited user sees only its own keyspace (survey §5.1)
 ```
+
+(If Step 5's image check drops `bin1` / `txt1`, or Step 8 drops `u_ttl`, delete the matching A20 / A21 assertion from this test; P40.)
 
 - [ ] **Step 2: Run it and see it fail**
 
@@ -245,10 +247,11 @@ def _basic(user: str, password: str) -> str:
 
 def couchbase_query_text(
     statement: str, params: dict[str, Any] | None = None, *, user: str = COUCHBASE_USER,
-    password: str = COUCHBASE_PASSWORD,
+    password: str = COUCHBASE_PASSWORD, timeout: float = 60.0,
 ) -> str:
-    """One SQL++ request to the dev cluster's query service, answered as the raw response text."""
-    conn = http.client.HTTPConnection(COUCHBASE_HOST, COUCHBASE_PORT, timeout=60)
+    """One SQL++ request to the dev cluster's query service, answered as the raw response text. `timeout` (seconds) is
+    the HTTP timeout: the import-time readiness check uses a short one (P48)."""
+    conn = http.client.HTTPConnection(COUCHBASE_HOST, COUCHBASE_PORT, timeout=timeout)
     try:
         body = json.dumps({"statement": statement, **(params or {})})
         conn.request("POST", "/query/service", body=body,
@@ -258,8 +261,9 @@ def couchbase_query_text(
         conn.close()
 
 
-def couchbase_query(statement: str, params: dict[str, Any] | None = None, **auth: str) -> dict[str, Any]:
-    return json.loads(couchbase_query_text(statement, params, **auth), parse_float=Decimal)
+def couchbase_query(statement: str, params: dict[str, Any] | None = None, **options: Any) -> dict[str, Any]:
+    """`options`: `user`, `password`, `timeout` of couchbase_query_text."""
+    return json.loads(couchbase_query_text(statement, params, **options), parse_float=Decimal)
 
 
 def couchbase_ca_file(directory: Path) -> Path:
@@ -292,7 +296,8 @@ def _couchbase_ready() -> bool:
     if not _port_open(COUCHBASE_PORT):
         return False
     try:
-        done = couchbase_query('SELECT RAW COUNT(*) FROM dbaguy._default._default USE KEYS "seed_done"')
+        # A short timeout (P48): this runs at import, and a slow query service must not stall every pytest start for 60 s
+        done = couchbase_query('SELECT RAW COUNT(*) FROM dbaguy._default._default USE KEYS "seed_done"', timeout=5)
         return done.get("results") == [1]
     except (OSError, ValueError, http.client.HTTPException):
         return False
@@ -345,7 +350,16 @@ def make_couchbase_profile(**overrides) -> ServerProfile:
     restart: "no"
 ```
 
-- [ ] **Step 5: Write `dev/couchbase/seed.sh`** exactly as below (mode 755). The image has `curl`, `cbq`, `cbc` and `python3` (checked while planning: `cbc create` takes `--scope`, `--collection`, `-f` flags, `-e` expiry, and the value on stdin).
+- [ ] **Step 5: Check the image, then write `dev/couchbase/seed.sh`** exactly as below (mode 755). The script relies on `curl`, `cbq`, `cbc` and `python3` in the image, which the pre-flight review could not confirm (P40), so check first: `docker run --rm --entrypoint sh couchbase/server:enterprise-7.6.12 -c 'command -v curl cbq cbc python3; cbc create --help'`.
+  - `curl` or `cbq` missing: stop and report; the seed cannot be written as planned.
+  - `python3` missing: add `-d pretty=false` to the `curl` in `q()` (one-line JSON) and define `value()` as below, which takes the first scalar of `"results"` (every `value` call of the seed is a `SELECT RAW COUNT(*)`):
+
+    ```bash
+    value() { q "$1" | sed -n 's/.*"results":\[\([^],]*\)[],].*/\1/p'; }
+    ```
+
+  - `cbc` missing, or `cbc create --help` shows no `--scope` / `--collection`: drop `bin1` and `txt1` from 04a. Remove the `blob` function, the two `printf` lines and the two `blob` calls from the seed, and the A20 assertion from Step 1's test (nothing else uses them); record A20 as "not seeded" in Step 10 and add a row to "Carries to 04b and 04c" for 04c (binary and text documents).
+  - `u_ttl` stays on the SQL++ `OPTIONS` path whatever the check shows: there is no `cbc` fallback for it (Step 8).
 
 ```bash
 #!/bin/bash
@@ -401,11 +415,13 @@ sample_ready() {
     [[ "$(value 'SELECT RAW COUNT(*) FROM system:indexes AS i WHERE i.bucket_id = "travel-sample" OR i.keyspace_id = "travel-sample"')" -gt 0 ]] &&
     [[ "$(value 'SELECT RAW COUNT(*) FROM system:indexes AS i WHERE (i.bucket_id = "travel-sample" OR i.keyspace_id = "travel-sample") AND i.state != "online"')" == 0 ]]
 }
+# Only the scopes this seed creates are counted (P36): a `_system` scope (7.6) or a `_default._default` row that carries
+# bucket and scope fields would make an unrestricted count 308–310, the wait would time out and `up --wait` would fail.
 collections_ready() {
-  [[ "$(value 'SELECT RAW COUNT(*) FROM system:keyspaces AS k WHERE k.`bucket` = "dbaguy"')" == 307 ]]
+  [[ "$(value 'SELECT RAW COUNT(*) FROM system:keyspaces AS k WHERE k.`bucket` = "dbaguy" AND k.`scope` IN ["app", "many"]')" == 307 ]]
 }
 indexes_ready() {
-  [[ "$(value 'SELECT RAW COUNT(*) FROM system:indexes AS i WHERE i.bucket_id = "dbaguy" AND i.state = "online"')" == 4 ]]
+  [[ "$(value 'SELECT RAW COUNT(*) FROM system:indexes AS i WHERE i.bucket_id = "dbaguy" AND i.scope_id = "app" AND i.state = "online"')" == 4 ]]
 }
 
 wait_for 300 "the cluster manager" curl -sf -o /dev/null "$MGR/ui/index.html"
@@ -528,12 +544,12 @@ UPSERT INTO dbaguy.app.noindex (KEY, VALUE) VALUES ("n_1", {"note": "no index: r
 Run: `docker compose -f dev/docker-compose.yml up -d --build --wait && cd backend && .venv/bin/pytest -q`
 Expected: all green, `test_dev_couchbase_is_seeded` passes (not skipped). Then run the `up … --wait` command a second time and check that it exits 0 (R-03b-P1). A first pull of the image (0.9 GB) can exceed `--wait`'s patience: run the command again. Note the seed's duration (`docker logs dbaguy-dev-couchbase-init-1` timestamps) and `docker stats --no-stream dbaguy-dev-couchbase-1` memory for CLAUDE.md (Task 13).
 If `cbq -exit-on-error` turns out not to stop on an error (check with `docker exec dbaguy-dev-couchbase-init-1 cbq -e http://couchbase:8093 -u dbaguy -p dbaguy -q -exit-on-error -s 'SELEC 1'; echo $?`), replace each `run "${CBQ[@]}" -f FILE` with a loop over the file's `;`-terminated statements through `q` (the files hold no `;` inside strings).
-**A20** fails (a type is not `base64`) → write `bin1` / `txt1` with `cbc create … -f 0` and record the flags that work. **A21** fails (an error on the `OPTIONS` form, or another expiration) → remove that statement from `03-data.n1ql` and add `printf '{"name":"Expires in 2100"}' >/tmp/u_ttl; cbc create -U couchbase://couchbase/dbaguy -u dbaguy -P dbaguy --scope app --collection users -J -e 4102444800 u_ttl </tmp/u_ttl` to `seed.sh`. Record either outcome in the assumptions table.
+**A20** fails (a type is not `base64`) → write `bin1` / `txt1` with `cbc create … -f 0` and record the flags that work; a `blob` call that cannot connect or write at all (the node is named `127.0.0.1`, so `cbc` has to reach the data service at `couchbase:11210` through the cluster map) → drop `bin1` / `txt1` as in Step 5 (P40). **A21** fails (an error on the `OPTIONS` form, or another expiration) → `u_ttl` stays on the SQL++ path and `cbc` is no fallback (P40): remove that statement from `03-data.n1ql` and the A21 assertion from Step 1's test, record A21 as "not seeded" and add a row to "Carries to 04b and 04c" for 04c. Record either outcome in the assumptions table.
 
 - [ ] **Step 9: Run the Task 1 probes** with the cluster up. Save as `<scratchpad>/t1_probe.py` (stdlib only) and run `backend/.venv/bin/python -I <scratchpad>/t1_probe.py`:
 
 ```python
-"""Task 1 probes of plan 04a (A1, A6, A7, A10, A11, A15) against the dev cluster. Fake dev credentials only."""
+"""Task 1 probes of plan 04a (A1, A6, A7, A10, A11, A15, A22) against the dev cluster. Fake dev credentials only."""
 import base64, http.client, json, socket, ssl, tempfile, threading, time, uuid
 
 HOST, AUTH = "127.0.0.1", "Basic " + base64.b64encode(b"dbaguy:dbaguy").decode()
@@ -557,11 +573,13 @@ def ca_file():
 
 print("A1", post('SELECT META(d).id, * FROM dbaguy.app.events AS d LIMIT 2')[:600])
 print("A6", post("SELECT 1 AS a -- c\r, 2 AS b")[:400])
-for name, ch in [("NBSP", " "), ("EM SPACE", " "), ("IDEOGRAPHIC", "　"), ("ZWSP", "​"),
-                 ("BOM", "﻿")]:
+for name, ch in [("NBSP", "\u00a0"), ("EM SPACE", "\u2003"), ("IDEOGRAPHIC", "\u3000"), ("ZWSP", "\u200b"),
+                 ("BOM", "\ufeff")]:  # written as escapes: these characters are invisible in a source file (P43)
     print("A7", name, json.loads(post(f"SELECT{ch}1 AS a")).get("status"))
 for statement in ("EXPLAIN SELECT * FROM dbaguy.app.users", "ADVISE SELECT * FROM dbaguy.app.users WHERE name = 'x'"):
     print("A15", statement.split()[0], json.dumps(json.loads(post(statement)).get("signature")))
+print("A22 keyspaces", post("SELECT * FROM system:keyspaces LIMIT 3")[:1500])  # the field names (P35)
+print("A22 indexes", post("SELECT * FROM system:indexes LIMIT 1")[:1500])
 
 ca = ca_file()
 full = ssl.create_default_context(cafile=ca)
@@ -581,7 +599,7 @@ class Tls(http.client.HTTPConnection):  # the design of Task 7: a dup of the TCP
         raw = socket.create_connection((HOST, 18093), timeout=10)
         self.handle = raw.dup()
         self.sock = loose.wrap_socket(raw, server_hostname=HOST)
-        self.sock.settimeout(None)
+        self.sock.settimeout(20)  # not None (P42): a read that survives the shutdown ends in TimeoutError, not a hang
 
 
 ccid = "t1-a10-" + uuid.uuid4().hex[:8]
@@ -601,9 +619,9 @@ print("A10 server state:", post("SELECT RAW r.state FROM system:completed_reques
                                 **{"$id": ccid})[:300])
 ```
 
-Expected (recorded, not asserted): A1 rows `{"id":"e100000","d":{…}}`; A6 shows whether `b` is in the result; A7 one status per character; A10 the reader ends within about 100 ms and the state is `closed`; A11 `ok` or the verification error plus the SAN list; A15 the two signatures.
+Expected (recorded, not asserted): A1 rows `{"id":"e100000","d":{…}}`; A6 shows whether `b` is in the result; A7 one status per character; A10 the reader ends within about 100 ms and the state is `closed` (the read ending only with `TimeoutError`, about 20 s after the shutdown, means shutting down the TCP duplicate did not end the blocked TLS read: A10 failed, and the spec §9 fallback of Tasks 7 and 11 applies, P41); A11 `ok` or the verification error plus the SAN list; A15 the two signatures; A22 the field names of `system:keyspaces` and `system:indexes` rows (P35).
 
-- [ ] **Step 10: Record the results** in this plan's "Assumptions recorded during execution" table (Planning rulings): one row each for A1, A6, A7, A10, A11, A15, A20, A21 — the observed result in a few words and the effect on later tasks, exactly as that table's "Effect" column describes for each outcome.
+- [ ] **Step 10: Record the results** in this plan's "Assumptions recorded during execution" table (Planning rulings): one row each for A1, A6, A7, A10, A11, A15, A20, A21, A22 — the observed result in a few words and the effect on later tasks, exactly as that table's "Effect" column describes for each outcome.
 
 - [ ] **Step 11: Commit**
 
@@ -643,7 +661,7 @@ git commit -m "chore(dev): Couchbase 7.6.12 EE dev cluster seeded by an init con
   - `POST /sql/format-guard` with `FormatGuardRequest{dialect, original, formatted}` → `FormatGuardResponse{same: bool, offset: int | None}` (UTF-16, in `original`).
   - `STATEMENT_KEYWORDS[SQLPP]`, `CLAUSE_KEYWORDS[SQLPP]`; `classifier._EXPLAIN_KEYWORDS[SQLPP] = ()`; `_from_sqlglot()` returns None for `KEYWORD_ONLY_DIALECTS` without logging; `warm_up()` skips them.
   - Frontend: `SQL_DIALECTS.sqlpp` (a `SQLDialect.define`), `LANGUAGES.sqlpp = "n1ql"`, and `formatSql` replaces the text only when `/sql/format-guard` says `same`.
-- Breaks on purpose (updated here): `tests/test_sql_api.py` split ranges gain `"params": []`; `test_every_dialect_parses_through_sqlglot_resolved_by_import` and `test_dialects_survive_a_bundle_without_sqlglots_by_name_lookups` iterate only dialects outside `KEYWORD_ONLY_DIALECTS`; the tripwire checks `SQLGLOT_DIALECT` only for them. Between this task and Task 3, SQL++ is classified by the generic keyword rules (`_lexical`); Task 3 replaces that before anything ships (ruling P22).
+- Breaks on purpose (updated here): `tests/test_sql_api.py` split ranges gain `"params": []`; `test_every_dialect_parses_through_sqlglot_resolved_by_import` and `test_dialects_survive_a_bundle_without_sqlglots_by_name_lookups` iterate only dialects outside `KEYWORD_ONLY_DIALECTS`; `test_warm_up_parses_once_per_dialect_and_logs_its_duration` asserts `len(calls) == len(Dialect) - len(KEYWORD_ONLY_DIALECTS)` (`warm_up()` skips SQL++; P34); the tripwire checks `SQLGLOT_DIALECT` only for them. Between this task and Task 3, SQL++ is classified by the generic keyword rules (`_lexical`); Task 3 replaces that before anything ships (ruling P22).
 
 - [ ] **Step 1: Write the failing tests.**
 
@@ -668,16 +686,16 @@ def test_sqlpp_comments():
     assert kinds("/*+ ordered */ SELECT", SQ)[0] == (K.COMMENT, "/*+ ordered */")  # a hint is a plain comment
 ```
 
-and, depending on A7 as Task 1 recorded it, **one** of these two:
+and, depending on A7 as Task 1 recorded it, **one** of these two (U+00A0 is written as the escape `\u00a0`: a literal no-break space is invisible in a source file, P43):
 
 ```python
 def test_sqlpp_unicode_spaces_follow_the_server():  # A7: the server reads U+00A0 as a space
-    assert kinds("DELETE FROM t", SQ) == [(K.WORD, "DELETE"), (K.WORD, "FROM"), (K.WORD, "t")]
+    assert kinds("DELETE\u00a0FROM t", SQ) == [(K.WORD, "DELETE"), (K.WORD, "FROM"), (K.WORD, "t")]
 ```
 
 ```python
 def test_sqlpp_unicode_spaces_follow_the_server():  # A7: the server rejects U+00A0 (syntax error, nothing runs)
-    assert kinds("DELETE FROM t", SQ) == [(K.WORD, "DELETE FROM"), (K.WORD, "t")]
+    assert kinds("DELETE\u00a0FROM t", SQ) == [(K.WORD, "DELETE\u00a0FROM"), (K.WORD, "t")]
 ```
 
 Add to `test_unterminated_tokens_are_flagged`: `("`abc", SQ)`, `(r"`a\`", SQ)`, `(r"'a\'", SQ)`, `('"abc', SQ)`. Add to `test_closed_tokens_are_terminated`: `(r"`a\`b`", SQ)`, `("`a``b`", SQ)`, `(r'"a\"b"', SQ)`, `("-- to the end", SQ)`.
@@ -727,7 +745,7 @@ def test_sqlpp_literals_and_paths():
 
 (Import `in_list`, `is_reserved`, `keyspace_path` with the others.)
 
-`tests/sql/test_classifier.py`: import `KEYWORD_ONLY_DIALECTS` from `dbaguy_backend.sql.dialects`; `test_every_dialect_parses_through_sqlglot_resolved_by_import` gets `@pytest.mark.parametrize("dialect", [d for d in Dialect if d not in KEYWORD_ONLY_DIALECTS])`; in `test_dialects_survive_a_bundle_without_sqlglots_by_name_lookups` the subprocess code iterates `[d for d in Dialect if d not in KEYWORD_ONLY_DIALECTS]` (import it there too) and the assertion compares with `* (len(Dialect) - len(KEYWORD_ONLY_DIALECTS))`. Append:
+`tests/sql/test_classifier.py`: import `KEYWORD_ONLY_DIALECTS` from `dbaguy_backend.sql.dialects`, and change the classifier import line to `from dbaguy_backend.sql.classifier import _from_sqlglot, classify, warm_up` (the new test below calls `_from_sqlglot`, which the file does not import yet; P34); `test_every_dialect_parses_through_sqlglot_resolved_by_import` gets `@pytest.mark.parametrize("dialect", [d for d in Dialect if d not in KEYWORD_ONLY_DIALECTS])`; in `test_dialects_survive_a_bundle_without_sqlglots_by_name_lookups` the subprocess code iterates `[d for d in Dialect if d not in KEYWORD_ONLY_DIALECTS]` (import it there too) and the assertion compares with `* (len(Dialect) - len(KEYWORD_ONLY_DIALECTS))`; in `test_warm_up_parses_once_per_dialect_and_logs_its_duration` the assertion `assert len(calls) == len(Dialect)` becomes `assert len(calls) == len(Dialect) - len(KEYWORD_ONLY_DIALECTS)` (P34). Append:
 
 ```python
 def test_keyword_only_dialects_never_reach_sqlglot(monkeypatch):
@@ -846,7 +864,7 @@ Expected: collection errors (`AttributeError: SQLPP`, `ImportError: format_guard
     ),
 ```
 
-  Set `unicode_spaces=True` if Task 1 recorded that the server ran `SELECT 1` (and keep the matching lexer test from Step 1).
+  Set `unicode_spaces=True` if Task 1 recorded that the server ran `SELECT 1` with U+00A0 between the two words (and keep the matching lexer test from Step 1).
   - `SQLPP_RESERVED` with exactly these 225 words (the 7.6 list, fetched while planning; quoting an extra word is harmless, as in the other dialects):
 
 ```python
@@ -1050,7 +1068,7 @@ def format_guard(body: FormatGuardRequest) -> FormatGuardResponse:
     return FormatGuardResponse(same=False, offset=Utf16Index(body.original).to_utf16(offset))
 ```
 
-- [ ] **Step 7: Frontend.** Run `npm run gen:api`. In `src/features/editor/extensions.ts` import `SQLDialect` from `@codemirror/lang-sql` and add:
+- [ ] **Step 7: Frontend.** Run `npm run gen:api`. `src/features/editor/extensions.ts` line 3 imports `type SQLDialect` (type-only, for the `SQL_DIALECTS` annotation), but `SQLDialect.define` needs the value: make it a value import, `import { MSSQL, MySQL, PostgreSQL, sql, SQLite, StandardSQL, SQLDialect } from "@codemirror/lang-sql";` (P44), and add:
 
 ```ts
 /** SQL++ (Couchbase 7.6): its reserved words (as `SQLPP_RESERVED` in the backend), common functions, "…" strings,
@@ -1216,7 +1234,7 @@ def test_tsql_unfiltered_dml_is_unchanged():  # the helper was generalised for S
 
 (Import `is_transaction_statement` from `dbaguy_backend.sql.classifier` and `DangerReason` from the domain if the file does not yet.)
 
-Append to `tests/test_safety.py`:
+Append to `tests/test_safety.py` (the file imports `GuardAction as A`, so the tests below use the alias `A.RUN` / `A.BLOCK` / `A.CONFIRM`, never `GuardAction`; P38):
 
 ```python
 SQ = Dialect.SQLPP
@@ -1228,7 +1246,7 @@ SQ = Dialect.SQLPP
     "WITH a AS (SELECT 1 AS x) SELECT a",
 ])
 def test_sqlpp_reads_run_read_only(sql):
-    assert SafetyPolicy().check(sql, SQ, "standard", read_only=True).action == GuardAction.RUN
+    assert SafetyPolicy().check(sql, SQ, "standard", read_only=True).action == A.RUN
 
 
 @pytest.mark.parametrize("sql", [
@@ -1237,12 +1255,12 @@ def test_sqlpp_reads_run_read_only(sql):
     "MERGE INTO users u USING orders o ON KEY o.u WHEN MATCHED THEN DELETE", "SET x = 1",
 ])
 def test_sqlpp_read_only_bypasses_fail_closed(sql):  # Review Focus 5
-    assert SafetyPolicy().check(sql, SQ, "standard", read_only=True).action == GuardAction.BLOCK
+    assert SafetyPolicy().check(sql, SQ, "standard", read_only=True).action == A.BLOCK
 
 
 def test_sqlpp_transactions_are_left_to_the_adapter():
     # Not a safety decision (D-04-13): the policy lets BEGIN WORK through, the Couchbase adapter refuses it.
-    assert SafetyPolicy().check("BEGIN WORK", SQ, "standard", read_only=True).action == GuardAction.RUN
+    assert SafetyPolicy().check("BEGIN WORK", SQ, "standard", read_only=True).action == A.RUN
 
 
 @pytest.mark.parametrize("sql, reason", [
@@ -1253,11 +1271,11 @@ def test_sqlpp_transactions_are_left_to_the_adapter():
 ])
 def test_sqlpp_dangers_are_confirmed_at_standard(sql, reason):
     decision = SafetyPolicy().check(sql, SQ, "standard", read_only=False)
-    assert (decision.action, decision.reasons) == (GuardAction.CONFIRM, [reason])
+    assert (decision.action, decision.reasons) == (A.CONFIRM, [reason])
 
 
 def test_targeted_sqlpp_writes_run_at_standard():
-    assert SafetyPolicy().check("DELETE FROM users USE KEYS 'k'", SQ, "standard", read_only=False).action == GuardAction.RUN
+    assert SafetyPolicy().check("DELETE FROM users USE KEYS 'k'", SQ, "standard", read_only=False).action == A.RUN
 ```
 
 (Import `GuardReason` from `dbaguy_backend.domain.classification` if the file does not yet.)
@@ -1392,6 +1410,7 @@ git commit -m "feat(sql): SQL++ classification — keyword rules, unfiltered/sys
 - Create: `backend/dbaguy_backend/adapters/sockets.py`
 - Modify: `backend/dbaguy_backend/adapters/mysql/adapter.py` (keepalive through `sockets`; `run` signature), `adapters/postgres/adapter.py`, `adapters/sqlite/adapter.py`, `adapters/mssql/adapter.py` (`run` signature only)
 - Modify: `backend/dbaguy_backend/services/connection_service.py`
+- Modify: `src/features/session/SessionController.ts` (`execute()` sends `profile_plan: false`; P33)
 - Modify: `backend/tests/fake_db.py`, `backend/tests/test_session_worker.py` (`MessagingConnection.run`), `backend/tests/test_api.py` (`test_engines`)
 - Create: `backend/tests/test_query_context.py`; modify `backend/tests/test_core_utils.py`, `backend/tests/test_connection_service.py`
 - Regenerate: `src/lib/api/openapi.json`, `src/lib/api/schema.d.ts`
@@ -1699,6 +1718,8 @@ def enable_keepalive(sock: socket.socket) -> None:
 
 - [ ] **Step 6: Run everything**
 
+First one frontend change (P33): openapi-typescript 7 makes a field with a non-null default required, so after `npm run gen:api` `ExecuteCommand.profile_plan` (default `false`) is a required `profile_plan: boolean`, and `SessionController.execute()` (`src/features/session/SessionController.ts`) passes its object literal to `track(…, command: ClientCommand)` without it, which fails the typecheck. Add `profile_plan: false,` to that literal, after `history: options.history ?? true,`. (`query_context` and `params` default to null, so they stay optional and need nothing; Task 12 adds `query_context` to the same literal and keeps `profile_plan: false`.)
+
 Run: `cd backend && .venv/bin/pytest -q && cd .. && npm run gen:api && npm run typecheck && npm run build`
 Expected: green; nothing else changes behaviour (no adapter declares a new capability yet).
 
@@ -1709,6 +1730,7 @@ git add backend/dbaguy_backend/domain backend/dbaguy_backend/adapters/base.py ba
   backend/dbaguy_backend/adapters/sockets.py backend/dbaguy_backend/adapters/mysql/adapter.py \
   backend/dbaguy_backend/adapters/postgres/adapter.py backend/dbaguy_backend/adapters/sqlite/adapter.py \
   backend/dbaguy_backend/adapters/mssql/adapter.py backend/dbaguy_backend/services/connection_service.py \
+  src/features/session/SessionController.ts \
   backend/tests/fake_db.py backend/tests/test_session_worker.py backend/tests/test_api.py \
   backend/tests/test_query_context.py backend/tests/test_core_utils.py backend/tests/test_connection_service.py \
   src/lib/api/openapi.json src/lib/api/schema.d.ts
@@ -2093,6 +2115,21 @@ def test_presentation_reaches_the_result_set_event():
         worker.close()
 
 
+def test_the_history_record_carries_the_requests_query_context():  # P37: `_complete` fills ExecutionRecord.query_context
+    worker, _, rec = make_worker(query_context=True)
+    records = []
+    worker.configure(WorkerHooks(check=_policy, capabilities=AdapterCapabilities(query_context=True),
+                                 on_record=records.append))
+    try:
+        worker.submit(ExecuteCommand(request_id="h", sql="rows 1", query_context=CONTEXT))
+        rec.wait_for(finished("h"))
+        worker.submit(ExecuteCommand(request_id="n", sql="rows 1"))  # no context: the record says so
+        rec.wait_for(finished("n"))
+        assert [r.query_context for r in records] == [CONTEXT, None]
+    finally:
+        worker.close()
+
+
 CLOSED = ("Closed this result after 2 min without loading more rows, to free the query node — run the statement again "
           "to load more")
 
@@ -2300,6 +2337,7 @@ def run_options(command: ExecuteCommand | ExportCommand, capabilities: AdapterCa
 
 - [ ] **Step 4: Implement the worker changes** in `sessions/worker.py`:
   - `ExecutionRecord.query_context: QueryContext | None = None`; `_Request.query_context: QueryContext | None = None`; `WorkerHooks.capabilities: AdapterCapabilities = AdapterCapabilities()`.
+  - `_complete` (the `ExecutionRecord(...)` it hands to `on_record`): add `query_context=req.query_context` (P37). Without it the history never receives the context: the hook tests call `on_record()` directly and would still pass.
   - `_PausedMark` (frozen dataclass: `token: int`, `request_id: str`, `since: float`); in `__init__`: `self._clock = clock`, `self._paused: _PausedMark | None = None` (guarded by `_state_lock`, listed in the class docstring's locking paragraph), `self._pause_tokens = itertools.count(1)`.
   - `_execute`, inside the `try`, after `_check_text`:
 
@@ -2446,8 +2484,8 @@ git commit -m "feat(sessions): per-request options checked against capabilities,
   - `split_object(text: str) -> tuple[RowField, ...]` — the members of one complete JSON object text; `ValueError` for anything else.
 - Produces (`adapters/couchbase/http.py`):
   - `READ_CHUNK = 64 * 1024`, `CONNECT_TIMEOUT_S = 10.0`, `KEEPALIVE_REUSE_S = 30.0`, `QUERY_PATH = "/query/service"`.
-  - `client_context_id(request_id: str) -> str`; `basic_auth(user: str, password: str) -> str`.
-  - `@dataclass(frozen=True) QueryRequest(statement: str, client_context_id: str, query_context: str | None = None, readonly: bool = False, named: Mapping[str, str] = {}, positional: Sequence[str] = (), profile: str | None = None, preserve_expiry: bool = False)`; `build_body(request: QueryRequest) -> bytes` (raises `UnicodeEncodeError` for a lone surrogate).
+  - `client_context_id(ident: str) -> str` (`"dbaguy-" + ident`, every character outside `[A-Za-z0-9_-]` removed, cut to 64; takes any id string: Task 11 passes `uuid4().hex`, P30, P47); `basic_auth(user: str, password: str) -> str`.
+  - `@dataclass(frozen=True) QueryRequest(statement: str, client_context_id: str, query_context: str | None = None, readonly: bool = False, named: Mapping[str, str] = field(default_factory=dict), positional: Sequence[str] = (), profile: str | None = None, preserve_expiry: bool = False)` (a `{}` default raises `ValueError: mutable default` when the class is created, P39); `build_body(request: QueryRequest) -> bytes` (raises `UnicodeEncodeError` for a lone surrogate).
   - `class ChannelError(Exception)` with `before_response: bool`, `tls: bool`; `failure_reason(exc: BaseException) -> str` (`refused`, `timed out`, `unknown host`, or the error's own text; Task 9's discovery uses it too).
   - `SocketFactory = Callable[[str, int, float], socket.socket]`.
   - `class HttpChannel` — `shutdown()` (any thread), `close()`, `reusable(now: float) -> bool`, attributes `host`, `port`, `used`, `idle_since`, `dead`.
@@ -2503,26 +2541,26 @@ class FakeQueryServer:
 
     def _handle(self, conn: socket.socket) -> None:
         with conn:
-            reader = conn.makefile("rb")
-            while reader.readline():  # the request line; empty when the client left
-                headers = {}
-                while (line := reader.readline()) not in (b"\r\n", b"\n", b""):
-                    name, _, value = line.decode().partition(":")
-                    headers[name.strip().lower()] = value.strip()
-                self.bodies.append(reader.read(int(headers.get("content-length", "0"))))
-                reply = self.replies.pop(0)
-                head = (f"HTTP/1.1 {reply.status} Reason\r\nContent-Type: {reply.content_type}\r\n"
-                        f"Transfer-Encoding: chunked\r\n{'Connection: close' + chr(13) + chr(10) if reply.close else ''}\r\n")
-                half = len(reply.body) // 2
-                try:
+            try:  # the whole loop (P45): a client that abandons a response (reset, broken pipe) leaves no thread warning
+                reader = conn.makefile("rb")
+                while reader.readline():  # the request line; empty when the client left
+                    headers = {}
+                    while (line := reader.readline()) not in (b"\r\n", b"\n", b""):
+                        name, _, value = line.decode().partition(":")
+                        headers[name.strip().lower()] = value.strip()
+                    self.bodies.append(reader.read(int(headers.get("content-length", "0"))))
+                    reply = self.replies.pop(0)
+                    head = (f"HTTP/1.1 {reply.status} Reason\r\nContent-Type: {reply.content_type}\r\n"
+                            f"Transfer-Encoding: chunked\r\n{'Connection: close' + chr(13) + chr(10) if reply.close else ''}\r\n")
+                    half = len(reply.body) // 2
                     conn.sendall(head.encode() + _chunk(reply.body[:half]))
                     if reply.hold is not None:
                         reply.hold.wait(10)
                     conn.sendall(_chunk(reply.body[half:]) + b"0\r\n\r\n")
-                except OSError:
-                    return
-                if reply.close or reply.drop_after:
-                    return
+                    if reply.close or reply.drop_after:
+                        return
+            except OSError:
+                return
 
     def close(self) -> None:
         self._server.close()
@@ -3053,7 +3091,8 @@ to stop the request at once (the server marks it `closed`, survey §3.7).
 Threads: the session's worker thread sends, reads and closes. Another thread only calls `HttpChannel.shutdown()`, which
 acts on a duplicate of the TCP socket taken right after connecting and kept until close(): http.client may close its own
 socket at any time, and a descriptor number closed and reused meanwhile would let a late cancel shut down an unrelated
-connection (ruling P3). SSLSocket.shutdown() is never called from another thread (spec §3.4.1)."""
+connection (ruling P3). SSLSocket.shutdown() is not called from another thread (spec §3.4.1), unless shutting down the TCP
+duplicate cannot end a blocked TLS read (probe A10; spec §9, ruling P41)."""
 ```
 
 `client_context_id`, `basic_auth`, `QueryRequest`, `build_body`:
@@ -3063,8 +3102,21 @@ _NOT_CONTEXT_ID = re.compile(r"[^A-Za-z0-9_-]")
 _CONTEXT_ID_LIMIT = 64  # longer ids are cut by the server; `/` and `"` are refused (error 1110)
 
 
-def client_context_id(request_id: str) -> str:
-    return ("dbaguy-" + _NOT_CONTEXT_ID.sub("", request_id))[:_CONTEXT_ID_LIMIT]
+def client_context_id(ident: str) -> str:
+    """`dbaguy-` + any id string (Task 11 passes `uuid4().hex`, P30), reduced to what the server accepts."""
+    return ("dbaguy-" + _NOT_CONTEXT_ID.sub("", ident))[:_CONTEXT_ID_LIMIT]
+
+
+@dataclass(frozen=True)  # `from dataclasses import dataclass, field`
+class QueryRequest:
+    statement: str
+    client_context_id: str
+    query_context: str | None = None
+    readonly: bool = False
+    named: Mapping[str, str] = field(default_factory=dict)  # not `= {}`: a dataclass refuses a mutable default (P39)
+    positional: Sequence[str] = ()
+    profile: str | None = None
+    preserve_expiry: bool = False
 
 
 def build_body(request: QueryRequest) -> bytes:
@@ -3230,7 +3282,7 @@ class NodeClient:
             self._channel = None
 ```
 
-If Task 1 recorded that A10 failed (a shutdown of the TCP duplicate does not end a blocked TLS read), `HttpChannel.shutdown()` also calls `self.conn.sock.shutdown(socket.SHUT_RDWR)` on the TLS socket when `self._tls` is set (spec §9's fallback), and Task 11 maps every exception raised under a cancel to a cancel (it already does); record it as a ruling.
+**Only if** Task 1 recorded that A10 failed (shutting down the TCP duplicate does not end a blocked TLS read), apply the one exception to the Global Constraint "never `SSLSocket.shutdown()`" (ruling P41, spec §9's fallback): when `self._tls` is set and `self.conn.sock` exists, `HttpChannel.shutdown()` also calls `self.conn.sock.shutdown(socket.SHUT_RDWR)` on the TLS socket (inside `suppress(OSError)`, after the duplicate's shutdown). The reader can then get an exception of any type from that socket, so Task 11's `EventStream` counts every exception the reader gets while the cancel flag is set as a cancelled statement. If A10 holds, none of this is added and `SSLSocket.shutdown()` is never called. Record the outcome in the A10 row of the assumptions table.
 
 - [ ] **Step 9: Run them**
 
@@ -4181,7 +4233,7 @@ git commit -m "feat(couchbase): connection settings, URL import, TLS contexts an
   - `list_children(query: Query, path: list[PathSegment]) -> list[ObjectNode]`, `object_detail(query: Query, path: list[PathSegment]) -> ObjectDetail`, `build_snapshot(query: Query) -> SchemaSnapshot`.
   - `index_ddl(index: Mapping[str, Any], bucket: str, scope: str, collection: str) -> str` and `index_detail(index: Mapping[str, Any]) -> str` (pure).
 
-Rules (spec §3.8; survey §5): system catalogs only (filtered by the user's privileges, one query port is enough; `/indexStatus` and the scopes manifest are 403 for limited users), every name passed as a parameter, `ORDER BY` everywhere. Buckets: `has_children`. Scopes of a bucket: `system:scopes` plus `_default` (never listed there) first, `_system` last and `system=True`. Collections of a scope: `system:keyspaces`; for `_default`, the bucket-level keyspace row (no `bucket` field, `name = $b`) is the `_default` collection, listed first. Collections `has_children` (their indexes hang right under them). Indexes of a collection: `system:indexes` by `bucket_id`/`scope_id`/`keyspace_id`; `_default._default` indexes have `keyspace_id = $b` and no `bucket_id`. Index `detail` = state, `primary · ` in front for a primary index. Details, all `ddl_is_generated=True`: bucket — no DDL, a comment that cluster management is not part of DbaGuy; scope — ``CREATE SCOPE `b`.`s`;`` (`_default`: a comment line, it exists with the bucket; ruling P9); collection — ``CREATE COLLECTION `b`.`s`.`c`;`` (or that comment for `_default._default`) followed by every index's DDL; index — the generated `CREATE [PRIMARY] INDEX … ON `b`.`s`.`c`(keys) [PARTITION BY …] [WHERE …] [WITH {…}];` with `index_key` / `condition` / `partition` pasted as the server wrote them, `defer_build` only for a deferred index, `num_replica` only when above 0; its comment = state, last scan, `using`. A path that names nothing → `NotFound` (the metadata connection stays). Snapshot: one `system:keyspaces` query (buckets follow from it; ruling P7).
+Rules (spec §3.8; survey §5): system catalogs only (filtered by the user's privileges, one query port is enough; `/indexStatus` and the scopes manifest are 403 for limited users), every name passed as a parameter, `ORDER BY` everywhere. Buckets: `has_children`. Scopes of a bucket: `system:scopes` plus `_default` (never listed there) first, `_system` last and `system=True`. Collections of a scope: `system:keyspaces` (no `namespace` predicate, P35: it lists only datastore keyspaces and its 7.x rows name the field `namespace_id`, so this supersedes the query text of spec §3.8; the row field names are Task 1's A22); for `_default`, the bucket-level keyspace row (no `bucket` field, `name = $b`) is the `_default` collection, listed first. Collections `has_children` (their indexes hang right under them). Indexes of a collection: `system:indexes` by `bucket_id`/`scope_id`/`keyspace_id`; `_default._default` indexes have `keyspace_id = $b` and no `bucket_id`. Index `detail` = state, `primary · ` in front for a primary index. Details, all `ddl_is_generated=True`: bucket — no DDL, a comment that cluster management is not part of DbaGuy; scope — ``CREATE SCOPE `b`.`s`;`` (`_default`: a comment line, it exists with the bucket; ruling P9); collection — ``CREATE COLLECTION `b`.`s`.`c`;`` (or that comment for `_default._default`) followed by every index's DDL; index — the generated `CREATE [PRIMARY] INDEX … ON `b`.`s`.`c`(keys) [PARTITION BY …] [WHERE …] [WITH {…}];` with `index_key` / `condition` / `partition` pasted as the server wrote them, `defer_build` only for a deferred index, `num_replica` only when above 0; its comment = state, last scan, `using`. A path that names nothing → `NotFound` (the metadata connection stays). Snapshot: one `system:keyspaces` query (buckets follow from it; ruling P7).
 
 - [ ] **Step 1: Write the failing tests** — `backend/tests/test_couchbase_catalog.py`:
 
@@ -4319,16 +4371,16 @@ DEFAULT = "_default"
 SYSTEM_SCOPE = "_system"
 _BUCKETS = "SELECT RAW b.name FROM system:buckets AS b ORDER BY b.name"
 _SCOPES = "SELECT RAW s.name FROM system:scopes AS s WHERE s.`bucket` = $b ORDER BY s.name"
-_COLLECTIONS = ("SELECT RAW k.name FROM system:keyspaces AS k WHERE k.namespace = \"default\" AND k.`bucket` = $b "
-                "AND k.`scope` = $s ORDER BY k.name")
-_BUCKET_KEYSPACE = ("SELECT RAW k.name FROM system:keyspaces AS k WHERE k.namespace = \"default\" "
-                    "AND k.`bucket` IS MISSING AND k.name = $b")
+# No `namespace` predicate in the three keyspace queries (P35): system:keyspaces lists only the datastore's keyspaces (one
+# data namespace, `default`), and its 7.x rows call that field `namespace_id`: `k.namespace` would match nothing.
+_COLLECTIONS = ("SELECT RAW k.name FROM system:keyspaces AS k WHERE k.`bucket` = $b AND k.`scope` = $s "
+                "ORDER BY k.name")
+_BUCKET_KEYSPACE = ("SELECT RAW k.name FROM system:keyspaces AS k WHERE k.`bucket` IS MISSING AND k.name = $b")
 _INDEXES = ("SELECT RAW i FROM system:indexes AS i WHERE i.bucket_id = $b AND i.scope_id = $s AND i.keyspace_id = $c "
             "ORDER BY i.name")
 _DEFAULT_INDEXES = ("SELECT RAW i FROM system:indexes AS i WHERE i.keyspace_id = $b AND i.bucket_id IS MISSING "
                     "ORDER BY i.name")
-_KEYSPACES = ("SELECT k.`bucket` AS b, k.`scope` AS s, k.name AS n FROM system:keyspaces AS k "
-              "WHERE k.namespace = \"default\"")
+_KEYSPACES = "SELECT k.`bucket` AS b, k.`scope` AS s, k.name AS n FROM system:keyspaces AS k"
 _BUILT_IN = "-- exists with the bucket: it cannot be created or dropped"
 
 
@@ -4429,7 +4481,7 @@ git commit -m "feat(couchbase): bucket › scope › collection › index tree f
   - `class CouchbaseConnection(DatabaseConnection)` — `run(sql, options)`, `query(statement: str, named: Mapping[str, str] | None = None) -> list[Any]` (internal, read-only, read to the end, decoded rows; the catalog's `Query`), `cancel()` / `force_cancel()` / `abort()` (any thread), `cancelled() -> bool`, `last_client_context_id: str | None` (tests and DEBUG logs), `identify(username: str) -> ServerInfo`, no-transaction methods, `server_info()`, `current_database()`, catalog delegation, `close()`.
   - Registered in `container.default_registry()` between SQL Server and SQLite.
 
-Request flow (spec §3.7): `run()` refuses transaction statements first (`is_transaction_statement` → `StatementError(…, code="transactions_unsupported")`, nothing sent); refuses text that is not valid UTF-8 (`invalid_text_error`); closes a result left open; `_begin()` marks the connection busy and the cancel flag clear under a small lock, builds the body (`client_context_id("dbaguy-" … uuid4().hex)` — `run()` gets no request id, ruling P30; `query_context` from the options; `readonly` for a read-only profile; parameters as given), and sends it through the `NodeClient` with an `attach` callback that, under the same lock, refuses when a cancel already came (nothing sent) or records the channel a cancel must shut down. An answer that is not JSON (a proxy's page) → `StatementError(f"HTTP {status} {reason}", code=f"http_{status}")`. Then `start_result`. The busy state ends when the response has been read to its end or the result is closed (`on_done`). `cancel()` with nothing busy does nothing; otherwise it sets the flag and shuts the channel down (if one is attached yet); every read error under the flag is a cancel. Internal queries (`query`) use the same path with `readonly=true` and `retry_safe=True`.
+Request flow (spec §3.7): `run()` refuses transaction statements first (`is_transaction_statement` → `StatementError(…, code="transactions_unsupported")`, nothing sent); refuses text that is not valid UTF-8 (`invalid_text_error`); closes a result left open; `_begin()` marks the connection busy and the cancel flag clear under a small lock, builds the body (`client_context_id(uuid4().hex)`, which adds the `dbaguy-` prefix — `run()` gets no request id, rulings P30, P47; `query_context` from the options; `readonly` for a read-only profile; parameters as given), and sends it through the `NodeClient` with an `attach` callback that, under the same lock, refuses when a cancel already came (nothing sent) or records the channel a cancel must shut down. An answer that is not JSON (a proxy's page) → `StatementError(f"HTTP {status} {reason}", code=f"http_{status}")`. Then `start_result`. The busy state ends when the response has been read to its end or the result is closed (`on_done`). `cancel()` with nothing busy does nothing and sets no flag — a deviation from spec §3.7.2, which says an idle cancel only sets the flag (ruling P46: `_begin()` would clear it anyway, and the worker's `_cancel_requested` covers the window before `run()`); otherwise it sets the flag and shuts the channel down (if one is attached yet); every read error under the flag is a cancel (and, only if Task 1's A10 probe failed, so does any other exception the reader gets under the flag: ruling P41, Step 3). Internal queries (`query`) use the same path with `readonly=true` and `retry_safe=True`.
 
 Connect (spec §3.6.3): `connection_settings` → `basic_auth` → `candidate_nodes` (INFO line on how) → for each node a `NodeClient`, a `CouchbaseConnection`, and `identify()`: `SELECT ds_version() AS v, CURRENT_USERS() AS u` (internal, so `readonly=true`); if that fails with a server error other than authentication, `SELECT ds_version() AS v` and the profile's user name (A17). A refused / timed-out / unknown node → the next one; authentication (`10000`, `13014`, `http_401`) → `ConnectionFailed(<server text> + "\nCheck the user name and password")` at once; TLS (`tls_failed`) → `ConnectionFailed(<ssl text> + "\nSet the cluster's CA file in the SSL tab")` at once; none left → `ConnectionFailed("Could not reach a query node: cb1:8093 (refused), cb2:8093 (timed out)")`. `ServerInfo(engine=COUCHBASE, version=f"Couchbase Server {v}", edition=enterprise|community from the suffix, current_user=first of CURRENT_USERS() or the profile's, current_database=default_context.text() or None, default_query_context=default_context)`; INFO `Connected to Couchbase Server <v> at <node> via <how> (tls=<mode>[, read-only])` — no user, no password.
 
@@ -4656,6 +4708,8 @@ class EventStream:
             self._response.abandon()  # the server stops the request at once (`closed`)
             self.done = True
 ```
+
+**Only if** Task 1 recorded that A10 failed (ruling P41: `HttpChannel.shutdown()` then also shuts down the TLS socket from the cancelling thread, Task 7 Step 8), the reader can get an exception of any type from that socket, not only `ChannelError` / `ProtocolError`. Then `_read` gets a last clause after the two above, `except Exception as exc:` with `if self._cancelled(): raise StatementCancelled() from exc` and a bare `raise` otherwise: any exception the reader gets while the cancel flag is set counts as cancelled (spec §9). If A10 holds, `_read` stays as written.
 
 `CouchbaseResult` keeps: `_stream`, `_sql`, `_plan`, `_bare_star`, `_dml`, `_on_done` (called once, from `_end()` or `close()`), `_signature`, `_errors`, `_status`, `_metrics`, `_messages: list[ServerMessage]`, `_peeked: deque[RawRow]`, `_rows_done`, `_ended`, `_pending: StatementError | None`, `_shape`, `_shaped`. The key methods:
 
@@ -4929,7 +4983,7 @@ class CouchbaseConnection(DatabaseConnection):
         started = time.monotonic()
         with self._lock:
             if not self._busy:
-                return  # nothing running: a cancel must never reach the next statement
+                return  # nothing running: no flag either (P46); a cancel must never reach the next statement
             self._cancelled = True
             channel = self._channel
         if channel is not None:
@@ -5605,7 +5659,7 @@ export function copyFormatsFor(dialect: Dialect | null): readonly CopyFormat[] {
   }
 ```
 
-`execute` adds `query_context: options.queryContext !== undefined ? options.queryContext : this.defaultQueryContext()`; `ExecuteOptions` gains `queryContext?: QueryContext | null` with the doc comment from Interfaces; `exportResult` adds `query_context: this.defaultQueryContext()` to its command. Engines other than Couchbase have no default, so their commands carry `null` (the worker refuses a non-null context only where the engine has none).
+`execute` adds `query_context: options.queryContext !== undefined ? options.queryContext : this.defaultQueryContext()` to the literal it sends and keeps the `profile_plan: false` Task 4 put there (P33: the regenerated type requires the field); `ExecuteOptions` gains `queryContext?: QueryContext | null` with the doc comment from Interfaces; `exportResult` adds `query_context: this.defaultQueryContext()` to its command. Engines other than Couchbase have no default, so their commands carry `null` (the worker refuses a non-null context only where the engine has none).
 
 - [ ] **Step 7: The connection dialog** (`ConnectionDialog.tsx`), as tables keyed by engine like the existing ones:
 
@@ -5819,7 +5873,7 @@ Owner tasks fill in the Result column (a few words) and apply the Effect; nothin
 | A7 | The server reads U+00A0, U+2003, U+3000, U+200B, U+FEFF as spaces | Task 1 | none yet | NBSP accepted as a space: `unicode_spaces=True` for SQLPP and the first lexer test variant; refused: False and the second. |
 | A8 | `nodeServices` entry without `hostname` = the asked node | Task 9 | none yet | One node only here; multi-node goes to the user's test list (Task 13 Step 7). |
 | A9 | Idle keep-alive connections survive ≥ 30 s | Task 11 Step 8 | none yet | Closed sooner: lower `KEEPALIVE_REUSE_S` below the observed time (reads are resent anyway). |
-| A10 | Shutting down the TCP duplicate ends a blocked TLS read at once | Task 1, Task 11 | none yet | Holds: as planned. Not: `HttpChannel.shutdown()` also shuts down the TLS socket (spec §9 fallback, Task 7 Step 8). |
+| A10 | Shutting down the TCP duplicate ends a blocked TLS read at once | Task 1, Task 11 | none yet | Holds: as planned (`SSLSocket.shutdown()` is never called). Not: `HttpChannel.shutdown()` also shuts down the TLS socket and Task 11 counts any exception under the cancel flag as a cancel (spec §9 fallback, ruling P41; Task 7 Step 8, Task 11 Step 3). |
 | A11 | The dev 18093 certificate holds 127.0.0.1 (verify-full) | Task 1 | none yet | Sets `A11_SAN_HAS_LOOPBACK` in Task 11's TLS test; CLAUDE.md notes a False. |
 | A12 | `readonly=true` with CTE, EXPLAIN FUNCTION, ADVISE | Task 11 | none yet | Record only (CTE is asserted; ADVISE recorded; EXPLAIN FUNCTION needs a function: not probed in 04a). |
 | A13 | A paused request is not closed by the server within 120 s | Task 11 Step 8 | none yet | Closed sooner: lower `PAUSED_RESULT_MAX_IDLE_S` below the observed time. |
@@ -5828,8 +5882,9 @@ Owner tasks fill in the Result column (a few words) and apply the Effect; nothin
 | A17 | A limited user can call `CURRENT_USERS()` | Task 11 | none yet | Not: the version-only probe and the profile's user name (already coded). |
 | A18 | `system:indexes` is filtered by privileges | Task 10 | none yet | No index visible to the reader: its test expects the empty set. |
 | A19 | `x IN [ … ]` is how SQL++ reads an IN list | Task 5 | none yet | Not: `_IN_LIST_BRACKETS[SQLPP]` back to `(`, `)` and the test follows. |
-| A20 | `cbc create` writes binary/text documents into `app.blobs` | Task 1 | none yet | Not: flags 0 (Task 1 Step 8). |
-| A21 | `UPSERT … (KEY, VALUE, OPTIONS)` with an absolute expiration | Task 1 | none yet | Not: the `cbc create -e 4102444800` fallback (Task 1 Step 8). |
+| A20 | `cbc create` writes binary/text documents into `app.blobs` | Task 1 | none yet | Not: flags 0 (Task 1 Step 8); `cbc` cannot write there at all: `bin1` / `txt1` are not seeded and the case is carried to 04c (Task 1 Steps 5 and 8, P40). |
+| A21 | `UPSERT … (KEY, VALUE, OPTIONS)` with an absolute expiration | Task 1 | none yet | Not: `u_ttl` is not seeded, its statement and assertion are removed and the case is carried to 04c; no `cbc` fallback (Task 1 Step 8, P40). |
+| A22 | `system:keyspaces` rows carry `bucket`, `scope` and `name` (the namespace field is `namespace_id`, so no query filters on `namespace`); `system:indexes` rows carry `bucket_id`, `scope_id`, `keyspace_id`, `name`, `state`, `is_primary`, `index_key`, `condition`, `partition`, `metadata` | Task 1 | none yet | Holds: Tasks 1 and 10 as written. A name differs: the seed's two wait queries (Task 1 Step 5) and Task 10's `_COLLECTIONS`, `_BUCKET_KEYSPACE`, `_KEYSPACES`, `_INDEXES`, `_DEFAULT_INDEXES` and `index_ddl` follow the recorded names (P35). |
 
 A2, A3 (04c) and A16 (04b) are not 04a's.
 
@@ -5869,6 +5924,29 @@ A2, A3 (04c) and A16 (04b) are not 04a's.
 | P30 | `client_context_id` is `"dbaguy-" + uuid4().hex`; `CouchbaseConnection.last_client_context_id` exposes it to tests and DEBUG logs. | `run()` receives no request id, and `RunOptions` keeps the spec's four fields. | A DBA cannot match the id to DbaGuy's request id; the DEBUG log pairs them. |
 | P31 | The response parser returns what it parsed before a failure and raises it on the next call. | Rows before a bad spot reach the grid (Review Focus 2). | None. |
 | P32 | A decode error whose bad token runs to the end of what has arrived means "wait for more" (at the body's end: a cut response → `connection_lost`); one followed by more JSON is malformed (`protocol_error`). | `raw_decode` reports a cut `tru`, `-` or `1e` like a malformed value; the delimiter after it tells them apart. | A malformed token at the very end of the body reads as a cut response. |
+
+### Pre-flight rulings (P33–P48)
+
+Made by the pre-flight review before Task 1 (prototypes of the plan's code and tests against the repository at `3379ac7`), adopted by the coordinator, and written into the tasks' own text: an implementer reads only its task and the Global Constraints.
+
+| # | Ruling | Changed in |
+|---|---|---|
+| P33 | `SessionController.execute()` sends `profile_plan: false`: openapi-typescript 7 makes a field with a non-null default required, so Task 4's `npm run typecheck` failed without it. Task 12 keeps the field when it adds `query_context`. | Task 4 (Files, Step 6, Step 7 commit); Task 12 Step 6 |
+| P34 | `test_warm_up_parses_once_per_dialect_and_logs_its_duration` now expects `len(Dialect) - len(KEYWORD_ONLY_DIALECTS)` calls (listed in "Breaks on purpose"), and `test_classifier.py` imports `_from_sqlglot` for the new keyword-only test. | Task 2 ("Breaks on purpose", Step 1) |
+| P35 | Catalog queries do not filter on `k.namespace` (the 7.x field is `namespace_id`; `system:keyspaces` lists only datastore keyspaces): dropped from Task 1's reader assertion and Task 10's `_COLLECTIONS`, `_BUCKET_KEYSPACE`, `_KEYSPACES`. The Task 1 probe prints one row of each catalog and the field names are recorded as A22. Spec §3.8's query text is superseded. | Task 1 (Step 1, Step 9, Step 10, A22 row); Task 10 (Rules, `catalog.py`) |
+| P36 | The seed's waits count only what it creates: `collections_ready` adds ``k.`scope` IN ["app", "many"]`` (307), `indexes_ready` adds `i.scope_id = "app"` (4), so a `_system` scope or a `_default._default` row cannot stall `up --wait`. | Task 1 Step 5 (`seed.sh`) |
+| P37 | `SessionWorker._complete` passes `query_context=req.query_context` into `ExecutionRecord`; a worker test checks that `on_record` receives the request's context (the hook tests called `on_record()` directly and hid the gap). | Task 6 (Step 1 test, Step 4) |
+| P38 | The `test_safety.py` additions use the file's alias `A.RUN` / `A.BLOCK` / `A.CONFIRM`, not `GuardAction`. | Task 3 Step 1 |
+| P39 | `QueryRequest.named: Mapping[str, str] = field(default_factory=dict)`: a `{}` default raises `ValueError: mutable default` at import. | Task 7 (Interfaces, Step 8) |
+| P40 | Before writing `seed.sh`, check the image (`command -v curl cbq cbc python3; cbc create --help`). No `python3`: `value()` reads the first scalar with `sed` (`pretty=false`). No usable `cbc`: drop `bin1` / `txt1` and the A20 assertion, record A20 as "not seeded", carry it to 04c. `u_ttl` stays on the SQL++ `OPTIONS` path (no `cbc` fallback). | Task 1 (Interfaces, Steps 1, 5, 8; A20, A21 rows) |
+| P41 | Conditional: `SSLSocket.shutdown()` from the cancelling thread is used only if the A10 probe shows that shutting down the duplicated TCP descriptor does not end a blocked TLS read; then any exception the reader gets while the cancel flag is set counts as cancelled (spec §9). If A10 holds, nothing changes. | Global Constraints (cancel bullet); Task 7 (Step 8 docstring and last paragraph); Task 11 (request flow, Step 3 `EventStream._read`); A10 row |
+| P42 | The Task 1 A10 probe sets `settimeout(20)` on the TLS socket, so a blocked read that survives the shutdown reports `TimeoutError` instead of hanging the probe. | Task 1 Step 9 |
+| P43 | Tests and probes write U+00A0, U+2003, U+3000, U+200B and U+FEFF as `\u…` escapes: literal invisible characters are lost in a source file. | Task 1 Step 9 (A7 probe line); Task 2 (Step 1 both test variants, Step 3 prose) |
+| P44 | `extensions.ts` imports `SQLDialect` as a value (it is a type-only import today); `SQLDialect.define` needs it. | Task 2 Step 7 |
+| P45 | `FakeQueryServer._handle` wraps its whole request loop in `try … except OSError: return`, so a client that abandons a response leaves no unhandled-thread warning. | Task 7 Step 1 |
+| P46 | `CouchbaseConnection.cancel()` with no request in flight does nothing and sets no flag (the worker's `_cancel_requested` covers the window before `run()`): recorded as a deviation from spec §3.7.2's "only set the flag". | Task 11 (request flow, `cancel()` comment) |
+| P47 | `client_context_id` is `"dbaguy-" + uuid4().hex`, filtered to `[A-Za-z0-9_-]` and cut to 64 characters (P30); `client_context_id()` takes any id string (parameter renamed `ident`). | Global Constraints; Task 7 (Interfaces, `http.py`); Task 11 (request flow) |
+| P48 | `_couchbase_ready()` uses a 5 s HTTP timeout (a `timeout` keyword on `couchbase_query_text` / `couchbase_query`): a slow query service must not stall every pytest start for 60 s. | Task 1 (Interfaces, Step 3) |
 
 ### Rulings made during execution
 
