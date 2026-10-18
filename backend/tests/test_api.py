@@ -84,6 +84,14 @@ def test_import_url_and_validation(client):
     assert invalid.status_code == 422 and invalid.json()["error"]["code"] == "validation_failed"
 
 
+def test_a_validation_error_never_echoes_the_input(client):
+    secret = "hunter2\ud800"  # a lone surrogate could not be encoded in the answer either
+    body = '{"profile": {"engine": "postgres", "port": "' + secret.encode("unicode_escape").decode() + '"}}'
+    response = client.post("/profiles", content=body, headers={**AUTH, "Content-Type": "application/json"})
+    assert response.status_code == 422 and response.json()["error"]["code"] == "validation_failed"
+    assert "hunter2" not in response.text and all("input" not in e for e in response.json()["error"]["detail"])
+
+
 @pytest.mark.parametrize("url", [
     "postgres://h:abc/db", "postgres://h:99999999/db", "postgres://[bad/db", "sqlite://[bad/x.db",
     "mysql://h:abc/db", "jdbc:mysql://h:99999999/db", "mysql://[bad/db",

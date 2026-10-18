@@ -27,9 +27,10 @@ def register_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # Where and why, never the input itself: it can be a secret, and a lone surrogate in it cannot be encoded
+        errors = [{key: value for key, value in error.items() if key != "input"} for error in exc.errors()]
         return JSONResponse(
-            status_code=422,
-            content=error_body("validation_failed", "Invalid request", jsonable_encoder(exc.errors())),
+            status_code=422, content=error_body("validation_failed", "Invalid request", jsonable_encoder(errors)),
         )
 
     @app.exception_handler(Exception)
