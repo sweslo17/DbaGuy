@@ -46,6 +46,7 @@ from .http import (
     ChannelError, HttpChannel, NodeClient, QueryRequest, TlsFailure, basic_auth, build_body, client_context_id,
 )
 from .nodes import candidate_nodes
+from .params import parameter_warnings
 from .result import CouchbaseResult, EventStream, start_result
 from .rows import has_bare_star
 from .settings import (
@@ -74,6 +75,7 @@ _IDENTIFY = "SELECT ds_version() AS v, CURRENT_USERS() AS u"
 _VERSION = "SELECT ds_version() AS v"  # A17: for a user that may not call CURRENT_USERS()
 _DML = frozenset({"INSERT", "UPSERT", "UPDATE", "DELETE", "MERGE"})
 _PLANS = frozenset({"EXPLAIN", "ADVISE"})
+_PROFILE = "timings"  # a run with profile (R-04-13): the answer ends with `profile.executionTimings` (A16)
 # How a wrong user name or password comes back: 7.6.12 answers 401 with JSON code 2120 "Failure to authenticate user"
 # (A14); 10000 and 13014 are the older and the privilege codes (spec §3.6.3); http_401 a 401 that is not JSON.
 _AUTH_FAILURES = frozenset({"2120", "10000", "13014", "http_401"})
@@ -158,7 +160,7 @@ class CouchbaseConnection(DatabaseConnection):
     # ---- requests ----
 
     def _begin(self, sql: str, *, context: QueryContext | None, params: StatementParams | None, readonly: bool,
-               retry_safe: bool, deadline: _Deadline | None = None) -> EventStream:
+               retry_safe: bool, deadline: _Deadline | None = None, profile: str | None = None) -> EventStream:
         """Send one request and wait for its status line. Busy from here until the response is read or abandoned."""
         with self._lock:
             self._busy, self._cancelled, self._channel = True, False, None
@@ -170,11 +172,11 @@ class CouchbaseConnection(DatabaseConnection):
                 statement=sql, client_context_id=client_context_id(uuid4().hex),
                 query_context=request_context(context) if context is not None else None, readonly=readonly,
                 named=params.named if params else {}, positional=params.positional if params else (),
-                timeout=deadline.server if deadline is not None else None,
+                timeout=deadline.server if deadline is not None else None, profile=profile,
             )
             self.last_client_context_id = request.client_context_id
-            logger.debug("Couchbase request {} to {}{}", request.client_context_id, self._client.label,
-                         " (read-only)" if readonly else "")
+            logger.debug("Couchbase request {} to {}{}{}", request.client_context_id, self._client.label,
+                         " (read-only)" if readonly else "", f" (profile {profile})" if profile else "")
             body = build_body(request)
             response = self._client.send(body, retry_safe=retry_safe, attach=self._attach,
                                          read_timeout=deadline.client_s if deadline is not None else None)
@@ -239,11 +241,15 @@ class CouchbaseConnection(DatabaseConnection):
         except UnicodeEncodeError as exc:
             raise invalid_text_error(sql, exc.start) from None
         self._close_result()
+        warnings = parameter_warnings(options.params)  # spec §3.5.4: by name, never the value (B10)
+        if warnings:
+            logger.debug("Couchbase: {} parameter(s) the server reads as a double", len(warnings))
         stream = self._begin(sql, context=options.query_context, params=options.params, readonly=self._read_only,
-                             retry_safe=options.retry_safe)
+                             retry_safe=options.retry_safe, profile=_PROFILE if options.profile_plan else None)
         first = first_keyword(sql, Dialect.SQLPP)
         self._result = start_result(stream, sql, plan=first in _PLANS, bare_star=has_bare_star(sql),
-                                    dml=first in _DML, on_done=self._end)
+                                    dml=first in _DML, on_done=self._end, profile=options.profile_plan,
+                                    messages=warnings)
         return self._result
 
     def query(self, statement: str, named: Mapping[str, str] | None = None) -> list[Any]:
@@ -376,10 +382,11 @@ class CouchbaseAdapter(DatabaseAdapter):
     url_schemes = URL_SCHEMES
     default_port = QUERY_PORT
     dialect = Dialect.SQLPP
-    # documents: 04c; executed plan: 04b (ruling P6)
+    # documents: 04c. executed_plan: 04a's ruling P6 lifted in 04b, A16 holds (the `profile` field follows `metrics`,
+    # so it arrives after the last row as a second result set)
     capabilities = AdapterCapabilities(
         server_read_only=True, transactions=False, query_context=True, parameters=True, documents=False,
-        executed_plan=False, plan_format="couchbase", paused_result_max_idle_s=PAUSED_RESULT_MAX_IDLE_S,
+        executed_plan=True, plan_format="couchbase", paused_result_max_idle_s=PAUSED_RESULT_MAX_IDLE_S,
         read_ahead_bytes=READ_AHEAD_BYTES,
     )
 

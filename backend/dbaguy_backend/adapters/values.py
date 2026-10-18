@@ -7,7 +7,8 @@ from typing import Any, final
 from uuid import UUID
 
 MAX_SAFE_INT = 2**53 - 1
-TEXT_LIMIT = 64 * 1024
+TEXT_LIMIT = 64 * 1024  # the longest text or JSON cell sent whole; a longer one goes as a preview
+PLAN_TEXT_LIMIT = 4 * 1024 * 1024  # the same for a cell of a `plan` set (EXPLAIN, ADVISE, a profile): drawn whole
 BYTES_PREVIEW = 64
 
 
@@ -48,13 +49,14 @@ class MissingType:
 MISSING = MissingType()
 
 
-def _truncated(text: str) -> dict[str, Any]:
-    """A text cell too long to send whole: its first TEXT_LIMIT characters and its full size."""
-    return {"$type": "text", "preview": text[:TEXT_LIMIT], "size": len(text), "truncated": True}
+def _truncated(text: str, limit: int) -> dict[str, Any]:
+    """A text cell too long to send whole: its first `limit` characters and its full size."""
+    return {"$type": "text", "preview": text[:limit], "size": len(text), "truncated": True}
 
 
-def encode_value(value: Any) -> Any:
-    """Convert a driver value into a JSON-safe cell without losing precision."""
+def encode_value(value: Any, text_limit: int = TEXT_LIMIT) -> Any:
+    """Convert a driver value into a JSON-safe cell without losing precision. `text_limit`: the longest text or JSON
+    cell sent whole (characters)."""
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, int):
@@ -64,11 +66,13 @@ def encode_value(value: Any) -> Any:
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, JsonText):
-        return {"$type": "json", "text": value.text} if len(value.text) <= TEXT_LIMIT else _truncated(value.text)
+        if len(value.text) > text_limit:
+            return _truncated(value.text, text_limit)
+        return {"$type": "json", "text": value.text}
     if value is MISSING:
         return {"$type": "missing"}
     if isinstance(value, str):
-        return value if len(value) <= TEXT_LIMIT else _truncated(value)
+        return value if len(value) <= text_limit else _truncated(value, text_limit)
     if isinstance(value, (bytes, bytearray, memoryview)):
         data = bytes(value)
         return {"$type": "bytes", "size": len(data), "preview": data[:BYTES_PREVIEW].hex()}
@@ -83,5 +87,5 @@ def encode_value(value: Any) -> Any:
     return str(value)
 
 
-def encode_row(row: Any) -> list[Any]:
-    return [encode_value(v) for v in row]
+def encode_row(row: Any, text_limit: int = TEXT_LIMIT) -> list[Any]:
+    return [encode_value(v, text_limit) for v in row]

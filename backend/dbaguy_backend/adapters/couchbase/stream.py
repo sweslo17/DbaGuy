@@ -3,8 +3,9 @@
 The answer to `POST /query/service` is one JSON object sent in chunks:
 `{"requestID":…, "signature":…, "results":[row, row, …], "errors":[…], "warnings":[…], "status":…, "metrics":{…}}`.
 `ResponseParser` turns the bytes into events: a `FieldEvent` for each top-level field other than `results` (decoded as
-usual: they are small), `ResultsStart`, one `RowEvent` per row, `ResultsEnd`, and `EndEvent` when the object closes. An
-error that comes after rows comes after their events, so no row is lost to it.
+usual: they are small; with the value's exact text too, as the execution profile is shown), `ResultsStart`, one
+`RowEvent` per row, `ResultsEnd`, and `EndEvent` when the object closes. An error that comes after rows comes after
+their events, so no row is lost to it.
 
 Rows keep the server's exact text (`RawRow.text`, and each member's text for an object row): numbers are never turned
 into Python numbers here (`1.10`, `-0`, `1E+3`, `9007199254740993`, `1e400` stay as sent), keys stay in order. A row's
@@ -29,7 +30,7 @@ How bytes become events:
 import codecs
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from json.decoder import scanstring
 from typing import Any, Literal, NoReturn
@@ -59,10 +60,12 @@ class RawRow:
 
 @dataclass(frozen=True, slots=True)
 class FieldEvent:
-    """A top-level field other than `results` (or a `results` that is not an array), decoded as usual."""
+    """A top-level field other than `results` (or a `results` that is not an array), decoded as usual. `text`: the
+    value's exact text as sent (the `profile` field is shown as the server wrote it); not compared (ruling B36)."""
 
     name: str
     value: Any
+    text: str = field(default="", compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,7 +357,7 @@ class ResponseParser:
                     return
                 self.attempts += 1
                 value, end = _decode(_META_DECODER, s, i, eof)
-                events.append(FieldEvent(self._key, value))
+                events.append(FieldEvent(self._key, value, s[i:end]))
                 self._pos, self._state = end, _State.AFTER_VALUE
             case _State.AFTER_VALUE:
                 if char == "}":

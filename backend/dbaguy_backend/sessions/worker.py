@@ -27,7 +27,7 @@ from ..adapters.base import (
     StatementResult,
     invalid_text_error,
 )
-from ..adapters.values import encode_row
+from ..adapters.values import PLAN_TEXT_LIMIT, TEXT_LIMIT, encode_row
 from ..domain.classification import Classification, StatementKind
 from ..domain.errors import ConnectionFailed, SessionBusy
 from ..domain.execution import (
@@ -199,6 +199,9 @@ class _OpenExecution:
     # The last read-ahead step's state (written under the worker's _state_lock); None: the engine does not read ahead
     ahead: ReadAheadState | None = None
     received: int = 0  # the last read-ahead step's `received`
+    # The current set's longest cell text sent whole: PLAN_TEXT_LIMIT for a `plan` set, else TEXT_LIMIT. Set when its
+    # ResultSetEvent goes out and kept here, since a Load more re-enters _pump with `columns_sent` already set (B37).
+    text_limit: int = TEXT_LIMIT
 
     @property
     def request_id(self) -> str:
@@ -811,8 +814,10 @@ class SessionWorker:
                     self._send(AffectedEvent(request_id=ex.request_id, index=ex.index, rows=affected))
             else:
                 if not ex.columns_sent:
+                    presentation = result.presentation()
+                    ex.text_limit = PLAN_TEXT_LIMIT if presentation == "plan" else TEXT_LIMIT  # a plan is drawn whole
                     self._send(ResultSetEvent(
-                        request_id=ex.request_id, index=ex.index, columns=columns, presentation=result.presentation(),
+                        request_id=ex.request_id, index=ex.index, columns=columns, presentation=presentation,
                     ))
                     ex.columns_sent = True
                 while budget > 0:
@@ -821,7 +826,7 @@ class SessionWorker:
                     if len(rows) < want:
                         rows += result.fetch(want - len(rows))
                     if rows:
-                        cells = [encode_row(r) for r in rows]
+                        cells = [encode_row(r, ex.text_limit) for r in rows]
                         self._send(RowsEvent(request_id=ex.request_id, index=ex.index, rows=cells))
                         ex.sent += len(rows)
                         ex.req.rows += len(rows)

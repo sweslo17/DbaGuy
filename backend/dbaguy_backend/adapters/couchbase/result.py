@@ -1,6 +1,7 @@
 """One Couchbase response as a StatementResult (spec §3.5, §3.7): rows read on demand from the wire, the `*` peek
 inside columns(), messages from warnings and metrics, an error that follows rows raised where the worker will see it,
-and each row's server text for raw JSON exports.
+each row's server text for raw JSON exports, and for a run with profile (R-04-13, A16) the `profile` field that
+follows `metrics` as a second result set: one `plan` cell holding the field's exact text.
 
 Threads: everything here runs on the session's worker thread. A cancel from another thread only shuts the connection
 down (adapter.py); the read that fails because of it is reported as a cancel, since `cancelled()` says so.
@@ -14,7 +15,7 @@ rows and before the stream's, and a failure met while reading ahead is kept unti
 
 import sys
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from enum import Enum, auto
 from typing import Any, Protocol
 
@@ -32,6 +33,7 @@ from .stream import (
 )
 
 STOPPED_ON_THE_SERVER = "Query was stopped on the server"
+NO_PROFILE = "The server sent no execution profile (Community Edition does not give one)"
 # One read-ahead step makes at most this many reads of up to READ_CHUNK (ruling B35: 16 reads took 0.42 s on 6-byte
 # rows; with 2 the longest step was about 70 ms and filling 8 MiB took as long): a command waits for one step at most.
 READ_AHEAD_STEP_CHUNKS = 2
@@ -184,10 +186,16 @@ class CouchbaseResult(StatementResult, RawJsonRows):
     page, which is read inside `columns()` (the worker's timeout covers it) and delivered first by `fetch()` and
     `fetch_raw()` (R-04a-C14), then the rows read ahead while paused (`held`), then the stream. An error or a stop that
     follows rows is kept until those rows are out, then raised by the next `fetch()` that has no rows, `next_result()`
-    or `affected_rows()` (Review Focus 2)."""
+    or `affected_rows()` (Review Focus 2).
+
+    `profile` (a run with profile): once the rows are over and no error is pending, `next_result()` turns the result
+    into a second set, the `profile` field as one `plan` cell; an answer without that field (Community Edition) has no
+    second set and says so once. The field's text is kept outside the read-ahead budget, which counts rows only: it
+    comes after the rows, when a step reads on to the end whatever it holds. `messages` (the parameter warnings) are
+    delivered by the first `take_messages()`."""
 
     def __init__(self, stream: EventStream, sql: str, *, plan: bool, bare_star: bool, dml: bool,
-                 on_done: Callable[[], None]) -> None:
+                 on_done: Callable[[], None], profile: bool = False, messages: Sequence[ServerMessage] = ()) -> None:
         self._stream = stream
         self._sql = sql
         self._plan, self._bare_star, self._dml = plan, bare_star, dml
@@ -196,7 +204,10 @@ class CouchbaseResult(StatementResult, RawJsonRows):
         self._errors: list[Any] = []
         self._status: Any = None
         self._metrics: dict[str, Any] = {}
-        self._messages: list[ServerMessage] = []
+        self._messages: list[ServerMessage] = list(messages)
+        self._profile_wanted = profile
+        self._profile: str | None = None  # the `profile` field's exact text, kept until its set starts
+        self._in_profile = False  # the second set: the profile's one row
         self._peeked: deque[RawRow] = deque()  # the first page, read to build the columns, not delivered yet
         self._held: deque[str] = deque()  # rows read ahead while paused, their text only (parsed again when delivered)
         self.held = 0  # the bytes those rows take (row_cost)
@@ -238,6 +249,9 @@ class CouchbaseResult(StatementResult, RawJsonRows):
             case "metrics":
                 self._metrics = value if isinstance(value, dict) else {}
                 logger.debug("Couchbase metrics: {}", self._metrics)
+            case "profile" if self._profile_wanted:  # unasked (a node-wide profile setting), it is not shown
+                self._profile = event.text
+                logger.debug("Couchbase execution profile: {} characters", len(event.text))  # never its content
             case "requestID" | "clientContextID":
                 logger.debug("Couchbase {}: {}", event.name, value)
 
@@ -252,6 +266,11 @@ class CouchbaseResult(StatementResult, RawJsonRows):
             self._pending = statement_error(self._errors, self._sql)
         elif self._status == "stopped":  # someone else stopped it (DELETE FROM system:active_requests)
             self._pending = StatementCancelled(STOPPED_ON_THE_SERVER)
+        elif self._profile_wanted and self._profile is None:
+            # said here, not in next_result(): the worker takes the messages before it asks for the next set
+            self._messages.append(ServerMessage(severity=MessageSeverity.INFO, text=NO_PROFILE))
+        if self._pending is not None:
+            self._profile = None  # an answer that failed shows its error, never a profile
         logger.debug("Couchbase response ended: status {}", self._status)
         self._release()
 
@@ -368,25 +387,44 @@ class CouchbaseResult(StatementResult, RawJsonRows):
         return self._rows(n, _row_text)
 
     def affected_rows(self) -> int | None:
-        """`metrics.mutationCount`; 0 for DML without it (the server leaves out a zero), else None (spec §3.5.5)."""
+        """`metrics.mutationCount`; 0 for DML without it (the server leaves out a zero), else None (spec §3.5.5). None
+        for the profile set."""
+        if self._in_profile:
+            return None
         self._read_to_end()
         if self._pending is not None:
             raise self._take_pending()
         count = self._metrics.get("mutationCount")
         return count if type(count) is int else (0 if self._dml else None)
 
-    def next_result(self) -> bool:  # 04b adds the profile result set here
+    def next_result(self) -> bool:
+        """The profile set once the rows are over (see the class docstring), else False; an error or a stop that came
+        with the answer is raised instead. The profile set's own next_result() is False: its text is taken."""
         self._read_to_end()
         if self._pending is not None:
             raise self._take_pending()
-        return False
+        if self._profile is None:
+            return False
+        self._start_profile_set(self._profile)
+        return True
+
+    def _start_profile_set(self, text: str) -> None:
+        """The second set: one row, the profile's text in the `plan` shape. Rows of the first set nobody fetched are
+        dropped, held ones as those still on the wire (`_read_to_end`); the worker only asks once the rows are out."""
+        self._profile, self._in_profile = None, True
+        self._held.clear()
+        self.held = 0
+        self._peeked = deque([RawRow(text, None, None)])
+        self._shape = build_shape(None, plan=True, bare_star=False, first_page=[])
+        self._shaped = True
+        logger.debug("Couchbase execution profile delivered as a plan result set")
 
     def take_messages(self) -> list[ServerMessage]:
         messages, self._messages = self._messages, []
         return messages
 
     def presentation(self) -> Presentation:
-        return "plan" if self._plan else "grid"
+        return "plan" if self._plan or self._in_profile else "grid"
 
     def read_ahead(self, budget: int) -> ReadAhead:
         """One step (see the module docstring): the events the stream already holds, then reads while the response is
@@ -442,6 +480,7 @@ class CouchbaseResult(StatementResult, RawJsonRows):
         self._peeked.clear()
         self._held.clear()
         self.held = 0
+        self._profile = None
         try:
             self._stream.end_if_ready(READ_AHEAD_STEP_CHUNKS)
             self._stream.close()
@@ -454,10 +493,13 @@ def _row_text(row: RawRow) -> str:
 
 
 def start_result(stream: EventStream, sql: str, *, plan: bool, bare_star: bool, dml: bool,
-                 on_done: Callable[[], None]) -> CouchbaseResult:
+                 on_done: Callable[[], None], profile: bool = False,
+                 messages: Sequence[ServerMessage] = ()) -> CouchbaseResult:
     """Reads the head of the response (spec §3.7.1 step 3): signature, early errors and warnings, up to the start of
-    `results` or the end. `run()` returns quickly because the server sends the signature first."""
-    result = CouchbaseResult(stream, sql, plan=plan, bare_star=bare_star, dml=dml, on_done=on_done)
+    `results` or the end. `run()` returns quickly because the server sends the signature first. `profile` and
+    `messages`: see CouchbaseResult."""
+    result = CouchbaseResult(stream, sql, plan=plan, bare_star=bare_star, dml=dml, on_done=on_done, profile=profile,
+                             messages=messages)
     try:
         result.read_head()
     except BaseException:
