@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from dbaguy_backend.adapters.base import Endpoint
+from dbaguy_backend.adapters.base import Endpoint, ReadAheadState
 from dbaguy_backend.adapters.couchbase.adapter import PAUSED_RESULT_MAX_IDLE_S, CouchbaseAdapter
 from dbaguy_backend.domain.execution import ExecuteCommand, ExportCommand, FetchMoreCommand, QueryContext
 from dbaguy_backend.services.safety import SafetyPolicy
@@ -13,6 +13,7 @@ from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks, paused_re
 from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.jsontext import one_line
 from tests.fake_db import FakeLease
+from tests.fake_ssh import wait_until
 from tests.support import (
     COUCHBASE_PASSWORD, LONG_AGGREGATE, completed_request_state, make_couchbase_profile, requires_couchbase, scaled,
 )
@@ -32,9 +33,10 @@ class Clock:
         return self.now
 
 
-def start_cb_worker(clock=time.monotonic) -> tuple[SessionWorker, Recorder]:
+def start_cb_worker(clock=time.monotonic, **profile_fields) -> tuple[SessionWorker, Recorder]:
     adapter = CouchbaseAdapter()
-    lease = FakeLease(adapter.open(make_couchbase_profile(), Endpoint("127.0.0.1", 8093), COUCHBASE_PASSWORD, None))
+    profile = make_couchbase_profile(**profile_fields)
+    lease = FakeLease(adapter.open(profile, Endpoint(*adapter.endpoint_target(profile)), COUCHBASE_PASSWORD, None))
     worker = SessionWorker("couchbase", lambda: lease, clock=clock)
     worker.start()
     worker.configure(WorkerHooks(
@@ -159,12 +161,15 @@ def test_an_idle_paused_result_is_closed_and_frees_the_server_request():  # R-04
     worker, rec = start_cb_worker(clock)
     try:
         worker.submit(ExecuteCommand(request_id="p", sql=STREAM, page_size=500))
-        rec.wait_for(paused("p", 500), timeout=30)  # the first pause: the idle clock starts here
+        rec.wait_for(paused("p", 500), timeout=30)  # reading ahead stopped here: the idle clock starts
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL, 30)
         ident = worker.connection.last_client_context_id
         time.sleep(1.2)  # system:completed_requests keeps requests over 1 s
         clock.now += 20  # a Load more 20 s into the pause: served from the buffers, it does not restart the clock
         worker.submit(FetchMoreCommand(request_id="p", count=500))
         rec.wait_for(paused("p", 1000), timeout=30)
+        # the pause after a Load more has no stall start until its first step re-evaluates it (b47c992): wait for it
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL, 30)
         clock.now += PAUSED_RESULT_MAX_IDLE_S - 20 - 1  # 1 s short of the limit, counted from the first pause
         worker.check_paused_result()  # below the limit it queues nothing
         assert not rec.of("p", "finished")

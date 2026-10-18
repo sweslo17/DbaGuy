@@ -210,6 +210,21 @@ def split_object(text: str) -> tuple[RowField, ...]:
     return fields
 
 
+def parse_row(text: str) -> RawRow:
+    """One complete row text, rebuilt exactly as ResponseParser made it (`parse_row(row.text) == row`): a paused
+    result's read-ahead holds rows as their text only (result.py). ValueError for anything else."""
+    if text[:1] == "{":
+        fields, end = _scan_object(text, 0, eof=True)
+        if _skip(text, end) != len(text):
+            raise ValueError("text after the row")
+        return RawRow(text, None, fields)
+    # _decode refuses a value at the very end of its input (a number may go on): give it one delimiter after the text
+    value, end = _decode(_ROW_DECODER, text + ",", 0, eof=True)
+    if end != len(text):
+        raise ValueError("text after the row")
+    return RawRow(text, value, None)
+
+
 class _State(Enum):
     """What may come next."""
 

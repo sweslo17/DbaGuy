@@ -10,8 +10,8 @@ from loguru import logger
 
 from dbaguy_backend.adapters.couchbase import http as http_module
 from dbaguy_backend.adapters.couchbase.http import (
-    ChannelError, NodeClient, QueryRequest, TlsFailure, basic_auth, build_body, client_context_id, failure_reason,
-    tls_failure,
+    ChannelError, ChunkedBody, NodeClient, QueryRequest, TlsFailure, basic_auth, build_body, client_context_id,
+    failure_reason, tls_failure,
 )
 from dbaguy_backend.adapters.couchbase.stream import EndEvent, FieldEvent, ResponseParser, RowEvent
 from tests.couchbase_fakes import (
@@ -522,3 +522,31 @@ def test_a_certificate_the_client_does_not_trust_is_a_tls_failure():
         assert error.value.tls_failure == TlsFailure.ISSUER  # the cluster's CA is self-signed, the system does not know it
     finally:
         client.close()
+
+
+def _chunked(*parts: bytes, extension: bytes = b"", trailer: bytes = b"") -> bytes:
+    body = b"".join(f"{len(p):x}".encode() + extension + b"\r\n" + p + b"\r\n" for p in parts)
+    return body + b"0\r\n" + trailer + b"\r\n"
+
+
+def test_chunked_body_decodes_at_every_split():  # B33: what has arrived is decoded, a cut line waits for the rest
+    parts = (b'{"results":[', b"1,2", b"]}" * 40)
+    for extension, trailer in [(b"", b""), (b";x=1", b"X-Trailer: 1\r\n")]:
+        body = _chunked(*parts, extension=extension, trailer=trailer)
+        for cut in range(len(body) + 1):
+            decoder = ChunkedBody()
+            data = decoder.feed(body[:cut]) + decoder.feed(body[cut:])
+            assert data == b"".join(parts) and decoder.done
+        byte_by_byte = ChunkedBody()
+        assert b"".join(byte_by_byte.feed(body[i:i + 1]) for i in range(len(body))) == b"".join(parts)
+
+
+@pytest.mark.parametrize("body, problem", [
+    (b"zz\r\n", "not a hexadecimal number"), (b"-5\r\nabcde\r\n", "not a hexadecimal number"),
+    (b"3\r\nabcXY", "not followed by CRLF"), (b"0\r\n\r\nmore", "data after the last chunk"),
+    (b"1" * 5000, "too long"),
+])
+def test_chunked_body_refuses_broken_framing_with_a_fixed_text(body, problem):
+    with pytest.raises(ValueError, match=problem) as error:
+        ChunkedBody().feed(body)
+    assert "zz" not in str(error.value)  # never the peer's bytes

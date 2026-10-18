@@ -14,11 +14,16 @@ a cancel for CONNECT_TIMEOUT_S (ruling R-04a-T7a).
 The server sends no status line until its first output is ready (a long aggregate: minutes), so `NodeClient.send()` can
 block that long; a cancel during that wait shuts the channel down like any other (the caller gets the channel from
 `attach` before anything is sent, and arms its own timer before calling `send`). A caller that cannot be cancelled by
-anyone (the internal metadata queries) passes `read_timeout`: no bytes for that long ends the request (R-04a-F3)."""
+anyone (the internal metadata queries) passes `read_timeout`: no bytes for that long ends the request (R-04a-F3).
+
+A paused result reads ahead without waiting (result.py): `QueryResponse.ready()` says whether a read would wait, and a
+chunked body is decoded here (`ChunkedBody`), never by http.client, whose chunked reading waits for the next chunk's
+size line (ruling B33)."""
 
 import base64
 import errno
 import http.client
+import io
 import json
 import os
 import re
@@ -175,6 +180,65 @@ def _endpoint_label(host: str, port: int) -> str:
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
 
+_CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,16}")
+_CHUNK_LINE_LIMIT = 4096  # a size line (with extensions) or a trailer line longer than this is not the query service
+
+
+class ChunkedBody:
+    """The chunked transfer coding (RFC 9112 §7.1) decoded from whatever bytes have arrived. A size line or a CRLF cut
+    between two reads waits here for the rest, so a read never asks the socket for more than it holds (http.client's
+    own decoding reads a size line to its end, which blocks when the server has sent a chunk and not the next one).
+    ValueError, with a fixed text (never the peer's bytes), when the framing is broken."""
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+        self._left = 0  # data bytes still to come in the current chunk
+        self._state = "size"  # size | data | crlf | trailer | done
+        self.done = False  # the last chunk and the trailer have been read
+
+    def feed(self, data: bytes) -> bytes:
+        """The body bytes `data` completes (possibly none: framing only)."""
+        self._buf += data
+        out = bytearray()
+        while True:
+            if self._state == "data":
+                take = min(self._left, len(self._buf))
+                out += self._buf[:take]
+                del self._buf[:take]
+                self._left -= take
+                if self._left:
+                    return bytes(out)
+                self._state = "crlf"
+            elif self._state == "crlf":
+                if len(self._buf) < 2:
+                    return bytes(out)
+                if self._buf[:2] != b"\r\n":
+                    raise ValueError("a chunk is not followed by CRLF")
+                del self._buf[:2]
+                self._state = "size"
+            elif self._state in ("size", "trailer"):
+                end = self._buf.find(b"\n")
+                if end < 0:
+                    if len(self._buf) > _CHUNK_LINE_LIMIT:
+                        raise ValueError("a chunk line is too long")
+                    return bytes(out)
+                line = bytes(self._buf[:end]).rstrip(b"\r")
+                del self._buf[:end + 1]
+                if self._state == "trailer":
+                    if not line:
+                        self._state, self.done = "done", True
+                    continue
+                size = line.split(b";", 1)[0].strip()
+                if not _CHUNK_SIZE.fullmatch(size):
+                    raise ValueError("a chunk size is not a hexadecimal number")
+                self._left = int(size, 16)
+                self._state = "data" if self._left else "trailer"
+            else:  # done
+                if self._buf:
+                    raise ValueError("data after the last chunk")
+                return bytes(out)
+
+
 def _connect(host: str, port: int, timeout: float, cancelled: Callable[[], bool]) -> socket.socket:
     """socket.create_connection that a cancel ends within _CONNECT_POLL_S (R-04a-T7a): each address is connected without
     blocking and polled, with `cancelled()` checked in between. `timeout` bounds the whole attempt over every address;
@@ -239,6 +303,9 @@ class HttpChannel:
         self._lock = threading.Lock()  # a leaf: guards _handle and _shut, held for a shutdown() syscall at most
         self._handle: socket.socket | None = None  # the duplicate a shutdown acts on
         self._shut = False  # shutdown() was called
+        # The socket open_socket() returned (worker thread only): http.client drops `conn.sock` after a `Connection:
+        # close` answer while the response still reads from it, and readable() must look at that one
+        self._sock: socket.socket | None = None
         self.conn = _Connection(self)
         self.used = False
         self.idle_since: float | None = None
@@ -267,6 +334,7 @@ class HttpChannel:
             sock.settimeout(None)  # reads wait as long as a paused result needs; a cancel shuts the socket down
             logger.debug("Connected to the query node {} ({})", _endpoint_label(self.host, self.port),
                          "TLS" if self._tls is not None else "plain")
+            self._sock = sock
             return sock
         except BaseException:
             sock.close()
@@ -288,9 +356,26 @@ class HttpChannel:
         with self._lock:
             return self._shut
 
+    def readable(self) -> bool:
+        """Worker thread: whether a read would not wait. True when bytes are on the socket, decrypted TLS bytes are
+        pending, or the socket is gone or failed (the read then fails at once). With TLS, bytes on the socket may be
+        part of a record whose rest is still in flight: a read then waits for that rest only."""
+        sock = self._sock
+        if sock is None:
+            return True
+        try:
+            if isinstance(sock, ssl.SSLSocket) and sock.pending():
+                return True
+            with selectors.DefaultSelector() as selector:
+                selector.register(sock, selectors.EVENT_READ)
+                return bool(selector.select(0))
+        except (OSError, ValueError):  # closed (fileno -1) or failed
+            return True
+
     def close(self) -> None:
         """Worker thread."""
         self.dead = True
+        self._sock = None
         with self._lock:
             handle, self._handle = self._handle, None
         with suppress(Exception):
@@ -306,7 +391,8 @@ class HttpChannel:
 
 class QueryResponse:
     """The answer to one request, read in chunks by the worker thread. `done`: read to the end (the connection may then
-    carry the next request)."""
+    carry the next request). A chunked body (every big answer) is decoded by ChunkedBody over the socket's reader; a
+    Content-Length body by http.client's read1()."""
 
     def __init__(self, channel: HttpChannel, response: http.client.HTTPResponse, clock: Callable[[], float]) -> None:
         self._channel, self._response, self._clock = channel, response, clock
@@ -314,25 +400,51 @@ class QueryResponse:
         self.content_type = response.getheader("Content-Type") or ""
         self.done = False
         self._failed: ChannelError | None = None  # raised by every later read: a failed body never ends cleanly
+        self._chunked = ChunkedBody() if response.chunked else None
+        self._unread = True  # no read yet: http.client's reader may hold body bytes it read with the headers
 
-    def read_chunk(self) -> bytes:
-        """The next bytes of the body (up to READ_CHUNK), b"" at its end. ChannelError when the connection fails."""
+    def ready(self) -> bool:
+        """Worker thread: whether a read would not wait. Exact after the first read, which (as every read) empties
+        http.client's buffered reader. A Content-Length body http.client has read to its end returns b"" at once."""
+        return (self.done or self._failed is not None or self._unread
+                or (self._chunked is None and self._response.isclosed()) or self._channel.readable())
+
+    def read_chunk(self, wait: bool = True) -> bytes:
+        """The next bytes of the body, b"" at its end (`done`). ChannelError when the connection fails. `wait=False`
+        (a read-ahead, called only when `ready()`): one read of what is there, which may bring chunk framing only and
+        then returns b"" with `done` still False."""
         if self._failed is not None:
             raise self._failed
-        if self.done:
-            return b""
+        while not self.done:
+            data = self._read_once()
+            if data or not wait:
+                return data
+        return b""
+
+    def _read_once(self) -> bytes:
         try:
-            data = self._response.read1(READ_CHUNK)
-        except _FAILURES as exc:
+            size = max(READ_CHUNK, io.DEFAULT_BUFFER_SIZE)  # at least the reader's buffer: each read empties it
+            if self._chunked is None:
+                data = self._response.read1(size)
+            else:
+                raw = self._response.fp.read1(size)
+                if not raw:
+                    raise http.client.IncompleteRead(b"")
+                data = self._chunked.feed(raw)
+        except _FAILURES as exc:  # ChunkedBody's ValueError too (a fixed text)
             error = ChannelError(failure_reason(exc))
             self._stop(error)
             raise error from exc
-        if not data:
-            if self._response.length:  # a Content-Length body that ended early: http.client's read1() does not raise
-                error = ChannelError(failure_reason(http.client.IncompleteRead(b"", self._response.length)))
-                self._stop(error)
-                raise error
+        self._unread = False
+        if self._chunked is None and not data and self._response.length:
+            # a Content-Length body that ended early: http.client's read1() does not raise
+            error = ChannelError(failure_reason(http.client.IncompleteRead(b"", self._response.length)))
+            self._stop(error)
+            raise error
+        if self._chunked.done if self._chunked is not None else not data:
             self.done = True
+            if self._chunked is not None:
+                self._response.close()  # as http.client does after the last chunk: the connection takes a new request
             if self._response.will_close:
                 self._channel.close()
             else:

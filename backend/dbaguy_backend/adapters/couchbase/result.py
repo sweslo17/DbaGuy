@@ -3,28 +3,62 @@ inside columns(), messages from warnings and metrics, an error that follows rows
 and each row's server text for raw JSON exports.
 
 Threads: everything here runs on the session's worker thread. A cancel from another thread only shuts the connection
-down (adapter.py); the read that fails because of it is reported as a cancel, since `cancelled()` says so."""
+down (adapter.py); the read that fails because of it is reported as a cancel, since `cancelled()` says so.
 
+Read-ahead (R-04a-T11a): while the result is paused, the worker steps `read_ahead()`, which takes the rows the server
+has already sent into memory so the server is not held back, up to the budget (`READ_AHEAD_BYTES`, counted by
+`row_cost`). A step never waits: it reads only when the response is ready (`QueryResponse.ready()`: bytes on the
+socket), at most READ_AHEAD_STEP_CHUNKS times. Held rows keep their text only and are parsed again when delivered
+(`parse_row`): a parsed row with its fields costs 4–5 times its text (ruling B5). They come out after the `*` peek's
+rows and before the stream's, and a failure met while reading ahead is kept until they are out."""
+
+import sys
 from collections import deque
 from collections.abc import Callable
+from enum import Enum, auto
 from typing import Any, Protocol
 
 from loguru import logger
 
 from ...domain.execution import ColumnMeta, MessageSeverity, Presentation, ServerMessage
-from ..base import RawJsonRows, StatementCancelled, StatementError, StatementResult
+from ..base import (
+    RawJsonRows, ReadAhead, ReadAheadState, StatementCancelled, StatementError, StatementResult,
+)
 from .http import ChannelError
 from .messages import PROTOCOL_ERROR, metrics_message, statement_error, warning_messages
 from .rows import STAR_PEEK_BYTES, STAR_PEEK_ROWS, RowShape, build_shape, needs_first_page
-from .stream import EndEvent, Event, FieldEvent, ProtocolError, RawRow, ResponseParser, ResultsEnd, ResultsStart, RowEvent
+from .stream import (
+    EndEvent, Event, FieldEvent, ProtocolError, RawRow, ResponseParser, ResultsEnd, ResultsStart, RowEvent, parse_row,
+)
 
 STOPPED_ON_THE_SERVER = "Query was stopped on the server"
+# One read-ahead step makes at most this many reads of up to READ_CHUNK (ruling B35: 16 reads took 0.42 s on 6-byte
+# rows; with 2 the longest step was about 70 ms and filling 8 MiB took as long): a command waits for one step at most.
+READ_AHEAD_STEP_CHUNKS = 2
+
+
+def row_cost(text: str) -> int:
+    """What a held row takes in memory: its text object and its slot in the deque."""
+    return sys.getsizeof(text) + 8
+
+
+class NotReady(Enum):
+    """`EventStream.next_if_ready()`: no event is complete, and reading on would wait or the step's reads are used up."""
+
+    NOT_READY = auto()
+
+
+NOT_READY = NotReady.NOT_READY
 
 
 class Response(Protocol):
     """What EventStream reads: http.QueryResponse (or a test's canned FakeResponse)."""
 
-    def read_chunk(self) -> bytes: ...
+    done: bool  # the body has been read to its end
+
+    def ready(self) -> bool: ...
+
+    def read_chunk(self, wait: bool = True) -> bytes: ...
 
     def abandon(self) -> None: ...
 
@@ -39,33 +73,73 @@ class EventStream:
         self._events: deque[Event] = deque()
         self._ended = False  # the response object has closed (EndEvent seen), or the stream was closed
         self.done = False  # …and the body has been read to its end: the connection may carry the next request
+        self.received = 0  # body bytes read so far, by every path (a read-ahead step, fetch(), the trailer; B44)
+        self.reads = 0  # reads made so far (a read-ahead step counts its own)
 
     def next(self) -> Event | None:
-        """The next event; None once the response object has closed."""
+        """The next event; None once the response object has closed. Waits for the server."""
+        event = self._next(None)
+        assert event is not NOT_READY
+        return event
+
+    def next_if_ready(self, max_reads: int) -> Event | None | NotReady:
+        """As next(), but never waits (ruling B34): while no event is complete it reads one chunk at a time, only when
+        the response is ready and at most `max_reads` times, and then gives NOT_READY. The bytes after the object are
+        read only while ready, within the same `max_reads`."""
+        return self._next(max_reads)
+
+    def _next(self, max_reads: int | None) -> Event | None | NotReady:
+        """`max_reads` None: wait for the server (next())."""
+        reads = 0
         while not self._events:
             if self._ended:
                 return None
-            self._read()
+            if max_reads is None:
+                self._read()
+            elif reads < max_reads and self._response.ready():
+                reads += 1
+                self._read(wait=False)
+            else:
+                return NOT_READY
         event = self._events.popleft()
         if isinstance(event, EndEvent):
             self._ended = True
-            self._read_trailer()
+            self._read_trailer(None if max_reads is None else max_reads - reads)
         return event
 
-    def _read_trailer(self) -> None:
+    def _read_trailer(self, max_reads: int | None) -> None:
         """The last bytes after the object (a newline, the end of the chunked body): usually already here. The answer is
-        complete, so a failure here costs the connection only, never the statement."""
+        complete, so a failure here costs the connection only, never the statement. `max_reads` (a read-ahead step):
+        read only while ready and at most that often; what is left is dropped by close() (the request is over, only
+        the kept-alive connection goes)."""
         try:
             while not self.done:
-                self._read()
+                if max_reads is None:
+                    self._read()
+                elif max_reads > 0 and self._response.ready():
+                    max_reads -= 1
+                    self._read(wait=False)
+                else:
+                    return
         except StatementError as exc:
             logger.debug("Couchbase response from {} ended badly after its last field: {}", self._node, exc.message)
             self.close()
 
-    def _read(self) -> None:
+    def _read(self, wait: bool = True) -> None:
+        """One read and the events it completes. `wait=False` (a read-ahead, only when the response is ready): a read
+        that brings chunk framing only completes nothing and is not the end either (B33)."""
+        self.reads += 1
         try:
-            chunk = self._response.read_chunk()
-            events = self._parser.feed(chunk) if chunk else self._parser.finish()
+            chunk = self._response.read_chunk(wait)
+            self.received += len(chunk)
+            events = self._parser.feed(chunk) if chunk else []
+            if self._response.done:
+                try:
+                    events += self._parser.finish()
+                except ProtocolError:
+                    if not events:
+                        raise
+                    # the events before the failure go out first: the parser raises it again on the next call
         except ChannelError as exc:
             raise self._lost(str(exc)) from exc
         except ProtocolError as exc:
@@ -76,7 +150,7 @@ class EventStream:
             logger.warning("Malformed response from the query node {} at offset {} (field {})", self._node, exc.offset,
                            exc.field)
             raise StatementError(PROTOCOL_ERROR, code="protocol_error") from exc
-        self.done = not chunk
+        self.done = self._response.done
         self._events.extend(events)
 
     def _lost(self, reason: str) -> StatementError:
@@ -97,8 +171,9 @@ class EventStream:
 class CouchbaseResult(StatementResult, RawJsonRows):
     """The rows of one statement, read as asked for. The columns come from the signature, or for a `*` from the first
     page, which is read inside `columns()` (the worker's timeout covers it) and delivered first by `fetch()` and
-    `fetch_raw()` (R-04a-C14). An error or a stop that follows rows is kept until those rows are out, then raised by the
-    next `fetch()` that has no rows, `next_result()` or `affected_rows()` (Review Focus 2)."""
+    `fetch_raw()` (R-04a-C14), then the rows read ahead while paused (`held`), then the stream. An error or a stop that
+    follows rows is kept until those rows are out, then raised by the next `fetch()` that has no rows, `next_result()`
+    or `affected_rows()` (Review Focus 2)."""
 
     def __init__(self, stream: EventStream, sql: str, *, plan: bool, bare_star: bool, dml: bool,
                  on_done: Callable[[], None]) -> None:
@@ -112,6 +187,8 @@ class CouchbaseResult(StatementResult, RawJsonRows):
         self._metrics: dict[str, Any] = {}
         self._messages: list[ServerMessage] = []
         self._peeked: deque[RawRow] = deque()  # the first page, read to build the columns, not delivered yet
+        self._held: deque[str] = deque()  # rows read ahead while paused, their text only (parsed again when delivered)
+        self.held = 0  # the bytes those rows take (row_cost)
         self._rows_done = False  # no more row will come
         self._ended = False  # the response object has closed (or the result was closed)
         self._pending: StatementError | None = None  # a failure kept while rows read before it go out
@@ -170,6 +247,10 @@ class CouchbaseResult(StatementResult, RawJsonRows):
     def _next_row(self) -> RawRow | None:
         if self._peeked:
             return self._peeked.popleft()
+        if self._held:
+            text = self._held.popleft()
+            self.held -= row_cost(text)
+            return parse_row(text)
         while not self._rows_done:
             event = self._stream.next()
             match event:
@@ -206,7 +287,7 @@ class CouchbaseResult(StatementResult, RawJsonRows):
             return []
         out: list[Any] = []
         while len(out) < n:
-            if not self._peeked and self._pending is not None:
+            if not self._peeked and not self._held and self._pending is not None:
                 break  # a failure kept while earlier rows went out: those rows first, then it
             try:
                 row = self._next_row()
@@ -296,11 +377,52 @@ class CouchbaseResult(StatementResult, RawJsonRows):
     def presentation(self) -> Presentation:
         return "plan" if self._plan else "grid"
 
+    def read_ahead(self, budget: int) -> ReadAhead:
+        """One step (see the module docstring): the events the stream already holds, then reads while the response is
+        ready, at most READ_AHEAD_STEP_CHUNKS of them, until the rows held take `budget` (FULL; checked after each row,
+        so a row is never split and the events after it stay queued), the answer ends (DONE: `_end()` releases the
+        connection), or nothing more is ready (WAITING when this step read nothing and took nothing, else READING: a
+        chunk inside a long row completes no event and is still progress, B34). A failure is kept for after the held
+        rows, and the step says DONE."""
+        if self._ended or self._pending is not None:
+            return ReadAhead(ReadAheadState.DONE, self._stream.received)
+        reads, took = self._stream.reads, False
+        while self.held < budget:
+            try:
+                event = self._stream.next_if_ready(READ_AHEAD_STEP_CHUNKS - (self._stream.reads - reads))
+            except StatementError as exc:  # a cut connection, a protocol error, a cancel
+                self._pending = exc  # raised once the rows held before it are out (Review Focus 2)
+                return self._ahead_done()
+            if event is NOT_READY:
+                idle = not took and self._stream.reads == reads
+                return ReadAhead(ReadAheadState.WAITING if idle else ReadAheadState.READING, self._stream.received)
+            took = True
+            match event:
+                case RowEvent(row=row):
+                    if not self._rows_done:  # as _read_to_end(): nothing after the rows is a row
+                        self._held.append(row.text)
+                        self.held += row_cost(row.text)
+                case FieldEvent():
+                    self._field(event)
+                case ResultsEnd():
+                    self._rows_done = True
+                case EndEvent() | None:
+                    self._end()  # an error or a stop in the answer is kept for after the held rows
+                    return self._ahead_done()
+        return ReadAhead(ReadAheadState.FULL, self._stream.received)
+
+    def _ahead_done(self) -> ReadAhead:
+        logger.debug("Couchbase read-ahead reached the end of the answer: {} rows held ({} bytes){}", len(self._held),
+                     self.held, ", then an error" if self._pending is not None else "")
+        return ReadAhead(ReadAheadState.DONE, self._stream.received)
+
     def close(self) -> None:
         """Idempotent. A response read to its end leaves the connection for the next request; any other is abandoned,
-        which stops the request on the server at once (no drain, spec §3.7.2)."""
+        which stops the request on the server at once (no drain, spec §3.7.2). The rows held are dropped."""
         self._ended = self._rows_done = True
         self._peeked.clear()
+        self._held.clear()
+        self.held = 0
         try:
             self._stream.close()
         finally:

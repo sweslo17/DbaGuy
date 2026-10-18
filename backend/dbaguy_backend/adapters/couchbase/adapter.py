@@ -63,6 +63,10 @@ from .settings import (
 # reading (1203 "Slow/stalled client write timed out", the rest of the response cut), so the worker must close it
 # first, with its own message, well before 77 s: 45–60 s.
 PAUSED_RESULT_MAX_IDLE_S = 45.0
+# R-04a-T11a: the row memory a paused result reads ahead into (spec §8 Q1 「預讀上限 8 MiB」), counted by
+# `sys.getsizeof` of each row's text (result.row_cost): a 20,000-row collection page-through (≈ 3 MB held) fits and is
+# read to its end, so the server holds nothing for it; the same cap as the `*` peek (rows.STAR_PEEK_BYTES).
+READ_AHEAD_BYTES = 8 * 1024 * 1024
 TRANSACTIONS_UNSUPPORTED = "transactions_unsupported"
 _NO_TRANSACTIONS = ("SQL++ transactions (BEGIN WORK, COMMIT, ROLLBACK, SAVEPOINT) are not supported in DbaGuy yet; "
                     "every statement commits on its own")
@@ -376,6 +380,7 @@ class CouchbaseAdapter(DatabaseAdapter):
     capabilities = AdapterCapabilities(
         server_read_only=True, transactions=False, query_context=True, parameters=True, documents=False,
         executed_plan=False, plan_format="couchbase", paused_result_max_idle_s=PAUSED_RESULT_MAX_IDLE_S,
+        read_ahead_bytes=READ_AHEAD_BYTES,
     )
 
     def parse_url(self, url: str) -> ParsedUrl:

@@ -160,7 +160,8 @@ class FullListenQueue:
 
 
 class FakeResponse:
-    """A QueryResponse made of canned chunks (result tests without a server)."""
+    """A QueryResponse made of canned chunks (result tests without a server). `arrived`: how many of them are "on the
+    socket" for a read-ahead (`ready()`); None: all of them."""
 
     def __init__(self, chunks: list[bytes], status: int = 200, content_type: str = "application/json") -> None:
         self._chunks = list(chunks)
@@ -168,13 +169,19 @@ class FakeResponse:
         self.done = False
         self.abandoned = False
         self.fail_with: Exception | None = None
+        self.arrived: int | None = None
 
-    def read_chunk(self) -> bytes:
+    def ready(self) -> bool:
+        return self.fail_with is not None or not self._chunks or self.arrived is None or self.arrived > 0
+
+    def read_chunk(self, wait: bool = True) -> bytes:  # `wait` changes nothing: every canned chunk holds data
         if self.fail_with is not None:
             raise self.fail_with
         if not self._chunks:
             self.done = True
             return b""
+        if self.arrived is not None:
+            self.arrived = max(0, self.arrived - 1)  # a blocking read of a chunk not there yet waited for it
         return self._chunks.pop(0)
 
     def abandon(self) -> None:
