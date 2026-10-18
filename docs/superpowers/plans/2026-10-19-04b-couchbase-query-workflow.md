@@ -40,7 +40,7 @@ From `docs/research/2026-10-15-feature-priorities.md`. Every task review and the
 - **No Couchbase SDK.** Python `>=3.13,<3.14`, poetry in-project venv (`backend/.venv`); no new Python or frontend dependency in 04b (`@codemirror/lang-json` is 04c).
 - Binding values, each defined once, in the file named:
   - `adapters/couchbase/adapter.py`: `PAUSED_RESULT_MAX_IDLE_S = 45.0` (unchanged), `READ_AHEAD_BYTES = 8 * 1024 * 1024` → capability `read_ahead_bytes`; the housekeeping pass runs every 15 s (`container._HOUSEKEEPING_INTERVAL_S`).
-  - `sessions/read_ahead.py`: `STALL_RESET_FACTOR = 2` (the server's stall clock is taken to restart once 2 × the engine's read-ahead budget of answer bytes has been read since the stall began, A23), `READ_AHEAD_POLL_S = 0.25` (how soon a read-ahead that found nothing on the socket looks again).
+  - `sessions/read_ahead.py`: `STALL_RESET_FACTOR = 2` (the server's stall clock is taken to restart once 2 × the engine's read-ahead budget of answer bytes has been read since the stall began, A23; the only thing that ends a stall besides the end of the answer: an empty socket does not, ruling B42), `READ_AHEAD_POLL_S = 0.25` (how soon a read-ahead that found nothing on the socket looks again).
   - `adapters/couchbase/result.py`: `READ_AHEAD_STEP_CHUNKS = 2` (one read-ahead step makes at most 2 reads of `READ_CHUNK` = 128 KiB; 16 reads took 0.42 s on 6-byte rows, ruling B35); a held row costs `sys.getsizeof(text) + 8` bytes (`row_cost`).
   - `adapters/values.py`: `PLAN_TEXT_LIMIT = 4 * 1024 * 1024` (a cell of a `plan` presentation is sent whole up to this; every other cell keeps `TEXT_LIMIT` = 64 KiB).
   - `adapters/couchbase/sampling.py`: `SAMPLE_MAX_BYTES = 32 * 1024 * 1024`, `FIELD_PATH_MAX_DEPTH = 6`, `FIELD_PATHS_MAX = 2000`. `domain/settings.py`: `CouchbaseSettings.sample_size: int = 1000` (10–10,000).
@@ -71,7 +71,7 @@ From `docs/research/2026-10-15-feature-priorities.md`. Every task review and the
 
 1. **A paused result reading ahead must never hold up a command.** A server that trickles rows, one that has stopped sending, or a 1 MiB burst being parsed: Cancel, Discard, Load more, a new statement and closing the tab are each served within one step (≤ 128 KiB parsed and never a wait on the socket, a 50 ms fake step in the tests; rulings B33, B35), and the server request is `closed` after a discard. → Task 2 `test_read_ahead_never_holds_up_a_command`; Task 3 `test_a_step_never_waits_at_a_chunk_boundary`, `test_a_discard_during_read_ahead_frees_the_server_request`.
 2. **Rows come out once, in order, exactly**, across the `*` peek, the read-ahead buffer and the stream, with an error that followed the rows raised only after them, and number literals (`u_numbers`) unchanged by the re-parse of held rows. → Task 3 `test_parse_row_rebuilds_what_the_parser_made`, `test_read_ahead_holds_rows_until_the_budget_then_says_full`, `test_an_error_after_the_rows_is_raised_after_the_held_rows`, live `test_rows_stay_in_order_across_the_peek_the_read_ahead_and_the_stream`.
-3. **The idle close times the server's stall, not DbaGuy's pauses.** A result read to its end is never closed; a larger one closes 45–60 s after reading stopped (before the server's 77 s kill, A23), a small refill (a Load more of 500 rows) does not restart that clock, an empty socket or 16 MiB drained does, and engines without read-ahead keep the first-pause clock (R-04a-T11b). → Task 2 `test_read_ahead.py` (all), `test_a_result_read_to_its_end_is_never_closed`, `test_the_idle_limit_counts_from_where_the_read_ahead_stopped`, `test_draining_twice_the_budget_restarts_the_clock`; Task 3 live `test_a_result_that_fits_is_read_to_its_end_and_stays_loadable`.
+3. **The idle close times the server's stall, not DbaGuy's pauses.** A result read to its end is never closed; a larger one closes 45–60 s after reading stopped (before the server's 77 s kill, A23), a small refill (a Load more of 500 rows) and an empty socket do not restart that clock, only 16 MiB drained does (ruling B42), and engines without read-ahead keep the first-pause clock (R-04a-T11b). → Task 2 `test_read_ahead.py` (all), `test_a_result_read_to_its_end_is_never_closed`, `test_the_idle_limit_counts_from_where_the_read_ahead_stopped`, `test_an_empty_socket_after_a_load_more_does_not_restart_the_clock`, `test_draining_twice_the_budget_restarts_the_clock`; Task 3 live `test_a_result_that_fits_is_read_to_its_end_and_stays_loadable`.
 4. **Parameters reach the server exactly and only where used.** `$x` and `@x` are one parameter; `?` and `$1` share positions; each statement gets only what it uses; a missing or invalid value sends nothing; `9007199254740993` stays exact; a number the server would read as a double is flagged by name, never by value. → Task 4 `test_parameters_reach_the_server_exactly`, `test_changes_as_double`, `test_warnings_name_the_parameter_and_never_its_value`, live `test_a_number_the_server_reads_as_a_double_is_flagged`; Task 10 manual checks 1–7.
 5. **Query contexts with awkward names round-trip.** A bucket with a dot or a back-tick, `_default._default`, a context from History that the snapshot no longer lists, and an explicit "No context" persisted across a restart: what the picker shows is exactly what is sent and what History records. → Task 6 `test_the_current_context_is_listed_even_when_the_snapshot_lacks_it`, `test_history_entries_carry_their_parsed_context`, `test_workspace_keeps_the_tab_context_and_params`, `test_sqlpp_browse_select_reads_the_collection_with_its_meta_id`; Task 9 manual checks 2–6.
 
@@ -392,7 +392,7 @@ git commit -m "test(couchbase): plan fixtures from the dev cluster, request_acti
 **Interfaces:**
 - Consumes: 04a's worker (`_OpenExecution`, `_PausedMark`, `_pause`, `check_paused_result`, `_close_idle_paused`, the injectable `clock`), `AdapterCapabilities.paused_result_max_idle_s`.
 - Produces, in `adapters/base.py`:
-  - `class ReadAheadState(StrEnum)`: `READING = "reading"` (took rows the server had sent; more may be on the socket), `WAITING = "waiting"` (nothing on the socket: the server is working or done, not held back by DbaGuy), `FULL = "full"` (the budget is used up: reading stopped, the server will be held back from here), `DONE = "done"` (the whole answer is in memory, or ended in an error kept for later: nothing can stall);
+  - `class ReadAheadState(StrEnum)`: `READING = "reading"` (took rows the server had sent; more may be on the socket), `WAITING = "waiting"` (the step read nothing: nothing is on the socket now. It says nothing about the server's own stall clock — an emptied socket does not mean the server's pending write completed, A23 — so the stall clock ignores it, ruling B42), `FULL = "full"` (the budget is used up: reading stopped, the server will be held back from here), `DONE = "done"` (the whole answer is in memory, or ended in an error kept for later: nothing can stall);
   - `@dataclass(frozen=True) class ReadAhead`: `state: ReadAheadState`, `received: int = 0` (bytes of the server's answer read so far, by any path: cumulative);
   - `StatementResult.read_ahead(self, budget: int) -> ReadAhead` — non-abstract; default `return ReadAhead(ReadAheadState.FULL)`. Contract (docstring): worker thread only, only while the result is paused; must never block; reads rows the server has already sent into memory until the rows held take `budget` bytes; rows read here come out of the next `fetch()` / `fetch_raw()` first, in order; a failure met while reading is kept and raised after the rows read before it (never raised here);
   - `AdapterCapabilities.read_ahead_bytes: int | None = None` (None: the engine does not read ahead; not in `EngineInfo`).
@@ -403,7 +403,7 @@ The worker's rules, which Steps 1 and 3 pin:
 - An engine with `read_ahead_bytes` set reads ahead while a result is paused: after each pause the worker, whenever no task is queued, calls `result.read_ahead(read_ahead_bytes)` — at once again after `READING`, after `READ_AHEAD_POLL_S` of an empty queue after `WAITING`, and not again after `FULL` (until the next pause, since a Load more frees room) or `DONE` (never again).
 - Every step feeds `StallClock.update(step, clock())`; the paused mark's `since` follows `StallClock.since`; `check_paused_result()` closes only a mark whose `since` is set and at least `paused_result_max_idle_s` old.
 - An engine without `read_ahead_bytes` never has `read_ahead` called: at each pause the worker feeds `ReadAhead(FULL)` itself, so the clock runs from the first pause and a Load more does not restart it (R-04a-T11b, unchanged).
-- `StallClock.update`: `WAITING` or `DONE` → `since = None`. `READING` or `FULL` with `since` set and `step.received - received_at_stall >= reset_bytes` (reset_bytes not None) → `since = None` (the server has been unblocked). Then `FULL` with `since` None → `since = now`, `received_at_stall = step.received`.
+- `StallClock.update` (ruling B42; B3 is withdrawn): `WAITING` changes nothing (it neither starts nor ends a stall). `DONE` → `since = None`. `READING` or `FULL` with `since` set and `step.received - received_at_stall >= reset_bytes` (reset_bytes not None) → `since = None` (the server has been unblocked, B2). Then `FULL` with `since` None → `since = now`, `received_at_stall = step.received`. So a result that never fills the budget never stalls, whatever the socket shows.
 - A read-ahead that raises (a bug: adapters keep failures) is logged with its traceback and treated as `FULL` with the last `received`.
 
 - [ ] **Step 1: Write the failing tests.** Create `backend/tests/test_read_ahead.py`:
@@ -411,8 +411,6 @@ The worker's rules, which Steps 1 and 3 pin:
 ```python
 """The stall clock of a paused result (R-04a-T11a/T11b, A23): when the server may be held back because DbaGuy stopped
 reading, and when that ends."""
-
-import pytest
 
 from dbaguy_backend.adapters.base import ReadAhead
 from dbaguy_backend.adapters.base import ReadAheadState as S
@@ -443,12 +441,22 @@ def test_a_small_refill_keeps_the_stall_and_a_large_drain_ends_it():  # A23: 128
     assert clock.since == 31.0
 
 
-@pytest.mark.parametrize("state", [S.WAITING, S.DONE])
-def test_an_empty_socket_or_the_end_means_no_stall(state):
+def test_the_end_means_no_stall():
     clock = StallClock(reset_bytes=16 * MIB)
     clock.update(ReadAhead(S.FULL, 8 * MIB), now=10.0)
-    clock.update(ReadAhead(state, 8 * MIB), now=11.0)
+    clock.update(ReadAhead(S.DONE, 8 * MIB), now=11.0)
     assert clock.since is None
+
+
+def test_an_empty_socket_changes_nothing():  # B42: draining the socket is not the server's write completing (A23)
+    clock = StallClock(reset_bytes=16 * MIB)
+    clock.update(ReadAhead(S.WAITING, 1 * MIB), now=5.0)
+    assert clock.since is None  # no stall in progress: an empty socket does not start one
+    clock.update(ReadAhead(S.FULL, 8 * MIB), now=10.0)
+    clock.update(ReadAhead(S.WAITING, 8 * MIB + 64 * 1024), now=20.0)
+    assert clock.since == 10.0  # a stall in progress: an empty socket does not end it
+    clock.update(ReadAhead(S.FULL, 8 * MIB + 64 * 1024), now=21.0)
+    assert clock.since == 10.0
 
 
 def test_without_read_ahead_the_stall_starts_at_the_first_pause_and_never_restarts():  # R-04a-T11b
@@ -557,7 +565,7 @@ def test_the_idle_limit_counts_from_where_the_read_ahead_stopped():  # Review Fo
         worker.close()
 
 
-def test_an_empty_socket_after_a_load_more_restarts_the_clock():
+def test_an_empty_socket_after_a_load_more_does_not_restart_the_clock():  # B42 (B3 withdrawn)
     clock = Clock()
     worker, conn, rec = read_ahead_worker(clock)
     try:
@@ -570,16 +578,16 @@ def test_an_empty_socket_after_a_load_more_restarts_the_clock():
         clock.now = 1040.0
         conn.script.put(ReadAhead(ReadAheadState.WAITING, 1 * MIB))  # the refill drained the socket
         wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.WAITING)
-        clock.now = 1050.0
-        conn.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB + 4096))
-        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
-        clock.now = 1094.0  # 94 s after the first stop, 44 s after the second
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB + 4096))  # 4 KiB more: far from 2 × the budget
+        wait_until(lambda: conn.script.empty() and worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1044.0  # 44 s after the first stop
         worker.check_paused_result()
         _barrier(worker)
         assert not rec.of("p", "finished")
-        clock.now = 1095.0
+        clock.now = 1045.0  # 45 s after the FIRST stop, 5 s after the empty socket
         worker.check_paused_result()
         rec.wait_for(finished("p"))
+        assert rec.of("p", "message")[-1].text == CLOSED_AFTER_45
     finally:
         worker.close()
 
@@ -750,10 +758,10 @@ git commit -m "feat(sessions): paused results read ahead between commands; the i
 - Modify: `backend/tests/couchbase_fakes.py` (`FakeResponse.ready()`, `arrived`, `read_chunk(wait=True)`)
 - Create: `backend/tests/test_couchbase_read_ahead.py`
 - Modify: `backend/tests/test_couchbase_http.py` (`ChunkedBody` tests, ruling B33)
-- Modify: `backend/tests/test_couchbase_sessions.py` (`test_an_idle_paused_result_is_closed_and_frees_the_server_request`: wait for `FULL` before moving the clock)
+- Modify: `backend/tests/test_couchbase_sessions.py` (`test_an_idle_paused_result_is_closed_and_frees_the_server_request`: wait for `FULL` before moving the clock; `start_cb_worker` takes profile fields, ruling B43)
 
 **Interfaces:**
-- Consumes (Task 2): `ReadAhead`, `ReadAheadState`, the `StatementResult.read_ahead(budget)` contract, `AdapterCapabilities.read_ahead_bytes`, `SessionWorker.paused_read_ahead()`; (Task 1) `request_active`.
+- Consumes (Task 2): `ReadAhead`, `ReadAheadState`, the `StatementResult.read_ahead(budget)` contract, `AdapterCapabilities.read_ahead_bytes`, `SessionWorker.paused_read_ahead()`; (Task 1) `request_active`; (04a) `tests/support.couchbase_ca_file`, `completed_request_state`, `COUCHBASE_TLS_PORT`.
 - Produces:
   - `adapters/couchbase/adapter.py`: `READ_AHEAD_BYTES = 8 * 1024 * 1024`; `CouchbaseAdapter.capabilities` gains `read_ahead_bytes=READ_AHEAD_BYTES`.
   - `adapters/couchbase/http.py` (ruling B33): `ChunkedBody` (`feed(data: bytes) -> bytes`, `done: bool`; Step 4 gives it whole); `QueryResponse.read_chunk(self, wait: bool = True) -> bytes` (with `wait`, as in 04a: the next body bytes, b"" only at the end; `wait=False`, called only when `ready()`: one read, which may bring chunk framing only and then returns b"" with `done` still False); `HttpChannel.readable(self) -> bool` (worker thread; true when a read would not wait: bytes on the socket, decrypted TLS bytes pending, or the socket gone); `QueryResponse.ready(self) -> bool` (`done`, failed, no read yet — http.client's reader may hold body bytes it read with the headers —, or `channel.readable()`).
@@ -762,7 +770,7 @@ git commit -m "feat(sessions): paused results read ahead between commands; the i
 
 How the Couchbase result reads ahead (the tests pin each line):
 - The held rows are kept as their text only, in a `deque[str]`, and rebuilt with `parse_row` when delivered (a parsed row with its fields costs 4–5 times its text; ruling B5). `fetch()` / `fetch_raw()` deliver the `*` peek's rows first, then the held rows, then the stream; `held` drops as rows go out.
-- One step: take the events the stream already holds (no I/O), then call `next_if_ready(READ_AHEAD_STEP_CHUNKS − the reads this step has made)` until `held >= budget` (`FULL`; checked after each row taken, so the events after that row stay queued in the stream), the answer ends (`DONE`: `_end()` runs, the connection is released through `on_done`; the bytes after the JSON object are read only while ready, and whatever is left is dropped by `close()`: the request is over, only the kept-alive connection goes), or it returns `NOT_READY`: `WAITING` only when this step read nothing and took no event, else `READING` (a chunk inside a long row completes no event and is still progress; reading it as "nothing ready" would restart the stall clock and wait `READ_AHEAD_POLL_S` per chunk, ruling B34). A row that crosses the budget is still taken (a row is never split). `received` is `EventStream.received`.
+- One step: take the events the stream already holds (no I/O), then call `next_if_ready(READ_AHEAD_STEP_CHUNKS − the reads this step has made)` until `held >= budget` (`FULL`; checked after each row taken, so the events after that row stay queued in the stream), the answer ends (`DONE`: `_end()` runs, the connection is released through `on_done`; the bytes after the JSON object are read only while ready, and whatever is left is dropped by `close()`: the request is over, only the kept-alive connection goes), or it returns `NOT_READY`: `WAITING` only when this step read nothing and took no event, else `READING` (a chunk inside a long row completes no event and is still progress; reading it as "nothing ready" would wait `READ_AHEAD_POLL_S` per chunk, ruling B34). A row that crosses the budget is still taken (a row is never split). `received` is `EventStream.received`.
 - A failure met while reading ahead (cut connection, protocol error, server error after the rows, a cancel) is kept as the pending error and the step says `DONE`; the held rows go out before it (Review Focus 2). `_rows()` stops on the pending error only when neither the peek nor the held rows have anything left.
 - `close()` drops the held rows (`held == 0`) and abandons an answer not read to its end, as before.
 - `HttpChannel.readable()` looks at the socket `open_socket()` returned, kept on the channel (http.client drops `conn.sock` after a `Connection: close` answer while the response still reads from it): `ssl.SSLSocket.pending()` first, then a zero-timeout `selectors.DefaultSelector` poll for `EVENT_READ`; a closed or failed socket counts as readable (the read then fails at once). Every read asks for `max(READ_CHUNK, io.DEFAULT_BUFFER_SIZE)` bytes, which empties http.client's buffered reader each time, so after the first read nothing hides there and `ready()` is exact (ruling B33 replaces B6).
@@ -787,10 +795,13 @@ from dbaguy_backend.adapters.couchbase.http import ChannelError
 from dbaguy_backend.adapters.couchbase.result import READ_AHEAD_STEP_CHUNKS, row_cost
 from dbaguy_backend.adapters.couchbase.stream import ResponseParser, RowEvent, parse_row
 from dbaguy_backend.domain.execution import ExecuteCommand, FetchMoreCommand
+from dbaguy_backend.domain.profiles import SslConfig
 from dbaguy_backend.sessions.worker import paused_result_closed_text
 from tests.couchbase_fakes import Reply
 from tests.fake_ssh import wait_until
-from tests.support import request_active, requires_couchbase, scaled
+from tests.support import (
+    COUCHBASE_TLS_PORT, completed_request_state, couchbase_ca_file, request_active, requires_couchbase, scaled,
+)
 from tests.test_couchbase_adapter import STREAM
 from tests.test_couchbase_result import fake_connection, result_of
 from tests.test_couchbase_sessions import APP, Clock, page_through, start_cb_worker
@@ -1007,7 +1018,31 @@ def test_a_discard_during_read_ahead_frees_the_server_request():  # Review Focus
         wait_until(lambda: not request_active(ident), 5)
     finally:
         worker.close()
+
+
+@requires_couchbase
+def test_tls_reads_ahead_in_order_and_a_discard_closes_the_request(tmp_path):  # B43: pending TLS bytes and ready()
+    ca = couchbase_ca_file(tmp_path)
+    worker, rec = start_cb_worker(port=COUCHBASE_TLS_PORT, ssl=SslConfig(mode="verify-ca", ca_file=str(ca)))
+    try:
+        worker.submit(ExecuteCommand(request_id="t", sql=STREAM, page_size=500))
+        rec.wait_for(paused("t", 500), timeout=30)
+        ident = worker.connection.last_client_context_id
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL, 30)
+        assert READ_AHEAD_BYTES <= worker._open_exec.result.held < READ_AHEAD_BYTES + 1024
+        for page in range(1, 4):  # 30,000 more rows, from the held ones
+            worker.submit(FetchMoreCommand(request_id="t", count=10_000))
+            rec.wait_for(paused("t", 500 + page * 10_000), timeout=30)
+        assert [row[0] for event in rec.of("t", "rows") for row in event.rows] == list(range(30_500))
+        time.sleep(1.2)  # system:completed_requests keeps requests over 1 s
+        worker.cancel("t")  # paused: a discard
+        rec.wait_for(finished("t"), timeout=10)
+        assert completed_request_state(ident) == "closed"
+    finally:
+        worker.close()
 ```
+
+In `tests/test_couchbase_sessions.py`, `start_cb_worker(clock=time.monotonic, **profile_fields)` builds its profile with `make_couchbase_profile(**profile_fields)` and opens it at `adapter.endpoint_target(profile)` instead of the fixed `Endpoint("127.0.0.1", 8093)` (ruling B43; every existing caller passes no profile field, so nothing else changes).
 
 In `tests/test_couchbase_sessions.py::test_an_idle_paused_result_is_closed_and_frees_the_server_request`, right after `rec.wait_for(paused("p", 500), timeout=30)` add `wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL, 30)` (imports: `ReadAheadState` from `adapters.base`, `wait_until` from `tests.fake_ssh`) and change its first comment to "reading ahead stopped here: the idle clock starts". The rest stays: a 500-row Load more refills a few KB, far from the 16 MiB that restart the clock (A23), so the close still comes 45 s after that first stop, and `completed_request_state(ident) == "closed"`.
 
@@ -2695,11 +2730,11 @@ Expected output lines per process (`dbaguy-backend [123]: 64-bit    Footprint: 7
 - [ ] **Step 6: Update `CLAUDE.md`** (keep its language and style):
   - **Repo 結構:** `sessions/read_ahead.py`（暫停結果的停滯時鐘，`StallClock`）; `adapters/couchbase/` 加 `params`（參數數字警告）、`explain`（plan／profile／ADVISE 分析，純函式）、`sampling`（取樣欄位路徑，純函式）; `services/couchbase_service.py`（query context 清單、ADVISE、History 的 context）、`services/field_sample_service.py`（取樣快取）; `sql/keyspaces.py`、`sql/sqlpp_completion.py`; `api/couchbase.py`; 前端 `features/explain/`、`features/query/{queryContext, ContextPicker, params, ParamsPanel}`、`features/explorer/{browse, fieldSamples, SampledFields, SampleFieldsDialog}`.
   - **架構重點 → 新增 engine:** 能在暫停時預讀的 engine 實作 `StatementResult.read_ahead()`（不可阻塞）並宣告 `read_ahead_bytes`.
-  - **架構重點 → Couchbase:** replace the 暫停的結果 bullet: 暫停後 worker 在指令之間預讀 server 已送出的列（每個結果最多 8 MiB，以 `sys.getsizeof` 計、只存列的原文；只讀 socket 上已有的，不等待，所以 Cancel／Discard／Load more 永遠不會被擋；chunked 回應由 `http.ChunkedBody` 自己解碼，因為 http.client 的 chunked 讀取會停在 chunk 邊界等下一個 chunk 的長度行）；放得下就讀到結尾（server 請求結束，結果可以一直 Load more）；放不下時 45 秒從讀滿停下那一刻起算（housekeeping 每 15 秒，45–60 秒關閉），之後讀了 16 MiB（預讀上限 2 倍）或 socket 讀空才重算（A23：7.6.12 在 client 停止讀取 77 秒後砍請求；之後讀 128 KiB 不會重置，約 5.5–8 MiB 會）。沒有預讀的引擎照舊從第一次暫停起算. Add bullets: 每個 tab 自己的 query context（`QueryTabState.queryContext`：undefined＝profile 預設、`"none"`＝不帶、或 `{bucket, scope}`；workspace 的 `query_context`；顯示文字一律是 backend 的 `QueryContext.text()`；Couchbase 的 tab 不用 `database`，History 重開帶 `HistoryEntry.query_context`）；參數面板（`/sql/split` 的參數，值是 JSON literal，跑之前全部檢查，worker 收 `StatementParams`，server 會讀成 double 而改值的數字以參數名警告，不顯示值）；plan 檢視（EXPLAIN／ADVISE／profile 的結果 `presentation="plan"`，`/couchbase/plan` 分析，Explain ⌘E 前綴 `EXPLAIN `，Get index advice 走 metadata 連線的 `/couchbase/advise`，Run with profile 的 profile 是第二個 result set，plan cell 4 MiB 內不截斷）；Sample fields（`SELECT META(d).type AS t, d … LIMIT $n`，Python 推導欄位路徑，32 MiB／深度 6／2,000 條，快取到重新取樣或 profile 變更）；SQL++ 補全（keyspace 路徑、取樣欄位、結果看過的欄位，名稱需要時加 back-tick）.
+  - **架構重點 → Couchbase:** replace the 暫停的結果 bullet: 暫停後 worker 在指令之間預讀 server 已送出的列（每個結果最多 8 MiB，以 `sys.getsizeof` 計、只存列的原文；只讀 socket 上已有的，不等待，所以 Cancel／Discard／Load more 永遠不會被擋；chunked 回應由 `http.ChunkedBody` 自己解碼，因為 http.client 的 chunked 讀取會停在 chunk 邊界等下一個 chunk 的長度行）；放得下就讀到結尾（server 請求結束，結果可以一直 Load more）；放不下時 45 秒從讀滿停下那一刻起算（housekeeping 每 15 秒，45–60 秒關閉），之後只有再讀了 16 MiB（預讀上限 2 倍）才重算，socket 讀空不算（A23：7.6.12 在 client 停止讀取 77 秒後砍請求；之後讀 128 KiB 不會重置，約 5.5–8 MiB 會；讀空 socket 不代表 server 的寫入已完成，B42）。沒有預讀的引擎照舊從第一次暫停起算. Add bullets: 每個 tab 自己的 query context（`QueryTabState.queryContext`：undefined＝profile 預設、`"none"`＝不帶、或 `{bucket, scope}`；workspace 的 `query_context`；顯示文字一律是 backend 的 `QueryContext.text()`；Couchbase 的 tab 不用 `database`，History 重開帶 `HistoryEntry.query_context`）；參數面板（`/sql/split` 的參數，值是 JSON literal，跑之前全部檢查，worker 收 `StatementParams`，server 會讀成 double 而改值的數字以參數名警告，不顯示值）；plan 檢視（EXPLAIN／ADVISE／profile 的結果 `presentation="plan"`，`/couchbase/plan` 分析，Explain ⌘E 前綴 `EXPLAIN `，Get index advice 走 metadata 連線的 `/couchbase/advise`，Run with profile 的 profile 是第二個 result set，plan cell 4 MiB 內不截斷）；Sample fields（`SELECT META(d).type AS t, d … LIMIT $n`，Python 推導欄位路徑，32 MiB／深度 6／2,000 條，快取到重新取樣或 profile 變更）；SQL++ 補全（keyspace 路徑、取樣欄位、結果看過的欄位，名稱需要時加 back-tick）.
   - **已知限制 → Couchbase:** drop the 04a lines that 04b resolves ("暫停：活躍使用 Load more…要等 04b 的預讀", "EXPLAIN／ADVISE 在 04a 以一欄 JSON 顯示（plan 檢視是 04b）"); add: 16 MiB 重算門檻只在 dev（OrbStack）量過；多個暫停的 Couchbase 結果每個最多佔 8 MiB；補全不處理陣列元素（`a.items[0].`）與 UNNEST 的 alias；結果看過的欄位不含帶 `.` 的欄名；plan 檢視是縮排的樹（不是圖）；ADVISE／profile 在 Community Edition 停用；Explain 只對游標下或選取的一句、缺值的參數不送；Sample fields 的路徑最多 6 層、2,000 條；MySQL／PostgreSQL／SQL Server 不預讀（driver 沒有不阻塞的讀取；MySQL 的 `net_write_timeout` 是否會砍長時間暫停的結果未驗證）.
   - **量測:** Step 3's RSS and footprint while paging, Step 5's startup and footprint, the sidecar size.
   - **進度 ④:** `進行中：04a、04b 完成（SQL++ 方言與 HTTP 引擎；query context、參數、plan 檢視、取樣與補全、暫停預讀）；04c（文件）待做`.
-- [ ] **Step 7: Update the spec** (`docs/superpowers/specs/2026-10-18-04-couchbase-design.md`; record decisions, do not rewrite history): R-04-6's row ends with 「04b：暫停時預讀（每個結果 8 MiB），放得下就讀到結尾、不關閉；放不下時 45 秒從預讀停下起算，讀 16 MiB 或讀空才重算（A23）」; §1's paused-result success criterion gets the same; §3.2.1's capability table gains `read_ahead_bytes` (預設 None，Couchbase `READ_AHEAD_BYTES`，worker 的暫停預讀); §3.7.4 gets a closing bullet pointing to `sessions/read_ahead.py`; §3.4.2's last bullet (「讀取：`HTTPResponse.read1(READ_CHUNK = 64 KiB)`（處理 chunked）」) becomes 「讀取：Content-Length 用 `HTTPResponse.read1`；chunked 由 `http.ChunkedBody` 增量解碼（http.client 的 chunked 讀取停在 chunk 邊界會等下一個 chunk，預讀不能用，04b B33）」; §3.12's sampling query becomes `SELECT META(d).type AS t, d FROM ks AS d LIMIT $n`（binary 文件以 `META().type` 判斷，A24）; §10's A16 row records 〔實測〕(04b T1) and A23–A26 are added with their results.
+- [ ] **Step 7: Update the spec** (`docs/superpowers/specs/2026-10-18-04-couchbase-design.md`; record decisions, do not rewrite history): R-04-6's row ends with 「04b：暫停時預讀（每個結果 8 MiB），放得下就讀到結尾、不關閉；放不下時 45 秒從預讀停下起算，讀 16 MiB 才重算（A23；socket 讀空不算，B42）」; §1's paused-result success criterion gets the same; §3.2.1's capability table gains `read_ahead_bytes` (預設 None，Couchbase `READ_AHEAD_BYTES`，worker 的暫停預讀); §3.7.4 gets a closing bullet pointing to `sessions/read_ahead.py`; §3.4.2's last bullet (「讀取：`HTTPResponse.read1(READ_CHUNK = 64 KiB)`（處理 chunked）」) becomes 「讀取：Content-Length 用 `HTTPResponse.read1`；chunked 由 `http.ChunkedBody` 增量解碼（http.client 的 chunked 讀取停在 chunk 邊界會等下一個 chunk，預讀不能用，04b B33）」; §3.12's sampling query becomes `SELECT META(d).type AS t, d FROM ks AS d LIMIT $n`（binary 文件以 `META().type` 判斷，A24）; §10's A16 row records 〔實測〕(04b T1) and A23–A26 are added with their results.
 - [ ] **Step 8: Report the user's test list** for 04b in the task handoff (what the dev cluster already showed next to each):
   1. The company cluster's buckets and scopes in the context picker; clicking the tree sets the tab's context; a History entry reopens in its context (dev: travel-sample, dbaguy).
   2. Parameters with real ids and amounts: big integers stay exact, a decimal the server rounds is flagged (dev: `9007199254740993` + 1).
@@ -2753,7 +2788,7 @@ Task 1 re-runs the probes; the Result column below is what they showed while pla
 |---|---|---|---|
 | B1 | The read-ahead budget is 8 MiB of memory as `sys.getsizeof` counts each held row's text (+8 for its deque slot), not 8 MiB of characters. | A million 8-character rows are 8 MB of text but ~65 MB of Python objects; Q1 needs the real figure. | Small rows hold fewer rows than 8 MiB of text would: a result of tiny rows exceeds the budget sooner and closes after 45–60 s as in 04a. |
 | B2 | The stall clock restarts once `STALL_RESET_FACTOR × budget` (16 MiB) of answer bytes have been read since the stall began, by the read-ahead or by Load more. | A23: 128 KiB does not restart the server's 77 s clock; ≈ 5.5 MiB in steps and 8 MiB at once do; 2 × leaves room for bigger buffers elsewhere. | Too high: an active Load-more user's result closes earlier than needed (rows kept, clear text). Too low on another setup: the server ends the request first and the next Load more fails with `connection_lost` (04a's behaviour before R-04a-T11b). |
-| B3 | A read-ahead step that finds nothing on the socket (`WAITING`) ends a stall. | Nothing waiting on the socket means DbaGuy has drained everything the server sent: its writes are not blocked by DbaGuy. | On a slow link a momentarily empty socket restarts the clock while data is in flight: at worst the same as B2's "too low". |
+| B3 | **Superseded by B42 (pre-flight): an empty socket no longer ends a stall.** A read-ahead step that finds nothing on the socket (`WAITING`) ends a stall. | Nothing waiting on the socket means DbaGuy has drained everything the server sent: its writes are not blocked by DbaGuy. | On a slow link a momentarily empty socket restarts the clock while data is in flight: at worst the same as B2's "too low". |
 | B4 | Only Couchbase reads ahead in 04b; PostgreSQL, MySQL, SQL Server and SQLite keep the default (`read_ahead` → `FULL`, never called). | Their drivers read through their own buffered sockets with no non-blocking poll; a blocking read on the worker would hold Cancel / Discard / Load more behind a slow server (Q2), and SQL Server's FreeTDS must not be entered for that (03b). MySQL could free its connection with it, but that is a change to an adapter with a delicate drain / KILL path: carried. Whether MySQL's `net_write_timeout` (60 s) ends a long-paused streamed result was not probed. | None new: those engines behave as in 04a. |
 | B5 | Held rows are stored as text and re-parsed on delivery (`parse_row`). | A parsed `RawRow` (row text, field texts, decoded values) is 4–5× its text. | Rows read ahead are parsed twice (≈ 80k rows/s): 8 MiB costs ~0.1–0.4 s spread over Load mores. |
 | B6 | A step never waits: it reads only when `QueryResponse.ready()` (bytes on the socket or decrypted TLS bytes pending). Bytes already inside http.client's buffer are not seen. | http.client exposes no non-blocking look at its buffer, and a read with a socket timeout corrupts its chunked state for good. | An answer whose last bytes sit in that buffer stays `WAITING` until the next Load more reads them; never closed meanwhile (WAITING is not a stall). |
@@ -2782,7 +2817,7 @@ Task 1 re-runs the probes; the Result column below is what they showed while pla
 | B29 | A `read_ahead` that raises (a bug) is logged and treated as `FULL`: the first-pause clock. | Adapters keep failures; an unexpected exception must not kill the worker loop. | None. |
 | B30 | The params slot logic and the context helpers are pure TS checked by hand (no TS test runner). | The project has no frontend test framework (CLAUDE.md work rules); the backend owns parsing (`/sql/split` gives each statement's parameters). | A slip in `paramSlots` shows as a wrong panel row; the manual list covers named, `@`, `?`/`$k` and multi-statement cases. |
 
-### Pre-flight rulings (B31–B41)
+### Pre-flight rulings (B31–B43)
 
 Made by the pre-flight review before Task 1 (prototypes of Tasks 1–4 and the Task 6/7 models against the repository at `7ddb596`, in a scratch worktree, full backend suite and `npm run typecheck` run there; details in `.superpowers/sdd/2026-10-19-04b-couchbase-query-workflow/preflight.md`), and written into the tasks' own text: an implementer reads only its task and the Global Constraints.
 
@@ -2791,7 +2826,7 @@ Made by the pre-flight review before Task 1 (prototypes of Tasks 1–4 and the T
 | B31 | `_read_ahead_step()` reads the clock right after `read_ahead()` returns, updates the stall clock, then publishes the mark's `since` and `ex.ahead` / `ex.received` in one `_state_lock` take; `paused_read_ahead()` reads the mark, the open execution and its `ahead` in one take. The planned order (publish `ex.ahead`, then read the clock) lets a test see `FULL` and move its fake clock first: with a 20 ms pause injected there, 3 of section 8's tests failed; with this order they pass with pauses injected anywhere. | Task 2 Step 5 (`_pause`, `_read_ahead_step`, `paused_read_ahead`) |
 | B32 | `_OpenExecution.stall` follows `result` (a field without a default after `index: int = 0` fails at import); `_read_ahead_step()` runs inside the task loop's `try … except Exception` (an unexpected error must not end the worker thread); `_close_idle_paused`'s INFO log says "after the server was left waiting". | Task 2 Step 5 |
 | B33 | Couchbase decodes chunked bodies itself (`http.ChunkedBody` over `response.fp.read1(max(READ_CHUNK, io.DEFAULT_BUFFER_SIZE))`; Content-Length bodies keep `HTTPResponse.read1`); `read_chunk(wait=True)` keeps 04a's contract, `wait=False` makes one read; `EventStream` ends on `response.done`; `ready()` is exact after the first read (B6 superseded); a step reads the bytes after the JSON object only while ready. http.client's chunked `read1()` reads the CRLF and the next size line to their end, so the planned design blocked a step until the server's next chunk (prototype: 3 s against a held `FakeQueryServer`, i.e. any slow query between two 16 KiB flushes), holding Cancel, Discard, Load more, a new statement and closing the tab (`close()` cannot interrupt it: no request is running). Every 04a Couchbase test passes with the decoder, and read-ahead over TLS (18093) works. Spec §3.4.2's `HTTPResponse.read1`（處理 chunked）is superseded (Task 13 Step 7). | Global Constraints (Threads); Review Focus 1; File Structure; Task 3 (Files, Interfaces, rules, Step 1 tests, Steps 4, 5, 8); Task 13 (Files, Steps 6, 7); Spec issues |
-| B34 | `EventStream.next_if_ready(max_reads)` reads ready chunks one at a time, at most `max_reads`, until an event is complete, else `NOT_READY`; a step is `WAITING` only when it read nothing and took no event. "Reading at most one chunk" left a chunk that completes no event undefined: read as "nothing ready" it ends the step `WAITING`, restarts the stall clock and waits `READ_AHEAD_POLL_S` per chunk of a long row (a 5 MiB row: 80 × 0.25 s), and the plan's own error-after-rows test (16-byte chunks) needs the step to go on. New test `test_a_row_longer_than_a_step_keeps_reading`. | Task 3 (Interfaces, rules, Step 1, Step 5) |
+| B34 | `EventStream.next_if_ready(max_reads)` reads ready chunks one at a time, at most `max_reads`, until an event is complete, else `NOT_READY`; a step is `WAITING` only when it read nothing and took no event. "Reading at most one chunk" left a chunk that completes no event undefined: read as "nothing ready" it ends the step `WAITING`, restarts the stall clock and waits `READ_AHEAD_POLL_S` per chunk of a long row (a 5 MiB row: 80 × 0.25 s), and the plan's own error-after-rows test (16-byte chunks) needs the step to go on. New test `test_a_row_longer_than_a_step_keeps_reading`. (Since B42 an empty socket no longer touches the stall clock; the 0.25 s per chunk remains.) | Task 3 (Interfaces, rules, Step 1, Step 5) |
 | B35 | `READ_AHEAD_STEP_CHUNKS = 2` (128 KiB per step). Measured on the dev cluster: a 16-read step of the 100 M-row `SELECT RAW` stream (6-byte rows, ≈ 140,000 rows per MiB) took 0.42 s; with 2 the longest step took 69–73 ms (events 25 ms, TLS 22 ms) and filling 8 MiB took the same 0.47 s. `test_an_error_after_the_rows_is_raised_after_the_held_rows` steps until it is not `READING`. | Global Constraints; Pain points (M12); Review Focus 1; Task 3 (Interfaces, Step 1) |
 | B36 | `FieldEvent.text = field(default="", compare=False)`: six existing stream / http tests compare `FieldEvent(name, value)` with the parser's events and failed in the pre-flight with a compared `text`. | Task 4 Interfaces |
 | B37 | `tests/test_api.py::test_engines` breaks on purpose (it asserts Couchbase has no `executed_plan`) and is updated and staged in Task 4; a plan set's text limit is kept on `_OpenExecution.text_limit` (a Load more re-enters `_pump` with `columns_sent` set). | Task 4 (Files, Interfaces, Steps 4, 6, 7) |
@@ -2799,6 +2834,8 @@ Made by the pre-flight review before Task 1 (prototypes of Tasks 1–4 and the T
 | B39 | A server's error answer to ADVISE or to a sample (a `StatementError` whose code is all digits) is raised as `QueryFailed` from inside the metadata call, so `MetadataService` does not reconnect and send it again (its resend is for a lost connection): otherwise the 5001 panic is triggered twice, and a sample that meets the 30 s server timeout runs twice (60 s, twice the load on the company cluster). | Task 6 Interfaces (`/couchbase/advise`); Task 7 Produces (`FieldSampleService.sample`) |
 | B40 | Parameter slots exist only for names the backend takes (`$name` starting with a letter or `_`; positional `$1`…`$200`), and `workspaceFile.ts` saves drafts through `savedParams` (keys matching `WorkspaceTab.params`' pattern, texts ≤ 1,048,576 characters, at most 400). `PUT /workspace` validates the whole state: a `$1abc` (the lexer yields it), a `$1000`, a pasted value over 1 MiB or a 401st name would make every save fail and a crash lose every tab's unsaved text (Q2). | Task 10 (Interfaces, Step 1) |
 | B41 | The `footprint` lines go after the RSS total and before `stop_app`: after it the measured processes are gone. | Task 13 Step 4 |
+| B42 | B3 is withdrawn: an empty socket (`WAITING`) neither starts nor ends a stall. `DONE` ends it; `READING` / `FULL` with ≥ `STALL_RESET_FACTOR` × budget read since the stall ends it (B2); `FULL` with no stall starts one; a result that never fills the budget never stalls. Draining the local socket does not mean the server's pending write completed (A23 needs ≈ 5.5 MiB absorbed to reset the server's clock): on a link with small socket buffers (a VPN to the company cluster) a refill can empty the socket after a small read, and B3 would restart DbaGuy's clock while the server's keeps running, so the server would kill the request first (`connection_lost`). B2 alone fails only towards an early clean close. Cost: a user who keeps loading more of a result larger than the budget gets the clean close 45–60 s after the stall began unless 16 MiB has been read since. | Global Constraints (`STALL_RESET_FACTOR`); Review Focus 3; Task 2 (Interfaces, rules, `test_read_ahead.py`, the inverted `test_an_empty_socket_after_a_load_more_does_not_restart_the_clock`); Task 3 rules (B34's wording); Task 13 Steps 6, 7; B3 row; Spec issues |
+| B43 | Task 3 commits a live TLS read-ahead test: verify-ca with the dev CA (`couchbase_ca_file`) on 18093, a result larger than the budget pauses with read-ahead `FULL`, three Load mores deliver 30,500 rows in order, and a discard leaves the server request `closed`; `start_cb_worker` takes profile fields. TLS read-ahead (decrypted bytes pending in OpenSSL, `ready()`) was covered only by the pre-flight's probe. | Task 3 (Files, Interfaces, Step 1) |
 
 ### Rulings made during execution
 
@@ -2807,7 +2844,7 @@ None yet.
 ## Spec issues found while planning
 
 - §3.5.4's parameter WARNING example contains the value (`18446744073709551615`) while §4 says DbaGuy's texts never echo parameter values (B10).
-- R-04-6, §1 and §3.7.4 time the idle close "from the first pause"; the binding 04a carry R-04a-T11a/T11b replaces that with the read-ahead's stop, and A23 shows a Load more's small refill must not restart it (B1–B3, Task 13 Step 7 records it).
+- R-04-6, §1 and §3.7.4 time the idle close "from the first pause"; the binding 04a carry R-04a-T11a/T11b replaces that with the read-ahead's stop, and A23 shows a Load more's small refill must not restart it (B1, B2, B42, Task 13 Step 7 records it).
 - §3.12's `SELECT RAW d` cannot tell a binary document from a string document (A24, B16).
 - §3.12's seen fields "不含 value 與溢出欄" would still offer alias collision columns such as `d.id` (B22).
 - §3.11.1's `GET /couchbase/contexts?profile_id` lists only snapshot contexts, but the picker must also show (and the frontend must not quote) a current context the snapshot lacks (B13).
