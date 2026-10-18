@@ -365,9 +365,11 @@ class MysqlConnection(DatabaseConnection):
 
     def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
         self._killed.clear()
-        self._window.take_over()  # after the clear: a cancel kept while armed sends nothing; from here one KILLs
         if _MENTIONS_AUTOCOMMIT.search(sql) or first_keyword(sql, Dialect.MYSQL) in _MAY_SET_AUTOCOMMIT:
             self._autocommit_stale = True
+        # Right before the first send, after the clear: a cancel kept while armed means nothing is sent; from here
+        # one sets the KILL flag and KILLs.
+        self._window.take_over()
         cursor = _VerbatimCursor(self._conn)  # not conn.cursor(): that sends a PING first, one round trip per statement
         try:
             cursor.execute_verbatim(sql)

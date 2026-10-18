@@ -18,7 +18,7 @@ from dbaguy_backend.adapters.mysql.adapter import MysqlAdapter
 from dbaguy_backend.adapters.postgres.adapter import PostgresAdapter
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.domain.classification import Classification, StatementKind
-from dbaguy_backend.domain.execution import ExecuteCommand, ExportCommand, FetchMoreCommand
+from dbaguy_backend.domain.execution import ExecuteCommand, ExportCommand, FetchMoreCommand, SetAutocommitCommand
 from dbaguy_backend.domain.formats import FormatKind
 from dbaguy_backend.domain.profiles import SqliteProfile
 from dbaguy_backend.services.safety import GuardAction, GuardDecision
@@ -73,6 +73,23 @@ def cancel_after_last_check(worker: SessionWorker, request_id: str, times: int =
             state["at"] = time.monotonic()
 
     worker._raise_if_cancelled = check_then_cancel
+    return state
+
+
+def cancel_after_run(worker: SessionWorker, request_id: str) -> dict:
+    """Once, right after run() has returned for `request_id` (the connection disarmed, nothing read yet), cancel it:
+    PostgreSQL in a transaction has only DECLAREd the cursor then, and its backend is idle (R-04a-6b1). Returns {"at": when
+    the cancel was delivered}."""
+    run_statement, state = worker._run_statement, {"at": None}
+
+    def run_then_cancel(req, *args):
+        result = run_statement(req, *args)
+        if state["at"] is None and req.request_id == request_id:
+            cancel_from_another_thread(worker, request_id)
+            state["at"] = time.monotonic()
+        return result
+
+    worker._run_statement = run_then_cancel
     return state
 
 
@@ -192,6 +209,37 @@ def test_every_way_out_disarms(fake, path, way_out, tmp_path):
     assert conn.runs == ([] if done.cancelled else [sql])
 
 
+@pytest.mark.parametrize("kind, cancelled", [(StatementKind.READ, True), (StatementKind.WRITE, False)])
+def test_a_cancel_just_after_run_returns_stops_a_read_never_a_completed_write(fake, kind, cancelled):
+    worker, conn, rec = fake
+    decision = GuardDecision(action=GuardAction.RUN, classification=Classification(kind=kind))
+    worker.configure(WorkerHooks(check=lambda sql, confirmed: decision))
+    delivered = cancel_after_run(worker, "r")
+    worker.submit(ExecuteCommand(request_id="r", sql="rows 3"))
+    done = rec.wait_for(finished("r"), timeout=scaled(5))
+    assert delivered["at"] is not None and done.cancelled is cancelled and not rec.of("r", "error")
+    assert sum(len(e.rows) for e in rec.of("r", "rows")) == (0 if cancelled else 3)  # a read delivers nothing
+    worker.submit(ExecuteCommand(request_id="n", sql="rows 1"))
+    assert not rec.wait_for(finished("n"), timeout=scaled(5)).cancelled
+
+
+def test_a_cancel_just_after_an_exports_run_returns_reads_nothing(fake, tmp_path):
+    worker, conn, rec = fake
+    statement, fetches = conn.statement, []
+
+    def counting(sql, options):  # the first fetch is what runs the query on PostgreSQL in a transaction
+        result = statement(sql, options)
+        fetch = result.fetch
+        result.fetch = lambda n: fetches.append(n) or fetch(n)
+        return result
+
+    conn.statement = counting
+    delivered = cancel_after_run(worker, "x")
+    target = submit(worker, "export", "x", "rows 3", tmp_path)
+    done = rec.wait_for(finished("x"), timeout=scaled(5))
+    assert delivered["at"] is not None and done.cancelled and not target.exists() and fetches == []
+
+
 # ---- 2. every real adapter (dev databases): the forced window, and no cancel ever reaching a later statement ----
 
 PROBE = "SELECT 'next' AS v"  # the statement after: it must return its own row
@@ -300,3 +348,32 @@ def test_no_cancel_reaches_a_later_statement(connection):
     assert probe(connection) == [["next"]]
     connection.cancel()  # nothing running, not armed: ignored
     assert probe(connection) == [["next"]]
+
+
+@requires_pg
+@pytest.mark.parametrize("path", ["execute", "export"])
+@pytest.mark.parametrize("transaction", ["BEGIN", "manual commit"])
+def test_postgres_a_cancel_between_declare_and_the_first_fetch_stops_the_read(path, transaction, tmp_path):
+    """R-04a-6b1: in a transaction run() only DECLAREs the cursor and the first FETCH runs the query, so a cancel
+    landing in between finds the backend idle. The worker's check after run() stops the read: the cursor is closed with
+    CLOSE, and the transaction stays open and healthy."""
+    worker, rec = start_worker(lambda: TARGETS["postgres"].open(tmp_path), "window-pg-tx")
+    try:
+        if transaction == "BEGIN":
+            worker.submit(ExecuteCommand(request_id="b", sql="BEGIN"))
+        else:
+            worker.submit(SetAutocommitCommand(request_id="b", enabled=False))
+        assert not rec.wait_for(finished("b"), timeout=scaled(10)).cancelled
+        delivered = cancel_after_run(worker, "w")
+        target = submit(worker, path, "w", "SELECT pg_sleep(30)", tmp_path)
+        done = rec.wait_for(finished("w"), timeout=scaled(LOST_AFTER_S))  # lost: the sleep runs its 30 s
+        took = time.monotonic() - delivered["at"]
+        assert done.cancelled and not rec.of("w", "error"), rec.of("w", "error")
+        assert took < scaled(CANCEL_WITHIN_S), f"the cancel took {took:.1f} s"
+        assert done.in_transaction and not done.transaction_failed and not target.exists()
+        worker.submit(ExecuteCommand(request_id="n", sql=PROBE))  # inside the same transaction
+        nxt = rec.wait_for(finished("n"), timeout=scaled(10))
+        assert not nxt.cancelled and not rec.of("n", "error"), rec.of("n", "error")
+        assert rec.of("n", "rows")[0].rows == [["next"]] and nxt.in_transaction and not nxt.transaction_failed
+    finally:
+        worker.close()

@@ -469,7 +469,6 @@ class PostgresConnection(DatabaseConnection):
             logger.warning("Read-only connection: default_transaction_read_only was turned off; restored")
 
     def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
-        self._window.take_over()  # a cancel kept while armed: nothing is sent; from here a cancel goes to the server
         if self._read_only and len(split(sql, Dialect.POSTGRES)) > 1:
             # A script could switch the default off and commit between statements, which no per-call check can see.
             raise StatementError(
@@ -478,6 +477,9 @@ class PostgresConnection(DatabaseConnection):
         if _uses_client_copy(sql):
             raise StatementError(_UNSUPPORTED_COPY, code="unsupported_copy")
         try:
+            # Right before the first send (the checks above take ~1 ms per KB): a cancel kept while armed means nothing
+            # is sent; from here a cancel goes to the server.
+            self._window.take_over()
             self._restore_read_only()
             if _likely_returns_rows(sql):
                 status = self._conn.info.transaction_status

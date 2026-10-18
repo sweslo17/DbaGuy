@@ -530,6 +530,12 @@ class SessionWorker:
             with self._timeout(req):
                 result = self._run_statement(req, "execute", cmd.sql, options)
                 self._open_exec = _OpenExecution(req=req, result=result)
+                # R-04a-6b1: run() can return before the statement has done its work (PostgreSQL in a transaction:
+                # DECLARE, and the first FETCH runs the query), and a cancel landing in between finds the backend idle.
+                # A read run() returned from has delivered nothing yet, so it stops here. Never a write: one run()
+                # returned from is done, and must not be reported cancelled.
+                if req.kind == StatementKind.READ:
+                    self._raise_if_cancelled()
                 self._pump(self._open_exec, cmd.page_size)
         except StatementError as exc:
             self._fail(req, exc)
@@ -775,6 +781,7 @@ class SessionWorker:
         `close()` runs only when every row is in.
         """
         try:
+            self._raise_if_cancelled()  # as in _execute (R-04a-6b1): an export is always a read
             columns = result.columns()
             if columns is None:
                 raise StatementError(_EXPORT_SELECT_ONLY, code="export_requires_select")
