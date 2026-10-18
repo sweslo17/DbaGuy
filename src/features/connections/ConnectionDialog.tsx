@@ -55,7 +55,7 @@ const SSL_MODE_HINTS: Partial<Record<Engine, string>> = {
   mysql: "verify-full cannot be used through an SSH tunnel",
   mssql: "verify-ca and verify-full need a CA file; verify-full cannot be used through an SSH tunnel",
   couchbase:
-    "TLS uses ports 18093 and 18091; verify-ca and verify-full need the cluster's CA file unless its certificate is publicly trusted",
+    "TLS uses ports 18093 and 18091; verify-ca and verify-full need the cluster's CA file (the app does not read the macOS keychain)",
 };
 /** The mode a new profile starts with (the others start with `prefer`): Couchbase's TLS is on other ports, so HTTP. */
 const DEFAULT_SSL_MODES: Partial<Record<Engine, SslConfig["mode"]>> = { couchbase: "disable" };
