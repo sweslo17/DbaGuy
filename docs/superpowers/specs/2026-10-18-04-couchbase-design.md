@@ -485,7 +485,7 @@ sqlglot 沒有 N1QL／SQL++ 方言（〔實測〕30.23.0 為最新）。SQLPP �
 |---|---|
 | root | ``SELECT RAW b.name FROM system:buckets AS b ORDER BY b.name`` |
 | bucket | ``SELECT RAW s.name FROM system:scopes AS s WHERE s.`bucket` = $b ORDER BY s.name``；另加 `_default`（system:scopes 不列它）；`_system` 標 `system=True` 排最後 |
-| scope | ``SELECT RAW k.name FROM system:keyspaces AS k WHERE k.namespace = "default" AND k.`bucket` = $b AND k.`scope` = $s ORDER BY k.name``；`_default` scope 另查 bucket 層的 keyspace（沒有 `bucket` 欄位、`name = $b` 的那列）→ `_default` collection |
+| scope | ``SELECT RAW k.name FROM system:keyspaces AS k WHERE k.`bucket` = $b AND k.`scope` = $s ORDER BY k.name``；`_default` scope 另查 bucket 層的 keyspace（沒有 `bucket` 欄位、`name = $b` 的那列）→ `_default` collection |
 | collection | ``SELECT RAW i FROM system:indexes AS i WHERE i.bucket_id = $b AND i.scope_id = $s AND i.keyspace_id = $c ORDER BY i.name``；`_default._default` 用 `i.keyspace_id = $b AND i.bucket_id IS MISSING` |
 
 - 節點：bucket／scope `has_children=True`；collection `has_children=True`（index 直接掛在下面，不另設資料夾——只有一種子物件）；index `detail`＝`online`／`deferred`／`primary · online`…（〔實測〕看過 online、deferred；文件另列 building、pending、offline、scheduled for creation、error）。
@@ -494,7 +494,7 @@ sqlglot 沒有 N1QL／SQL++ 方言（〔實測〕30.23.0 為最新）。SQLPP �
   - collection：``CREATE COLLECTION `b`.`s`.`c`;`` ＋各 index 的 DDL；取樣欄位由前端另外取（§3.12），不在這裡合併。
   - index：``CREATE [PRIMARY] INDEX `name` ON `b`.`s`.`c`(key, …) [PARTITION BY …] [WHERE cond] [WITH {"defer_build": true, "num_replica": n}]``；`index_key`／`condition` 是 server 給的表達式字串，照貼；`defer_build` 只在 state 為 deferred 時；`num_replica` > 0 才寫；`comment` 放 state、`last_scan_time`、`using`。`/indexStatus` 的完整 definition 對受限使用者 403（調查 §5.2），不用。
   - bucket：沒有 DDL（叢集管理不在範圍），`comment` 說明。
-- `schema_snapshot()`：buckets ＋ ``SELECT k.`bucket`, k.`scope`, k.name FROM system:keyspaces AS k WHERE k.namespace = "default"``（bucket 層那列換成 `_default._default`）→ `SchemaSnapshot(database=None, default_schema=None, search_path=[], schemas=[], keyspaces=[…])`。數量固定、兩個查詢，不設上限。
+- `schema_snapshot()`：buckets ＋ ``SELECT k.`bucket`, k.`scope`, k.name FROM system:keyspaces AS k ORDER BY k.`bucket`, k.`scope`, k.name``（04a：不加 namespace 條件——列裡有 `namespace` 與 `namespace_id`，`namespace` 是保留字，要用時加 back-tick；bucket 層那列換成 `_default._default`）→ `SchemaSnapshot(database=None, default_schema=None, search_path=[], schemas=[], keyspaces=[…])`。數量固定、兩個查詢，不設上限。
 - 受限使用者看到的 index 是否也依權限過濾 **〔未實測，A18〕**；只看得到自己的 keyspace 是〔實測〕。
 
 ### 3.9 文件（R-04-2；`adapters/couchbase/documents.py`、`services/document_service.py`、`api/couchbase.py`）
