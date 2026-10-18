@@ -1,8 +1,9 @@
 """SQL Server through pymssql's low-level `_mssql` API. Batches are sent verbatim (no driver parameters, so `%` is never
 touched) and streamed with pymssql's row iterator.
 
-- How a cancel reaches the statement (flag, the wait callback, a watched cross-thread cancel, dropping the connection
-  as the last resort) is `cancel.CancelControl`'s job; this module tells it which driver call is in progress.
+- How a cancel reaches the statement (flag, the wait callback, the message handler, dropping the connection as the
+  last resort; never from another thread) is `cancel.CancelControl`'s job; this module tells it which driver call is in
+  progress.
 - `SET IMPLICIT_TRANSACTIONS` gives manual commit. The transaction state (@@TRANCOUNT, XACT_STATE(), the mode and the
   database) is cached and re-read in one round trip only when it may have changed and nothing is unread.
 - Messages (PRINT, RAISERROR ≤ 10) arrive live through `set_msghandler`; DbaGuy's own queries never pass theirs on.
@@ -170,7 +171,7 @@ class MssqlResult(StatementResult):
                         ended = True
                         break
                     rows.append(row)
-                    call.rows += 1  # the canceller sees a read that makes no progress
+                    call.rows += 1  # the watcher sees a read that makes no progress
         except driver.ERRORS as exc:  # an error later in the batch; pymssql has already cancelled the rest
             self._exhausted = True
             error = owner.statement_error(exc)
@@ -201,7 +202,7 @@ class MssqlResult(StatementResult):
 
     def next_result(self) -> bool:
         """The worker asks only once the current set is read to its end (pymssql's nextresult() would otherwise drain
-        it inside a call that only a cross-thread cancel can reach)."""
+        it inside one call the flag cannot reach)."""
         if self._closed:
             return False
         while self._columns is not None and not self._rows_done and not self._exhausted:
@@ -282,7 +283,7 @@ class MssqlConnection(DatabaseConnection):
 
     def _may_hold_transaction(self) -> bool:
         """Whether the running batch may have a transaction to lose (R-03b-T8h): manual commit, one open before it (the
-        state was read when it started), or a transaction word in its text. The canceller thread asks, while the
+        state was read when it started), or a transaction word in its text. The watcher thread asks, while the
         worker is inside the driver and changes none of this."""
         if self._implicit or self._trancount > 0:
             return True
@@ -478,9 +479,8 @@ class MssqlConnection(DatabaseConnection):
 
     def _on_message(self, state: int, severity: int, server: bytes, procedure: bytes, line: int, text: bytes) -> None:
         """pymssql calls this on the thread inside the driver call, for every message: errors too (severity >= 11),
-        which pymssql then raises as the statement's error, so they are left to it. A cross-thread cancel can bring
-        the cancelled statement's last messages on the cancelling thread; the listener is thread-safe. Never raises
-        into the driver."""
+        which pymssql then raises as the statement's error, so they are left to it. The listener is thread-safe.
+        Never raises into the driver."""
         try:
             if severity >= 11:
                 return
@@ -661,11 +661,8 @@ class MssqlConnection(DatabaseConnection):
 
     def close(self) -> None:
         """Frees the connection only once no thread is inside the driver for it (R-03b-F5). The worker closes its own
-        connection, so normally none is; one that is (a cross-thread cancel, a reader on another thread) gets the
-        socket shut down first, so its read ends, and the guard waits for it or leaks the connection."""
-        if self._control.poisoned:  # a cancel thread may still be inside the driver: closing under it aborts FreeTDS
-            logger.warning("Not closing SQL Server SPID {}: a cancel never returned (its socket is shut down)", self._spid)
-            return
+        connection, so normally none is; a reader on another thread gets the socket shut down first, so its read ends,
+        and the guard waits for it or leaks the connection."""
         if self._conn.busy:
             self._control.drop("closed while another thread was inside the driver")
         with suppress(*driver.ERRORS):

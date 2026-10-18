@@ -5,7 +5,7 @@ import pytest
 from dbaguy_backend.adapters.base import Endpoint
 from dbaguy_backend.adapters.mssql import adapter as mssql_adapter
 from dbaguy_backend.adapters.mssql.adapter import MssqlAdapter
-from dbaguy_backend.adapters.mssql.cancel import BUSY_WARNING
+from dbaguy_backend.adapters.mssql.cancel import BUSY_WARNING, WAITING_DROPPED_MESSAGE
 from dbaguy_backend.domain.execution import CommitCommand, ExecuteCommand, SetAutocommitCommand
 from dbaguy_backend.sessions.worker import SessionWorker
 from tests.fake_db import FakeLease
@@ -157,7 +157,7 @@ def test_a_nul_character_is_refused_before_the_safety_check_and_the_server(mssql
     assert rec.of("k", "rows")[0].rows == [[2]]  # the server never saw a DELETE without its WHERE
 
 
-def test_a_timeout_stops_a_select_blocked_on_a_row_lock(mssql_worker):  # Important 1: the timeout could not before
+def test_a_timeout_stops_a_select_blocked_on_a_row_lock(mssql_worker):  # Important 1; R-03b-F6: by escalation
     worker, rec = mssql_worker
     locker = MssqlAdapter().open(make_mssql_profile(), Endpoint(MSSQL_HOST, MSSQL_PORT), MSSQL_PASSWORD, None)
     try:
@@ -170,9 +170,11 @@ def test_a_timeout_stops_a_select_blocked_on_a_row_lock(mssql_worker):  # Import
         worker.submit(ExecuteCommand(request_id="t", sql="SELECT id, v FROM ##zz_locktimeout ORDER BY id",
                                      page_size=5000, timeout_s=1))
         done = rec.wait_for(finished("t"), timeout=10)
-        assert done.timed_out and done.cancelled and done.elapsed_ms < 3000
-        assert not run(worker, rec, "u", "SELECT 'mine' AS m").cancelled
-        assert rec.of("u", "rows")[0].rows == [["mine"]]
+        # The timeout is a first Cancel; blocked inside a row read the flag cannot reach the worker, so a second later
+        # the auto-commit connection is dropped with the honest text (no cross-thread cancel any more, R-03b-F6).
+        [error] = rec.of("t", "error")
+        assert error.code == "connection_lost" and error.message == WAITING_DROPPED_MESSAGE
+        assert done.elapsed_ms < 3500 and not done.in_transaction
     finally:
         locker.rollback()
         locker.set_autocommit(True)

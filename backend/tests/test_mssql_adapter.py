@@ -820,6 +820,79 @@ def test_a_second_cancel_while_the_server_undoes_the_statement_warns_first(conn)
     conn.rollback()
 
 
+_BIG = 20_000_000  # characters: a value whose conversion takes a while after its bytes have all arrived
+BLOB_PROBES = {  # the independent verifier's three probes (R-03b-F6), smaller
+    # a big value fully arrived and being converted, the next small rows already in FreeTDS's buffer
+    "race": f"SELECT n, REPLICATE(CAST(N'é' AS nvarchar(max)), {_BIG}) AS big, "
+            f"REPLICATE(CAST(N'è' AS nvarchar(max)), {_BIG}) AS big2, n AS tail FROM (VALUES (1)) v(n) "
+            "UNION ALL SELECT 2, N'a', N'b', 2 UNION ALL SELECT 3, N'c', N'd', 3",
+    # plus a large ASCII value: freed under the reader, it would likely be unmapped
+    "crash": f"SELECT n, REPLICATE(CAST(N'é' AS nvarchar(max)), {_BIG}) AS big, "
+             f"REPLICATE(CAST('x' AS varchar(max)), {3 * _BIG}) AS big2, n AS tail FROM (VALUES (1)) v(n) "
+             "UNION ALL SELECT 2, N'a', 'b', 2 UNION ALL SELECT 3, N'c', 'd', 3",
+    # the next result sets buffered behind the big row
+    "multiset": f"SELECT n, REPLICATE(CAST(N'é' AS nvarchar(max)), {_BIG}) AS big, "
+                + ", ".join(f"n * {i} AS c{i}" for i in range(1, 41))
+                + " FROM (VALUES (1)) v(n); SELECT 1 AS a, N'x' AS b, 2 AS c; SELECT 3 AS d",
+}
+
+
+def read_every_set(connection, sql, state):
+    """The reader: every result set to its end, recorded in `state`; anything but a StatementError is recorded too."""
+    try:
+        result = connection.run(sql)
+        sets = []
+        while True:
+            rows = []
+            while batch := result.fetch(500):
+                rows += batch
+            sets.append(rows)
+            if not result.next_result():
+                break
+        result.close()
+        state["out"], state["sets"] = "ok", sets
+    except StatementError as exc:
+        state["out"] = exc.code or "error"
+    except BaseException as exc:  # UnicodeDecodeError, SystemError: values freed or rewritten under the converter
+        state["out"] = f"{type(exc).__name__}: {exc}"[:300]
+
+
+@pytest.mark.parametrize("probe", list(BLOB_PROBES))
+def test_a_cancel_while_big_values_are_converted_never_corrupts_them(probe):  # R-03b-F6
+    """A Cancel at random moments of a big row's transfer and conversion. With a cross-thread dbcancel the verifier
+    saw UnicodeDecodeError, SystemError and garbage bytes; now only the worker enters FreeTDS, so every outcome is ok
+    (values intact), cancelled or connection_lost."""
+    sql, rng, connection = BLOB_PROBES[probe], random.Random(probe), open_mssql()
+    try:
+        state: dict = {}
+        started = time.monotonic()
+        read_every_set(connection, sql, state)  # calibration: how long the whole batch takes without a Cancel
+        span = time.monotonic() - started
+        assert state["out"] == "ok" and state["sets"][0][0][1] == "é" * _BIG
+        for i in range(5):
+            if connection is None:
+                connection = open_mssql()
+            state = {}
+            thread = threading.Thread(target=read_every_set, args=(connection, sql, state), daemon=True)
+            thread.start()
+            with ends_reader(connection, thread):
+                time.sleep(rng.uniform(0.1, span))
+                connection.cancel()
+                thread.join(30)
+            assert state.get("out") in ("ok", "cancelled", "connection_lost"), (i, state.get("out"))
+            if state["out"] == "ok":
+                first = state["sets"][0][0]
+                assert first[1] == "é" * _BIG and first[0] == 1, i
+            if state["out"] == "connection_lost":
+                connection.close()
+                connection = None
+            else:
+                assert one(connection, "SELECT 'mine' AS m") == [["mine"]]
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 @pytest.fixture
 def locked_row():
     """##zz_lockrows (5,000 rows) with row 3000 locked by another session's open transaction."""
@@ -854,15 +927,31 @@ def stream_in_thread(connection, sql):
     return thread, state
 
 
-def test_a_select_blocked_on_a_row_lock_mid_stream_can_be_cancelled(conn, locked_row):  # Important 1
+@pytest.mark.parametrize("manual", [False, True])
+def test_a_select_blocked_on_a_row_lock_mid_stream_ends_by_escalation(conn, locked_row, manual):  # R-03b-F6
+    """Blocked inside a row read, the worker cannot see the flag, and no other thread may send it a cancel any more:
+    auto-commit drops the connection after about a second with the "waiting" text; manual commit warns first, and the
+    next Cancel drops it."""
+    conn.set_autocommit(not manual)
+    heard: list = []
+    conn.set_message_listener(lambda m: heard.append((m.severity, m.text)))
     thread, state = stream_in_thread(conn, locked_row)
-    time.sleep(0.8)
-    assert 0 < state["rows"] < 3000 and "out" not in state  # blocked inside a row read
-    started = time.monotonic()
-    conn.cancel()
-    thread.join(5)
-    assert state.get("out") == "cancelled" and time.monotonic() - started < 2
-    assert one(conn, "SELECT 'mine' AS m") == [["mine"]]
+    with ends_reader(conn, thread):
+        time.sleep(0.8)
+        assert 0 < state["rows"] < 3000 and "out" not in state  # blocked inside a row read
+        started = time.monotonic()
+        conn.cancel()
+        if manual:
+            while not heard and time.monotonic() - started < 3:
+                time.sleep(0.02)
+            assert heard == [("warning", mssql_adapter_cancel.WAITING_WARNING)] and "out" not in state
+            time.sleep(mssql_adapter_cancel.DOUBLE_CLICK_S + 0.1)
+            conn.force_cancel()  # the next Cancel
+        thread.join(5)
+        took = time.monotonic() - started
+    expected = mssql_adapter_cancel.ABORTED_MESSAGE if manual else mssql_adapter_cancel.WAITING_DROPPED_MESSAGE
+    assert state.get("out") == "connection_lost" and state["message"] == expected, state
+    assert mssql_adapter_cancel.WEDGE_S <= took < mssql_adapter_cancel.WEDGE_S + 2
 
 
 def test_closing_the_session_mid_stream_reads_connection_lost_not_the_end(conn, locked_row):  # R-03b-T8a (6)

@@ -1,4 +1,5 @@
-"""The in-driver count (R-03b-F5) without a database: dbclose() never runs while a call is inside the driver."""
+"""The in-driver count (R-03b-F5, F6) without a database: dbclose() never runs while a call is inside the driver, and
+no second thread ever enters it."""
 
 import socket
 import threading
@@ -57,7 +58,7 @@ def test_close_waits_for_a_call_inside_the_driver_then_frees_it(call):
     conn = GuardedConnection(raw)
     work = {
         "execute_query": lambda: conn.execute_query("SELECT 1"),
-        "cancel": conn.cancel_across_threads,  # the canceller's dbcancel
+        "cancel": conn.cancel,  # the worker's own dbcancel, reading to the acknowledgement
         "row read": lambda: [row for _, row in zip(range(2), conn.get_iterator(driver.ROW))],  # blocks in row 2
     }[call]
     worker = in_thread(work)
@@ -88,7 +89,7 @@ def test_a_call_that_never_leaves_leaks_the_connection_instead_of_freeing_it():
     assert conn.close() is True and raw.log.count("close") == 1  # idempotent
 
 
-def test_a_second_thread_never_reaches_the_driver_while_another_is_inside_except_to_cancel():
+def test_a_second_thread_never_reaches_the_driver_while_another_is_inside_not_even_to_cancel():  # R-03b-F6
     raw = FakeRaw()
     conn = GuardedConnection(raw)
     worker = in_thread(lambda: conn.execute_query("SELECT 1"))
@@ -98,14 +99,11 @@ def test_a_second_thread_never_reaches_the_driver_while_another_is_inside_except
     with pytest.raises(driver.DriverError):
         next(conn.get_iterator(driver.ROW))
     with pytest.raises(driver.DriverError):
-        conn.cancel()  # a cancel from a stranger too: only the canceller's goes across threads
+        conn.cancel()  # a dbcancel() from another thread frees what the worker is still converting: refused too
     assert raw.log == ["enter execute_query"]
-    canceller = in_thread(conn.cancel_across_threads)  # the canceller's dbcancel is the designed exception
-    time.sleep(0.1)
-    assert raw.log == ["enter execute_query", "enter cancel"]
+    assert not hasattr(conn, "cancel_across_threads")
     raw.release.set()
     worker.join(2)
-    canceller.join(2)
     conn.execute_query("SELECT 3")  # once it left, another thread may use the connection
     assert not conn.busy
 

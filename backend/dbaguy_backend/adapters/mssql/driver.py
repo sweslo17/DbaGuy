@@ -17,10 +17,10 @@ any other call (other connections, test helpers). A hook may block (polling the 
 wait; it must never call `cancel()`: dbsqlok() would then wait for an acknowledgement already consumed. The socket is
 then left with the batch sent and unread, which the raising thread ends itself with `cancel()`.
 
-Every entry into the driver is counted (R-03b-F5): `connect()` hands out a `GuardedConnection`, never pymssql's own
-object. dbclose() frees FreeTDS's connection; a thread still inside the driver for it (a row read, a cross-thread
-dbcancel) would then use freed memory and take the whole sidecar down with it. So `close()` waits, bounded, until no
-call is inside, and otherwise leaves the connection open (leaked) instead of freeing it under the call.
+Every entry into the driver is counted (R-03b-F5, F6): `connect()` hands out a `GuardedConnection`, never pymssql's
+own object. Only one thread uses a connection, the cancel included. dbclose() frees FreeTDS's connection; a thread
+still inside the driver for it would then use freed memory and take the whole sidecar down with it. So `close()` waits,
+bounded, until no call is inside, and otherwise leaves the connection open (leaked) instead of freeing it under it.
 
 Importing this module is what sets the threshold and the callback, so every production module takes pymssql from
 here, never from `pymssql` directly (test helpers may).
@@ -69,12 +69,12 @@ CLOSE_WAIT_S = 3.0  # how long close() waits for the calls inside the driver to 
 
 
 class GuardedConnection:
-    """A pymssql connection whose every entry into the driver, from any thread, goes through one count (R-03b-F5).
+    """A pymssql connection whose every entry into the driver goes through one count (R-03b-F5, F6).
 
-    - `close()` frees the connection only once the count is 0 (see `close`).
-    - One thread uses the connection at a time: a call from a second thread while another thread's call is inside is
-      refused before it reaches the driver (two threads in FreeTDS for one connection is what aborts it). The one
-      exception is `cancel_across_threads()`, the canceller's dbcancel at the moment `cancel.CancelControl` allows.
+    - Only one thread ever uses the connection: a call from another thread while one is inside is refused before it
+      reaches the driver, with no exception (two threads in FreeTDS for one connection is what aborts it, or corrupts
+      the values the other thread is converting). A cancel goes through the same door: only the worker sends one.
+    - `close()` frees the connection only once no call is inside (see `close`).
     - A row iterator counts each row read on its own, so a reader blocked inside a row is inside the driver.
 
     No lock is held during a driver call. A thread inside a call also holds a reference to pymssql's object, so its
@@ -84,9 +84,8 @@ class GuardedConnection:
     def __init__(self, raw: Any) -> None:
         self._raw = raw
         self._lock = threading.Lock()
-        self._inside = 0  # driver calls in progress, any thread, cancels included
-        self._user: int | None = None  # the thread whose calls (not cancels) are inside
-        self._depth = 0  # how many of them (a message handler's call nests in the call that brought the message)
+        self._user: int | None = None  # the thread whose calls are inside
+        self._depth = 0  # how many (a message handler's cancel nests in the call that brought the message)
         self._closed = False  # set first thing in close(): no call enters from then on
         self._freed = False  # dbclose() ran
 
@@ -94,32 +93,28 @@ class GuardedConnection:
     def busy(self) -> bool:
         """Whether a call is inside the driver right now."""
         with self._lock:
-            return self._inside > 0
+            return self._depth > 0
 
-    def _enter(self, cancel: bool = False) -> Any:
+    def _enter(self) -> Any:
         me = threading.get_ident()
         with self._lock:
             if self._closed:
                 raise DriverError("The SQL Server connection is closed")  # never reach a freed connection
-            if not cancel:
-                if self._depth and self._user != me:
-                    raise DriverError("Another thread is using this SQL Server connection")
-                self._user, self._depth = me, self._depth + 1
-            self._inside += 1
+            if self._depth and self._user != me:
+                raise DriverError("Another thread is using this SQL Server connection")
+            self._user, self._depth = me, self._depth + 1
         return self._raw
 
-    def _leave(self, cancel: bool = False) -> None:
+    def _leave(self) -> None:
         with self._lock:
-            self._inside -= 1
-            if not cancel:
-                self._depth -= 1
+            self._depth -= 1
 
-    def _call(self, name: str, *args: Any, cancel: bool = False) -> Any:
-        raw = self._enter(cancel)
+    def _call(self, name: str, *args: Any) -> Any:
+        raw = self._enter()
         try:
             return getattr(raw, name)(*args)
         finally:
-            self._leave(cancel)
+            self._leave()
 
     def execute_query(self, sql: str) -> None:
         self._call("execute_query", sql)
@@ -139,10 +134,6 @@ class GuardedConnection:
     def cancel(self) -> None:
         """The worker's own cancel (also from its message handler, inside the call that brought the message)."""
         self._call("cancel")
-
-    def cancel_across_threads(self) -> None:
-        """The canceller's dbcancel while the worker's call is inside (see the class)."""
-        self._call("cancel", cancel=True)
 
     @property
     def rows_affected(self) -> int:

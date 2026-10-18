@@ -1,5 +1,5 @@
-"""CancelControl's decisions (R-03b-T8a/d/e/h/i, F1, F2) without a database: a socket pair stands in for the
-connection's socket and a fake records the driver's cancel()."""
+"""CancelControl's decisions (R-03b-T8d/e/h/i, F1, F2, F6) without a database: a socket pair stands in for the
+connection's socket and a fake records the driver's cancel() and the thread that sent it."""
 
 import socket
 import threading
@@ -9,7 +9,7 @@ import pytest
 
 from dbaguy_backend.adapters.mssql.cancel import (
     ABORTED_MESSAGE, BUSY_DATA_DROPPED_MESSAGE, BUSY_DATA_WARNING, BUSY_DROPPED_MESSAGE, BUSY_WARNING, DOUBLE_CLICK_S,
-    GRACE_S, UNDOING_WARNING, WEDGE_S, CallKind, CancelControl, CancelPending,
+    GRACE_S, UNDOING_WARNING, WAITING_DROPPED_MESSAGE, WAITING_WARNING, WEDGE_S, CallKind, CancelControl, CancelPending,
 )
 
 
@@ -19,8 +19,6 @@ class FakeDriver:
 
     def cancel(self) -> None:
         self.cancels.append(threading.get_ident())
-
-    cancel_across_threads = cancel
 
 
 @pytest.fixture
@@ -138,16 +136,26 @@ def test_closing_the_session_drops_a_call_in_progress_and_only_flags_otherwise(u
     assert control.aborted == "forced by closing the session" and dropped(unix_pair[1]) and control.unusable
 
 
-def test_a_cancel_reaches_a_waiting_worker_across_threads_once_the_socket_is_quiet(tcp_pair):
-    control, driver = control_on(tcp_pair[0])
-    with control.call(CallKind.NEXT_SET) as call:  # the worker waits for the next result set: the flag cannot reach it
+@pytest.mark.parametrize("holds", [False, True])
+def test_a_worker_waiting_where_the_flag_cannot_reach_escalates_and_never_gets_a_cancel_from_another_thread(
+        tcp_pair, holds):  # R-03b-F6: a quiet socket is no longer a reason to dbcancel() across threads
+    """The worker waits for the next result set (a WAITFOR between two SELECTs, a row lock mid-result) and the server
+    sends nothing: after WEDGE_S the connection is dropped, or the request warned, with the "waiting" texts."""
+    warnings: list[str] = []
+    control, driver = control_on(tcp_pair[0], may_hold_transaction=lambda: holds, warn=warnings.append)
+    with control.call(CallKind.NEXT_SET):
         started = time.monotonic()
         control.cancel()
-        while call.across_done_at is None and time.monotonic() - started < 2:
+        while control.aborted is None and not warnings and time.monotonic() - started < WEDGE_S + 1:
             time.sleep(0.01)
-    assert call.attention == "across threads" and len(driver.cancels) == 1
-    assert driver.cancels[0] != threading.get_ident() and call.across_sent_at - started >= GRACE_S
-    assert control.aborted is None
+        took = time.monotonic() - started
+        assert driver.cancels == [] and WEDGE_S <= took < WEDGE_S + 0.5
+        if holds:
+            assert warnings == [WAITING_WARNING] and control.aborted is None
+            control.abort()
+        else:
+            assert control.aborted_message == WAITING_DROPPED_MESSAGE and warnings == []
+    assert dropped(tcp_pair[1])
 
 
 class Chatter:
@@ -200,7 +208,7 @@ def test_a_busy_connection_without_a_safe_moment_is_dropped_when_no_transaction_
     with control.call(CallKind.NEXT_SET):
         control.cancel()
         took = Chatter(tcp_pair).run_until(lambda: control.aborted is not None, WEDGE_S + 2)
-    assert control.aborted and "no transaction to lose" in control.aborted and driver.cancels == []
+    assert control.aborted and "no transaction can be open" in control.aborted and driver.cancels == []
     assert control.aborted_message == BUSY_DROPPED_MESSAGE and WEDGE_S <= took < WEDGE_S + 1
 
 
@@ -298,7 +306,7 @@ def test_a_failing_transaction_check_counts_as_a_transaction(tcp_pair):
         control.abort()
 
 
-def test_rows_that_keep_coming_need_no_cancel_across_threads(tcp_pair):
+def test_rows_that_keep_coming_are_never_escalated(tcp_pair):
     control, driver = control_on(tcp_pair[0])
     with control.call(CallKind.ROWS) as call:
         control.cancel()
