@@ -8,6 +8,7 @@ from ..domain.errors import ValidationFailed
 from ..domain.metadata import NodeKind, PathSegment
 from .dialects import Dialect, qualified, quote_ident
 from .lexer import INSIGNIFICANT, TokenKind, tokenize
+from .tsql import statements
 
 _RELATION_KINDS = frozenset({NodeKind.TABLE, NodeKind.VIEW, NodeKind.MATERIALIZED_VIEW, NodeKind.PARTITION})
 _TRAILING = INSIGNIFICANT | {TokenKind.SEMI}
@@ -37,6 +38,7 @@ def _single_expression(where: str | None, dialect: Dialect) -> str | None:
     - MySQL executable comments (`/*! … */`, `/*+ … */`) are code to the server, not comments: turning one into
       a space would silently change the filter, and passing it through would run code (a `;` included) that looks
       like a comment: rejected.
+    - T-SQL needs no `;` between statements: a filter the T-SQL statement cutter splits in two is rejected.
     """
     tokens = tokenize(where or "", dialect)
     if not all(token.terminated for token in tokens):
@@ -47,6 +49,9 @@ def _single_expression(where: str | None, dialect: Dialect) -> str | None:
         tokens.pop()
     if any(token.kind == TokenKind.SEMI for token in tokens):
         raise ValidationFailed("A filter must be a single expression")
+    # T-SQL needs no `;` before a second statement: `id = 1 DELETE FROM t` would run the DELETE.
+    if dialect is Dialect.TSQL and len(statements([t for t in tokens if t.kind not in INSIGNIFICANT])) > 1:
+        raise ValidationFailed("A filter must be a single expression: this one holds another T-SQL statement")
     return "".join(" " if token.kind == TokenKind.COMMENT else token.text for token in tokens).strip() or None
 
 

@@ -237,3 +237,77 @@ def test_the_mysql_allow_list_does_not_leak_into_the_other_engines():
         for sql in ("SET @x = 1", "USE analytics", "SET NAMES utf8mb4"):
             decision = policy.check(sql, dialect, "standard", read_only=True)
             assert (decision.action, decision.reasons) == (A.BLOCK, ["read_only"])
+
+
+# ---- read-only SQL Server connections: DbaGuy is the only guard (spec §3.4, plan Ruling 9) ----
+
+TS = Dialect.TSQL
+
+
+def decide_ts(sql, level="standard", read_only=False):
+    decision = policy.check(sql, TS, level, read_only)
+    return decision.action, decision.reasons
+
+
+@pytest.mark.parametrize("sql", [
+    "DECLARE @x int = 1; SELECT @x", "SELECT @x = 1", "PRINT 'x'", "WAITFOR DELAY '00:00:01'", "IF 1 = 1 SELECT 1",
+    "SET NOCOUNT ON", "SET NOCOUNT ON; SELECT 1", "SET ANSI_NULLS, QUOTED_IDENTIFIER ON", "SET ANSI_WARNINGS OFF",
+    "SET ARITHABORT ON", "SET DATEFORMAT dmy", "SET LANGUAGE us_english", "SET LANGUAGE N'us_english'",
+    "SET LOCK_TIMEOUT 1000", "SET STATISTICS IO ON", "SET STATISTICS TIME ON", "SET SHOWPLAN_XML ON",
+    "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED", "USE analytics", "USE [my db]", "BEGIN TRAN",
+])
+def test_tsql_read_only_allows(sql):
+    assert decide_ts(sql, read_only=True) == (A.RUN, [])
+
+
+@pytest.mark.parametrize("sql", [
+    "INSERT INTO t VALUES (1)", "EXEC sp_who", "EXECUTE p", "sp_who", "SELECT 1\nDELETE FROM t",
+    "DECLARE @t TABLE (a int); INSERT INTO @t VALUES (1)", "SELECT * INTO #t FROM t", "CREATE TABLE #t (a int)",
+    "SET IMPLICIT_TRANSACTIONS ON", "SET XACT_ABORT ON", "SET IDENTITY_INSERT t ON", "SET STATISTICS XML ON",
+    "SET ROWCOUNT 10", "SET NOCOUNT ON; SET XACT_ABORT ON", "SET NOCOUNT ON\nUPDATE t SET a = 1",
+    "DBCC FREEPROCCACHE", "SELECT * FROM t WITH (UPDLOCK)", "SET NOCOUNT ON\nGO\nSET XACT_ABORT ON",
+    # R-03b-P2: the pre-flight's bypasses
+    "DECLARE @p varbinary(16) = (SELECT TEXTPTR(c) FROM dbo.zz_text WHERE id = 1)\nWRITETEXT dbo.zz_text.c @p 'new'",
+    "DECLARE @p varbinary(16)\nUPDATETEXT dbo.zz_text.c @p 0 NULL 'x'",
+    "SELECT * INTO t2 FROM t OPTION (USE HINT ('FORCE_LEGACY_CARDINALITY_ESTIMATION'))",
+    "SELECT * INTO t2 FROM CHANGETABLE(CHANGES t, 0) c",
+    "DECLARE @h uniqueidentifier\nEND CONVERSATION @h",
+    "DECLARE @h uniqueidentifier\nBEGIN DIALOG CONVERSATION @h FROM SERVICE s TO SERVICE 't' ON CONTRACT c",
+    "WAITFOR (RECEIVE TOP (1) * FROM dbo.q), TIMEOUT 1000",
+    "DECLARE @h uniqueidentifier\nSEND ON CONVERSATION @h ('x')",
+    "DECLARE @h uniqueidentifier, @g uniqueidentifier\nMOVE CONVERSATION @h TO @g",
+    # Found by the self-check, each run by SQL Server 2022 as described.
+    "SELECT throw INTO t2 FROM t", "IF 1 = 1 DISABLE TRIGGER tr ON t",
+    "IF 1 = 1 SELECT 1 ELSE DISABLE TRIGGER ALL ON t",
+    "SELECT 1\nADD SENSITIVITY CLASSIFICATION TO dbo.t.a WITH (LABEL = 'x')", "SELECT NEXT VALUE FOR dbo.s",
+    "pragma x", "show x", "SET ANSI_NULLS ON; SET IMPLICIT_TRANSACTIONS ON",
+    "(SELECT a INTO t2 FROM t) OPTION (USE HINT ('FORCE_LEGACY_CARDINALITY_ESTIMATION'))",
+])
+def test_tsql_read_only_blocks(sql):
+    assert decide_ts(sql, read_only=True) == (A.BLOCK, ["read_only"])
+
+
+def test_tsql_levels():
+    assert decide_ts("SET NOCOUNT ON", "strict") == (A.CONFIRM, ["strict_session"])
+    assert decide_ts("EXEC sp_who", "strict") == (A.CONFIRM, ["strict_unknown"])
+    assert decide_ts("SELECT 1\nDELETE FROM t") == (A.CONFIRM, ["delete_without_where"])
+
+
+@pytest.mark.parametrize("sql, reasons", [  # R-03b-P3: the standard level still asks, with the reason
+    ("SET NOCOUNT ON\nDELETE FROM t", ["delete_without_where"]),
+    ("SET XACT_ABORT ON\nUPDATE t SET a = 1", ["update_without_where"]),
+    ("ALTER TABLE t ADD c int\nDROP TABLE u", ["drop"]),
+    ("GRANT SELECT ON t TO u\nDROP TABLE t", ["drop"]),
+    ("DENY SELECT ON t TO u\nTRUNCATE TABLE t", ["truncate"]),
+    ("REVOKE SELECT ON t FROM u\nDELETE FROM t", ["delete_without_where"]),
+    # Found by the self-check: SQL Server ran each DELETE / UPDATE / DROP, which the standard level must confirm.
+    ("SELECT 1 AS after\nDELETE FROM t", ["delete_without_where"]),
+    ("ALTER LOGIN l WITH CHECK_POLICY = ON\nDELETE FROM t", ["delete_without_where"]),
+    ("ALTER DATABASE CURRENT SET ANSI_NULLS ON\nUPDATE t SET a = 1", ["update_without_where"]),
+    ("ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES u (id) ON UPDATE CASCADE\nSET XACT_ABORT ON\n"
+     "DELETE FROM t", ["delete_without_where"]),
+    ("ALTER TABLE t ADD c int\nDROP ASSEMBLY a", ["drop"]),
+    ("ALTER PARTITION FUNCTION pf() MERGE RANGE (1)\nDROP TABLE t", ["drop"]),
+])
+def test_tsql_standard_level_keeps_danger_reasons(sql, reasons):
+    assert decide_ts(sql) == (A.CONFIRM, reasons)

@@ -9,6 +9,7 @@ from ..sql.classifier import classify
 from ..sql.dialects import Dialect
 from ..sql.lexer import INSIGNIFICANT, Token, TokenKind, tokenize
 from ..sql.splitter import split
+from ..sql.tsql import statements
 
 _SET_CONFIG = "SET_CONFIG"  # a SELECT can call it to switch default_transaction_read_only off
 # Settings a read-only PostgreSQL session may still change: they shape how statements run and look, never whether
@@ -211,7 +212,51 @@ def _harmless_mysql_session(sql: str) -> bool:
     return all(_harmless_mysql_assignment(item) for item in _top_level_items(tokens[1:]))
 
 
+_TSQL_HARMLESS_OPTIONS = frozenset(
+    {"NOCOUNT", "ARITHABORT", "QUOTED_IDENTIFIER", "DATEFORMAT", "LANGUAGE", "LOCK_TIMEOUT"}
+)
+_TSQL_HARMLESS_PREFIXES = ("ANSI_", "SHOWPLAN_")
+_TSQL_STATISTICS = (["STATISTICS", "IO"], ["STATISTICS", "TIME"])
+
+
+def _harmless_tsql_setting(tokens: list[Token]) -> bool:
+    """One T-SQL statement that only shapes how statements run or look (spec §3.4): `USE db`, `SET @var = …`,
+    `SET TRANSACTION ISOLATION LEVEL …`, `SET STATISTICS IO|TIME …`, or `SET <option>[, <option>…] <value>` whose
+    options are NOCOUNT, ANSI_*, ARITHABORT, QUOTED_IDENTIFIER, DATEFORMAT, LANGUAGE, LOCK_TIMEOUT or SHOWPLAN_*.
+    Never IMPLICIT_TRANSACTIONS, XACT_ABORT, ROWCOUNT, IDENTITY_INSERT or anything else."""
+    words = _keywords(tokens)
+    if words[:1] == ["USE"]:
+        return len(tokens) == 2 and tokens[1].kind in (TokenKind.WORD, TokenKind.QUOTED)
+    if words[:1] != ["SET"] or len(tokens) < 3:
+        return False
+    if words[1].startswith("@") and not words[1].startswith("@@"):
+        return True
+    if words[1:4] == ["TRANSACTION", "ISOLATION", "LEVEL"]:
+        return len(tokens) > 4
+    items = _top_level_items(tokens[1:-1])  # the options; the last token is the value
+    if words[1] == "STATISTICS":
+        return len(items) == 1 and [t.upper for t in items[0]] in _TSQL_STATISTICS
+    return all(
+        len(item) == 1 and item[0].kind == TokenKind.WORD
+        and (item[0].upper in _TSQL_HARMLESS_OPTIONS or item[0].upper.startswith(_TSQL_HARMLESS_PREFIXES))
+        for item in items
+    )
+
+
+def _harmless_tsql_session(sql: str) -> bool:
+    """A T-SQL text classified SESSION holds no write, DDL or unknown statement (or it would be classified so): it is
+    allowed read-only when every session statement in it, in every batch, is harmless."""
+    for span in split(sql, Dialect.TSQL):
+        tokens = [t for t in tokenize(span.text, Dialect.TSQL) if t.kind not in INSIGNIFICANT]
+        for piece in statements(tokens):
+            text = span.text[piece[0].start:piece[-1].end]
+            if classify(text, Dialect.TSQL).kind == StatementKind.SESSION and not _harmless_tsql_setting(piece):
+                return False
+    return True
+
+
 _HARMLESS_SESSION: dict[Dialect, Callable[[str], bool]] = {
     Dialect.POSTGRES: _harmless_pg_setting,
     Dialect.MYSQL: _harmless_mysql_session,
+    Dialect.TSQL: _harmless_tsql_session,
 }  # a dialect without an entry (SQLite) allows no SESSION statement on a read-only connection

@@ -195,6 +195,28 @@ def test_tsql_comments_and_words():
     ]
 
 
+# SQL Server separates tokens at every Unicode space (probed on 2022: exactly str.isspace() and U+200B), so
+# `DELETE\u00a0FROM t` is a DELETE there; elsewhere a non-ASCII character continues a name, as in the servers.
+TSQL_SPACES = ["\x85", "\xa0", "\u1680", *map(chr, range(0x2000, 0x200C)), "\u2028", "\u2029", "\u202f", "\u205f",
+               "\u3000"]
+
+
+@pytest.mark.parametrize("space", TSQL_SPACES)
+def test_tsql_unicode_spaces_end_words(space):
+    text = f"SELECT{space}a{space}FROM @t{space}#x{space}DELETE{space}FROM t"
+    assert kinds(text, TS) == [
+        (K.WORD, "SELECT"), (K.WORD, "a"), (K.WORD, "FROM"), (K.WORD, "@t"), (K.WORD, "#x"), (K.WORD, "DELETE"),
+        (K.WORD, "FROM"), (K.WORD, "t"),
+    ]
+    assert "".join(t.text for t in tokenize(text, TS)) == text
+
+
+def test_other_unicode_stays_in_tsql_names_and_spaces_stay_in_other_dialects_names():
+    assert kinds("SELECT a\u200cb, 名前 FROM t", TS)[1:4] == [(K.WORD, "a\u200cb"), (K.COMMA, ","), (K.WORD, "名前")]
+    for dialect in (PG, LITE, MY):
+        assert kinds("SELECT a\u00a0b\u200bc", dialect) == [(K.WORD, "SELECT"), (K.WORD, "a\u00a0b\u200bc")]
+
+
 def test_closing_brackets_double_in_every_dialect():  # Ruling 4
     assert kinds("[a]]b] x", LITE) == [(K.QUOTED, "[a]]b]"), (K.WORD, "x")]
 

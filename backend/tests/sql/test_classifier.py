@@ -468,3 +468,148 @@ def test_a_single_statement_inside_delimiter_lines_is_classified_without_them():
     wrapped = "DELIMITER $$\nDELETE FROM t$$\nDELIMITER ;"  # the danger of the statement is not lost to the wrapper
     assert classify(wrapped, MY) == classify("DELETE FROM t", MY)
     assert classify(wrapped, MY).dangerous_reasons == [DangerReason.DELETE_WITHOUT_WHERE]
+
+
+# ---- T-SQL: every statement of a batch judged, with or without `;` (spec §3.4, plan Ruling 8) ----
+
+TS = Dialect.TSQL
+
+
+@pytest.mark.parametrize(("sql", "kind", "reasons"), [
+    ("DECLARE @x int = 1; SELECT @x", K.READ, []),
+    ("DECLARE @x int = 41\nSELECT @x + 1 AS answer", K.READ, []),
+    ("DECLARE @t TABLE (a int)", K.READ, []),
+    ("SET @x = 1", K.READ, []),
+    ("SELECT @x = a FROM t", K.READ, []),
+    ("PRINT 'hi'", K.READ, []),
+    ("RAISERROR('x', 10, 1) WITH NOWAIT", K.READ, []),
+    ("THROW 50000, 'x', 1", K.READ, []),
+    ("WAITFOR DELAY '00:00:01'", K.READ, []),
+    ("IF EXISTS (SELECT 1 FROM t) PRINT 'y' ELSE PRINT 'n'", K.READ, []),
+    ("BEGIN TRY SELECT 1/0 END TRY BEGIN CATCH SELECT ERROR_MESSAGE() END CATCH", K.READ, []),
+    ("WHILE @i < 3 BEGIN SET @i = @i + 1 END", K.READ, []),
+    ("SELECT TOP 10 * FROM t WITH (NOLOCK)", K.READ, []),
+    ("SELECT * FROM t FOR XML PATH('')", K.READ, []),
+    ("SELECT 'DELETE FROM t' AS s, [update] FROM t", K.READ, []),
+    ("EXEC sp_who", K.UNKNOWN, []),
+    ("EXECUTE dbo.p @a = 1", K.UNKNOWN, []),
+    ("sp_who", K.UNKNOWN, []),
+    ("EXEC sp_executesql N'DELETE FROM t'", K.UNKNOWN, []),
+    ("SELECT 1; EXEC('DROP TABLE t')", K.UNKNOWN, []),
+    ("DBCC CHECKDB", K.UNKNOWN, []),
+    ("BACKUP DATABASE d TO DISK = 'x'", K.UNKNOWN, []),
+    ("KILL 55", K.UNKNOWN, []),
+    ("SHUTDOWN", K.UNKNOWN, []),
+    ("BULK INSERT t FROM 'x'", K.WRITE, []),
+    ("DECLARE @x int\nDELETE FROM t", K.WRITE, ["delete_without_where"]),
+    ("SELECT 1\nDROP TABLE t", K.DDL, ["drop"]),
+    ("SELECT 1\nUPDATE t SET a = 1", K.WRITE, ["update_without_where"]),
+    ("UPDATE t SET a = 1 WHERE id = 1", K.WRITE, []),
+    ("WITH c AS (SELECT * FROM t) DELETE FROM c", K.WRITE, ["delete_without_where"]),
+    ("IF @x = 1 DELETE FROM t WHERE id = 1 ELSE UPDATE t SET a = 1", K.WRITE, ["update_without_where"]),
+    ("MERGE t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = s.a;", K.WRITE, []),
+    ("SELECT * FROM t WITH (UPDLOCK)", K.WRITE, []),
+    ("UPDATE STATISTICS t", K.WRITE, []),
+    ("SELECT * INTO #t FROM t", K.DDL, []),
+    ("CREATE TABLE #t (a int)", K.DDL, []),
+    ("TRUNCATE TABLE t", K.DDL, ["truncate"]),
+    ("ALTER TABLE t DROP COLUMN a", K.DDL, ["alter_drop"]),
+    ("DENY SELECT ON t TO u", K.DDL, []),
+    ("GRANT SELECT, INSERT ON t TO u", K.DDL, []),
+    ("CREATE PROCEDURE p AS\nBEGIN\n  DELETE FROM t;\n  EXEC q;\nEND", K.DDL, []),
+    ("CREATE OR ALTER VIEW v AS SELECT 1 AS a", K.DDL, []),
+    ("ALTER PROCEDURE p AS EXEC q", K.DDL, []),
+    ("BEGIN TRAN", K.TRANSACTION, []),
+    ("SAVE TRANSACTION s", K.TRANSACTION, []),
+    ("BEGIN TRANSACTION; UPDATE t SET a = 1 WHERE id = 1; COMMIT", K.WRITE, []),
+    ("SET NOCOUNT ON", K.SESSION, []),
+    ("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED", K.SESSION, []),
+    ("USE master", K.SESSION, []),
+    ("SELECT 1\nGO\nDELETE FROM t", K.WRITE, ["delete_without_where"]),  # every batch judged
+    # R-03b-P2: the pre-flight's bypasses (each accepted and run by SQL Server 2022)
+    ("DECLARE @p varbinary(16) = (SELECT TEXTPTR(c) FROM dbo.zz_text WHERE id = 1)\nWRITETEXT dbo.zz_text.c @p 'new'",
+     K.WRITE, []),
+    ("DECLARE @p varbinary(16)\nUPDATETEXT dbo.zz_text.c @p 0 NULL 'x'", K.WRITE, []),
+    ("SELECT * INTO t2 FROM t OPTION (USE HINT ('FORCE_LEGACY_CARDINALITY_ESTIMATION'))", K.DDL, []),
+    ("SELECT * INTO t2 FROM CHANGETABLE(CHANGES t, 0) c", K.DDL, []),
+    ("WITH c AS (SELECT 1 AS a) SELECT * INTO t2 FROM c", K.DDL, []),
+    ("(SELECT a INTO t2 FROM t) OPTION (USE HINT ('FORCE_LEGACY_CARDINALITY_ESTIMATION'))", K.DDL, []),  # self-check
+    ("(SELECT * INTO t2 FROM CHANGETABLE(CHANGES t, 0) c)", K.DDL, []),
+    ("IF 1 = 1 (SELECT * INTO t2 FROM CHANGETABLE(CHANGES t, 0) c)", K.DDL, []),  # it created t2
+    ("DECLARE @p varbinary(16)\n((SELECT * INTO t2 FROM CHANGETABLE(CHANGES t, 0) c))", K.DDL, []),
+    ("BEGIN TRAN\n(SELECT * INTO t2 FROM CHANGETABLE(CHANGES t, 0) c)", K.DDL, []),
+    ("SELECT a FROM t WHERE a IN (SELECT b FROM u) OPTION (USE HINT ('X'))", K.READ, []),
+    ("FETCH NEXT FROM c INTO @x", K.READ, []),
+    ("DECLARE @h uniqueidentifier\nEND CONVERSATION @h", K.UNKNOWN, []),
+    ("DECLARE @h uniqueidentifier\nBEGIN DIALOG CONVERSATION @h FROM SERVICE s TO SERVICE 't' ON CONTRACT c", K.UNKNOWN, []),
+    ("BEGIN CONVERSATION TIMER (@h) TIMEOUT = 60", K.UNKNOWN, []),
+    ("WAITFOR (RECEIVE TOP (1) * FROM dbo.q), TIMEOUT 1000", K.WRITE, []),
+    ("DECLARE @h uniqueidentifier\nSEND ON CONVERSATION @h ('x')", K.UNKNOWN, []),
+    ("DECLARE @h uniqueidentifier, @g uniqueidentifier\nMOVE CONVERSATION @h TO @g", K.UNKNOWN, []),
+    ("SELECT * FROM t WITH (TABLOCKX)", K.WRITE, []),
+    ("FETCH NEXT FROM c INTO @x", K.READ, []),
+    # R-03b-P3: danger reasons survive statements run together without `;`
+    ("SET NOCOUNT ON\nDELETE FROM t", K.WRITE, ["delete_without_where"]),
+    ("SET XACT_ABORT ON\nUPDATE t SET a = 1", K.WRITE, ["update_without_where"]),
+    ("ALTER TABLE t ADD c int\nDROP TABLE u", K.DDL, ["drop"]),
+    ("GRANT SELECT ON t TO u\nDROP TABLE t", K.DDL, ["drop"]),
+    ("DENY SELECT ON t TO u\nTRUNCATE TABLE t", K.DDL, ["truncate"]),
+    ("REVOKE SELECT ON t FROM u\nDELETE FROM t", K.DDL, ["delete_without_where"]),
+    ("WITH c AS (SELECT * FROM t) UPDATE c SET a = 1", K.WRITE, ["update_without_where"]),
+    # Found by the self-check, each run by SQL Server 2022 as described.
+    ("SELECT throw INTO t2 FROM t", K.DDL, []),  # THROW is not reserved: a column, and the SELECT creates t2
+    ("SELECT t.throw INTO t2 FROM t", K.DDL, []),
+    ("IF 1 = 1 DISABLE TRIGGER tr ON t", K.UNKNOWN, []),  # it disabled the trigger
+    ("WHILE 1 = 0 ENABLE TRIGGER ALL ON t", K.UNKNOWN, []),
+    ("SELECT 1\nADD SENSITIVITY CLASSIFICATION TO dbo.t.a WITH (LABEL = 'x')", K.DDL, []),
+    ("IF 1 = 1 ADD SIGNATURE TO dbo.p BY CERTIFICATE c", K.DDL, []),
+    ("SELECT NEXT VALUE FOR dbo.s", K.WRITE, []),  # it advances the sequence
+    ("pragma x", K.UNKNOWN, []),  # a bare name at the start of a batch runs that procedure
+    ("show x", K.UNKNOWN, []),
+    ("explain x", K.UNKNOWN, []),
+    ("describe x", K.UNKNOWN, []),
+    ("SELECT 1 AS after\nDELETE FROM t", K.WRITE, ["delete_without_where"]),
+    ("ALTER LOGIN l WITH CHECK_POLICY = ON\nDELETE FROM t", K.DDL, ["delete_without_where"]),
+    ("ALTER DATABASE CURRENT SET ANSI_NULLS ON\nUPDATE t SET a = 1", K.DDL, ["update_without_where"]),
+    ("ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES u (id) ON UPDATE CASCADE\nSET XACT_ABORT ON\n"
+     "DELETE FROM t", K.DDL, ["delete_without_where"]),
+    ("ALTER TABLE t ADD c int\nDROP ASSEMBLY a", K.DDL, ["drop"]),
+    ("ALTER PARTITION FUNCTION pf() MERGE RANGE (1)\nDROP TABLE t", K.DDL, ["drop"]),
+    ("SELECT throw, enable, get, move FROM t", K.READ, []),  # names, not statements
+    ("BEGIN TRY SELECT 1 END TRY BEGIN CATCH THROW END CATCH", K.READ, []),
+    # SQL Server separates tokens at Unicode spaces: both ran (all rows deleted, the table dropped)
+    ("SELECT 1\nDELETE\u00a0FROM t", K.WRITE, ["delete_without_where"]),
+    ("DECLARE @x int\u3000DROP TABLE u", K.DDL, ["drop"]),
+    ("SELECT a FROM t\u200bDELETE FROM t", K.WRITE, ["delete_without_where"]),
+    ("WITH\u200bc\u200bAS\u200b(SELECT\u200b*\u200bFROM\u200bt)\u200bDELETE\u200bFROM\u200bc", K.WRITE,
+     ["delete_without_where"]),
+    # An unfiltered UPDATE/DELETE keeps its reason when sqlglot cannot parse it (OPTION after a CTE, USE HINT), and a
+    # WHERE inside a subquery or a CTE filters nothing.
+    ("WITH c AS (SELECT * FROM t) DELETE FROM c OPTION (MAXDOP 1)", K.WRITE, ["delete_without_where"]),
+    ("WITH c AS (SELECT * FROM t) UPDATE TOP (1) c SET a = 1", K.WRITE, ["update_without_where"]),
+    ("UPDATE t SET a = (SELECT MAX(b) FROM u WHERE u.id = t.id) OPTION (MAXDOP 1, USE HINT ('X'))", K.WRITE,
+     ["update_without_where"]),
+    ("WITH c AS (SELECT * FROM t WHERE a = 1) DELETE FROM c OPTION (MAXDOP 1)", K.WRITE, ["delete_without_where"]),
+    ("WITH c AS (SELECT * FROM t) DELETE FROM c WHERE b = 2 OPTION (MAXDOP 1)", K.WRITE, []),
+    ("UPDATE t SET a = 1 WHERE id IN (SELECT id FROM u) OPTION (USE HINT ('X'))", K.WRITE, []),
+    ("WITH c AS (SELECT * FROM t) SELECT * FROM c WHERE a = 1 OPTION (MAXDOP 1)", K.READ, []),
+    # MERGE as a join or union hint is no MERGE statement
+    ("SELECT * FROM t INNER MERGE JOIN u ON u.id = t.id", K.READ, []),
+    ("SELECT * FROM t JOIN u ON u.id = t.id OPTION (HASH JOIN, MERGE JOIN, MERGE UNION)", K.READ, []),
+])
+def test_tsql(sql, kind, reasons):
+    result = classify(sql, TS)
+    assert (result.kind, list(result.dangerous_reasons)) == (kind, reasons)
+
+
+@pytest.mark.parametrize("sql", ["SHOW x", "EXPLAIN SELECT 1", "DESCRIBE t", "PRAGMA x", "START TRANSACTION",
+                                 "RESET x", "LISTEN x", "NOTIFY x", "DISCARD ALL", "RELEASE x", "ABORT"])
+def test_words_that_start_no_tsql_statement_are_unknown(sql):  # plan Ruling 8: a leading name is an implicit EXEC
+    assert classify(sql, TS).kind == K.UNKNOWN
+
+
+def test_the_tsql_keyword_overrides_do_not_leak_into_the_other_dialects():
+    assert classify("SHOW search_path", PG).kind == K.READ
+    assert classify("PRAGMA table_info(t)", LITE).kind == K.READ
+    assert classify("PRAGMA journal_mode = WAL", LITE).kind == K.SESSION
+    assert classify("DESCRIBE t", MY).kind == K.READ

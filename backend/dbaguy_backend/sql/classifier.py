@@ -1,5 +1,6 @@
 import threading
 import time
+from collections.abc import Iterator
 from types import ModuleType
 
 from loguru import logger
@@ -7,8 +8,11 @@ from loguru import logger
 # The models live in the domain (the execution protocol carries them); re-exported here for the sql/ callers.
 from ..domain.classification import Classification, DangerReason, StatementKind
 from .dialects import Dialect
-from .lexer import HINT_COMMENT_START, INSIGNIFICANT, VERSION_COMMENT_STARTS, Token, TokenKind, tokenize
+from .lexer import (
+    HINT_COMMENT_START, INSIGNIFICANT, VERSION_COMMENT_STARTS, Token, TokenKind, tokenize, with_ascii_spaces,
+)
 from .splitter import split
+from .tsql import statements
 
 __all__ = ["Classification", "DangerReason", "StatementKind", "classify", "warm_up"]
 
@@ -36,6 +40,22 @@ _KEYWORD_KIND: dict[str, StatementKind] = {
 # session setting: RESET MASTER, RESET REPLICA, RESET PERSIST act on the server (sqlglot reads them as an alias).
 _DIALECT_KEYWORD_KIND: dict[Dialect, dict[str, StatementKind]] = {
     Dialect.MYSQL: {"LOAD": StatementKind.WRITE, "HANDLER": StatementKind.WRITE, "RESET": StatementKind.UNKNOWN},
+    Dialect.TSQL: {  # spec §3.4
+        **dict.fromkeys(
+            ("DECLARE", "PRINT", "WAITFOR", "RAISERROR", "THROW", "OPEN", "CLOSE", "DEALLOCATE"), StatementKind.READ
+        ),
+        # a procedure may write: EXEC / EXECUTE / sp_executesql (and a bare procedure name, which no table knows)
+        **dict.fromkeys(("EXEC", "EXECUTE", "DBCC", "BACKUP", "RESTORE", "KILL"), StatementKind.UNKNOWN),
+        **dict.fromkeys(("BULK", "WRITETEXT", "UPDATETEXT"), StatementKind.WRITE),  # text/image writes (R-03b-P2)
+        "SAVE": StatementKind.TRANSACTION, "DENY": StatementKind.DDL,
+        # Words _KEYWORD_KIND (or PRAGMA's rule) reads as a read, transaction or session statement that start no T-SQL
+        # statement: as the first word of a batch, such a name runs the procedure it names (plan Ruling 8).
+        **dict.fromkeys(
+            ("SHOW", "EXPLAIN", "DESCRIBE", "DESC", "PRAGMA", "START", "SAVEPOINT", "RELEASE", "ABORT", "RESET",
+             "ATTACH", "DETACH", "LISTEN", "UNLISTEN", "NOTIFY", "DISCARD"),
+            StatementKind.UNKNOWN,
+        ),
+    },
 }
 # MySQL: sqlglot reads every `START …` as a transaction, and so does _KEYWORD_KIND (START REPLICA, START
 # GROUP_REPLICATION, …). A statement counts as a TRANSACTION only when it begins with one of these; anything else is
@@ -43,6 +63,9 @@ _DIALECT_KEYWORD_KIND: dict[Dialect, dict[str, StatementKind]] = {
 _TRANSACTION_STARTS: dict[Dialect, tuple[tuple[str, ...], ...]] = {
     Dialect.MYSQL: (
         ("BEGIN",), ("START", "TRANSACTION"), ("COMMIT",), ("ROLLBACK",), ("SAVEPOINT",), ("RELEASE", "SAVEPOINT"),
+    ),
+    Dialect.TSQL: (
+        ("BEGIN", "TRAN"), ("BEGIN", "TRANSACTION"), ("BEGIN", "DISTRIBUTED"), ("COMMIT",), ("ROLLBACK",), ("SAVE",),
     ),
 }
 # The keywords that open an EXPLAIN. In MySQL DESCRIBE and DESC are synonyms: `DESCRIBE ANALYZE DELETE …` runs the
@@ -66,6 +89,37 @@ _ANALYZE = ("ANALYZE", "ANALYSE")  # PostgreSQL accepts both spellings; EXPLAIN 
 # What follows DROP inside an ALTER when it loses rows or the keys and constraints that guard them (R-03a-F1).
 # `ALTER COLUMN a DROP DEFAULT|NOT NULL|EXPRESSION|IDENTITY` loses neither.
 _ALTER_DROPPED = frozenset({"PARTITION", "PRIMARY", "COLUMN", "INDEX", "KEY", "FOREIGN", "CONSTRAINT", "CHECK"})
+# T-SQL control flow: the statements inside are cut out and judged on their own, so these words read and write nothing.
+_TSQL_CONTROL = frozenset({"IF", "ELSE", "WHILE", "BREAK", "CONTINUE", "GOTO", "RETURN"})
+# BEGIN / END are control flow only as a block or TRY/CATCH (R-03b-P2); BEGIN TRAN|TRANSACTION|DISTRIBUTED keep their
+# transaction kind; any other BEGIN x / END x (BEGIN DIALOG, END CONVERSATION, …) is UNKNOWN.
+_TSQL_BLOCK_WORDS = frozenset({"", "TRY", "CATCH"})
+_TSQL_BEGIN_TRANSACTION = frozenset({"TRAN", "TRANSACTION", "DISTRIBUTED"})
+# A floor over every word of a T-SQL batch (strings, comments and [names] are not words): whatever the cuts merged,
+# no write can pass as something milder. Kinds only; the dangerous reasons come from the statements.
+_TSQL_FLOOR: dict[str, StatementKind] = {
+    **dict.fromkeys(
+        ("INSERT", "UPDATE", "DELETE", "MERGE", "BULK", "UPDLOCK", "XLOCK", "TABLOCKX", "WRITETEXT", "UPDATETEXT",
+         # Service Broker (R-03b-P2): SEND, RECEIVE, and every … CONVERSATION / BEGIN DIALOG statement write
+         "SEND", "RECEIVE", "CONVERSATION", "DIALOG"),
+        StatementKind.WRITE,
+    ),
+    # ADD and TRIGGER are reserved words only DDL uses: ADD SIGNATURE, ADD SENSITIVITY CLASSIFICATION and ENABLE |
+    # DISABLE TRIGGER are accepted after IF, ELSE or WHILE, and ADD … after an unterminated statement too.
+    **dict.fromkeys(
+        ("CREATE", "ALTER", "DROP", "TRUNCATE", "GRANT", "REVOKE", "DENY", "ADD", "TRIGGER"), StatementKind.DDL
+    ),
+    **dict.fromkeys(
+        ("EXEC", "EXECUTE", "DBCC", "BACKUP", "RESTORE", "KILL", "SHUTDOWN", "RECONFIGURE", "CHECKPOINT", "OPENROWSET",
+         "OPENQUERY", "OPENDATASOURCE", "SETUSER"),
+        StatementKind.UNKNOWN,
+    ),
+}
+# The same floor for words that write only together: NEXT VALUE FOR advances a sequence, inside any SELECT or SET.
+_TSQL_FLOOR_PHRASES: dict[tuple[str, ...], StatementKind] = {("NEXT", "VALUE", "FOR"): StatementKind.WRITE}
+# A floor word before one of these is a query hint, no statement: INNER MERGE JOIN, OPTION (MERGE JOIN | MERGE UNION)
+# (a MERGE statement's target cannot be named JOIN or UNION: both are reserved).
+_TSQL_FLOOR_HINT_BEFORE: dict[str, frozenset[str]] = {"MERGE": frozenset({"JOIN", "UNION"})}
 
 
 def _has_version_comment(tokens: list[Token]) -> bool:
@@ -120,10 +174,12 @@ def _lexical(sql: str, dialect: Dialect) -> Classification:
     if not words:
         return Classification(kind=StatementKind.UNKNOWN)
     first = words[0]
-    if first == "PRAGMA":  # `PRAGMA x = y` sets, `PRAGMA x` reads (an "=" inside a string or comment does not count)
+    overrides = _DIALECT_KEYWORD_KIND.get(dialect, {})
+    if first == "PRAGMA" and first not in overrides:
+        # `PRAGMA x = y` sets, `PRAGMA x` reads (an "=" inside a string or comment does not count)
         assigns = any(t.kind == TokenKind.OTHER and t.text == "=" for t in tokens)
         return Classification(kind=StatementKind.SESSION if assigns else StatementKind.READ)
-    kind = _DIALECT_KEYWORD_KIND.get(dialect, {}).get(first) or _KEYWORD_KIND.get(first, StatementKind.UNKNOWN)
+    kind = overrides.get(first) or _KEYWORD_KIND.get(first, StatementKind.UNKNOWN)
     if kind == StatementKind.READ and first in ("SELECT", "WITH"):
         # Data-modifying CTEs, locking reads and file writes are writes even when sqlglot could not parse them.
         has_dml = any(w in ("INSERT", "UPDATE", "DELETE", "MERGE") for w in words[1:])
@@ -208,18 +264,128 @@ def _from_sqlglot(sql: str, dialect: Dialect) -> list[Classification | None] | N
     return None
 
 
+def _tsql_rule(words: list[str]) -> Classification | None:
+    """T-SQL statements decided before sqlglot (spec §3.4); None when the general rules decide."""
+    first = words[0] if words else ""
+    second = words[1] if len(words) > 1 else ""
+    if first in _TSQL_CONTROL:
+        return Classification(kind=StatementKind.READ)  # IF, ELSE, WHILE, …: their statements are separate pieces
+    if first in ("BEGIN", "END"):
+        if second in _TSQL_BLOCK_WORDS and len(words) <= 2:
+            return Classification(kind=StatementKind.READ)  # BEGIN, END, BEGIN TRY, END CATCH
+        if first == "BEGIN" and second in _TSQL_BEGIN_TRANSACTION:
+            return None  # BEGIN TRAN …: the transaction rules decide
+        return Classification(kind=StatementKind.UNKNOWN)  # BEGIN DIALOG, END CONVERSATION, …: fail closed
+    if first == "SET" and len(words) > 1 and words[1].startswith("@") and not words[1].startswith("@@"):
+        return Classification(kind=StatementKind.READ)  # SET @var = …: a variable, not a session setting
+    if words[:2] == ["UPDATE", "STATISTICS"]:
+        return Classification(kind=StatementKind.WRITE)  # maintenance; it has no WHERE to miss
+    return None
+
+
+def _tsql_unfiltered_dml(tokens: list[Token]) -> list[DangerReason]:
+    """The danger reason of a T-SQL UPDATE or DELETE, also one after a CTE (WITH … DELETE), that has no WHERE at
+    parenthesis depth 0: a WHERE inside a subquery or a CTE filters nothing. Decided on the words, whatever sqlglot
+    makes of the rest: it cannot parse `OPTION (USE HINT …)`, nor `OPTION (MAXDOP 1)` after a CTE (self-check)."""
+    depth, dml = 0, ""
+    for k, token in enumerate(t for t in tokens if t.kind not in INSIGNIFICANT):
+        word = token.upper if token.kind == TokenKind.WORD else ""
+        depth = max(depth + (token.kind == TokenKind.LPAREN) - (token.kind == TokenKind.RPAREN), 0)
+        if depth or not word:
+            continue
+        if k == 0 and word not in ("UPDATE", "DELETE", "WITH"):
+            return []
+        if not dml and word in ("SELECT", "INSERT", "UPDATE", "DELETE", "MERGE"):
+            if word not in ("UPDATE", "DELETE"):
+                return []
+            dml = word
+        elif dml and word == "WHERE":
+            return []
+    reasons = {"UPDATE": DangerReason.UPDATE_WITHOUT_WHERE, "DELETE": DangerReason.DELETE_WITHOUT_WHERE}
+    return [reasons[dml]] if dml else []
+
+
+_SELECT_FAMILY = ("SELECT", "WITH")
+
+
+def _tsql_selects_into_a_table(tokens: list[Token]) -> bool:
+    """A SELECT … INTO that creates a table, in one T-SQL statement (`tokens`: its significant tokens): an INTO not
+    right after INSERT or MERGE and not followed by an @variable, in a statement whose first word (also after an opening
+    parenthesis) is SELECT or WITH, or inside a parenthesis that opens with one: T-SQL allows INTO in no subquery, so
+    that is a statement in parentheses, which the cuts leave in the piece before it (`IF 1 = 1 (SELECT * INTO t2 …)`).
+    Decided on the words, whatever sqlglot makes of the rest: it cannot parse `OPTION (USE HINT …)` or `CHANGETABLE(…)`
+    (R-03b-P2, self-check)."""
+    words = [t.upper if t.kind == TokenKind.WORD else "" for t in tokens]
+    statement = next((t.upper for t in tokens if t.kind != TokenKind.LPAREN), "") in _SELECT_FAMILY
+    groups: list[bool] = []  # per open parenthesis: whether it opens with SELECT or WITH
+    for k, token in enumerate(tokens):
+        if token.kind == TokenKind.LPAREN:
+            groups.append(k + 1 < len(words) and words[k + 1] in _SELECT_FAMILY)
+        elif token.kind == TokenKind.RPAREN:
+            groups = groups[:-1]
+        elif words[k] == "INTO" and (statement or any(groups)) and not (k and words[k - 1] in ("INSERT", "MERGE")):
+            following = tokens[k + 1] if k + 1 < len(tokens) else None
+            if following is None or following.kind != TokenKind.WORD or not following.text.startswith("@"):
+                return True  # not FETCH … INTO @x, OUTPUT … INTO @t
+    return False
+
+
+def _tsql_floor_kinds(tokens: list[Token], pieces: list[list[Token]]) -> Iterator[StatementKind]:
+    """The floor kinds of a T-SQL batch (`tokens`: its significant tokens; `pieces`: them cut into statements): those
+    of its words and phrases, and DDL for a SELECT … INTO that creates a table."""
+    words = [t.upper if t.kind == TokenKind.WORD else "" for t in tokens]
+    for k, word in enumerate(words):
+        hint = k + 1 < len(words) and words[k + 1] in _TSQL_FLOOR_HINT_BEFORE.get(word, ())
+        if word in _TSQL_FLOOR and not hint:
+            yield _TSQL_FLOOR[word]
+        for phrase, kind in _TSQL_FLOOR_PHRASES.items():
+            if tuple(words[k:k + len(phrase)]) == phrase:
+                yield kind
+    if any(_tsql_selects_into_a_table(piece) for piece in pieces):
+        yield StatementKind.DDL  # whatever kind sqlglot or a control-flow rule gave its piece
+
+
+def _classify_tsql_batch(sql: str, has_body: bool) -> Classification:
+    """A T-SQL batch (the text between GO lines): every statement judged, with or without `;` between them, the
+    strictest wins, and no word of the batch may be stricter than that (the floor). A batch that defines a procedure,
+    function, trigger or view is that one DDL statement: its body runs later, not now."""
+    if has_body:
+        return _classify_single(sql, Dialect.TSQL, has_body=True)
+    tokens = [t for t in tokenize(sql, Dialect.TSQL) if t.kind not in INSIGNIFICANT]
+    pieces = statements(tokens)
+    results = [_classify_single(sql[p[0].start:p[-1].end], Dialect.TSQL) for p in pieces]
+    combined = _combine(results) if results else Classification(kind=StatementKind.UNKNOWN)
+    floor = max((*_tsql_floor_kinds(tokens, pieces), StatementKind.READ), key=_SEVERITY.index)
+    if _SEVERITY.index(floor) > _SEVERITY.index(combined.kind):
+        return Classification(kind=floor, dangerous_reasons=combined.dangerous_reasons)
+    return combined
+
+
 def _classify_statement(sql: str, dialect: Dialect, has_body: bool = False) -> Classification:
-    """One statement as the splitter sees it; `has_body`: it holds a routine or trigger body."""
+    """One span as the splitter sees it: a statement, or for T-SQL a whole batch."""
+    if dialect is Dialect.TSQL:
+        return _classify_tsql_batch(sql, has_body)
+    return _classify_single(sql, dialect, has_body)
+
+
+def _classify_single(sql: str, dialect: Dialect, has_body: bool = False) -> Classification:
+    """One statement; `has_body`: it holds a routine or trigger body."""
     tokens = tokenize(sql, dialect)
     if _has_version_comment(tokens):
         return Classification(kind=StatementKind.UNKNOWN)
     words = _words(tokens)
-    result = _classify_text(sql, dialect, has_body)
+    tsql = dialect is Dialect.TSQL and not has_body
+    if tsql and (decided := _tsql_rule(words)) is not None:
+        return decided
+    # sqlglot's tokenizer does not know U+200B, which SQL Server reads as a space
+    result = _classify_text(with_ascii_spaces(sql) if dialect is Dialect.TSQL else sql, dialect, has_body)
     if result.kind == StatementKind.TRANSACTION and not _begins_a_transaction_statement(words, dialect):
         return Classification(kind=StatementKind.UNKNOWN)
     # R-03a-F1: the words decide after whichever rules did. sqlglot 30.23 cannot parse `ALTER TABLE t DROP PARTITION p`
     # and reads `TRUNCATE PARTITION` as a Command, so both reach the keyword rules, which judge only the first word.
-    if missing := [r for r in _alter_reasons(words) if r not in result.dangerous_reasons]:
+    # The same holds for T-SQL's unfiltered UPDATE/DELETE.
+    implied = [*_alter_reasons(words), *(_tsql_unfiltered_dml(tokens) if tsql else [])]
+    if missing := [r for r in implied if r not in result.dangerous_reasons]:
         result = Classification(kind=result.kind, dangerous_reasons=[*result.dangerous_reasons, *missing])
     # R-03a-P7: decided after sqlglot too, as a floor. sqlglot 30.23 cannot parse INTO OUTFILE (so _lexical sees it
     # today), but a sqlglot that parses it as exp.Into would make it a plain READ for MySQL (INTO_CREATES_A_TABLE
@@ -231,7 +397,7 @@ def _classify_statement(sql: str, dialect: Dialect, has_body: bool = False) -> C
         and _SEVERITY.index(result.kind) < _SEVERITY.index(StatementKind.WRITE)
     ):
         return Classification(kind=StatementKind.WRITE, dangerous_reasons=result.dangerous_reasons)
-    return result
+    return result  # T-SQL's table-creating INTO is part of the batch's floor (_tsql_floor_kinds)
 
 
 def _classify_text(sql: str, dialect: Dialect, has_body: bool) -> Classification:

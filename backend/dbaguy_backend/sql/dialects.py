@@ -40,6 +40,9 @@ class LexRules:
     body_rule: BodyRule
     client_command: ClientCommand | None = None
     national_strings: bool = False  # T-SQL: N'…' is one string
+    # T-SQL: every Unicode space ends a word, as in SQL Server (probed on 2022: str.isspace() and U+200B), so
+    # `DELETE\u00a0FROM t` is a DELETE. Elsewhere a non-ASCII character continues a name, as in those servers.
+    unicode_spaces: bool = False
 
 
 RULES: dict[Dialect, LexRules] = {
@@ -69,7 +72,7 @@ RULES: dict[Dialect, LexRules] = {
         escape_string_prefixes=frozenset(), backslash_escapes=False, string_quotes=frozenset("'"),
         # `"` names an identifier: DbaGuy connects with QUOTED_IDENTIFIER ON (Task 6, Ruling 3)
         identifier_quotes=(("[", "]"), ('"', '"')), variable_prefixes=frozenset("@#"),
-        body_rule=BodyRule.TSQL_MODULE, client_command=ClientCommand.GO, national_strings=True,
+        body_rule=BodyRule.TSQL_MODULE, client_command=ClientCommand.GO, national_strings=True, unicode_spaces=True,
     ),
 }
 

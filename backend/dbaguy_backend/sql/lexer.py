@@ -59,6 +59,24 @@ def _ident_char(ch: str) -> bool:
     return ch.isalnum() or ch in "_$" or ord(ch) > 127
 
 
+def _unicode_space(ch: str) -> bool:
+    """A space to SQL Server: whatever str.isspace() says, and U+200B (ZERO WIDTH SPACE)."""
+    return ch.isspace() or ch == "\u200b"
+
+
+def _tsql_name_char(ch: str) -> bool:
+    return _ident_char(ch) and not _unicode_space(ch)
+
+
+_TO_ASCII_SPACE = {i: " " for i in range(0x80, 0x3001) if _unicode_space(chr(i))}  # U+3000 is the last one
+
+
+def with_ascii_spaces(text: str) -> str:
+    """`text` with every non-ASCII space SQL Server knows (see _unicode_space) replaced by an ASCII space: as long, the
+    same tokens for the T-SQL lexer, and readable alike by a parser that does not know U+200B (sqlglot)."""
+    return text.translate(_TO_ASCII_SPACE)
+
+
 def _scan_string(text: str, i: int, quote: str, backslash: bool) -> tuple[int, bool]:
     """i points at the opening quote; returns (index after the closing quote or len(text), whether it closed).
     A doubled quote stands for one; with `backslash`, a backslash escapes the next character."""
@@ -105,6 +123,7 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
     """
     rules = RULES[dialect]
     quotes = dict(rules.identifier_quotes)
+    is_space, name_char = (_unicode_space, _tsql_name_char) if rules.unicode_spaces else (str.isspace, _ident_char)
     delimiter = delimiter or None  # an empty terminator would match everywhere without advancing
     n = len(text)
     i = start
@@ -115,8 +134,8 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
         if delimiter is not None and text.startswith(delimiter, i):
             i += len(delimiter)
             kind = TokenKind.DELIMITER
-        elif ch.isspace():
-            while i < n and text[i].isspace():
+        elif is_space(ch):
+            while i < n and is_space(text[i]):
                 i += 1
             kind = TokenKind.SPACE
         elif _starts_line_comment(text, i, rules):
@@ -165,13 +184,13 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
         elif ch in rules.variable_prefixes:  # MySQL @x, @@x; T-SQL @x, @@x, #t, ##g
             while i < n and text[i] == ch:  # @ or @@, # or ##
                 i += 1
-            while i < n and _ident_char(text[i]):
+            while i < n and name_char(text[i]):
                 i += 1
             if delimiter is not None:
                 i = _cut_at_delimiter(text, begin, i, delimiter)
             kind = TokenKind.WORD
         elif _ident_start(ch):
-            while i < n and _ident_char(text[i]):
+            while i < n and name_char(text[i]):
                 i += 1
             if delimiter is not None:
                 i = _cut_at_delimiter(text, begin, i, delimiter)
