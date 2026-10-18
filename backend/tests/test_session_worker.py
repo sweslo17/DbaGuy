@@ -1,12 +1,13 @@
 """Worker / manager lifecycle and cancel semantics, driven by a fake connection so every race is forced, not hoped for."""
 
+import queue
 import sqlite3
 import threading
 import time
 
 import pytest
 
-from dbaguy_backend.adapters.base import AdapterCapabilities, RawJsonRows, RunOptions
+from dbaguy_backend.adapters.base import AdapterCapabilities, RawJsonRows, ReadAhead, ReadAheadState, RunOptions
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager, write_askpass_script
@@ -34,6 +35,7 @@ from dbaguy_backend.storage.profile_store import ProfileStore
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
 from tests.fake_db import FakeConnection, FakeLease, FakeResult
 from tests.fake_ssh import run_in_thread, wait_until
+from tests.support import scaled
 from tests.test_sessions import Recorder, finished, paused
 
 
@@ -525,8 +527,8 @@ def test_the_history_record_carries_the_requests_query_context():  # P37: `_comp
         worker.close()
 
 
-CLOSED = ("Closed this result 2 min after it first paused, to free the query node — run the statement again to load "
-          "more, or export it to get every row")
+CLOSED = ("Closed this result 2 min after the server was left waiting for it, to free the query node — run the "
+          "statement again to load more, or export it to get every row")
 
 
 def test_an_idle_paused_result_is_closed_after_the_limit():
@@ -596,8 +598,8 @@ def _barrier(worker):
     assert done.wait(5)
 
 
-CLOSED_45 = ("Closed this result 45 s after it first paused, to free the query node — run the statement again to load "
-             "more, or export it to get every row")
+CLOSED_45 = ("Closed this result 45 s after the server was left waiting for it, to free the query node — run the "
+             "statement again to load more, or export it to get every row")
 
 
 def test_the_idle_limit_counts_from_the_first_pause_and_a_load_more_does_not_restart_it():  # R-04a-T11b
@@ -742,5 +744,218 @@ def test_an_export_format_the_dialect_cannot_write_is_refused(tmp_path):
         worker.submit(ExportCommand(request_id="i", sql="rows 1", format="insert", path=str(tmp_path / "x.sql")))
         rec.wait_for(finished("i"))
         assert rec.of("i", "error")[0].code == "unsupported_format" and conn.runs == []
+    finally:
+        worker.close()
+
+
+# ---- 8. read-ahead of paused results (04b, R-04a-T11a) ----
+
+MIB = 1024 * 1024
+CLOSED_AFTER_45 = ("Closed this result 45 s after the server was left waiting for it, to free the query node — run the "
+                   "statement again to load more, or export it to get every row")
+
+
+class ScriptedResult(FakeResult):
+    """Rows like FakeResult. Its read-ahead answers from `script` (the test feeds steps or exceptions); with nothing fed
+    within 50 ms it says READING again, as a result still reading would."""
+
+    def __init__(self, rows: int, script: queue.Queue) -> None:
+        super().__init__(rows)
+        self.script = script
+        self.received = 0
+        self.calls = 0
+
+    def read_ahead(self, budget: int) -> ReadAhead:
+        self.calls += 1
+        try:
+            step = self.script.get(timeout=0.05)
+        except queue.Empty:
+            return ReadAhead(ReadAheadState.READING, self.received)
+        if isinstance(step, BaseException):
+            raise step
+        self.received = step.received
+        return step
+
+
+class ReadAheadConnection(FakeConnection):
+    """`rows N` returns a ScriptedResult sharing the connection's `script`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.script: queue.Queue = queue.Queue()
+        self.results: list[ScriptedResult] = []
+
+    def statement(self, sql, options):
+        result = super().statement(sql, options)
+        if not sql.startswith("rows "):
+            return result
+        scripted = ScriptedResult(int(sql.split()[1]), self.script)
+        self.results.append(scripted)
+        return scripted
+
+
+def read_ahead_worker(clock, **capabilities):
+    connection = ReadAheadConnection()
+    worker, _, rec = make_worker(connection, clock=clock, **{"paused_result_max_idle_s": 45.0,
+                                                             "read_ahead_bytes": 1 * MIB, **capabilities})
+    return worker, connection, rec
+
+
+def test_a_result_read_to_its_end_is_never_closed():
+    clock = Clock()
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        execute(worker, "p", "rows 1200")
+        rec.wait_for(paused("p", 500))
+        conn.script.put(ReadAhead(ReadAheadState.DONE, 300_000))
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.DONE)
+        clock.now += 10_000
+        worker.check_paused_result()
+        _barrier(worker)
+        assert not rec.of("p", "finished")
+        worker.submit(FetchMoreCommand(request_id="p", count=1000))
+        rec.wait_for(finished("p"))
+        assert sum(len(e.rows) for e in rec.of("p", "rows")) == 1200 and not rec.of("p", "error")
+    finally:
+        worker.close()
+
+
+def test_the_idle_limit_counts_from_where_the_read_ahead_stopped():  # Review Focus 3
+    clock = Clock()  # 1000.0 at the pause
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        execute(worker, "p", "rows 2000")
+        rec.wait_for(paused("p", 500))
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.READING)
+        clock.now = 1030.0  # still reading 30 s later: the server is not held back, nothing may close
+        worker.check_paused_result()
+        _barrier(worker)
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB))
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1074.0  # 44 s after the stop, 74 s after the pause
+        worker.check_paused_result()
+        _barrier(worker)
+        assert not rec.of("p", "finished")
+        clock.now = 1075.0
+        worker.check_paused_result()
+        rec.wait_for(finished("p"))
+        assert rec.of("p", "message")[-1].text == CLOSED_AFTER_45
+    finally:
+        worker.close()
+
+
+def test_an_empty_socket_after_a_load_more_does_not_restart_the_clock():  # B42 (B3 withdrawn)
+    clock = Clock()
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        execute(worker, "p", "rows 2000")
+        rec.wait_for(paused("p", 500))
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB))  # stopped at 1000.0
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        worker.submit(FetchMoreCommand(request_id="p", count=500))
+        rec.wait_for(paused("p", 1000))
+        clock.now = 1040.0
+        conn.script.put(ReadAhead(ReadAheadState.WAITING, 1 * MIB))  # the refill drained the socket
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.WAITING)
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB + 4096))  # 4 KiB more: far from 2 × the budget
+        wait_until(lambda: conn.script.empty() and worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1044.0  # 44 s after the first stop
+        worker.check_paused_result()
+        _barrier(worker)
+        assert not rec.of("p", "finished")
+        clock.now = 1045.0  # 45 s after the FIRST stop, 5 s after the empty socket
+        worker.check_paused_result()
+        rec.wait_for(finished("p"))
+        assert rec.of("p", "message")[-1].text == CLOSED_AFTER_45
+    finally:
+        worker.close()
+
+
+def test_draining_twice_the_budget_restarts_the_clock():  # STALL_RESET_FACTOR = 2, budget 1 MiB here
+    clock = Clock()
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        execute(worker, "p", "rows 5000")
+        rec.wait_for(paused("p", 500))
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB))  # stopped at 1000.0
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1040.0
+        conn.script.put(ReadAhead(ReadAheadState.READING, 2 * MIB))  # 1 MiB since the stop: not enough
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 2 * MIB))
+        worker.submit(FetchMoreCommand(request_id="p", count=2000))
+        rec.wait_for(paused("p", 2500))
+        wait_until(lambda: conn.script.empty() and worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1045.0  # 45 s after the first stop: closes
+        worker.check_paused_result()
+        rec.wait_for(finished("p"))
+    finally:
+        worker.close()
+    clock = Clock()
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        execute(worker, "q", "rows 5000")
+        rec.wait_for(paused("q", 500))
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB))  # stopped at 1000.0
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1040.0
+        conn.script.put(ReadAhead(ReadAheadState.READING, 3 * MIB))  # 2 MiB since the stop: unblocked
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 3 * MIB))  # stopped again at 1040.0
+        worker.submit(FetchMoreCommand(request_id="q", count=2000))
+        rec.wait_for(paused("q", 2500))
+        wait_until(lambda: conn.script.empty() and worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1084.0
+        worker.check_paused_result()
+        _barrier(worker)
+        assert not rec.of("q", "finished")
+        clock.now = 1085.0
+        worker.check_paused_result()
+        rec.wait_for(finished("q"))
+    finally:
+        worker.close()
+
+
+def test_read_ahead_never_holds_up_a_command():  # Review Focus 1: every step here takes 50 ms and finds more
+    clock = Clock()
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        execute(worker, "p", "rows 2000")
+        rec.wait_for(paused("p", 500))
+        wait_until(lambda: conn.results[0].calls >= 3)  # stepping
+        started = time.monotonic()
+        worker.cancel("p")  # paused: a discard
+        rec.wait_for(finished("p"))
+        assert time.monotonic() - started < scaled(1.0)
+        execute(worker, "n", "rows 1")
+        rec.wait_for(finished("n"))
+        assert conn.results[0].closed
+    finally:
+        worker.close()
+
+
+def test_a_failing_read_ahead_falls_back_to_the_first_pause_clock():
+    clock = Clock()
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        conn.script.put(RuntimeError("bug in an adapter"))
+        execute(worker, "p", "rows 2000")
+        rec.wait_for(paused("p", 500))
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now += 45
+        worker.check_paused_result()
+        rec.wait_for(finished("p"))
+        assert sum(len(e.rows) for e in rec.of("p", "rows")) == 500  # the rows loaded stay
+    finally:
+        worker.close()
+
+
+def test_engines_without_read_ahead_never_read_ahead():
+    clock = Clock()
+    connection = ReadAheadConnection()
+    worker, _, rec = make_worker(connection, clock=clock, paused_result_max_idle_s=45.0)
+    try:
+        execute(worker, "p", "rows 1200")
+        rec.wait_for(paused("p", 500))
+        _barrier(worker)
+        assert connection.results[0].calls == 0 and worker.paused_read_ahead() is None
     finally:
         worker.close()

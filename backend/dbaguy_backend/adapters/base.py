@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, ClassVar, Literal
 
 from ..domain.errors import ValidationFailed
@@ -36,6 +37,10 @@ class AdapterCapabilities:
     plan_format: Literal["couchbase"] | None = None  # how EXPLAIN / profile results are laid out
     # A paused result idle this long is closed by the worker (Couchbase: the server drops an idle stream); None: never
     paused_result_max_idle_s: float | None = None
+    # A paused result reads up to this many bytes of rows the server has already sent (`StatementResult.read_ahead`), so
+    # the server is not held back while the user looks at a page; None: the engine does not read ahead (not in
+    # EngineInfo)
+    read_ahead_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +103,25 @@ class StatementCancelled(StatementError):
         super().__init__(message, code="cancelled")
 
 
+class ReadAheadState(StrEnum):
+    """Where one read-ahead step of a paused result left it (`StatementResult.read_ahead`)."""
+
+    READING = "reading"  # took rows the server had sent; more may be on the socket
+    # The step read nothing: nothing is on the socket now. It says nothing about the server's own stall clock (an
+    # emptied socket does not mean the server's pending write completed, A23), so the stall clock ignores it (B42).
+    WAITING = "waiting"
+    FULL = "full"  # the budget is used up: reading stopped, the server will be held back from here
+    DONE = "done"  # the whole answer is in memory, or ended in an error kept for later: nothing can stall
+
+
+@dataclass(frozen=True)
+class ReadAhead:
+    """One read-ahead step: its state, and the bytes of the server's answer read so far by any path (cumulative)."""
+
+    state: ReadAheadState
+    received: int = 0
+
+
 class StatementResult(ABC):
     """Results of one executed statement or batch, possibly with several result sets.
 
@@ -136,6 +160,18 @@ class StatementResult(ABC):
     def presentation(self) -> Presentation:
         """How the client may show the current result set: "plan" for an EXPLAIN / ADVISE / profile result."""
         return "grid"
+
+    def read_ahead(self, budget: int) -> ReadAhead:
+        """Read on while the result is paused, so the server is not held back (engines with
+        `capabilities.read_ahead_bytes`; the worker passes that as `budget`).
+
+        Called on the worker thread only, and only while the result is paused (between Load mores). Must never block:
+        it reads only rows the server has already sent, into memory, until the rows held take `budget` bytes. Rows
+        read here come out of the next `fetch()` / `fetch_raw()` first, in order. A failure met while reading is kept
+        and raised after the rows read before it, by those calls; never raised here.
+
+        The default reads nothing and says FULL: the server is held back from the pause on."""
+        return ReadAhead(ReadAheadState.FULL)
 
 
 class RawJsonRows(ABC):

@@ -484,8 +484,9 @@ def test_a_node_nobody_listens_on_is_reported_with_its_reason():
 def test_a_paused_result_is_closed_before_the_server_ends_it():  # A13: 7.6.12 ends a stalled request after 77–86 s
     assert PAUSED_RESULT_MAX_IDLE_S + container._HOUSEKEEPING_INTERVAL_S <= 77 - 15  # a margin for a slower server
     assert CouchbaseAdapter.capabilities.paused_result_max_idle_s == PAUSED_RESULT_MAX_IDLE_S
-    assert paused_result_closed_text(PAUSED_RESULT_MAX_IDLE_S).startswith("Closed this result 45 s after it first paused")
-    assert paused_result_closed_text(120.0).startswith("Closed this result 2 min after it first paused")
+    assert paused_result_closed_text(PAUSED_RESULT_MAX_IDLE_S).startswith(
+        "Closed this result 45 s after the server was left waiting")
+    assert paused_result_closed_text(120.0).startswith("Closed this result 2 min after the server was left waiting")
 
 
 def test_the_fake_server_ends_a_connection_when_its_script_runs_out():  # a test asking too much fails at once

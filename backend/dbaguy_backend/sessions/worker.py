@@ -19,6 +19,8 @@ from ..adapters.base import (
     AdapterCapabilities,
     DatabaseConnection,
     RawJsonRows,
+    ReadAhead,
+    ReadAheadState,
     RunOptions,
     StatementCancelled,
     StatementError,
@@ -66,6 +68,7 @@ from ..sql.formatting import (
 )
 from ..storage.atomic_file import atomic_text_file
 from .options import run_options
+from .read_ahead import READ_AHEAD_POLL_S, STALL_RESET_FACTOR, StallClock
 from .session_state import SessionStateTracker
 
 T = TypeVar("T")
@@ -74,18 +77,20 @@ Emitter = Callable[[BaseModel], None]
 TransactionCommand = CommitCommand | RollbackCommand | SetAutocommitCommand
 _CHUNK = 200
 _STOP = object()
+_READ_AHEAD = object()  # what `_next_task` gives when no task is queued and the paused result should read ahead now
 _EXPORT_CHUNK = 1000  # rows fetched, written and checked for a cancel at a time
 _PROGRESS_EVERY = 10_000  # an export reports its row count each time it passes a multiple of this
 _EXPORT_SELECT_ONLY = "Only a statement that returns rows (SELECT, WITH, VALUES…) can be exported"
 
 
 def paused_result_closed_text(limit_s: float) -> str:
-    """The warning a paused result gets when the worker closes it `limit_s` after its first pause (the engine's limit;
-    whole minutes as minutes, anything else in seconds: "2 min", "45 s"). A Load more does not restart that clock
-    (R-04a-T11b), so the text does not promise that loading more keeps the result open."""
+    """The warning a paused result gets when the worker closes it `limit_s` after the server was left waiting for it
+    (the engine's limit, counted by the stall clock: from where the read-ahead stopped, or from the first pause for an
+    engine without read-ahead; whole minutes as minutes, anything else in seconds: "2 min", "45 s"). A Load more need
+    not restart that clock (R-04a-T11b, B42), so the text does not promise that loading more keeps the result open."""
     after = f"{limit_s / 60:g} min" if limit_s % 60 == 0 else f"{limit_s:g} s"
-    return (f"Closed this result {after} after it first paused, to free the query node — run the statement again to "
-            "load more, or export it to get every row")
+    return (f"Closed this result {after} after the server was left waiting for it, to free the query node — run the "
+            "statement again to load more, or export it to get every row")
 
 
 def _param_names(params: StatementParams) -> str:
@@ -168,24 +173,31 @@ class _Request:
 
 @dataclass(frozen=True)
 class _PausedMark:
-    """One pause of the open result: the idle close acts only while the mark it saw is still the current one."""
+    """One pause of the open result: the idle close acts only while the mark it saw is still the current one (compared
+    by value: a read-ahead step that moves `since` replaces the mark, so a close queued for the old one does nothing).
+    """
 
     token: int  # tells two pauses of the same request apart
     request_id: str
-    since: float  # the worker's clock at the result's first pause (the idle limit counts from it, R-04a-T11b)
+    # The worker's clock where the stall began (the idle limit counts from it): where the read-ahead stopped, or the
+    # first pause for an engine without read-ahead (R-04a-T11b). None: nothing holds the server back.
+    since: float | None
 
 
 @dataclass
 class _OpenExecution:
     req: _Request
     result: StatementResult
+    # When the server may be held back since: fed by every read-ahead step, or by every pause for an engine without
+    # read-ahead (the clock then runs from the first pause, and a Load more does not restart it, R-04a-T11b)
+    stall: StallClock
     index: int = 0
     sent: int = 0
     columns_sent: bool = False
     peeked: list[list[Any]] = field(default_factory=list)  # raw rows read ahead to detect a full page
-    # The worker's clock at the result's first pause: the idle limit counts from it on every later pause too
-    # (R-04a-T11b: a Load more served from buffers does not restart the server's own stall clock)
-    first_paused_at: float | None = None
+    # The last read-ahead step's state (written under the worker's _state_lock); None: the engine does not read ahead
+    ahead: ReadAheadState | None = None
+    received: int = 0  # the last read-ahead step's `received`
 
     @property
     def request_id(self) -> str:
@@ -196,10 +208,16 @@ class SessionWorker:
     """Owns one connection and one thread; every driver call happens on that thread.
 
     Locking: `_queue_lock` guards `_closed` and every enqueue, so nothing can land behind the stop marker.
-    `_state_lock` guards `_running_request`, `_cancel_requested`, `_queued`, `_paused` and `_Request.timer_armed`; it
-    is held across `connection.cancel()`, so a cancel can never hit a statement other than the one it was meant for
-    (the worker changes the running request under it). `_tracker` has its own leaf lock for the session state that other
-    threads read; `_state_send_lock` keeps a replayed state from overtaking a newer one.
+    `_state_lock` guards `_running_request`, `_cancel_requested`, `_queued`, `_paused`, `_Request.timer_armed` and the
+    open execution's `ahead`; it is held across `connection.cancel()`, so a cancel can never hit a statement other than
+    the one it was meant for (the worker changes the running request under it). `_tracker` has its own leaf lock for the
+    session state that other threads read; `_state_send_lock` keeps a replayed state from overtaking a newer one.
+
+    Read-ahead (engines with `capabilities.read_ahead_bytes`): while the open result is paused, the worker thread steps
+    `result.read_ahead()` between tasks, only when none is queued. A step never blocks and touches only the open result,
+    so a queued task (Cancel, Discard, Load more, a new statement, close) waits at most one step; nothing is running
+    meanwhile, so a cancel queues a discard and never reaches the connection. Each step moves the paused mark's `since`
+    with the stall clock (`read_ahead.StallClock`), which the idle close counts from.
 
     Every request ends with exactly one `finished`, and a `session_state` immediately before it.
     """
@@ -342,21 +360,33 @@ class SessionWorker:
 
     def check_paused_result(self) -> None:
         """Close the paused result once the engine's limit (capability `paused_result_max_idle_s`; Couchbase: a paused
-        request holds a query servicer, R-04-6) has passed since the result's FIRST pause: a Load more does not restart
-        the clock (R-04a-T11b; Couchbase ends a stalled request on its own 77–86 s after the first stall, and a Load
-        more served from buffers does not unstall it). Any thread; the close itself runs on the worker thread, and only
-        if the result is still in the same pause by then (a Load more racing the close wins)."""
+        request holds a query servicer, R-04-6) has passed on the stall clock: since where its read-ahead stopped, or,
+        for an engine without read-ahead, since the result's FIRST pause (a Load more does not restart it, R-04a-T11b;
+        Couchbase ends a stalled request on its own 77–86 s after the stall began, and a small refill does not unstall
+        it, A23). A result read to its end, or still reading, is never closed. Any thread; the close itself runs on the
+        worker thread, and only if the result is still in the same pause with the same stall start by then (a Load more
+        or a read-ahead step racing the close wins)."""
         limit = self._hooks.capabilities.paused_result_max_idle_s
         if limit is None:
             return
         with self._state_lock:
             mark = self._paused
-        if mark is None or self._clock() - mark.since < limit:
+        if mark is None or mark.since is None or self._clock() - mark.since < limit:
             return
         try:
             self._put(lambda: self._close_idle_paused(mark, limit))
         except SessionBusy:
             pass  # closing: the worker finishes the open result itself
+
+    def paused_read_ahead(self) -> ReadAheadState | None:
+        """The paused result's last read-ahead state (any thread). None when no result is paused or the engine does not
+        read ahead."""
+        with self._state_lock:  # one take: the mark, the open execution and its state agree (B31)
+            mark, execution = self._paused, self._open_exec
+            ahead = execution.ahead if execution is not None else None
+        if mark is None or execution is None or mark.request_id != execution.request_id:
+            return None
+        return ahead
 
     def close(self) -> None:
         if not self._begin_close():
@@ -442,18 +472,74 @@ class SessionWorker:
         logger.info("Session {} closed", self.name)
 
     def _run_queued(self) -> None:
-        """Run queued tasks until the stop marker; once closing, tasks only fail fast (see _execute / call)."""
+        """Run queued tasks until the stop marker; once closing, tasks only fail fast (see _execute / call). With no
+        task queued, a paused result reads ahead one step at a time."""
         while True:
-            try:
-                task = self._queue.get(block=self._lease is not None)
-            except queue.Empty:
-                return  # the opener failed: only what was queued before the failure is left
-            if task is _STOP:
-                return
-            try:
-                task()
+            task = self._next_task()
+            if task is None or task is _STOP:
+                return  # None: the opener failed, and only what was queued before the failure was left
+            try:  # a step too: an error escaping it must not end this thread, or every later command would wait forever
+                if task is _READ_AHEAD:
+                    self._read_ahead_step()
+                else:
+                    task()
             except Exception:
                 logger.exception("Session task failed on {}", self.name)
+
+    def _next_task(self) -> object:
+        """The next queued task. While a paused result reads ahead the queue is never waited on for long: an empty
+        queue gives `_READ_AHEAD` at once after READING, after READ_AHEAD_POLL_S after WAITING. None: the opener failed
+        and nothing is left in the queue."""
+        if self._lease is None:
+            try:
+                return self._queue.get_nowait()
+            except queue.Empty:
+                return None
+        wait = self._read_ahead_wait()
+        try:
+            if wait is None:
+                return self._queue.get()
+            return self._queue.get(timeout=wait) if wait > 0 else self._queue.get_nowait()
+        except queue.Empty:
+            return _READ_AHEAD
+
+    def _read_ahead_wait(self) -> float | None:
+        """None: nothing reads ahead (block on the queue); else how long to wait for a task before the next step."""
+        ex = self._open_exec
+        paused = self._paused  # only this thread changes it
+        if ex is None or paused is None or paused.request_id != ex.request_id:
+            return None
+        if ex.ahead is ReadAheadState.READING:
+            return 0.0
+        return READ_AHEAD_POLL_S if ex.ahead is ReadAheadState.WAITING else None
+
+    def _read_ahead_step(self) -> None:
+        """One read-ahead step of the paused open result (no task queued). A failing `read_ahead()` is a bug (adapters
+        keep failures for fetch()): it counts as FULL with the last `received`, and the result waits for Load more."""
+        ex = self._open_exec
+        if ex is None:  # never: _read_ahead_wait() gives a step only for the paused open result
+            return
+        try:
+            step = ex.result.read_ahead(self._hooks.capabilities.read_ahead_bytes)
+        except Exception:
+            logger.exception("Read-ahead of {} failed on {}; the result waits for Load more as it is",
+                             ex.request_id, self.name)
+            step = ReadAhead(ReadAheadState.FULL, ex.received)
+        # B31: where this step stopped, read before anything is published; whoever then sees the new state also sees
+        # the stall start it led to (publishing the state first would let a reader act on it before the clock is read)
+        now = self._clock()
+        ex.stall.update(step, now)
+        with self._state_lock:
+            if self._paused is not None and self._paused.request_id == ex.request_id:
+                self._paused = replace(self._paused, since=ex.stall.since)
+            previous, ex.ahead, ex.received = ex.ahead, step.state, step.received
+        if step.state is previous:
+            return
+        if step.state is ReadAheadState.DONE:  # never read again: once per result
+            logger.info("[{}] paused result {} read to its end ({} bytes)", self.name, ex.request_id, step.received)
+        else:
+            logger.debug("[{}] read-ahead of {}: {} ({} bytes read)", self.name, ex.request_id, step.state,
+                         step.received)
 
     def _send(self, event: BaseModel) -> None:
         with self._emit_lock:
@@ -537,7 +623,9 @@ class SessionWorker:
             options = replace(options, retry_safe=req.kind == StatementKind.READ)  # D-04-14: only a read is resent
             with self._timeout(req):
                 result = self._run_statement(req, "execute", cmd.sql, options)
-                self._open_exec = _OpenExecution(req=req, result=result)
+                budget = self._hooks.capabilities.read_ahead_bytes
+                stall = StallClock(None if budget is None else STALL_RESET_FACTOR * budget)
+                self._open_exec = _OpenExecution(req=req, result=result, stall=stall)
                 # R-04a-6b1: run() can return before the statement has done its work (PostgreSQL in a transaction:
                 # DECLARE, and the first FETCH runs the query), and a cancel landing in between finds the backend idle.
                 # A read run() returned from has delivered nothing yet, so it stops here. Never a write: one run()
@@ -657,10 +745,13 @@ class SessionWorker:
         if self._set_running(None):
             self._discard(ex.request_id, cancelled=True)
             return
-        if ex.first_paused_at is None:
-            ex.first_paused_at = self._clock()
+        budget = self._hooks.capabilities.read_ahead_bytes
+        if budget is None:  # no read-ahead: the server is held back from the first pause on (R-04a-T11b)
+            ex.stall.update(ReadAhead(ReadAheadState.FULL), self._clock())
         with self._state_lock:  # before any event: the idle check may look at this pause now
-            self._paused = _PausedMark(next(self._pause_tokens), ex.request_id, ex.first_paused_at)
+            if budget is not None and ex.ahead is not ReadAheadState.DONE:
+                ex.ahead = ReadAheadState.READING  # read on while it waits (a Load more freed room); seen with the mark
+            self._paused = _PausedMark(next(self._pause_tokens), ex.request_id, ex.stall.since)
         # In manual-commit mode the statement opened a transaction that a paused result keeps open: report it now,
         # not only at `finished`, so the client and the idle check see it.
         self._refresh_state(began_at=ex.req.started_at)
@@ -901,8 +992,9 @@ class SessionWorker:
         execution = self._open_exec
         if self._closed or not still or execution is None or execution.request_id != mark.request_id:
             return  # a Load more, a new statement, a discard or closing came first: the result is not idle any more
-        logger.info("[{}] closed paused result {} {:.0f} s after its first pause (limit {:g} s)", self.name,
-                    mark.request_id, self._clock() - mark.since, limit_s)
+        waited = self._clock() - mark.since if mark.since is not None else 0.0  # always set: check_paused_result
+        logger.info("[{}] closed paused result {} {:.0f} s after the server was left waiting (limit {:g} s)",
+                    self.name, mark.request_id, waited, limit_s)
         self._send(MessageEvent(
             request_id=mark.request_id, severity=MessageSeverity.WARNING, text=paused_result_closed_text(limit_s),
         ))

@@ -172,7 +172,6 @@ def test_an_idle_paused_result_is_closed_and_frees_the_server_request():  # R-04
         worker.check_paused_result()
         rec.wait_for(finished("p"), timeout=10)
         assert rec.of("p", "message")[-1].text == paused_result_closed_text(PAUSED_RESULT_MAX_IDLE_S)
-        assert "after it first paused" in rec.of("p", "message")[-1].text
         assert sum(len(e.rows) for e in rec.of("p", "rows")) == 1000 and not rec.of("p", "error")
         assert completed_request_state(ident) == "closed"  # our close, not the server's stall kill (`fatal`)
         worker.submit(ExecuteCommand(request_id="n", sql="SELECT RAW 1"))
