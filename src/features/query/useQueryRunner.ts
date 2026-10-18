@@ -247,21 +247,23 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
         toast("error", `GO n runs a batch at most ${MAX_GO_REPEAT.toLocaleString("en-US")} times in DbaGuy`);
         return;
       }
+      // A `GO 0` batch is never sent, so it is neither checked nor confirmed.
+      const sent = planned.filter((s) => s.repeat > 0);
+      if (sent.length === 0) {
+        toast("info", "GO 0 runs the batch zero times");
+        return;
+      }
       const job: ActiveRun = { controller: session, requestId: null, cancelled: false };
       active.current = job;
       try {
-        const confirmed = await confirmUpFront(job, profile, planned);
+        const confirmed = await confirmUpFront(job, profile, sent);
         if (!confirmed || job.cancelled) return;
         if (options.unchanged && !options.unchanged()) {
           // Typed while the statements were being checked: their offsets no longer match the text.
           toast("warning", "The text changed — run again");
           return;
         }
-        const expanded = expandRepeats(planned, confirmed);
-        if (expanded.statements.length === 0) {
-          toast("info", "GO 0 runs the batch zero times");
-          return;
-        }
+        const expanded = expandRepeats(sent, confirmed);
         await execute(job, expanded.statements, expanded.confirmed);
       } finally {
         active.current = null;
