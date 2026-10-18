@@ -36,14 +36,23 @@ const SSL_MODE_LABELS: Partial<Record<Engine, Record<SslConfig["mode"], string>>
     "verify-ca": "verify-ca (VERIFY_CA)",
     "verify-full": "verify-full (VERIFY_IDENTITY)",
   },
+  mssql: {
+    disable: "disable (encryption off)",
+    prefer: "prefer (request: encrypts the login; all traffic only if the server forces it)",
+    require: "require (encrypt, no certificate check)",
+    "verify-ca": "verify-ca (encrypt, check the CA)",
+    "verify-full": "verify-full (check the CA and host name)",
+  },
 };
 const SSL_MODE_HINTS: Partial<Record<Engine, string>> = {
   mysql: "verify-full cannot be used through an SSH tunnel",
+  mssql: "verify-ca and verify-full need a CA file; verify-full cannot be used through an SSH tunnel",
 };
 /** The Import URL placeholder for the selected engine (PostgreSQL's when it has none). */
 const URL_EXAMPLES: Partial<Record<Engine, string>> = {
   postgres: "postgres://user@host:5432/db",
   mysql: "mysql://user@host:3306/db or jdbc:mysql://host:3306/db",
+  mssql: "mssql://user@host:1433/db or jdbc:sqlserver://host:1433;databaseName=db",
   sqlite: "sqlite:///path/to.db",
 };
 const SSL_FILE_FIELDS = [
@@ -51,6 +60,10 @@ const SSL_FILE_FIELDS = [
   { field: "cert_file", label: "Client cert" },
   { field: "key_file", label: "Client key" },
 ] as const;
+/** SQL Server has no client certificates: only the CA file is offered (values stored earlier stay as they are). */
+const CA_FILE_ONLY_ENGINES: readonly Engine[] = ["mssql"];
+const SERVER_READ_ONLY_NOTE =
+  "SQL Server cannot enforce read-only on the connection: DbaGuy blocks write statements itself. For a hard guarantee, use a login that can only read.";
 
 const DEFAULT_SSL: SslConfig = { mode: "prefer", ca_file: null, cert_file: null, key_file: null };
 const DEFAULT_SSH: SshConfig = {
@@ -217,6 +230,9 @@ function ConnectionDialogBody({
   const ssh = server?.ssh ?? DEFAULT_SSH;
   const engineInfo = engines.data?.find((e) => e.engine === draft.engine);
   const engineOptions = engines.data?.map((e) => e.engine) ?? [draft.engine];
+  const sslFileFields = SSL_FILE_FIELDS.filter(
+    ({ field }) => field === "ca_file" || !CA_FILE_ONLY_ENGINES.includes(draft.engine),
+  );
 
   const patchCommon = (changes: Partial<Pick<ServerProfileDraft, CommonField>>) =>
     setDraft((d) => ({ ...d, ...changes }));
@@ -366,7 +382,10 @@ function ConnectionDialogBody({
             />
           </FieldRow>
         )}
-        <FieldRow label="">
+        <FieldRow
+          label=""
+          hint={draft.read_only && engineInfo?.server_read_only === false ? SERVER_READ_ONLY_NOTE : undefined}
+        >
           <div className="flex flex-col gap-1.5">
             {server && (
               <Checkbox
@@ -403,7 +422,7 @@ function ConnectionDialogBody({
             ))}
           </Select>
         </FieldRow>
-        {SSL_FILE_FIELDS.map(({ field, label }) => (
+        {sslFileFields.map(({ field, label }) => (
           <FieldRow key={field} label={label}>
             <NullableInput
               placeholder="/path/to/file.pem"

@@ -5,11 +5,15 @@ import { currentStatements, rangeAt, splitText, type StatementRange } from "../e
 /** ⌘↵ runs by the `run.default` setting (or the selection); ⌘⇧↵ runs every statement. */
 export type RunMode = "default" | "all";
 
-/** One statement to send: its text and where it is in the editor (UTF-16 offsets, without the `;`). */
+/**
+ * One statement to send: its text and where it is in the editor (UTF-16 offsets, without the `;`). `repeat` is how
+ * many times it is sent (T-SQL `GO n`; 1 otherwise, 0 for `GO 0`).
+ */
 export interface PlannedStatement {
   sql: string;
   from: number;
   to: number;
+  repeat: number;
 }
 
 /**
@@ -30,12 +34,34 @@ export async function planRun(
       sql: text.slice(r.from, r.to),
       from: selection.from + r.from,
       to: selection.from + r.to,
+      repeat: r.repeat,
     }));
   }
   const { state, ranges } = await currentStatements(view, dialect);
   const all = mode === "all" || runDefault === "all";
   const chosen: (StatementRange | null)[] = all ? ranges : [rangeAt(ranges, state.selection.main.head)];
-  return chosen.filter((r) => r !== null).map((r) => ({ sql: state.sliceDoc(r.from, r.to), from: r.from, to: r.to }));
+  return chosen
+    .filter((r) => r !== null)
+    .map((r) => ({ sql: state.sliceDoc(r.from, r.to), from: r.from, to: r.to, repeat: r.repeat }));
+}
+
+/**
+ * The statements a run really sends: each one `repeat` times, in order (`GO 0` sends none). A confirmation given to a
+ * statement holds for each of its copies, so `GO 100` asks once; the copies share the statement's editor offsets.
+ */
+export function expandRepeats(
+  planned: readonly PlannedStatement[],
+  confirmed: ReadonlySet<number>,
+): { statements: PlannedStatement[]; confirmed: Set<number> } {
+  const statements: PlannedStatement[] = [];
+  const agreed = new Set<number>();
+  planned.forEach((statement, index) => {
+    for (let copy = 0; copy < statement.repeat; copy += 1) {
+      if (confirmed.has(index)) agreed.add(statements.length);
+      statements.push(statement);
+    }
+  });
+  return { statements, confirmed: agreed };
 }
 
 /**

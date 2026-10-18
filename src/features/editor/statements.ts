@@ -13,12 +13,13 @@ import type { Dialect } from "@/lib/api/types";
 
 /**
  * UTF-16 offsets into the document: [from, to) is the statement, `terminatorEnd` is after its `;` or custom
- * delimiter (or `to`).
+ * delimiter (or `to`). `repeat` is how many times a run sends it (T-SQL `GO n`; 1 for every other statement).
  */
 export interface StatementRange {
   from: number;
   to: number;
   terminatorEnd: number;
+  repeat: number;
 }
 
 export interface StatementsState {
@@ -44,7 +45,10 @@ function mapRanges(ranges: StatementRange[], changes: ChangeDesc): StatementRang
     // Text typed at either edge belongs to the statement until the next split says otherwise.
     const from = changes.mapPos(range.from, -1);
     const to = changes.mapPos(range.to, 1);
-    if (to > from) mapped.push({ from, to, terminatorEnd: Math.max(to, changes.mapPos(range.terminatorEnd, -1)) });
+    if (to > from) {
+      const terminatorEnd = Math.max(to, changes.mapPos(range.terminatorEnd, -1));
+      mapped.push({ from, to, terminatorEnd, repeat: range.repeat });
+    }
   }
   return mapped;
 }
@@ -71,7 +75,7 @@ export const statementsField = StateField.define<StatementsState>({
 export async function splitText(text: string, dialect: Dialect, signal?: AbortSignal): Promise<StatementRange[]> {
   const client = await api();
   const { statements } = unwrap(await client.POST("/sql/split", { body: { text, dialect }, signal }));
-  return statements.map((s) => ({ from: s.start, to: s.end, terminatorEnd: s.terminator_end }));
+  return statements.map((s) => ({ from: s.start, to: s.end, terminatorEnd: s.terminator_end, repeat: s.repeat }));
 }
 
 function applySplit(view: EditorView, version: number, ranges: StatementRange[]): void {

@@ -6,7 +6,7 @@ import type { AppSettings, GuardDecision } from "@/lib/api/types";
 import { refreshHistory } from "../history/useHistory";
 import { CONNECTION_LOST, type ExecutionState } from "../session/execution";
 import { busy, type SessionController } from "../session/SessionController";
-import type { PlannedStatement } from "./runPlan";
+import { expandRepeats, type PlannedStatement } from "./runPlan";
 
 export type StepStatus = "pending" | "running" | "done" | "error" | "cancelled" | "skipped";
 
@@ -58,6 +58,9 @@ export interface QueryRunnerArgs {
   listener?: RunListener;
 }
 
+/** The most times `GO n` may send a batch: a typo such as `GO 100000` would otherwise hold the session for hours. */
+const MAX_GO_REPEAT = 1000;
+
 /** Errors after which nothing more can run on this session, whatever `continue_on_error` says. */
 const FATAL_CODES = new Set(["not_connected", CONNECTION_LOST]);
 
@@ -94,9 +97,10 @@ interface ActiveRun {
 
 /**
  * Runs planned statements on the tab's session (spec §4.1): one `/sql/analyze` for all of them and one confirmation
- * dialog for the flagged ones up front, then one execute per statement, each awaited until it is done or paused.
- * An error stops the run unless `run.continue_on_error`; cancel stops the running statement and the run. A new run
- * forgets the previous run's results. The run belongs to the controller it ran on: a new session starts empty.
+ * dialog for the flagged ones up front, then one execute per statement, each awaited until it is done or paused
+ * (`GO n` sends its batch n times, each an execute of its own). An error stops the run unless `run.continue_on_error`;
+ * cancel stops the running statement and the run. A new run forgets the previous run's results. The run belongs to the
+ * controller it ran on: a new session starts empty.
  */
 export function useQueryRunner({ controller, profileId, settings, timeoutS, listener }: QueryRunnerArgs) {
   const [result, setResult] = useState<{ controller: SessionController; run: RunState } | null>(null);
@@ -239,6 +243,10 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
       const { controller: session, profileId: profile } = latest.current;
       if (!session || !profile || planned.length === 0 || active.current) return;
       if (busy(session.store.getState())) return;
+      if (planned.some((s) => s.repeat > MAX_GO_REPEAT)) {
+        toast("error", `GO n runs a batch at most ${MAX_GO_REPEAT.toLocaleString("en-US")} times in DbaGuy`);
+        return;
+      }
       const job: ActiveRun = { controller: session, requestId: null, cancelled: false };
       active.current = job;
       try {
@@ -249,7 +257,12 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
           toast("warning", "The text changed — run again");
           return;
         }
-        await execute(job, planned, confirmed);
+        const expanded = expandRepeats(planned, confirmed);
+        if (expanded.statements.length === 0) {
+          toast("info", "GO 0 runs the batch zero times");
+          return;
+        }
+        await execute(job, expanded.statements, expanded.confirmed);
       } finally {
         active.current = null;
       }
