@@ -13,7 +13,12 @@ import { currentStatements, splitText, type StatementRange } from "./statements"
  */
 
 /** The formatter's language per dialect; a dialect not listed (or no connection) formats as generic SQL. */
-const LANGUAGES: Partial<Record<Dialect, SqlLanguage>> = { postgres: "postgresql", sqlite: "sqlite", mysql: "mysql" };
+const LANGUAGES: Partial<Record<Dialect, SqlLanguage>> = {
+  postgres: "postgresql",
+  sqlite: "sqlite",
+  mysql: "mysql",
+  tsql: "transactsql",
+};
 
 export function formatLanguage(dialect: Dialect | null): SqlLanguage {
   return (dialect && LANGUAGES[dialect]) || "sql";

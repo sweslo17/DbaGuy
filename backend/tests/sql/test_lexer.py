@@ -4,7 +4,7 @@ from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.lexer import TokenKind as K
 from dbaguy_backend.sql.lexer import INSIGNIFICANT, first_keyword, scan, tokenize
 
-PG, LITE, MY = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL
+PG, LITE, MY, TS = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL
 
 
 def kinds(text, dialect=PG):
@@ -58,7 +58,8 @@ def test_unterminated_constructs_do_not_raise():
     "text, dialect",
     [("'abc", PG), ("E'a\\'", PG), ('"abc', PG), ('"abc""', PG), ("$$ open", PG), ("$t$ x $$", PG), ("/* open", PG),
      ("/* a /* b */", PG), ("/* open", LITE), ("[abc", LITE), ("`abc", LITE),
-     ("'abc\\'", MY), ('"abc', MY), ("`abc", MY), ("/*! open", MY)],
+     ("'abc\\'", MY), ('"abc', MY), ("`abc", MY), ("/*! open", MY),
+     ("[abc", TS), ("[a]]", TS), ("N'abc", TS), ('"abc', TS), ("/* a /* b */", TS)],
 )
 def test_unterminated_tokens_are_flagged(text, dialect):
     assert [token.terminated for token in tokenize(text, dialect)] == [False]
@@ -68,7 +69,8 @@ def test_unterminated_tokens_are_flagged(text, dialect):
     "text, dialect",
     [("'it''s'", PG), ('"we""ird"', PG), ("$$a$$", PG), ("$t$x$t$", PG), ("/* a /* b */ c */", PG), ("-- to the end", PG),
      (r"E'a\'b'", PG), ("[a]", LITE), ("`a`", LITE), ("/* a /* b */", LITE),
-     (r"'a\'b'", MY), ('"a""b"', MY), ("/*!1 x */", MY), ("# to the end", MY)],
+     (r"'a\'b'", MY), ('"a""b"', MY), ("/*!1 x */", MY), ("# to the end", MY),
+     ("[a]]b]", TS), ("N'a''b'", TS), ("/* a /* b */ */", TS), ("-- to the end", TS)],
 )
 def test_closed_tokens_are_terminated(text, dialect):
     tokens = tokenize(text, dialect)
@@ -170,5 +172,35 @@ def test_scan_with_a_custom_delimiter():
 def test_mysql_offsets_cover_the_text():
     text = "SELECT '中文' # 😀\nFROM `t` WHERE a = \"x\\\"y\" /*! 1 */ AND @v"
     tokens = tokenize(text, MY)
+    assert "".join(t.text for t in tokens) == text
+    assert all(text[t.start:t.end] == t.text for t in tokens)
+
+
+def test_tsql_names_and_strings():
+    assert kinds("[a]]b;c] \"x;y\" N'it''s;中文' n'z'", TS) == [
+        (K.QUOTED, "[a]]b;c]"), (K.QUOTED, '"x;y"'), (K.STRING, "N'it''s;中文'"), (K.STRING, "n'z'"),
+    ]
+    assert kinds("N 'x'", TS) == [(K.WORD, "N"), (K.STRING, "'x'")]  # with a space: the word N, then a string
+    assert kinds("'a\\' + 'b'", TS) == [(K.STRING, "'a\\'"), (K.OTHER, "+"), (K.STRING, "'b'")]  # no backslash escapes
+    assert kinds("N'x'", PG) == [(K.WORD, "N"), (K.STRING, "'x'")]  # other dialects unchanged
+
+
+def test_tsql_comments_and_words():
+    assert kinds("/* a /* b */ c */ x", TS)[0] == (K.COMMENT, "/* a /* b */ c */")
+    assert kinds("SELECT 1--1", TS)[-1] == (K.COMMENT, "--1")  # T-SQL needs no space after --
+    assert kinds("-- c\r; x", TS) == [(K.COMMENT, "-- c"), (K.SEMI, ";"), (K.WORD, "x")]  # ends at CR too
+    assert kinds("FROM #t JOIN ##g ON @x = @@ROWCOUNT", TS) == [
+        (K.WORD, "FROM"), (K.WORD, "#t"), (K.WORD, "JOIN"), (K.WORD, "##g"), (K.WORD, "ON"), (K.WORD, "@x"),
+        (K.OTHER, "="), (K.WORD, "@@ROWCOUNT"),
+    ]
+
+
+def test_closing_brackets_double_in_every_dialect():  # Ruling 4
+    assert kinds("[a]]b] x", LITE) == [(K.QUOTED, "[a]]b]"), (K.WORD, "x")]
+
+
+def test_tsql_offsets_cover_the_text():
+    text = "SELECT N'中文' -- 😀\nFROM [a]]b] /* x /* y */ */ WHERE @v = #t"
+    tokens = tokenize(text, TS)
     assert "".join(t.text for t in tokens) == text
     assert all(text[t.start:t.end] == t.text for t in tokens)

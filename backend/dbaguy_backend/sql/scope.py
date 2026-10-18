@@ -17,10 +17,11 @@ _NOT_A_RELATION_AFTER = {
     "UPDATE": frozenset({"FOR", "KEY", "DO"}),
     "STRAIGHT_JOIN": frozenset({"SELECT", "ALL", "DISTINCT", "DISTINCTROW", "HIGH_PRIORITY"}),
 }
+# USE…PARTITION: MySQL hints. OUTPUT OPTION APPLY: T-SQL (DELETE … OUTPUT, … OPTION (…), CROSS|OUTER APPLY)
 _ALIAS_STOP = frozenset(
     """ON WHERE JOIN LEFT RIGHT INNER OUTER FULL CROSS NATURAL GROUP ORDER LIMIT OFFSET SET USING UNION EXCEPT
     INTERSECT WINDOW HAVING VALUES RETURNING LATERAL SELECT FROM AS FOR DEFAULT WITH FETCH TABLESAMPLE WITHOUT
-    STRICT ADD ALTER DROP RENAME USE FORCE IGNORE STRAIGHT_JOIN PARTITION""".split()  # USE…PARTITION: MySQL hints
+    STRICT ADD ALTER DROP RENAME USE FORCE IGNORE STRAIGHT_JOIN PARTITION OUTPUT OPTION APPLY""".split()
 )
 _CLOSING_QUOTE = {opening: closing for rules in RULES.values() for opening, closing in rules.identifier_quotes}
 # Select-list parsing for CTE output names.
@@ -77,13 +78,13 @@ class Scope:
 
 
 def unquote(token: Token) -> str:
-    """`"a""b"` → `a"b`, `[a b]` → `a b`, `` `a` `` → `a`; an unterminated quote yields what was typed so far."""
+    """`"a""b"` → `a"b`, `[a]]b]` → `a]b`, `` `a` `` → `a`; an unterminated quote yields what was typed so far."""
     text = token.text
     close = _CLOSING_QUOTE.get(text[:1]) if token.kind == TokenKind.QUOTED else None
     if close is None:
         return text
     inner = text[1:-1] if len(text) > 1 and text.endswith(close) else text[1:]
-    return inner if close == "]" else inner.replace(close * 2, close)
+    return inner.replace(close * 2, close)
 
 
 def word(tokens: list[Token], i: int) -> str:

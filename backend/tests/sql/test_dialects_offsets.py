@@ -1,12 +1,12 @@
 import pytest
 
 from dbaguy_backend.sql.dialects import (
-    Dialect, bool_literal, bytes_literal, force_quote_ident, json_literal, needs_quote, qualified, quote_ident,
-    quote_literal,
+    Dialect, bool_literal, bytes_literal, datetime_literal, force_quote_ident, json_literal, needs_quote, qualified,
+    quote_ident, quote_literal, zero_date_as_text,
 )
 from dbaguy_backend.sql.offsets import Utf16Index
 
-PG, LITE, MY = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL
+PG, LITE, MY, TS = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL
 
 
 @pytest.mark.parametrize(
@@ -29,6 +29,15 @@ PG, LITE, MY = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL
         (MY, "1abc", "`1abc`"),
         (MY, "中文", "`中文`"),
         (MY, "delimiter", "delimiter"),
+        (TS, "users", "users"),
+        (TS, "Users", "Users"),
+        (TS, "order", "[order]"),
+        (TS, "select", "[select]"),
+        (TS, "Order Items", "[Order Items]"),
+        (TS, "a]b", "[a]]b]"),
+        (TS, "a$b", "[a$b]"),
+        (TS, "1abc", "[1abc]"),
+        (TS, "中文", "[中文]"),
     ],
 )
 def test_quote_ident(dialect, name, expected):
@@ -57,9 +66,29 @@ def test_literals_per_dialect():
     ]
 
 
+def test_tsql_literals():
+    assert quote_literal(TS, "it's 中文") == "N'it''s 中文'"
+    assert quote_literal(TS, "a\\b") == "N'a\\b'"  # no backslash escapes
+    assert [bool_literal(TS, True), bool_literal(TS, False)] == ["1", "0"]
+    assert bytes_literal(TS, "dead") == "0xdead"
+    assert qualified(TS, "dbo", "Order Items") == "dbo.[Order Items]"
+    assert force_quote_ident(TS, "x") == "[x]"
+    assert json_literal(TS, '{"a": 1}') == "N'{\"a\": 1}'"
+    assert zero_date_as_text(TS, "d", "0000-00-00") is None
+
+
+def test_tsql_datetime_literals_are_language_neutral():  # R-03b-P10
+    assert datetime_literal(TS, "2026-10-18 12:34:56.123") == "N'2026-10-18T12:34:56.123'"
+    assert datetime_literal(TS, "2026-10-18 12:34:56.123456+08:00") == "N'2026-10-18T12:34:56.123456+08:00'"
+    assert datetime_literal(TS, "2026-10-18") == "N'2026-10-18'"  # a date alone is neutral for date columns
+    assert datetime_literal(TS, "12:34:56") == "N'12:34:56'"
+    assert datetime_literal(PG, "2026-10-18 12:34:56") == "'2026-10-18 12:34:56'"
+    assert datetime_literal(MY, "2026-10-18 12:34:56") == "'2026-10-18 12:34:56'"
+
+
 @pytest.mark.parametrize("dialect", list(Dialect))
 def test_every_dialect_has_an_entry_in_every_dialect_table(dialect):  # tripwire for 03b's T-SQL
-    from dbaguy_backend.sql import completion, dialects, sqlglot_rules
+    from dbaguy_backend.sql import classifier, completion, dialects, sqlglot_rules
 
     tables = {
         "dialects.RULES": dialects.RULES,
@@ -70,6 +99,9 @@ def test_every_dialect_has_an_entry_in_every_dialect_table(dialect):  # tripwire
         "dialects._BYTES_LITERALS": dialects._BYTES_LITERALS,
         "dialects._JSON_LITERALS": dialects._JSON_LITERALS,
         "dialects._ZERO_DATE_AS_TEXT": dialects._ZERO_DATE_AS_TEXT,
+        "dialects._STRING_PREFIXES": dialects._STRING_PREFIXES,
+        "dialects._ISO_DATETIME": dialects._ISO_DATETIME,
+        "classifier._EXPLAIN_KEYWORDS": classifier._EXPLAIN_KEYWORDS,
         "sqlglot_rules.SQLGLOT_DIALECT": sqlglot_rules.SQLGLOT_DIALECT,
         "completion.STATEMENT_KEYWORDS": completion.STATEMENT_KEYWORDS,
         "completion.CLAUSE_KEYWORDS": completion.CLAUSE_KEYWORDS,

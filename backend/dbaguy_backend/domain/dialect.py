@@ -7,3 +7,4 @@ class Dialect(StrEnum):
     POSTGRES = "postgres"
     SQLITE = "sqlite"
     MYSQL = "mysql"
+    TSQL = "tsql"

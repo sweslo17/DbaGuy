@@ -77,12 +77,17 @@ STATEMENT_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.POSTGRES: _STARTERS,
     Dialect.SQLITE: (*_STARTERS, "PRAGMA"),
     Dialect.MYSQL: (*_STARTERS, "SHOW", "USE", "REPLACE", "CALL"),
+    Dialect.TSQL: (*(word for word in _STARTERS if word != "EXPLAIN"), "EXEC", "DECLARE", "PRINT", "USE", "MERGE", "SET"),
 }
 CLAUSE_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.POSTGRES: (*_CLAUSES, "ILIKE"),
     Dialect.SQLITE: (*_CLAUSES, "GLOB"),
     Dialect.MYSQL: (  # no RETURNING and no FULL JOIN
         *(word for word in _CLAUSES if word not in ("RETURNING", "FULL JOIN")), "ON DUPLICATE KEY UPDATE",
+    ),
+    Dialect.TSQL: (  # no LIMIT and no RETURNING: TOP, OFFSET … FETCH and OUTPUT instead
+        *(word for word in _CLAUSES if word not in ("LIMIT", "RETURNING")), "TOP", "OUTPUT", "CROSS APPLY",
+        "OUTER APPLY", "FETCH NEXT", "ROWS ONLY", "WITH (NOLOCK)",
     ),
 }
 

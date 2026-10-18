@@ -14,6 +14,7 @@ from sqlglot.dialects.dialect import Dialect as SqlglotDialect
 from sqlglot.dialects.mysql import MySQL
 from sqlglot.dialects.postgres import Postgres
 from sqlglot.dialects.sqlite import SQLite
+from sqlglot.dialects.tsql import TSQL
 from sqlglot.errors import ParseError, TokenError
 
 from ..domain.classification import Classification, DangerReason, StatementKind
@@ -24,7 +25,7 @@ from .dialects import Dialect
 logging.getLogger("sqlglot").setLevel(logging.CRITICAL)
 
 SQLGLOT_DIALECT: dict[Dialect, type[SqlglotDialect]] = {
-    Dialect.POSTGRES: Postgres, Dialect.SQLITE: SQLite, Dialect.MYSQL: MySQL,
+    Dialect.POSTGRES: Postgres, Dialect.SQLITE: SQLite, Dialect.MYSQL: MySQL, Dialect.TSQL: TSQL,
 }
 # Text sqlglot does not understand (RecursionError: absurd nesting). Anything else is unexpected, e.g. a sqlglot bug.
 EXPECTED_FAILURES = (ParseError, TokenError, RecursionError)
@@ -32,8 +33,8 @@ _DML = (exp.Insert, exp.Update, exp.Delete, exp.Merge)
 # What an ALTER can drop: a column, index, key or constraint is an exp.Drop; a primary key and a partition have their
 # own nodes (R-03a-F1).
 _ALTER_DROPS = (exp.Drop, exp.DropPrimaryKey, exp.DropPartition)
-# SELECT … INTO <table>; MySQL's INTO only fills variables or writes a file
-INTO_CREATES_A_TABLE: frozenset[Dialect] = frozenset({Dialect.POSTGRES, Dialect.SQLITE})
+# SELECT … INTO <table> (T-SQL: SELECT … INTO #t creates one); MySQL's INTO only fills variables or writes a file
+INTO_CREATES_A_TABLE: frozenset[Dialect] = frozenset({Dialect.POSTGRES, Dialect.SQLITE, Dialect.TSQL})
 
 
 def parse(sql: str, dialect: Dialect) -> list[exp.Expression]:

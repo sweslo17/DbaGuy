@@ -51,6 +51,7 @@ _EXPLAIN_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.POSTGRES: ("EXPLAIN",),
     Dialect.SQLITE: ("EXPLAIN",),
     Dialect.MYSQL: ("EXPLAIN", "DESCRIBE", "DESC"),
+    Dialect.TSQL: (),  # T-SQL has no EXPLAIN: plans come from SET SHOWPLAN_* / SET STATISTICS (SESSION statements)
 }
 # Least to most cautious: when a script mixes kinds, the strictest one decides (unknown is the most cautious).
 _SEVERITY = (

@@ -12,7 +12,7 @@ from dbaguy_backend.sql.formatting import (
     FormatColumn, FormatKind as F, RowFormatOptions, format_rows, open_writer, value_condition,
 )
 
-PG, LITE, MY = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL
+PG, LITE, MY, TS = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL
 COLS = [FormatColumn(name="id", category=C.NUMBER), FormatColumn(name="note", category=C.TEXT),
         FormatColumn(name="ok", category=C.BOOL)]
 ROWS = [[1, "a\tb", True], ["9007199254740993", None, False]]
@@ -58,6 +58,20 @@ def test_insert_in_mysql():
     assert fmt(F.INSERT, rows=[[b"\xde\xad"]], cols=cols, source="raw", dialect=MY).text.endswith("(X'dead');")
 
 
+def test_insert_in_tsql():
+    rows = [[1, "it's 中文", True], [2, None, False]]
+    result = fmt(F.INSERT, rows=rows, dialect=TS, table_schema="dbo", table_name="Order Items")
+    assert result.text.splitlines() == [
+        "INSERT INTO dbo.[Order Items] (id, note, ok) VALUES (1, N'it''s 中文', 1);",
+        "INSERT INTO dbo.[Order Items] (id, note, ok) VALUES (2, NULL, 0);",
+    ]
+    cols = [FormatColumn(name="b", category=C.BINARY)]
+    assert fmt(F.INSERT, rows=[[b"\xde\xad"]], cols=cols, source="raw", dialect=TS).text.endswith("(0xdead);")
+    seen = [FormatColumn(name="seen", category=C.DATETIME)]
+    assert fmt(F.INSERT, rows=[["2026-10-18 12:34:56.123"]], cols=seen, dialect=TS).text.endswith(
+        "(N'2026-10-18T12:34:56.123');")  # R-03b-P10
+
+
 @pytest.mark.parametrize("dialect, column, value, category, expected", [
     (PG, "note", None, C.TEXT, "note IS NULL"),
     (PG, "Select", "it's", C.TEXT, "\"Select\" = 'it''s'"),
@@ -88,6 +102,13 @@ def test_insert_in_mysql():
     (MY, "yr", "2000", C.DATETIME, "yr = '2000'"),
     (PG, "born", "0000-00-00", C.DATETIME, "born = '0000-00-00'"),  # only MySQL has zero dates
     (LITE, "doc", '{"a": 1}', C.JSON, """doc = '{"a": 1}'"""),
+    (TS, "flag", True, C.BOOL, "flag = 1"),
+    (TS, "order", 42, C.NUMBER, "[order] = 42"),
+    (TS, "note", "it's", C.TEXT, "note = N'it''s'"),
+    (TS, "seen", "2026-10-18 12:34:56.123", C.DATETIME, "seen = N'2026-10-18T12:34:56.123'"),
+    (TS, "born", "2026-10-18", C.DATETIME, "born = N'2026-10-18'"),
+    (MY, "seen", "2026-10-18 12:34:56", C.DATETIME, "seen = '2026-10-18 12:34:56'"),
+    (TS, "data", {"$type": "bytes", "size": 2, "preview": "dead"}, C.BINARY, "data = 0xdead"),
 ])
 def test_value_condition(dialect, column, value, category, expected):
     assert value_condition(dialect, column, value, category) == expected

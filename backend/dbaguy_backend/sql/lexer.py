@@ -144,8 +144,8 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
             terminated = False
             while i < n:
                 if text[i] == close:
-                    if close != "]" and i + 1 < n and text[i + 1] == close:
-                        i += 2
+                    if i + 1 < n and text[i + 1] == close:  # a doubled closing quote stands for one: "" `` and ]] alike
+                        i += 2  # (SQLite cannot escape ] at all)
                         continue
                     i += 1
                     terminated = True
@@ -162,8 +162,8 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
             terminated = close_at >= 0
             i = n if close_at < 0 else close_at + len(tag.group(0))
             kind = TokenKind.STRING
-        elif ch == rules.variable_prefix:  # "" never equals a character
-            while i < n and text[i] == ch:  # @ or @@
+        elif ch in rules.variable_prefixes:  # MySQL @x, @@x; T-SQL @x, @@x, #t, ##g
+            while i < n and text[i] == ch:  # @ or @@, # or ##
                 i += 1
             while i < n and _ident_char(text[i]):
                 i += 1
@@ -175,8 +175,12 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
                 i += 1
             if delimiter is not None:
                 i = _cut_at_delimiter(text, begin, i, delimiter)
-            if text[begin:i] in rules.escape_string_prefixes and i < n and text[i] == "'":
+            word = text[begin:i]
+            if word in rules.escape_string_prefixes and i < n and text[i] == "'":
                 i, terminated = _scan_string(text, i, "'", backslash=True)
+                kind = TokenKind.STRING
+            elif rules.national_strings and word in ("N", "n") and i < n and text[i] == "'":
+                i, terminated = _scan_string(text, i, "'", backslash=False)  # T-SQL N'…'
                 kind = TokenKind.STRING
             else:
                 kind = TokenKind.WORD

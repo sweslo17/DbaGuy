@@ -16,7 +16,7 @@ from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.lexer import INSIGNIFICANT, tokenize
 from dbaguy_backend.sql.scope import scope_at
 
-PG, LITE, MY = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL
+PG, LITE, MY, TS = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL
 
 
 def table(name, columns, pk=None, fks=None, kind="table"):
@@ -227,6 +227,7 @@ _FUZZ_PIECES = [
     "SELECT", "FROM", "JOIN", "ON", "WITH", "RECURSIVE", "AS", "NOT", "MATERIALIZED", "DISTINCT", "UPDATE", "FOR",
     "INTO", "TABLE", "ONLY", "WHERE", "AND", "users", "orders", "sales", "u", "x", "id", ".", ",", "(", ")", "*", "=",
     "'", '"', "[", "`", "--", "/*", "*/", ";", " ", "\n", "$$", "$1", "1.", "#", "@x", "/*!", "\\'", "DELIMITER",
+    "GO", "N'", "#t", "]]", "@@x",
 ]
 
 
@@ -347,3 +348,29 @@ def test_mysql_completion_after_straight_join():
     after_modifier = "SELECT STRAIGHT_JOIN "
     items = complete(after_modifier, len(after_modifier), MY, my_index).items
     assert "users" not in [i.label for i in items]  # a select-list position, not a relation position
+
+
+def test_tsql_completion_quotes_with_brackets_and_knows_its_keywords():
+    snapshot = SchemaSnapshot(
+        database="dbaguy", default_schema="dbo", search_path=["dbo"], built_at=datetime.now(UTC),
+        schemas=[SnapshotSchema(name="dbo", relations=[table("Order Items", [("select", "nvarchar(50)"), ("a]b", "int")])])],
+    )
+    index = SnapshotIndex(snapshot, TS)
+    item = next(i for i in complete("SELECT * FROM Ord", 17, TS, index).items if i.label == "Order Items")
+    assert item.apply == "[Order Items]"
+    text = "SELECT [Order Items]. FROM [Order Items]"
+    items = complete(text, text.index(". ") + 1, TS, index).items
+    assert [(i.label, i.apply) for i in items] == [("select", "[select]"), ("a]b", "[a]]b]")]
+    assert {"TOP", "OUTPUT", "CROSS APPLY", "OUTER APPLY", "FETCH NEXT"} <= set(CLAUSE_KEYWORDS[TS])
+    assert "LIMIT" not in CLAUSE_KEYWORDS[TS] and "RETURNING" not in CLAUSE_KEYWORDS[TS]
+    assert "EXEC" in [i.label for i in complete("EXE", 3, TS, None).items]
+    assert complete("SELECT N'fro", 12, TS, index).items == []  # inside an N'' string
+
+
+@pytest.mark.parametrize("sql", [
+    "DELETE FROM orders OUTPUT deleted.id WHERE ",
+    "SELECT * FROM orders OPTION (RECOMPILE) ",
+])
+def test_tsql_output_and_option_are_not_aliases(sql):
+    [ref] = scope_at([t for t in tokenize(sql, TS) if t.kind not in INSIGNIFICANT], len(sql)).relations
+    assert (ref.name, ref.alias) == ("orders", None)

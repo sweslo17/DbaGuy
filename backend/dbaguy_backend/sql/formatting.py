@@ -23,8 +23,8 @@ from ..domain.column_category import ColumnCategory
 from ..domain.errors import ValidationFailed
 from ..domain.formats import FormatColumn, FormatKind, RowFormatOptions
 from .dialects import (
-    NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, json_literal, qualified, quote_ident, quote_literal,
-    zero_date_as_text,
+    NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, datetime_literal, json_literal, qualified, quote_ident,
+    quote_literal, zero_date_as_text,
 )
 
 __all__ = [
@@ -220,6 +220,8 @@ class _SqlLiterals:
                 return bytes_literal(self._dialect, cell.hex)
             case int() | float():
                 return str(cell)
+            case _ if column.category == ColumnCategory.DATETIME:
+                return datetime_literal(self._dialect, cell)
             case _:
                 numeric = column.category == ColumnCategory.NUMBER and NUMERIC_LITERAL.fullmatch(cell)
                 return cell if numeric else quote_literal(self._dialect, cell)
