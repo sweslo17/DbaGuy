@@ -84,9 +84,9 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
   - Text-first 載入，型別表在 `adapters/mysql/types.py`：大的 unsigned 整數、DECIMAL、日期不失真（`0000-00-00` 與超過 24 小時的 TIME 照原樣），`TINYINT(1)` 顯示數字。
 - SQL Server（pymssql 的低階 `_mssql` API，只在 `adapters/mssql/driver.py` import；`min_error_severity = 11`）：
   - 批次原樣送出（沒有 driver 參數，`%` 不會被替換）。`GO [n]` 由 splitter 切成批次，`repeat` 由前端照次數送出（上限 1,000；`GO 0` 不送也不確認），`;` 不切分；分類用 `sql/tsql.py` 逐句判斷再加字詞下限（fail closed，EXEC／未知過程名是 UNKNOWN）。
-  - 取消由 `adapters/mssql/cancel.py` 決定，原則是兩條執行緒不同時進 FreeTDS（跨執行緒 `dbcancel` 曾讓 worker 永遠卡在 condition variable）：等 server 第一個回應時（WAITFOR、慢查詢、鎖等待）由 process 全域的 wait callback（從不在裡面 cancel）每 50 ms 輪詢並 raise，worker 在自己的執行緒送 cancel；PRINT／RAISERROR 的 message handler 裡由 worker 自己 cancel；讀列與暫停頁只設旗標，在 worker 的下一列前停；卡在 driver 讀取（例如鎖）時，要 socket 安靜 50 ms（macOS `TCP_CONNECTION_INFO`）才從 canceller 執行緒送；`run()` 開始後、批次送出前的取消會保留，批次不送出。
-  - 升級（`cancel._escalate`，唯一的「先警告再強制」規則）：1 秒內找不到安全時機，或再按 Cancel 時語句卡住（送出的 cancel 已 ≥ 1 秒還沒結束，即 server 還在 undo；或旗標已 ≥ 1 秒、一個大值還在傳）。不可能有交易時（auto-commit、`@@TRANCOUNT` 為 0、批次沒有交易字詞）shutdown socket（從不 `close()`），回 `connection_lost` 與誠實的說明；可能有交易時不斷線，先顯示一次即時警告（依情況：row counts／資料還在傳／server 還在 undo），**下一次 Cancel 或關 tab** 才強制斷線。連點不會強制：距 cancel 送出或旗標不到 1 秒、距警告不到 0.5 秒的 Cancel 都只當一般 cancel。匯出對話框的 Cancel 按下後 1 秒（或一收到警告）就能再按，並顯示警告。
-  - Driver 防護（`driver.GuardedConnection`，`connect()` 只交出它）：每次進 pymssql 都計數；別的執行緒的呼叫在另一條執行緒還在 driver 裡時直接拒絕（唯一例外是 canceller 的 `cancel_across_threads()`）；`close()` 等計數歸零（最多 3 秒，先 shutdown socket 讓讀取結束），等不到就 ERROR log 並留著不 free。`dbclose` 在別的執行緒還在 FreeTDS 裡時執行會讓整個 sidecar native crash。
+  - 取消由 `adapters/mssql/cancel.py` 決定，只有 worker 會進 FreeTDS，沒有任何跨執行緒的 `dbcancel`（R-03b-F6：它曾讓 worker 永遠卡在 condition variable，也會在 pymssql `get_row` 轉換已到齊的大值時處理後面已緩衝的 token，釋放／改寫 worker 正在讀的 buffer，造成值損毀、SystemError，離 native crash 只差 allocator 的運氣）。Cancel 到得了的地方只有：等 server 第一個回應時（WAITFOR、慢查詢、鎖等待）由 process 全域的 wait callback（從不在裡面 cancel）每 50 ms 輪詢並 raise，worker 在自己的執行緒送 cancel；PRINT／RAISERROR 的 message handler 裡由 worker 自己 cancel；讀列、結果集之間與暫停頁只設旗標，在 worker 的下一步前停；`run()` 開始後、批次送出前的取消會保留，批次不送出。
+  - 升級（`cancel._escalate`，唯一的「先警告再強制」規則）：旗標 1 秒內到不了 worker（讀列中途被鎖擋住、等下一個結果集、NOCOUNT OFF 迴圈只送 row counts），或再按 Cancel 時語句卡住（送出的 cancel 已 ≥ 1 秒還沒結束，即 server 還在 undo；或旗標已 ≥ 1 秒、一個大值還在傳）。一個大值的 byte 進度算進度（worker 讀完那一列就看到旗標），byte 計數（macOS `TCP_CONNECTION_INFO`）只用來判斷進度與選說明文字。不可能有交易時（auto-commit、`@@TRANCOUNT` 為 0、批次沒有交易字詞）shutdown socket（從不 `close()`），回 `connection_lost` 與誠實的說明；可能有交易時不斷線，先顯示一次即時警告（依情況：在結果裡等待（例如鎖）／row counts／資料還在傳／server 還在 undo），**下一次 Cancel 或關 tab** 才強制斷線。連點不會強制：距 cancel 送出或旗標不到 1 秒、距警告不到 0.5 秒的 Cancel 都只當一般 cancel。匯出對話框的 Cancel 按下後 1 秒（或一收到警告）就能再按，並顯示警告。
+  - Driver 防護（`driver.GuardedConnection`，`connect()` 只交出它）：每次進 pymssql 都計數；別的執行緒的呼叫在另一條執行緒還在 driver 裡時直接拒絕，cancel 也一樣，沒有例外；`close()` 等計數歸零（最多 3 秒，先 shutdown socket 讓讀取結束），等不到就 ERROR log 並留著不 free。`dbclose` 在別的執行緒還在 FreeTDS 裡時執行會讓整個 sidecar native crash。
   - 手動 commit 是 `SET IMPLICIT_TRANSACTIONS ON`，交易狀態以 `@@TRANCOUNT, XACT_STATE(), @@OPTIONS & 2, DB_NAME()` 快取，只在沒有未讀結果時更新，Commit 為 `WHILE @@TRANCOUNT > 0 COMMIT`。
   - 第一個結果集的欄位型別來自 `sys.dm_exec_describe_first_result_set`（不用 sp_describe：XACT_ABORT ON 時會 rollback 使用者交易）；FOR JSON／FOR XML 的分段結果合成一個值，`real` 以 float32 位數顯示；`SET NOEXEC`／`PARSEONLY`／`FMTONLY`／`SHOWPLAN_*` 之後 session 仍可用。
   - `PRINT`／`RAISERROR … WITH NOWAIT` 經 message listener 即時送出。
@@ -102,6 +102,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
   - `backend/entry.py` 先呼叫 `multiprocessing.freeze_support()`（防護用）：multiprocessing 若要啟動輔助程序，會重新執行凍結後的執行檔，少了這行每個子程序都會再啟動一個 backend，無限遞迴。以前 loguru 的 `enqueue=True` 會觸發這件事（resource tracker），現在已不用 `enqueue`。
   - MySQL 只打包 pure driver：spec 排除 C extension（`_mysql_connector`，連同它帶的 dylib）以及用不到的 aio、Django、OpenTelemetry instrumentation、Kerberos／LDAP／OCI／OpenID／WebAuthn plugin。`collect_submodules("mysql.connector")` 保留以 importlib 載入的 locales 與 auth plugins；sqlglot 的 MySQL 方言跟 PG／SQLite 一樣按名稱列在 hidden imports。Pure 套件在 PYZ 裡，不會出現在 `_internal/`，所以打包後的檢查是讓凍結的 sidecar 實際連 dev MySQL 跑一次查詢。
   - SQL Server：pymssql 的 `_mssql`／`_pymssql`（FreeTDS 連在裡面）與它自帶的 OpenSSL（`pymssql/.dylibs/libssl.3.dylib`、`libcrypto.3.dylib`）隨 sidecar 打包；spec 把兩個 extension 與 sqlglot 的 T-SQL 方言按名稱列在 hidden imports（`driver.py` 的 import 與 PyInstaller 的 hook 本來就會收，列名稱是保險）。PyInstaller 把 `@loader_path/.dylibs/…` 改寫成 `@rpath/…`（rpath `@loader_path/..`），`_internal/libssl.3.dylib`、`libcrypto.3.dylib` 是指向 pymssql 副本的 symlink，Python 的 `ssl`（MySQL TLS）也用這一份（和 Homebrew 的同為 OpenSSL 3.6.3、同一組設定）；psycopg_binary 自帶另一份。`build-backend.sh` 在 bundle 裡找不到 `_mssql*.so` 就失敗。sidecar 裡每個 `.so`／`.dylib` 都過 `codesign --verify --strict`，`finalize-app.sh` 不必另外重簽；bundle 的 libcrypto 版本和 venv Python 的 `ssl.OPENSSL_VERSION` 不同時 `build-backend.sh` 失敗。打包後的檢查：凍結的 sidecar 以 TLS 登入 SQL Server、分類 T-SQL、列物件樹、串流含即時訊息的批次，也測過取消。
+- Backend 意外結束（Tauri）：前端（`src/app/BackendBanner.tsx`）立刻自動重啟，5 分鐘內最多 3 次，再多就顯示手動 Restart 的 banner；editor 內容在前端，重啟後照樣存到新 backend，開著的結果、交易與 session 都沒了（tab 提供 Reconnect）。
 - 選單（`src-tauri/src/menu.rs`）：照 Tauri 預設選單，但 Close Window 改成 ⌘⇧W，⌘W 留給前端關 tab（預設的 Close Window 綁 ⌘W，打包版會直接關掉整個視窗）。
 - Log：stderr 與 `~/Library/Logs/DbaGuy/backend.log` 都跟著 `DBAGUY_LOG_LEVEL`（預設 INFO）。SQL 文字是 DEBUG，只有明確開 DEBUG 才會寫進檔案（`scripts/dev.sh` 會開）。
 
@@ -125,7 +126,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
   - 唯讀只在應用層（SQL Server 沒有 session 級唯讀，連線設定對話框有說明）：欄位名叫 `serializable`／`repeatableread` 的查詢在唯讀下會被擋；唯讀對 RECEIVE（Service Broker）的縮窄只在 SQL Server 2022 驗證過。
   - 一個批次只回報最後一句的影響列數；錯誤後同批次後面的結果不顯示（server 仍會執行完）。
   - `@@ROWCOUNT`／`@@ERROR` 在之後的 GO 批次讀到的是 DbaGuy 自己的狀態查詢（同一批次內是使用者的值）。
-  - 取消：一個 `NOCOUNT OFF` 的迴圈（只送影響列數、沒有訊息）通常只能斷線才停得下來（`SET NOCOUNT ON` 後就可以取消）；socket 安靜檢查只有 macOS 有；仍有微秒級的 race，約 1,700 次刻意瞄準的取消量到 0 次（真的發生時，第二次 Cancel 或關 tab 仍會結束 server 的 session，但 worker 執行緒會留著）。
+  - 取消只發生在 worker 自己的執行緒：讀列中途被鎖擋住、批次在兩個結果集之間等待（例如 SELECT 後的 `WAITFOR`、下一句被鎖擋住）、`NOCOUNT OFF` 的迴圈（只送影響列數、沒有訊息；`SET NOCOUNT ON` 後就可以取消），Cancel（含 timeout）1 秒後 auto-commit 直接斷線（`connection_lost`，訊息說明原因，已完成的語句保留），可能有交易時先警告、再按 Cancel 或關 tab 才斷線。大值的 byte 進度只有 macOS 量得到；其他平台一個超過 1 秒才傳完的值也會被當成卡住。
   - 使用者自己 `SET XACT_ABORT ON` 時，取消或丟棄暫停中的結果會讓 SQL Server rollback 開著的交易（沒有匯出取消警告）。
   - Lexer 假設 `QUOTED_IDENTIFIER ON`（pymssql 連線預設）：`SET QUOTED_IDENTIFIER OFF` 之後 `"…"` 是字串，切句與安全檢查的判斷可能和 server 不同。
   - Tab 不會跟著 `USE` 切換：database picker 與補全一直是選定的 database（狀態查詢有讀 `DB_NAME()`，但 `SessionStateEvent` 沒有 database 欄位）。
@@ -136,7 +137,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
   - 登入失敗的原因可能缺漏（pymssql 的錯誤狀態是 process 全域的）。
   - T-SQL 補全的範圍是整個批次（`;` 不切分）。
   - 每句多 2 次 round trip（狀態讀取＋describe），之後的效能項目。
-  - 串流以絕對預算驗收（10 萬列 ≤ 2.0 秒、一頁 ≤ 25 ms）：本機實測 10 萬列 0.24–0.26 秒、最慢一頁 ≤ 8.3 ms。
+  - 串流以絕對預算驗收（10 萬列 ≤ 2.0 秒、一頁 ≤ 25 ms）：本機實測（含 driver 防護每列的計數）10 萬列 0.27–0.32 秒、最慢一頁 ≤ 3.0 ms。
 - 打包版量測（Apple Silicon、macOS 26；03b 時量，已加入 mysql-connector 與 pymssql）：冷啟動到第一個 API 請求約 1.2–1.4 秒（每次重新 build 後的第一次啟動約 4 秒）；各程序 RSS 加總約 269–297 MB（上限值，共用頁面重複計算），`footprint` 加總約 173 MB（backend 約 72 MB）。和 03a（0.9–1.1 秒、156 MB）的差距沒有在 app 層級驗證過：只有 sidecar 做過同機 A/B（03a 與 03b 都約 0.47 秒、70–72 MB），所以差距不在 backend，原因（外殼、前端或機器負載）未查。Sidecar 約 41 MB → 約 49 MB：加入 SQL Server 多約 7 MB（`_mssql`／`_pymssql` 與 OpenSSL 共 6.9 MB），加入 MySQL 只多約 0.3 MB；如果讓 PyInstaller 自動收進 mysql 的 C extension 與它帶的 dylib，會再多約 13 MB。
 
 ## 進度
