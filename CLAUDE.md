@@ -175,7 +175,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
 | ① | 地基：Tauri + sidecar、adapter 介面、連線管理、PG + SQLite 物件瀏覽 | 完成 |
 | ② | 核心查詢流程：編輯器、結果 grid、執行範圍、取消、history、安全 | 完成（followups：[02a](docs/superpowers/notes/2026-10-16-02a-query-backend-followups.md)、[02b](docs/superpowers/notes/2026-10-16-02b-grid-and-data-followups.md)、[02c](docs/superpowers/notes/2026-10-16-02c-editor-and-query-followups.md)，含打包版待驗清單與後續子專案的 carries） |
 | ③ | MySQL + MSSQL adapter | 完成（followups：[03a](docs/superpowers/notes/2026-10-18-03a-dialects-and-mysql-followups.md)、[03b](docs/superpowers/notes/2026-10-18-03b-sql-server-followups.md)，含公司 SQL Server 檢查清單與打包版待驗清單） |
-| ④ | Couchbase 一級支援 | 進行中：04a 完成（SQL++ 方言、HTTP 引擎、dev cluster）；04b、04c 待做 |
+| ④ | Couchbase 一級支援 | 進行中：04a 完成（SQL++ 方言、HTTP 引擎、dev cluster；followups：[04a](docs/superpowers/notes/2026-10-19-04a-couchbase-engine-followups.md)）；04b、04c 待做 |
 | ⑤ | Grid 內編輯（暫存修改、預覽 DML、一次 commit） | 未開始 |
 | ⑥ | 資料工具：SQL dump／還原、跨 DB 傳輸 | 未開始 |
 | ⑦ | ER 圖（唯讀） | 未開始 |
