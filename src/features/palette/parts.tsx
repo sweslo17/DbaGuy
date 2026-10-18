@@ -1,6 +1,6 @@
 import { Command } from "cmdk";
 import { Search, type LucideIcon } from "lucide-react";
-import type { ReactNode } from "react";
+import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { cn } from "@/lib/cn";
 
 /*
@@ -89,7 +89,11 @@ export interface PaletteItemProps {
    */
   pending?: boolean;
   onSelect: () => void;
-  icon?: LucideIcon;
+  /**
+   * A lucide icon (muted, in the text colour), or a ready-made element such as an `EngineIcon`, which keeps its own
+   * colour except on the highlighted row, where its `svg`s take the row's text colour.
+   */
+  icon?: LucideIcon | ReactElement;
   label: string;
   /** Muted after the label, e.g. a connection or a folder. */
   detail?: string;
@@ -108,7 +112,11 @@ export function PaletteItem({ icon: Icon, label, detail, hint, pending, onSelect
         pending && "opacity-40",
       )}
     >
-      {Icon && <Icon size={14} className="shrink-0 opacity-70" aria-hidden />}
+      {isValidElement(Icon) ? (
+        <span className="flex shrink-0 in-data-[selected=true]:[&_svg]:text-accent-fg">{Icon}</span>
+      ) : (
+        Icon && <Icon size={14} className="shrink-0 opacity-70" aria-hidden />
+      )}
       <span className="min-w-0 truncate">{label}</span>
       {detail && <span className="min-w-0 shrink-[100] truncate text-[12px] opacity-60">{detail}</span>}
       {hint !== undefined && <span className="ml-auto shrink-0 pl-4 text-[12px] opacity-60">{hint}</span>}

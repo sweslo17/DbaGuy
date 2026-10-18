@@ -1,6 +1,7 @@
 import { defaultFilter } from "cmdk";
-import { FileCode2, FileText, Server } from "lucide-react";
+import { FileCode2, FileText } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { EngineIcon } from "@/components/EngineIcon";
 import { errorMessage } from "@/lib/api/client";
 import type { ScriptNode } from "@/lib/api/types";
 import { ENGINE_LABELS } from "@/lib/engines";
@@ -115,7 +116,7 @@ export function QuickOpen({ choose }: { choose: Choose }) {
                 key={profile.id}
                 value={`connection:${profile.id}`}
                 onSelect={() => choose(() => openQuery(profile.id, null))}
-                icon={Server}
+                icon={<EngineIcon engine={profile.engine} decorative />}
                 label={profile.name}
                 detail={ENGINE_LABELS[profile.engine]}
                 hint="New query"
