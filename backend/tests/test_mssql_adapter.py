@@ -2,6 +2,7 @@ import json
 import random
 import threading
 import time
+from contextlib import contextmanager
 
 import pytest
 
@@ -14,7 +15,7 @@ from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.values import encode_row
 from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager, write_askpass_script
 from dbaguy_backend.container import default_registry
-from dbaguy_backend.domain.errors import ConnectionFailed
+from dbaguy_backend.domain.errors import ConnectionFailed, QueryFailed
 from dbaguy_backend.domain.metadata import PathSegment
 from dbaguy_backend.domain.profiles import SshConfig, SslConfig
 from dbaguy_backend.services.connection_service import ConnectionService
@@ -733,6 +734,92 @@ def test_a_cancel_while_one_big_value_arrives_waits_for_the_row(conn, manual):  
     conn.rollback()
 
 
+@contextmanager
+def ends_reader(connection, thread):
+    """A failed assertion must not leave the reader inside the driver when the fixture closes the connection (closing
+    under a reading thread aborts FreeTDS, and pytest with it): drop the connection and let the reader end first."""
+    try:
+        yield
+    finally:
+        if thread.is_alive():
+            connection.abort()
+            thread.join(10)
+
+
+HUGE_VALUES = "SELECT n, REPLICATE(CAST('x' AS varchar(max)), 150000000) AS big FROM (VALUES (1), (2)) v(n)"
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_a_repeated_cancel_while_one_big_value_arrives_follows_the_warn_then_force_rule(conn, manual):  # R-03b-F2
+    """A 150 MB value takes seconds to arrive and its bytes count as progress, so the first Cancel waits for the row.
+    A repeated Cancel a second later gives up on it: auto-commit drops the connection; manual commit warns first."""
+    conn.set_autocommit(not manual)
+    heard: list = []
+    conn.set_message_listener(lambda m: heard.append((m.severity, m.text)))
+    result = conn.run(HUGE_VALUES)
+    state: dict = {}
+
+    def reader():
+        try:
+            while result.fetch(1):
+                pass
+            state["out"] = "ran"
+        except StatementError as exc:
+            state["out"], state["message"] = exc.code, exc.message
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    with ends_reader(conn, thread):
+        time.sleep(0.2)
+        conn.cancel()
+        time.sleep(mssql_adapter_cancel.WEDGE_S + 0.15)
+        assert "out" not in state  # still receiving the first value
+        conn.force_cancel()
+        if manual:
+            time.sleep(mssql_adapter_cancel.DOUBLE_CLICK_S + 0.1)
+            assert "out" not in state and heard == [("warning", mssql_adapter_cancel.BUSY_DATA_WARNING)]
+            conn.force_cancel()  # the next Cancel
+        thread.join(10)
+    expected = mssql_adapter_cancel.ABORTED_MESSAGE if manual else mssql_adapter_cancel.BUSY_DATA_DROPPED_MESSAGE
+    assert state.get("out") == "connection_lost" and state["message"] == expected
+    assert [text for severity, text in heard if severity == "warning"] == (
+        [mssql_adapter_cancel.BUSY_DATA_WARNING] if manual else [])
+
+
+UNDO_SEED = (
+    "SET NOCOUNT ON; CREATE TABLE #undo (id int PRIMARY KEY, v int, pad char(200)); "
+    "INSERT #undo (id, v, pad) SELECT TOP (2000000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), 0, 'x' "
+    "FROM sys.all_columns a CROSS JOIN sys.all_columns b"
+)
+
+
+def test_a_second_cancel_while_the_server_undoes_the_statement_warns_first(conn):  # R-03b-F1
+    """SQL Server acknowledges a cancel only once it has undone the statement: here about two seconds of a big
+    UPDATE. A second Cancel a second into that wait must warn, never drop the connection and the transaction."""
+    one(conn, UNDO_SEED)
+    one(conn, "BEGIN TRAN; INSERT #undo (id, v, pad) VALUES (-1, 42, 'marker')")
+    heard: list = []
+    conn.set_message_listener(lambda m: heard.append((m.severity, m.text)))
+    for cancel_after in (1.5, 2.0, 1.0):  # the UPDATE alone takes about 3 s
+        heard.clear()
+        thread, state = stream_in_thread(conn, "UPDATE #undo SET v = v + 1, pad = 'y' WHERE id > 0")
+        with ends_reader(conn, thread):
+            time.sleep(cancel_after)
+            conn.cancel()
+            time.sleep(mssql_adapter_cancel.WEDGE_S + 0.15)
+            conn.force_cancel()  # the worker's own cancel still waits for the acknowledgement
+            thread.join(30)
+        assert state.get("out") in ("cancelled", "ran"), state  # never connection_lost
+        if ("warning", mssql_adapter_cancel.UNDOING_WARNING) in heard:
+            break
+    else:
+        pytest.skip("the server undid the UPDATE within a second three times")
+    assert state["out"] == "cancelled" and not conn.unusable
+    assert [text for severity, text in heard if severity == "warning"] == [mssql_adapter_cancel.UNDOING_WARNING]
+    assert conn.in_transaction() and one(conn, "SELECT v FROM #undo WHERE id = -1") == [[42]]  # the work before it
+    conn.rollback()
+
+
 @pytest.fixture
 def locked_row():
     """##zz_lockrows (5,000 rows) with row 3000 locked by another session's open transaction."""
@@ -893,6 +980,54 @@ def test_metadata_is_bound_to_the_connections_database(conn):
     with pytest.raises(Exception, match="bound to database 'dbaguy'"):
         conn.list_children([seg("database", "analytics"), seg("schema", "dbo")])
     assert conn.schema_snapshot().database == "dbaguy"
+
+
+def timed(fn, limit: float = 10):
+    """`fn()` on a thread: {"value" or "error", "took"}; fails when it is still waiting `limit` seconds later."""
+    outcome: dict = {}
+
+    def go():
+        started = time.monotonic()
+        try:
+            outcome["value"] = fn()
+        except Exception as exc:
+            outcome["error"] = exc
+        outcome["took"] = time.monotonic() - started
+
+    thread = threading.Thread(target=go, daemon=True)
+    thread.start()
+    thread.join(limit)
+    assert not thread.is_alive(), f"still waiting {limit} s later"
+    return outcome
+
+
+def test_another_sessions_uncommitted_ddl_never_stalls_the_metadata(conn):  # R-03b-F3
+    """A manual-commit tab's ALTER holds a schema lock until it ends. The tree and the completion snapshot read past
+    it; the detail of the locked table answers, or gives up after the lock timeout with a message that says why."""
+    locker = open_mssql()
+    one(locker, "IF OBJECT_ID('dbo.zz_meta_lock') IS NOT NULL DROP TABLE dbo.zz_meta_lock; "
+                "CREATE TABLE dbo.zz_meta_lock (id int CONSTRAINT zz_meta_lock_pk PRIMARY KEY)")
+    locker.set_autocommit(False)
+    one(locker, "ALTER TABLE dbo.zz_meta_lock ADD c int")
+    try:
+        db, dbo = seg("database", "dbaguy"), seg("schema", "dbo")
+        tree = timed(lambda: conn.list_children([db, dbo, seg("folder", "tables")]))
+        assert tree["took"] < 2 and "zz_meta_lock" in [node.name for node in tree["value"]]
+        snapshot = timed(conn.schema_snapshot)
+        relations = [r.name for s in snapshot["value"].schemas for r in s.relations]
+        assert snapshot["took"] < 2 and "zz_meta_lock" in relations and "customer_alias" in relations  # 9: synonyms
+        other = timed(lambda: conn.object_detail([db, dbo, seg("table", "customers")]))
+        assert other["took"] < 2 and other["value"].columns
+        locked = timed(lambda: conn.object_detail([db, dbo, seg("table", "zz_meta_lock")]))
+        assert locked["took"] < 8, locked
+        if "error" in locked:
+            assert isinstance(locked["error"], QueryFailed) and locked["error"].message == mssql_adapter.LOCKED_MESSAGE
+        assert timed(conn.schema_snapshot)["took"] < 2  # the timeout left the connection working
+    finally:
+        locker.rollback()
+        locker.set_autocommit(True)
+        one(locker, "DROP TABLE dbo.zz_meta_lock")
+        locker.close()
 
 
 def test_registry_and_url_import():

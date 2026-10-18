@@ -672,7 +672,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "keyword" | "schema" | "table" | "view" | "materialized_view" | "column" | "alias" | "function" | "join";
+            kind: "keyword" | "schema" | "table" | "view" | "materialized_view" | "synonym" | "column" | "alias" | "function" | "join";
             /** Detail */
             detail?: string | null;
             /** Apply */
@@ -768,7 +768,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "table" | "view" | "materialized_view";
+            kind: "table" | "view" | "materialized_view" | "synonym";
             /** Columns */
             columns: components["schemas"]["DescribeColumn"][];
         };
@@ -1177,7 +1177,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "table" | "view" | "materialized_view";
+            kind: "table" | "view" | "materialized_view" | "synonym";
             /** Path */
             path: components["schemas"]["PathSegment"][];
         };

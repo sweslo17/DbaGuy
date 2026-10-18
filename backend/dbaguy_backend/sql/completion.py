@@ -21,7 +21,7 @@ from .scope import (
 from .splitter import split
 
 CompletionKind = Literal[
-    "keyword", "schema", "table", "view", "materialized_view", "column", "alias", "function", "join"
+    "keyword", "schema", "table", "view", "materialized_view", "synonym", "column", "alias", "function", "join"
 ]
 _Context = Literal["start", "clause", "relations", "columns", "join"]
 MAX_ITEMS = 300
@@ -30,8 +30,8 @@ _SYSTEM_BOOST = -1
 _PREFIX_BOOST, _SUBSTRING_BOOST = 2, 1
 # Tie-break after the boost. Relation kinds share a rank so a short view is not buried under every table.
 _KIND_ORDER: dict[str, int] = {
-    "join": 0, "alias": 1, "column": 2, "table": 3, "view": 3, "materialized_view": 3, "schema": 4, "function": 5,
-    "keyword": 6,
+    "join": 0, "alias": 1, "column": 2, "table": 3, "view": 3, "materialized_view": 3, "synonym": 3, "schema": 4,
+    "function": 5, "keyword": 6,
 }
 
 

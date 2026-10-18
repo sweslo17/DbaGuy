@@ -200,6 +200,7 @@ class DatabaseAdapter(ABC):
 
     _FOLDER_FOR_KIND: ClassVar[dict[str, str]] = {
         "table": Folder.TABLES, "view": Folder.VIEWS, "materialized_view": Folder.MATERIALIZED_VIEWS,
+        "synonym": Folder.SYNONYMS,
     }
 
     @abstractmethod

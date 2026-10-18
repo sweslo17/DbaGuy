@@ -4,6 +4,11 @@ batch (one round trip).
 A snapshot covers the database the connection is bound to (SQL Server catalogs are per database); other databases get
 their own connection and snapshot. An account without VIEW DEFINITION sees fewer facts, never fewer columns: a column of
 a user type it may not see keeps its base type, and a foreign key to a table it may not see is left out.
+
+Synonyms are relations without columns (their target may be anywhere, even another server), so `FROM customer_alias`
+completes. Names come from joins on the catalog views, never from COL_NAME / OBJECT_NAME / OBJECT_SCHEMA_NAME: those
+take a lock on the object, so one table under another session's uncommitted ALTER (or sp_rename) would stall the whole
+snapshot; the catalog views read under READ UNCOMMITTED do not wait (R-03b-F3, see the adapter).
 """
 
 from datetime import UTC, datetime
@@ -18,8 +23,9 @@ _CURRENT = "SELECT DB_NAME(), SCHEMA_NAME()"
 _SCHEMAS = "SELECT name, schema_id FROM sys.schemas"
 _RELATIONS = (
     "SELECT object_id, SCHEMA_NAME(schema_id), name, type FROM sys.objects "
-    "WHERE type IN ('U', 'V') AND is_ms_shipped = 0 ORDER BY 2, 3"
+    "WHERE type IN ('U', 'V', 'SN') AND is_ms_shipped = 0 ORDER BY 2, 3"
 )
+_KINDS = {"U": "table", "V": "view", "SN": "synonym"}  # sys.objects.type (char(2), padded)
 # LEFT JOIN: a column whose user type the account may not see keeps its base type (system_type_id) rather than vanish.
 _COLUMNS = (
     "SELECT c.object_id, c.name, COALESCE(t.name, st.name, N'?'), c.max_length, c.precision, c.scale FROM sys.columns c "
@@ -28,16 +34,19 @@ _COLUMNS = (
     "WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 ORDER BY c.object_id, c.column_id"
 )
 _PRIMARY_KEYS = (
-    "SELECT i.object_id, COL_NAME(k.object_id, k.column_id) FROM sys.indexes i "
+    "SELECT i.object_id, c.name FROM sys.indexes i "
     "JOIN sys.index_columns k ON k.object_id = i.object_id AND k.index_id = i.index_id "
+    "JOIN sys.columns c ON c.object_id = k.object_id AND c.column_id = k.column_id "
     "JOIN sys.objects o ON o.object_id = i.object_id "
     "WHERE i.is_primary_key = 1 AND o.is_ms_shipped = 0 ORDER BY i.object_id, k.key_ordinal"
 )
+# LEFT JOIN: what the account may not see reads NULL, and the key is left out whole (see _fill_keys).
 _FOREIGN_KEYS = """
-SELECT f.parent_object_id, f.name, COL_NAME(fc.parent_object_id, fc.parent_column_id),
-       OBJECT_SCHEMA_NAME(f.referenced_object_id), OBJECT_NAME(f.referenced_object_id),
-       COL_NAME(fc.referenced_object_id, fc.referenced_column_id)
+SELECT f.parent_object_id, f.name, pc.name, SCHEMA_NAME(ro.schema_id), ro.name, rc.name
 FROM sys.foreign_keys f JOIN sys.foreign_key_columns fc ON fc.constraint_object_id = f.object_id
+LEFT JOIN sys.columns pc ON pc.object_id = fc.parent_object_id AND pc.column_id = fc.parent_column_id
+LEFT JOIN sys.objects ro ON ro.object_id = f.referenced_object_id
+LEFT JOIN sys.columns rc ON rc.object_id = fc.referenced_object_id AND rc.column_id = fc.referenced_column_id
 ORDER BY f.parent_object_id, f.name, fc.constraint_column_id
 """
 _FUNCTIONS = (
@@ -50,11 +59,11 @@ _QUERIES = (_CURRENT, _SCHEMAS, _RELATIONS, _COLUMNS, _PRIMARY_KEYS, _FOREIGN_KE
 def _relations(
     schemas: dict[str, SnapshotSchema], relation_rows: list[tuple], column_rows: list[tuple]
 ) -> dict[int, SnapshotRelation]:
-    """Tables and views of the schemas that take any, with their columns, keyed by object id."""
+    """Tables, views and synonyms of the schemas that take any, with their columns, keyed by object id."""
     relations: dict[int, SnapshotRelation] = {}
     for object_id, schema, name, kind in relation_rows:
         if schema in schemas and not schemas[schema].system:  # system schemas get no relations
-            relation = SnapshotRelation(name=name, kind="view" if kind.strip() == "V" else "table", columns=[])
+            relation = SnapshotRelation(name=name, kind=_KINDS[kind.strip()], columns=[])
             relations[object_id] = relation
             schemas[schema].relations.append(relation)
     for object_id, column, type_name, max_length, precision, scale in column_rows:

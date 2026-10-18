@@ -2421,6 +2421,7 @@
               "table",
               "view",
               "materialized_view",
+              "synonym",
               "column",
               "alias",
               "function",
@@ -2698,7 +2699,8 @@
             "enum": [
               "table",
               "view",
-              "materialized_view"
+              "materialized_view",
+              "synonym"
             ],
             "title": "Kind"
           },
@@ -3734,7 +3736,8 @@
             "enum": [
               "table",
               "view",
-              "materialized_view"
+              "materialized_view",
+              "synonym"
             ],
             "title": "Kind"
           },

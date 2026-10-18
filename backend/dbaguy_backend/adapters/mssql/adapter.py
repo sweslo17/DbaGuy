@@ -26,7 +26,7 @@ from typing import Any
 from loguru import logger
 
 from ...domain.column_category import ColumnCategory
-from ...domain.errors import ConnectionFailed, ValidationFailed
+from ...domain.errors import ConnectionFailed, QueryFailed, ValidationFailed
 from ...domain.execution import ColumnMeta, ErrorPosition, MessageSeverity, ServerMessage
 from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
 from ...domain.profiles import AnyProfile, Engine, ServerProfile
@@ -74,6 +74,16 @@ _JOINED_COLUMNS = {
 _TRANSACTION_WORDS = frozenset({"TRAN", "TRANSACTION", "COMMIT", "ROLLBACK", "IMPLICIT_TRANSACTIONS", "ANSI_DEFAULTS"})
 _TRANSACTION_HINT = re.compile("|".join(_TRANSACTION_WORDS), re.IGNORECASE)
 SQL_VARIANT_HINT = "sql_variant values are shown as raw bytes: CAST them to read them, e.g. CAST(col AS nvarchar(4000))"
+# Metadata reads (R-03b-F3). Catalog views read under READ UNCOMMITTED never wait for another session's uncommitted DDL
+# (an ALTER in a manual-commit tab would otherwise hang the tree and completion until its rollback). The functions that
+# still take locks (OBJECT_ID, OBJECT_DEFINITION, COL_NAME, …) give up after the lock timeout; XACT_ABORT ends the
+# batch at the first such timeout instead of letting each of its queries wait in turn (probed: 6 queries, 6 timeouts).
+_METADATA_SESSION = "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 5000; SET XACT_ABORT ON"
+_LOCK_TIMEOUT = 1222
+LOCKED_MESSAGE = (
+    "This object is locked by an uncommitted change in another session (for example an open ALTER). Commit or roll "
+    "back that change, then refresh."
+)
 _LOGIN_HINT = (
     "SQL Server refused the login. Check the user name and password, that the login may open the database, and the "
     "SSL mode: the server may require encryption, and verify-ca / verify-full need the CA file that signed the "
@@ -247,6 +257,7 @@ class MssqlConnection(DatabaseConnection):
         self._batch = ""  # the running batch's text
         self._transaction_words: bool | None = None  # it may begin or end a transaction; worked out when first asked
         self._trancount, self._xact_state, self._implicit = state
+        self._metadata_session = False  # _METADATA_SESSION is set (on a metadata connection, before its first read)
         conn.set_msghandler(self._on_message)
 
     # ---- cancel ----
@@ -622,23 +633,44 @@ class MssqlConnection(DatabaseConnection):
         if path and path[0].name != self._database:
             raise ValidationFailed(f"Connection is bound to database '{self._database}', not '{path[0].name}'")
 
+    def _metadata_call[T](self, read: Callable[[], T]) -> T:
+        """The object tree, details and the completion snapshot. Only MetadataService's dedicated connections run them,
+        so the session settings they need are set on the connection once and never meet a user's statement. A lock
+        timeout reads as what it is, without a reconnect (QueryFailed is not retried)."""
+        if not self._metadata_session:
+            self._catalog_call(lambda: self._conn.execute_non_query(_METADATA_SESSION))
+            self._metadata_session = True
+        try:
+            return self._catalog_call(read)
+        except StatementError as exc:
+            if exc.code == str(_LOCK_TIMEOUT):
+                logger.info("A SQL Server metadata read on SPID {} timed out on a lock held by another session", self._spid)
+                raise QueryFailed(LOCKED_MESSAGE) from exc
+            raise
+
     def list_children(self, path: list[PathSegment]) -> list[ObjectNode]:
         self._check_database(path)
-        return self._catalog_call(lambda: introspection.list_children(self._conn, path))
+        return self._metadata_call(lambda: introspection.list_children(self._conn, path))
 
     def object_detail(self, path: list[PathSegment]) -> ObjectDetail:
         self._check_database(path)
-        return self._catalog_call(lambda: introspection.object_detail(self._conn, path))
+        return self._metadata_call(lambda: introspection.object_detail(self._conn, path))
 
     def schema_snapshot(self) -> SchemaSnapshot:
-        return self._catalog_call(lambda: mssql_schema.build_snapshot(self._conn))
+        return self._metadata_call(lambda: mssql_schema.build_snapshot(self._conn))
 
     def close(self) -> None:
+        """Frees the connection only once no thread is inside the driver for it (R-03b-F5). The worker closes its own
+        connection, so normally none is; one that is (a cross-thread cancel, a reader on another thread) gets the
+        socket shut down first, so its read ends, and the guard waits for it or leaks the connection."""
         if self._control.poisoned:  # a cancel thread may still be inside the driver: closing under it aborts FreeTDS
             logger.warning("Not closing SQL Server SPID {}: a cancel never returned (its socket is shut down)", self._spid)
             return
+        if self._conn.busy:
+            self._control.drop("closed while another thread was inside the driver")
         with suppress(*driver.ERRORS):
-            self._conn.close()
+            if not self._conn.close():
+                logger.error("SQL Server SPID {} was left open: a driver call never returned", self._spid)
 
 
 def _login_failure(exc: Exception, endpoint: Endpoint, section: str) -> str:

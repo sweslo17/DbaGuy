@@ -1,5 +1,5 @@
-"""CancelControl's decisions (R-03b-T8a/d/e) without a database: a socket pair stands in for the connection's socket
-and a fake records the driver's cancel()."""
+"""CancelControl's decisions (R-03b-T8a/d/e/h/i, F1, F2) without a database: a socket pair stands in for the
+connection's socket and a fake records the driver's cancel()."""
 
 import socket
 import threading
@@ -8,8 +8,8 @@ import time
 import pytest
 
 from dbaguy_backend.adapters.mssql.cancel import (
-    ABORTED_MESSAGE, BUSY_DATA_DROPPED_MESSAGE, BUSY_DATA_WARNING, BUSY_DROPPED_MESSAGE, BUSY_WARNING, GRACE_S, WEDGE_S,
-    CallKind, CancelControl, CancelPending,
+    ABORTED_MESSAGE, BUSY_DATA_DROPPED_MESSAGE, BUSY_DATA_WARNING, BUSY_DROPPED_MESSAGE, BUSY_WARNING, DOUBLE_CLICK_S,
+    GRACE_S, UNDOING_WARNING, WEDGE_S, CallKind, CancelControl, CancelPending,
 )
 
 
@@ -19,6 +19,8 @@ class FakeDriver:
 
     def cancel(self) -> None:
         self.cancels.append(threading.get_ident())
+
+    cancel_across_threads = cancel
 
 
 @pytest.fixture
@@ -71,7 +73,7 @@ def test_a_pending_cancel_keeps_the_batch_from_starting(unix_pair):  # R-03b-P5
 
 
 def test_a_double_click_never_drops_but_a_second_cancel_a_second_later_does(unix_pair):  # R-03b-T8i
-    control, driver = control_on(unix_pair[0])
+    control, driver = control_on(unix_pair[0], may_hold_transaction=lambda: False)  # nothing to lose (R-03b-F1)
     control.force_cancel()  # nothing sent yet: an ordinary cancel
     assert control.cancel_requested and control.aborted is None
     with control.call(CallKind.STOP):  # the worker's own dbcancel(), reading a stream up to the acknowledgement
@@ -82,6 +84,40 @@ def test_a_double_click_never_drops_but_a_second_cancel_a_second_later_does(unix
         control.force_cancel()
     assert control.aborted == "forced by a second cancel" and dropped(unix_pair[1])
     assert control.aborted_message == ABORTED_MESSAGE and driver.cancels == []  # never a cancel() from this thread
+
+
+def test_a_second_cancel_while_the_server_undoes_the_statement_warns_first(unix_pair):  # R-03b-F1
+    """The worker's own cancel reads up to the acknowledgement, which comes once the server has undone the statement.
+    A transaction may be open: the second Cancel warns, the next one (not a double click) drops."""
+    warnings: list[str] = []
+    control, driver = control_on(unix_pair[0], may_hold_transaction=lambda: True, warn=warnings.append)
+    control.cancel()
+    with control.call(CallKind.STOP):
+        time.sleep(0.1)
+        control.force_cancel()  # a double click
+        assert control.aborted is None and warnings == []
+        time.sleep(WEDGE_S)
+        control.force_cancel()
+        assert warnings == [UNDOING_WARNING] and control.aborted is None  # told, nothing rolled back
+        control.force_cancel()  # straight after the warning: the rest of a double click
+        assert warnings == [UNDOING_WARNING] and control.aborted is None
+        time.sleep(DOUBLE_CLICK_S)
+        control.force_cancel()
+    assert control.aborted == "forced by a second cancel" and control.aborted_message == ABORTED_MESSAGE
+    assert dropped(unix_pair[1]) and warnings == [UNDOING_WARNING] and driver.cancels == []
+
+
+def test_closing_the_session_after_the_warning_drops_at_once(unix_pair):  # R-03b-F1: a cancel from a message
+    warnings: list[str] = []
+    control, driver = control_on(unix_pair[0], may_hold_transaction=lambda: True, warn=warnings.append)
+    with control.call(CallKind.EXECUTE):
+        control.cancel()
+        control.on_message()  # the cancel goes out from the message handler; the acknowledgement does not come
+        time.sleep(WEDGE_S)
+        control.force_cancel()
+        assert warnings == [UNDOING_WARNING] and control.aborted is None
+        control.abort()  # the tab closes: no second warning, no wait
+    assert control.aborted == "forced by closing the session" and dropped(unix_pair[1]) and len(driver.cancels) == 1
 
 
 def test_a_second_cancel_soon_after_a_cancel_from_a_message_waits_too(unix_pair):  # R-03b-T8i
@@ -115,26 +151,48 @@ def test_a_cancel_reaches_a_waiting_worker_across_threads_once_the_socket_is_qui
 
 
 class Chatter:
-    """Keeps data arriving on the connection's socket (a NOCOUNT OFF loop never lets it go quiet)."""
+    """Keeps data arriving on the connection's socket, read as the worker reads it (a NOCOUNT OFF loop never lets it
+    go quiet; nor do the bytes of one big value). As a context manager it chatters in the background."""
 
     def __init__(self, pair) -> None:
         self._reader, self._sender = pair
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._send, daemon=True)
+        self._threads = [threading.Thread(target=self._send, daemon=True), threading.Thread(target=self._read, daemon=True)]
 
     def _send(self) -> None:
         while not self._stop.is_set():
-            self._sender.sendall(b"x" * 256)
+            try:
+                self._sender.sendall(b"x" * 256)
+            except OSError:  # the connection was dropped
+                return
             time.sleep(0.005)
 
-    def run_until(self, done, limit: float) -> float:
-        """Keep reading what arrives (as the worker does) until `done()` or `limit` seconds; returns the time taken."""
-        self._thread.start()
-        started = time.monotonic()
-        while not done() and time.monotonic() - started < limit:
-            self._reader.recv(65536)
+    def _read(self) -> None:
+        self._reader.settimeout(0.05)
+        while not self._stop.is_set():
+            try:
+                if self._reader.recv(65536) == b"":
+                    return
+            except TimeoutError:
+                pass
+
+    def __enter__(self) -> "Chatter":
+        for thread in self._threads:
+            thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
         self._stop.set()
-        return time.monotonic() - started
+        for thread in self._threads:
+            thread.join(1)
+
+    def run_until(self, done, limit: float) -> float:
+        """Chatter until `done()` or `limit` seconds; returns the time taken."""
+        with self:
+            started = time.monotonic()
+            while not done() and time.monotonic() - started < limit:
+                time.sleep(0.005)
+            return time.monotonic() - started
 
 
 def test_a_busy_connection_without_a_safe_moment_is_dropped_when_no_transaction_can_be_open(tcp_pair):
@@ -158,6 +216,45 @@ def test_a_busy_connection_that_may_hold_a_transaction_is_warned_and_waits_for_a
         control.force_cancel()  # the user's next Cancel
     assert control.aborted == "forced by a second cancel" and control.aborted_message == ABORTED_MESSAGE
     assert warnings == [BUSY_WARNING] and driver.cancels == []
+
+
+def test_a_cancel_right_after_the_warning_is_a_double_click(tcp_pair):  # R-03b-T8i applied to the warning
+    warnings: list[str] = []
+    control, _ = control_on(tcp_pair[0], may_hold_transaction=lambda: True, warn=warnings.append)
+    with control.call(CallKind.NEXT_SET), Chatter(tcp_pair):
+        control.cancel()
+        started = time.monotonic()
+        while not warnings and time.monotonic() - started < WEDGE_S + 1:
+            time.sleep(0.005)
+        control.force_cancel()  # a click that lands as the warning appears: the user has not read it
+        assert warnings == [BUSY_WARNING] and control.aborted is None
+        time.sleep(DOUBLE_CLICK_S)
+        control.force_cancel()
+        assert control.aborted == "forced by a second cancel"
+
+
+@pytest.mark.parametrize("holds", [False, True])
+def test_a_repeated_cancel_during_one_big_value_follows_the_warn_then_force_rule(tcp_pair, holds):  # R-03b-F2
+    """The bytes of one big value count as progress, so the canceller never reaches its deadline. A repeated Cancel a
+    second after the flag gives up on the row: dropped when nothing can be lost, else warned first."""
+    warnings: list[str] = []
+    control, driver = control_on(tcp_pair[0], may_hold_transaction=lambda: holds, warn=warnings.append)
+    with control.call(CallKind.ROWS), Chatter(tcp_pair):
+        control.cancel()
+        time.sleep(0.3)
+        control.force_cancel()  # a double click
+        assert control.aborted is None and warnings == []
+        time.sleep(WEDGE_S)
+        control.force_cancel()
+        if holds:
+            assert warnings == [BUSY_DATA_WARNING] and control.aborted is None
+            time.sleep(DOUBLE_CLICK_S)
+            control.force_cancel()
+            assert control.aborted_message == ABORTED_MESSAGE
+        else:
+            assert control.aborted_message == BUSY_DATA_DROPPED_MESSAGE
+        assert control.aborted == "forced by a second cancel"
+    assert driver.cancels == [] and warnings == ([BUSY_DATA_WARNING] if holds else [])
 
 
 def test_the_bytes_of_one_big_row_count_as_progress(tcp_pair):  # 300 MB in one value: no row completes for seconds
