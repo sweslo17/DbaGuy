@@ -1,36 +1,38 @@
 """SQL Server through pymssql's low-level `_mssql` API. Batches are sent verbatim (no driver parameters, so `%` is never
 touched) and streamed with pymssql's row iterator.
 
-- A phase lock decides how a cancel reaches the statement: across threads only while the worker waits for the server
-  (EXECUTING); otherwise it only sets a flag, and the worker stops before its next row or never sends the batch.
+- How a cancel reaches the statement (flag, the wait callback, a watched cross-thread cancel, dropping the connection
+  as the last resort) is `cancel.CancelControl`'s job; this module tells it which driver call is in progress.
 - `SET IMPLICIT_TRANSACTIONS` gives manual commit. The transaction state (@@TRANCOUNT, XACT_STATE(), the mode and the
   database) is cached and re-read in one round trip only when it may have changed and nothing is unread.
 - Messages (PRINT, RAISERROR ≤ 10) arrive live through `set_msghandler`; DbaGuy's own queries never pass theirs on.
 - Column types come from `sys.dm_exec_describe_first_result_set` for the first result set, guessed for the others.
 
 Known limits (probed): a batch reports one row count (its last statement's); results after an error later in a batch
-are not shown although the server goes on running the batch; SQL Server holds a result's last packet until the batch
-moves on, so a cancel that arrives while those rows are awaited waits for them; @@ROWCOUNT and @@ERROR read in a later
-batch report DbaGuy's state query, not the previous batch (inside one batch they are the user's).
+are not shown although the server goes on running the batch; @@ROWCOUNT and @@ERROR read in a later batch report
+DbaGuy's state query, not the previous batch (inside one batch they are the user's); cancelling a batch that keeps the
+connection busy without sending messages (a NOCOUNT OFF loop) drops the connection after about a second, because the
+driver offers no safe moment to send the cancel (see `cancel`).
 """
 
+import re
 import socket
-import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, suppress
-from enum import StrEnum
+from contextlib import AbstractContextManager, contextmanager, suppress
 from typing import Any
 
 from loguru import logger
 
+from ...domain.column_category import ColumnCategory
 from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import ColumnMeta, ErrorPosition, MessageSeverity, ServerMessage
 from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
 from ...domain.profiles import AnyProfile, Engine, ServerProfile
 from ...domain.schema import SchemaSnapshot
 from ...sql.dialects import Dialect, quote_literal
+from ...sql.lexer import TokenKind, scan
 from ..base import (
     AdapterCapabilities,
     DatabaseAdapter,
@@ -46,8 +48,9 @@ from ..base import (
 )
 from . import catalog, driver, freetds, introspection
 from . import schema as mssql_schema
+from .cancel import ABORTED_MESSAGE, Call, CallKind, CancelControl, CancelledWhileWaiting, CancelPending
 from .settings import CONNECT_TIMEOUT_S, URL_SCHEMES, connect_params, parse_mssql_url
-from .types import ColumnKind, convert_row, described_kind, guessed_kinds
+from .types import ColumnKind, described_kind, guessed_kinds, row_converter
 
 _PROCEDURE_LINE = "\n(in {procedure}, line {line})"
 _CONNECTION_LOST_NUMBERS = frozenset({20003, 20004, 20006, 20009, 20047})  # DB-Lib; rarely seen (severities < 11)
@@ -61,29 +64,21 @@ _COMMIT = "WHILE @@TRANCOUNT > 0 COMMIT TRANSACTION"  # every nesting level (Rul
 _ROLLBACK = "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION"
 _NO_COLUMN_NAME = "(No column name)"
 _TCP_CHECK_S = 3
-# A cross-thread cancel goes out only once the worker has waited this long in EXECUTING. pymssql's cancel() is
-# dbcancel(): it sends the attention and then reads until the server acknowledges it. While the worker is blocked in a
-# read, that second step returns at once and the worker reads the acknowledgement itself (the probes' WAITFOR case).
-# But a statement that is answering is between two reads inside execute_query() for a few microseconds at a time, and
-# a dbcancel() then reads alongside the worker: the hammer test wedged the session or killed it (about once in 500
-# cancels of a 1 ms query). A statement still waiting after the grace period is in a blocking read; one that answers
-# sooner leaves EXECUTING, and the flag stops it at the next phase change.
-_CANCEL_GRACE_S = 0.05
+# A top-level FOR JSON / FOR XML result arrives as rows of about 2,000 characters in one column with this name; SSMS
+# joins them into one value, and so does the grid.
+_JOINED_COLUMNS = {
+    "JSON_F52E2B61-18A1-11d1-B105-00805F49916B": ColumnKind("json", ColumnCategory.JSON),
+    "XML_F52E2B61-18A1-11d1-B105-00805F49916B": ColumnKind("xml", ColumnCategory.TEXT),
+}
+# Words after which the cached transaction state cannot be trusted while rows wait unread (a paused page).
+_TRANSACTION_WORDS = frozenset({"TRAN", "TRANSACTION", "COMMIT", "ROLLBACK", "IMPLICIT_TRANSACTIONS", "ANSI_DEFAULTS"})
+_TRANSACTION_HINT = re.compile("|".join(_TRANSACTION_WORDS), re.IGNORECASE)
 SQL_VARIANT_HINT = "sql_variant values are shown as raw bytes: CAST them to read them, e.g. CAST(col AS nvarchar(4000))"
 _LOGIN_HINT = (
     "SQL Server refused the login. Check the user name and password, that the login may open the database, and the "
     "SSL mode: the server may require encryption, and verify-ca / verify-full need the CA file that signed the "
     "server's certificate."
 )
-
-
-class _Phase(StrEnum):
-    IDLE = "idle"  # no statement on the connection
-    # run() has begun but the user's batch is not on the wire yet: the state read and the describe query's rows. A
-    # cancel only sets the flag, and the batch is then never sent (R-03b-P4, R-03b-P5).
-    STARTING = "starting"
-    EXECUTING = "executing"  # the worker waits for the server: sending the describe query, execute, the next result set
-    STREAMING = "streaming"  # the user's rows are being read, or wait unread (a paused page)
 
 
 def _text(raw: bytes | str | None) -> str:
@@ -99,6 +94,16 @@ def server_text(exc: Exception) -> str:
         raw = first[1] if isinstance(first, tuple) and len(first) > 1 else str(first)
     text = _text(raw).split("DB-Lib error message", 1)[0].strip()
     return "" if text in ("", "Unknown error") else text
+
+
+def _mentions_transaction(sql: str) -> bool:
+    """Whether the batch has a transaction word outside strings and comments. The regex spares the lexer most batches;
+    a script over _DESCRIBE_LIMIT is not lexed (a second or so per megabyte): a mention anywhere counts."""
+    if not _TRANSACTION_HINT.search(sql):
+        return False
+    if len(sql) > _DESCRIBE_LIMIT:
+        return True
+    return any(t.kind is TokenKind.WORD and t.text.upper() in _TRANSACTION_WORDS for t in scan(sql, Dialect.TSQL))
 
 
 class MssqlResult(StatementResult):
@@ -127,6 +132,10 @@ class MssqlResult(StatementResult):
         else:
             self._buffer = self._read(_TYPE_PEEK)
             kinds = guessed_kinds(header, self._buffer)
+        if len(names) == 1 and names[0] in _JOINED_COLUMNS:
+            kinds = [_JOINED_COLUMNS[names[0]]]
+            self._join_fragments()
+        self._convert = row_converter(kinds)
         self._columns = [
             ColumnMeta(name=name or _NO_COLUMN_NAME, type_name=kind.name, category=kind.category)
             for name, kind in zip(names, kinds)
@@ -134,24 +143,35 @@ class MssqlResult(StatementResult):
         if any(kind.name == "sql_variant" for kind in kinds):
             self._owner.note(ServerMessage(severity=MessageSeverity.INFO, text=SQL_VARIANT_HINT))
 
+    def _join_fragments(self) -> None:
+        while not self._rows_done:
+            self._buffer += self._read(1000)
+        self._buffer = [("".join(fragment or "" for (fragment,) in self._buffer),)] if self._buffer else []
+
     def _read(self, n: int) -> list[tuple]:
+        owner = self._owner
         rows: list[tuple] = []
+        ended = False
         try:
-            while len(rows) < n:
-                if self._owner.cancel_requested:  # a plain attribute read; cancel() sets it under the owner's lock
-                    self._exhausted = True
-                    raise self._owner.stop_stream()
-                row = next(self._iter, None)
-                if row is None:
-                    self._rows_done = True
-                    break
-                rows.append(row)
+            with owner.row_call() as call:
+                while len(rows) < n and not owner.cancel_requested:  # a plain attribute read between rows
+                    row = next(self._iter, None)
+                    if row is None:
+                        ended = True
+                        break
+                    rows.append(row)
+                    call.rows += 1  # the canceller sees a read that makes no progress
         except driver.ERRORS as exc:  # an error later in the batch; pymssql has already cancelled the rest
             self._exhausted = True
-            error = self._owner.statement_error(exc)
-            if not rows:
-                raise error from exc
+            error = owner.statement_error(exc)
+            if not rows or isinstance(error, StatementCancelled) or error.code == "connection_lost":
+                raise error from exc  # a cancel or a lost connection never looks like the end of the rows
             self._rows_done, self._deferred = True, error
+            return rows
+        if owner.cancel_requested or owner.unusable:  # also when a cancel or a shutdown ended the rows: not their end
+            self._exhausted = True
+            raise owner.stop_stream()
+        self._rows_done = ended
         return rows
 
     def columns(self) -> list[ColumnMeta] | None:
@@ -163,7 +183,7 @@ class MssqlResult(StatementResult):
         rows, self._buffer = self._buffer[:n], self._buffer[n:]
         if len(rows) < n and not self._rows_done:
             rows += self._read(n - len(rows))
-        return [convert_row(row) for row in rows]
+        return [self._convert(row) for row in rows]
 
     def affected_rows(self) -> int | None:
         count = self._owner.rows_affected()
@@ -171,7 +191,7 @@ class MssqlResult(StatementResult):
 
     def next_result(self) -> bool:
         """The worker asks only once the current set is read to its end (pymssql's nextresult() would otherwise drain
-        it while the phase says EXECUTING)."""
+        it inside a call that only a cross-thread cancel can reach)."""
         if self._closed:
             return False
         while self._columns is not None and not self._rows_done and not self._exhausted:
@@ -207,134 +227,127 @@ class MssqlConnection(DatabaseConnection):
     def __init__(
         self, conn: driver.Connection, *, spid: int, database: str | None, read_only: bool,
         state: tuple[int, int, bool],  # (@@TRANCOUNT, XACT_STATE(), IMPLICIT_TRANSACTIONS) read at open
+        socket_fd: int | None = None,
     ) -> None:
         self._conn = conn
         self._spid = spid
         self._database = database
         self._read_only = read_only  # application-level only (spec §3.4): logged, never enforced here
-        self._lock = threading.Lock()  # guards the phase fields and cancel_requested; held across a cross-thread cancel
-        self._phase_changed = threading.Condition(self._lock)
-        self._phase = _Phase.IDLE
-        self._phase_serial = 0  # counts phase changes: a waiting cancel sees whether the worker moved on
-        self._phase_at = 0.0  # time.monotonic() of the last phase change
-        self.cancel_requested = False
+        self._control = CancelControl(conn, spid)
+        if socket_fd is not None:
+            self._control.note_socket(socket_fd)
         self._result: MssqlResult | None = None  # the open result until it is read to its end or closed
         self._listener: MessageListener | None = None
         self._pending: deque[ServerMessage] = deque(maxlen=1000)
         self._muted = False  # one of DbaGuy's own queries runs: its messages belong to no statement
         self._lost = False
         self._stale = False  # True once the cached state may be out of date: re-read when nothing is unread
+        self._batch = ""  # the running batch's text
+        self._transaction_words: bool | None = None  # it may begin or end a transaction; worked out when first asked
         self._trancount, self._xact_state, self._implicit = state
         conn.set_msghandler(self._on_message)
 
-    # ---- phases and cancel ----
+    # ---- cancel ----
 
-    def _set_phase(self, phase: _Phase) -> bool:
-        """Change the phase under the lock, so a cross-thread cancel in progress finishes first. Returns whether a
-        cancel reached this statement. Leaving IDLE starts a statement: the flag belongs to it alone (R-03a-P4)."""
-        with self._lock:
-            if self._phase is _Phase.IDLE and phase is not _Phase.IDLE:
-                self.cancel_requested = False
-            self._enter(phase)
-            return self.cancel_requested
+    @property
+    def cancel_requested(self) -> bool:
+        return self._control.cancel_requested
 
-    def _enter_executing(self) -> bool:
-        """Enter EXECUTING unless a cancel already reached this statement: then nothing may be sent, and the phase stays
-        flag-only, so a stop_stream() on this thread never meets a cross-thread dbcancel(). Returns whether it was
-        cancelled."""
-        with self._lock:
-            if self.cancel_requested:
-                return True
-            self._enter(_Phase.EXECUTING)
-            return False
+    @property
+    def unusable(self) -> bool:
+        return self._control.unusable
 
-    def _enter(self, phase: _Phase) -> None:
-        """Caller holds the lock."""
-        self._phase = phase
-        self._phase_serial += 1
-        self._phase_at = time.monotonic()
-        self._phase_changed.notify_all()
+    def cancel(self) -> None:
+        """Any thread (spec §3.6); see `cancel.CancelControl`."""
+        self._control.cancel()
+
+    def force_cancel(self) -> None:
+        self._control.force_cancel()
+
+    def abort(self) -> None:
+        self._control.abort()
+
+    def row_call(self) -> AbstractContextManager[Call]:
+        return self._control.call(CallKind.ROWS)
 
     def end_statement(self) -> None:
-        with self._lock:
-            self._enter(_Phase.IDLE)
-            self.cancel_requested = False
+        self._control.end_statement()
         self._result = None
         self._stale = True
 
-    def cancel(self) -> None:
-        """Any thread (spec §3.6). EXECUTING: the attention goes out across threads, which the probes show ends a
-        WAITFOR in about 1 s and keeps the session, but only once the worker has waited `_CANCEL_GRACE_S` (see there).
-        STARTING and STREAMING: only the flag. Rows are being read then, and a cross-thread cancel between two row
-        reads can wedge the driver (research; pre-flight R-03b-P4). The worker stops before its next row, or never
-        sends the batch. IDLE: nothing runs; a flag now would cancel the next statement."""
-        with self._phase_changed:
-            if self._phase is _Phase.IDLE:
-                return
-            self.cancel_requested = True
-            if self._phase is not _Phase.EXECUTING:
-                logger.info("SQL Server cancel flagged for SPID {} ({}): it stops before the next row or the batch",
-                            self._spid, self._phase)
-                return
-            serial, due = self._phase_serial, self._phase_at + _CANCEL_GRACE_S
-            while self._phase_serial == serial and (left := due - time.monotonic()) > 0:
-                self._phase_changed.wait(left)  # releases the lock: the worker may move on meanwhile
-            if self._phase_serial != serial:
-                logger.info("SQL Server cancel flagged for SPID {}: the server answered within {:.0f} ms",
-                            self._spid, _CANCEL_GRACE_S * 1000)
-                return
-            started = time.monotonic()
-            try:
-                self._conn.cancel()
-            except Exception as exc:  # never let a cancel raise; the flag still stops the stream
-                logger.warning("SQL Server cancel of SPID {} failed: {}: {}", self._spid, type(exc).__name__, exc)
-                return
-            logger.info("SQL Server cancel sent to SPID {} in {:.0f} ms", self._spid, (time.monotonic() - started) * 1000)
-
-    def stop_stream(self) -> StatementCancelled:
-        """Worker thread: end the statement whose cancel was flagged (or whose rows are no longer wanted)."""
-        started = time.monotonic()
+    def _attention(self) -> None:
+        """This thread's own cancel: an attention, then everything up to its acknowledgement is read and dropped (the
+        transaction and #temp tables stay, probed). A second Cancel or closing the session may drop the connection
+        while the server takes its time to acknowledge."""
+        if self._control.unusable:
+            return
         try:
-            self._conn.cancel()
+            with self._control.call(CallKind.STOP):
+                self._conn.cancel()
         except driver.ERRORS as exc:  # e.g. an error the server sent before the attention: the statement ends anyway
-            logger.warning("Stopping the SQL Server stream on SPID {} reported: {}", self._spid, server_text(exc) or exc)
+            logger.warning("Stopping the statement on SQL Server SPID {} reported: {}", self._spid, server_text(exc) or exc)
+
+    def stop_stream(self, cancelled: bool = True) -> StatementError:
+        """Worker thread: end the statement whose cancel was flagged (`cancelled`) or whose rows are no longer wanted.
+        Returns what to raise: "cancelled", or connection_lost when the connection was dropped or killed meanwhile (a
+        KILL during a flagged cancel must not read as a cancel: the server is asked, a round trip per cancel)."""
+        started = time.monotonic()
+        self._attention()
+        lost = self._control.unusable or (cancelled and not self._alive())
+        error = self._lost_error() if lost else StatementCancelled()
         self.end_statement()
-        logger.info("SQL Server stream on SPID {} stopped in {:.0f} ms", self._spid, (time.monotonic() - started) * 1000)
-        return StatementCancelled()
+        logger.info("SQL Server statement on SPID {} stopped in {:.0f} ms", self._spid, (time.monotonic() - started) * 1000)
+        return error
 
     def finish_result(self, result: MssqlResult, complete: bool) -> None:
         if self._result is not result:
             return
         if not complete:
-            self.stop_stream()  # an attention on this thread: the transaction and #temp tables stay (probed)
+            self.stop_stream(cancelled=False)
         else:
             self.end_statement()
+
+    def _lost_error(self) -> StatementError:
+        self._lost = True
+        if self._control.aborted is not None:
+            return StatementError(ABORTED_MESSAGE, code="connection_lost")
+        return StatementError("Connection to the server was lost", code="connection_lost")
+
+    def _check_usable(self) -> None:
+        if self._control.unusable:
+            raise self._lost_error()
 
     # ---- execution ----
 
     def run(self, sql: str) -> StatementResult:
         if self._result is not None:  # the worker closes every result first; never send over unread rows
             self._result.close()
-        self._set_phase(_Phase.STARTING)  # from here a cancel is kept, not dropped (R-03b-P5)
+        self._control.begin_statement()  # from here a cancel is kept, not dropped (R-03b-P5)
         try:
+            self._check_usable()
+            self._batch, self._transaction_words = sql, None
             self._refresh_state()  # the describe needs the current mode; normally fresh (the worker reads it per request)
             self._stale = True
-            described = self._describe(sql)  # comes back in STARTING
-            if self._enter_executing():  # a cancel arrived before the batch went out: it never runs
-                raise StatementCancelled()
-            self._conn.execute_query(sql)  # sends the batch verbatim (no params: `%` untouched), waits for set 1
-        except StatementCancelled:
+            described = self._describe(sql)
+            with self._control.call(CallKind.EXECUTE):  # not started when a cancel arrived first: the batch never runs
+                self._conn.execute_query(sql)  # sends the batch verbatim (no params: `%` untouched), waits for set 1
+        except CancelPending:
+            self.end_statement()
+            raise StatementCancelled() from None
+        except CancelledWhileWaiting:  # the batch is sent, its first response unread (R-03b-T8e)
+            raise self.stop_stream() from None
+        except StatementError:
             self.end_statement()
             raise
         except driver.ERRORS as exc:
             raise self.statement_error(exc) from exc
         except UnicodeEncodeError as exc:  # a lone surrogate (half an emoji) cannot be sent as UTF-8; nothing was sent
             self.end_statement()
-            raise invalid_text_error(sql, exc) from exc
+            raise invalid_text_error(sql, exc.start) from exc
         except BaseException:
             self.end_statement()  # the statement is over: its flag must not reach the next one
             raise
-        if self._set_phase(_Phase.STREAMING):  # it ended just as the cancel arrived
+        if self._control.cancel_requested:  # it ended just as the cancel arrived
             raise self.stop_stream()
         header = self.header()
         names = [h[0] for h in header] if header else []
@@ -343,13 +356,16 @@ class MssqlConnection(DatabaseConnection):
         return self._result
 
     def next_set(self) -> bool:
-        if self._enter_executing():
+        if self._control.unusable:
             raise self.stop_stream()
         try:
-            more = bool(self._conn.nextresult())
+            with self._control.call(CallKind.NEXT_SET):
+                more = bool(self._conn.nextresult())
+        except CancelPending:
+            raise self.stop_stream() from None
         except driver.ERRORS as exc:
             raise self.statement_error(exc) from exc
-        if self._set_phase(_Phase.STREAMING):
+        if self._control.cancel_requested or self._control.unusable:
             raise self.stop_stream()
         return more
 
@@ -365,11 +381,8 @@ class MssqlConnection(DatabaseConnection):
     def _describe(self, sql: str) -> list[tuple[str, ColumnKind]] | None:
         """The first result set's column names and types, from sys.dm_exec_describe_first_result_set, on the same
         connection, before the batch. The DMF reports a batch it cannot describe as error rows instead of raising, so
-        an XACT_ABORT ON transaction never dies of it, unlike sp_describe_first_result_set (probed).
-
-        Phases (R-03b-P4): the query is sent in EXECUTING, so a describe that waits (e.g. on a schema lock) stays
-        cancellable across threads. Its rows are read in STARTING, flag-only, because a cross-thread cancel between
-        two row reads wedged the driver in the pre-flight. Returns in STARTING.
+        an XACT_ABORT ON transaction never dies of it, unlike sp_describe_first_result_set (probed). Its rows are read
+        outside any driver call a cancel interrupts: the flag alone stops what follows (R-03b-P4).
 
         In manual mode a SELECT from the DMF would open an implicit transaction, so the mode is switched off around it
         in the same round trip. Whenever the describe did not finish, or a cancel reached it (its attention may have
@@ -388,20 +401,23 @@ class MssqlConnection(DatabaseConnection):
         sent = finished = False
         with self._internal():
             try:
-                if self._enter_executing():
-                    return None  # cancelled: nothing is sent, the batch neither
-                sent = True
-                self._conn.execute_query(query)
-                self._set_phase(_Phase.STARTING)  # flag-only from here: the rows are read
+                with self._control.call(CallKind.EXECUTE):
+                    sent = True
+                    self._conn.execute_query(query)
                 found = catalog.read_rows(self._conn)  # reads to the end: the trailing SET included (R-03b-P7)
                 finished = True
+            except CancelPending:
+                return None  # nothing was sent; the batch will not be either
+            except CancelledWhileWaiting:
+                self._attention()
             except (*driver.ERRORS, UnicodeEncodeError) as exc:
                 logger.debug("Describing a SQL Server batch failed ({})", type(exc).__name__)
             finally:
-                cancelled = self._set_phase(_Phase.STARTING)
-                if wrapped and sent and (not finished or cancelled):
+                restore = wrapped and sent and (not finished or self._control.cancel_requested)
+                if restore and not self._control.unusable:
                     self._conn.execute_non_query("SET IMPLICIT_TRANSACTIONS ON")  # R-03b-P6
-        if not found or any(error is not None for _, _, error in found):
+        # The expected shape only: SET SHOWPLAN_* answers with plans, SET NOEXEC / PARSEONLY / FMTONLY with nothing.
+        if not found or any(len(row) != 3 or row[2] is not None for row in found):
             return None
         return [(name or "", described_kind(type_name)) for name, type_name, _ in found]
 
@@ -446,6 +462,7 @@ class MssqlConnection(DatabaseConnection):
                 logger.debug("Dropped a message from DbaGuy's own query on SPID {}: {}", self._spid, _text(text))
                 return
             self.note(ServerMessage(severity=MessageSeverity.INFO, text=_text(text)))
+            self._control.on_message()  # a pending cancel goes out from here (see cancel.CancelControl)
         except Exception:
             logger.exception("SQL Server message handler failed")
 
@@ -453,7 +470,7 @@ class MssqlConnection(DatabaseConnection):
 
     def _refresh_state(self) -> None:
         """One round trip, only after something may have changed the state and only with nothing unread."""
-        if not self._stale or self._result is not None or self._lost:
+        if not self._stale or self._result is not None or self._lost or self._control.unusable:
             return
         with self._internal():
             try:
@@ -462,18 +479,32 @@ class MssqlConnection(DatabaseConnection):
                 self.translate_error(exc)  # marks a dead connection as lost
                 logger.debug("Could not read the SQL Server transaction state on SPID {}: {}", self._spid, server_text(exc))
                 return
-        trancount, xact_state, implicit, database = row
-        self._trancount, self._xact_state, self._implicit = int(trancount), int(xact_state), bool(implicit)
+        self._stale = False  # one try per statement, whatever the answer
+        try:
+            trancount, xact_state, implicit, database = row  # type: ignore[misc]
+            self._trancount, self._xact_state, self._implicit = int(trancount), int(xact_state), bool(implicit)
+        except (TypeError, ValueError):
+            # SET NOEXEC / PARSEONLY / FMTONLY ON answer with no row, SET SHOWPLAN_* ON with a plan: keep the cache
+            logger.debug("The SQL Server state query on SPID {} got {!r}; the cached state is kept", self._spid,
+                         row if row is None else f"{len(row)} column(s)")
+            return
         self._database = database
-        self._stale = False
 
     def in_transaction(self) -> bool:
         self._refresh_state()
-        if self._lost:
+        if self._lost or self._control.unusable:
             return False
-        # Ruling 17: rows are unread, so no query: in manual mode a result long enough to pause comes from a table,
-        # and reading a table opens an implicit transaction.
-        return self._trancount > 0 or (self._implicit and self._result is not None)
+        if self._result is not None:
+            # Rows wait unread, so no query. Ruling 17: in manual mode a result long enough to pause comes from a
+            # table, and reading a table opens an implicit transaction. A batch with BEGIN TRAN, COMMIT and the like
+            # may have changed the state the cache holds: an open transaction is assumed until the pause ends.
+            if self._implicit:
+                return True
+            if self._transaction_words is None:
+                self._transaction_words = _mentions_transaction(self._batch)
+            if self._transaction_words:
+                return True
+        return self._trancount > 0
 
     def transaction_failed(self) -> bool:
         self._refresh_state()
@@ -502,6 +533,7 @@ class MssqlConnection(DatabaseConnection):
 
     def _internal_statement(self, sql: str) -> None:
         """A statement of DbaGuy's own (commit, rollback, the mode): its errors never read "cancelled" (R-03a-P4)."""
+        self._check_usable()
         with self._internal():
             try:
                 self._conn.execute_non_query(sql)
@@ -517,17 +549,20 @@ class MssqlConnection(DatabaseConnection):
         return error
 
     def translate_error(self, exc: Exception, statement: bool = False) -> StatementError:
-        """Commit, rollback, auto-commit and state queries never report "cancelled" (R-03a-P4)."""
+        """Commit, rollback, auto-commit and state queries never report "cancelled" (R-03a-P4). A lost or dropped
+        connection is checked first: a KILL or a shutdown during a flagged cancel reads connection_lost."""
         number = int(getattr(exc, "number", 0) or 0)
         text = server_text(exc)
-        if statement and self.cancel_requested:
-            return StatementCancelled()
         severity = int(getattr(exc, "severity", 0) or 0)
+        if self._control.unusable:
+            return self._lost_error()
         if self._lost or number in _CONNECTION_LOST_NUMBERS or severity >= _FATAL_SEVERITY or (number == 0 and not self._alive()):
             self._lost = True
             return StatementError(
                 "Connection to the server was lost" + (f": {text}" if text else ""), code="connection_lost"
             )
+        if statement and self._control.cancel_requested:
+            return StatementCancelled()
         if number == 0:
             return StatementError(text or "SQL Server ended the statement without an error message")
         line = int(getattr(exc, "line", 0) or 0)
@@ -537,7 +572,10 @@ class MssqlConnection(DatabaseConnection):
         return StatementError(message, code=str(number), position=position)
 
     def _alive(self) -> bool:
-        """pymssql reports a dead connection as error 0 "Unknown error" and keeps `connected` True: ask once."""
+        """pymssql reports a dead connection as error 0 "Unknown error" and keeps `connected` True: ask once. Runs
+        outside any driver call a cancel interrupts, so a cancel arriving now only sets the flag."""
+        if self._control.unusable:
+            return False
         with self._internal():
             try:
                 self._conn.execute_non_query("SELECT 1")
@@ -548,6 +586,7 @@ class MssqlConnection(DatabaseConnection):
     # ---- metadata ----
 
     def _catalog_call[T](self, read: Callable[[], T]) -> T:
+        self._check_usable()
         with self._internal():
             try:
                 return read()
@@ -555,7 +594,8 @@ class MssqlConnection(DatabaseConnection):
                 raise self.translate_error(exc) from exc
 
     def server_info(self) -> ServerInfo:
-        version, database, user = self._catalog_call(lambda: catalog.first_row(self._conn, _SERVER_INFO))
+        row = self._catalog_call(lambda: catalog.first_row(self._conn, _SERVER_INFO))
+        version, database, user = row if row is not None and len(row) == 3 else ("", self._database, None)
         self._database = database
         first_line = (version or "").strip().split("\n", 1)[0].strip()  # @@VERSION spans several lines
         return ServerInfo(engine=Engine.MSSQL, version=first_line, current_database=database, current_user=user)
@@ -579,6 +619,9 @@ class MssqlConnection(DatabaseConnection):
         return self._catalog_call(lambda: mssql_schema.build_snapshot(self._conn))
 
     def close(self) -> None:
+        if self._control.poisoned:  # a cancel thread may still be inside the driver: closing under it aborts FreeTDS
+            logger.warning("Not closing SQL Server SPID {}: a cancel never returned (its socket is shut down)", self._spid)
+            return
         with suppress(*driver.ERRORS):
             self._conn.close()
 
@@ -628,8 +671,10 @@ class MssqlAdapter(DatabaseAdapter):
             raise ConnectionFailed(_login_failure(exc, endpoint, kwargs["server"])) from exc
         except (TypeError, ValueError) as exc:
             raise ConnectionFailed(f"Invalid SQL Server connection setting: {exc}") from exc
+        sockets: list[int] = []  # the first query names the connection's socket (R-03b-T8d)
         try:
-            spid, trancount, xact, implicit, db = catalog.first_row(conn, _OPEN_QUERY)
+            with driver.wait_hook(sockets.append):
+                spid, trancount, xact, implicit, db = catalog.first_row(conn, _OPEN_QUERY)
         except driver.ERRORS as exc:
             with suppress(*driver.ERRORS):
                 conn.close()
@@ -645,5 +690,5 @@ class MssqlAdapter(DatabaseAdapter):
         )
         return MssqlConnection(
             conn, spid=int(spid), database=db, read_only=profile.read_only,
-            state=(int(trancount), int(xact), bool(implicit)),
+            state=(int(trancount), int(xact), bool(implicit)), socket_fd=sockets[0] if sockets else None,
         )

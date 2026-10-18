@@ -4,7 +4,9 @@ from uuid import UUID
 
 import pytest
 
-from dbaguy_backend.adapters.mssql.types import ColumnKind, convert_row, described_kind, guessed_kinds
+from dbaguy_backend.adapters.mssql.types import (
+    ColumnKind, convert_row, described_kind, guessed_kinds, row_converter, shortest_real,
+)
 
 
 @pytest.mark.parametrize("value, expected", [
@@ -42,3 +44,19 @@ def test_guessed_kinds():
         ("bit", "bool"), ("datetimeoffset", "datetime"), ("varbinary", "binary"), ("nvarchar", "text"),
         ("datetime", "datetime"), ("unknown", "other"),
     ]
+
+
+@pytest.mark.parametrize("widened, shown", [
+    (0.10000000149011612, 0.1), (3.4028234663852886e38, 3.4028235e38), (1.401298464324817e-45, 1e-45),
+    (-2.5, -2.5), (0.0, 0.0), (16777216.0, 16777216.0), (0.30000001192092896, 0.3),
+])
+def test_real_values_are_their_shortest_float32_digits(widened, shown):  # pymssql widens a real to a double
+    assert shortest_real(widened) == shown
+
+
+def test_row_converter_touches_only_real_columns():
+    convert = row_converter([ColumnKind("real", "number"), ColumnKind("float", "number"), ColumnKind("date", "datetime")])
+    assert convert([0.10000000149011612, 0.10000000149011612, date(2026, 10, 18)]) == [
+        0.1, 0.10000000149011612, "2026-10-18"]
+    assert convert([None, None, None]) == [None, None, None]
+    assert row_converter([ColumnKind("int", "number")]) is convert_row

@@ -143,3 +143,37 @@ def test_an_error_that_ends_the_transaction_updates_the_badge(mssql_worker):  # 
     assert rec.of("e", "error")[0].code == "8134"
     assert not done.in_transaction  # XACT_ABORT rolled it back: read from the server, not the cache
     run(worker, rec, "o", "SET XACT_ABORT OFF")
+
+
+def test_a_nul_character_is_refused_before_the_safety_check_and_the_server(mssql_worker):  # Important 3
+    worker, rec = mssql_worker
+    run(worker, rec, "c", "CREATE TABLE #n (id int); INSERT #n VALUES (1), (2)")
+    worker.submit(ExecuteCommand(request_id="d", sql="DELETE FROM #n\x00 WHERE id = 1"))
+    rec.wait_for(finished("d"), timeout=30)
+    [error] = rec.of("d", "error")
+    assert error.code == "invalid_text" and (error.position.line, error.position.column) == (1, 15)
+    run(worker, rec, "k", "SELECT COUNT(*) FROM #n")
+    assert rec.of("k", "rows")[0].rows == [[2]]  # the server never saw a DELETE without its WHERE
+
+
+def test_a_timeout_stops_a_select_blocked_on_a_row_lock(mssql_worker):  # Important 1: the timeout could not before
+    worker, rec = mssql_worker
+    locker = MssqlAdapter().open(make_mssql_profile(), Endpoint(MSSQL_HOST, MSSQL_PORT), MSSQL_PASSWORD, None)
+    try:
+        for sql in ("IF OBJECT_ID('tempdb..##zz_locktimeout') IS NOT NULL DROP TABLE ##zz_locktimeout",
+                    "CREATE TABLE ##zz_locktimeout (id int PRIMARY KEY, v int)",
+                    "INSERT ##zz_locktimeout SELECT TOP 5000 id, id AS v FROM dbo.big_table ORDER BY id"):
+            locker.run(sql).close()
+        locker.set_autocommit(False)
+        locker.run("UPDATE ##zz_locktimeout SET v = v WHERE id = 3000").close()
+        worker.submit(ExecuteCommand(request_id="t", sql="SELECT id, v FROM ##zz_locktimeout ORDER BY id",
+                                     page_size=5000, timeout_s=1))
+        done = rec.wait_for(finished("t"), timeout=10)
+        assert done.timed_out and done.cancelled and done.elapsed_ms < 3000
+        assert not run(worker, rec, "u", "SELECT 'mine' AS m").cancelled
+        assert rec.of("u", "rows")[0].rows == [["mine"]]
+    finally:
+        locker.rollback()
+        locker.set_autocommit(True)
+        locker.run("DROP TABLE ##zz_locktimeout").close()
+        locker.close()

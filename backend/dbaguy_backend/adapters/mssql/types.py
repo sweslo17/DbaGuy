@@ -7,6 +7,7 @@ first non-NULL value. Pure: no I/O.
 Known limits (the driver's, probed): datetime2/datetimeoffset/time(7) arrive as microseconds (the 7th digit is lost),
 and sql_variant arrives as raw bytes (the adapter tells the user to CAST it)."""
 
+import struct
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -81,3 +82,33 @@ _CONVERTERS: dict[type, Callable[[Any], Any]] = {
 
 def convert_row(row: Sequence[Any]) -> list[Any]:
     return [convert(value) if (convert := _CONVERTERS.get(type(value))) else value for value in row]
+
+
+def _single(value: float) -> float:
+    return struct.unpack("f", struct.pack("f", value))[0]
+
+
+def shortest_real(value: float) -> float:
+    """A `real` (float32) as the shortest decimal that reads back as the same float32: pymssql widens CAST(0.1 AS
+    real) to 0.10000000149011612, SSMS shows 0.1."""
+    single = _single(value)
+    for digits in range(1, 10):  # nine significant digits always round-trip a float32
+        if _single(shorter := float(f"{single:.{digits}g}")) == single:
+            return shorter
+    return single
+
+
+def row_converter(kinds: Sequence[ColumnKind]) -> Callable[[Sequence[Any]], list[Any]]:
+    """`convert_row`, plus `shortest_real` for the columns described as `real`."""
+    reals = [i for i, kind in enumerate(kinds) if kind.name == "real"]
+    if not reals:
+        return convert_row
+
+    def convert(row: Sequence[Any]) -> list[Any]:
+        values = convert_row(row)
+        for i in reals:
+            if values[i] is not None:
+                values[i] = shortest_real(values[i])
+        return values
+
+    return convert

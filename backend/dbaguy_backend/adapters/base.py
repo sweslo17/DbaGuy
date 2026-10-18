@@ -63,11 +63,12 @@ def transaction_open_error() -> StatementError:
 INVALID_TEXT = "invalid_text"
 
 
-def invalid_text_error(sql: str, exc: UnicodeEncodeError) -> StatementError:
-    """A lone surrogate (half of an emoji, e.g. from a broken paste) cannot be sent as UTF-8."""
-    line, column = offset_to_line_col(sql, exc.start + 1)
+def invalid_text_error(sql: str, index: int) -> StatementError:
+    """The character at `index` cannot be sent: a lone surrogate (half of an emoji, e.g. from a broken paste) is not
+    UTF-8, and drivers cut the text at U+0000 (so a filter after it would be lost)."""
+    line, column = offset_to_line_col(sql, index + 1)
     return StatementError(
-        f"The statement contains a character that is not valid text (U+{ord(sql[exc.start]):04X}); delete it and "
+        f"The statement contains a character that is not valid text (U+{ord(sql[index]):04X}); delete it and "
         "retype it", code=INVALID_TEXT, position=ErrorPosition(line=line, column=column),
     )
 
@@ -175,6 +176,16 @@ class DatabaseConnection(ABC):
     @abstractmethod
     def cancel(self) -> None:
         """Best-effort cancel of the running statement. Safe to call from any thread."""
+
+    def force_cancel(self) -> None:
+        """A repeated Cancel of the same running request (never a timeout): an adapter whose cancel can fail to end
+        the statement may now drop the connection instead. Safe to call from any thread. Default: cancel()."""
+        self.cancel()
+
+    def abort(self) -> None:
+        """The session is closing (its close guard has already asked about an open transaction): stop the running
+        statement now, dropping the connection if need be. Safe to call from any thread. Default: cancel()."""
+        self.cancel()
 
     @abstractmethod
     def close(self) -> None: ...

@@ -42,7 +42,8 @@ class FakeResult(StatementResult):
 
 
 class FakeConnection(DatabaseConnection):
-    """`run()` words: `rows N` returns N rows; `block` waits until cancel() (then raises StatementCancelled);
+    """`run()` words: `rows N` returns N rows; `block` waits until cancel() (then raises StatementCancelled); `hold`
+    waits for a forced cancel or an abort (a statement a plain cancel cannot stop);
     `fail MSG` raises StatementError (and aborts an open transaction, like PostgreSQL); `begin` opens a transaction;
     anything else returns an empty result. In manual-commit mode (`auto` False) every statement opens a transaction
     first, like the real adapters."""
@@ -50,6 +51,8 @@ class FakeConnection(DatabaseConnection):
     def __init__(self) -> None:
         self.runs: list[str] = []
         self.cancel_calls = 0
+        self.interruptions: list[str] = []  # "cancel", "force", "abort", in order
+        self._forced = threading.Event()
         self.closed = False
         self.blocked = threading.Event()  # set while a "block" statement is waiting
         self._unblock = threading.Event()
@@ -81,6 +84,11 @@ class FakeConnection(DatabaseConnection):
         if not self.auto:
             self.tx = True  # manual mode: the adapters BEGIN before the statement, even a SELECT that then pauses
         word, _, arg = sql.partition(" ")
+        if word == "hold":
+            self.blocked.set()
+            assert self._forced.wait(10), "hold was never forced"
+            self._forced.clear()
+            raise StatementError("Connection to the server was lost", code="connection_lost")
         if word == "block":
             self.blocked.set()
             assert self._unblock.wait(10), "block was never cancelled"
@@ -122,9 +130,21 @@ class FakeConnection(DatabaseConnection):
             self.tx = False
             self.failed = False
 
-    def cancel(self) -> None:
+    def _interrupt(self, kind: str) -> None:
         self.cancel_calls += 1
+        self.interruptions.append(kind)
         self._unblock.set()
+        if kind != "cancel":
+            self._forced.set()
+
+    def cancel(self) -> None:
+        self._interrupt("cancel")
+
+    def force_cancel(self) -> None:
+        self._interrupt("force")
+
+    def abort(self) -> None:
+        self._interrupt("abort")
 
     def close(self) -> None:
         self.closed = True

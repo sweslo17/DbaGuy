@@ -1,3 +1,4 @@
+import json
 import random
 import threading
 import time
@@ -394,9 +395,9 @@ def test_cancel_hammered_during_the_describe_never_wedges(conn):  # R-03b-P4 (an
 
 
 def test_cancel_hammered_while_executing_and_streaming_never_wedges(conn):
-    """R-03b-P4 beyond the describe: cancels land in the user's execute (the server answers within the grace period,
-    so the flag stops it), while rows stream (flag only), or after the end. Without the grace period a cross-thread
-    dbcancel() read alongside the worker inside execute_query(): about one wedged or killed session in 500 cancels."""
+    """R-03b-P4 beyond the describe: cancels land while the batch waits for its first response (the wait callback),
+    while rows stream (flag only), or after the end. A cross-thread dbcancel() at those moments read alongside the
+    worker inside execute_query(): about one wedged or killed session in 500 cancels (43c3f2c's review)."""
     rng = random.Random(5)
     for i in range(100):
         outcome = []
@@ -588,6 +589,173 @@ def test_a_deadlock_victims_transaction_state_follows_the_server(conn):
     finally:
         other.close()
         one(conn, "SET DEADLOCK_PRIORITY NORMAL; DROP TABLE ##zz_deadlock_a; DROP TABLE ##zz_deadlock_b")
+
+
+# ---- fix round 1: cancels that never hang (R-03b-T8a/d/e), SET options, FOR JSON/XML, real, the paused badge ----
+
+CHATTY = {  # temporary procedures: nothing is left in the dev database
+    "dml": "CREATE PROCEDURE #zz_work AS BEGIN DECLARE @t TABLE (a int); DECLARE @i int = 0; "
+           "WHILE @i < 3000000 BEGIN INSERT @t VALUES (@i); SET @i += 1; END; SELECT 'done' AS d; END",
+    "nowait": "CREATE PROCEDURE #zz_work AS BEGIN DECLARE @i int = 0; WHILE @i < 400 BEGIN "
+              "RAISERROR('tick %d', 0, 1, @i) WITH NOWAIT; WAITFOR DELAY '00:00:00.002'; SET @i += 1; END; "
+              "SELECT 'done' AS d; END",
+}
+
+
+@pytest.mark.parametrize("kind, iterations", [("dml", 8), ("nowait", 20)])
+def test_cancelling_chatty_batches_never_hangs(kind, iterations):  # Critical: every cancel ends, never a hang
+    rng, outcomes, connection = random.Random(7), [], None
+    for i in range(iterations):
+        if connection is None:
+            connection = open_mssql()
+            one(connection, CHATTY[kind])
+            connection.set_message_listener(lambda m: None)
+        outcome = []
+
+        def attempt(c=connection):
+            try:
+                result = c.run("EXEC #zz_work")
+                while result.fetch(500):
+                    pass
+                result.close()
+                outcome.append("ran")
+            except StatementError as exc:
+                outcome.append(exc.code)
+
+        runner = threading.Thread(target=attempt, daemon=True)
+        runner.start()
+        time.sleep(rng.uniform(0.1, 0.4))
+        connection.cancel()
+        runner.join(10)
+        assert not runner.is_alive(), f"{kind}: hung in iteration {i}"
+        assert outcome[0] in ("cancelled", "connection_lost"), outcome
+        outcomes.append(outcome[0])
+        if outcome[0] == "connection_lost":
+            connection.close()
+            connection = None
+        else:
+            assert one(connection, "SELECT 'mine' AS m") == [["mine"]] and not connection.in_transaction()
+    if connection is not None:
+        connection.close()
+    if kind == "nowait":  # the cancel goes out from the message handler: the session stays
+        assert outcomes.count("cancelled") == iterations
+
+
+@pytest.fixture
+def locked_row():
+    """##zz_lockrows (5,000 rows) with row 3000 locked by another session's open transaction."""
+    locker = open_mssql()
+    one(locker, "IF OBJECT_ID('tempdb..##zz_lockrows') IS NOT NULL DROP TABLE ##zz_lockrows; "
+                "CREATE TABLE ##zz_lockrows (id int PRIMARY KEY, v int); "
+                "INSERT ##zz_lockrows SELECT TOP 5000 id, id AS v FROM dbo.big_table ORDER BY id")
+    locker.set_autocommit(False)
+    one(locker, "UPDATE ##zz_lockrows SET v = v WHERE id = 3000")
+    yield "SELECT id, v FROM ##zz_lockrows ORDER BY id"
+    locker.rollback()
+    locker.set_autocommit(True)
+    one(locker, "DROP TABLE ##zz_lockrows")
+    locker.close()
+
+
+def stream_in_thread(connection, sql):
+    state = {"rows": 0}
+
+    def reader():
+        try:
+            result = connection.run(sql)
+            while rows := result.fetch(500):
+                state["rows"] += len(rows)
+            result.close()
+            state["out"] = "ran"
+        except StatementError as exc:
+            state["out"], state["message"] = exc.code, exc.message
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    return thread, state
+
+
+def test_a_select_blocked_on_a_row_lock_mid_stream_can_be_cancelled(conn, locked_row):  # Important 1
+    thread, state = stream_in_thread(conn, locked_row)
+    time.sleep(0.8)
+    assert 0 < state["rows"] < 3000 and "out" not in state  # blocked inside a row read
+    started = time.monotonic()
+    conn.cancel()
+    thread.join(5)
+    assert state.get("out") == "cancelled" and time.monotonic() - started < 2
+    assert one(conn, "SELECT 'mine' AS m") == [["mine"]]
+
+
+def test_closing_the_session_mid_stream_reads_connection_lost_not_the_end(conn, locked_row):  # R-03b-T8a (6)
+    thread, state = stream_in_thread(conn, locked_row)
+    time.sleep(0.8)
+    conn.abort()  # the tab closes: the blocked read ends by dropping the connection
+    thread.join(5)
+    assert state.get("out") == "connection_lost"  # never "ran" with 2,500 of 5,000 rows
+    assert "dropped to stop the statement" in state["message"]  # not "cancelled", not a bare "lost"
+    with pytest.raises(StatementError) as lost:
+        conn.run("SELECT 1")
+    assert lost.value.code == "connection_lost" and "dropped to stop the statement" in lost.value.message
+
+
+def test_a_kill_during_a_flagged_cancel_reads_connection_lost(conn):  # R-03b-T8a (5)
+    [[spid]] = one(conn, "SELECT @@SPID")
+    result = conn.run(ENDLESS)
+    assert len(result.fetch(500)) == 500
+    conn.cancel()  # between rows: only the flag
+    kill_mssql_session(spid)
+    with pytest.raises(StatementError) as lost:
+        result.fetch(500)
+    assert lost.value.code == "connection_lost"
+
+
+@pytest.mark.parametrize("option", ["NOEXEC", "PARSEONLY", "FMTONLY", "SHOWPLAN_XML", "SHOWPLAN_TEXT"])
+@pytest.mark.parametrize("manual", [False, True])
+def test_set_options_that_change_every_answer_leave_the_session_working(conn, option, manual):  # Important 2
+    conn.set_autocommit(not manual)
+    one(conn, f"SET {option} ON")
+    assert conn.autocommit() is not manual and not conn.in_transaction()  # no row or a plan: the cache stays
+    sets = read_all(conn, "SELECT id FROM dbo.big_table WHERE id = 1")
+    if option.startswith("SHOWPLAN"):
+        assert sets[0] and isinstance(sets[0][0][0], str)  # the plan reaches the user
+    one(conn, f"SET {option} OFF")
+    assert one(conn, "SELECT id FROM dbo.big_table WHERE id = 1") == [[1]]
+    assert one(conn, "SELECT @@OPTIONS & 2") == [[2 if manual else 0]]
+    conn.rollback()
+
+
+def test_for_json_and_for_xml_arrive_as_one_value(conn):  # minor: as SSMS joins the ~2,000-character rows
+    result = conn.run("SELECT TOP 300 id, label FROM dbo.big_table ORDER BY id FOR JSON PATH")
+    [column] = result.columns()
+    [[text]] = drain(result)
+    result.close()
+    assert column.category == "json" and len(json.loads(text)) == 300
+    result = conn.run("SELECT TOP 300 id FROM dbo.big_table ORDER BY id FOR XML PATH('r')")
+    [[xml]] = drain(result)
+    result.close()
+    assert result.columns()[0].type_name == "xml" and xml.count("<r>") == 300 and xml.startswith("<r><id>1</id>")
+
+
+def test_real_values_show_their_shortest_digits(conn):  # minor
+    result = conn.run("SELECT CAST(0.1 AS real) AS r, CAST(0.1 AS float) AS f, CAST(NULL AS real) AS n")
+    assert [c.type_name for c in result.columns()] == ["real", "float", "real"]
+    assert drain(result) == [[0.1, 0.1, None]]
+    result.close()
+
+
+def test_a_pause_after_transaction_words_reports_a_transaction(conn):  # minor: Ruling 17 in auto-commit mode
+    result = conn.run("BEGIN TRAN; " + ENDLESS)
+    assert len(result.fetch(500)) == 500
+    assert conn.in_transaction()  # rows unread: the state is unknown, a transaction is assumed
+    result.close()
+    assert conn.in_transaction()  # read from the server: BEGIN TRAN opened one
+    result = conn.run("COMMIT; " + ENDLESS)
+    assert len(result.fetch(500)) == 500 and conn.in_transaction()
+    result.close()
+    assert not conn.in_transaction()
+    result = conn.run(ENDLESS)  # no transaction word: the cached state stands while paused
+    assert len(result.fetch(500)) == 500 and not conn.in_transaction()
+    result.close()
 
 
 def test_tls_modes():

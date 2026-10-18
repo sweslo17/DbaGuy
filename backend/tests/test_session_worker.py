@@ -125,6 +125,55 @@ def test_cancel_of_a_running_statement_reaches_the_connection_once(started_worke
     assert conn.cancel_calls == 1
 
 
+def test_a_repeated_cancel_of_the_same_request_is_a_forced_one(started_worker):  # R-03b-T8a: the second Cancel
+    worker, conn, recorder = started_worker(Recorder())
+    execute(worker, "r", "hold")  # a statement a plain cancel does not stop
+    assert conn.blocked.wait(5)
+    worker.cancel("r")
+    time.sleep(0.2)
+    assert conn.interruptions == ["cancel"] and not recorder.of("r", "finished")
+    worker.cancel("r")
+    assert recorder.wait_for(finished("r"))
+    assert conn.interruptions == ["cancel", "force"]
+    conn.blocked.clear()
+    execute(worker, "s", "hold")  # the count belongs to one request: a new one starts again at a plain cancel
+    assert conn.blocked.wait(5)
+    worker.cancel("s")
+    time.sleep(0.2)
+    assert conn.interruptions == ["cancel", "force", "cancel"]
+    worker.cancel("s")
+    assert recorder.wait_for(finished("s"))
+
+
+def test_closing_the_session_aborts_the_running_statement(started_worker):  # R-03b-T8a: closing the tab forces
+    worker, conn, recorder = started_worker(Recorder())
+    execute(worker, "r", "hold")
+    assert conn.blocked.wait(5)
+    worker.close()
+    assert conn.interruptions == ["abort"] and conn.closed
+
+
+def test_a_timeout_never_forces(started_worker):  # a statement timeout behaves like the first Cancel only
+    worker, conn, recorder = started_worker(Recorder())
+    worker.submit(ExecuteCommand(request_id="t", sql="block", timeout_s=0.2))
+    assert recorder.wait_for(finished("t")).timed_out
+    assert conn.interruptions == ["cancel"]
+
+
+@pytest.mark.parametrize("sql, column", [("rows 3\x00", 7), ("SELECT 1;\n-- a\x00 b", 5)])
+def test_text_with_a_nul_character_never_reaches_the_connection(started_worker, sql, column):  # Important 3
+    worker, conn, recorder = started_worker(Recorder())
+    execute(worker, "n", sql)
+    done = recorder.wait_for(finished("n"))
+    [error] = recorder.of("n", "error")
+    assert error.code == "invalid_text" and "U+0000" in error.message
+    assert error.position.column == column and not done.cancelled
+    assert conn.runs == []  # drivers cut C strings at NUL: whatever follows it would be lost silently
+    worker.submit(ExportCommand(request_id="e", sql=sql, path="/tmp/never-written.csv", format=FormatKind.CSV))
+    recorder.wait_for(finished("e"))
+    assert recorder.of("e", "error")[0].code == "invalid_text" and conn.runs == []
+
+
 # ---- 5. queued and paused work can be cancelled; close() does not run the backlog ----
 
 def test_cancelled_queued_statement_never_runs(started_worker):

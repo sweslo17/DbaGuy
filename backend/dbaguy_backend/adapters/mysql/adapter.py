@@ -359,7 +359,7 @@ class MysqlConnection(DatabaseConnection):
         try:
             cursor.execute_verbatim(sql)
         except (mysql.connector.Error, UnicodeEncodeError) as exc:
-            error = self.statement_error(exc) if isinstance(exc, mysql.connector.Error) else invalid_text_error(sql, exc)
+            error = self.statement_error(exc) if isinstance(exc, mysql.connector.Error) else invalid_text_error(sql, exc.start)
             self._killed.clear()  # the statement is over: its flag must not reach the next call (R-03a-P4)
             with suppress(mysql.connector.Error):
                 cursor.close()
