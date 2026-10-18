@@ -26,7 +26,7 @@ from dbaguy_backend.storage.profile_store import ProfileStore
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
 from tests.support import (
     BASTION_PORT, MYSQL_HOST, MYSQL_PASSWORD, MYSQL_PORT, make_mysql_profile, mysql_driver_kwargs, mysql_procedure,
-    requires_mysql, requires_mysql_bastion,
+    requires_mysql, requires_mysql_bastion, scaled, unique_name,
 )
 from tests.test_ssh_tunnel import TEST_SSH_OPTIONS
 
@@ -217,7 +217,7 @@ def test_cancelling_a_call_between_its_result_sets_keeps_the_protocol_in_step(co
         with pytest.raises(StatementCancelled):
             result.next_result()  # the SLEEP ends early, SELECT 2 still arrives: it is a cancel all the same
         result.close()
-        assert time.monotonic() - started < 2.5
+        assert time.monotonic() - started < scaled(2.5)
         assert_next_statement_gets_its_own_rows(conn)
 
 
@@ -228,7 +228,7 @@ def test_closing_a_call_at_a_result_set_boundary_stops_the_procedure(conn):  # R
         assert result.fetch(5) == [[1]]  # the first set is read to its end; the procedure is still working
         started = time.monotonic()
         result.close()
-        assert time.monotonic() - started < 2
+        assert time.monotonic() - started < scaled(2)
     written = conn.run("SELECT COUNT(*) FROM zz_written")
     assert written.fetch(1) == [[0]]  # KILL QUERY stopped it before its INSERT
     written.close()
@@ -251,7 +251,7 @@ def give_up_on(conn, sql, monkeypatch):
     try:
         started = time.monotonic()
         result.close()
-        assert time.monotonic() - started < 1.5
+        assert time.monotonic() - started < scaled(1.5)
         assert not conn.in_transaction()  # the connection is gone, its transaction with it: no badge, no idle rollback
         with pytest.raises(StatementError) as info:
             conn.run("SELECT 1")
@@ -311,7 +311,7 @@ def test_a_call_that_swallows_the_kill_cannot_hold_its_close(conn, monkeypatch):
             assert result.fetch(5) == [[0]]
             started = time.monotonic()
             result.close()  # KILL QUERY is sent, yet the loop keeps sending a result set every 0.5 s
-            assert time.monotonic() - started < 3
+            assert time.monotonic() - started < scaled(3)
             assert not conn.in_transaction()
             with pytest.raises(StatementError) as info:
                 conn.run("SELECT 1")
@@ -339,7 +339,7 @@ def test_a_killed_call_that_only_finishes_its_tail_keeps_the_connection(conn, mo
             assert result.fetch(5) == [[1]]
             started = time.monotonic()
             result.close()  # the KILL cuts the first SLEEP short; the second runs its 2 s, then the CALL ends
-            assert 1.5 < time.monotonic() - started < 4  # past the 1 s limit, and still not given up
+            assert 1.5 < time.monotonic() - started < scaled(4)  # past the 1 s limit, and still not given up
             assert conn.in_transaction()  # the connection and its transaction survive
             rows = conn.run("SELECT COUNT(*) FROM zz_tx")
             assert rows.fetch(1) == [[1]]
@@ -445,7 +445,7 @@ def test_cancel_a_running_statement(conn):
     started = time.monotonic()
     with pytest.raises(StatementCancelled):
         conn.run("SELECT SLEEP(30)")
-    assert time.monotonic() - started < 2.5
+    assert time.monotonic() - started < scaled(2.5)
     assert conn.run("SELECT 1").fetch(1) == [[1]]
 
 
@@ -464,7 +464,7 @@ def test_cancel_mid_stream_then_reuse(conn):
     conn.cancel()
     with pytest.raises(StatementCancelled):
         drain(result)
-    assert time.monotonic() - started < 3
+    assert time.monotonic() - started < scaled(3)
     result.close()
     assert conn.run("SELECT 1").fetch(1) == [[1]]
 
@@ -507,57 +507,57 @@ def test_manual_commit_mode_and_transaction_state(conn):
 
 
 def test_a_deadlock_rollback_clears_the_transaction_flag(conn):  # R-03a-T9b: ERR packets carry no status flags
+    table = unique_name("zz_deadlock")
     owner = mysql.connector.connect(**mysql_driver_kwargs(autocommit=True))
-    owner.cmd_query("DROP TABLE IF EXISTS zz_deadlock")
-    owner.cmd_query("CREATE TABLE zz_deadlock (id INT PRIMARY KEY, v INT)")
-    owner.cmd_query("INSERT INTO zz_deadlock VALUES (1, 0), (2, 0)")
+    owner.cmd_query(f"CREATE TABLE {table} (id INT PRIMARY KEY, v INT)")
+    owner.cmd_query(f"INSERT INTO {table} VALUES (1, 0), (2, 0)")
     other = mysql.connector.connect(**mysql_driver_kwargs())
-    blocked = threading.Thread(target=other.cmd_query, args=("UPDATE zz_deadlock SET v = 2 WHERE id = 1",))
+    blocked = threading.Thread(target=other.cmd_query, args=(f"UPDATE {table} SET v = 2 WHERE id = 1",))
     try:
         conn.set_autocommit(False)
-        conn.run("UPDATE zz_deadlock SET v = 1 WHERE id = 1").close()
+        conn.run(f"UPDATE {table} SET v = 1 WHERE id = 1").close()
         assert conn.in_transaction()
         other.cmd_query("START TRANSACTION")
         # More rows changed: InnoDB rolls back the smaller transaction, ours.
-        other.cmd_query("INSERT INTO zz_deadlock SELECT id + 10, 0 FROM big_table WHERE id <= 100")
-        other.cmd_query("UPDATE zz_deadlock SET v = 2 WHERE id = 2")
+        other.cmd_query(f"INSERT INTO {table} SELECT id + 10, 0 FROM big_table WHERE id <= 100")
+        other.cmd_query(f"UPDATE {table} SET v = 2 WHERE id = 2")
         blocked.start()
         time.sleep(0.3)  # `other` now waits for our lock on row 1
         with pytest.raises(StatementError) as info:
-            conn.run("UPDATE zz_deadlock SET v = 1 WHERE id = 2")
+            conn.run(f"UPDATE {table} SET v = 1 WHERE id = 2")
         assert info.value.code == "1213"
         assert not conn.in_transaction()  # the server rolled our transaction back
     finally:
         if blocked.ident is not None:
-            blocked.join(5)
+            blocked.join(scaled(5))
         other.close()
         conn.rollback()
-        owner.cmd_query("DROP TABLE IF EXISTS zz_deadlock")
+        owner.cmd_query(f"DROP TABLE IF EXISTS {table}")
         owner.close()
 
 
 def test_a_failing_ddl_has_committed_and_the_flag_says_so(conn):  # R-03a-T9b
+    table = unique_name("zz_implicit")
     owner = mysql.connector.connect(**mysql_driver_kwargs(autocommit=True))
-    owner.cmd_query("DROP TABLE IF EXISTS zz_implicit")
-    owner.cmd_query("CREATE TABLE zz_implicit (id INT)")
+    owner.cmd_query(f"CREATE TABLE {table} (id INT)")
     try:
         conn.set_autocommit(False)
-        conn.run("INSERT INTO zz_implicit VALUES (1)").close()
+        conn.run(f"INSERT INTO {table} VALUES (1)").close()
         assert conn.in_transaction()
         with pytest.raises(StatementError) as info:
-            conn.run("CREATE TABLE zz_implicit (id INT)")  # MySQL commits before it runs DDL, even DDL that fails
+            conn.run(f"CREATE TABLE {table} (id INT)")  # MySQL commits before it runs DDL, even DDL that fails
         assert info.value.code == "1050"
         assert not conn.in_transaction()
         warnings = conn.run("SHOW WARNINGS")  # R-03a-T9e: reading the flags again keeps the diagnostics
         assert [row[1] for row in warnings.fetch(5)] == [1050]
         warnings.close()
         conn.rollback()
-        rows = conn.run("SELECT COUNT(*) FROM zz_implicit")
+        rows = conn.run(f"SELECT COUNT(*) FROM {table}")
         assert rows.fetch(1) == [[1]]  # committed: the rollback could not undo it
         rows.close()
     finally:
         conn.rollback()
-        owner.cmd_query("DROP TABLE IF EXISTS zz_implicit")
+        owner.cmd_query(f"DROP TABLE IF EXISTS {table}")
         owner.close()
 
 
@@ -679,7 +679,7 @@ def test_a_cancel_that_reached_the_server_before_its_statement_still_stops_it(co
     started = time.monotonic()
     with pytest.raises(StatementCancelled):
         conn.run(ENDLESS)  # the rows come back after the cancel: closing them must KILL again, not drain 10^10 rows
-    assert time.monotonic() - started < 1.5
+    assert time.monotonic() - started < scaled(1.5)
     monkeypatch.undo()
     assert_next_statement_gets_its_own_rows(conn)
 
@@ -765,7 +765,7 @@ def test_mysql_through_the_ssh_bastion_including_cancel(tmp_path):  # Review Foc
         started = time.monotonic()
         with pytest.raises(StatementCancelled):
             connection.run("SELECT SLEEP(30)")
-        assert time.monotonic() - started < 3
+        assert time.monotonic() - started < scaled(3)
         assert connection.run("SELECT 1").fetch(1) == [[1]]
     finally:
         lease.close()

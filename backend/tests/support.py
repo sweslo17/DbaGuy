@@ -46,6 +46,47 @@ BASTION_PORT = 2222
 SKIP_REASON = "dev databases not running: docker compose -f dev/docker-compose.yml up -d --build --wait"
 
 
+LOAD_FACTOR_ENV = "DBAGUY_TEST_LOAD_FACTOR"
+MAX_LOAD_FACTOR = 6.0
+
+
+def load_factor() -> float:
+    """How much slower than an idle machine the timing tests allow the machine to be right now: 1.0 (idle) up to
+    MAX_LOAD_FACTOR. It is the 1-minute load average per core (so it lags a sudden burst by a little), or the value of
+    DBAGUY_TEST_LOAD_FACTOR when that is set (to force a factor, or 1 to get the idle bounds back)."""
+    override = os.environ.get(LOAD_FACTOR_ENV)
+    try:
+        value = float(override) if override else os.getloadavg()[0] / (os.cpu_count() or 1)
+    except (ValueError, OSError):
+        value = 1.0
+    return min(MAX_LOAD_FACTOR, max(1.0, value))
+
+
+def scaled(seconds: float) -> float:
+    """A hard deadline (an upper bound: "this must end within") stretched by the machine's load. Only for upper bounds
+    that guard against a hang or a missing cancel (a 30 s WAITFOR, 10^10 rows, a stuck thread), which stay far above the
+    stretched value; never for a lower bound (a wait the product promises) or a product constant such as WEDGE_S."""
+    return seconds * load_factor()
+
+
+def unique_name(prefix: str) -> str:
+    """`prefix` with a random suffix: an object a test creates on the shared dev server (a global temp table, a table,
+    a procedure). Several test runs share one server (an agent's run beside another's), and a fixed name lets one run
+    drop or lock what another is in the middle of using."""
+    return f"{prefix}_{uuid4().hex[:8]}"
+
+
+def wait_until(predicate, timeout: float, interval: float = 0.01) -> bool:
+    """Polls `predicate()` until it is true (True) or `timeout` seconds have passed (False). `timeout` is used as given:
+    pass scaled(...) for a deadline."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+    return True
+
+
 def _port_open(port: int) -> bool:
     try:
         socket.create_connection(("127.0.0.1", port), timeout=1).close()
@@ -137,8 +178,10 @@ def kill_mssql_session(spid: int) -> None:
 
 @contextmanager
 def mysql_procedure(name: str, body: str) -> Iterator[str]:
-    """A stored procedure in the dev `dbaguy` database for one test, dropped afterwards. `name` starts with `zz_`."""
+    """A stored procedure in the dev `dbaguy` database for one test, dropped afterwards. `name` starts with `zz_`; the
+    procedure gets a random suffix (the yielded name), so concurrent runs never share one."""
     assert name.startswith("zz_")
+    name = unique_name(name)
     owner = mysql.connector.connect(**mysql_driver_kwargs(autocommit=True))
     try:
         owner.cmd_query(f"DROP PROCEDURE IF EXISTS {name}")

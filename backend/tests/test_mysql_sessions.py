@@ -10,7 +10,7 @@ from dbaguy_backend.domain.execution import (
 from dbaguy_backend.sessions.worker import SessionWorker
 from tests.fake_db import FakeLease
 from tests.support import (
-    MYSQL_HOST, MYSQL_PASSWORD, MYSQL_PORT, make_mysql_profile, mysql_procedure, requires_mysql,
+    MYSQL_HOST, MYSQL_PASSWORD, MYSQL_PORT, make_mysql_profile, mysql_procedure, requires_mysql, scaled,
 )
 from tests.test_sessions import Recorder, finished, paused
 
@@ -31,14 +31,14 @@ def mysql_worker():
 
 def run(worker, rec, rid, sql, page_size=500):
     worker.submit(ExecuteCommand(request_id=rid, sql=sql, page_size=page_size))
-    done = rec.wait_for(finished(rid), timeout=30)
+    done = rec.wait_for(finished(rid), timeout=scaled(30))
     assert not rec.of(rid, "error"), rec.of(rid, "error")[0].message
     return done
 
 
 def command(worker, rec, cmd):
     worker.submit(cmd)
-    done = rec.wait_for(finished(cmd.request_id), timeout=30)
+    done = rec.wait_for(finished(cmd.request_id), timeout=scaled(30))
     assert not rec.of(cmd.request_id, "error")
     return done
 
@@ -46,8 +46,8 @@ def command(worker, rec, cmd):
 def test_statement_timeout_on_mysql(mysql_worker):
     worker, rec = mysql_worker
     worker.submit(ExecuteCommand(request_id="t", sql="SELECT SLEEP(5)", timeout_s=0.3))
-    done = rec.wait_for(finished("t"), timeout=30)
-    assert done.timed_out and done.cancelled and done.elapsed_ms < 3000
+    done = rec.wait_for(finished("t"), timeout=scaled(30))
+    assert done.timed_out and done.cancelled and done.elapsed_ms < scaled(3000)
     assert rec.of("t", "message")[-1].text == "Timed out after 0.3 s"
     assert not run(worker, rec, "u", "SELECT 1").cancelled
 
@@ -58,12 +58,12 @@ def test_cancel_inside_a_manual_transaction_keeps_the_transaction(mysql_worker):
     run(worker, rec, "c", "CREATE TEMPORARY TABLE keep_rows (id INT)")
     assert run(worker, rec, "i", "INSERT INTO keep_rows VALUES (1)").in_transaction
     worker.submit(ExecuteCommand(request_id="s", sql="SELECT SLEEP(30)"))
-    rec.wait_for(lambda e: e.type == "started" and e.request_id == "s", timeout=10)
+    rec.wait_for(lambda e: e.type == "started" and e.request_id == "s", timeout=scaled(10))
     time.sleep(0.3)
     started = time.monotonic()
     worker.cancel("s")
-    done = rec.wait_for(finished("s"), timeout=10)
-    assert done.cancelled and time.monotonic() - started < 2
+    done = rec.wait_for(finished("s"), timeout=scaled(10))
+    assert done.cancelled and time.monotonic() - started < scaled(2)
     assert done.in_transaction  # KILL QUERY ends the statement, not the transaction
     assert not command(worker, rec, CommitCommand(request_id="k")).in_transaction
     run(worker, rec, "n", "SELECT COUNT(*) FROM keep_rows")
@@ -76,7 +76,7 @@ def test_paused_large_select_inside_a_transaction_does_not_end_it(mysql_worker):
     run(worker, rec, "t", "CREATE TEMPORARY TABLE keep_page (id INT)")
     run(worker, rec, "i", "INSERT INTO keep_page VALUES (1)")
     worker.submit(ExecuteCommand(request_id="big", sql=LARGE_SELECT, page_size=500))
-    assert rec.wait_for(paused("big", 500), timeout=30).has_more
+    assert rec.wait_for(paused("big", 500), timeout=scaled(30)).has_more
     assert not command(worker, rec, CommitCommand(request_id="c")).in_transaction  # discards the paused result first
     run(worker, rec, "n", "SELECT COUNT(*) FROM keep_page")
     assert rec.of("n", "rows")[0].rows == [[1]]
@@ -97,9 +97,9 @@ def test_a_call_paused_between_its_result_sets_keeps_the_protocol_in_step(mysql_
     # 501 rows: the page of 500 plus the peeked row reads the first set's end, while the second set is still coming.
     # A CALL marks auto-commit for re-reading; the pause must not send that query in between (Commands out of sync).
     worker.submit(ExecuteCommand(request_id="p", sql="CALL two_results(501)", page_size=500))
-    assert rec.wait_for(paused("p", 500), timeout=30).has_more
+    assert rec.wait_for(paused("p", 500), timeout=scaled(30)).has_more
     worker.submit(FetchMoreCommand(request_id="p", count=500))
-    done = rec.wait_for(finished("p"), timeout=30)
+    done = rec.wait_for(finished("p"), timeout=scaled(30))
     assert not rec.of("p", "error") and not done.cancelled
     assert [e.rows for e in rec.of("p", "rows")][-2:] == [[[501, "row 501"]], [[100000]]]
     assert not run(worker, rec, "n", "SELECT 1").cancelled
@@ -111,9 +111,9 @@ def test_cancelling_a_call_during_its_sleep_leaves_the_next_statement_its_own_ro
     # A SLEEP inside a procedure swallows KILL QUERY: the procedure goes on and still sends SELECT 2.
     with mysql_procedure("zz_sleep_between", "SELECT 1 AS first; DO SLEEP(3); SELECT 2 AS second;") as name:
         worker.submit(ExecuteCommand(request_id="c", sql=f"CALL {name}()"))
-        rec.wait_for(lambda e: e.type == "result_set_end" and e.request_id == "c", timeout=10)
+        rec.wait_for(lambda e: e.type == "result_set_end" and e.request_id == "c", timeout=scaled(10))
         time.sleep(0.3)  # the worker is now waiting for the next result set, during the SLEEP
         worker.cancel("c")
-        assert rec.wait_for(finished("c"), timeout=10).cancelled
+        assert rec.wait_for(finished("c"), timeout=scaled(10)).cancelled
     run(worker, rec, "n", "SELECT 'next' AS n")
     assert rec.of("n", "rows")[0].rows == [["next"]]

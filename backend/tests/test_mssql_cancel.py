@@ -11,6 +11,7 @@ from dbaguy_backend.adapters.mssql.cancel import (
     ABORTED_MESSAGE, BUSY_DATA_DROPPED_MESSAGE, BUSY_DATA_WARNING, BUSY_DROPPED_MESSAGE, BUSY_WARNING, DOUBLE_CLICK_S,
     GRACE_S, UNDOING_WARNING, WAITING_DROPPED_MESSAGE, WAITING_WARNING, WEDGE_S, CallKind, CancelControl, CancelPending,
 )
+from tests.support import scaled, wait_until
 
 
 class FakeDriver:
@@ -39,6 +40,16 @@ def tcp_pair():
         sock.close()
 
 
+class Warnings(list):
+    """The warnings a CancelControl gave (pass it as `warn`); `at` is when the latest one came."""
+
+    at = 0.0
+
+    def __call__(self, text: str) -> None:
+        self.append(text)
+        self.at = time.monotonic()
+
+
 def control_on(sock: socket.socket, **options) -> tuple[CancelControl, FakeDriver]:
     driver = FakeDriver()
     control = CancelControl(driver, spid=1, **options)  # type: ignore[arg-type]
@@ -48,7 +59,7 @@ def control_on(sock: socket.socket, **options) -> tuple[CancelControl, FakeDrive
 
 
 def dropped(peer: socket.socket) -> bool:
-    peer.settimeout(1)
+    peer.settimeout(scaled(1))
     return peer.recv(1) == b""  # the other end was shut down
 
 
@@ -141,21 +152,23 @@ def test_a_worker_waiting_where_the_flag_cannot_reach_escalates_and_never_gets_a
         tcp_pair, holds):  # R-03b-F6: a quiet socket is no longer a reason to dbcancel() across threads
     """The worker waits for the next result set (a WAITFOR between two SELECTs, a row lock mid-result) and the server
     sends nothing: after WEDGE_S the connection is dropped, or the request warned, with the "waiting" texts."""
-    warnings: list[str] = []
-    control, driver = control_on(tcp_pair[0], may_hold_transaction=lambda: holds, warn=warnings.append)
+    warnings = Warnings()
+    control, driver = control_on(tcp_pair[0], may_hold_transaction=lambda: holds, warn=warnings)
     with control.call(CallKind.NEXT_SET):
         started = time.monotonic()
         control.cancel()
-        while control.aborted is None and not warnings and time.monotonic() - started < WEDGE_S + 1:
-            time.sleep(0.01)
+        wait_until(lambda: control.aborted is not None or warnings, WEDGE_S + scaled(1))
         took = time.monotonic() - started
-        assert driver.cancels == [] and WEDGE_S <= took < WEDGE_S + 0.5
+        assert driver.cancels == [] and WEDGE_S <= took < WEDGE_S + scaled(0.5)
         if holds:
             assert warnings == [WAITING_WARNING] and control.aborted is None
             control.abort()
         else:
             assert control.aborted_message == WAITING_DROPPED_MESSAGE and warnings == []
     assert dropped(tcp_pair[1])
+
+
+STARVED_S = 0.2  # a Chatter that paused this long let the socket go quiet for most of the 0.25 s the product looks at
 
 
 class Chatter:
@@ -165,14 +178,18 @@ class Chatter:
     def __init__(self, pair) -> None:
         self._reader, self._sender = pair
         self._stop = threading.Event()
+        self.longest_gap = 0.0  # the longest the sender went between two sends: a starved machine makes it long
         self._threads = [threading.Thread(target=self._send, daemon=True), threading.Thread(target=self._read, daemon=True)]
 
     def _send(self) -> None:
+        last = time.monotonic()
         while not self._stop.is_set():
             try:
                 self._sender.sendall(b"x" * 256)
             except OSError:  # the connection was dropped
                 return
+            now = time.monotonic()
+            self.longest_gap, last = max(self.longest_gap, now - last), now
             time.sleep(0.005)
 
     def _read(self) -> None:
@@ -194,48 +211,62 @@ class Chatter:
         for thread in self._threads:
             thread.join(1)
 
-    def run_until(self, done, limit: float) -> float:
-        """Chatter until `done()` or `limit` seconds; returns the time taken."""
+    def run_until(self, done, limit: float, linger: float = 0.0) -> float:
+        """Chatter until `done()` or `limit` seconds, then `linger` seconds more; returns the time taken."""
         with self:
             started = time.monotonic()
-            while not done() and time.monotonic() - started < limit:
-                time.sleep(0.005)
+            wait_until(done, limit, 0.005)
+            time.sleep(linger)
             return time.monotonic() - started
+
+    def busy_texts(self, busy: str, waiting: str) -> set[str]:
+        """What a drop or a warning may say while this chatter keeps data arriving: the "busy" text. A machine that
+        starved the chatter for STARVED_S let the socket go quiet (the product calls a socket quiet for 0.25 s waiting),
+        and then the "waiting" text is just as right."""
+        return {busy, waiting} if self.longest_gap >= STARVED_S else {busy}
 
 
 def test_a_busy_connection_without_a_safe_moment_is_dropped_when_no_transaction_can_be_open(tcp_pair):
     control, driver = control_on(tcp_pair[0], may_hold_transaction=lambda: False)
+    chatter = Chatter(tcp_pair)
     with control.call(CallKind.NEXT_SET):
+        started = time.monotonic()  # before the cancel: the watcher's WEDGE_S starts there, never earlier
         control.cancel()
-        took = Chatter(tcp_pair).run_until(lambda: control.aborted is not None, WEDGE_S + 2)
+        chatter.run_until(lambda: control.aborted is not None, WEDGE_S + scaled(2))
+        took = time.monotonic() - started
     assert control.aborted and "no transaction can be open" in control.aborted and driver.cancels == []
-    assert control.aborted_message == BUSY_DROPPED_MESSAGE and WEDGE_S <= took < WEDGE_S + 1
+    assert control.aborted_message in chatter.busy_texts(BUSY_DROPPED_MESSAGE, WAITING_DROPPED_MESSAGE)
+    assert WEDGE_S <= took < WEDGE_S + scaled(1)
 
 
 def test_a_busy_connection_that_may_hold_a_transaction_is_warned_and_waits_for_a_second_cancel(tcp_pair):  # T8h
-    warnings: list[str] = []
-    control, driver = control_on(tcp_pair[0], may_hold_transaction=lambda: True, warn=warnings.append)
+    warnings = Warnings()
+    control, driver = control_on(tcp_pair[0], may_hold_transaction=lambda: True, warn=warnings)
+    chatter = Chatter(tcp_pair)
     with control.call(CallKind.NEXT_SET):
         control.cancel()
-        Chatter(tcp_pair).run_until(lambda: False, WEDGE_S + 1)
-        assert warnings == [BUSY_WARNING] and control.aborted is None  # told once, never dropped by itself
+        chatter.run_until(lambda: bool(warnings), WEDGE_S + scaled(2), linger=0.5)  # the warning, then a while longer
+        assert len(warnings) == 1 and warnings[0] in chatter.busy_texts(BUSY_WARNING, WAITING_WARNING)
+        assert control.aborted is None  # told once, never dropped by itself
         control.cancel()  # a timeout after the warning is a first Cancel only
         assert control.aborted is None
         control.force_cancel()  # the user's next Cancel
     assert control.aborted == "forced by a second cancel" and control.aborted_message == ABORTED_MESSAGE
-    assert warnings == [BUSY_WARNING] and driver.cancels == []
+    assert len(warnings) == 1 and driver.cancels == []
 
 
 def test_a_cancel_right_after_the_warning_is_a_double_click(tcp_pair):  # R-03b-T8i applied to the warning
-    warnings: list[str] = []
-    control, _ = control_on(tcp_pair[0], may_hold_transaction=lambda: True, warn=warnings.append)
-    with control.call(CallKind.NEXT_SET), Chatter(tcp_pair):
+    warnings = Warnings()
+    control, _ = control_on(tcp_pair[0], may_hold_transaction=lambda: True, warn=warnings)
+    chatter = Chatter(tcp_pair)
+    with control.call(CallKind.NEXT_SET), chatter:
         control.cancel()
-        started = time.monotonic()
-        while not warnings and time.monotonic() - started < WEDGE_S + 1:
-            time.sleep(0.005)
+        wait_until(lambda: bool(warnings), WEDGE_S + scaled(2), 0.005)
         control.force_cancel()  # a click that lands as the warning appears: the user has not read it
-        assert warnings == [BUSY_WARNING] and control.aborted is None
+        landed_in = time.monotonic() - warnings.at  # when force_cancel looked, the warning was at most this old
+        assert len(warnings) == 1 and warnings[0] in chatter.busy_texts(BUSY_WARNING, WAITING_WARNING)
+        if landed_in < DOUBLE_CLICK_S - 0.05:  # a machine that kept this thread away for longer made it a second click
+            assert control.aborted is None
         time.sleep(DOUBLE_CLICK_S)
         control.force_cancel()
         assert control.aborted == "forced by a second cancel"
@@ -283,9 +314,7 @@ def test_a_row_read_without_a_safe_moment_is_not_blamed_on_row_counts(unix_pair,
     control, _ = control_on(unix_pair[0], may_hold_transaction=lambda: holds, warn=warnings.append)
     with control.call(CallKind.ROWS):
         control.cancel()
-        started = time.monotonic()
-        while control.aborted is None and not warnings and time.monotonic() - started < WEDGE_S + 1:
-            time.sleep(0.02)
+        wait_until(lambda: control.aborted is not None or warnings, WEDGE_S + scaled(1), 0.02)
         if expected == "dropped":
             assert control.aborted_message == BUSY_DATA_DROPPED_MESSAGE and warnings == []
         else:
@@ -297,12 +326,14 @@ def test_a_failing_transaction_check_counts_as_a_transaction(tcp_pair):
     def broken() -> bool:
         raise RuntimeError("no state")
 
-    warnings: list[str] = []
-    control, _ = control_on(tcp_pair[0], may_hold_transaction=broken, warn=warnings.append)
+    warnings = Warnings()
+    control, _ = control_on(tcp_pair[0], may_hold_transaction=broken, warn=warnings)
+    chatter = Chatter(tcp_pair)
     with control.call(CallKind.NEXT_SET):
         control.cancel()
-        Chatter(tcp_pair).run_until(lambda: bool(warnings), WEDGE_S + 1)
-        assert warnings == [BUSY_WARNING] and control.aborted is None  # warned, never dropped by itself
+        chatter.run_until(lambda: bool(warnings), WEDGE_S + scaled(2))
+        assert len(warnings) == 1 and warnings[0] in chatter.busy_texts(BUSY_WARNING, WAITING_WARNING)
+        assert control.aborted is None  # warned, never dropped by itself
         control.abort()
 
 

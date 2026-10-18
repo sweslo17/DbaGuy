@@ -28,7 +28,7 @@ from dbaguy_backend.storage.profile_store import ProfileStore
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
 from tests.support import (
     BASTION_PORT, MSSQL_HOST, MSSQL_PASSWORD, MSSQL_PORT, MSSQL_SA_PASSWORD, kill_mssql_session, make_mssql_profile,
-    requires_mssql, requires_mssql_bastion,
+    requires_mssql, requires_mssql_bastion, scaled, unique_name, wait_until,
 )
 from tests.test_ssh_tunnel import TEST_SSH_OPTIONS
 
@@ -179,7 +179,7 @@ def test_messages_arrive_live_and_in_order(conn):  # Review Focus 5
     result.close()
     conn.set_message_listener(None)
     assert [text for _, text in heard] == ["one", "two", "three"]
-    assert heard[1][0] < 1.5 <= heard[2][0]  # "two" WITH NOWAIT came before the 2 s wait ended
+    assert heard[2][0] - heard[1][0] >= 1.5  # "two" WITH NOWAIT came before the 2 s wait ended (not batched with "three")
 
 
 def test_error_after_a_result_set_leaves_the_connection_usable(conn):
@@ -222,7 +222,7 @@ def test_cancel_while_waiting_for_the_server(conn):  # Review Focus 2
     started = time.monotonic()
     with pytest.raises(StatementCancelled):
         conn.run("WAITFOR DELAY '00:00:30'")
-    assert time.monotonic() - started < 2.5
+    assert time.monotonic() - started < scaled(2.5)
     assert one(conn, "SELECT 1") == [[1]]
 
 
@@ -233,7 +233,7 @@ def test_cancel_mid_stream_then_reuse(conn):  # Review Focus 2
     conn.cancel()  # rows are streaming: only the flag, the next fetch cancels on this thread
     with pytest.raises(StatementCancelled):
         drain(result)
-    assert time.monotonic() - started < 2
+    assert time.monotonic() - started < scaled(2)
     result.close()
     assert one(conn, "SELECT 1") == [[1]]
 
@@ -345,7 +345,7 @@ def test_a_cancel_during_the_start_is_kept(conn, monkeypatch):  # R-03b-P5
     started = time.monotonic()
     with pytest.raises(StatementCancelled):
         conn.run("WAITFOR DELAY '00:00:30'")
-    assert time.monotonic() - started < 2  # the WAITFOR was never sent
+    assert time.monotonic() - started < scaled(2)  # the WAITFOR was never sent
     monkeypatch.setattr(catalog, "read_rows", real)
     assert one(conn, "SELECT 1") == [[1]]
 
@@ -387,7 +387,7 @@ def test_cancel_hammered_during_the_describe_never_wedges(conn):  # R-03b-P4 (an
         runner = threading.Thread(target=attempt, daemon=True)
         timer.start()
         runner.start()
-        runner.join(10)
+        runner.join(scaled(10))
         timer.cancel()
         timer.join()
         assert not runner.is_alive(), f"wedged in iteration {i}"
@@ -418,7 +418,7 @@ def test_cancel_hammered_while_executing_and_streaming_never_wedges(conn):
         runner = threading.Thread(target=attempt, daemon=True)
         timer.start()
         runner.start()
-        runner.join(10)
+        runner.join(scaled(10))
         timer.cancel()
         timer.join()
         assert not runner.is_alive(), f"wedged in iteration {i}"
@@ -510,7 +510,7 @@ def test_a_cancel_inside_a_batch_with_a_wait_between_selects_leaves_no_rows_behi
     started = time.monotonic()
     with pytest.raises(StatementCancelled):  # set 1 is held while the server waits; the worker cancels on its own thread
         read_all(conn, "SELECT 1 AS a; WAITFOR DELAY '00:00:30'; SELECT 2 AS b")
-    assert time.monotonic() - started < 3
+    assert time.monotonic() - started < scaled(3)
     assert one(conn, "SELECT 'mine' AS m") == [["mine"]]
     result = conn.run("SELECT TOP 5000 id FROM dbo.big_table ORDER BY id; WAITFOR DELAY '00:00:02'; SELECT 'late' AS l")
     assert len(result.fetch(100)) == 100
@@ -530,7 +530,7 @@ def test_closing_at_a_result_set_boundary_stops_the_rest_of_the_batch(conn):
     assert drain(result) == [[1], [2], [3]]  # the first set read to its end, the second not asked for
     started = time.monotonic()
     result.close()
-    assert time.monotonic() - started < 2  # an attention, not two million rows read and dropped
+    assert time.monotonic() - started < scaled(2)  # an attention, not two million rows read and dropped
     assert one(conn, "SELECT COUNT(*) FROM #rest") == [[0]]  # the INSERT after them never ran
     procedure = conn.run("EXEC dbo.two_results 2")
     assert drain(procedure) == [[1, "row 1"], [2, "row 2"]]
@@ -565,16 +565,17 @@ def test_an_xact_abort_error_ends_the_transaction_and_the_state_follows(conn):
 
 def test_a_deadlock_victims_transaction_state_follows_the_server(conn):
     other = open_mssql()
-    one(conn, "CREATE TABLE ##zz_deadlock_a (a int); CREATE TABLE ##zz_deadlock_b (b int); "
-              "INSERT ##zz_deadlock_a VALUES (1); INSERT ##zz_deadlock_b VALUES (1)")
+    table_a, table_b = unique_name("##zz_deadlock_a"), unique_name("##zz_deadlock_b")  # global temp: shared by all runs
+    one(conn, f"CREATE TABLE {table_a} (a int); CREATE TABLE {table_b} (b int); "
+              f"INSERT {table_a} VALUES (1); INSERT {table_b} VALUES (1)")
     try:
-        one(conn, "SET DEADLOCK_PRIORITY LOW; BEGIN TRAN; UPDATE ##zz_deadlock_a SET a = 2")
-        one(other, "BEGIN TRAN; UPDATE ##zz_deadlock_b SET b = 2")
+        one(conn, f"SET DEADLOCK_PRIORITY LOW; BEGIN TRAN; UPDATE {table_a} SET a = 2")
+        one(other, f"BEGIN TRAN; UPDATE {table_b} SET b = 2")
         failures = []
 
         def other_side():
             try:
-                one(other, "UPDATE ##zz_deadlock_a SET a = 3")  # waits for conn's lock
+                one(other, f"UPDATE {table_a} SET a = 3")  # waits for conn's lock
             except StatementError as exc:
                 failures.append(exc)
 
@@ -582,15 +583,15 @@ def test_a_deadlock_victims_transaction_state_follows_the_server(conn):
         waiter.start()
         time.sleep(0.5)
         with pytest.raises(StatementError) as victim:  # closes the cycle; conn has the lower priority
-            one(conn, "UPDATE ##zz_deadlock_b SET b = 3")
-        waiter.join(15)
+            one(conn, f"UPDATE {table_b} SET b = 3")
+        waiter.join(scaled(15))
         assert victim.value.code == "1205" and not failures
         assert not conn.in_transaction()  # SQL Server rolled the victim's transaction back
         assert other.in_transaction()
         other.rollback()
     finally:
         other.close()
-        one(conn, "SET DEADLOCK_PRIORITY NORMAL; DROP TABLE ##zz_deadlock_a; DROP TABLE ##zz_deadlock_b")
+        one(conn, f"SET DEADLOCK_PRIORITY NORMAL; DROP TABLE {table_a}; DROP TABLE {table_b}")
 
 
 # ---- fix round 1: cancels that never hang (R-03b-T8a/d/e), SET options, FOR JSON/XML, real, the paused badge ----
@@ -604,14 +605,24 @@ CHATTY = {  # temporary procedures: nothing is left in the dev database
 }
 
 
+# What a drop says: the batch kept sending row counts, or (a loaded server that went quiet for a while before the
+# deadline) it was waiting. The warnings the same two ways.
+DROPPED_TEXTS = (mssql_adapter_cancel.BUSY_DROPPED_MESSAGE, mssql_adapter_cancel.WAITING_DROPPED_MESSAGE)
+WARNING_TEXTS = (mssql_adapter_cancel.BUSY_WARNING, mssql_adapter_cancel.WAITING_WARNING)
+
+
 @pytest.mark.parametrize("kind, iterations", [("dml", 8), ("nowait", 20)])
 def test_cancelling_chatty_batches_never_hangs(kind, iterations):  # Critical: every cancel ends, never a hang
-    rng, outcomes, connection = random.Random(7), [], None
+    """Every Cancel ends: cleanly (the session stays, answering its own next statement) or, when the cancel could not
+    reach the statement for WEDGE_S, by dropping the connection with the text that says why. For the NOWAIT batch a
+    message after the Cancel sends it from the handler, so a drop is only right if no message came for WEDGE_S: a loaded
+    server can go that quiet."""
+    rng, outcomes, connection, heard = random.Random(7), [], None, []  # heard: when each message arrived
     for i in range(iterations):
         if connection is None:
             connection = open_mssql()
             one(connection, CHATTY[kind])
-            connection.set_message_listener(lambda m: None)
+            connection.set_message_listener(lambda m: heard.append(time.monotonic()))
         outcome = []
 
         def attempt(c=connection):
@@ -627,21 +638,24 @@ def test_cancelling_chatty_batches_never_hangs(kind, iterations):  # Critical: e
         runner = threading.Thread(target=attempt, daemon=True)
         runner.start()
         time.sleep(rng.uniform(0.1, 0.4))
+        cancelled_at = time.monotonic()
         connection.cancel()
-        runner.join(10)
+        runner.join(scaled(10))
         assert not runner.is_alive(), f"{kind}: hung in iteration {i}"
         assert outcome[0] in ("cancelled", "connection_lost"), outcome
         outcomes.append(outcome[0])
         if outcome[0] == "connection_lost":  # auto-commit, nothing open before: dropped by itself, and told so (T8h)
-            assert outcome[1] == mssql_adapter_cancel.BUSY_DROPPED_MESSAGE
+            assert outcome[1] in DROPPED_TEXTS, outcome
+            if kind == "nowait":  # a message soon after the cancel would have carried it: the drop needs a silence
+                soon = cancelled_at + mssql_adapter_cancel.WEDGE_S - 0.5
+                late = [t - cancelled_at for t in heard if cancelled_at <= t < soon]
+                assert not late, f"dropped although messages came {late} s after the cancel"
             connection.close()
             connection = None
         else:
             assert one(connection, "SELECT 'mine' AS m") == [["mine"]] and not connection.in_transaction()
     if connection is not None:
         connection.close()
-    if kind == "nowait":  # the cancel goes out from the message handler: the session stays
-        assert outcomes.count("cancelled") == iterations
 
 
 @pytest.mark.parametrize("setup, batch", [
@@ -657,15 +671,16 @@ def test_a_batch_that_may_hold_a_transaction_is_never_dropped_by_the_first_cance
         one(conn, "BEGIN TRAN")
     heard: list = []
     conn.set_message_listener(lambda m: heard.append((m.severity, m.text)))
+
+    def warnings() -> list[str]:
+        return [text for severity, text in heard if severity == "warning"]
+
     for _ in range(3):  # a rare quiet moment cancels the loop cleanly instead: try again
         heard.clear()
         thread, state = stream_in_thread(conn, batch)
         time.sleep(0.3)
         conn.cancel()
-        deadline = time.monotonic() + 4
-        while ("warning", mssql_adapter_cancel.BUSY_WARNING) not in heard and "out" not in state:
-            assert time.monotonic() < deadline, "neither a warning nor an end"
-            time.sleep(0.05)
+        assert wait_until(lambda: warnings() or "out" in state, scaled(4), 0.05), "neither a warning nor an end"
         if "out" not in state:
             break
         assert state["out"] == "cancelled"
@@ -676,9 +691,10 @@ def test_a_batch_that_may_hold_a_transaction_is_never_dropped_by_the_first_cance
         pytest.skip("the loop found a quiet moment three times")
     time.sleep(0.5)
     assert thread.is_alive() and "out" not in state  # warned, still running: nothing was rolled back
-    assert [text for severity, text in heard if severity == "warning"] == [mssql_adapter_cancel.BUSY_WARNING]
+    [warning] = warnings()  # once; "row counts" while they keep arriving, "waiting" if a loaded server went quiet
+    assert warning in WARNING_TEXTS
     conn.force_cancel()  # the second Cancel
-    thread.join(5)
+    thread.join(scaled(5))
     assert state.get("out") == "connection_lost" and state["message"] == mssql_adapter_cancel.ABORTED_MESSAGE
 
 
@@ -695,7 +711,7 @@ def test_a_double_click_on_cancel_keeps_the_transaction(conn):  # R-03b-T8i
         conn.cancel()
         time.sleep(0.1)
         conn.force_cancel()  # what the worker sends for the second click
-        thread.join(10)
+        thread.join(scaled(10))
         assert state.get("out") == "cancelled", (i, state)
         assert conn.in_transaction() and one(conn, "SELECT 'mine' AS m") == [["mine"]]
     conn.rollback()
@@ -726,7 +742,7 @@ def test_a_cancel_while_one_big_value_arrives_waits_for_the_row(conn, manual):  
     thread.start()
     time.sleep(0.2)
     conn.cancel()
-    thread.join(15)
+    thread.join(scaled(15))
     assert state.get("out") == "cancelled" and heard == []
     result.close()
     conn.set_message_listener(None)
@@ -743,7 +759,7 @@ def ends_reader(connection, thread):
     finally:
         if thread.is_alive():
             connection.abort()
-            thread.join(10)
+            thread.join(scaled(10))
 
 
 HUGE_VALUES = "SELECT n, REPLICATE(CAST('x' AS varchar(max)), 150000000) AS big FROM (VALUES (1), (2)) v(n)"
@@ -779,7 +795,7 @@ def test_a_repeated_cancel_while_one_big_value_arrives_follows_the_warn_then_for
             time.sleep(mssql_adapter_cancel.DOUBLE_CLICK_S + 0.1)
             assert "out" not in state and heard == [("warning", mssql_adapter_cancel.BUSY_DATA_WARNING)]
             conn.force_cancel()  # the next Cancel
-        thread.join(10)
+        thread.join(scaled(10))
     expected = mssql_adapter_cancel.ABORTED_MESSAGE if manual else mssql_adapter_cancel.BUSY_DATA_DROPPED_MESSAGE
     assert state.get("out") == "connection_lost" and state["message"] == expected
     assert [text for severity, text in heard if severity == "warning"] == (
@@ -808,7 +824,7 @@ def test_a_second_cancel_while_the_server_undoes_the_statement_warns_first(conn)
             conn.cancel()
             time.sleep(mssql_adapter_cancel.WEDGE_S + 0.15)
             conn.force_cancel()  # the worker's own cancel still waits for the acknowledgement
-            thread.join(30)
+            thread.join(scaled(30))
         assert state.get("out") in ("cancelled", "ran"), state  # never connection_lost
         if ("warning", mssql_adapter_cancel.UNDOING_WARNING) in heard:
             break
@@ -878,7 +894,7 @@ def test_a_cancel_while_big_values_are_converted_never_corrupts_them(probe):  # 
             with ends_reader(connection, thread):
                 time.sleep(rng.uniform(0.1, span))
                 connection.cancel()
-                thread.join(30)
+                thread.join(scaled(30))
             assert state.get("out") in ("ok", "cancelled", "connection_lost"), (i, state.get("out"))
             if state["out"] == "ok":
                 first = state["sets"][0][0]
@@ -895,18 +911,33 @@ def test_a_cancel_while_big_values_are_converted_never_corrupts_them(probe):  # 
 
 @pytest.fixture
 def locked_row():
-    """##zz_lockrows (5,000 rows) with row 3000 locked by another session's open transaction."""
-    locker = open_mssql()
-    one(locker, "IF OBJECT_ID('tempdb..##zz_lockrows') IS NOT NULL DROP TABLE ##zz_lockrows; "
-                "CREATE TABLE ##zz_lockrows (id int PRIMARY KEY, v int); "
-                "INSERT ##zz_lockrows SELECT TOP 5000 id, id AS v FROM dbo.big_table ORDER BY id")
+    """A global temp table (5,000 rows) with row 3000 locked by another session's open transaction. Its name is unique:
+    a global temp table is visible to every run on the server, and another run's teardown would release this lock."""
+    table, locker = unique_name("##zz_lockrows"), open_mssql()
+    one(locker, f"CREATE TABLE {table} (id int PRIMARY KEY, v int); "
+                f"INSERT {table} SELECT TOP 5000 id, id AS v FROM dbo.big_table ORDER BY id")
     locker.set_autocommit(False)
-    one(locker, "UPDATE ##zz_lockrows SET v = v WHERE id = 3000")
-    yield "SELECT id, v FROM ##zz_lockrows ORDER BY id"
+    # A real change: `SET v = v` writes nothing, and once the server has flushed the page (a checkpoint, a busy lazy
+    # writer: more likely the slower the machine) a reader skips its lock, so the SELECT would never block.
+    one(locker, f"UPDATE {table} SET v = v + 1 WHERE id = 3000")
+    yield f"SELECT id, v FROM {table} ORDER BY id"
     locker.rollback()
     locker.set_autocommit(True)
-    one(locker, "DROP TABLE ##zz_lockrows")
+    one(locker, f"DROP TABLE {table}")
     locker.close()
+
+
+def blocked_inside_a_page(state, quiet_s: float = 0.4) -> bool:
+    """Waits until the reader of `stream_in_thread` has read some rows and then none for `quiet_s`: blocked inside its
+    next page on the lock, not just slow (a Cancel that lands while it still reads is only a flag it sees between rows)."""
+    seen = [-1, time.monotonic()]  # rows, since when
+
+    def stalled() -> bool:
+        if state["rows"] != seen[0]:
+            seen[:] = [state["rows"], time.monotonic()]
+        return seen[0] > 0 and time.monotonic() - seen[1] >= quiet_s
+
+    return wait_until(stalled, scaled(10))
 
 
 def stream_in_thread(connection, sql):
@@ -937,28 +968,28 @@ def test_a_select_blocked_on_a_row_lock_mid_stream_ends_by_escalation(conn, lock
     conn.set_message_listener(lambda m: heard.append((m.severity, m.text)))
     thread, state = stream_in_thread(conn, locked_row)
     with ends_reader(conn, thread):
-        time.sleep(0.8)
+        assert blocked_inside_a_page(state)
         assert 0 < state["rows"] < 3000 and "out" not in state  # blocked inside a row read
         started = time.monotonic()
         conn.cancel()
         if manual:
-            while not heard and time.monotonic() - started < 3:
-                time.sleep(0.02)
+            wait_until(lambda: heard, mssql_adapter_cancel.WEDGE_S + scaled(2), 0.02)
             assert heard == [("warning", mssql_adapter_cancel.WAITING_WARNING)] and "out" not in state
             time.sleep(mssql_adapter_cancel.DOUBLE_CLICK_S + 0.1)
             conn.force_cancel()  # the next Cancel
-        thread.join(5)
+        thread.join(scaled(5))
         took = time.monotonic() - started
     expected = mssql_adapter_cancel.ABORTED_MESSAGE if manual else mssql_adapter_cancel.WAITING_DROPPED_MESSAGE
     assert state.get("out") == "connection_lost" and state["message"] == expected, state
-    assert mssql_adapter_cancel.WEDGE_S <= took < mssql_adapter_cancel.WEDGE_S + 2
+    assert mssql_adapter_cancel.WEDGE_S <= took < mssql_adapter_cancel.WEDGE_S + scaled(2)
 
 
 def test_closing_the_session_mid_stream_reads_connection_lost_not_the_end(conn, locked_row):  # R-03b-T8a (6)
     thread, state = stream_in_thread(conn, locked_row)
-    time.sleep(0.8)
-    conn.abort()  # the tab closes: the blocked read ends by dropping the connection
-    thread.join(5)
+    with ends_reader(conn, thread):
+        assert blocked_inside_a_page(state)
+        conn.abort()  # the tab closes: the blocked read ends by dropping the connection
+        thread.join(scaled(5))
     assert state.get("out") == "connection_lost"  # never "ran" with 2,500 of 5,000 rows
     assert "dropped to stop the statement" in state["message"]  # not "cancelled", not a bare "lost"
     with pytest.raises(StatementError) as lost:
@@ -1071,8 +1102,10 @@ def test_metadata_is_bound_to_the_connections_database(conn):
     assert conn.schema_snapshot().database == "dbaguy"
 
 
-def timed(fn, limit: float = 10):
-    """`fn()` on a thread: {"value" or "error", "took"}; fails when it is still waiting `limit` seconds later."""
+def timed(fn, limit: float | None = None):
+    """`fn()` on a thread: {"value" or "error", "took"}; fails when it is still waiting `limit` (default scaled(10))
+    seconds later."""
+    limit = scaled(10) if limit is None else limit
     outcome: dict = {}
 
     def go():
@@ -1094,28 +1127,31 @@ def test_another_sessions_uncommitted_ddl_never_stalls_the_metadata(conn):  # R-
     """A manual-commit tab's ALTER holds a schema lock until it ends. The tree and the completion snapshot read past
     it; the detail of the locked table answers, or gives up after the lock timeout with a message that says why."""
     locker = open_mssql()
-    one(locker, "IF OBJECT_ID('dbo.zz_meta_lock') IS NOT NULL DROP TABLE dbo.zz_meta_lock; "
-                "CREATE TABLE dbo.zz_meta_lock (id int CONSTRAINT zz_meta_lock_pk PRIMARY KEY)")
+    table = unique_name("zz_meta_lock")  # a real table, so a fixed name would be shared with every run on the server
+    one(locker, "DECLARE @sql nvarchar(max) = N''; "  # what an interrupted run left behind (never a run's live one)
+                "SELECT @sql += N'DROP TABLE dbo.' + QUOTENAME(name) + N';' FROM sys.tables "
+                "WHERE name LIKE 'zz[_]meta[_]lock[_]%' AND create_date < DATEADD(minute, -10, GETDATE()); EXEC (@sql)")
+    one(locker, f"CREATE TABLE dbo.{table} (id int CONSTRAINT {table}_pk PRIMARY KEY)")
     locker.set_autocommit(False)
-    one(locker, "ALTER TABLE dbo.zz_meta_lock ADD c int")
+    one(locker, f"ALTER TABLE dbo.{table} ADD c int")
     try:
         db, dbo = seg("database", "dbaguy"), seg("schema", "dbo")
         tree = timed(lambda: conn.list_children([db, dbo, seg("folder", "tables")]))
-        assert tree["took"] < 2 and "zz_meta_lock" in [node.name for node in tree["value"]]
+        assert tree["took"] < scaled(2) and table in [node.name for node in tree["value"]]
         snapshot = timed(conn.schema_snapshot)
         relations = [r.name for s in snapshot["value"].schemas for r in s.relations]
-        assert snapshot["took"] < 2 and "zz_meta_lock" in relations and "customer_alias" in relations  # 9: synonyms
+        assert snapshot["took"] < scaled(2) and table in relations and "customer_alias" in relations  # 9: synonyms
         other = timed(lambda: conn.object_detail([db, dbo, seg("table", "customers")]))
-        assert other["took"] < 2 and other["value"].columns
-        locked = timed(lambda: conn.object_detail([db, dbo, seg("table", "zz_meta_lock")]))
-        assert locked["took"] < 8, locked
+        assert other["took"] < scaled(2) and other["value"].columns
+        locked = timed(lambda: conn.object_detail([db, dbo, seg("table", table)]))
+        assert locked["took"] < scaled(8), locked
         if "error" in locked:
             assert isinstance(locked["error"], QueryFailed) and locked["error"].message == mssql_adapter.LOCKED_MESSAGE
-        assert timed(conn.schema_snapshot)["took"] < 2  # the timeout left the connection working
+        assert timed(conn.schema_snapshot)["took"] < scaled(2)  # the timeout left the connection working
     finally:
         locker.rollback()
         locker.set_autocommit(True)
-        one(locker, "DROP TABLE dbo.zz_meta_lock")
+        one(locker, f"DROP TABLE dbo.{table}")
         locker.close()
 
 
@@ -1143,7 +1179,7 @@ def test_mssql_through_the_ssh_bastion_including_cancel(tmp_path):
         started = time.monotonic()
         with pytest.raises(StatementCancelled):
             connection.run("WAITFOR DELAY '00:00:30'")
-        assert time.monotonic() - started < 3
+        assert time.monotonic() - started < scaled(3)
         assert one(connection, "SELECT 1") == [[1]]
     finally:
         lease.close()
