@@ -30,9 +30,9 @@ from ..base import (
     StatementCancelled,
     StatementError,
     StatementResult,
+    invalid_text_error,
     transaction_open_error,
 )
-from ..positions import offset_to_line_col
 from . import catalog, introspection
 from . import schema as mysql_schema
 from .settings import URL_SCHEMES, connect_params, kill_params, parse_mysql_url, requires_tls, session_settings
@@ -67,7 +67,6 @@ _READ_ONLY_SESSION = "SET SESSION TRANSACTION READ ONLY"
 # diagnostic statement, keeps what SHOW WARNINGS, SHOW ERRORS and GET DIAGNOSTICS report (R-03a-T9e; `DO 0` cleared it).
 _STATUS_PROBE = "SHOW WARNINGS LIMIT 0"
 _PARSE_ERRNOS = frozenset({1064, 1065})  # syntax error, empty query: rejected before anything ran
-INVALID_TEXT = "invalid_text"
 
 
 class _VerbatimCursor(MySQLCursorRaw):
@@ -360,7 +359,7 @@ class MysqlConnection(DatabaseConnection):
         try:
             cursor.execute_verbatim(sql)
         except (mysql.connector.Error, UnicodeEncodeError) as exc:
-            error = self.statement_error(exc) if isinstance(exc, mysql.connector.Error) else _invalid_text(sql, exc)
+            error = self.statement_error(exc) if isinstance(exc, mysql.connector.Error) else invalid_text_error(sql, exc)
             self._killed.clear()  # the statement is over: its flag must not reach the next call (R-03a-P4)
             with suppress(mysql.connector.Error):
                 cursor.close()
@@ -464,15 +463,6 @@ def _is_lost(exc: mysql.connector.Error) -> bool:
 def _may_change_status(exc: mysql.connector.Error) -> bool:
     """A server error (it carries a SQLSTATE) other than a parse error may have ended the transaction."""
     return bool(exc.sqlstate) and exc.errno not in _PARSE_ERRNOS and not _is_lost(exc)
-
-
-def _invalid_text(sql: str, exc: UnicodeEncodeError) -> StatementError:
-    """A lone surrogate (half of an emoji, e.g. from a broken paste) cannot be sent as UTF-8."""
-    line, column = offset_to_line_col(sql, exc.start + 1)
-    return StatementError(
-        f"The statement contains a character that is not valid text (U+{ord(sql[exc.start]):04X}); delete it and "
-        "retype it", code=INVALID_TEXT, position=ErrorPosition(line=line, column=column),
-    )
 
 
 def _enable_keepalive(conn: MySQLConnection) -> None:

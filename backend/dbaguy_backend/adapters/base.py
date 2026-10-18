@@ -8,6 +8,7 @@ from ..domain.metadata import Folder, NodeKind, ObjectDetail, ObjectNode, PathSe
 from ..domain.profiles import AnyDraft, AnyProfile, Engine, EngineInfo
 from ..domain.schema import RelationKind, SchemaSnapshot
 from ..sql.dialects import Dialect
+from .positions import offset_to_line_col
 
 
 MessageListener = Callable[[ServerMessage], None]
@@ -57,6 +58,18 @@ FAILED_COMMIT_MESSAGE = "The transaction had failed, so COMMIT rolled it back"
 
 def transaction_open_error() -> StatementError:
     return StatementError("Commit or roll back the open transaction first", code=TRANSACTION_OPEN)
+
+
+INVALID_TEXT = "invalid_text"
+
+
+def invalid_text_error(sql: str, exc: UnicodeEncodeError) -> StatementError:
+    """A lone surrogate (half of an emoji, e.g. from a broken paste) cannot be sent as UTF-8."""
+    line, column = offset_to_line_col(sql, exc.start + 1)
+    return StatementError(
+        f"The statement contains a character that is not valid text (U+{ord(sql[exc.start]):04X}); delete it and "
+        "retype it", code=INVALID_TEXT, position=ErrorPosition(line=line, column=column),
+    )
 
 
 class StatementCancelled(StatementError):

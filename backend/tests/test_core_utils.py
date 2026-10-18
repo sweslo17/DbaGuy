@@ -135,6 +135,8 @@ def test_default_registry_reads_jdbc_urls():
     assert registry.parse_url("jdbc:sqlite:/tmp/x.db").profile.path == "/tmp/x.db"
     mysql = registry.parse_url("jdbc:mysql://me@h:3307/app?useSSL=false").profile
     assert (mysql.engine, mysql.port, mysql.database, mysql.ssl.mode) == ("mysql", 3307, "app", "disable")
+    mssql = registry.parse_url("jdbc:sqlserver://h:1444;databaseName=app;encrypt=false").profile
+    assert (mssql.engine, mssql.port, mssql.database, mssql.ssl.mode) == ("mssql", 1444, "app", "prefer")
 
 
 @pytest.mark.parametrize("url", [

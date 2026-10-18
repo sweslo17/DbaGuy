@@ -108,13 +108,17 @@ def test_import_url_never_echoes_the_password_of_a_malformed_url(client):
 
 def test_engines(client):
     engines = {e["engine"]: e for e in client.get("/system/engines", headers=AUTH).json()}
-    assert set(engines) == {"postgres", "mysql", "sqlite"}
+    assert set(engines) == {"postgres", "mysql", "mssql", "sqlite"}
     assert engines["postgres"]["per_database_connection"] and engines["postgres"]["cancel_aborts_transaction"]
     assert not engines["sqlite"]["per_database_connection"] and not engines["sqlite"]["cancel_aborts_transaction"]
     assert engines["postgres"]["server_read_only"] and engines["sqlite"]["server_read_only"]
     mysql = engines["mysql"]
     assert (mysql["per_database_connection"], mysql["cancel_aborts_transaction"], mysql["server_read_only"]) == (
         False, False, True,
+    )
+    mssql = engines["mssql"]
+    assert (mssql["per_database_connection"], mssql["cancel_aborts_transaction"], mssql["server_read_only"]) == (
+        True, False, False,
     )
 
 
