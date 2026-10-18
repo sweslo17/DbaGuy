@@ -369,7 +369,9 @@ def test_go_lines_end_batches_and_semicolons_do_not():
 
 
 def test_what_is_not_a_go_line():
-    for sql in ("SELECT 1\nGO;\nSELECT 2", "SELECT 1\nGO2\nSELECT 2", "SELECT 1\nGO /* c */\nSELECT 2", "SELECT 1 GO\nSELECT 2"):
+    for sql in (
+        "SELECT 1\nGO;\nSELECT 2", "SELECT 1\nGO2\nSELECT 2", "SELECT 1\nGO /* c */\nSELECT 2", "SELECT 1 GO\nSELECT 2",
+    ):
         assert batches(sql) == [(sql, 1)], sql
     assert batches("SELECT 'a\nGO\nb'\nGO") == [("SELECT 'a\nGO\nb'", 1)]
     assert batches("/* a /* b */\nGO\n*/ SELECT 1\nGO") == [("SELECT 1", 1)]  # nested comment: still inside it

@@ -26,7 +26,8 @@ class StatementSpan:
     end: int
     terminator_end: int
     text: str
-    has_body: bool = False  # a routine or trigger body whose inner `;` did not end the statement (T-SQL: the batch defines a module)
+    # a routine or trigger body whose inner `;` did not end the statement (T-SQL: the batch defines a module)
+    has_body: bool = False
     repeat: int = 1  # T-SQL "GO n": times the batch runs (0 for GO 0)
 
 
@@ -208,18 +209,21 @@ def _emit(
     spans.append(StatementSpan(start, end, terminator, text[start:end], has_body, repeat))
 
 
-def _delimiter_line(text: str, token: Token, started: bool) -> re.Match[str] | None:
-    """A MySQL `DELIMITER x` line: the word DELIMITER is first on its line and no statement has started.
+def _first_on_line(text: str, token: Token) -> bool:
+    """Only spaces and tabs come before the token on its line.
 
-    Linear however long the line: only the spaces and tabs right before the word are looked at (not the line back to
-    its start), and the rest of the line is read only once the word is known to start it (`/sql/split` runs on every
-    edit)."""
-    if started or token.kind != TokenKind.WORD or token.upper != "DELIMITER":
-        return None
+    Linear however long the line: only the spaces and tabs right before the token are looked at (not the line back to
+    its start), because `/sql/split` runs on every edit."""
     i = token.start
     while i > 0 and text[i - 1] in " \t":
         i -= 1
-    if i > 0 and text[i - 1] != "\n":
+    return i == 0 or text[i - 1] == "\n"
+
+
+def _delimiter_line(text: str, token: Token, started: bool) -> re.Match[str] | None:
+    """A MySQL `DELIMITER x` line: the word DELIMITER is first on its line and no statement has started. The rest of
+    the line is read only once the word is known to start it."""
+    if started or token.kind != TokenKind.WORD or token.upper != "DELIMITER" or not _first_on_line(text, token):
         return None
     return _DELIMITER_ARGUMENT.match(text, token.end)
 
@@ -227,13 +231,8 @@ def _delimiter_line(text: str, token: Token, started: bool) -> re.Match[str] | N
 def _go_line(text: str, token: Token) -> re.Match[str] | None:
     """A T-SQL `GO [n]` line, as sqlcmd and SSMS read it: the word GO alone on its line, optionally followed by a count
     and a `--` comment. `GO;`, `GO2` and `GO /* c */` are not. A GO inside a string, comment or [name] is not a WORD
-    token, so it never gets here. Linear: only the spaces and tabs before the word are looked at."""
-    if token.kind != TokenKind.WORD or token.upper != "GO":
-        return None
-    i = token.start
-    while i > 0 and text[i - 1] in " \t":
-        i -= 1
-    if i > 0 and text[i - 1] != "\n":
+    token, so it never gets here."""
+    if token.kind != TokenKind.WORD or token.upper != "GO" or not _first_on_line(text, token):
         return None
     return _GO_REST.match(text, token.end)
 
