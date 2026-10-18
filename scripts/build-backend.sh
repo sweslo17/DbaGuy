@@ -23,6 +23,25 @@ if [[ -z "$(find dist/dbaguy-backend -name '_mssql*.so' | head -n 1)" ]]; then
   exit 1
 fi
 
+# One OpenSSL for the whole bundle: PyInstaller links Python's _ssl and _hashlib (and psycopg's libpq) to the
+# libssl/libcrypto it took from pymssql (pymssql/.dylibs). That is safe only while it is the OpenSSL the venv's Python
+# was built against; fail when the versions differ (e.g. a pymssql wheel built with another OpenSSL).
+crypto="$(find dist/dbaguy-backend/_internal -maxdepth 1 -name 'libcrypto*.dylib' | head -n 1)"
+if [[ -z "$crypto" ]]; then
+  echo "error: no libcrypto in the bundle's _internal; the OpenSSL check cannot run" >&2
+  exit 1
+fi
+# A fresh interpreter that never imports ssl, so the bundled library is the only libcrypto it loads.
+bundled_ssl="$(.venv/bin/python -I -c 'import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1]); lib.OpenSSL_version.restype = ctypes.c_char_p
+print(" ".join(lib.OpenSSL_version(0).decode().split()[:2]))' "$crypto")"
+venv_ssl="$(.venv/bin/python -I -c 'import ssl; print(" ".join(ssl.OPENSSL_VERSION.split()[:2]))')"
+if [[ "$bundled_ssl" != "$venv_ssl" ]]; then
+  echo "error: the bundle's OpenSSL ($bundled_ssl, $crypto) is not the one the venv's Python uses ($venv_ssl)" >&2
+  exit 1
+fi
+echo "OpenSSL in the bundle: $bundled_ssl (same as the venv's Python)"
+
 find "$DEST" -mindepth 1 ! -name .gitkeep -exec rm -rf {} +
 cp -R dist/dbaguy-backend/. "$DEST/"
 echo "Backend bundled into $DEST"
