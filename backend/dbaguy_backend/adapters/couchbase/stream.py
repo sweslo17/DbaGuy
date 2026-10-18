@@ -15,9 +15,10 @@ How bytes become events:
 - A strict incremental UTF-8 decoder (a character cut between chunks waits for its other bytes).
 - A state machine over the top-level object and the `results` array; the position only moves past a unit (a key, a
   colon, a field value, a row, a bracket, a comma) once the whole unit has arrived.
-- A value is accepted only when something follows it (a number may go on in the next chunk). A decode error whose bad
-  token runs to the end of what has arrived (an open string, `tru`, `1e`, `{"a"`) means "wait for more"; at the end of
-  the body it means the response was cut short (`ProtocolError.truncated`). A bad token followed by more JSON is
+- A value is accepted only when something follows it (a number may go on in the next chunk; at the end of the body a
+  value with nothing after it is a cut response, so `[1,23` cut to `[1,2` never shows a row `2`). A decode error whose
+  bad token runs to the end of what has arrived (an open string, `tru`, `1e`, `{"a"`) means "wait for more"; at the end
+  of the body it means the response was cut short (`ProtocolError.truncated`). A bad token followed by more JSON is
   malformed at once.
 - A value that is not complete yet is parsed again only once the text buffered from its start has doubled, and new text
   is kept as a list of pieces joined only for that attempt: a 5 MB row costs about twice its size, never a parse per
@@ -157,8 +158,10 @@ def _decode(decoder: json.JSONDecoder, s: str, i: int, eof: bool) -> tuple[Any, 
         if _DELIMITER.search(s, end):
             raise ValueError("malformed JSON after a value")
         raise _short(eof, "the text ends inside a number")  # `1e` of `1e400`, cut between two chunks
-    if end >= len(s) and not eof:
-        raise _Incomplete()  # a number may go on in the next chunk
+    if end >= len(s):
+        # A number may go on in the next chunk; and a valid response never ends on a value, so at the end of the body
+        # `[1,2` is `[1,23` cut short, not a row `2`.
+        raise _short(eof, "the text ends after a value")
     return value, end
 
 
@@ -298,6 +301,7 @@ class ResponseParser:
             while (i := _skip(self._buf, self._pos)) < len(self._buf):
                 self._pos = i
                 self._step(events, eof)
+            self._pos = i  # whitespace at the end is consumed, not scanned again by the next call
         except _Incomplete:
             self._need = 2 * (len(self._buf) - self._pos)
         except (ValueError, RecursionError) as exc:  # cut short (_EndedEarly), malformed JSON, NaN, absurd nesting

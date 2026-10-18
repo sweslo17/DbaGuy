@@ -1,5 +1,6 @@
 import json
 import random
+import time
 
 import pytest
 
@@ -7,6 +8,7 @@ from dbaguy_backend.adapters.couchbase.stream import (
     EndEvent, FieldEvent, ProtocolError, ResponseParser, ResultsEnd, ResultsStart, RowEvent, RowField, json_kind,
     split_object,
 )
+from tests.support import scaled
 
 FULL = (
     '{"requestID":"r1","clientContextID":"dbaguy-x","signature":{"id":"json","*":"*"},"results":[\n'
@@ -164,6 +166,30 @@ def test_a_cut_response_keeps_what_came_and_is_truncated(data, rows):
         events, error = parse_until_failure(data, [cut])
         assert error.truncated, cut
         assert len([e for e in events if isinstance(e, RowEvent)]) == rows, cut
+
+
+@pytest.mark.parametrize("data", [
+    b'{"results":[1,23,1e400,-0.0,12345678901234567890,7],"status":"success"}', RAW, FULL, ESCAPES,
+], ids=["numbers", "raw", "full", "escapes"])
+def test_a_body_cut_anywhere_never_shows_a_wrong_row(data):  # a cut inside `23` must not give a row `2`
+    whole = [e.row for e in parse(data, []) if isinstance(e, RowEvent)]
+    for cut in range(len(data.rstrip())):  # every cut before the object closes
+        events, error = parse_until_failure(data[:cut], [])
+        rows = [e.row for e in events if isinstance(e, RowEvent)]
+        assert rows == whole[:len(rows)], cut
+        assert error.truncated, cut
+
+
+def test_long_whitespace_is_read_once():  # what `pretty=true` or a padding proxy could send
+    run = b" " * (8 * 1024 * 1024)
+    data = b'{"results":[1,' + run + b'2]' + run + b',"status":"success"}'
+    parser, events = ResponseParser(), []
+    started = time.monotonic()
+    for i in range(0, len(data), 64 * 1024):
+        events += parser.feed(data[i:i + 64 * 1024])
+    events += parser.finish()
+    assert time.monotonic() - started < scaled(0.5)
+    assert [e.row.text for e in events if isinstance(e, RowEvent)] == ["1", "2"] and events[-1] == EndEvent()
 
 
 @pytest.mark.parametrize("bad", [b"\xff", b"x", b"]]"])

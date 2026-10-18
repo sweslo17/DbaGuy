@@ -8,11 +8,12 @@ from uuid import uuid4
 import pytest
 from loguru import logger
 
+from dbaguy_backend.adapters.couchbase import http as http_module
 from dbaguy_backend.adapters.couchbase.http import (
     ChannelError, NodeClient, QueryRequest, basic_auth, build_body, client_context_id, failure_reason,
 )
 from dbaguy_backend.adapters.couchbase.stream import EndEvent, FieldEvent, ResponseParser, RowEvent
-from tests.couchbase_fakes import FakeQueryServer, Reply
+from tests.couchbase_fakes import FakeQueryServer, FullListenQueue, Reply
 from tests.support import (
     COUCHBASE_HOST, COUCHBASE_PASSWORD, COUCHBASE_PORT, COUCHBASE_TLS_PORT, COUCHBASE_USER, LONG_AGGREGATE,
     completed_request_state, couchbase_ca_file, requires_couchbase, scaled, wait_until,
@@ -248,6 +249,61 @@ def test_a_refused_connection():
     with pytest.raises(ChannelError) as error:
         send(client)
     assert (str(error.value), error.value.before_response, error.value.tls) == ("refused", False, False)
+
+
+def test_a_host_name_with_more_addresses_tries_the_next_one():  # `localhost`: ::1 refused, then 127.0.0.1
+    server = FakeQueryServer([Reply(OK)])
+    client = NodeClient("localhost", server.port, auth="", user_agent="DbaGuy/test", tls=None)
+    try:
+        assert read_all(send(client)) == OK
+    finally:
+        client.close()
+        server.close()
+
+
+def test_a_cancel_while_connecting_ends_the_connect_at_once():  # R-04a-T7a
+    queue = FullListenQueue()
+    client = NodeClient("127.0.0.1", queue.port, auth="", user_agent="DbaGuy/test", tls=None)
+    shut_at = []
+
+    def attach(channel):
+        def cancel():
+            shut_at.append(time.monotonic())
+            channel.shutdown()
+
+        threading.Timer(0.2, cancel).start()
+
+    try:
+        with pytest.raises(ChannelError) as error:
+            send(client, attach=attach)
+        assert time.monotonic() - shut_at[0] < scaled(0.2)
+        assert str(error.value) == "cancelled while connecting"
+    finally:
+        client.close()
+        queue.close()
+
+
+def test_a_connect_that_gets_no_answer_times_out(monkeypatch):
+    monkeypatch.setattr(http_module, "CONNECT_TIMEOUT_S", 0.3)  # the whole attempt, every address
+    queue = FullListenQueue()
+    client = NodeClient("127.0.0.1", queue.port, auth="", user_agent="DbaGuy/test", tls=None)
+    try:
+        started = time.monotonic()
+        with pytest.raises(ChannelError) as error:
+            send(client)
+        assert 0.25 < time.monotonic() - started < 0.3 + scaled(0.5)
+        assert (str(error.value), error.value.before_response) == ("timed out", False)
+    finally:
+        client.close()
+        queue.close()
+
+
+def test_a_host_http_client_refuses_is_a_channel_error():
+    client = NodeClient("bad host", 8093, auth="", user_agent="DbaGuy/test", tls=None)
+    attached = []
+    with pytest.raises(ChannelError) as error:
+        send(client, attach=attached.append)
+    assert (str(error.value), error.value.before_response, attached) == ("invalid host name", False, [])
 
 
 def test_a_non_json_error_page_is_reported_as_it_came():

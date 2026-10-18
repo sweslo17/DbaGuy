@@ -1,5 +1,6 @@
 """Stand-ins for the Couchbase query service: a local HTTP/1.1 server with scripted replies, and a canned response."""
 
+import select
 import socket
 import threading
 from dataclasses import dataclass
@@ -73,6 +74,33 @@ class FakeQueryServer:
                 return
 
     def close(self) -> None:
+        self._server.close()
+
+
+class FullListenQueue:
+    """A local port whose listen queue is full, so a new connect to it waits (the kernel drops its SYN) until it times
+    out: a host that does not answer, without the network. On macOS `listen(1)` plus a connection nobody accepts fills
+    it; the fill goes on until a connect stays pending."""
+
+    def __init__(self) -> None:
+        self._server = socket.socket()
+        self._server.bind(("127.0.0.1", 0))
+        self._server.listen(1)
+        self.port = self._server.getsockname()[1]
+        self._fillers: list[socket.socket] = []
+        for _ in range(16):
+            filler = socket.socket()
+            filler.setblocking(False)
+            filler.connect_ex(("127.0.0.1", self.port))
+            self._fillers.append(filler)
+            if not select.select([], [filler], [], 0.2)[1]:
+                return  # this connect waits: so will the next one
+        self.close()
+        raise RuntimeError("the listen queue did not fill up")
+
+    def close(self) -> None:
+        for filler in self._fillers:
+            filler.close()
         self._server.close()
 
 

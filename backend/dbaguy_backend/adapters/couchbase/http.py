@@ -8,14 +8,20 @@ socket at any time, and a descriptor number closed and reused meanwhile would le
 connection (ruling P3). SSLSocket.shutdown() is never called from another thread (spec §3.4.1): shutting down the TCP
 duplicate ends a blocked TLS read within a millisecond (probe A10 held, so ruling P41's fallback is not used).
 
+A connect polls for a cancel every 50 ms (name resolution stays blocking), so a node that does not answer never holds
+a cancel for CONNECT_TIMEOUT_S (ruling R-04a-T7a).
+
 The server sends no status line until its first output is ready (a long aggregate: minutes), so `NodeClient.send()` can
 block that long; a cancel during that wait shuts the channel down like any other (the caller gets the channel from
 `attach` before anything is sent, and arms its own timer before calling `send`)."""
 
 import base64
+import errno
 import http.client
 import json
+import os
 import re
+import selectors
 import socket
 import ssl
 import threading
@@ -23,6 +29,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
+from typing import Any
 
 from loguru import logger
 
@@ -30,13 +37,15 @@ from dbaguy_backend.adapters.sockets import enable_keepalive
 
 READ_CHUNK = 64 * 1024
 CONNECT_TIMEOUT_S = 10.0  # connect and TLS handshake; reads afterwards block with no timeout (a cancel ends them)
+_CONNECT_POLL_S = 0.05  # how often a connect in progress looks for a cancel (ruling R-04a-T7a)
+_IN_PROGRESS = frozenset({errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY})
 KEEPALIVE_REUSE_S = 30.0  # a connection idle for longer is replaced rather than reused
 QUERY_PATH = "/query/service"
 
 _NOT_CONTEXT_ID = re.compile(r"[^A-Za-z0-9_-]")
 _CONTEXT_ID_LIMIT = 64  # longer ids are cut by the server; `/` and `"` are refused (error 1110)
 
-SocketFactory = Callable[[str, int, float], socket.socket]
+SocketFactory = Callable[[str, int, float], socket.socket]  # (host, port, timeout): a connected socket (tests)
 
 
 def client_context_id(ident: str) -> str:
@@ -115,8 +124,45 @@ def _endpoint_label(host: str, port: int) -> str:
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
 
-def _tcp(host: str, port: int, timeout: float) -> socket.socket:
-    return socket.create_connection((host, port), timeout=timeout)
+def _connect(host: str, port: int, timeout: float, cancelled: Callable[[], bool]) -> socket.socket:
+    """socket.create_connection that a cancel ends within _CONNECT_POLL_S (R-04a-T7a): each address is connected without
+    blocking and polled, with `cancelled()` checked in between. `timeout` bounds the whole attempt over every address;
+    name resolution stays blocking. The socket comes back with `timeout` set: the TLS handshake runs within it."""
+    deadline = time.monotonic() + timeout
+    error: OSError | None = None
+    for family, kind, proto, _, address in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+        sock = socket.socket(family, kind, proto)
+        try:
+            _connect_one(sock, address, deadline, cancelled)
+        except OSError as exc:
+            sock.close()
+            if isinstance(exc, TimeoutError):
+                raise  # the time is up for every address
+            error = exc  # refused, unreachable: the next address
+            continue
+        except BaseException:
+            sock.close()
+            raise
+        sock.settimeout(timeout)
+        return sock
+    raise error or OSError(errno.EADDRNOTAVAIL, "no address to connect to")
+
+
+def _connect_one(sock: socket.socket, address: Any, deadline: float, cancelled: Callable[[], bool]) -> None:
+    sock.setblocking(False)
+    code = sock.connect_ex(address)
+    with selectors.DefaultSelector() as selector:
+        selector.register(sock, selectors.EVENT_WRITE)
+        while code in _IN_PROGRESS:
+            if cancelled():
+                raise ChannelError("cancelled while connecting", before_response=True)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("timed out")
+            if selector.select(min(_CONNECT_POLL_S, left)):
+                code = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+    if code:
+        raise OSError(code, os.strerror(code))  # ECONNREFUSED comes out as ConnectionRefusedError
 
 
 class _Connection(http.client.HTTPConnection):
@@ -136,7 +182,7 @@ class HttpChannel:
     flight)."""
 
     def __init__(self, host: str, port: int, *, tls: ssl.SSLContext | None, server_hostname: str | None,
-                 socket_factory: SocketFactory) -> None:
+                 socket_factory: SocketFactory | None) -> None:
         self.host, self.port = host, port
         self._tls, self._server_hostname, self._socket_factory = tls, server_hostname or host, socket_factory
         self._lock = threading.Lock()  # a leaf: guards _handle and _shut, held for a shutdown() syscall at most
@@ -148,8 +194,12 @@ class HttpChannel:
         self.dead = False
 
     def open_socket(self) -> socket.socket:
-        """Worker thread (from http.client's connect): the connected socket, TLS set up; the duplicate kept."""
-        sock = self._socket_factory(self.host, self.port, CONNECT_TIMEOUT_S)
+        """Worker thread (from http.client's connect): the connected socket, TLS set up; the duplicate kept. A cancel
+        while connecting ends the connect within _CONNECT_POLL_S (a test's socket factory: once it returns)."""
+        if self._socket_factory is not None:
+            sock = self._socket_factory(self.host, self.port, CONNECT_TIMEOUT_S)
+        else:
+            sock = _connect(self.host, self.port, CONNECT_TIMEOUT_S, lambda: self.shut_down)
         try:
             enable_keepalive(sock)
             with suppress(OSError):
@@ -172,8 +222,9 @@ class HttpChannel:
             raise
 
     def shutdown(self) -> None:
-        """Any thread: ends whatever the worker is blocked on (connecting, sending, waiting for the status line,
-        reading the body) at once. The socket objects themselves are left to the worker."""
+        """Any thread: ends whatever the worker is blocked on (sending, waiting for the status line, reading the body)
+        at once, and a connect in progress within _CONNECT_POLL_S. The socket objects themselves are left to the
+        worker."""
         with self._lock:
             self._shut = True
             if self._handle is not None:
@@ -264,7 +315,7 @@ class NodeClient:
         self.label = _endpoint_label(host, port)
         self._headers = {"Authorization": auth, "Content-Type": "application/json", "User-Agent": user_agent}
         self._tls, self._server_hostname = tls, server_hostname
-        self._socket_factory = socket_factory or _tcp
+        self._socket_factory = socket_factory  # None: the cancellable connect
         self._clock = clock
         self._channel: HttpChannel | None = None
 
@@ -285,8 +336,12 @@ class NodeClient:
         if self._channel is None or not self._channel.reusable(self._clock()):
             if self._channel is not None:
                 self._channel.close()
-            self._channel = HttpChannel(self.host, self.port, tls=self._tls, server_hostname=self._server_hostname,
-                                        socket_factory=self._socket_factory)
+                self._channel = None
+            try:
+                self._channel = HttpChannel(self.host, self.port, tls=self._tls,
+                                            server_hostname=self._server_hostname, socket_factory=self._socket_factory)
+            except http.client.InvalidURL as exc:  # a host http.client refuses (a space, a control character)
+                raise ChannelError("invalid host name") from exc
         return self._channel
 
     def _post(self, channel: HttpChannel, body: bytes, attach: Callable[[HttpChannel], None]) -> QueryResponse:
