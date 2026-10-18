@@ -19,7 +19,6 @@ from typing import Any, Literal, NoReturn, TextIO
 
 from pydantic import BaseModel
 
-from ..adapters.couchbase.jsontext import one_line
 from ..adapters.values import MISSING, JsonText, encode_value
 from ..domain.column_category import ColumnCategory
 from ..domain.errors import UnsupportedFormat, ValidationFailed
@@ -28,6 +27,7 @@ from .dialects import (
     NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, datetime_literal, in_list, json_literal, qualified,
     quote_ident, quote_literal, zero_date_as_text,
 )
+from .jsontext import one_line
 
 __all__ = [
     "FormatColumn", "FormatKind", "FormatResult", "RAW_JSON_FORMATS", "RawJsonWriter", "RowFormatOptions", "RowWriter",

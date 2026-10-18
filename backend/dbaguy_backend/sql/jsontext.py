@@ -1,5 +1,6 @@
-"""Lossless helpers for JSON text as Couchbase sends and stores it: never parsed and re-encoded, so numbers, key order
-and escapes stay exactly as they are (04c adds the token comparison and the save diff here)."""
+"""Lossless helpers for JSON text as Couchbase sends and stores it: pure text functions, never parsed and re-encoded, so
+numbers, key order and escapes stay exactly as they are (04c adds the token comparison and the save diff here). Here, not
+in the adapter, because the row formats in `formatting.py` use them and `sql/` takes no import from an adapter."""
 
 import re
 

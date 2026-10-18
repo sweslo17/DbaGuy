@@ -7,11 +7,11 @@ import pytest
 
 from dbaguy_backend.adapters.base import Endpoint
 from dbaguy_backend.adapters.couchbase.adapter import PAUSED_RESULT_MAX_IDLE_S, CouchbaseAdapter
-from dbaguy_backend.adapters.couchbase.jsontext import one_line
 from dbaguy_backend.domain.execution import ExecuteCommand, ExportCommand, FetchMoreCommand, QueryContext
 from dbaguy_backend.services.safety import SafetyPolicy
 from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks, paused_result_closed_text
 from dbaguy_backend.sql.dialects import Dialect
+from dbaguy_backend.sql.jsontext import one_line
 from tests.fake_db import FakeLease
 from tests.support import (
     COUCHBASE_PASSWORD, LONG_AGGREGATE, completed_request_state, make_couchbase_profile, requires_couchbase, scaled,

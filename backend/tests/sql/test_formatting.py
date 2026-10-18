@@ -6,7 +6,6 @@ from io import StringIO
 
 import pytest
 
-from dbaguy_backend.adapters.couchbase.jsontext import one_line
 from dbaguy_backend.adapters.values import MISSING, JsonText as J
 from dbaguy_backend.domain.errors import UnsupportedFormat, ValidationFailed
 from dbaguy_backend.domain.execution import ColumnCategory as C
@@ -15,6 +14,7 @@ from dbaguy_backend.sql.formatting import (
     FormatColumn, FormatKind as F, RowFormatOptions, format_rows, open_raw_json_writer, open_writer,
     unsupported_reason, value_condition,
 )
+from dbaguy_backend.sql.jsontext import one_line
 
 PG, LITE, MY, TS = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL
 COLS = [FormatColumn(name="id", category=C.NUMBER), FormatColumn(name="note", category=C.TEXT),
