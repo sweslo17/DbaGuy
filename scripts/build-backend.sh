@@ -16,6 +16,13 @@ if [[ -n "$(find dist/dbaguy-backend -name '_mysql_connector*' | head -n 1)" ]];
   exit 1
 fi
 
+# SQL Server: pymssql's extension (FreeTDS linked in) must be in the bundle. PyInstaller collects the OpenSSL it loads
+# (pymssql/.dylibs) as a binary dependency; this check does not look at that.
+if [[ -z "$(find dist/dbaguy-backend -name '_mssql*.so' | head -n 1)" ]]; then
+  echo "error: pymssql's _mssql extension is missing from the bundle; check hiddenimports in dbaguy-backend.spec" >&2
+  exit 1
+fi
+
 find "$DEST" -mindepth 1 ! -name .gitkeep -exec rm -rf {} +
 cp -R dist/dbaguy-backend/. "$DEST/"
 echo "Backend bundled into $DEST"
