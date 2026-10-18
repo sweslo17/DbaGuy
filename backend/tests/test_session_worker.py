@@ -9,13 +9,22 @@ import pytest
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager, write_askpass_script
+from dbaguy_backend.domain.classification import Classification, StatementKind
 from dbaguy_backend.domain.errors import ConnectionFailed, SessionBusy, SessionNotFound
-from dbaguy_backend.domain.execution import ExecuteCommand, MessageSeverity, ServerMessage
+from dbaguy_backend.domain.execution import (
+    ExecuteCommand,
+    ExportCommand,
+    FetchMoreCommand,
+    MessageSeverity,
+    ServerMessage,
+)
+from dbaguy_backend.domain.formats import FormatKind
 from dbaguy_backend.domain.profiles import ProfileUpsertRequest
 from dbaguy_backend.services.connection_service import ConnectionService
 from dbaguy_backend.services.profile_service import ProfileService
+from dbaguy_backend.services.safety import GuardAction, GuardDecision
 from dbaguy_backend.sessions.manager import SessionCreateRequest, SessionManager
-from dbaguy_backend.sessions.worker import SessionWorker
+from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks
 from dbaguy_backend.storage.paths import profiles_file
 from dbaguy_backend.storage.profile_store import ProfileStore
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
@@ -304,21 +313,63 @@ class MessagingConnection(FakeConnection):
         return super().run(sql)
 
 
-def test_live_messages_reach_the_running_request_before_its_rows():
+@pytest.fixture
+def messaging_worker():
+    """A started worker on a MessagingConnection, with a recorder attached: (worker, connection, recorder)."""
     lease = FakeLease(MessagingConnection())
     worker = SessionWorker("fake", lambda: lease)
     worker.start()
-    rec = Recorder()
-    worker.set_emitter(rec)
-    try:
-        execute(worker, "m", "rows 3")
-        rec.wait_for(finished("m"))
-        kinds = [e.type for e in rec.events if getattr(e, "request_id", None) == "m"]
-        assert kinds.index("message") < kinds.index("result_set")
-        assert [e.text for e in rec.of("m", "message")] == ["before rows 3"]
-        assert lease.connection.listener is None  # cleared when the request ended
-        execute(worker, "n", "rows 1")
-        rec.wait_for(finished("n"))
-        assert [e.text for e in rec.of("n", "message")] == ["before rows 1"]  # each request gets its own
-    finally:
-        worker.close()
+    recorder = Recorder()
+    worker.set_emitter(recorder)
+    yield worker, lease.connection, recorder
+    worker.close()
+
+
+def test_live_messages_reach_the_running_request_before_its_rows(messaging_worker):
+    worker, conn, rec = messaging_worker
+    execute(worker, "m", "rows 3")
+    rec.wait_for(finished("m"))
+    kinds = [e.type for e in rec.events if getattr(e, "request_id", None) == "m"]
+    assert kinds.index("message") < kinds.index("result_set")
+    assert [e.text for e in rec.of("m", "message")] == ["before rows 3"]
+    assert conn.listener is None  # cleared when the request ended
+    execute(worker, "n", "rows 1")
+    rec.wait_for(finished("n"))
+    assert [e.text for e in rec.of("n", "message")] == ["before rows 1"]  # each request gets its own
+
+
+def test_a_paused_result_keeps_its_listener_across_fetch_more(messaging_worker):
+    worker, conn, rec = messaging_worker
+    execute(worker, "p", "rows 3", page_size=1)
+    rec.wait_for(lambda e: e.type == "result_set_end" and e.request_id == "p" and e.has_more)
+    listener = conn.listener
+    assert listener is not None  # paused, still the open request's
+    worker.submit(FetchMoreCommand(request_id="p", count=10))
+    rec.wait_for(finished("p"))
+    assert conn.listeners == [listener, None]  # set once at the start, cleared once at the end, untouched in between
+    assert [e.text for e in rec.of("p", "message")] == ["before rows 3"]
+
+
+@pytest.mark.parametrize("how", ["fail", "cancel"])
+def test_a_failed_or_cancelled_request_clears_its_listener(messaging_worker, how):
+    worker, conn, rec = messaging_worker
+    execute(worker, "x", "fail boom" if how == "fail" else "block")
+    if how == "cancel":
+        assert conn.blocked.wait(5)
+        worker.cancel("x")
+    done = rec.wait_for(finished("x"))
+    assert done.cancelled is (how == "cancel")
+    assert [e.text for e in rec.of("x", "message") if e.text.startswith("before")] == [f"before {conn.runs[-1]}"]
+    assert conn.listener is None and len(conn.listeners) == 2
+
+
+def test_an_export_routes_live_messages_to_its_own_request(messaging_worker, tmp_path):
+    worker, conn, rec = messaging_worker
+    allow_read = GuardDecision(action=GuardAction.RUN, classification=Classification(kind=StatementKind.READ))
+    worker.configure(WorkerHooks(check=lambda sql, confirmed: allow_read))
+    worker.submit(ExportCommand(request_id="e", sql="rows 4", format=FormatKind.CSV, path=str(tmp_path / "out.csv")))
+    rec.wait_for(finished("e"))
+    assert not rec.of("e", "error")
+    texts = [e.text for e in rec.of("e", "message")]
+    assert texts[0] == "before rows 4" and texts[-1].startswith("Exported 4 rows")
+    assert conn.listener is None and len(conn.listeners) == 2

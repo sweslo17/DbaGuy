@@ -551,12 +551,13 @@ class SessionWorker:
             logger.warning("Could not set the message listener on {}", self.name, exc_info=True)
 
     def _send_live_message(self, request_id: str, message: ServerMessage) -> None:
-        """Called by the connection on this worker thread, from inside a driver call."""
+        """Send one server message to `request_id`'s Messages. A connection calls it, through its listener, on this
+        worker thread from inside a driver call; `_send_messages` calls it for messages taken from the result."""
         self._send(MessageEvent(request_id=request_id, severity=message.severity, text=message.text))
 
     def _send_messages(self, ex: _OpenExecution) -> None:
         for message in ex.result.take_messages():
-            self._send(MessageEvent(request_id=ex.request_id, severity=message.severity, text=message.text))
+            self._send_live_message(ex.request_id, message)
 
     def _pump(self, ex: _OpenExecution, budget: int) -> None:
         result = ex.result

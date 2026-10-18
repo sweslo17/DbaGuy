@@ -88,7 +88,8 @@ class StatementResult(ABC):
 
     @abstractmethod
     def take_messages(self) -> list[ServerMessage]:
-        """Server messages (NOTICE, PRINT…) received since the last call."""
+        """Server messages (NOTICE, PRINT…) received since the last call. Messages the connection delivers to its
+        message listener (`DatabaseConnection.set_message_listener`) are not returned here as well."""
 
     @abstractmethod
     def close(self) -> None:
@@ -128,7 +129,12 @@ class DatabaseConnection(ABC):
     def set_message_listener(self, listener: MessageListener | None) -> None:
         """Deliver server messages (SQL Server PRINT, RAISERROR … WITH NOWAIT) to `listener` the moment they arrive,
         on the thread running the statement, instead of through `StatementResult.take_messages()`; None stops it.
-        The default does nothing: such connections keep reporting messages through take_messages()."""
+        The default does nothing: such connections keep reporting messages through take_messages().
+
+        While a listener is set, the adapter delivers each message live and `take_messages()` must not return the same
+        messages. With no listener set, messages may be buffered for `take_messages()` or dropped, as the adapter
+        decides; an adapter must not let messages from internal queries (commit/rollback, state refresh, metadata)
+        reach a later request."""
 
     @abstractmethod
     def in_transaction(self) -> bool: ...
