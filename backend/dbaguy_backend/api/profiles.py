@@ -18,9 +18,10 @@ router = APIRouter(prefix="/profiles", tags=["profiles"], dependencies=[Depends(
 
 
 def _forget_connections_and_schema(container: AppContainer, profile_id: UUID) -> None:
-    """After a profile changed or went away: drop its metadata connections and cached schema snapshots."""
+    """After a profile changed or went away: drop its metadata connections, cached schema snapshots and field samples."""
     container.metadata.invalidate(profile_id)
     container.schema_cache.invalidate(profile_id)
+    container.field_samples.invalidate(profile_id)
 
 
 @router.get("", response_model=list[ProfileEntry])

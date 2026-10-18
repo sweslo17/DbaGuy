@@ -1,9 +1,11 @@
 """API models of the Couchbase features: the plan view (EXPLAIN, ADVISE and the profile of a statement as an operator
-tree with flags, index advice and timings, spec §3.10) and the query contexts a tab can pick (§3.11.1)."""
+tree with flags, index advice and timings, spec §3.10), the query contexts a tab can pick (§3.11.1) and the field paths
+of a keyspace's sampled documents (R-04-11)."""
 
+from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 PlanBadge = Literal["primary_scan", "sequential_scan", "intersect_scan", "not_covered", "slowest"]
 
@@ -78,3 +80,35 @@ class ContextOption(BaseModel):
     scope: str | None = None
     text: str
     listed: bool = True  # False: the tab's current context, which the schema snapshot does not list
+
+
+class Keyspace(BaseModel):
+    """A collection by its three names. Frozen: it is the key of the field-sample cache."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    bucket: str = Field(min_length=1, max_length=100)
+    scope: str = Field(min_length=1, max_length=251)
+    collection: str = Field(min_length=1, max_length=251)
+
+
+class FieldPath(BaseModel):
+    """One field path of a sample: how many documents have it and with which JSON kinds."""
+
+    path: list[str | None]  # keys from the document's root; None: an element of an array; []: the document itself
+    types: dict[str, int]  # JSON kind ("binary" for a binary document) → documents in which the path has that kind
+    docs: int  # documents in which the path occurs
+    percent: float  # docs / documents sampled × 100, one decimal
+
+
+class FieldSample(BaseModel):
+    """A manual sample of a keyspace (R-04-11): the field paths derived in Python from the documents read."""
+
+    keyspace: Keyspace
+    sampled_at: datetime
+    requested: int  # the sample size asked for
+    documents: int  # documents read
+    cut_at_bytes: bool  # stopped at SAMPLE_MAX_BYTES before `requested` documents
+    paths_capped: bool  # more than FIELD_PATHS_MAX paths: the later ones are left out
+    elapsed_ms: int
+    fields: list[FieldPath]

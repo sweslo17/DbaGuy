@@ -12,11 +12,13 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import uuid4
 
 from loguru import logger
 
+from ...domain.couchbase import FieldSample, Keyspace
 from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import QueryContext, StatementParams
 from ...domain.metadata import NodeKind, ObjectDetail, ObjectNode, PathSegment, ServerInfo, child_path
@@ -33,6 +35,7 @@ from ..base import (
     DatabaseAdapter,
     DatabaseConnection,
     Endpoint,
+    FieldSampling,
     ParsedUrl,
     RunOptions,
     StatementCancelled,
@@ -41,10 +44,11 @@ from ..base import (
     invalid_text_error,
 )
 from ..cancel_window import CancelWindow
-from . import catalog
+from . import catalog, sampling
 from .http import (
     ChannelError, HttpChannel, NodeClient, QueryRequest, TlsFailure, basic_auth, build_body, client_context_id,
 )
+from .messages import PROTOCOL_ERROR
 from .nodes import candidate_nodes
 from .params import parameter_warnings
 from .result import CouchbaseResult, EventStream, start_result
@@ -135,7 +139,7 @@ def is_server_error(exc: StatementError) -> bool:
     return exc.code is not None and exc.code.isdigit()
 
 
-class CouchbaseConnection(DatabaseConnection):
+class CouchbaseConnection(DatabaseConnection, FieldSampling):
     """One session's connection: one keep-alive channel to one query node (NodeClient), one request at a time. All
     methods except cancel(), force_cancel() and abort() run on the owning worker thread."""
 
@@ -252,18 +256,24 @@ class CouchbaseConnection(DatabaseConnection):
                                     messages=warnings)
         return self._result
 
-    def query(self, statement: str, named: Mapping[str, str] | None = None, *,
-              context: QueryContext | None = None) -> list[Any]:
-        """An internal statement (catalog, identification, ADVISE): always read-only, read to the end, rows decoded with
-        plain JSON (an int stays an int: the catalog's num_replica, R-04a-C20), and with a deadline (_INTERNAL_DEADLINE:
-        the server's `timeout` of 30 s, whose error 1080 is raised like any other, and 40 s without a byte on the
-        client). `named`: parameter names without `$` and their JSON literal texts. `context`: the request's query
-        context (None: none is sent, as the catalog wants)."""
+    def _internal_result(self, statement: str, named: Mapping[str, str] | None,
+                         context: QueryContext | None) -> CouchbaseResult:
+        """Start an internal statement (catalog, identification, ADVISE, a field sample) and read its head: always
+        read-only, retry-safe and with a deadline (_INTERNAL_DEADLINE: the server's `timeout` of 30 s, whose error 1080
+        is raised like any other, and 40 s without a byte on the client). The caller reads the rows and closes it.
+        `named`: parameter names without `$` and their JSON literal texts. `context`: the request's query context
+        (None: none is sent, as the catalog wants)."""
         self._close_result()
         params = StatementParams(named=dict(named)) if named else None
         stream = self._begin(statement, context=context, params=params, readonly=True, retry_safe=True,
                              deadline=_INTERNAL_DEADLINE)
-        result = start_result(stream, statement, plan=False, bare_star=False, dml=False, on_done=self._end)
+        return start_result(stream, statement, plan=False, bare_star=False, dml=False, on_done=self._end)
+
+    def query(self, statement: str, named: Mapping[str, str] | None = None, *,
+              context: QueryContext | None = None) -> list[Any]:
+        """An internal statement read to the end (see `_internal_result`), rows decoded with plain JSON (an int stays an
+        int: the catalog's num_replica, R-04a-C20)."""
+        result = self._internal_result(statement, named, context)
         try:
             rows: list[Any] = []
             while batch := result.fetch_raw(1000):
@@ -272,6 +282,37 @@ class CouchbaseConnection(DatabaseConnection):
             return rows
         finally:
             result.close()
+
+    def sample_fields(self, keyspace: Keyspace, size: int) -> FieldSample:
+        """A manual sample (R-04-11): up to `size` documents, their field paths derived in Python (sampling.py). The rows
+        are read one at a time and the byte cap is checked after each (ruling B38: a batch is read whole before anything
+        looks at it, and 200 documents of up to 20 MiB each would be 4 GB); the row that takes the texts past
+        SAMPLE_MAX_BYTES is the last: the result is closed, which abandons the rest and stops the request on the server
+        at once. A server's error answer is raised as StatementError. Nothing of a document is logged."""
+        started = time.monotonic()
+        collector = sampling.FieldCollector()
+        read, cut = 0, False
+        result = self._internal_result(sampling.sample_statement(keyspace), {"n": str(size)}, None)
+        try:
+            while rows := result.fetch_raw(1):
+                try:
+                    collector.add(*sampling.split_sample_row(rows[0]))
+                except ValueError:  # the statement selects `t` and `d` of every row: anything else is not the service
+                    raise StatementError(PROTOCOL_ERROR, code="protocol_error") from None
+                read += len(rows[0])  # characters, as the `*` peek counts (ruling P12)
+                if read > sampling.SAMPLE_MAX_BYTES:  # read now, not at import: a test lowers it
+                    cut = collector.documents < size
+                    break
+        finally:
+            result.close()
+        fields = collector.fields()
+        logger.debug("Couchbase sample: {} documents, {} characters, {} field paths{}", collector.documents, read,
+                     len(fields), " (cut at the byte cap)" if cut else "")
+        return FieldSample(
+            keyspace=keyspace, sampled_at=datetime.now(UTC), requested=size, documents=collector.documents,
+            cut_at_bytes=cut, paths_capped=collector.paths_capped,
+            elapsed_ms=int((time.monotonic() - started) * 1000), fields=fields,
+        )
 
     def arm_cancel(self) -> None:
         self._window.arm()

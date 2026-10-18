@@ -66,6 +66,15 @@ export type PlanSubquery = S["PlanSubquery"];
 export type IndexAdvice = S["IndexAdvice"];
 /** Couchbase (spec §3.11.2): the typed parameters of one statement, JSON literal texts by name or position. */
 export type StatementParams = S["StatementParams"];
+/** Couchbase: a collection by its three names (the key of a field sample). */
+export type Keyspace = S["Keyspace"];
+/**
+ * Couchbase (R-04-11): one field path of a manual sample. `path` runs from the document's root: a key, `null` for the
+ * elements of an array, `[]` for the document itself; `types` counts the documents by JSON kind ("binary" included).
+ */
+export type FieldPath = S["FieldPath"];
+/** Couchbase (R-04-11): the field paths of a keyspace's sampled documents, as `POST /couchbase/fields/sample` answers. */
+export type FieldSample = S["FieldSample"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

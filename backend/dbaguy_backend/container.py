@@ -15,6 +15,7 @@ from .config import Settings, default_data_dir
 from .connectivity.ssh_tunnel import SshTunnelManager
 from .services.connection_service import ConnectionService
 from .services.couchbase_service import CouchbaseService
+from .services.field_sample_service import FieldSampleService
 from .services.history_service import HistoryService
 from .services.metadata_service import MetadataService
 from .services.profile_service import ProfileService
@@ -75,6 +76,7 @@ class AppContainer:
         self.metadata = MetadataService(self.registry, self.connections, self.profiles)
         self.schema_cache = SchemaCache(self.metadata, self.registry, self.profiles)
         self.couchbase = CouchbaseService(self.registry, self.profiles, self.schema_cache, self.metadata)
+        self.field_samples = FieldSampleService(self.metadata, self.app_settings)
         self.history = HistoryService(history_file(data_dir))
         self.policy = SafetyPolicy()
         hooks = SessionHooksFactory(self.registry, self.profiles, self.policy, self.history, self.schema_cache)

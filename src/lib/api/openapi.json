@@ -1170,6 +1170,167 @@
         }
       }
     },
+    "/couchbase/fields/sample": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Sample Fields",
+        "description": "Sample a keyspace's documents (R-04-11): a manual action, whose result is kept for `GET /fields`.",
+        "operationId": "sample_fields_couchbase_fields_sample_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SampleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FieldSample"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/couchbase/fields": {
+      "get": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Cached Fields",
+        "description": "The keyspace's last sample, or null when it has none (nothing samples by itself).",
+        "operationId": "cached_fields_couchbase_fields_get",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Profile Id"
+            }
+          },
+          {
+            "name": "bucket",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100,
+              "title": "Bucket"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 251,
+              "title": "Scope"
+            }
+          },
+          {
+            "name": "collection",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 251,
+              "title": "Collection"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/FieldSample"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Cached Fields Couchbase Fields Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/settings": {
       "get": {
         "tags": [
@@ -2444,6 +2605,12 @@
               "long_query_seconds": 15
             }
           },
+          "couchbase": {
+            "$ref": "#/components/schemas/CouchbaseSettings",
+            "default": {
+              "sample_size": 1000
+            }
+          },
           "scripts_dir": {
             "anyOf": [
               {
@@ -2946,6 +3113,20 @@
         ],
         "title": "ContextOption",
         "description": "One entry of the query-context picker. `text` is `QueryContext(bucket, scope).text()`, so the frontend never\nquotes a name (B13)."
+      },
+      "CouchbaseSettings": {
+        "properties": {
+          "sample_size": {
+            "type": "integer",
+            "maximum": 10000.0,
+            "minimum": 10.0,
+            "title": "Sample Size",
+            "default": 1000
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "CouchbaseSettings"
       },
       "DangerReason": {
         "type": "string",
@@ -3577,6 +3758,100 @@
         ],
         "title": "FetchMoreCommand"
       },
+      "FieldPath": {
+        "properties": {
+          "path": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Path"
+          },
+          "types": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Types"
+          },
+          "docs": {
+            "type": "integer",
+            "title": "Docs"
+          },
+          "percent": {
+            "type": "number",
+            "title": "Percent"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "types",
+          "docs",
+          "percent"
+        ],
+        "title": "FieldPath",
+        "description": "One field path of a sample: how many documents have it and with which JSON kinds."
+      },
+      "FieldSample": {
+        "properties": {
+          "keyspace": {
+            "$ref": "#/components/schemas/Keyspace"
+          },
+          "sampled_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Sampled At"
+          },
+          "requested": {
+            "type": "integer",
+            "title": "Requested"
+          },
+          "documents": {
+            "type": "integer",
+            "title": "Documents"
+          },
+          "cut_at_bytes": {
+            "type": "boolean",
+            "title": "Cut At Bytes"
+          },
+          "paths_capped": {
+            "type": "boolean",
+            "title": "Paths Capped"
+          },
+          "elapsed_ms": {
+            "type": "integer",
+            "title": "Elapsed Ms"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/FieldPath"
+            },
+            "type": "array",
+            "title": "Fields"
+          }
+        },
+        "type": "object",
+        "required": [
+          "keyspace",
+          "sampled_at",
+          "requested",
+          "documents",
+          "cut_at_bytes",
+          "paths_capped",
+          "elapsed_ms",
+          "fields"
+        ],
+        "title": "FieldSample",
+        "description": "A manual sample of a keyspace (R-04-11): the field paths derived in Python from the documents read."
+      },
       "FinishedEvent": {
         "properties": {
           "type": {
@@ -4074,6 +4349,37 @@
           "statement"
         ],
         "title": "IndexAdvice"
+      },
+      "Keyspace": {
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Bucket"
+          },
+          "scope": {
+            "type": "string",
+            "maxLength": 251,
+            "minLength": 1,
+            "title": "Scope"
+          },
+          "collection": {
+            "type": "string",
+            "maxLength": 251,
+            "minLength": 1,
+            "title": "Collection"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "bucket",
+          "scope",
+          "collection"
+        ],
+        "title": "Keyspace",
+        "description": "A collection by its three names. Frozen: it is the key of the field-sample cache."
       },
       "MessageEvent": {
         "properties": {
@@ -5056,6 +5362,38 @@
         "additionalProperties": false,
         "type": "object",
         "title": "SafetySettings"
+      },
+      "SampleRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "keyspace": {
+            "$ref": "#/components/schemas/Keyspace"
+          },
+          "size": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 10000.0,
+                "minimum": 10.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "keyspace"
+        ],
+        "title": "SampleRequest"
       },
       "SchemaRefreshRequest": {
         "properties": {

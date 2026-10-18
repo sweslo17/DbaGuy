@@ -99,12 +99,14 @@ def test_settings_defaults_and_unknown_fields_survive(tmp_path):
     service = SettingsService(path, tmp_path / "scripts")
     current = service.get()
     assert current.editor.font_size == 15 and current.run.page_size == 500
+    assert current.couchbase.sample_size == 1000  # a settings.json from before 04b has no couchbase section
     service.update(current.model_copy(update={"run": current.run.model_copy(update={"page_size": 1000})}))
     saved = json.loads(path.read_text())
     assert saved["run"]["page_size"] == 1000 and saved["future_section"] == {"x": 2} and saved["editor"]["future"] == 1
 
 
-@pytest.mark.parametrize("content", ["{not json", '{"editor": {"font_size": 999}}', "[]"])
+@pytest.mark.parametrize("content", ["{not json", '{"editor": {"font_size": 999}}', '{"couchbase": {"sample_size": 9}}',
+                                     "[]"])
 def test_unreadable_settings_are_moved_aside(tmp_path, content):
     path = tmp_path / "settings.json"
     path.write_text(content)

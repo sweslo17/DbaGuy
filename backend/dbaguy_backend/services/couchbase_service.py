@@ -1,6 +1,8 @@
 """What the Couchbase query workflow needs beyond a session: the contexts a tab can pick, plan analysis, index advice
 on the metadata connection (B12) and the context of a History entry (B15)."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 from uuid import UUID
 
@@ -20,6 +22,19 @@ from .profile_service import ProfileService
 from .schema_cache import SchemaCache
 
 _NOT_COUCHBASE = "This is not a Couchbase connection"
+
+
+@contextmanager
+def server_errors_are_final() -> Iterator[None]:
+    """Around a statement sent on a metadata connection: the server's own error answer (a numeric code) is raised as a
+    DomainError (QueryFailed, with the server's text), so the metadata call does not reconnect and send the statement
+    again. That resend is for a lost connection, and ADVISE on `app.users` panics the server (B39, A15)."""
+    try:
+        yield
+    except StatementError as exc:
+        if is_server_error(exc):
+            raise QueryFailed(exc.message) from exc
+        raise
 
 
 def _nodes(view: PlanView) -> int:
@@ -93,14 +108,8 @@ class CouchbaseService:
         def run(connection: DatabaseConnection) -> list[Any]:
             if not isinstance(connection, CouchbaseConnection):
                 raise ValidationFailed(_NOT_COUCHBASE)
-            try:
+            with server_errors_are_final():
                 return connection.query("ADVISE " + statement, context=context)
-            except StatementError as exc:
-                if is_server_error(exc):
-                    # Raised as a DomainError so the metadata call does not reconnect and send the statement again:
-                    # that resend is for a lost connection, and ADVISE on `app.users` panics the server (B39, A15).
-                    raise QueryFailed(exc.message) from exc
-                raise
 
         rows = self._metadata.with_connection(profile_id, None, run)
         return _answered(analyze_value(rows[0]) if rows else PlanView(kind="unknown"))

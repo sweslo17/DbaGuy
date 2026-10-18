@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, ClassVar, Literal
 
+from ..domain.couchbase import FieldSample, Keyspace
 from ..domain.errors import ValidationFailed
 from ..domain.execution import ColumnMeta, ErrorPosition, Presentation, QueryContext, ServerMessage, StatementParams
 from ..domain.metadata import Folder, NodeKind, ObjectDetail, ObjectNode, PathSegment, ServerInfo, child_path
@@ -274,6 +275,15 @@ class DatabaseConnection(ABC):
 
     @abstractmethod
     def close(self) -> None: ...
+
+
+class FieldSampling(ABC):
+    """A connection whose engine can read sample documents of a keyspace and tell their field paths (Couchbase)."""
+
+    @abstractmethod
+    def sample_fields(self, keyspace: Keyspace, size: int) -> FieldSample:
+        """Read up to `size` documents of `keyspace` and derive their field paths (a manual action, R-04-11). Runs on
+        the owning worker thread like every method; a server's error answer is raised as StatementError."""
 
 
 class DatabaseAdapter(ABC):

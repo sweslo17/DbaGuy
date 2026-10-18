@@ -305,6 +305,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/couchbase/fields/sample": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Sample Fields
+         * @description Sample a keyspace's documents (R-04-11): a manual action, whose result is kept for `GET /fields`.
+         */
+        post: operations["sample_fields_couchbase_fields_sample_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/couchbase/fields": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Cached Fields
+         * @description The keyspace's last sample, or null when it has none (nothing samples by itself).
+         */
+        get: operations["cached_fields_couchbase_fields_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/settings": {
         parameters: {
             query?: never;
@@ -648,6 +688,12 @@ export interface components {
              *     }
              */
             notifications: components["schemas"]["NotificationSettings"];
+            /**
+             * @default {
+             *       "sample_size": 1000
+             *     }
+             */
+            couchbase: components["schemas"]["CouchbaseSettings"];
             /** Scripts Dir */
             scripts_dir?: string | null;
         };
@@ -830,6 +876,14 @@ export interface components {
              * @default true
              */
             listed: boolean;
+        };
+        /** CouchbaseSettings */
+        CouchbaseSettings: {
+            /**
+             * Sample Size
+             * @default 1000
+             */
+            sample_size: number;
         };
         /**
          * DangerReason
@@ -1063,6 +1117,46 @@ export interface components {
              */
             count: number;
         };
+        /**
+         * FieldPath
+         * @description One field path of a sample: how many documents have it and with which JSON kinds.
+         */
+        FieldPath: {
+            /** Path */
+            path: (string | null)[];
+            /** Types */
+            types: {
+                [key: string]: number;
+            };
+            /** Docs */
+            docs: number;
+            /** Percent */
+            percent: number;
+        };
+        /**
+         * FieldSample
+         * @description A manual sample of a keyspace (R-04-11): the field paths derived in Python from the documents read.
+         */
+        FieldSample: {
+            keyspace: components["schemas"]["Keyspace"];
+            /**
+             * Sampled At
+             * Format: date-time
+             */
+            sampled_at: string;
+            /** Requested */
+            requested: number;
+            /** Documents */
+            documents: number;
+            /** Cut At Bytes */
+            cut_at_bytes: boolean;
+            /** Paths Capped */
+            paths_capped: boolean;
+            /** Elapsed Ms */
+            elapsed_ms: number;
+            /** Fields */
+            fields: components["schemas"]["FieldPath"][];
+        };
         /** FinishedEvent */
         FinishedEvent: {
             /**
@@ -1247,6 +1341,18 @@ export interface components {
             rule?: string | null;
             /** Update Statistics */
             update_statistics?: string | null;
+        };
+        /**
+         * Keyspace
+         * @description A collection by its three names. Frozen: it is the key of the field-sample cache.
+         */
+        Keyspace: {
+            /** Bucket */
+            bucket: string;
+            /** Scope */
+            scope: string;
+            /** Collection */
+            collection: string;
         };
         /** MessageEvent */
         MessageEvent: {
@@ -1629,6 +1735,17 @@ export interface components {
              * @default 0
              */
             idle_transaction_rollback_minutes: number;
+        };
+        /** SampleRequest */
+        SampleRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            keyspace: components["schemas"]["Keyspace"];
+            /** Size */
+            size?: number | null;
         };
         /** SchemaRefreshRequest */
         SchemaRefreshRequest: {
@@ -2785,6 +2902,77 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PlanView"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    sample_fields_couchbase_fields_sample_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SampleRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FieldSample"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cached_fields_couchbase_fields_get: {
+        parameters: {
+            query: {
+                profile_id: string;
+                bucket: string;
+                scope: string;
+                collection: string;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FieldSample"] | null;
                 };
             };
             /** @description Validation Error */
