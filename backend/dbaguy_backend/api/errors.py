@@ -6,7 +6,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from loguru import logger
 
-from ..domain.errors import DomainError
+from ..domain.errors import DomainError, QueryFailed
 
 
 def error_body(code: str, message: str, detail: Any | None = None) -> dict[str, Any]:
@@ -21,6 +21,11 @@ def register_error_handlers(app: FastAPI) -> None:
     async def handle_domain_error(request: Request, exc: DomainError) -> JSONResponse:
         if exc.status >= 500:
             logger.error("{} {} failed: {} ({})", request.method, request.url.path, exc.message, exc.code)
+        elif isinstance(exc, QueryFailed):
+            # The server's or driver's own text: a syntax error quotes the statement (a string literal included), so it
+            # stays out of the INFO log, which a user may share; DEBUG already carries SQL text (spec §5).
+            logger.info("{} {} rejected ({})", request.method, request.url.path, exc.code)
+            logger.debug("{} {} rejected: {}", request.method, request.url.path, exc.message)
         else:
             logger.info("{} {} rejected: {} ({})", request.method, request.url.path, exc.message, exc.code)
         return JSONResponse(status_code=exc.status, content=error_body(exc.code, exc.message, exc.detail))

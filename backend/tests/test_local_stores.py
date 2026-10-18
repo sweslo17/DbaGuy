@@ -209,6 +209,40 @@ def test_an_invalid_tab_is_dropped_alone_with_a_warning_naming_its_fields(tmp_pa
     assert "secret-buffer" not in logged_warnings[0] and "chart" not in logged_warnings[0]
 
 
+def test_a_tab_with_bad_drafts_or_context_keeps_its_buffer_and_loses_only_those(tmp_path, logged_warnings):
+    path = tmp_path / "workspace.json"
+    bad_names = {"$1000": "1", "$x y": "1", "$0": "1", "$1abc": "1", "$\u00e9": "1", "$line\nbreak": "1"}
+    path.write_text(json.dumps({"tabs": [
+        {"id": "t1", "kind": "query", "buffer": "SELECT $x", "query_context": "all",
+         "params": {"$ok": "1", **bad_names, "$big": "x" * (1 << 20) + "y"}},
+        {"id": "t2", "kind": "query", "buffer": "kept", "params": {"$a": "1"},
+         "query_context": {"bucket": "b", "scope": "s"}},
+        {"id": "t3", "kind": "query", "buffer": "b3", "params": ["not", "a", "dict"]},
+        {"id": "t4", "kind": "query", "buffer": "b4", "params": {f"$p{i}": "1" for i in range(450)},
+         "query_context": {"bucket": ""}},
+        {"id": "t5", "kind": "chart", "buffer": "dropped as before"},
+    ]}))
+    state = WorkspaceService(path).get()
+    t1, t2, t3, t4 = state.tabs
+    assert [t.id for t in state.tabs] == ["t1", "t2", "t3", "t4"]
+    assert (t1.buffer, t1.params, t1.query_context) == ("SELECT $x", {"$ok": "1"}, None)
+    assert (t2.params, t2.query_context.bucket) == ({"$a": "1"}, "b")  # a good tab is untouched
+    assert (t3.buffer, t3.params) == ("b3", None)
+    assert (t4.buffer, len(t4.params), list(t4.params)[0], t4.query_context) == ("b4", 400, "$p0", None)
+    assert list(tmp_path.glob("workspace.json.corrupt-*")) == []
+    repaired = [line for line in logged_warnings if line.startswith("Repaired")]
+    assert repaired == [
+        "Repaired tab 0 of the saved workspace: removed 7 parameter draft(s) and reset the query context",
+        "Repaired tab 2 of the saved workspace: removed 1 parameter draft(s)",
+        "Repaired tab 3 of the saved workspace: removed 50 parameter draft(s) and reset the query context",
+    ]
+    everything = "".join(logged_warnings)  # counts and indexes only: no name, no draft, no context value
+    for secret in ("$x y", "$1000", "line", "break", "$ok", "all", "xxxx"):
+        assert secret not in everything
+    WorkspaceService(path).put(state)  # the next save writes what was kept
+    assert [t["id"] for t in json.loads(path.read_text())["tabs"]] == ["t1", "t2", "t3", "t4"]
+
+
 @pytest.mark.parametrize("content", ["{not json", "[]", '{"tabs": "nope"}', '{"version": "two", "tabs": []}'])
 def test_a_workspace_file_unreadable_as_a_whole_is_moved_aside(tmp_path, content):
     path = tmp_path / "workspace.json"

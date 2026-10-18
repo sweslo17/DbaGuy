@@ -126,6 +126,11 @@ class QueryContext(BaseModel):
         return cls(bucket=parts[0], scope=parts[1] if len(parts) == 2 else None)  # pydantic's ValidationError is a ValueError
 
 
+# A parameter's name, without its `$` / `@`: what the worker accepts (sessions/options) and what a tab's saved drafts
+# are keyed by (domain/workspace). Defined here once.
+PARAM_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+
+
 class StatementParams(BaseModel):
     """Typed parameters of one statement (R-10): JSON literal texts, sent unchanged. Content is checked by the worker
     (`invalid_params`), only the shape here."""

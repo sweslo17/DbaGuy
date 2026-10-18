@@ -28,6 +28,9 @@ from dbaguy_backend.domain.couchbase import (
 
 DETAIL_MAX_CHARS = 300  # a detail longer than this ends with "…", the "…" being the 300th character
 MAX_PLAN_DEPTH = 200  # deeper than any plan the server writes, and shallower than what pydantic can serialize (~250)
+# More operators than any plan the server writes (a join of dozens of keyspaces has hundreds): a 4 MiB text can hold
+# 220,000, which took 1.9 s, answered 24 MB and held 450 MB of memory to draw
+MAX_PLAN_NODES = 10_000
 
 # What an operator's children are, in this order; any other key whose value is an operator (or a list of operators)
 # comes after them, so an operator the survey did not see still has its subtree walked.
@@ -77,11 +80,15 @@ class _TooDeep(RecursionError):
     """A plan nested deeper than `MAX_PLAN_DEPTH`: the same answer as one nested deeper than the interpreter follows."""
 
 
+class _TooMany(RecursionError):
+    """A view of more than `MAX_PLAN_NODES` operators: the same answer as a plan that is too deep."""
+
+
 def analyze_value(value: Any) -> PlanView:
     """Like `analyze()`, for a value that is already decoded."""
     try:
         return _analyze(value)
-    except RecursionError:  # (also `_TooDeep`) an answer nested that deep is not one the server wrote
+    except RecursionError:  # (also `_TooDeep`, `_TooMany`) an answer that big is not one the server wrote
         return PlanView(kind="unknown")
 
 
@@ -184,6 +191,8 @@ class _Builder:
     def build(self, op: dict[str, Any], depth: int = 1) -> PlanNode:
         if depth > MAX_PLAN_DEPTH:
             raise _TooDeep
+        if self._next_id >= MAX_PLAN_NODES:
+            raise _TooMany
         node_id = self._next_id
         self._next_id += 1
         operator: str = op["#operator"]

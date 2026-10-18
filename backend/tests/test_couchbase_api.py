@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from loguru import logger
 
 from dbaguy_backend.adapters.couchbase.adapter import CouchbaseAdapter, CouchbaseConnection
 from dbaguy_backend.adapters.registry import AdapterRegistry
@@ -81,6 +82,15 @@ def test_contexts_refuse_other_engines(app, tmp_path):
                          headers=AUTH).json()["profile"]["id"]
     response = client.get("/couchbase/contexts", params={"profile_id": sqlite}, headers=AUTH)
     assert response.status_code == 422 and "not a Couchbase connection" in response.json()["error"]["message"]
+
+
+def test_plan_of_text_that_cannot_be_sent_is_unknown_not_a_500(app):
+    """`"\\ud800"` is valid JSON, but the lone surrogate it names is not UTF-8: the view could not be answered."""
+    client, _ = app
+    text = '{"plan": {"#operator": "IndexScan3", "keyspace": "\\ud800", "index": "i"}, "text": "t"}'
+    response = client.post("/couchbase/plan", json={"text": text}, headers=AUTH)
+    assert response.status_code == 200 and response.json()["kind"] == "unknown"
+    assert client.post("/couchbase/plan", json={"text": text.replace("\\ud800", "k")}, headers=AUTH).json()["kind"] == "plan"
 
 
 def test_plan_analyses_a_text(app):
@@ -168,6 +178,21 @@ def test_describe_is_not_offered_for_sqlpp(app, cb):
     body = {"profile_id": cb, "text": "SELECT * FROM users", "cursor": 16}
     response = client.post("/sql/describe", json=body, headers=AUTH)
     assert response.status_code == 200 and response.json() is None
+
+
+@requires_couchbase
+def test_a_syntax_error_of_advise_never_puts_the_statement_in_the_info_log(app, cb):
+    client, _ = app
+    info: list[str] = []
+    sink = logger.add(lambda m: info.append(m.record["message"]), level="INFO")
+    body = {"profile_id": cb, "statement": 'SELECT * FROM orders WHERE x = "SECRET_LIT_1" "z"',
+            "query_context": {"bucket": "dbaguy", "scope": "app"}}
+    try:
+        response = client.post("/couchbase/advise", json=body, headers=AUTH)
+    finally:
+        logger.remove(sink)
+    assert response.status_code == 400 and "SECRET_LIT_1" in response.json()["error"]["message"]  # the server quotes it
+    assert "SECRET_LIT_1" not in "".join(info)
 
 
 @requires_couchbase

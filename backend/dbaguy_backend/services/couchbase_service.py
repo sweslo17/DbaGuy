@@ -33,7 +33,14 @@ def _nodes(view: PlanView) -> int:
     return count
 
 
-def _logged(view: PlanView) -> PlanView:
+def _answered(view: PlanView) -> PlanView:
+    """What the endpoint answers with, and the one log line about it (kind and counts, never the plan's content). A
+    view whose text cannot be sent (an escaped lone surrogate, `"\\ud800"`, is valid JSON but not UTF-8) is `unknown`."""
+    try:
+        view.model_dump_json().encode("utf-8")
+    except ValueError:  # PydanticSerializationError, UnicodeEncodeError
+        logger.debug("Plan view of kind {} holds text that cannot be sent: answering unknown", view.kind)
+        view = PlanView(kind="unknown")
     logger.debug("Plan view: {}, {} operators, {} findings, {} advice", view.kind, _nodes(view), len(view.findings),
                  len(view.advice))
     return view
@@ -75,7 +82,7 @@ class CouchbaseService:
 
     def plan(self, text: str) -> PlanView:
         """The view of an EXPLAIN / ADVISE / profile text the user pasted: pure, no connection."""
-        return _logged(analyze(text))
+        return _answered(analyze(text))
 
     def advise(self, profile_id: UUID, statement: str, context: QueryContext | None) -> PlanView:
         """`ADVISE <statement>` on the profile's metadata connection, read-only like every internal query, in `context`
@@ -96,7 +103,7 @@ class CouchbaseService:
                 raise
 
         rows = self._metadata.with_connection(profile_id, None, run)
-        return _logged(analyze_value(rows[0]) if rows else PlanView(kind="unknown"))
+        return _answered(analyze_value(rows[0]) if rows else PlanView(kind="unknown"))
 
     def with_query_contexts(self, page: HistoryPage) -> HistoryPage:
         """The page with each entry's context read back from its `database` (B15), for the entries of existing profiles

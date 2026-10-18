@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from dbaguy_backend.adapters.couchbase.explain import analyze, go_duration_ns
+from dbaguy_backend.adapters.couchbase.explain import MAX_PLAN_NODES, analyze, go_duration_ns
 from dbaguy_backend.domain.couchbase import IndexAdvice, PlanNode, PlanView
 from tests.support import plan_fixture
 
@@ -243,6 +243,23 @@ def test_a_plan_nested_past_the_cap_is_unknown_and_one_at_the_cap_serializes():
     assert analyze(json.dumps({"plan": chain(201)})).kind == "unknown"
     too_deep = analyze(json.dumps({"plan": chain(300), "text": "t"}))
     assert too_deep.kind == "unknown" and too_deep.model_dump_json()  # pydantic's own limit is near 250
+
+
+def flat(operators: int) -> dict:
+    """A Sequence of `operators` operators in all (one root and its flat children)."""
+    return {"#operator": "Sequence", "~children": [{"#operator": "Filter"} for _ in range(operators - 1)]}
+
+
+def test_a_view_of_more_operators_than_the_cap_is_unknown_and_one_at_the_cap_is_whole():
+    at_cap = analyze(json.dumps({"plan": flat(MAX_PLAN_NODES), "text": "t"}))
+    assert at_cap.kind == "plan" and len(list(walk(at_cap.root))) == MAX_PLAN_NODES
+    assert analyze(json.dumps({"plan": flat(MAX_PLAN_NODES + 1), "text": "t"})).kind == "unknown"
+    # the cap counts the whole view: the main tree and its subqueries together
+    subqueries = [{"subquery": "s", "correlated": False, "plan": flat(MAX_PLAN_NODES // 2)}] * 2
+    shared = {"plan": flat(2), "~subqueries": subqueries}
+    assert analyze(json.dumps(shared)).kind == "unknown"
+    assert analyze(json.dumps({**shared, "~subqueries": subqueries[:1]})).kind == "plan"
+    assert analyze(json.dumps({"executionTimings": flat(MAX_PLAN_NODES + 1)})).kind == "unknown"
 
 
 def test_a_covering_index_keeps_its_property_as_the_reason():
