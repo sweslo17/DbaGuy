@@ -3,6 +3,7 @@ connection over a fake query service (what a request carries, what is never sent
 
 import json
 import threading
+import time
 
 import pytest
 
@@ -22,7 +23,7 @@ from dbaguy_backend.domain.metadata import ServerInfo
 from dbaguy_backend.domain.profiles import Engine
 from dbaguy_backend.sessions.worker import paused_result_closed_text
 from tests.couchbase_fakes import FakeQueryServer, FakeResponse, Reply
-from tests.support import make_couchbase_profile
+from tests.support import make_couchbase_profile, scaled
 
 
 def result_of(*chunks, sql="SELECT * FROM ks", plan=False, bare_star=True, dml=False, cancelled=lambda: False):
@@ -380,5 +381,18 @@ def test_a_node_nobody_listens_on_is_reported_with_its_reason():
 def test_a_paused_result_is_closed_before_the_server_ends_it():  # A13: 7.6.12 ends a stalled request after 77–86 s
     assert PAUSED_RESULT_MAX_IDLE_S + container._HOUSEKEEPING_INTERVAL_S <= 77 - 15  # a margin for a slower server
     assert CouchbaseAdapter.capabilities.paused_result_max_idle_s == PAUSED_RESULT_MAX_IDLE_S
-    assert paused_result_closed_text(PAUSED_RESULT_MAX_IDLE_S).startswith("Closed this result after 45 s without")
-    assert paused_result_closed_text(120.0).startswith("Closed this result after 2 min without")
+    assert paused_result_closed_text(PAUSED_RESULT_MAX_IDLE_S).startswith("Closed this result 45 s after it first paused")
+    assert paused_result_closed_text(120.0).startswith("Closed this result 2 min after it first paused")
+
+
+def test_the_fake_server_ends_a_connection_when_its_script_runs_out():  # a test asking too much fails at once
+    server, connection = fake_connection([OK_ONE])
+    try:
+        connection.run("SELECT 1").close()
+        started = time.monotonic()
+        with pytest.raises(StatementError) as error:
+            connection.run("SELECT 2")
+        assert error.value.code == "connection_lost" and time.monotonic() - started < scaled(2.0)
+    finally:
+        connection.close()
+        server.close()

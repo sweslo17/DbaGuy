@@ -80,11 +80,12 @@ _EXPORT_SELECT_ONLY = "Only a statement that returns rows (SELECT, WITH, VALUES�
 
 
 def paused_result_closed_text(limit_s: float) -> str:
-    """The warning a paused result gets when the worker closes it for idling past the engine's limit (whole minutes
-    as minutes, anything else in seconds: "2 min", "45 s")."""
+    """The warning a paused result gets when the worker closes it `limit_s` after its first pause (the engine's limit;
+    whole minutes as minutes, anything else in seconds: "2 min", "45 s"). A Load more does not restart that clock
+    (R-04a-T11b), so the text does not promise that loading more keeps the result open."""
     after = f"{limit_s / 60:g} min" if limit_s % 60 == 0 else f"{limit_s:g} s"
-    return (f"Closed this result after {after} without loading more rows, to free the query node — "
-            "run the statement again to load more")
+    return (f"Closed this result {after} after it first paused, to free the query node — run the statement again to "
+            "load more, or export it to get every row")
 
 
 def _param_names(params: StatementParams) -> str:
@@ -171,7 +172,7 @@ class _PausedMark:
 
     token: int  # tells two pauses of the same request apart
     request_id: str
-    since: float  # the worker's clock when the pause began
+    since: float  # the worker's clock at the result's first pause (the idle limit counts from it, R-04a-T11b)
 
 
 @dataclass
@@ -182,6 +183,9 @@ class _OpenExecution:
     sent: int = 0
     columns_sent: bool = False
     peeked: list[list[Any]] = field(default_factory=list)  # raw rows read ahead to detect a full page
+    # The worker's clock at the result's first pause: the idle limit counts from it on every later pause too
+    # (R-04a-T11b: a Load more served from buffers does not restart the server's own stall clock)
+    first_paused_at: float | None = None
 
     @property
     def request_id(self) -> str:
@@ -337,9 +341,11 @@ class SessionWorker:
                 pass  # closing: closing the connection ends the transaction anyway
 
     def check_paused_result(self) -> None:
-        """Close the paused result once it has waited for Load more longer than the engine allows (capability
-        `paused_result_max_idle_s`; Couchbase: a paused request holds a query servicer, R-04-6). Any thread; the close
-        itself runs on the worker thread, and only if the result is still in the same pause by then."""
+        """Close the paused result once the engine's limit (capability `paused_result_max_idle_s`; Couchbase: a paused
+        request holds a query servicer, R-04-6) has passed since the result's FIRST pause: a Load more does not restart
+        the clock (R-04a-T11b; Couchbase ends a stalled request on its own 77–86 s after the first stall, and a Load
+        more served from buffers does not unstall it). Any thread; the close itself runs on the worker thread, and only
+        if the result is still in the same pause by then (a Load more racing the close wins)."""
         limit = self._hooks.capabilities.paused_result_max_idle_s
         if limit is None:
             return
@@ -651,8 +657,10 @@ class SessionWorker:
         if self._set_running(None):
             self._discard(ex.request_id, cancelled=True)
             return
-        with self._state_lock:  # before any event: the idle check may start counting now
-            self._paused = _PausedMark(next(self._pause_tokens), ex.request_id, self._clock())
+        if ex.first_paused_at is None:
+            ex.first_paused_at = self._clock()
+        with self._state_lock:  # before any event: the idle check may look at this pause now
+            self._paused = _PausedMark(next(self._pause_tokens), ex.request_id, ex.first_paused_at)
         # In manual-commit mode the statement opened a transaction that a paused result keeps open: report it now,
         # not only at `finished`, so the client and the idle check see it.
         self._refresh_state(began_at=ex.req.started_at)
@@ -893,7 +901,7 @@ class SessionWorker:
         execution = self._open_exec
         if self._closed or not still or execution is None or execution.request_id != mark.request_id:
             return  # a Load more, a new statement, a discard or closing came first: the result is not idle any more
-        logger.info("[{}] closed paused result {} after {:.0f} s without Load more (limit {:g} s)", self.name,
+        logger.info("[{}] closed paused result {} {:.0f} s after its first pause (limit {:g} s)", self.name,
                     mark.request_id, self._clock() - mark.since, limit_s)
         self._send(MessageEvent(
             request_id=mark.request_id, severity=MessageSeverity.WARNING, text=paused_result_closed_text(limit_s),

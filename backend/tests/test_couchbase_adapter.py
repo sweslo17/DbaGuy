@@ -415,7 +415,7 @@ def test_tls_with_the_cluster_ca(tmp_path):  # A10, A11
         try:
             assert read(conn, "SELECT RAW 1")[1] == [[1]]
             if mode == "verify-ca":  # cancel over TLS (A10), the timer started before run() (R-04a-C1)
-                timer, delivered = cancel_later(conn, 1.0)
+                timer, delivered = cancel_later(conn, 1.5)  # past 1 s on the server: completed_requests keeps it
                 try:
                     with pytest.raises(StatementCancelled):
                         conn.run(LONG_AGGREGATE)

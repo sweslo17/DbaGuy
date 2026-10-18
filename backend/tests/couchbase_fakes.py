@@ -45,15 +45,18 @@ class FakeQueryServer:
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
     def _handle(self, conn: socket.socket) -> None:
-        with conn:
+        # The reader closes with the connection: a file object left open would keep the descriptor (and the client's
+        # wait) alive after the handler ends.
+        with conn, conn.makefile("rb") as reader:
             try:  # the whole loop (P45): a client that abandons a response (reset, broken pipe) leaves no thread warning
-                reader = conn.makefile("rb")
                 while reader.readline():  # the request line; empty when the client left
                     headers = {}
                     while (line := reader.readline()) not in (b"\r\n", b"\n", b""):
                         name, _, value = line.decode().partition(":")
                         headers[name.strip().lower()] = value.strip()
                     self.bodies.append(reader.read(int(headers.get("content-length", "0"))))
+                    if not self.replies:
+                        return  # the script ran out: the connection closes, and the client fails at once
                     reply = self.replies.pop(0)
                     if reply.before_head is not None:
                         reply.before_head.wait(10)

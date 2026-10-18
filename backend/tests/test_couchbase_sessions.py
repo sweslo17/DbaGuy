@@ -18,7 +18,7 @@ from tests.support import (
 )
 from tests.test_couchbase_adapter import STREAM, U_KEYORDER
 from tests.test_dev_env import U_NUMBERS
-from tests.test_sessions import Recorder, finished
+from tests.test_sessions import Recorder, finished, paused
 
 pytestmark = requires_couchbase
 APP = QueryContext(bucket="dbaguy", scope="app")
@@ -154,22 +154,27 @@ def test_begin_work_and_insert_exports_are_refused(cb_worker, tmp_path):
     assert rec.of("i", "error")[0].code == "unsupported_format"
 
 
-def test_an_idle_paused_result_is_closed_and_frees_the_server_request():  # R-04-6, A13
+def test_an_idle_paused_result_is_closed_and_frees_the_server_request():  # R-04-6, A13, R-04a-T11b
     clock = Clock()
     worker, rec = start_cb_worker(clock)
     try:
         worker.submit(ExecuteCommand(request_id="p", sql=STREAM, page_size=500))
-        rec.wait_for(lambda e: e.type == "result_set_end" and e.request_id == "p" and e.has_more, timeout=30)
+        rec.wait_for(paused("p", 500), timeout=30)  # the first pause: the idle clock starts here
         ident = worker.connection.last_client_context_id
         time.sleep(1.2)  # system:completed_requests keeps requests over 1 s
-        clock.now += PAUSED_RESULT_MAX_IDLE_S - 1
-        worker.check_paused_result()
+        clock.now += 20  # a Load more 20 s into the pause: served from the buffers, it does not restart the clock
+        worker.submit(FetchMoreCommand(request_id="p", count=500))
+        rec.wait_for(paused("p", 1000), timeout=30)
+        clock.now += PAUSED_RESULT_MAX_IDLE_S - 20 - 1  # 1 s short of the limit, counted from the first pause
+        worker.check_paused_result()  # below the limit it queues nothing
         assert not rec.of("p", "finished")
-        clock.now += 2
+        clock.now += 1  # the limit after the FIRST pause (not after the Load more)
         worker.check_paused_result()
         rec.wait_for(finished("p"), timeout=10)
         assert rec.of("p", "message")[-1].text == paused_result_closed_text(PAUSED_RESULT_MAX_IDLE_S)
-        assert completed_request_state(ident) == "closed"  # the query servicer is free again
+        assert "after it first paused" in rec.of("p", "message")[-1].text
+        assert sum(len(e.rows) for e in rec.of("p", "rows")) == 1000 and not rec.of("p", "error")
+        assert completed_request_state(ident) == "closed"  # our close, not the server's stall kill (`fatal`)
         worker.submit(ExecuteCommand(request_id="n", sql="SELECT RAW 1"))
         rec.wait_for(finished("n"))
         assert rec.of("n", "rows")[0].rows == [[1]]

@@ -525,8 +525,8 @@ def test_the_history_record_carries_the_requests_query_context():  # P37: `_comp
         worker.close()
 
 
-CLOSED = ("Closed this result after 2 min without loading more rows, to free the query node — run the statement again "
-          "to load more")
+CLOSED = ("Closed this result 2 min after it first paused, to free the query node — run the statement again to load "
+          "more, or export it to get every row")
 
 
 def test_an_idle_paused_result_is_closed_after_the_limit():
@@ -596,6 +596,54 @@ def _barrier(worker):
     assert done.wait(5)
 
 
+CLOSED_45 = ("Closed this result 45 s after it first paused, to free the query node — run the statement again to load "
+             "more, or export it to get every row")
+
+
+def test_the_idle_limit_counts_from_the_first_pause_and_a_load_more_does_not_restart_it():  # R-04a-T11b
+    clock = Clock()
+    worker, _, rec = make_worker(clock=clock, paused_result_max_idle_s=45.0)
+    try:
+        execute(worker, "p", "rows 2000")
+        rec.wait_for(paused("p", 500))  # the first pause: the clock starts here
+        clock.now += 40  # limit - 5 s
+        worker.submit(FetchMoreCommand(request_id="p"))
+        rec.wait_for(paused("p", 1000))
+        clock.now += 4  # 44 s after the first pause, 4 s after the second
+        worker.check_paused_result()
+        _barrier(worker)
+        assert not rec.of("p", "finished")
+        clock.now += 1  # 45 s after the first pause (5 s after the second): the limit, not 45 s after the Load more
+        worker.check_paused_result()
+        rec.wait_for(finished("p"))
+        assert rec.of("p", "message")[-1].text == CLOSED_45
+        assert sum(len(e.rows) for e in rec.of("p", "rows")) == 1000  # the rows loaded stay
+    finally:
+        worker.close()
+
+
+def test_a_load_more_racing_the_close_still_wins_and_the_clock_still_runs_from_the_first_pause():  # R-04a-T11b
+    clock = Clock()
+    rec = HoldingRecorder(lambda e: e.type == "result_set_end" and e.has_more)
+    worker, _, _ = make_worker(clock=clock, recorder=rec, paused_result_max_idle_s=45.0)
+    try:
+        execute(worker, "p", "rows 2000")
+        assert rec.holding.wait(5)  # paused at 500, held inside the pause
+        clock.now += 46
+        worker.submit(FetchMoreCommand(request_id="p"))
+        worker.check_paused_result()  # a close for the pause at 500, queued behind the Load more
+        rec.proceed.set()
+        rec.wait_for(paused("p", 1000))
+        _barrier(worker)
+        assert not rec.of("p", "finished")  # the Load more won: the stale close found a new mark
+        assert sum(len(e.rows) for e in rec.of("p", "rows")) == 1000
+        worker.check_paused_result()  # the pause at 1000 is already past the limit counted from the first pause
+        rec.wait_for(finished("p"))
+        assert rec.of("p", "message")[-1].text == CLOSED_45
+    finally:
+        worker.close()
+
+
 def test_a_close_queued_for_an_earlier_pause_spares_the_next_one():  # the token: same request, a later pause
     clock = Clock()
     rec = HoldingRecorder(lambda e: e.type == "result_set_end" and e.has_more)
@@ -607,7 +655,7 @@ def test_a_close_queued_for_an_earlier_pause_spares_the_next_one():  # the token
         worker.submit(FetchMoreCommand(request_id="p"))
         worker.check_paused_result()  # queued behind the Load more, for the pause at 500
         rec.proceed.set()
-        rec.wait_for(paused("p", 1000))  # the Load more paused again, a new idle stretch from now
+        rec.wait_for(paused("p", 1000))  # the Load more paused again: a new mark, which the queued close spares
         _barrier(worker)
         assert not rec.of("p", "finished") and CLOSED not in [e.text for e in rec.of("p", "message")]
         clock.now += 121
