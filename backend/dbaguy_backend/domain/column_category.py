@@ -11,3 +11,4 @@ class ColumnCategory(StrEnum):
     BINARY = "binary"
     JSON = "json"
     OTHER = "other"
+    MIXED = "mixed"  # every cell carries its own type (Couchbase): a string is a string, never guessed as JSON

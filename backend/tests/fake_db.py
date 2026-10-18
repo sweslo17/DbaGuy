@@ -5,6 +5,7 @@ from typing import Any
 
 from dbaguy_backend.adapters.base import (
     DatabaseConnection,
+    RunOptions,
     StatementCancelled,
     StatementError,
     StatementResult,
@@ -50,6 +51,7 @@ class FakeConnection(DatabaseConnection):
 
     def __init__(self) -> None:
         self.runs: list[str] = []
+        self.options: list[RunOptions | None] = []  # what each run() received, in order
         self.cancel_calls = 0
         self.interruptions: list[str] = []  # "cancel", "force", "abort", in order
         self._forced = threading.Event()
@@ -77,10 +79,11 @@ class FakeConnection(DatabaseConnection):
     def schema_snapshot(self) -> SchemaSnapshot:
         raise NotImplementedError
 
-    def run(self, sql: str) -> StatementResult:
+    def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
         """`rows N` → N rows; `block` → waits for cancel(); `fail MSG` → StatementError; `begin` opens a
         transaction; anything else → an empty result."""
         self.runs.append(sql)
+        self.options.append(options)
         if not self.auto:
             self.tx = True  # manual mode: the adapters BEGIN before the statement, even a SELECT that then pauses
         word, _, arg = sql.partition(" ")

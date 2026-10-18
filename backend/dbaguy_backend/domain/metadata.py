@@ -1,8 +1,10 @@
 from enum import StrEnum
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .execution import QueryContext
 from .profiles import Engine
 
 
@@ -83,6 +85,9 @@ class ServerInfo(BaseModel):
     version: str
     current_database: str | None = None
     current_user: str | None = None
+    edition: Literal["enterprise", "community"] | None = None  # Couchbase; None for the other engines
+    # Couchbase: the profile's default context; the client sends it unless a tab chose another (ruling P1)
+    default_query_context: QueryContext | None = None
 
 
 class MetadataRequest(BaseModel):

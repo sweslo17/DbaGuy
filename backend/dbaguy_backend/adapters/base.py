@@ -1,11 +1,12 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
-from ..domain.execution import ColumnMeta, ErrorPosition, ServerMessage
+from ..domain.errors import ValidationFailed
+from ..domain.execution import ColumnMeta, ErrorPosition, Presentation, QueryContext, ServerMessage, StatementParams
 from ..domain.metadata import Folder, NodeKind, ObjectDetail, ObjectNode, PathSegment, ServerInfo, child_path
-from ..domain.profiles import AnyDraft, AnyProfile, Engine, EngineInfo
+from ..domain.profiles import AnyDraft, AnyProfile, Engine, EngineInfo, ServerProfile
 from ..domain.schema import RelationKind, SchemaSnapshot
 from ..sql.dialects import Dialect
 from .positions import offset_to_line_col
@@ -27,6 +28,25 @@ class AdapterCapabilities:
     # PostgreSQL: cancelling a statement aborts the transaction around it (the export-cancel warning)
     cancel_aborts_transaction: bool = False
     server_read_only: bool = True  # the database can enforce a read-only session; SQL Server cannot (03b)
+    transactions: bool = True  # BEGIN / COMMIT / ROLLBACK and the auto-commit switch (Couchbase: none)
+    query_context: bool = False  # run() takes RunOptions.query_context (Couchbase)
+    parameters: bool = False  # run() takes RunOptions.params
+    documents: bool = False  # the engine stores JSON documents by key
+    executed_plan: bool = False  # run() takes RunOptions.profile_plan (04b)
+    plan_format: Literal["couchbase"] | None = None  # how EXPLAIN / profile results are laid out
+    # A paused result idle this long is closed by the worker (Couchbase: the server drops an idle stream); None: never
+    paused_result_max_idle_s: float | None = None
+
+
+@dataclass(frozen=True)
+class RunOptions:
+    """Per-request options of `run()` (D-04-3). The worker checks them against the engine's capabilities, so an adapter
+    never receives one it did not declare."""
+
+    query_context: QueryContext | None = None  # needs capabilities.query_context
+    params: StatementParams | None = None  # needs capabilities.parameters
+    profile_plan: bool = False  # needs capabilities.executed_plan (04b)
+    retry_safe: bool = False  # the statement was classified READ: an adapter may send it again after a stale connection
 
 
 @dataclass(frozen=True)
@@ -113,6 +133,19 @@ class StatementResult(ABC):
         transaction open and healthy (e.g. PostgreSQL closes a cursor instead of cancelling the statement).
         """
 
+    def presentation(self) -> Presentation:
+        """How the client may show the current result set: "plan" for an EXPLAIN / ADVISE / profile result."""
+        return "grid"
+
+
+class RawJsonRows(ABC):
+    """A result whose rows are JSON documents as the server sent them (Couchbase): JSON / JSONL exports write them."""
+
+    @abstractmethod
+    def fetch_raw(self, n: int) -> list[str]:
+        """Up to n rows of the current result set, each the server's JSON text; fewer (or none) means exhausted.
+        Rows read here are not returned by `fetch()` as well."""
+
 
 class DatabaseConnection(ABC):
     """All methods except cancel() must be called on the owning worker thread."""
@@ -137,8 +170,9 @@ class DatabaseConnection(ABC):
         """
 
     @abstractmethod
-    def run(self, sql: str) -> StatementResult:
-        """Execute one statement/batch (no parameters). Raises StatementError."""
+    def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
+        """Execute one statement/batch. `options` holds only what the adapter's capabilities declare (the worker
+        checks); adapters without such capabilities ignore it. Raises StatementError."""
 
     def set_message_listener(self, listener: MessageListener | None) -> None:
         """Deliver server messages (SQL Server PRINT, RAISERROR … WITH NOWAIT) to `listener` the moment they arrive,
@@ -216,12 +250,22 @@ class DatabaseAdapter(ABC):
     ) -> DatabaseConnection:
         """Open a connection. Raises ConnectionFailed."""
 
+    def endpoint_target(self, profile: ServerProfile) -> tuple[str, int]:
+        """Where a connection to `profile` goes (directly, or as the SSH tunnel's target): the profile's host and port,
+        or the engine's default port. An engine whose host field holds more (Couchbase: a seed list) picks one."""
+        port = profile.port or self.default_port
+        if port is None:
+            raise ValidationFailed("A port is required")
+        return profile.host, port
+
     def info(self) -> EngineInfo:
+        caps = self.capabilities
         return EngineInfo(
             engine=self.engine, default_port=self.default_port, url_schemes=list(self.url_schemes),
-            dialect=self.dialect, per_database_connection=self.capabilities.per_database_connection,
-            cancel_aborts_transaction=self.capabilities.cancel_aborts_transaction,
-            server_read_only=self.capabilities.server_read_only,
+            dialect=self.dialect, per_database_connection=caps.per_database_connection,
+            cancel_aborts_transaction=caps.cancel_aborts_transaction, server_read_only=caps.server_read_only,
+            transactions=caps.transactions, query_context=caps.query_context, parameters=caps.parameters,
+            documents=caps.documents, executed_plan=caps.executed_plan, plan_format=caps.plan_format,
         )
 
     def relation_path(self, database: str | None, schema: str, name: str, kind: RelationKind) -> list[PathSegment]:

@@ -40,6 +40,12 @@ class UnsupportedEngine(ValidationFailed):
     code = "unsupported_engine"
 
 
+class UnsupportedFormat(ValidationFailed):
+    """The export or copy format cannot be produced for this engine's dialect."""
+
+    code = "unsupported_format"
+
+
 class ConnectionFailed(DomainError):
     code = "connection_failed"
     status = 502

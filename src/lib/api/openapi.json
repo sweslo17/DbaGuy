@@ -2319,7 +2319,8 @@
           "datetime",
           "binary",
           "json",
-          "other"
+          "other",
+          "mixed"
         ],
         "title": "ColumnCategory"
       },
@@ -2902,6 +2903,38 @@
           "server_read_only": {
             "type": "boolean",
             "title": "Server Read Only"
+          },
+          "transactions": {
+            "type": "boolean",
+            "title": "Transactions"
+          },
+          "query_context": {
+            "type": "boolean",
+            "title": "Query Context"
+          },
+          "parameters": {
+            "type": "boolean",
+            "title": "Parameters"
+          },
+          "documents": {
+            "type": "boolean",
+            "title": "Documents"
+          },
+          "executed_plan": {
+            "type": "boolean",
+            "title": "Executed Plan"
+          },
+          "plan_format": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "couchbase"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Format"
           }
         },
         "type": "object",
@@ -2912,7 +2945,13 @@
           "dialect",
           "per_database_connection",
           "cancel_aborts_transaction",
-          "server_read_only"
+          "server_read_only",
+          "transactions",
+          "query_context",
+          "parameters",
+          "documents",
+          "executed_plan",
+          "plan_format"
         ],
         "title": "EngineInfo"
       },
@@ -3024,6 +3063,31 @@
             "type": "boolean",
             "title": "History",
             "default": true
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "params": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StatementParams"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "profile_plan": {
+            "type": "boolean",
+            "title": "Profile Plan",
+            "default": false
           }
         },
         "type": "object",
@@ -3169,6 +3233,26 @@
               "header": true,
               "null_text": ""
             }
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "params": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StatementParams"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -4017,6 +4101,36 @@
         "title": "ProgressEvent",
         "description": "An export has written `rows` rows so far; sent after every 10,000 rows."
       },
+      "QueryContext": {
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Bucket"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 251,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "bucket"
+        ],
+        "title": "QueryContext",
+        "description": "Couchbase: the bucket (and scope) that unqualified keyspace names resolve against, sent with every request\n(D-04-5: a structure, because a bucket name may hold a dot)."
+      },
       "ResultSetEndEvent": {
         "properties": {
           "type": {
@@ -4073,6 +4187,15 @@
             },
             "type": "array",
             "title": "Columns"
+          },
+          "presentation": {
+            "type": "string",
+            "enum": [
+              "grid",
+              "plan"
+            ],
+            "title": "Presentation",
+            "default": "grid"
           }
         },
         "type": "object",
@@ -4418,6 +4541,31 @@
               }
             ],
             "title": "Current User"
+          },
+          "edition": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "enterprise",
+                  "community"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Edition"
+          },
+          "default_query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -5141,6 +5289,30 @@
           "unknown"
         ],
         "title": "StatementKind"
+      },
+      "StatementParams": {
+        "properties": {
+          "named": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "maxProperties": 200,
+            "title": "Named"
+          },
+          "positional": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "title": "Positional"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "StatementParams",
+        "description": "Typed parameters of one statement (R-10): JSON literal texts, sent unchanged. Content is checked by the worker\n(`invalid_params`), only the shape here."
       },
       "StatementRange": {
         "properties": {

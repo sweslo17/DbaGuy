@@ -138,3 +138,9 @@ class EngineInfo(BaseModel):
     # PostgreSQL: cancelling a statement aborts the transaction around it (the export-cancel warning)
     cancel_aborts_transaction: bool
     server_read_only: bool  # the database can enforce a read-only session; SQL Server cannot (03b)
+    transactions: bool  # BEGIN / COMMIT / ROLLBACK and the auto-commit switch (Couchbase: none)
+    query_context: bool  # requests carry a query context (Couchbase)
+    parameters: bool  # statements take typed parameters
+    documents: bool  # the engine stores JSON documents by key
+    executed_plan: bool  # a statement can also return the plan it ran with (04b)
+    plan_format: Literal["couchbase"] | None  # how EXPLAIN / profile results are laid out; None: no plan view

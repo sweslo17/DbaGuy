@@ -120,6 +120,9 @@ def test_engines(client):
     assert (mssql["per_database_connection"], mssql["cancel_aborts_transaction"], mssql["server_read_only"]) == (
         True, False, False,
     )
+    for info in engines.values():
+        assert info["transactions"] and info["plan_format"] is None
+        assert not (info["query_context"] or info["parameters"] or info["documents"] or info["executed_plan"])
 
 
 def test_metadata_and_session_over_websocket(client, sqlite_profile_id):

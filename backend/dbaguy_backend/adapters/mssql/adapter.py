@@ -41,6 +41,7 @@ from ..base import (
     Endpoint,
     MessageListener,
     ParsedUrl,
+    RunOptions,
     StatementCancelled,
     StatementError,
     StatementResult,
@@ -346,7 +347,7 @@ class MssqlConnection(DatabaseConnection):
 
     # ---- execution ----
 
-    def run(self, sql: str) -> StatementResult:
+    def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
         if self._result is not None:  # the worker closes every result first; never send over unread rows
             self._result.close()
         self._control.begin_statement()  # from here a cancel is kept, not dropped (R-03b-P5)

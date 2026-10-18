@@ -367,10 +367,10 @@ class MessagingConnection(FakeConnection):
         self.listener = listener
         self.listeners.append(listener)
 
-    def run(self, sql):
+    def run(self, sql, options=None):
         if self.listener is not None:
             self.listener(ServerMessage(severity=MessageSeverity.INFO, text=f"before {sql}"))
-        return super().run(sql)
+        return super().run(sql, options)
 
 
 @pytest.fixture

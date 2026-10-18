@@ -24,6 +24,7 @@ from ..base import (
     DatabaseConnection,
     Endpoint,
     ParsedUrl,
+    RunOptions,
     StatementCancelled,
     StatementError,
     StatementResult,
@@ -464,7 +465,7 @@ class PostgresConnection(DatabaseConnection):
         if state == "off":
             logger.warning("Read-only connection: default_transaction_read_only was turned off; restored")
 
-    def run(self, sql: str) -> StatementResult:
+    def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
         if self._read_only and len(split(sql, Dialect.POSTGRES)) > 1:
             # A script could switch the default off and commit between statements, which no per-call check can see.
             raise StatementError(

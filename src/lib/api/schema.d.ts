@@ -635,7 +635,7 @@ export interface components {
          * ColumnCategory
          * @enum {string}
          */
-        ColumnCategory: "number" | "text" | "bool" | "datetime" | "binary" | "json" | "other";
+        ColumnCategory: "number" | "text" | "bool" | "datetime" | "binary" | "json" | "other" | "mixed";
         /** ColumnInfo */
         ColumnInfo: {
             /** Name */
@@ -856,6 +856,18 @@ export interface components {
             cancel_aborts_transaction: boolean;
             /** Server Read Only */
             server_read_only: boolean;
+            /** Transactions */
+            transactions: boolean;
+            /** Query Context */
+            query_context: boolean;
+            /** Parameters */
+            parameters: boolean;
+            /** Documents */
+            documents: boolean;
+            /** Executed Plan */
+            executed_plan: boolean;
+            /** Plan Format */
+            plan_format: "couchbase" | null;
         };
         /** ErrorEvent */
         ErrorEvent: {
@@ -907,6 +919,13 @@ export interface components {
              * @default true
              */
             history: boolean;
+            query_context?: components["schemas"]["QueryContext"] | null;
+            params?: components["schemas"]["StatementParams"] | null;
+            /**
+             * Profile Plan
+             * @default false
+             */
+            profile_plan: boolean;
         };
         /**
          * ExecutionSchema
@@ -942,6 +961,8 @@ export interface components {
              *     }
              */
             options: components["schemas"]["RowFormatOptions"];
+            query_context?: components["schemas"]["QueryContext"] | null;
+            params?: components["schemas"]["StatementParams"] | null;
         };
         /** FetchMoreCommand */
         FetchMoreCommand: {
@@ -1263,6 +1284,17 @@ export interface components {
             /** Rows */
             rows: number;
         };
+        /**
+         * QueryContext
+         * @description Couchbase: the bucket (and scope) that unqualified keyspace names resolve against, sent with every request
+         *     (D-04-5: a structure, because a bucket name may hold a dot).
+         */
+        QueryContext: {
+            /** Bucket */
+            bucket: string;
+            /** Scope */
+            scope?: string | null;
+        };
         /** ResultSetEndEvent */
         ResultSetEndEvent: {
             /**
@@ -1292,6 +1324,12 @@ export interface components {
             index: number;
             /** Columns */
             columns: components["schemas"]["ColumnMeta"][];
+            /**
+             * Presentation
+             * @default grid
+             * @enum {string}
+             */
+            presentation: "grid" | "plan";
         };
         /** RollbackCommand */
         RollbackCommand: {
@@ -1448,6 +1486,9 @@ export interface components {
             current_database?: string | null;
             /** Current User */
             current_user?: string | null;
+            /** Edition */
+            edition?: ("enterprise" | "community") | null;
+            default_query_context?: components["schemas"]["QueryContext"] | null;
         };
         /** ServerProfile */
         ServerProfile: {
@@ -1772,6 +1813,19 @@ export interface components {
          * @enum {string}
          */
         StatementKind: "read" | "write" | "ddl" | "transaction" | "session" | "unknown";
+        /**
+         * StatementParams
+         * @description Typed parameters of one statement (R-10): JSON literal texts, sent unchanged. Content is checked by the worker
+         *     (`invalid_params`), only the shape here.
+         */
+        StatementParams: {
+            /** Named */
+            named?: {
+                [key: string]: string;
+            };
+            /** Positional */
+            positional?: string[];
+        };
         /** StatementRange */
         StatementRange: {
             /** Start */

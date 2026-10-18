@@ -1,3 +1,4 @@
+import socket
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -7,8 +8,9 @@ import pytest
 from dbaguy_backend.adapters.base import DatabaseAdapter, ParsedUrl
 from dbaguy_backend.adapters.positions import offset_to_line_col
 from dbaguy_backend.adapters.registry import AdapterRegistry
+from dbaguy_backend.adapters.sockets import enable_keepalive
 from dbaguy_backend.adapters.sql_text import first_keyword, qualified_pg, quote_ident_pg, quote_literal_pg
-from dbaguy_backend.adapters.values import MAX_SAFE_INT, TEXT_LIMIT, encode_value
+from dbaguy_backend.adapters.values import MAX_SAFE_INT, MISSING, TEXT_LIMIT, JsonText, encode_value
 from dbaguy_backend.container import default_registry
 from dbaguy_backend.domain.errors import UnsupportedEngine, ValidationFailed
 from dbaguy_backend.domain.execution import ClientCommand, ServerEvent
@@ -187,3 +189,24 @@ def test_an_unsupported_paste_never_echoes_what_precedes_the_colon(pasted):
 def test_an_unsupported_scheme_that_looks_like_one_is_named():
     with pytest.raises(ValidationFailed, match="Unsupported URL scheme 'redis'"):
         default_registry().parse_url("redis://h")
+
+
+def test_encode_json_text_and_missing():
+    assert encode_value(JsonText('{"a": 1e400}')) == {"$type": "json", "text": '{"a": 1e400}'}
+    assert encode_value(MISSING) == {"$type": "missing"}
+    long = JsonText("[" + "1," * TEXT_LIMIT + "1]")
+    cell = encode_value(long)
+    assert cell["$type"] == "text" and cell["truncated"] and cell["size"] == len(long.text)
+
+
+def test_enable_keepalive_sets_the_timers():
+    server = socket.create_server(("127.0.0.1", 0))
+    client = socket.create_connection(server.getsockname())
+    try:
+        enable_keepalive(client)
+        assert client.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
+        if hasattr(socket, "TCP_KEEPALIVE"):  # macOS
+            assert client.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE) == 30
+    finally:
+        client.close()
+        server.close()

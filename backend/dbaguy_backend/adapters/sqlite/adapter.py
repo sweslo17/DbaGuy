@@ -20,6 +20,7 @@ from ..base import (
     DatabaseConnection,
     Endpoint,
     ParsedUrl,
+    RunOptions,
     StatementCancelled,
     StatementError,
     StatementResult,
@@ -189,7 +190,7 @@ class SqliteConnection(DatabaseConnection):
         except sqlite3.Error as exc:
             raise _translate(exc) from exc
 
-    def run(self, sql: str) -> StatementResult:
+    def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
         with self._gate.call():  # from here a cancel sticks until the statement runs (see _CancelGate)
             self._begin_if_manual(sql)
             cursor = self._conn.cursor()

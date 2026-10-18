@@ -1,12 +1,16 @@
 import sqlite3
+from uuid import uuid4
+
+import pytest
 
 from dbaguy_backend.adapters.postgres.adapter import PostgresAdapter
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager, write_askpass_script
-from dbaguy_backend.domain.profiles import ConnectionTestRequest, ProfileSecretsInput
+from dbaguy_backend.domain.errors import ValidationFailed
+from dbaguy_backend.domain.profiles import ConnectionTestRequest, ProfileSecretsInput, ServerProfile
 from dbaguy_backend.services.connection_service import ConnectionService
-from dbaguy_backend.services.profile_service import ProfileService
+from dbaguy_backend.services.profile_service import ProfileService, ResolvedSecrets
 from dbaguy_backend.storage.paths import profiles_file
 from dbaguy_backend.storage.profile_store import ProfileStore
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
@@ -57,3 +61,20 @@ def test_postgres_through_ssh_bastion(tmp_path):
     result = service.test(request)
     assert result.ok, result.message
     assert service._tunnels.active_count() == 0  # released after the test
+
+
+def test_the_adapter_decides_the_endpoint(tmp_path):
+    class Pinned(SqliteAdapter):  # any adapter: only endpoint_target matters here
+        def endpoint_target(self, profile):
+            return "first-seed", 4242
+
+    profile = ServerProfile(id=uuid4(), name="x", engine="postgres", host="a,b", port=None)
+    service = ConnectionService(AdapterRegistry([Pinned()]), None, None)
+    endpoint, release = service._endpoint(Pinned(), profile, ResolvedSecrets(), share_tunnel=True)
+    assert (endpoint.host, endpoint.port) == ("first-seed", 4242)
+    release()
+
+
+def test_the_default_endpoint_needs_a_port():
+    with pytest.raises(ValidationFailed, match="port"):
+        SqliteAdapter().endpoint_target(ServerProfile(id=uuid4(), name="x", engine="postgres", host="h"))

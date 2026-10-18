@@ -2,11 +2,13 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .classification import Classification, GuardReason
 from .column_category import ColumnCategory
 from .formats import FormatKind, RowFormatOptions
+
+Presentation = Literal["grid", "plan"]  # "plan": an EXPLAIN / ADVISE / profile result the client may show as a plan
 
 
 class ColumnMeta(BaseModel):
@@ -30,6 +32,110 @@ class ErrorPosition(BaseModel):
     column: int  # 1-based, in UTF-16 code units (the editor's unit)
 
 
+_DEFAULT_NAMESPACE = "default:"
+
+
+def _context_part(name: str, *, quote_dots: bool) -> str:
+    """A name as context text: back-ticked when plain text would not read back as this name — it holds a back-tick, a
+    dot where a dot would be read as the split, ends in a dot (`a.` before a scope would read `a..s`), has surrounding
+    spaces (`parse` strips the text) or starts like the `default:` namespace. Quoted as `_path_parts` reads it, which is
+    SQL++'s `force_quote_ident` (back-ticks and backslashes doubled); the domain cannot import `sql/`."""
+    if (
+        "`" in name or (quote_dots and "." in name) or name.endswith(".") or name != name.strip()
+        or name[:len(_DEFAULT_NAMESPACE)].lower() == _DEFAULT_NAMESPACE
+    ):
+        return "`" + name.replace("\\", "\\\\").replace("`", "``") + "`"
+    return name
+
+
+def _path_parts(text: str) -> list[str]:
+    """`a.b`, `` `a.b` ``, `` `a`.`b` ``: SQL++ path parts, back-ticks with `` and \\ escapes."""
+    parts: list[str] = []
+    i, n = 0, len(text)
+    while True:
+        if i < n and text[i] == "`":
+            name: list[str] = []
+            i += 1
+            while True:
+                if i >= n:
+                    raise ValueError("unclosed back-tick")
+                if text[i] == "\\" and i + 1 < n:
+                    name.append(text[i + 1])
+                    i += 2
+                elif text[i] == "`" and text[i + 1:i + 2] == "`":
+                    name.append("`")
+                    i += 2
+                elif text[i] == "`":
+                    i += 1
+                    break
+                else:
+                    name.append(text[i])
+                    i += 1
+            parts.append("".join(name))
+        else:
+            end = text.find(".", i)
+            end = n if end < 0 else end
+            if "`" in text[i:end]:
+                raise ValueError("a back-tick inside a name")
+            parts.append(text[i:end])
+            i = end
+        if i == n:
+            return parts
+        if text[i] != ".":
+            raise ValueError("expected a dot")
+        i += 1
+
+
+class QueryContext(BaseModel):
+    """Couchbase: the bucket (and scope) that unqualified keyspace names resolve against, sent with every request
+    (D-04-5: a structure, because a bucket name may hold a dot)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    bucket: str = Field(min_length=1, max_length=100)
+    scope: str | None = Field(default=None, min_length=1, max_length=251)
+
+    def text(self) -> str:
+        """`travel-sample.inventory`, `dbaguy`, `` `my.bucket` `` (a bucket alone whose name holds a dot), `my.bucket.app`
+        (with a scope the last dot splits). What the history keeps; `parse` reads it back."""
+        if self.scope is None:
+            return _context_part(self.bucket, quote_dots=True)
+        scope = _context_part(self.scope, quote_dots=True)
+        plain = f"{_context_part(self.bucket, quote_dots=False)}.{scope}"
+        if "`" not in plain:
+            return plain  # read back by splitting at the last dot
+        # read back as a SQL++ path, where every dot outside back-ticks splits: the bucket's dots are quoted too
+        return f"{_context_part(self.bucket, quote_dots=True)}.{scope}"
+
+    @classmethod
+    def parse(cls, text: str | None) -> "QueryContext | None":
+        """A profile's database field or a history entry: `bucket`, `bucket.scope` (split at the last dot), with an
+        optional `default:` in front, or SQL++ back-ticked parts. None for no text; ValueError when malformed."""
+        text = (text or "").strip()
+        if text[:len(_DEFAULT_NAMESPACE)].lower() == _DEFAULT_NAMESPACE:
+            text = text[len(_DEFAULT_NAMESPACE):]
+        if not text:
+            return None
+        if "`" in text:
+            parts = _path_parts(text)
+        else:
+            parts = text.rsplit(".", 1) if "." in text else [text]
+        # an empty part, or a bucket ending in a dot (`a..b` splits into `a.` and `b`), is malformed
+        if not 1 <= len(parts) <= 2 or not all(parts) or ("`" not in text and parts[0].endswith(".")):
+            raise ValueError("not a bucket or bucket.scope")
+        return cls(bucket=parts[0], scope=parts[1] if len(parts) == 2 else None)  # pydantic's ValidationError is a ValueError
+
+
+class StatementParams(BaseModel):
+    """Typed parameters of one statement (R-10): JSON literal texts, sent unchanged. Content is checked by the worker
+    (`invalid_params`), only the shape here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    named: dict[str, str] = Field(default_factory=dict, max_length=200)  # name without $ / @ → JSON literal text
+    positional: list[str] = Field(default_factory=list, max_length=200)  # $1, $2 … / ? in order
+
+
 # ---- client -> server ----
 
 class ExecuteCommand(BaseModel):
@@ -40,6 +146,9 @@ class ExecuteCommand(BaseModel):
     confirmed: bool = False  # the user confirmed this dangerous statement; checked again on every execute
     timeout_s: float | None = Field(default=None, ge=0, le=86_400)  # covers run() and the first page; None/0 = none
     history: bool = True  # False for queries the app runs on the user's behalf (e.g. table browsing)
+    query_context: QueryContext | None = None  # None: the request carries no context (ruling P1)
+    params: StatementParams | None = None
+    profile_plan: bool = False  # also return the executed plan (needs the engine's `executed_plan`)
 
 
 class ExportCommand(BaseModel):
@@ -51,6 +160,8 @@ class ExportCommand(BaseModel):
     format: FormatKind
     path: str  # absolute, in an existing folder; written through a temporary file, so a failed export keeps any old file
     options: RowFormatOptions = RowFormatOptions()
+    query_context: QueryContext | None = None  # an export runs the statement again: the same context and parameters
+    params: StatementParams | None = None
 
 
 class FetchMoreCommand(BaseModel):
@@ -104,6 +215,7 @@ class ResultSetEvent(BaseModel):
     request_id: str
     index: int
     columns: list[ColumnMeta]
+    presentation: Presentation = "grid"
 
 
 class RowsEvent(BaseModel):

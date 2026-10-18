@@ -154,6 +154,7 @@ export class SessionController {
       confirmed: options.confirmed ?? false,
       timeout_s: options.timeoutS ?? null,
       history: options.history ?? true,
+      profile_plan: false,
     });
   }
 
