@@ -121,6 +121,12 @@ class TunnelLease:
         self._release()
 
 
+
+def forward_spec(local_port: int, target_host: str, target_port: int) -> str:
+    """`ssh -L` spec; an IPv6 target needs brackets (`[::1]`), or ssh splits it at its colons."""
+    host = f"[{target_host}]" if ":" in target_host and not target_host.startswith("[") else target_host
+    return f"127.0.0.1:{local_port}:{host}:{target_port}"
+
 class SshTunnelManager:
     """Local port forwards through the system `ssh` (honours ~/.ssh/config, agent, ProxyJump).
 
@@ -262,7 +268,7 @@ class SshTunnelManager:
     def _command(self, ssh: SshConfig, local_port: int, target_host: str, target_port: int) -> list[str]:
         cmd = [
             self._ssh, *self._extra,  # extra options first: ssh uses the first value it sees
-            "-N", "-L", f"127.0.0.1:{local_port}:{target_host}:{target_port}",
+            "-N", "-L", forward_spec(local_port, target_host, target_port),
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
