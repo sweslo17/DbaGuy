@@ -286,6 +286,11 @@ def test_select_into_still_creates_a_table_in_postgres():
     assert classify("SELECT * INTO n FROM t", LITE).kind == K.DDL
 
 
+def test_select_into_creates_a_table_in_tsql():  # INTO_CREATES_A_TABLE: SELECT … INTO #t makes a temp table
+    assert classify("SELECT * INTO #t FROM a", Dialect.TSQL) == Classification(kind=K.DDL)
+    assert classify("SELECT a INTO dbo.b FROM a", Dialect.TSQL).kind == K.DDL
+
+
 def test_load_and_handler_mean_a_write_only_in_mysql():
     assert classify("LOAD 'plpgsql'", PG).kind == K.UNKNOWN  # PostgreSQL's LOAD loads a library
     assert classify("HANDLER t OPEN", PG).kind == K.UNKNOWN

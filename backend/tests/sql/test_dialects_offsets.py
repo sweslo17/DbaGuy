@@ -4,7 +4,9 @@ from dbaguy_backend.sql.dialects import (
     Dialect, bool_literal, bytes_literal, datetime_literal, force_quote_ident, json_literal, needs_quote, qualified,
     quote_ident, quote_literal, zero_date_as_text,
 )
+from dbaguy_backend.sql.lexer import INSIGNIFICANT, TokenKind, tokenize
 from dbaguy_backend.sql.offsets import Utf16Index
+from dbaguy_backend.sql.sqlglot_rules import parse
 
 PG, LITE, MY, TS = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL
 
@@ -38,6 +40,8 @@ PG, LITE, MY, TS = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL
         (TS, "a$b", "[a$b]"),
         (TS, "1abc", "[1abc]"),
         (TS, "中文", "[中文]"),
+        (TS, "go", "[go]"),  # not reserved by the server, but alone on a line it is the batch separator
+        (TS, "GO", "[GO]"),
     ],
 )
 def test_quote_ident(dialect, name, expected):
@@ -77,6 +81,21 @@ def test_tsql_literals():
     assert zero_date_as_text(TS, "d", "0000-00-00") is None
 
 
+def test_tsql_literal_never_carries_a_raw_nul():
+    # pymssql sends the SQL as a C string: a raw NUL cuts it off (error 105), and every later row of an export is lost
+    literal = quote_literal(TS, "a\x00b'c\x00")
+    assert "\x00" not in literal
+    nul = "CAST(NCHAR(0) AS NVARCHAR(MAX))"  # MAX: a plain NCHAR(0) would cap the concatenation at 4000 characters
+    assert literal == f"N'a' + {nul} + N'b''c' + {nul} + N''"
+    tokens = [t for t in tokenize(literal, TS) if t.kind not in INSIGNIFICANT]
+    assert all(t.terminated for t in tokens)
+    assert [t.text for t in tokens if t.kind == TokenKind.STRING] == ["N'a'", "N'b''c'", "N''"]  # no string leaks out
+    assert "\x00" not in json_literal(TS, '{"a": "x\x00"}')
+    [statement] = parse(f"SELECT {literal}", TS)  # and it is one valid expression, not a Command fallback
+    assert type(statement).__name__ == "Select"
+    assert quote_literal(PG, "a\x00b") == "'a\x00b'" and quote_literal(MY, "a\x00b") == "'a\x00b'"  # TSQL only
+
+
 def test_tsql_datetime_literals_are_language_neutral():  # R-03b-P10
     assert datetime_literal(TS, "2026-10-18 12:34:56.123") == "N'2026-10-18T12:34:56.123'"
     assert datetime_literal(TS, "2026-10-18 12:34:56.123456+08:00") == "N'2026-10-18T12:34:56.123456+08:00'"
@@ -101,6 +120,7 @@ def test_every_dialect_has_an_entry_in_every_dialect_table(dialect):  # tripwire
         "dialects._ZERO_DATE_AS_TEXT": dialects._ZERO_DATE_AS_TEXT,
         "dialects._STRING_PREFIXES": dialects._STRING_PREFIXES,
         "dialects._ISO_DATETIME": dialects._ISO_DATETIME,
+        "dialects._NUL_IN_LITERAL": dialects._NUL_IN_LITERAL,
         "classifier._EXPLAIN_KEYWORDS": classifier._EXPLAIN_KEYWORDS,
         "sqlglot_rules.SQLGLOT_DIALECT": sqlglot_rules.SQLGLOT_DIALECT,
         "completion.STATEMENT_KEYWORDS": completion.STATEMENT_KEYWORDS,

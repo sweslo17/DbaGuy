@@ -14,7 +14,7 @@ from dbaguy_backend.sql.completion import (
 )
 from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.lexer import INSIGNIFICANT, tokenize
-from dbaguy_backend.sql.scope import scope_at
+from dbaguy_backend.sql.scope import scope_at, unquote
 
 PG, LITE, MY, TS = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL
 
@@ -384,3 +384,9 @@ def test_tsql_completion_reads_the_batch_under_the_cursor():
 def test_tsql_output_and_option_are_not_aliases(sql):
     [ref] = scope_at([t for t in tokenize(sql, TS) if t.kind not in INSIGNIFICANT], len(sql)).relations
     assert (ref.name, ref.alias) == ("orders", None)
+
+
+@pytest.mark.parametrize("dialect", [TS, LITE])  # Ruling 4: ]] is one ] in every dialect with brackets
+def test_unquote_undoubles_a_closing_bracket(dialect):
+    [token] = tokenize("[a]]b]", dialect)
+    assert unquote(token) == "a]b"

@@ -119,13 +119,15 @@ MYSQL_RESERVED = frozenset(  # MySQL 8.4 reserved words (+ a few newer ones): an
     varbinary varchar varcharacter varying virtual when where while window with write xor year_month zerofill""".split()
 )
 
-TSQL_RESERVED = frozenset(  # SQL Server reserved keywords: an extra one only costs a pair of brackets
+# SQL Server reserved keywords: an extra one only costs a pair of brackets. `go` is not one, but a name that lands
+# alone on a line would act as the batch separator, so it is always bracketed.
+TSQL_RESERVED = frozenset(
     """add all alter and any as asc authorization backup begin between break browse bulk by cascade case check
     checkpoint close clustered coalesce collate column commit compute constraint contains containstable continue
     convert create cross current current_date current_time current_timestamp current_user cursor database dbcc
     deallocate declare default delete deny desc disk distinct distributed double drop dump else end errlvl escape
     except exec execute exists exit external fetch file fillfactor for foreign freetext freetexttable from full function
-    goto grant group having holdlock identity identity_insert identitycol if in index inner insert intersect into is
+    go goto grant group having holdlock identity identity_insert identitycol if in index inner insert intersect into is
     join key kill left like lineno load merge national nocheck nonclustered not null nullif of off offsets on open
     opendatasource openquery openrowset openxml option or order outer over percent pivot plan precision primary print
     proc procedure public raiserror read readtext reconfigure references replication restore restrict return revert
@@ -176,6 +178,13 @@ _STRING_PREFIXES: dict[Dialect, str] = {  # T-SQL N'…': Unicode, so text outsi
 _ISO_DATETIME: dict[Dialect, bool] = {  # T-SQL: write date and time with a "T", the form no login language misreads
     Dialect.POSTGRES: False, Dialect.SQLITE: False, Dialect.MYSQL: False, Dialect.TSQL: True,
 }
+# What stands for a NUL character inside a quoted literal; None: it is written as is. pymssql hands the SQL to the
+# driver as a C string, so a raw NUL would cut the statement off (error 105). MAX keeps the concatenation from being
+# capped at 4000 characters, which would silently truncate a long value.
+_NUL_IN_LITERAL: dict[Dialect, str | None] = {
+    Dialect.POSTGRES: None, Dialect.SQLITE: None, Dialect.MYSQL: None,
+    Dialect.TSQL: "' + CAST(NCHAR(0) AS NVARCHAR(MAX)) + N'",
+}
 _DATE_SPACE_TIME = re.compile(r"(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})")
 NUMERIC_LITERAL = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?", re.ASCII)  # text that can be written as a bare number
 
@@ -200,10 +209,13 @@ def qualified(dialect: Dialect, schema: str | None, name: str) -> str:
 
 def quote_literal(dialect: Dialect, value: str) -> str:
     """A string literal that the dialect reads back as exactly `value`: quotes are doubled, and where backslash
-    escapes exist (MySQL's default sql_mode), backslashes are doubled too. T-SQL literals carry the N prefix."""
+    escapes exist (MySQL's default sql_mode), backslashes are doubled too. T-SQL literals carry the N prefix, and a
+    NUL character becomes a concatenation with NCHAR(0): the text is one expression, never a raw NUL."""
     if RULES[dialect].backslash_escapes:
         value = value.replace("\\", "\\\\")
-    return _STRING_PREFIXES[dialect] + "'" + value.replace("'", "''") + "'"
+    literal = _STRING_PREFIXES[dialect] + "'" + value.replace("'", "''") + "'"
+    nul = _NUL_IN_LITERAL[dialect]
+    return literal if nul is None else literal.replace("\x00", nul)
 
 
 def datetime_literal(dialect: Dialect, text: str) -> str:
