@@ -78,6 +78,10 @@ STATEMENT_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.SQLITE: (*_STARTERS, "PRAGMA"),
     Dialect.MYSQL: (*_STARTERS, "SHOW", "USE", "REPLACE", "CALL"),
     Dialect.TSQL: (*(word for word in _STARTERS if word != "EXPLAIN"), "EXEC", "DECLARE", "PRINT", "USE", "MERGE", "SET"),
+    Dialect.SQLPP: (
+        "SELECT", "INSERT", "UPSERT", "UPDATE", "DELETE", "MERGE", "WITH", "CREATE", "DROP", "ALTER", "BUILD",
+        "EXPLAIN", "ADVISE", "INFER", "PREPARE", "EXECUTE", "GRANT", "REVOKE",
+    ),
 }
 CLAUSE_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.POSTGRES: (*_CLAUSES, "ILIKE"),
@@ -88,6 +92,13 @@ CLAUSE_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.TSQL: (  # no LIMIT and no RETURNING: TOP, OFFSET … FETCH and OUTPUT instead
         *(word for word in _CLAUSES if word not in ("LIMIT", "RETURNING")), "TOP", "OUTPUT", "CROSS APPLY",
         "OUTER APPLY", "FETCH NEXT", "ROWS ONLY", "WITH (NOLOCK)",
+    ),
+    Dialect.SQLPP: (  # spec §3.3.6; no FULL / RIGHT JOIN
+        "SELECT", "RAW", "DISTINCT", "FROM", "USE KEYS", "USE INDEX", "ON KEYS", "JOIN", "LEFT JOIN", "INNER JOIN",
+        "NEST", "UNNEST", "LET", "LETTING", "WHERE", "GROUP BY", "HAVING", "ORDER BY", "LIMIT", "OFFSET", "RETURNING",
+        "SET", "UNSET", "VALUES", "ANY", "EVERY", "SATISFIES", "IN", "WITHIN", "END", "IS MISSING", "IS NOT MISSING",
+        "IS VALUED", "IS NULL", "IS NOT NULL", "AND", "OR", "NOT", "LIKE", "BETWEEN", "CASE", "WHEN", "THEN", "ELSE",
+        "ARRAY", "FOR", "EXISTS", "UNION", "INTERSECT", "EXCEPT", "ALL", "AS", "ASC", "DESC", "MISSING", "NULL",
     ),
 }
 

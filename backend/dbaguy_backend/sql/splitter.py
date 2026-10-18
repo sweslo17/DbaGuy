@@ -29,6 +29,7 @@ class StatementSpan:
     # a routine or trigger body whose inner `;` did not end the statement (T-SQL: the batch defines a module)
     has_body: bool = False
     repeat: int = 1  # T-SQL "GO n": times the batch runs (0 for GO 0)
+    params: tuple[str, ...] = ()  # the parameters it uses (SQL++): $name, $1, and each ?
 
 
 class _BodyTracker:
@@ -197,16 +198,34 @@ def _tracker(rule: BodyRule) -> _BodyTracker | _CompoundTracker:
     return _CompoundTracker() if rule is BodyRule.COMPOUND else _BodyTracker(rule)
 
 
+def _params(tokens: list[Token]) -> tuple[str, ...]:
+    """The parameters of one statement in order of first use: `$x` for both `$x` and `@x` (one parameter), `$1`…, and
+    every `?` (each one takes the next positional argument)."""
+    named: dict[str, None] = {}
+    found: list[str] = []
+    for token in tokens:
+        if token.kind != TokenKind.PARAM:
+            continue
+        if token.text == "?":
+            found.append("?")
+        elif (name := "$" + token.text[1:]) not in named:
+            named[name] = None
+            found.append(name)
+    return tuple(found)
+
+
 def _emit(
     spans: list[StatementSpan], text: str, tokens: list[Token], terminator_end: int | None, has_body: bool,
-    repeat: int = 1,
+    repeat: int = 1, params: bool = False,
 ) -> None:
     significant = [t for t in tokens if t.kind not in INSIGNIFICANT]
     if not significant:
         return
     start, end = significant[0].start, significant[-1].end
     terminator = terminator_end if terminator_end is not None else end
-    spans.append(StatementSpan(start, end, terminator, text[start:end], has_body, repeat))
+    spans.append(
+        StatementSpan(start, end, terminator, text[start:end], has_body, repeat, _params(significant) if params else ())
+    )
 
 
 def _first_on_line(text: str, token: Token) -> bool:
@@ -280,6 +299,7 @@ def split(text: str, dialect: Dialect) -> list[StatementSpan]:
     if rules.client_command is ClientCommand.GO:
         return _split_batches(text, dialect)
     commands = rules.client_command is ClientCommand.DELIMITER
+    with_params = bool(rules.named_param_prefixes or rules.question_params)
     spans: list[StatementSpan] = []
     delimiter: str | None = None  # set by a DELIMITER line; None: `;` ends statements (outside bodies)
     start = 0
@@ -296,7 +316,7 @@ def split(text: str, dialect: Dialect) -> list[StatementSpan]:
             if token.kind == TokenKind.DELIMITER or (
                 delimiter is None and token.kind == TokenKind.SEMI and tracker.depth == 0
             ):
-                _emit(spans, text, current, token.end, tracker.has_body)
+                _emit(spans, text, current, token.end, tracker.has_body, params=with_params)
                 current, tracker, started = [], _tracker(rules.body_rule), False
                 continue
             current.append(token)
@@ -304,6 +324,6 @@ def split(text: str, dialect: Dialect) -> list[StatementSpan]:
                 started = True
                 tracker.feed(token)  # also under a custom delimiter: has_body tells the classifier about bodies
         if restart is None:
-            _emit(spans, text, current, None, tracker.has_body)
+            _emit(spans, text, current, None, tracker.has_body, params=with_params)
             return spans
         start = restart

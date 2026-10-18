@@ -3,13 +3,15 @@ import { EditorSelection, type EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import type { SqlLanguage } from "sql-formatter";
 import { toast } from "@/components/ui/Toast";
-import { errorMessage } from "@/lib/api/client";
+import { api, errorMessage, unwrap } from "@/lib/api/client";
 import type { Dialect, EditorSettings } from "@/lib/api/types";
 import { currentStatements, splitText, type StatementRange } from "./statements";
 
 /*
  * ⌘⇧F (spec §4.11): formats the selection, else the statement under the cursor, with `sql-formatter`, locally. The
- * formatter is loaded on first use, so it stays out of the startup bundle.
+ * formatter is loaded on first use, so it stays out of the startup bundle. Its output replaces the text only when the
+ * backend's `/sql/format-guard` says the significant tokens are the same (whitespace, keyword case and comment layout
+ * may change).
  */
 
 /** The formatter's language per dialect; a dialect not listed (or no connection) formats as generic SQL. */
@@ -18,6 +20,7 @@ const LANGUAGES: Partial<Record<Dialect, SqlLanguage>> = {
   sqlite: "sqlite",
   mysql: "mysql",
   tsql: "transactsql",
+  sqlpp: "n1ql",
 };
 
 export function formatLanguage(dialect: Dialect | null): SqlLanguage {
@@ -92,8 +95,8 @@ async function target(
 
 /**
  * Formats the selection, else the statement under the cursor, as one undo step of its own. A cursor between statements
- * formats nothing (never a neighbouring statement) and says so; a text the formatter cannot parse is left unchanged
- * and the reason shown in a toast.
+ * formats nothing (never a neighbouring statement) and says so; a text the formatter cannot parse, or whose output the
+ * guard refuses, is left unchanged and the reason shown in a toast.
  */
 export async function formatSql(view: EditorView, settings: FormatSettings): Promise<void> {
   if (formatting.has(view)) return;
@@ -127,11 +130,24 @@ export async function formatSql(view: EditorView, settings: FormatSettings): Pro
       toast("error", `Could not format the ${selection ? "selection" : "statement"}: ${reason}`);
       return;
     }
+    if (formatted === original) return;
+    // The formatter must not change what the statement means (spec §3.3.7): n1ql splits 'it''s' into two strings.
+    let same: boolean;
+    try {
+      const body = { dialect: settings.dialect ?? "postgres", original, formatted };
+      same = unwrap(await (await api()).POST("/sql/format-guard", { body })).same;
+    } catch (error) {
+      toast("error", `Could not check the formatted text: ${errorMessage(error)}`);
+      return;
+    }
+    if (!same) {
+      toast("warning", "The formatter would change what the statement means (for example a string): the text is kept as it was");
+      return;
+    }
     if (view.state.doc !== state.doc) {
       toast("warning", "The text changed — format again");
       return;
     }
-    if (formatted === original) return;
     // The formatter joins lines with "\n", as the editor does. A cursor after the statement (by its `;`) moves with it.
     const head = state.selection.main.head;
     const cursor = head >= to ? head + formatted.length - original.length : from + mapOffset(original, formatted, head - from);

@@ -7,7 +7,7 @@ from loguru import logger
 
 # The models live in the domain (the execution protocol carries them); re-exported here for the sql/ callers.
 from ..domain.classification import Classification, DangerReason, StatementKind
-from .dialects import Dialect
+from .dialects import KEYWORD_ONLY_DIALECTS, Dialect
 from .lexer import (
     HINT_COMMENT_START, INSIGNIFICANT, VERSION_COMMENT_STARTS, Token, TokenKind, tokenize, with_ascii_spaces,
 )
@@ -75,6 +75,7 @@ _EXPLAIN_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.SQLITE: ("EXPLAIN",),
     Dialect.MYSQL: ("EXPLAIN", "DESCRIBE", "DESC"),
     Dialect.TSQL: (),  # T-SQL has no EXPLAIN: plans come from SET SHOWPLAN_* / SET STATISTICS (SESSION statements)
+    Dialect.SQLPP: (),  # SQL++ EXPLAIN never executes; the executed plan is profile=timings (04b)
 }
 # Least to most cautious: when a script mixes kinds, the strictest one decides (unknown is the most cautious).
 _SEVERITY = (
@@ -260,6 +261,8 @@ def _from_sqlglot(sql: str, dialect: Dialect) -> list[Classification | None] | N
 
     Logs the exception type only: sqlglot's messages quote the statement.
     """
+    if dialect in KEYWORD_ONLY_DIALECTS:
+        return None  # no sqlglot dialect exists: the keyword rules decide, and that is not worth a log line
     try:
         rules = _sqlglot_rules()
     except Exception as exc:  # e.g. an app bundle without sqlglot: a packaging bug, not a statement problem
@@ -456,6 +459,6 @@ def classify(sql: str, dialect: Dialect) -> Classification:
 def warm_up() -> None:
     """Import sqlglot and parse one statement per dialect, so the first real classification does not pay for it."""
     started = time.perf_counter()
-    for dialect in Dialect:
+    for dialect in (d for d in Dialect if d not in KEYWORD_ONLY_DIALECTS):
         _from_sqlglot("SELECT 1", dialect)
     logger.debug("SQL classifier warmed up in {:.0f} ms", (time.perf_counter() - started) * 1000)

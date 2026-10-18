@@ -4,7 +4,7 @@ from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.lexer import TokenKind as K
 from dbaguy_backend.sql.lexer import INSIGNIFICANT, first_keyword, scan, tokenize
 
-PG, LITE, MY, TS = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL
+PG, LITE, MY, TS, SQ = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL, Dialect.SQLPP
 
 
 def kinds(text, dialect=PG):
@@ -59,7 +59,8 @@ def test_unterminated_constructs_do_not_raise():
     [("'abc", PG), ("E'a\\'", PG), ('"abc', PG), ('"abc""', PG), ("$$ open", PG), ("$t$ x $$", PG), ("/* open", PG),
      ("/* a /* b */", PG), ("/* open", LITE), ("[abc", LITE), ("`abc", LITE),
      ("'abc\\'", MY), ('"abc', MY), ("`abc", MY), ("/*! open", MY),
-     ("[abc", TS), ("[a]]", TS), ("N'abc", TS), ('"abc', TS), ("/* a /* b */", TS)],
+     ("[abc", TS), ("[a]]", TS), ("N'abc", TS), ('"abc', TS), ("/* a /* b */", TS),
+     ("`abc", SQ), (r"`a\`", SQ), (r"'a\'", SQ), ('"abc', SQ)],
 )
 def test_unterminated_tokens_are_flagged(text, dialect):
     assert [token.terminated for token in tokenize(text, dialect)] == [False]
@@ -70,7 +71,8 @@ def test_unterminated_tokens_are_flagged(text, dialect):
     [("'it''s'", PG), ('"we""ird"', PG), ("$$a$$", PG), ("$t$x$t$", PG), ("/* a /* b */ c */", PG), ("-- to the end", PG),
      (r"E'a\'b'", PG), ("[a]", LITE), ("`a`", LITE), ("/* a /* b */", LITE),
      (r"'a\'b'", MY), ('"a""b"', MY), ("/*!1 x */", MY), ("# to the end", MY),
-     ("[a]]b]", TS), ("N'a''b'", TS), ("/* a /* b */ */", TS), ("-- to the end", TS)],
+     ("[a]]b]", TS), ("N'a''b'", TS), ("/* a /* b */ */", TS), ("-- to the end", TS),
+     (r"`a\`b`", SQ), ("`a``b`", SQ), (r'"a\"b"', SQ), ("-- to the end", SQ)],
 )
 def test_closed_tokens_are_terminated(text, dialect):
     tokens = tokenize(text, dialect)
@@ -226,3 +228,30 @@ def test_tsql_offsets_cover_the_text():
     tokens = tokenize(text, TS)
     assert "".join(t.text for t in tokens) == text
     assert all(text[t.start:t.end] == t.text for t in tokens)
+
+
+def test_sqlpp_strings_names_and_parameters():
+    text = r"""'it''s;' "a\"b;" 'c\'d' `a``b;` `c\`d;` $x @y $1 ? $ x$y"""
+    assert kinds(text, SQ) == [
+        (K.STRING, "'it''s;'"), (K.STRING, r'"a\"b;"'), (K.STRING, r"'c\'d'"), (K.QUOTED, "`a``b;`"),
+        (K.QUOTED, r"`c\`d;`"), (K.PARAM, "$x"), (K.PARAM, "@y"), (K.PARAM, "$1"), (K.PARAM, "?"),
+        (K.OTHER, "$"), (K.WORD, "x$y"),
+    ]
+    assert kinds("? $x", PG) == [(K.OTHER, "?"), (K.OTHER, "$"), (K.WORD, "x")]  # other dialects unchanged
+
+
+def test_sqlpp_doubled_double_quote_covers_the_same_text_as_the_server_reads():
+    # The server reads "a""b" as two strings (a syntax error, probed in Task 2): one token here, the same extent.
+    assert kinds('"a""b;" ;', SQ) == [(K.STRING, '"a""b;"'), (K.SEMI, ";")]
+
+
+def test_sqlpp_comments():
+    assert kinds("SELECT 1--x", SQ)[-1] == (K.COMMENT, "--x")  # no space needed after --
+    assert kinds("-- c\r; x", SQ) == [(K.COMMENT, "-- c"), (K.SEMI, ";"), (K.WORD, "x")]  # CR ends it (A6: safe side)
+    assert kinds("/* a /* b */ c */", SQ)[0] == (K.COMMENT, "/* a /* b */")  # not nested
+    assert kinds("# not a comment", SQ)[0] == (K.OTHER, "#")
+    assert kinds("/*+ ordered */ SELECT", SQ)[0] == (K.COMMENT, "/*+ ordered */")  # a hint is a plain comment
+
+
+def test_sqlpp_unicode_spaces_follow_the_server():  # A7: the server rejects U+00A0 (syntax error, nothing runs)
+    assert kinds("DELETE\u00a0FROM t", SQ) == [(K.WORD, "DELETE\u00a0FROM"), (K.WORD, "t")]

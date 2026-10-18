@@ -462,6 +462,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sql/format-guard": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Format Guard
+         * @description Whether a formatter's output may replace the original: only when its significant tokens are the same.
+         */
+        post: operations["format_guard_sql_format_guard_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sql/browse-select": {
         parameters: {
             query?: never;
@@ -777,7 +797,7 @@ export interface components {
          * @description The SQL dialect of an engine: how its statements are split, classified, completed and quoted.
          * @enum {string}
          */
-        Dialect: "postgres" | "sqlite" | "mysql" | "tsql";
+        Dialect: "postgres" | "sqlite" | "mysql" | "tsql" | "sqlpp";
         /** DiscardCommand */
         DiscardCommand: {
             /**
@@ -977,6 +997,21 @@ export interface components {
             /** Name */
             name: string;
             category: components["schemas"]["ColumnCategory"];
+        };
+        /** FormatGuardRequest */
+        FormatGuardRequest: {
+            dialect: components["schemas"]["Dialect"];
+            /** Original */
+            original: string;
+            /** Formatted */
+            formatted: string;
+        };
+        /** FormatGuardResponse */
+        FormatGuardResponse: {
+            /** Same */
+            same: boolean;
+            /** Offset */
+            offset: number | null;
         };
         /**
          * FormatKind
@@ -1747,6 +1782,8 @@ export interface components {
             terminator_end: number;
             /** Repeat */
             repeat: number;
+            /** Params */
+            params: string[];
         };
         /** TextSelection */
         TextSelection: {
@@ -2931,6 +2968,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["FormatResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    format_guard_sql_format_guard_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FormatGuardRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FormatGuardResponse"];
                 };
             };
             /** @description Validation Error */

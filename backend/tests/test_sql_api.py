@@ -37,7 +37,7 @@ def labels(response):
 
 def test_split_uses_utf16_offsets(client):
     statements = client.post("/sql/split", json={"text": EMOJI_SQL, "dialect": "sqlite"}, headers=AUTH).json()["statements"]
-    assert statements[0] == {"start": 0, "end": 11, "terminator_end": 12, "repeat": 1}  # '😀' is two UTF-16 units
+    assert statements[0] == {"start": 0, "end": 11, "terminator_end": 12, "repeat": 1, "params": []}  # '😀' is two UTF-16 units
     assert statements[1]["start"] == 13 and statements[1]["end"] == utf16_len(EMOJI_SQL)
 
 
@@ -45,9 +45,23 @@ def test_split_returns_go_repeats(client):
     body = {"text": "SELECT '😀'\nGO 3\nSELECT '中'", "dialect": "tsql"}  # '😀' is two UTF-16 units, '中' one
     statements = client.post("/sql/split", json=body, headers=AUTH).json()["statements"]
     assert statements == [
-        {"start": 0, "end": 11, "terminator_end": 16, "repeat": 3},
-        {"start": 17, "end": 27, "terminator_end": 27, "repeat": 1},
+        {"start": 0, "end": 11, "terminator_end": 16, "repeat": 3, "params": []},
+        {"start": 17, "end": 27, "terminator_end": 27, "repeat": 1, "params": []},
     ]
+
+
+def test_split_returns_sqlpp_parameters(client):
+    body = {"text": "SELECT $a, ? FROM ks; SELECT @a", "dialect": "sqlpp"}
+    statements = client.post("/sql/split", json=body, headers=AUTH).json()["statements"]
+    assert [s["params"] for s in statements] == [["$a", "?"], ["$a"]]
+
+
+def test_format_guard_offsets_are_utf16(client):
+    original = "SELECT '😀', 'it''s'"
+    body = {"dialect": "sqlpp", "original": original, "formatted": "SELECT '😀', 'it' 's'"}
+    assert client.post("/sql/format-guard", json=body, headers=AUTH).json() == {"same": False, "offset": 13}
+    body["formatted"] = "SELECT\n  '😀',\n  'it''s'"
+    assert client.post("/sql/format-guard", json=body, headers=AUTH).json() == {"same": True, "offset": None}
 
 
 def test_complete_after_an_astral_character(client, sqlite_profile_id):

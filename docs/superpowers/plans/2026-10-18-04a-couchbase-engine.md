@@ -5862,13 +5862,13 @@ git commit -m "docs: Couchbase engine in CLAUDE.md (REST engine, dev cluster, li
 
 ### Assumptions recorded during execution
 
-Owner tasks fill in the Result column (a few words) and apply the Effect; nothing else in the plan needs editing for the outcomes listed. Results so far: Task 1 (A1, A6, A7, A10, A11, A15, A20, A21, A22; 7.6.12 EE dev cluster, probes in Task 1 Step 9).
+Owner tasks fill in the Result column (a few words) and apply the Effect; nothing else in the plan needs editing for the outcomes listed. Results so far: Task 1 (A1, A6, A7, A10, A11, A15, A20, A21, A22; 7.6.12 EE dev cluster, probes in Task 1 Step 9); Task 2 (A4, A5; `tests/test_couchbase_literals.py` against the same cluster).
 
 | # | Assumption (spec §10) | Owner | Result | Effect on later tasks |
 |---|---|---|---|---|
 | A1 | `SELECT META(d).id, * FROM ks AS d` rows are `{"id":…,"d":{doc}}` | Task 1 | Holds: rows `{"id":"e100000","d":{…}}`, signature `{"id":"json","*":"*"}` | Holds: Task 11 `test_browse_shape_expands_the_alias` as written. Not: its expected columns follow the recorded shape (still lossless, D-04-1 falls back) and 04b's browse statement becomes `SELECT META(d).id, d FROM …` (add to Carries). |
-| A4 | SQL++ string escapes equal JSON's (`\b`, `\f`, `\u0000`, `/`, emoji) | Task 2 | none yet | Holds: nothing. `\b` or `\f` refused: `quote_literal` writes `\u0008` / `\u000c` (Task 2 Step 3). |
-| A5 | `\\` in back-ticks is one backslash | Task 2 | none yet | Holds: nothing. Not: `force_quote_ident(SQLPP)` stops doubling backslashes (the lexer flag stays). |
+| A4 | SQL++ string escapes equal JSON's (`\b`, `\f`, `\u0000`, `/`, emoji) | Task 2 | Holds: `json.dumps(…, ensure_ascii=False)` round-trips every value of the test (`it's`, `say "hi"`, `back\slash`, tab/LF/CR, `\b\f`, `\x00\x1f`, `/`, `中文😀`, empty) and, probed beside it, DEL, U+2028/2029, BOM/NBSP/ZWSP inside a string, `$x`, `?`, `--`, `/* */` | Holds: nothing. `\b` or `\f` refused: `quote_literal` writes `\u0008` / `\u000c` (Task 2 Step 3). |
+| A5 | `\\` in back-ticks is one backslash | Task 2 | Holds: `force_quote_ident(SQLPP, n)` reads back as the field `n` for `a\b`, ``a`b``, `x.y`, `value`, `中文` (probed beside them: `\``, ` `` `, `\\`, `a b`, `1x`, `a-b`, `é`) | Holds: nothing. Not: `force_quote_ident(SQLPP)` stops doubling backslashes (the lexer flag stays). |
 | A6 | `--` ends at CR | Task 1 | Holds: `SELECT 1 AS a -- c` CR `, 2 AS b` → `{"a":1,"b":2}` | No code change either way (`[\n\r]` is the safe side); CLAUDE.md notes it. |
 | A7 | The server reads U+00A0, U+2003, U+3000, U+200B, U+FEFF as spaces | Task 1 | Refused, all five: 3000 syntax error (`at: \xa0` …), also as a leading BOM → `unicode_spaces=False`, the second test variant. Also seen: VT (U+000B) refused; TAB and FF accepted | NBSP accepted as a space: `unicode_spaces=True` for SQLPP and the first lexer test variant; refused: False and the second. |
 | A8 | `nodeServices` entry without `hostname` = the asked node | Task 9 | none yet | One node only here; multi-node goes to the user's test list (Task 13 Step 7). |

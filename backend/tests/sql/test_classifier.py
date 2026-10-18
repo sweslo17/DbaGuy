@@ -14,8 +14,8 @@ from sqlglot.dialects.dialect import Dialect as SqlglotDialect
 from dbaguy_backend.domain.classification import Classification, DangerReason
 from dbaguy_backend.sql import classifier
 from dbaguy_backend.sql.classifier import StatementKind as K
-from dbaguy_backend.sql.classifier import classify, warm_up
-from dbaguy_backend.sql.dialects import Dialect
+from dbaguy_backend.sql.classifier import _from_sqlglot, classify, warm_up
+from dbaguy_backend.sql.dialects import KEYWORD_ONLY_DIALECTS, Dialect
 from dbaguy_backend.sql.splitter import StatementSpan
 
 PG, LITE, MY = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL
@@ -362,7 +362,7 @@ def _warnings_while(action):
     return result, messages
 
 
-@pytest.mark.parametrize("dialect", list(Dialect))
+@pytest.mark.parametrize("dialect", [d for d in Dialect if d not in KEYWORD_ONLY_DIALECTS])
 def test_every_dialect_parses_through_sqlglot_resolved_by_import(dialect, monkeypatch):
     calls = []
     real = sqlglot.parse
@@ -391,15 +391,22 @@ def test_dialects_survive_a_bundle_without_sqlglots_by_name_lookups():
             return real(name, package)
         importlib.import_module = bundled_only
         from dbaguy_backend.sql.classifier import _from_sqlglot
-        from dbaguy_backend.sql.dialects import Dialect
+        from dbaguy_backend.sql.dialects import KEYWORD_ONLY_DIALECTS, Dialect
         # sqlglot's own answer (None when it could not run: a TypeError here); the keyword rules give the same reason
         sql = "ALTER TABLE t DROP COLUMN a"
-        print(json.dumps([[c.dangerous_reasons for c in _from_sqlglot(sql, d)] for d in Dialect]))
+        dialects = [d for d in Dialect if d not in KEYWORD_ONLY_DIALECTS]
+        print(json.dumps([[c.dangerous_reasons for c in _from_sqlglot(sql, d)] for d in dialects]))
     """)
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
                             cwd=Path(__file__).parents[2])
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == [[["alter_drop"]]] * len(Dialect)  # parsed, not the keyword fallback
+    assert json.loads(result.stdout) == [[["alter_drop"]]] * (len(Dialect) - len(KEYWORD_ONLY_DIALECTS))  # parsed, not the keyword fallback
+
+
+def test_keyword_only_dialects_never_reach_sqlglot(monkeypatch):
+    monkeypatch.setattr(sqlglot, "parse", lambda *a, **k: pytest.fail("sqlglot was asked about SQL++"))
+    result, warnings = _warnings_while(lambda: _from_sqlglot("SELECT 1", Dialect.SQLPP))
+    assert result is None and warnings == []
 
 
 def test_an_unexpected_sqlglot_failure_is_a_warning_naming_only_the_exception(monkeypatch):
@@ -433,7 +440,7 @@ def test_warm_up_parses_once_per_dialect_and_logs_its_duration(monkeypatch):
         warm_up()
     finally:
         logger.remove(sink)
-    assert len(calls) == len(Dialect)
+    assert len(calls) == len(Dialect) - len(KEYWORD_ONLY_DIALECTS)  # warm_up() skips the keyword-only dialects
     assert any("warmed up" in m and " ms" in m for m in messages)
 
 

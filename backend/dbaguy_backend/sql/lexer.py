@@ -59,6 +59,11 @@ def _ident_char(ch: str) -> bool:
     return ch.isalnum() or ch in "_$" or ord(ch) > 127
 
 
+def _param_char(ch: str) -> bool:
+    """A character of a SQL++ parameter name: `$name`, `@name`, `$1`."""
+    return ch == "_" or (ch.isascii() and ch.isalnum())
+
+
 def _unicode_space(ch: str) -> bool:
     """A space to SQL Server: whatever str.isspace() says, and U+200B (ZERO WIDTH SPACE)."""
     return ch.isspace() or ch == "\u200b"
@@ -79,7 +84,8 @@ def with_ascii_spaces(text: str) -> str:
 
 def _scan_string(text: str, i: int, quote: str, backslash: bool) -> tuple[int, bool]:
     """i points at the opening quote; returns (index after the closing quote or len(text), whether it closed).
-    A doubled quote stands for one; with `backslash`, a backslash escapes the next character."""
+    A doubled quote stands for one; with `backslash`, a backslash escapes the next character. (SQL++ reads `"a""b"` as
+    two strings, a syntax error, but the text that is inside a string is the same either way.)"""
     n = len(text)
     i += 1
     while i < n:
@@ -162,6 +168,9 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
             i += 1
             terminated = False
             while i < n:
+                if rules.identifier_backslash_escapes and text[i] == "\\":
+                    i = min(i + 2, n)  # SQL++: \` and \\ inside back-ticks (a last backslash escapes nothing)
+                    continue
                 if text[i] == close:
                     if i + 1 < n and text[i + 1] == close:  # a doubled closing quote stands for one: "" `` and ]] alike
                         i += 2  # (SQLite cannot escape ] at all)
@@ -171,6 +180,14 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
                     break
                 i += 1
             kind = TokenKind.QUOTED
+        elif ch in rules.named_param_prefixes and i + 1 < n and _param_char(text[i + 1]):
+            i += 1  # SQL++ $name, @name, $1
+            while i < n and _param_char(text[i]):
+                i += 1
+            kind = TokenKind.PARAM
+        elif ch == "?" and rules.question_params:
+            i += 1  # SQL++ positional parameter
+            kind = TokenKind.PARAM
         elif ch == "$" and rules.dollar_params and (param := _DOLLAR_PARAM.match(text, i)):
             i = param.end()
             kind = TokenKind.PARAM

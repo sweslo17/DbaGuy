@@ -20,6 +20,7 @@ from ..domain.metadata import PathSegment
 from ..services.safety import GuardDecision
 from ..sql.completion import CompletionItem, DescribeResult, SnapshotIndex, complete, describe_at
 from ..sql.dialects import Dialect
+from ..sql.format_guard import first_difference
 from ..sql.formatting import FormatResult, format_rows, value_condition
 from ..sql.offsets import Utf16Index
 from ..sql.select_builder import SortKey, build_browse_select
@@ -48,6 +49,7 @@ class StatementRange(BaseModel):
     end: int  # UTF-16, without the terminator
     terminator_end: int  # UTF-16, after the `;`, the custom delimiter or the `GO` line (or `end` when there is none)
     repeat: int  # times the statement runs: T-SQL "GO n" (0 for GO 0); 1 otherwise
+    params: list[str]  # the statement's parameters (SQL++): $name, $1, and each ?
 
 
 class SplitResponse(BaseModel):
@@ -99,6 +101,17 @@ class ValueConditionResponse(BaseModel):
     condition: str | None  # None: the cell is only a preview, so no condition matches it exactly
 
 
+class FormatGuardRequest(_Input):
+    dialect: Dialect
+    original: str
+    formatted: str
+
+
+class FormatGuardResponse(BaseModel):
+    same: bool
+    offset: int | None  # UTF-16 in `original`: the first token the formatter changed
+
+
 class BrowseSelectRequest(_Input):
     profile_id: UUID
     path: list[PathSegment]
@@ -145,7 +158,7 @@ def split_statements(body: SplitRequest) -> SplitResponse:
     index = Utf16Index(body.text)
     return SplitResponse(statements=[
         StatementRange(start=index.to_utf16(s.start), end=index.to_utf16(s.end),
-                       terminator_end=index.to_utf16(s.terminator_end), repeat=s.repeat)
+                       terminator_end=index.to_utf16(s.terminator_end), repeat=s.repeat, params=list(s.params))
         for s in split(body.text, body.dialect)
     ])
 
@@ -182,6 +195,16 @@ def describe(body: DescribeRequest, container: AppContainer = Depends(get_contai
 @router.post("/format-rows", response_model=FormatResult)
 def format_rows_for_copy(body: FormatRowsRequest) -> FormatResult:
     return format_rows(body.kind, body.columns, body.rows, body.options, body.dialect, "encoded")
+
+
+@router.post("/format-guard", response_model=FormatGuardResponse)
+def format_guard(body: FormatGuardRequest) -> FormatGuardResponse:
+    """Whether a formatter's output may replace the original: only when its significant tokens are the same."""
+    offset = first_difference(body.dialect, body.original, body.formatted)
+    if offset is None:
+        return FormatGuardResponse(same=True, offset=None)
+    logger.debug("Format guard ({}): the formatter changed a token at offset {}", body.dialect, offset)
+    return FormatGuardResponse(same=False, offset=Utf16Index(body.original).to_utf16(offset))
 
 
 @router.post("/browse-select", response_model=BrowseSelectResponse)

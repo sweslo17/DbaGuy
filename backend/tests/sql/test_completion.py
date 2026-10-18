@@ -10,7 +10,8 @@ from dbaguy_backend.domain.schema import (
 )
 from dbaguy_backend.sql import completion
 from dbaguy_backend.sql.completion import (
-    CLAUSE_KEYWORDS, CompletionResult, DescribeResult, SnapshotIndex, _complete, _describe, complete, describe_at,
+    CLAUSE_KEYWORDS, STATEMENT_KEYWORDS, CompletionResult, DescribeResult, SnapshotIndex, _complete, _describe, complete,
+    describe_at,
 )
 from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.lexer import INSIGNIFICANT, tokenize
@@ -227,7 +228,7 @@ _FUZZ_PIECES = [
     "SELECT", "FROM", "JOIN", "ON", "WITH", "RECURSIVE", "AS", "NOT", "MATERIALIZED", "DISTINCT", "UPDATE", "FOR",
     "INTO", "TABLE", "ONLY", "WHERE", "AND", "users", "orders", "sales", "u", "x", "id", ".", ",", "(", ")", "*", "=",
     "'", '"', "[", "`", "--", "/*", "*/", ";", " ", "\n", "$$", "$1", "1.", "#", "@x", "/*!", "\\'", "DELIMITER",
-    "GO", "N'", "#t", "]]", "@@x",
+    "GO", "N'", "#t", "]]", "@@x", "$x", "@y", "?", "`a\\`b`", "{", "}", "[", "]", "USE KEYS", "MISSING",
 ]
 
 
@@ -390,3 +391,10 @@ def test_tsql_output_and_option_are_not_aliases(sql):
 def test_unquote_undoubles_a_closing_bracket(dialect):
     [token] = tokenize("[a]]b]", dialect)
     assert unquote(token) == "a]b"
+
+
+def test_sqlpp_keywords():
+    labels = [i.label for i in complete("SELECT * FROM ks US", 19, Dialect.SQLPP, None).items]
+    assert "USE KEYS" in labels
+    assert {"UPSERT", "INFER", "ADVISE"} <= set(STATEMENT_KEYWORDS[Dialect.SQLPP])
+    assert {"UNNEST", "NEST", "SATISFIES", "IS MISSING", "RETURNING"} <= set(CLAUSE_KEYWORDS[Dialect.SQLPP])

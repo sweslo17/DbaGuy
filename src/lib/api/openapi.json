@@ -1926,6 +1926,66 @@
         }
       }
     },
+    "/sql/format-guard": {
+      "post": {
+        "tags": [
+          "sql"
+        ],
+        "summary": "Format Guard",
+        "description": "Whether a formatter's output may replace the original: only when its significant tokens are the same.",
+        "operationId": "format_guard_sql_format_guard_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FormatGuardRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FormatGuardResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/sql/browse-select": {
       "post": {
         "tags": [
@@ -2727,7 +2787,8 @@
           "postgres",
           "sqlite",
           "mysql",
-          "tsql"
+          "tsql",
+          "sqlpp"
         ],
         "title": "Dialect",
         "description": "The SQL dialect of an engine: how its statements are split, classified, completed and quoted."
@@ -3209,6 +3270,54 @@
           "category"
         ],
         "title": "FormatColumn"
+      },
+      "FormatGuardRequest": {
+        "properties": {
+          "dialect": {
+            "$ref": "#/components/schemas/Dialect"
+          },
+          "original": {
+            "type": "string",
+            "title": "Original"
+          },
+          "formatted": {
+            "type": "string",
+            "title": "Formatted"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "dialect",
+          "original",
+          "formatted"
+        ],
+        "title": "FormatGuardRequest"
+      },
+      "FormatGuardResponse": {
+        "properties": {
+          "same": {
+            "type": "boolean",
+            "title": "Same"
+          },
+          "offset": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offset"
+          }
+        },
+        "type": "object",
+        "required": [
+          "same",
+          "offset"
+        ],
+        "title": "FormatGuardResponse"
       },
       "FormatKind": {
         "type": "string",
@@ -5046,6 +5155,13 @@
           "repeat": {
             "type": "integer",
             "title": "Repeat"
+          },
+          "params": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Params"
           }
         },
         "type": "object",
@@ -5053,7 +5169,8 @@
           "start",
           "end",
           "terminator_end",
-          "repeat"
+          "repeat",
+          "params"
         ],
         "title": "StatementRange"
       },
