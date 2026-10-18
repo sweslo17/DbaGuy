@@ -596,6 +596,26 @@ TS = Dialect.TSQL
     # MERGE as a join or union hint is no MERGE statement
     ("SELECT * FROM t INNER MERGE JOIN u ON u.id = t.id", K.READ, []),
     ("SELECT * FROM t JOIN u ON u.id = t.id OPTION (HASH JOIN, MERGE JOIN, MERGE UNION)", K.READ, []),
+    # R-03b-T3b: hints that take or keep locks write, as FOR UPDATE / FOR SHARE do in PostgreSQL and MySQL
+    ("SELECT * FROM t WITH (HOLDLOCK)", K.WRITE, []),
+    ("SELECT * FROM t WITH (NOLOCK, SERIALIZABLE)", K.WRITE, []),
+    ("SELECT a FROM t (REPEATABLEREAD)", K.WRITE, []),
+    ("SELECT * FROM t WITH (XLOCK, ROWLOCK)", K.WRITE, []),
+    ("SET @x = (SELECT a FROM t WITH (HOLDLOCK))", K.WRITE, []),
+    ("DECLARE @x int = (SELECT a FROM t WITH (UPDLOCK))", K.WRITE, []),
+    ("SELECT * FROM t OPTION (TABLE HINT (t, HOLDLOCK))", K.WRITE, []),
+    ("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", K.SESSION, []),  # an isolation level, not a hint
+    ("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", K.SESSION, []),
+    # R-03b-T3c: Service Broker words are plain names outside their statements
+    ("SELECT a FROM t WHERE conversation = 1", K.READ, []),
+    ("SELECT send, receive, conversation, dialog FROM t", K.READ, []),
+    ("SELECT receive FROM t", K.READ, []),
+    ("SELECT * FROM receive WHERE dialog = 1 ORDER BY send", K.READ, []),
+    ("IF 1 = 1 RECEIVE TOP (1) * FROM dbo.q", K.UNKNOWN, []),
+    ("RECEIVE * FROM dbo.q", K.UNKNOWN, []),
+    ("BEGIN CATCH RECEIVE TOP (1) * FROM dbo.q END CATCH", K.UNKNOWN, []),
+    ("WAITFOR (GET CONVERSATION GROUP @g FROM dbo.q), TIMEOUT 1000", K.WRITE, []),
+    ("GET CONVERSATION GROUP @g FROM dbo.q", K.UNKNOWN, []),
 ])
 def test_tsql(sql, kind, reasons):
     result = classify(sql, TS)

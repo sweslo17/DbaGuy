@@ -81,6 +81,13 @@ def cut(sql):
     ("ALTER TABLE t DROP CONSTRAINT fk, COLUMN c", None),
     ("ALTER PARTITION FUNCTION pf() MERGE RANGE (1)\nDROP TABLE t", ["ALTER PARTITION FUNCTION pf() MERGE RANGE (1)", "DROP TABLE t"]),
     ("INSERT INTO t VALUES (1)\nSELECT * INTO t2 FROM t", ["INSERT INTO t VALUES (1)", "SELECT * INTO t2 FROM t"]),
+    # R-03b-T3c: SEND, RECEIVE, MOVE and GET start a statement only in their own form
+    ("SELECT receive, send FROM t WHERE conversation = 1 AND dialog = 2 ORDER BY move, get", None),
+    ("SELECT * FROM t AS receive JOIN u AS send ON send.id = receive.id", None),
+    ("IF 1 = 1 RECEIVE * FROM q", ["IF 1 = 1", "RECEIVE * FROM q"]),
+    ("BEGIN RECEIVE * FROM q END", ["BEGIN", "RECEIVE * FROM q", "END"]),
+    ("IF 1 = 1 SEND ON CONVERSATION @h ('x') ELSE GET CONVERSATION GROUP @g FROM q",
+     ["IF 1 = 1", "SEND ON CONVERSATION @h ('x')", "ELSE", "GET CONVERSATION GROUP @g FROM q"]),
 ])
 def test_statement_cuts(sql, pieces):
     assert cut(sql) == (pieces if pieces is not None else [sql])

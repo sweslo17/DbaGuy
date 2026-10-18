@@ -99,9 +99,9 @@ _TSQL_BEGIN_TRANSACTION = frozenset({"TRAN", "TRANSACTION", "DISTRIBUTED"})
 # no write can pass as something milder. Kinds only; the dangerous reasons come from the statements.
 _TSQL_FLOOR: dict[str, StatementKind] = {
     **dict.fromkeys(
-        ("INSERT", "UPDATE", "DELETE", "MERGE", "BULK", "UPDLOCK", "XLOCK", "TABLOCKX", "WRITETEXT", "UPDATETEXT",
-         # Service Broker (R-03b-P2): SEND, RECEIVE, and every … CONVERSATION / BEGIN DIALOG statement write
-         "SEND", "RECEIVE", "CONVERSATION", "DIALOG"),
+        ("INSERT", "UPDATE", "DELETE", "MERGE", "BULK", "WRITETEXT", "UPDATETEXT",
+         # Table hints that take or keep locks (R-03b-T3b), as FOR UPDATE / FOR SHARE in PostgreSQL and MySQL
+         "UPDLOCK", "XLOCK", "TABLOCKX", "HOLDLOCK", "SERIALIZABLE", "REPEATABLEREAD"),
         StatementKind.WRITE,
     ),
     # ADD and TRIGGER are reserved words only DDL uses: ADD SIGNATURE, ADD SENSITIVITY CLASSIFICATION and ENABLE |
@@ -115,11 +115,20 @@ _TSQL_FLOOR: dict[str, StatementKind] = {
         StatementKind.UNKNOWN,
     ),
 }
-# The same floor for words that write only together: NEXT VALUE FOR advances a sequence, inside any SELECT or SET.
-_TSQL_FLOOR_PHRASES: dict[tuple[str, ...], StatementKind] = {("NEXT", "VALUE", "FOR"): StatementKind.WRITE}
-# A floor word before one of these is a query hint, no statement: INNER MERGE JOIN, OPTION (MERGE JOIN | MERGE UNION)
-# (a MERGE statement's target cannot be named JOIN or UNION: both are reserved).
-_TSQL_FLOOR_HINT_BEFORE: dict[str, frozenset[str]] = {"MERGE": frozenset({"JOIN", "UNION"})}
+# The same floor for words that write only together ("(" stands for an opening parenthesis). NEXT VALUE FOR advances a
+# sequence, inside any SELECT or SET. Service Broker statements write (R-03b-P2), and only their phrases count: alone,
+# send, receive, conversation and dialog are plausible column names (R-03b-T3c). A RECEIVE that starts a statement is
+# its own piece (tsql._starts), which no rule knows: UNKNOWN.
+_TSQL_FLOOR_PHRASES: dict[tuple[str, ...], StatementKind] = dict.fromkeys(
+    (("NEXT", "VALUE", "FOR"), ("SEND", "ON", "CONVERSATION"), ("END", "CONVERSATION"), ("BEGIN", "DIALOG"),
+     ("BEGIN", "CONVERSATION"), ("MOVE", "CONVERSATION"), ("GET", "CONVERSATION", "GROUP"), ("WAITFOR", "(", "RECEIVE")),
+    StatementKind.WRITE,
+)
+# Where a floor word is neither a statement nor a hint. Before JOIN or UNION, MERGE is a query hint (INNER MERGE JOIN,
+# OPTION (MERGE UNION); a MERGE statement's target cannot be named JOIN or UNION, both reserved). After LEVEL,
+# SERIALIZABLE is an isolation level (SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, which the allow-list allows).
+_TSQL_FLOOR_NOT_BEFORE: dict[str, frozenset[str]] = {"MERGE": frozenset({"JOIN", "UNION"})}
+_TSQL_FLOOR_NOT_AFTER: dict[str, frozenset[str]] = {"SERIALIZABLE": frozenset({"LEVEL"})}
 
 
 def _has_version_comment(tokens: list[Token]) -> bool:
@@ -333,10 +342,12 @@ def _tsql_selects_into_a_table(tokens: list[Token]) -> bool:
 def _tsql_floor_kinds(tokens: list[Token], pieces: list[list[Token]]) -> Iterator[StatementKind]:
     """The floor kinds of a T-SQL batch (`tokens`: its significant tokens; `pieces`: them cut into statements): those
     of its words and phrases, and DDL for a SELECT … INTO that creates a table."""
-    words = [t.upper if t.kind == TokenKind.WORD else "" for t in tokens]
+    words = [t.upper if t.kind == TokenKind.WORD else "(" if t.kind == TokenKind.LPAREN else "" for t in tokens]
     for k, word in enumerate(words):
-        hint = k + 1 < len(words) and words[k + 1] in _TSQL_FLOOR_HINT_BEFORE.get(word, ())
-        if word in _TSQL_FLOOR and not hint:
+        exempt = (k + 1 < len(words) and words[k + 1] in _TSQL_FLOOR_NOT_BEFORE.get(word, ())) or (
+            k > 0 and words[k - 1] in _TSQL_FLOOR_NOT_AFTER.get(word, ())
+        )
+        if word in _TSQL_FLOOR and not exempt:
             yield _TSQL_FLOOR[word]
         for phrase, kind in _TSQL_FLOOR_PHRASES.items():
             if tuple(words[k:k + len(phrase)]) == phrase:

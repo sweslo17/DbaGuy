@@ -255,6 +255,16 @@ def decide_ts(sql, level="standard", read_only=False):
     "SET ARITHABORT ON", "SET DATEFORMAT dmy", "SET LANGUAGE us_english", "SET LANGUAGE N'us_english'",
     "SET LOCK_TIMEOUT 1000", "SET STATISTICS IO ON", "SET STATISTICS TIME ON", "SET SHOWPLAN_XML ON",
     "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED", "USE analytics", "USE [my db]", "BEGIN TRAN",
+    # Fix round 1: every STATISTICS item, more harmless settings, signed values
+    "SET STATISTICS IO, TIME ON", "SET STATISTICS PROFILE ON", "SET STATISTICS XML ON",
+    "SET STATISTICS TIME, IO, PROFILE, XML OFF", "SET DATEFIRST 1", "SET TEXTSIZE 65536", "SET DEADLOCK_PRIORITY LOW",
+    "SET DEADLOCK_PRIORITY -5", "SET DEADLOCK_PRIORITY @p", "SET CONCAT_NULL_YIELDS_NULL ON", "SET NUMERIC_ROUNDABORT OFF",
+    "SET LOCK_TIMEOUT -1", "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    # R-03b-T3c: columns and tables named like Service Broker words are plain reads
+    "SELECT a FROM t WHERE conversation = 1", "SELECT send, receive, conversation, dialog FROM t", "SELECT receive FROM t",
+    "SELECT * FROM receive WHERE dialog = 1", "SELECT a AS dialog, b AS send FROM t ORDER BY receive",
+    "SELECT t.send, t.receive FROM t", "DECLARE @c int = 1\nSELECT conversation FROM t WHERE receive = @c",
+    "SELECT * FROM t AS x JOIN u ON x.conversation = u.id",
 ])
 def test_tsql_read_only_allows(sql):
     assert decide_ts(sql, read_only=True) == (A.RUN, [])
@@ -263,7 +273,7 @@ def test_tsql_read_only_allows(sql):
 @pytest.mark.parametrize("sql", [
     "INSERT INTO t VALUES (1)", "EXEC sp_who", "EXECUTE p", "sp_who", "SELECT 1\nDELETE FROM t",
     "DECLARE @t TABLE (a int); INSERT INTO @t VALUES (1)", "SELECT * INTO #t FROM t", "CREATE TABLE #t (a int)",
-    "SET IMPLICIT_TRANSACTIONS ON", "SET XACT_ABORT ON", "SET IDENTITY_INSERT t ON", "SET STATISTICS XML ON",
+    "SET IMPLICIT_TRANSACTIONS ON", "SET XACT_ABORT ON", "SET IDENTITY_INSERT t ON",
     "SET ROWCOUNT 10", "SET NOCOUNT ON; SET XACT_ABORT ON", "SET NOCOUNT ON\nUPDATE t SET a = 1",
     "DBCC FREEPROCCACHE", "SELECT * FROM t WITH (UPDLOCK)", "SET NOCOUNT ON\nGO\nSET XACT_ABORT ON",
     # R-03b-P2: the pre-flight's bypasses
@@ -282,6 +292,15 @@ def test_tsql_read_only_allows(sql):
     "SELECT 1\nADD SENSITIVITY CLASSIFICATION TO dbo.t.a WITH (LABEL = 'x')", "SELECT NEXT VALUE FOR dbo.s",
     "pragma x", "show x", "SET ANSI_NULLS ON; SET IMPLICIT_TRANSACTIONS ON",
     "(SELECT a INTO t2 FROM t) OPTION (USE HINT ('FORCE_LEGACY_CARDINALITY_ESTIMATION'))",
+    # Fix round 1: ANSI_DEFAULTS turns IMPLICIT_TRANSACTIONS on (R-03b-T3a); locking hints write (R-03b-T3b)
+    "SET ANSI_DEFAULTS ON", "SET ANSI_NULLS, ANSI_DEFAULTS ON", "SET STATISTICS ON", "SET STATISTICS IO, TIME",
+    "SET STATISTICS IO, SHOWPLAN_XML ON", "SET DEADLOCK_PRIORITY LOW; SET XACT_ABORT ON", "SET TEXTSIZE 10\nDELETE FROM t",
+    "SELECT * FROM t WITH (HOLDLOCK)", "SELECT * FROM t WITH (NOLOCK, SERIALIZABLE)", "SELECT a FROM t (REPEATABLEREAD)",
+    "SET @x = (SELECT a FROM t WITH (HOLDLOCK))", "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT * FROM t WITH (XLOCK)",
+    # R-03b-T3c: the Service Broker statements themselves still block
+    "IF 1 = 1 RECEIVE TOP (1) * FROM dbo.q", "RECEIVE * FROM dbo.q", "SELECT 1; RECEIVE * FROM dbo.q",
+    "WAITFOR (GET CONVERSATION GROUP @g FROM dbo.q), TIMEOUT 1000", "BEGIN CATCH RECEIVE TOP (1) * FROM dbo.q END CATCH",
+    "DECLARE @h uniqueidentifier\nBEGIN CONVERSATION TIMER (@h) TIMEOUT = 60",
 ])
 def test_tsql_read_only_blocks(sql):
     assert decide_ts(sql, read_only=True) == (A.BLOCK, ["read_only"])

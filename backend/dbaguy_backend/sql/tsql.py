@@ -14,11 +14,16 @@ STATEMENT_STARTS = frozenset("""SELECT INSERT UPDATE DELETE MERGE DECLARE SET IF
     RESTORE DBCC KILL BULK COMMIT ROLLBACK SAVE OPEN FETCH CLOSE DEALLOCATE CHECKPOINT RECONFIGURE SHUTDOWN SETUSER
     REVERT WRITETEXT UPDATETEXT SEND RECEIVE MOVE GET ENABLE DISABLE""".split())
 # Not reserved words, so elsewhere they are names (`SELECT throw INTO t2 FROM t` reads a column and creates t2): they
-# start a statement only before their own syntax. THROW: see _starts.
-_STARTS_ONLY_BEFORE: dict[str, frozenset[str]] = {
-    "MOVE": frozenset({"CONVERSATION"}), "GET": frozenset({"CONVERSATION"}),
-    "ENABLE": frozenset({"TRIGGER"}), "DISABLE": frozenset({"TRIGGER"}),
+# start a statement only before their own syntax. THROW and RECEIVE: see _starts.
+_STARTS_ONLY_BEFORE: dict[str, tuple[str, ...]] = {
+    "SEND": ("ON", "CONVERSATION"), "MOVE": ("CONVERSATION",), "GET": ("CONVERSATION", "GROUP"),
+    "ENABLE": ("TRIGGER",), "DISABLE": ("TRIGGER",),
 }
+# RECEIVE has no word of its own after it (RECEIVE TOP (1) * | col, … FROM queue). SQL Server takes it only where a
+# statement may begin without a `;` before it (probed): at the start, after a label, after the condition of IF or
+# WHILE, after ELSE, and right after BEGIN, BEGIN TRY or BEGIN CATCH (R-03b-T3c). Anywhere else it is a name.
+_CONTROL_HEADS = frozenset({"IF", "ELSE", "WHILE"})
+_BLOCK_OPENERS = (["BEGIN"], ["BEGIN", "TRY"], ["BEGIN", "CATCH"])
 # A start word right after one of these words continues the statement. All of them are reserved words (an alias named
 # `after` once joined the DELETE after it to a SELECT and lost its danger reason), so AFTER INSERT|UPDATE|DELETE is
 # not here: a trigger is one module statement anyway, and a security policy's block predicate is cut (stricter).
@@ -69,21 +74,24 @@ def _words(tokens: list[Token]) -> list[str]:
     ]
 
 
-def _starts(words: list[str], tokens: list[Token], i: int) -> bool:
-    """Whether the word at `i` can start a statement at all, whatever comes before it."""
+def _starts(words: list[str], tokens: list[Token], i: int, begin: int) -> bool:
+    """Whether the word at `i` can start a statement there; the statement so far begins at `begin`."""
     word = words[i]
     if word not in STATEMENT_STARTS:
         return False
     following = tokens[i + 1] if i + 1 < len(tokens) else None
-    after = words[i + 1] if following is not None else ""
     if word == "THROW":  # THROW, THROW 50000, …, THROW @n, …; a bare THROW before `;`, END CATCH or the end
+        after = words[i + 1] if following is not None else ""
         return (
             following is None or following.kind in (TokenKind.SEMI, TokenKind.NUMBER) or after.startswith("@")
             or after == "END"
         )
+    if word == "RECEIVE":
+        label = i >= 2 and tokens[i - 1].text == ":" and tokens[i - 2].kind == TokenKind.WORD  # lbl: (not ::)
+        return label or words[begin] in _CONTROL_HEADS or words[begin:i] in _BLOCK_OPENERS
     if word in _STARTS_ONLY_BEFORE:
-        return after in _STARTS_ONLY_BEFORE[word]
-    return not (word == "MERGE" and after == "RANGE")  # ALTER PARTITION FUNCTION … MERGE RANGE (…)
+        return tuple(words[i + 1:i + 1 + len(_STARTS_ONLY_BEFORE[word])]) == _STARTS_ONLY_BEFORE[word]
+    return not (word == "MERGE" and words[i + 1:i + 2] == ["RANGE"])  # ALTER PARTITION FUNCTION … MERGE RANGE (…)
 
 
 def _continues(head: str, before: str, seen: set[str], words: list[str], tokens: list[Token], i: int) -> bool:
@@ -117,6 +125,7 @@ def statements(tokens: list[Token]) -> list[list[Token]]:
     words = _words(tokens)
     out: list[list[Token]] = []
     current: list[Token] = []
+    begin = 0  # where `current` begins in `tokens`
     head = ""
     seen: set[str] = set()  # words at depth 0 in `current`, its first word excepted
     depth = cases = 0
@@ -128,13 +137,13 @@ def statements(tokens: list[Token]) -> list[list[Token]]:
             continue
         word = words[i]
         if (
-            current and depth == 0 and cases == 0 and _starts(words, tokens, i)
+            current and depth == 0 and cases == 0 and _starts(words, tokens, i, begin)
             and not _continues(head, words[i - 1], seen, words, tokens, i)
         ):
             out.append(current)
             current, seen = [], set()
         if not current:
-            head = word
+            begin, head = i, word
         current.append(token)
         if token.kind == TokenKind.LPAREN:
             depth += 1

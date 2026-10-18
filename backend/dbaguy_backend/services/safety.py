@@ -212,18 +212,28 @@ def _harmless_mysql_session(sql: str) -> bool:
     return all(_harmless_mysql_assignment(item) for item in _top_level_items(tokens[1:]))
 
 
-_TSQL_HARMLESS_OPTIONS = frozenset(
-    {"NOCOUNT", "ARITHABORT", "QUOTED_IDENTIFIER", "DATEFORMAT", "LANGUAGE", "LOCK_TIMEOUT"}
-)
+_TSQL_HARMLESS_OPTIONS = frozenset({
+    "NOCOUNT", "ARITHABORT", "QUOTED_IDENTIFIER", "DATEFORMAT", "LANGUAGE", "LOCK_TIMEOUT",
+    "DATEFIRST", "TEXTSIZE", "DEADLOCK_PRIORITY", "CONCAT_NULL_YIELDS_NULL", "NUMERIC_ROUNDABORT",  # fix round 1
+})
 _TSQL_HARMLESS_PREFIXES = ("ANSI_", "SHOWPLAN_")
-_TSQL_STATISTICS = (["STATISTICS", "IO"], ["STATISTICS", "TIME"])
+_TSQL_NOT_HARMLESS = frozenset({"ANSI_DEFAULTS"})  # it turns IMPLICIT_TRANSACTIONS on (R-03b-T3a)
+_TSQL_STATISTICS = frozenset({"IO", "TIME", "PROFILE", "XML"})
+
+
+def _harmless_tsql_option(item: list[Token]) -> bool:
+    name = item[0].upper if len(item) == 1 and item[0].kind == TokenKind.WORD else ""
+    harmless = name in _TSQL_HARMLESS_OPTIONS or name.startswith(_TSQL_HARMLESS_PREFIXES)
+    return harmless and name not in _TSQL_NOT_HARMLESS
 
 
 def _harmless_tsql_setting(tokens: list[Token]) -> bool:
     """One T-SQL statement that only shapes how statements run or look (spec §3.4): `USE db`, `SET @var = …`,
-    `SET TRANSACTION ISOLATION LEVEL …`, `SET STATISTICS IO|TIME …`, or `SET <option>[, <option>…] <value>` whose
-    options are NOCOUNT, ANSI_*, ARITHABORT, QUOTED_IDENTIFIER, DATEFORMAT, LANGUAGE, LOCK_TIMEOUT or SHOWPLAN_*.
-    Never IMPLICIT_TRANSACTIONS, XACT_ABORT, ROWCOUNT, IDENTITY_INSERT or anything else."""
+    `SET TRANSACTION ISOLATION LEVEL …`, `SET STATISTICS IO|TIME|PROFILE|XML[, …] <value>`, or
+    `SET <option>[, <option>…] <value>` whose options are NOCOUNT, ANSI_* (not ANSI_DEFAULTS), ARITHABORT,
+    QUOTED_IDENTIFIER, DATEFORMAT, LANGUAGE, LOCK_TIMEOUT, SHOWPLAN_*, DATEFIRST, TEXTSIZE, DEADLOCK_PRIORITY,
+    CONCAT_NULL_YIELDS_NULL or NUMERIC_ROUNDABORT. Never IMPLICIT_TRANSACTIONS, XACT_ABORT, ROWCOUNT, IDENTITY_INSERT
+    or anything else."""
     words = _keywords(tokens)
     if words[:1] == ["USE"]:
         return len(tokens) == 2 and tokens[1].kind in (TokenKind.WORD, TokenKind.QUOTED)
@@ -233,14 +243,13 @@ def _harmless_tsql_setting(tokens: list[Token]) -> bool:
         return True
     if words[1:4] == ["TRANSACTION", "ISOLATION", "LEVEL"]:
         return len(tokens) > 4
-    items = _top_level_items(tokens[1:-1])  # the options; the last token is the value
-    if words[1] == "STATISTICS":
-        return len(items) == 1 and [t.upper for t in items[0]] in _TSQL_STATISTICS
-    return all(
-        len(item) == 1 and item[0].kind == TokenKind.WORD
-        and (item[0].upper in _TSQL_HARMLESS_OPTIONS or item[0].upper.startswith(_TSQL_HARMLESS_PREFIXES))
-        for item in items
-    )
+    # the value is the last token, or a sign and a number (SET LOCK_TIMEOUT -1, SET DEADLOCK_PRIORITY -5)
+    signed = tokens[-1].kind == TokenKind.NUMBER and tokens[-2].kind == TokenKind.OTHER and tokens[-2].text in "+-"
+    items = _top_level_items(tokens[1:-2 if signed else -1])  # the options
+    if words[1] == "STATISTICS":  # SET STATISTICS IO, TIME ON: the first item holds the word STATISTICS
+        names = [items[0][1:], *items[1:]]
+        return all(len(n) == 1 and n[0].kind == TokenKind.WORD and n[0].upper in _TSQL_STATISTICS for n in names)
+    return all(_harmless_tsql_option(item) for item in items)
 
 
 def _harmless_tsql_session(sql: str) -> bool:
