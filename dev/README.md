@@ -78,3 +78,6 @@ To start from an empty cluster (or to apply an edit to the seed), remove both co
 docker compose -f dev/docker-compose.yml rm -sfv couchbase couchbase-init
 docker compose -f dev/docker-compose.yml up -d --build --wait
 ```
+
+Recreating only `couchbase` leaves the idle `couchbase-init` as it is, so the new cluster is never seeded and `--wait`
+fails after about 11 minutes: remove both as above, or run `docker restart dbaguy-dev-couchbase-init-1` afterwards.

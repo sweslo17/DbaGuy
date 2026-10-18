@@ -12,6 +12,8 @@ trap 'exit 0' TERM
 # waited for. Not for commands that read stdin: a background command reads /dev/null.
 run() { "$@" & wait $!; }
 idle() { sleep infinity & wait; }
+# step WHAT: names the step in `docker logs`, so a bare curl or cbq error says where the seed stopped.
+step() { echo "seed: $*"; }
 MGR=http://couchbase:8091
 QRY=http://couchbase:8093/query/service
 CURL=(curl -sS -u dbaguy:dbaguy)
@@ -66,6 +68,7 @@ if seeded 2>/dev/null; then
   echo "already seeded"
   idle
 fi
+step "cluster init"
 if ! "${CURL[@]}" -f -o /dev/null "$MGR/pools/default" 2>/dev/null; then
   run curl -sSf -o /dev/null -X POST "$MGR/clusterInit" -d hostname=127.0.0.1 -d services=kv,n1ql,index \
     -d memoryQuota=512 -d indexMemoryQuota=256 -d indexerStorageMode=plasma -d username=dbaguy -d password=dbaguy \
@@ -73,11 +76,13 @@ if ! "${CURL[@]}" -f -o /dev/null "$MGR/pools/default" 2>/dev/null; then
 fi
 wait_for 120 "the query service" q 'SELECT 1'
 
+step "travel-sample"
 if ! "${CURL[@]}" -f -o /dev/null "$MGR/pools/default/buckets/travel-sample" 2>/dev/null; then
   run "${CURL[@]}" -f -o /dev/null -X POST "$MGR/sampleBuckets/install" -d '["travel-sample"]'
 fi
 wait_for 300 "travel-sample and its indexes" sample_ready
 
+step "dbaguy bucket, scopes and collections"
 if ! "${CURL[@]}" -f -o /dev/null "$MGR/pools/default/buckets/dbaguy" 2>/dev/null; then
   run "${CURL[@]}" -f -o /dev/null -X POST "$MGR/pools/default/buckets" -d name=dbaguy -d ramQuota=100 \
     -d bucketType=couchbase
@@ -87,9 +92,11 @@ run "${CBQ[@]}" -f /couchbase/init/01-keyspaces.n1ql
 for i in $(seq -w 1 300); do echo "CREATE COLLECTION dbaguy.many.c$i IF NOT EXISTS;"; done >/tmp/many.n1ql
 run "${CBQ[@]}" -f /tmp/many.n1ql
 wait_for 120 "the collections" collections_ready  # 300 in many + 7 in app
+step "indexes"
 run "${CBQ[@]}" -f /couchbase/init/02-indexes.n1ql
 wait_for 180 "the indexes" indexes_ready  # three primary indexes and idx_orders_amount; idx_users_deferred stays deferred
 
+step "documents"
 doc app users u_numbers '{"big":9007199254740993,"i64max":9223372036854775807,"i64min":-9223372036854775808,"u64max":18446744073709551615,"beyond":12345678901234567890,"dec":1.10,"pi":3.141592653589793238462643383279,"sci":1E+3,"tiny":1e-400,"huge":1e400,"half":0.5}'
 doc app users u_keyorder '{"zeta": 1,
  "alpha": {"z": 1, "a": 2}, "ws" :  [ 1 , 2 ], "mid": "a b"}'
@@ -110,6 +117,7 @@ blob bin1 0x03000002  # A20: binary and text documents (META().type "base64"); t
 blob txt1 0x04000004
 run "${CBQ[@]}" -f /couchbase/init/03-data.n1ql
 
+step "limited user"
 run "${CURL[@]}" -f -o /dev/null -X PUT "$MGR/settings/rbac/users/local/dbaguy_reader" -d password=dbaguy \
   --data-urlencode 'roles=query_select[dbaguy:app:users],data_reader[dbaguy:app:users]'
 q 'UPSERT INTO dbaguy._default._default (KEY, VALUE) VALUES ("seed_done", {"at": NOW_STR()})' >/dev/null
