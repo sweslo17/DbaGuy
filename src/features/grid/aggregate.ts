@@ -1,4 +1,5 @@
 import type { ColumnMeta } from "@/lib/api/types";
+import { isMissing, jsonCellText } from "@/lib/cells";
 import type { Rect } from "./selection";
 
 const NUMERIC = /^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
@@ -19,16 +20,22 @@ export interface Aggregates {
   capped: boolean;
 }
 
-function numberOf(value: unknown): { value: number; exact: boolean } | null {
+/**
+ * A cell's number: a JS number, or the text of a numeric string (a `number` column's big integers and decimals) or of
+ * a json cell (Couchbase). `typedOnly` (a `mixed` column: its type is on the cell, so a string is text) leaves plain
+ * strings out.
+ */
+function numberOf(value: unknown, typedOnly: boolean): { value: number; exact: boolean } | null {
   if (typeof value === "number") return { value, exact: Number.isSafeInteger(value) || !Number.isInteger(value) };
-  if (typeof value === "string" && NUMERIC.test(value.trim())) {
-    const digits = value.replace(/[^0-9]/g, "").replace(/^0+/, "").length;
-    return { value: Number(value), exact: digits <= 15 };
+  const text = jsonCellText(value) ?? (!typedOnly && typeof value === "string" ? value : null);
+  if (text !== null && NUMERIC.test(text.trim())) {
+    const digits = text.replace(/[^0-9]/g, "").replace(/^0+/, "").length;
+    return { value: Number(text), exact: digits <= 15 };
   }
   return null;
 }
 
-/** Status-bar figures over the loaded rows inside `rect`; numbers only from `number` columns. */
+/** Status-bar figures over the loaded rows inside `rect`; numbers only from `number` and `mixed` columns. */
 export function aggregate(rect: Rect, rows: unknown[][], columns: ColumnMeta[], cap = AGGREGATE_CAP): Aggregates {
   const cells = Math.max(0, rect.bottom - rect.top + 1) * Math.max(0, rect.right - rect.left + 1);
   const result: Aggregates = { cells, nonNull: 0, numeric: 0, approximate: false, capped: cells > cap };
@@ -39,10 +46,11 @@ export function aggregate(rect: Rect, rows: unknown[][], columns: ColumnMeta[], 
     if (!row) continue;
     for (let c = rect.left; c <= rect.right; c += 1) {
       const value = row[c];
-      if (value === null || value === undefined) continue;
+      if (value === null || value === undefined || isMissing(value)) continue;
       result.nonNull += 1;
-      if (columns[c]?.category !== "number") continue;
-      const n = numberOf(value);
+      const category = columns[c]?.category;
+      if (category !== "number" && category !== "mixed") continue;
+      const n = numberOf(value, category === "mixed");
       if (!n || !Number.isFinite(n.value)) continue;
       result.numeric += 1;
       result.approximate ||= !n.exact;

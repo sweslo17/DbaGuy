@@ -22,6 +22,8 @@ export type ObjectDetail = S["ObjectDetail"];
 export type ObjectSearchHit = S["ObjectSearchHit"];
 export type ColumnInfo = S["ColumnInfo"];
 export type SessionInfo = S["SessionInfo"];
+/** Couchbase: the bucket (and scope) that unqualified keyspace names resolve against, sent with execute and export. */
+export type QueryContext = S["QueryContext"];
 export type ColumnMeta = S["ColumnMeta"];
 export type ColumnCategory = S["ColumnCategory"];
 export type ServerEvent = S["ExecutionSchema"]["event"];

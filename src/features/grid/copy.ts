@@ -24,6 +24,14 @@ export const COPY_FORMATS: readonly CopyFormat[] = [
   "column_names",
 ];
 
+/** SQL++ has no INSERT by columns (it inserts a key and a document). */
+const SQLPP_COPY_FORMATS = COPY_FORMATS.filter((format) => format !== "insert");
+
+/** The "Copy as" formats a dialect can produce (null: the connection's type is not known yet, so all of them). */
+export function copyFormatsFor(dialect: Dialect | null): readonly CopyFormat[] {
+  return dialect === "sqlpp" ? SQLPP_COPY_FORMATS : COPY_FORMATS;
+}
+
 export const COPY_FORMAT_LABELS: Record<CopyFormat, string> = {
   tsv: "TSV",
   csv: "CSV",
@@ -70,7 +78,7 @@ async function formatRows(body: FormatRowsRequest): Promise<FormatResult> {
  * Copies the text being formatted and toasts the outcome; a format error wins over the clipboard error it causes.
  * Never rejects.
  */
-async function copyText(formatted: Promise<FormatResult>, success: string): Promise<void> {
+async function copyText(formatted: Promise<FormatResult>, success: string, warnings: string[] = []): Promise<void> {
   const written = writeClipboard(formatted.then((result) => result.text));
   written.catch(() => undefined); // awaited below, once the format outcome is known
   let result: FormatResult;
@@ -88,7 +96,7 @@ async function copyText(formatted: Promise<FormatResult>, success: string): Prom
     return;
   }
   toast("info", success);
-  for (const warning of result.warnings) toast("warning", warning);
+  for (const warning of [...result.warnings, ...warnings]) toast("warning", warning);
 }
 
 /** Copies text known on the client and toasts `success` (or the clipboard error). Never rejects. */
@@ -101,6 +109,28 @@ function isPartial(value: unknown): boolean {
   if (value === null || typeof value !== "object") return false;
   const cell = value as EncodedCell;
   return cell.$type === "text" || (cell.$type === "bytes" && (cell.size ?? 0) > BYTES_PREVIEW);
+}
+
+/** How many of the cells hold only the start of their value (see `isPartial`). */
+function countPartial(rows: unknown[][]): number {
+  let count = 0;
+  for (const row of rows) for (const value of row) if (isPartial(value)) count += 1;
+  return count;
+}
+
+/**
+ * The warning for values the grid cut (long text or JSON, bytes beyond the preview): TSV, CSV, JSON and Markdown write
+ * what the grid holds, so a copy holds only their start and would say nothing. INSERT and IN list (the dialect
+ * formats) write such a value as NULL and warn about it themselves.
+ */
+function partialWarnings(format: CopyFormat, rows: unknown[][]): string[] {
+  if (DIALECT_FORMATS.has(format)) return [];
+  const count = countPartial(rows);
+  if (count === 0) return [];
+  const each = count === 1 ? "it" : "each";
+  return [
+    `${plural(count, "value")} cut at the grid's size limit: the copy has only the start of ${each} — export the result for complete values`,
+  ];
 }
 
 /**
@@ -138,11 +168,12 @@ export async function copySelection(format: CopyFormat, input: CopyInput): Promi
     toast("error", `Connection type unknown: cannot copy as ${COPY_FORMAT_LABELS[format]} yet`);
     return;
   }
+  const rows = cellsOf(input.rows, rect);
   const body: FormatRowsRequest = {
     dialect: input.dialect ?? ANY_DIALECT,
     kind: format,
     columns: columns.slice(rect.left, rect.right + 1).map(({ name, category }) => ({ name, category })),
-    rows: cellsOf(input.rows, rect),
+    rows,
     options: {
       header: wantsHeader(input),
       null_text: "",
@@ -150,7 +181,8 @@ export async function copySelection(format: CopyFormat, input: CopyInput): Promi
       table_name: input.tableName?.name ?? null,
     },
   };
-  return copyText(formatRows(body), `Copied ${plural(rowCount, "row")} as ${COPY_FORMAT_LABELS[format]}`);
+  const success = `Copied ${plural(rowCount, "row")} as ${COPY_FORMAT_LABELS[format]}`;
+  return copyText(formatRows(body), success, partialWarnings(format, rows));
 }
 
 /**

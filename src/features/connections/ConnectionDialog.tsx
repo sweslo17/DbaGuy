@@ -43,18 +43,45 @@ const SSL_MODE_LABELS: Partial<Record<Engine, Record<SslConfig["mode"], string>>
     "verify-ca": "verify-ca (encrypt, check the CA)",
     "verify-full": "verify-full (check the CA and host name)",
   },
+  couchbase: {
+    disable: "disable (HTTP)",
+    prefer: "prefer (= disable: HTTP)",
+    require: "require (HTTPS, no certificate check)",
+    "verify-ca": "verify-ca (HTTPS, check the CA)",
+    "verify-full": "verify-full (HTTPS, check the CA and host name)",
+  },
 };
 const SSL_MODE_HINTS: Partial<Record<Engine, string>> = {
   mysql: "verify-full cannot be used through an SSH tunnel",
   mssql: "verify-ca and verify-full need a CA file; verify-full cannot be used through an SSH tunnel",
+  couchbase:
+    "TLS uses ports 18093 and 18091; verify-ca and verify-full need the cluster's CA file unless its certificate is publicly trusted",
 };
+/** The mode a new profile starts with (the others start with `prefer`): Couchbase's TLS is on other ports, so HTTP. */
+const DEFAULT_SSL_MODES: Partial<Record<Engine, SslConfig["mode"]>> = { couchbase: "disable" };
+/** Shown instead of the SSL hint when the password would cross the network in clear text. */
+const PLAIN_TEXT_NOTE =
+  "The password goes to the cluster in clear text (HTTP Basic auth): use TLS (require or verify-*) for a remote cluster";
+const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 /** The Import URL placeholder for the selected engine (PostgreSQL's when it has none). */
 const URL_EXAMPLES: Partial<Record<Engine, string>> = {
   postgres: "postgres://user@host:5432/db",
   mysql: "mysql://user@host:3306/db or jdbc:mysql://host:3306/db",
   mssql: "mssql://user@host:1433/db or jdbc:sqlserver://host:1433;databaseName=db",
+  couchbase: "couchbase://cb1,cb2/bucket · couchbases://host/bucket · http://host:8093",
   sqlite: "sqlite:///path/to.db",
 };
+/** Engine-specific wording of the General tab's server fields (the defaults suit the SQL engines). */
+const HOST_HINTS: Partial<Record<Engine, string>> = {
+  couchbase: "One host, or several separated by commas (cb1,cb2); only one through an SSH tunnel",
+};
+const PORT_PLACEHOLDERS: Partial<Record<Engine, string>> = { couchbase: "8093 (18093 with TLS)" };
+const DATABASE_LABELS: Partial<Record<Engine, string>> = { couchbase: "Default query context" };
+const DATABASE_PLACEHOLDERS: Partial<Record<Engine, string>> = { couchbase: "bucket or bucket.scope" };
+const DATABASE_HINTS: Partial<Record<Engine, string>> = {
+  couchbase: "A bucket alone whose name holds a dot goes in back-ticks: `my.bucket`",
+};
+const OPTIONS_HINTS: Partial<Record<Engine, string>> = { couchbase: "manager_port=8091, discover_nodes=false" };
 const SSL_FILE_FIELDS = [
   { field: "ca_file", label: "CA file" },
   { field: "cert_file", label: "Client cert" },
@@ -103,9 +130,17 @@ function emptyDraft(engine: Engine): ProfileDraft {
     database: null,
     username: null,
     options: {},
-    ssl: DEFAULT_SSL,
+    ssl: { ...DEFAULT_SSL, mode: DEFAULT_SSL_MODES[engine] ?? DEFAULT_SSL.mode },
     ssh: DEFAULT_SSH,
   };
+}
+
+/** The host (or each host of a list) is not this machine: the password would travel the network. */
+function hasRemoteHost(host: string): boolean {
+  return host
+    .split(",")
+    .map((name) => name.trim().toLowerCase())
+    .some((name) => name !== "" && !LOOPBACK_HOSTS.has(name));
 }
 
 function toDraft(entry: ProfileEntry): ProfileDraft {
@@ -234,6 +269,14 @@ function ConnectionDialogBody({
   const sslFileFields = SSL_FILE_FIELDS.filter(
     ({ field }) => field === "ca_file" || !CA_FILE_ONLY_ENGINES.includes(draft.engine),
   );
+  // Couchbase authenticates with HTTP Basic: without TLS (and without an SSH tunnel) a remote cluster sees the
+  // password in clear text.
+  const plainTextPassword =
+    draft.engine === "couchbase" &&
+    (ssl.mode === "disable" || ssl.mode === "prefer") &&
+    !ssh.enabled &&
+    !!server &&
+    hasRemoteHost(server.host);
 
   const patchCommon = (changes: Partial<Pick<ServerProfileDraft, CommonField>>) =>
     setDraft((d) => ({ ...d, ...changes }));
@@ -354,18 +397,22 @@ function ConnectionDialogBody({
         </FieldRow>
         {server ? (
           <>
-            <FieldRow label="Host">
+            <FieldRow label="Host" hint={HOST_HINTS[draft.engine]}>
               <div className="flex gap-2">
                 <Input value={server.host} onChange={(e) => patchServer({ host: e.target.value })} />
                 <PortInput
-                  placeholder={String(engineInfo?.default_port ?? "")}
+                  placeholder={PORT_PLACEHOLDERS[draft.engine] ?? String(engineInfo?.default_port ?? "")}
                   value={server.port}
                   onValue={(port) => patchServer({ port })}
                 />
               </div>
             </FieldRow>
-            <FieldRow label="Database">
-              <NullableInput value={server.database} onValue={(database) => patchServer({ database })} />
+            <FieldRow label={DATABASE_LABELS[draft.engine] ?? "Database"} hint={DATABASE_HINTS[draft.engine]}>
+              <NullableInput
+                placeholder={DATABASE_PLACEHOLDERS[draft.engine]}
+                value={server.database}
+                onValue={(database) => patchServer({ database })}
+              />
             </FieldRow>
             <FieldRow label="User">
               <NullableInput value={server.username} onValue={(username) => patchServer({ username })} />
@@ -414,7 +461,7 @@ function ConnectionDialogBody({
       </TabPanel>
 
       <TabPanel value="ssl" current={tab}>
-        <FieldRow label="Mode" hint={SSL_MODE_HINTS[draft.engine]}>
+        <FieldRow label="Mode" hint={plainTextPassword ? PLAIN_TEXT_NOTE : SSL_MODE_HINTS[draft.engine]}>
           <Select value={ssl.mode} onChange={(e) => patchSsl({ mode: e.target.value as SslConfig["mode"] })}>
             {SSL_MODES.map((mode) => (
               <option key={mode} value={mode}>
@@ -473,7 +520,7 @@ function ConnectionDialogBody({
       </TabPanel>
 
       <TabPanel value="advanced" current={tab}>
-        <FieldRow label="Options" hint="One key=value per line, passed to the driver">
+        <FieldRow label="Options" hint={OPTIONS_HINTS[draft.engine] ?? "One key=value per line, passed to the driver"}>
           <Textarea className="h-32 font-mono text-[12px]" value={optionsText} onChange={(e) => setOptionsText(e.target.value)} />
         </FieldRow>
       </TabPanel>

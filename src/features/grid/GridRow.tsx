@@ -44,7 +44,9 @@ const GridCell = memo(function GridCell({ value, category, selected, id, ...colu
       style={columnStyle(column)}
       title={cell.title}
     >
-      <span className={cn("truncate", cell.kind === "null" && "italic text-muted")}>{cell.text}</span>
+      <span className={cn("truncate", (cell.kind === "null" || cell.kind === "missing") && "italic text-muted")}>
+        {cell.text}
+      </span>
       {cell.detail && <span className="shrink-0 whitespace-pre text-muted">{cell.detail}</span>}
     </div>
   );

@@ -1,10 +1,13 @@
 import {
+  Boxes,
   Braces,
   CalendarClock,
   Columns3,
   CornerDownRight,
+  Cylinder,
   Database,
   Eye,
+  Files,
   Folder,
   FunctionSquare,
   Hash,
@@ -23,6 +26,9 @@ import {
 const KIND_ICONS: Record<string, LucideIcon> = {
   database: Database,
   schema: Braces,
+  bucket: Cylinder,
+  scope: Boxes,
+  collection: Files,
   table: Table2,
   partition: Split,
   view: Eye,
@@ -74,6 +80,9 @@ const FOLDER_LABELS: Record<string, string> = {
 const KIND_LABELS: Record<string, string> = {
   database: "Database",
   schema: "Schema",
+  bucket: "Bucket",
+  scope: "Scope",
+  collection: "Collection",
   table: "Table",
   partition: "Partition",
   view: "View",
@@ -90,6 +99,19 @@ const KIND_LABELS: Record<string, string> = {
   column: "Column",
 };
 
+/**
+ * Said under an expanded node of this kind that lists nothing, where "nothing" can also mean "not allowed to see".
+ * A Couchbase user without the privilege to list indexes gets an empty list, which reads as "no indexes" otherwise
+ * (`text` is the row, `title` its tooltip).
+ */
+const EMPTY_HINTS: Record<string, { text: string; title: string }> = {
+  collection: {
+    text: "No indexes shown (may need query_system_catalog)",
+    title:
+      "No indexes are listed. Listing indexes needs the query_system_catalog privilege (or an admin): with a more limited role they stay hidden even when they exist.",
+  },
+};
+
 /** Icon for an object kind; for `folder` nodes pass the folder name to get the icon of its contents. */
 export function kindIcon(kind: string, folderName?: string): LucideIcon {
   if (kind === "folder") return (folderName && FOLDER_ICONS[folderName]) || Folder;
@@ -100,4 +122,7 @@ export function folderLabel(name: string): string {
 }
 export function kindLabel(kind: string): string {
   return KIND_LABELS[kind] ?? kind;
+}
+export function emptyChildrenHint(kind: string): { text: string; title: string } | undefined {
+  return EMPTY_HINTS[kind];
 }

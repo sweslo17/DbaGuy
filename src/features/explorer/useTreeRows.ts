@@ -3,12 +3,15 @@ import { useMemo } from "react";
 import { api, ApiError, errorMessage, unwrap } from "@/lib/api/client";
 import { pathKey, type ObjectNode, type PathSegment, type ProfileEntry } from "@/lib/api/types";
 import { buildFolderTree, type FolderNode } from "../connections/folders";
+import { emptyChildrenHint } from "./kinds";
 
 export type TreeRow =
   | { type: "folder"; key: string; name: string; depth: number }
   | { type: "profile"; key: string; entry: ProfileEntry; depth: number }
   | { type: "node"; key: string; profileId: string; node: ObjectNode; depth: number }
   | { type: "loading"; key: string; depth: number }
+  /** An expanded node that lists nothing, where that can also mean "not allowed to see" (`emptyChildrenHint`). */
+  | { type: "hint"; key: string; depth: number; text: string; title: string }
   | {
       type: "error";
       key: string;
@@ -58,7 +61,7 @@ export function useTreeRows(
   return useMemo(() => {
     const byKey = new Map(targets.map(([key], i) => [key, results[i]]));
     const rows: TreeRow[] = [];
-    const pushChildren = (profileId: string, ownerKey: string, depth: number) => {
+    const pushChildren = (profileId: string, ownerKey: string, depth: number, owner?: ObjectNode) => {
       const result = byKey.get(ownerKey);
       if (!result || result.isPending) {
         rows.push({ type: "loading", key: `${ownerKey}#loading`, depth });
@@ -78,10 +81,12 @@ export function useTreeRows(
         });
         return;
       }
+      const hint = result.data?.length === 0 && owner ? emptyChildrenHint(owner.kind) : undefined;
+      if (hint) rows.push({ type: "hint", key: `${ownerKey}#empty`, depth, ...hint });
       for (const node of result.data ?? []) {
         const key = nodeKey(profileId, node.path);
         rows.push({ type: "node", key, profileId, node, depth });
-        if (node.has_children && expanded.has(key)) pushChildren(profileId, key, depth + 1);
+        if (node.has_children && expanded.has(key)) pushChildren(profileId, key, depth + 1, node);
       }
     };
     const walk = (folder: FolderNode, depth: number) => {

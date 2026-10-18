@@ -20,7 +20,7 @@ import type { ColumnMeta, Dialect } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { aggregate } from "./aggregate";
 import { columnSignature, HEADER_HEIGHT, ROW_HEIGHT } from "./columns";
-import { copyDefault, copySelection, type CopyFormat, type CopyInput } from "./copy";
+import { copyDefault, copyFormatsFor, copySelection, type CopyFormat, type CopyInput } from "./copy";
 import { GridDrawerPanel, type GridDrawer } from "./GridDrawer";
 import { GridHeader, type GridSort } from "./GridHeader";
 import { GridMenu } from "./GridMenu";
@@ -60,7 +60,7 @@ export interface DataGridProps {
    * delivers its first page (`useHeldResult`); nothing more is loaded for them.
    */
   stale?: boolean;
-  /** Dialect of the copy formats that need one (INSERT, IN list); null while unknown, and those copies refuse. */
+  /** Dialect of the copy formats that need one (INSERT, IN list), and of the formats offered; null while unknown. */
   dialect: Dialect | null;
   /** INSERT copies target this table (table data); else a `table_name` placeholder. */
   tableName?: { schema: string | null; name: string } | null;
@@ -321,6 +321,7 @@ export function DataGrid(props: DataGridProps) {
                 pinnedCount={layout.pinnedCount}
                 copyDefault={copyDefaultSelection}
                 copy={copy}
+                copyFormats={copyFormatsFor(dialect)}
                 pin={layout.pin}
                 openValue={openAt(openValue)}
                 openRecord={openAt(openRecord)}

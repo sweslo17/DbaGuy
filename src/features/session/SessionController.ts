@@ -4,6 +4,7 @@ import { SessionSocket, type SocketStatus } from "@/lib/api/session-socket";
 import type {
   ClientCommand,
   FormatKind,
+  QueryContext,
   RowFormatOptions,
   ServerEvent,
   SessionInfo,
@@ -45,6 +46,11 @@ export interface ExecuteOptions {
   timeoutS?: number | null;
   confirmed?: boolean;
   history?: boolean;
+  /**
+   * The Couchbase query context the statement runs in. Undefined: the session's default context
+   * (`info.server.default_query_context`); null: none. A tab's own choice goes through here.
+   */
+  queryContext?: QueryContext | null;
 }
 
 export interface SessionControllerOptions {
@@ -154,6 +160,7 @@ export class SessionController {
       confirmed: options.confirmed ?? false,
       timeout_s: options.timeoutS ?? null,
       history: options.history ?? true,
+      query_context: options.queryContext !== undefined ? options.queryContext : this.defaultQueryContext(),
       profile_plan: false,
     });
   }
@@ -189,7 +196,20 @@ export class SessionController {
 
   /** Runs `sql` again and writes its whole result to `path` on the backend; `progressRows` reports the rows written. */
   exportResult(sql: string, format: FormatKind, path: string, options: RowFormatOptions): string {
-    return this.track("export", sql, { type: "export", request_id: crypto.randomUUID(), sql, format, path, options });
+    return this.track("export", sql, {
+      type: "export",
+      request_id: crypto.randomUUID(),
+      sql,
+      format,
+      path,
+      options,
+      query_context: this.defaultQueryContext(),
+    });
+  }
+
+  /** The context a request runs in unless the tab chose one: the profile's default (Couchbase), else none. */
+  private defaultQueryContext(): QueryContext | null {
+    return this.store.getState().info?.server.default_query_context ?? null;
   }
 
   /** Drops a request's state (and its rows) from the store; later events for it are ignored. */

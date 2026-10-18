@@ -9,7 +9,7 @@ import { markEdited, readEditorBuffer, registerEditor, rememberEditorBuffer } fr
 import { useAppSettings } from "@/stores/settings";
 import { useReportTabStatus } from "@/stores/tabStatus";
 import { startSelection, useWorkspace, type QueryTabState } from "@/stores/workspace";
-import { useDialect, useProfiles } from "../connections/hooks";
+import { useEngineInfo, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
 import { CodeEditor, type CodeEditorHandle } from "../editor/CodeEditor";
 import { sqlCompletion, type CompletionTarget } from "../editor/completion";
@@ -51,7 +51,10 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   const [shown, setShown] = useState(active);
   if (active && !shown) setShown(true);
   const { controller, snapshot, retry } = useSession(tab.profileId, tab.database, { enabled: shown });
-  const dialect = useDialect(tab.profileId);
+  const engine = useEngineInfo(tab.profileId);
+  const dialect = engine?.dialect ?? null;
+  /** Whether the engine has transactions; undefined while the engines load. Couchbase has none (spec §3.7.5). */
+  const transactions = engine?.transactions;
   const profiles = useProfiles();
   const updateTab = useWorkspace((s) => s.updateTab);
   const editor = useRef<CodeEditorHandle>(null);
@@ -99,8 +102,8 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   const checking = splitting || runner.checking;
   const sessionBusy = busy(snapshot);
   // Nothing runs before the session has reported its state and taken the tab's auto-commit mode: a statement sent
-  // earlier would run in the wrong mode.
-  const modeApplied = !!snapshot?.state && snapshot.state.autocommit === tab.autocommit;
+  // earlier would run in the wrong mode. An engine without transactions has no mode to wait for.
+  const modeApplied = !!snapshot?.state && (transactions === false || snapshot.state.autocommit === tab.autocommit);
   const canRun = !!controller && phase === "open" && modeApplied && dialect !== null && !sessionBusy && !running;
   const runBlockedReason =
     tab.profileId === null
@@ -117,6 +120,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     controller,
     snapshot,
     autocommit: tab.autocommit,
+    transactions,
     subject,
   });
   const inTransaction = !!snapshot?.state?.inTransaction;
@@ -191,12 +195,12 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     runAll: { enabled: canRun, run: () => void start("all") },
     format: { enabled: true, run: format },
     toggleAutocommit: {
-      enabled: !autocommitBlockedReason,
+      enabled: transactions !== false && !autocommitBlockedReason,
       checked: tab.autocommit,
       run: () => transaction.setAutocommit(!tab.autocommit),
     },
-    commit: { enabled: canEnd, run: transaction.commit },
-    rollback: { enabled: canEnd, run: transaction.rollback },
+    commit: { enabled: transactions !== false && canEnd, run: transaction.commit },
+    rollback: { enabled: transactions !== false && canEnd, run: transaction.rollback },
   });
 
   // The editor's keymap is built once: it calls the latest `start`, `format` and script commands through refs.
@@ -306,6 +310,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
         onRun={() => void start("default")}
         onRunAll={() => void start("all")}
         onCancel={cancel}
+        showTransactions={transactions !== false}
         autocommit={tab.autocommit}
         autocommitBlockedReason={autocommitBlockedReason}
         onAutocommitChange={transaction.setAutocommit}

@@ -51,6 +51,8 @@ export interface QueryToolbarProps {
   onRun: () => void;
   onRunAll: () => void;
   onCancel: () => void;
+  /** The engine has transactions: without them (Couchbase) auto-commit, Commit, Rollback and the badge are not shown. */
+  showTransactions: boolean;
   /** The tab's desired auto-commit mode. */
   autocommit: boolean;
   /** Why the mode cannot change now (an open transaction, a running statement); the toggle is disabled with it. */
@@ -204,32 +206,36 @@ export function QueryToolbar(props: QueryToolbarProps) {
         <Label>Cancel</Label>
       </Button>
       <TimeoutField {...props.timeout} />
-      <div className="mx-1 h-4 w-px shrink-0 bg-border" />
-      <AutocommitToggle
-        checked={props.autocommit}
-        disabledReason={props.autocommitBlockedReason}
-        onChange={props.onAutocommitChange}
-      />
-      <Button
-        size="sm"
-        className={FIXED}
-        onClick={props.onCommit}
-        disabled={!props.canEnd}
-        title={endReason ?? "Commit the transaction"}
-      >
-        <Check size={12} />
-        <Label>Commit</Label>
-      </Button>
-      <Button
-        size="sm"
-        className={FIXED}
-        onClick={props.onRollback}
-        disabled={!props.canEnd}
-        title={endReason ?? "Roll back the transaction"}
-      >
-        <Undo2 size={12} />
-        <Label>Rollback</Label>
-      </Button>
+      {props.showTransactions && (
+        <>
+          <div className="mx-1 h-4 w-px shrink-0 bg-border" />
+          <AutocommitToggle
+            checked={props.autocommit}
+            disabledReason={props.autocommitBlockedReason}
+            onChange={props.onAutocommitChange}
+          />
+          <Button
+            size="sm"
+            className={FIXED}
+            onClick={props.onCommit}
+            disabled={!props.canEnd}
+            title={endReason ?? "Commit the transaction"}
+          >
+            <Check size={12} />
+            <Label>Commit</Label>
+          </Button>
+          <Button
+            size="sm"
+            className={FIXED}
+            onClick={props.onRollback}
+            disabled={!props.canEnd}
+            title={endReason ?? "Roll back the transaction"}
+          >
+            <Undo2 size={12} />
+            <Label>Rollback</Label>
+          </Button>
+        </>
+      )}
       <div className="flex-1" />
       {props.checking && (
         // Shown only if it takes a moment (a long script), so a short run does not flicker.
@@ -238,7 +244,7 @@ export function QueryToolbar(props: QueryToolbarProps) {
           <Label>Checking statements…</Label>
         </span>
       )}
-      <TransactionBadge state={state} visible={props.visible} pulse={props.pulse} />
+      {props.showTransactions && <TransactionBadge state={state} visible={props.visible} pulse={props.pulse} />}
       <ConnectionPicker {...props.connection} />
     </div>
   );

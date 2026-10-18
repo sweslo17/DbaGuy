@@ -21,7 +21,7 @@ import { nodeKeyPrefix, profileKey, useTreeRows, type Expansion, type TreeRow } 
 
 const ROW_HEIGHT = 22;
 /** Nodes that group other nodes: double-click expands them instead of opening a detail tab. */
-const CONTAINER_KINDS = new Set(["folder", "database", "schema"]);
+const CONTAINER_KINDS = new Set(["folder", "database", "schema", "bucket", "scope"]);
 
 type ErrorRow = Extract<TreeRow, { type: "error" }>;
 
@@ -288,6 +288,13 @@ export function Explorer() {
           <div className={base} style={pad}>
             <span className="w-4 shrink-0" />
             <span className="text-muted">Loading…</span>
+          </div>
+        );
+      case "hint":
+        return (
+          <div className={base} style={pad} title={row.title}>
+            <span className="w-4 shrink-0" />
+            <span className="truncate text-[12px] text-muted italic">{row.text}</span>
           </div>
         );
       case "error":

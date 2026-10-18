@@ -35,7 +35,10 @@ function RecordField({ column, value }: { column: ColumnMeta; value: unknown }) 
         className="m-0 min-w-0 border-b border-border px-3 py-1 font-mono break-words whitespace-pre-wrap"
         data-selectable
       >
-        <span className={cn(cell.kind === "null" && "text-muted italic")}>
+        <span
+          className={cn((cell.kind === "null" || cell.kind === "missing") && "text-muted italic")}
+          title={cell.kind === "missing" ? cell.title : undefined}
+        >
           {cell.text}
           {cell.clipped && "…"}
         </span>

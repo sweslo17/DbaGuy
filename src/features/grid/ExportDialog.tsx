@@ -1,5 +1,5 @@
 import { Loader2 } from "lucide-react";
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useStore } from "zustand";
 import { Button } from "@/components/ui/Button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
@@ -150,6 +150,9 @@ export function ExportDialog({
   const { controller, sql, title } = source;
   const engine = useEngineInfo(controller.profileId);
   const prefill = source.tableName ?? null;
+  // SQL++ has no INSERT by columns (it inserts a key and a document): the formats leave it out there.
+  const sqlpp = engine?.dialect === "sqlpp";
+  const formats = useMemo(() => FORMAT_ORDER.filter((kind) => kind !== "insert" || !sqlpp), [sqlpp]);
   const [format, setFormat] = useState<ExportFormat>("csv");
   const [header, setHeader] = useState(true);
   const [nullText, setNullText] = useState("");
@@ -173,6 +176,11 @@ export function ExportDialog({
   useEffect(() => {
     isOpen.current = open;
   }, [open]);
+  // The engine arrives after the dialog may have been opened (or the tab's connection changed): a format it cannot
+  // write is not kept.
+  useEffect(() => {
+    if (!formats.includes(format)) setFormat("csv");
+  }, [formats, format]);
   // After an error or a cancel the form is back: the path is what usually changes before a retry.
   useEffect(() => {
     if (outcome) pathInput.current?.focus();
@@ -309,7 +317,7 @@ export function ExportDialog({
         <div className="flex flex-col gap-2">
           <FieldRow label="Format">
             <Select value={format} onChange={(e) => changeFormat(e.target.value as ExportFormat)}>
-              {FORMAT_ORDER.map((kind) => (
+              {formats.map((kind) => (
                 <option key={kind} value={kind}>
                   {FORMATS[kind].label}
                 </option>
