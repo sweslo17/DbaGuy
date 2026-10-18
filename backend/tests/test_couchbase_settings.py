@@ -1,14 +1,19 @@
+import http.client
 import json
 import shutil
+import socket
 import ssl
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 from loguru import logger
 
 from dbaguy_backend.adapters.base import Endpoint
+from dbaguy_backend.adapters.couchbase import nodes as nodes_module
+from dbaguy_backend.adapters.couchbase.http import failure_reason
 from dbaguy_backend.adapters.couchbase.nodes import (
     DiscoveryFailed, QueryNode, candidate_nodes, discover, parse_node_services,
 )
@@ -18,7 +23,7 @@ from dbaguy_backend.adapters.couchbase.settings import (
 from dbaguy_backend.domain.errors import ConnectionFailed, ValidationFailed
 from dbaguy_backend.domain.execution import QueryContext
 from dbaguy_backend.domain.profiles import SshConfig, SslConfig
-from tests.support import COUCHBASE_PASSWORD, couchbase_ca_file, make_couchbase_profile, requires_couchbase
+from tests.support import COUCHBASE_PASSWORD, couchbase_ca_file, make_couchbase_profile, requires_couchbase, scaled
 
 AUTH = "Basic eA=="
 
@@ -105,6 +110,46 @@ def test_a_refused_url_never_repeats_its_text(url):
     assert "secret" not in refused.value.message and "h:x" not in refused.value.message
 
 
+LEAKY_URLS = [  # an unencoded `/`, `?` or `#` in a password ends the authority early: R-04a-T9a
+    "couchbase://u:12345/x@h", "couchbase://u:12345#frag@h/b", "couchbase://u:12345?x@h/b",
+    "couchbase://u:12345?Secret=abc@h/b", "couchbase://u:/x@h", "couchbase://u:a@b/c@h", "couchbase://u:12345/x\uff20h",
+    "couchbase://u:12345/x\ufe6bh", "couchbases://u:1/x@h?certpath=/ca.pem", "http://u:80/x@h:8093",
+    "couchbase://u:12345/%40@h", "couchbase://u:12345#a#b@h",
+]
+
+
+@pytest.mark.parametrize("url", LEAKY_URLS)
+def test_a_password_tail_never_lands_in_a_field_or_the_log(url):
+    pieces = ("12345", "frag", "Secret", "abc", "x@h", "a@b", "c@h", "%40")
+    seen = []
+    sink = logger.add(lambda m: seen.append(m.record["message"]), level=0)
+    try:
+        with pytest.raises(ValidationFailed) as refused:
+            parse_couchbase_url(url)
+    finally:
+        logger.remove(sink)
+    assert not any(piece in text for piece in pieces for text in (*seen, refused.value.message))
+
+
+def test_an_encoded_at_sign_in_the_path_or_query_is_fine():
+    parsed = parse_couchbase_url("couchbases://u:p@cb1/b?certpath=%2FUsers%2Fme%40corp%2Fca.pem#top")
+    assert (parsed.profile.ssl.ca_file, parsed.profile.database, parsed.password) == ("/Users/me@corp/ca.pem", "b", "p")
+
+
+@pytest.mark.parametrize("url", ["couchbase://h:/b", "couchbase://[::1]:/b", "http://h:", "couchbase://a,h:/b"])
+def test_an_empty_port_is_refused(url):
+    with pytest.raises(ValidationFailed):
+        parse_couchbase_url(url)
+
+
+@pytest.mark.parametrize("url, port", [
+    ("http://h:8091", None), ("https://h:18091/b", None), ("http://h:8093", 8093), ("https://h:18093", 18093),
+    ("http://h:9000", 9000), ("couchbase://h:8091", None),
+])
+def test_a_web_console_port_is_not_a_query_port(url, port):
+    assert parse_couchbase_url(url).profile.port == port
+
+
 def test_seed_hosts():
     assert seed_hosts(" cb1, cb2 ") == ["cb1", "cb2"]
     assert seed_hosts("[::1],cb2") == ["::1", "cb2"]
@@ -159,6 +204,23 @@ def test_a_tls_file_error_names_the_file_kind_never_the_path(tmp_path):
         messages.append(failed.value.message)
     assert not any("secret-dir-name" in m for m in messages)
     assert "CA" in messages[0] and "CA" in messages[1] and "client" in messages[2]
+
+
+@pytest.mark.parametrize("config", [
+    SslConfig(mode="verify-ca", ca_file="\x00"), SslConfig(mode="verify-ca", ca_file="~\x00"),
+    SslConfig(mode="require", cert_file="\x00", key_file="/tmp/k.pem"),
+    SslConfig(mode="require", cert_file="/tmp/c.pem", key_file="\x00"),
+])
+def test_a_file_name_with_a_null_byte_is_a_connection_failure(config):  # `?certpath=%00` in an imported URL
+    with pytest.raises(ConnectionFailed) as refused:
+        tls_context(config)
+    assert "null" not in refused.value.message and "not valid" in refused.value.message
+
+
+def test_a_certpath_with_a_null_byte_survives_import_and_fails_at_connect():
+    parsed = parse_couchbase_url("couchbases://u@h?certpath=%00")
+    with pytest.raises(ConnectionFailed, match="CA file"):
+        tls_context(parsed.profile.ssl)
 
 
 def test_a_client_key_with_a_passphrase_is_refused_without_a_prompt(tmp_path):
@@ -336,6 +398,40 @@ def test_a_map_without_a_query_service_gives_no_nodes():
     assert parse_node_services({"nodesExt": []}, "a", tls=False) == []
 
 
+@pytest.mark.parametrize("host", [
+    "[]", " ", "a\r\nHost: evil", "u:p@evil/x", "x" * 100_000, "a b", "\u00e9", "a/b", "a?b", "a#b", "[a]b", "x" * 254,
+])
+def test_a_discovered_host_that_is_no_host_name_is_dropped(host):
+    entries = [{"services": {"n1ql": 8093}, "hostname": host}, {"services": {"n1ql": 8093}, "hostname": "good"}]
+    assert parse_node_services({"nodesExt": entries}, "seed", tls=False) == [QueryNode("good", 8093)]
+
+
+def test_a_hostile_external_hostname_is_dropped_too():
+    body = {"nodesExt": [
+        {"services": {"n1ql": 8093}, "hostname": "10.0.0.1", "thisNode": True,
+         "alternateAddresses": {"external": {"hostname": "ext1"}}},
+        {"services": {"n1ql": 8093}, "hostname": "10.0.0.2",
+         "alternateAddresses": {"external": {"hostname": "evil\r\nHost: x"}}},
+    ]}
+    # the other node cannot be reached from outside under its internal name either
+    assert parse_node_services(body, "ext1", tls=False) == [QueryNode("ext1", 8093)]
+
+
+@pytest.mark.parametrize("host", ["a", "a.b-c_d.example", "fd00::1", "[fd00::1]", "fe80::1%en0", "10.0.0.1", "x" * 253])
+def test_host_names_and_addresses_are_kept(host):
+    nodes = parse_node_services({"nodesExt": [{"services": {"n1ql": 8093}, "hostname": host}]}, "seed", tls=False)
+    assert nodes == [QueryNode(host[1:-1] if host.startswith("[") else host, 8093)]
+
+
+def test_duplicates_are_listed_once_and_the_list_is_capped():
+    same = {"nodesExt": [{"services": {"n1ql": 8093}, "hostname": "dup"}] * 25_000}
+    assert parse_node_services(same, "seed", tls=False) == [QueryNode("dup", 8093)]
+    many = [{"services": {"n1ql": 8093}, "hostname": f"n{i}"} for i in range(25_000)]
+    many[20_000] = {**many[20_000], "thisNode": True}
+    nodes = parse_node_services({"nodesExt": many}, "seed", tls=False)
+    assert len(nodes) == 64 and nodes[0] == QueryNode("n20000", 8093) and nodes[1] == QueryNode("n0", 8093)
+
+
 def test_discovery_tries_each_seed_then_reports():
     def fetch(host, port):
         if host == "a":
@@ -450,6 +546,123 @@ def test_the_default_fetch_does_not_read_an_endless_answer(manager):
     manager.answer = (200, b" " * (2 * 1024 * 1024))
     nodes, reason = discover(["127.0.0.1"], manager.server_address[1], tls=None, auth=AUTH)
     assert nodes == [] and "too large" in reason
+
+
+def _http(body: bytes, head: bytes = b"") -> bytes:
+    return b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n%s\r\n" % (len(body), head) + body
+
+
+@pytest.fixture
+def raw_server():
+    """`start(serve)` answers each connection with `serve(conn)` (after its request) on a loopback port."""
+    servers = []
+
+    def run(serve, conn):
+        with conn:
+            try:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        return
+                    data += chunk
+                serve(conn)
+            except OSError:  # the client gave up
+                pass
+
+    def start(serve):
+        server = socket.create_server(("127.0.0.1", 0))
+        servers.append(server)
+
+        def accept():
+            while True:
+                try:
+                    conn, _ = server.accept()
+                except OSError:
+                    return
+                threading.Thread(target=run, args=(serve, conn), daemon=True).start()
+
+        threading.Thread(target=accept, daemon=True).start()
+        return server.getsockname()[1]
+
+    yield start
+    for server in servers:
+        server.close()
+
+
+def _drip(payload: bytes, pause: float = 0.05, whole_head: bool = False):
+    def serve(conn):
+        start = payload.index(b"\r\n\r\n") + 4 if whole_head else 0
+        conn.sendall(payload[:start])
+        for i in range(start, len(payload)):
+            conn.sendall(payload[i:i + 1])
+            time.sleep(pause)
+
+    return serve
+
+
+SERVICES_BODY = json.dumps(SERVICES).encode()
+
+
+@pytest.mark.parametrize("serve", [
+    _drip(_http(SERVICES_BODY)),  # the status line and headers arrive a byte at a time
+    _drip(_http(SERVICES_BODY), whole_head=True),  # then the body does
+    lambda conn: time.sleep(5),  # nothing at all
+], ids=["drip-head", "drip-body", "silent"])
+def test_the_default_fetch_stops_at_one_deadline_for_the_whole_answer(raw_server, monkeypatch, serve):
+    monkeypatch.setattr(nodes_module, "DISCOVERY_TIMEOUT_S", 0.5)  # the drip would take 12 s: a timeout per read is no bound
+    port = raw_server(serve)
+    started = time.monotonic()
+    assert discover(["127.0.0.1"], port, tls=None, auth=AUTH) == ([], "127.0.0.1: timed out")
+    assert time.monotonic() - started < scaled(2.0)
+
+
+def test_the_default_fetch_reads_a_chunked_answer(raw_server):
+    half = len(SERVICES_BODY) // 2
+    payload = (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+               + b"%x\r\n%s\r\n%x\r\n%s\r\n0\r\n\r\n" % (half, SERVICES_BODY[:half], len(SERVICES_BODY) - half,
+                                                          SERVICES_BODY[half:]))
+    port = raw_server(lambda conn: conn.sendall(payload))
+    assert discover(["127.0.0.1"], port, tls=None, auth=AUTH) == ([QueryNode("127.0.0.1", 8093), QueryNode("q2", 8093)], None)
+
+
+@pytest.mark.parametrize("payload, reason", [
+    (b"HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n{\"nodesExt\"", "cut short"),
+    (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{\"nod", "IncompleteRead"),
+    (b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n", "HTTP 503"),
+    (b"", "without response"),
+])
+def test_the_default_fetch_reports_an_answer_that_is_cut_or_refused(raw_server, payload, reason):
+    port = raw_server(lambda conn: conn.sendall(payload))
+    nodes, why = discover(["127.0.0.1"], port, tls=None, auth=AUTH)
+    assert nodes == [] and reason in why
+
+
+def test_a_hostile_status_line_never_reaches_the_reason(raw_server):
+    port = raw_server(lambda conn: conn.sendall(b"garbage-line\r\nInjected: evil\r\n\r\n"))
+    nodes, why = discover(["127.0.0.1"], port, tls=None, auth=AUTH)
+    assert nodes == [] and "garbage" not in why and "evil" not in why and "\n" not in why
+
+
+@pytest.mark.parametrize("host", ["a\r\nHost: evil", "u:p@evil/x", "a b", ""])
+def test_the_default_fetch_refuses_a_seed_that_is_no_host_name(host):
+    nodes, why = discover([host], 8091, tls=None, auth=AUTH)
+    assert (nodes, why) == ([], "(invalid host): invalid host name")
+
+
+@pytest.mark.parametrize("error, shown", [
+    (http.client.BadStatusLine("HTTP/1.1 200\r\nInjected: evil"), "the server's answer is not valid HTTP"),
+    (http.client.UnknownProtocol("HTTP/9.9\r\nevil"), "the server speaks an unknown HTTP version"),
+    (http.client.InvalidURL("nonnumeric port: 'evil'"), "invalid host name"),
+    (http.client.LineTooLong("header line"), "got more than 65536 bytes when reading header line"),
+    (http.client.RemoteDisconnected("Remote end closed connection without response"),
+     "Remote end closed connection without response"),
+    (http.client.IncompleteRead(b"ab", 5), "IncompleteRead(2 bytes read, 5 more expected)"),
+    (OSError("a\r\nb\x1b[31m" + "x" * 1000), "a b [31m" + "x" * 192),
+    (ValueError(""), "ValueError"),
+])
+def test_a_failure_reason_is_one_short_line_and_names_no_hostile_text(error, shown):
+    assert failure_reason(error) == shown
 
 
 @requires_couchbase

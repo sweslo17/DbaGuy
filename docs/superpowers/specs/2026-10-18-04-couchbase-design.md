@@ -405,17 +405,18 @@ sqlglot 沒有 N1QL／SQL++ 方言（〔實測〕30.23.0 為最新）。SQLPP �
 |---|---|
 | `couchbase://h1,h2[:port][/bucket][?…]` | host `h1,h2`；**port 一律不用**（couchbase:// 的 port 是 KV 11210 或舊的 8091，不是 query port）→ None；ssl `disable` |
 | `couchbases://h…` | 同上；ssl `verify-full` |
-| `http://h:8093`、`https://h:18093` | host、port 照用；ssl `disable`／`verify-full` |
+| `http://h:8093`、`https://h:18093` | host、port 照用（8091／18091 是 Web 管理介面，貼上來的 console URL 不是 query port → 丟掉，None）；ssl `disable`／`verify-full` |
 | 路徑 `/bucket[.scope]` | `database`（預設 context） |
 | `user:pass@` | username／password（解碼） |
 | `?certpath=`、`?truststorepath=` | `ssl.ca_file` |
 | `?ssl=no_verify` | ssl `require` |
-| 其他參數 | 丟掉，WARNING 只記鍵名（訊息永遠是固定文字，不回顯 URL：authority 裡有密碼，同 MySQL） |
+| 其他參數 | 丟掉，WARNING 只記鍵名（不是單純名稱的鍵記成 `(unnamed)`；訊息永遠是固定文字，不回顯 URL：authority 裡有密碼，同 MySQL） |
+| 拒絕 | 冒號後沒有 port；路徑、query、fragment 在 NFKC 正規化後含 `@`（R-04a-T9a：密碼裡未編碼的 `/`、`?`、`#` 會讓 authority 提早結束，密碼尾巴會跑進 database 或被記進 log；certpath 裡的 `@` 請以 `%40` 編碼） |
 
 #### 3.6.3 節點探索與失效轉移
 
 1. 不探索的情況：SSH 開啟、port 非預設、`discover_nodes=false`。→ 候選＝seed 清單，各用 query port。
-2. 探索：依序對每個 seed 的 manager port 送 `GET /pools/default/nodeServices`（Basic auth、`DISCOVERY_TIMEOUT_S = 3`），第一個成功的回應即可。〔實測〕受限使用者可用，匿名 401（調查 §10）。`nodesExt[]` 裡有 `n1ql`（TLS 時 `n1qlSSL`）的就是 query node。
+2. 探索：依序對每個 seed 的 manager port 送 `GET /pools/default/nodeServices`（Basic auth、`DISCOVERY_TIMEOUT_S = 3`，是整個交換（連線、TLS、回應）共用的期限，不是每次 read），第一個成功的回應即可；回應最多 1 MiB。〔實測〕受限使用者可用，匿名 401（調查 §10）。`nodesExt[]` 裡有 `n1ql`（TLS 時 `n1qlSSL`）的就是 query node；node 的 host 只收 `[A-Za-z0-9._:%-]{1,253}`（網路來的資料，不收的整筆丟掉），去重，最多 64 個（R-04a-T9b）。
    - 候選順序：被問的那個 seed 自己（若有 query service），其餘依清單順序。
    - 沒有 `hostname` 的條目＝被問的那個 node **〔未實測，A8〕**；`alternateAddresses.external`：seed host 等於某 node 的 external hostname 時，全部改用 external hostname 與 ports（SDK 的 network=auto 規則）**〔未實測，A8〕**。
    - 探索失敗（連不上、401、逾時、JSON 不對）→ 候選＝seed 清單，INFO 記原因。

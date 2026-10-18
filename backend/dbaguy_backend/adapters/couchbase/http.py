@@ -108,15 +108,29 @@ _STALE = (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError,
 _FAILURES = (http.client.HTTPException, OSError, ValueError)  # ssl.SSLError is an OSError
 
 
+# http.client errors whose text repeats what the peer sent (the status line, the protocol version) or the host: the
+# exact types only, because RemoteDisconnected is also a BadStatusLine and its text is fixed.
+_PEER_TEXT_ERRORS: dict[type[BaseException], str] = {
+    http.client.BadStatusLine: "the server's answer is not valid HTTP",
+    http.client.UnknownProtocol: "the server speaks an unknown HTTP version",
+    http.client.InvalidURL: "invalid host name",
+}
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+_REASON_LIMIT = 200
+
+
 def failure_reason(exc: BaseException) -> str:
-    """A short reason a connection failed, for messages and logs (never the request or credentials)."""
+    """A short reason a connection failed, for messages and logs (never the request or credentials). One line of at most
+    _REASON_LIMIT characters, and never text the peer chose: a hostile node's status line must not reach the log."""
     if isinstance(exc, ConnectionRefusedError):
         return "refused"
     if isinstance(exc, TimeoutError):
         return "timed out"
     if isinstance(exc, socket.gaierror):
         return "unknown host"
-    return str(exc) or type(exc).__name__
+    if fixed := _PEER_TEXT_ERRORS.get(type(exc)):
+        return fixed
+    return _CONTROL_CHARS.sub(" ", str(exc)).strip()[:_REASON_LIMIT] or type(exc).__name__
 
 
 def _endpoint_label(host: str, port: int) -> str:

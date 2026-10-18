@@ -7,6 +7,7 @@ refuses `[::1]`, and the HTTP layer adds the brackets to a label or a Host heade
 import os
 import re
 import ssl
+import unicodedata
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -34,8 +35,9 @@ _KNOWN_OPTIONS = (_PORT_OPTION, _DISCOVER_OPTION)
 _CA_KEYS = frozenset({"certpath", "truststorepath"})
 _PORT_TEXT = re.compile(r"[0-9]{1,5}")  # ASCII digits only: str.isdigit() takes "²", int() takes fullwidth digits
 _PLAIN_KEY = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # a URL parameter key that is safe to name in the log
-# The authority (up to the first `/`, `?` or `#`), the path, the query; the fragment is dropped.
-_URL_PARTS = re.compile(r"([^/?#]*)([^?#]*)(?:\?([^#]*))?")
+# The authority (up to the first `/`, `?` or `#`), the path, the query and the fragment.
+_URL_PARTS = re.compile(r"([^/?#]*)([^?#]*)(?:\?([^#]*))?(?:#(.*))?", re.DOTALL)
+_WEB_CONSOLE_PORTS = frozenset({MANAGER_PORT, MANAGER_TLS_PORT})  # a pasted http://host:8091/ui URL: not a query port
 _URL_START = ", ".join(f"{scheme}://" for scheme in URL_SCHEMES)
 
 
@@ -76,10 +78,13 @@ def _no_passphrase() -> bytes:
 
 @contextmanager
 def _reading(what: str, hint: str = "") -> Iterator[None]:
-    """A file-reading step whose failure names the kind of file (never the path) and what the system or OpenSSL said."""
+    """A file-reading step whose failure names the kind of file (never the path) and what the system or OpenSSL said.
+    A ValueError is a file name Python refuses (a NUL byte, e.g. from an imported `?certpath=%00`)."""
     try:
         yield
-    except (OSError, ssl.SSLError) as exc:
+    except ValueError as exc:  # before OSError: ssl.SSLError is an OSError, a ValueError is not
+        raise ConnectionFailed(f"Could not read the {what}: the file name is not valid") from exc
+    except OSError as exc:
         reason = exc.strerror or str(exc) or type(exc).__name__
         raise ConnectionFailed(f"Could not read the {what}: {reason}{f' ({hint})' if hint else ''}") from exc
 
@@ -91,8 +96,8 @@ def tls_context(config: SslConfig) -> ssl.SSLContext | None:
         return None
     if bool(config.cert_file) != bool(config.key_file):
         raise ConnectionFailed("Give both a client certificate and its key, or neither")
-    cafile = os.path.expanduser(config.ca_file) if config.ca_file and config.mode != "require" else None
     with _reading("CA file"):
+        cafile = os.path.expanduser(config.ca_file) if config.ca_file and config.mode != "require" else None
         context = ssl.create_default_context(cafile=cafile)
     if config.mode != "verify-full":
         context.check_hostname = False
@@ -205,16 +210,18 @@ def connection_settings(profile: ServerProfile, endpoint: Endpoint, database: st
 
 
 def _host_and_port(item: str) -> tuple[str, int | None]:
-    """`host`, `host:port`, `[v6]` or `[v6]:port`. Every refusal is fixed text: the URL holds a password."""
+    """`host`, `host:port`, `[v6]` or `[v6]:port`. Every refusal is fixed text: the URL holds a password. A colon
+    needs a port after it: a password that holds a `/` ends the authority early and leaves `user:` or `user:123`."""
     if item.startswith("["):
         close = item.find("]")
         rest = item[close + 1:]
         if close < 0 or (rest and not rest.startswith(":")):
             raise ValidationFailed(MALFORMED_URL_MESSAGE)
-        host, port_text = item[1:close], rest[1:]
+        host, has_port, port_text = item[1:close], bool(rest), rest[1:]
     else:
-        host, _, port_text = item.partition(":")  # an IPv6 address without brackets leaves a "port" that is no number
-    if not port_text:
+        host, colon, port_text = item.partition(":")  # an IPv6 address without brackets leaves a "port" that is no number
+        has_port = bool(colon)
+    if not has_port:
         return host, None
     if not _PORT_TEXT.fullmatch(port_text):
         raise ValidationFailed(MALFORMED_URL_MESSAGE)
@@ -236,7 +243,12 @@ def parse_couchbase_url(url: str) -> ParsedUrl:
     scheme = scheme.lower()
     if not separator or scheme not in URL_SCHEMES:
         raise ValidationFailed(f"A Couchbase URL starts with one of {_URL_START}")
-    authority, path, query = _URL_PARTS.match(rest).groups()
+    authority, path, query, fragment = _URL_PARTS.match(rest).groups()
+    # R-04a-T9a: a password with an unencoded `/`, `?` or `#` ends the authority early, so the rest of it, up to the `@`
+    # before the real host, would land in the database, a parameter name (logged) or nowhere. A bucket, a scope or a
+    # parameter never holds `@` (percent-encode one in a certpath); NFKC also catches a fullwidth or small `@`.
+    if "@" in unicodedata.normalize("NFKC", path + (query or "") + (fragment or "")):
+        raise ValidationFailed(MALFORMED_URL_MESSAGE)
     userinfo, _, hosts = authority.rpartition("@")
     username, _, password = userinfo.partition(":")
     items = [_host_and_port(item.strip()) for item in hosts.split(",")]
@@ -266,7 +278,7 @@ def parse_couchbase_url(url: str) -> ParsedUrl:
         engine="couchbase",
         name=f"{shown[0]}/{database}" if database else shown[0],
         host=",".join(shown),
-        port=items[0][1] if direct else None,
+        port=items[0][1] if direct and items[0][1] not in _WEB_CONSOLE_PORTS else None,
         database=database or None,
         username=unquote(username) or None,
         ssl=SslConfig(**ssl_fields),
