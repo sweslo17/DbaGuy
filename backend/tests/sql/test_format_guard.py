@@ -28,3 +28,26 @@ def test_sqlpp_identifier_case_matters():
 def test_extra_or_missing_tokens():
     assert first_difference(PG, "SELECT 1", "SELECT 1;") == len("SELECT 1")
     assert first_difference(PG, "SELECT 1, 2", "SELECT 1") == len("SELECT 1")
+
+
+@pytest.mark.parametrize("original, formatted", [
+    ("INSERT INTO Users (KEY, VALUE) VALUES ('k', 1)", "INSERT INTO USERS (KEY, VALUE) VALUES ('k', 1)"),
+    ("SELECT o.user FROM ks o", "SELECT o.USER FROM ks o"),  # reserved, yet a plain name to the server
+    ("CREATE INDEX i ON Orders(amount)", "CREATE INDEX i ON ORDERS(amount)"),
+    ("SELECT b.f(1) FROM ks b", "SELECT b.F(1) FROM ks b"),  # after a dot: a path, not a function
+])
+def test_sqlpp_names_before_a_paren_or_reserved_like_names_keep_their_case(original, formatted):
+    assert first_difference(SQ, original, formatted) is not None
+
+
+def test_sqlpp_function_names_are_case_free():
+    assert first_difference(SQ, "select lower(d.a), count(*) from ks d", "SELECT LOWER(d.a), COUNT(*) FROM ks d") is None
+
+
+def test_the_guard_is_linear_in_the_statement_size():
+    import time
+    fields = ", ".join(f"d.f{i} AS g{i}" for i in range(20000))
+    text = f"SELECT {fields} FROM ks d"
+    started = time.monotonic()
+    assert first_difference(SQ, text, text.replace("SELECT", "select", 1)) is None
+    assert time.monotonic() - started < 3.0  # was ~11 s (a slice per word)
