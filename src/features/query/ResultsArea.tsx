@@ -2,7 +2,7 @@ import { useCallback, useMemo, useState } from "react";
 import type { Dialect } from "@/lib/api/types";
 import { sameElements, useHeldResult } from "../grid/useHeldResult";
 import type { ExecutionState, ResultSetState } from "../session/execution";
-import type { SessionController, SessionPhase } from "../session/SessionController";
+import type { RequestOptions, SessionController, SessionPhase } from "../session/SessionController";
 import { ResultGrid } from "./ResultGrid";
 import { ResultTabStrip, type StripTab } from "./ResultTabStrip";
 import { RunMessages, type RunMessagesProps } from "./RunMessages";
@@ -67,8 +67,8 @@ export interface ResultsAreaProps extends Omit<RunMessagesProps, "run"> {
   phase: SessionPhase;
   dialect: Dialect | null;
   pageSize: number;
-  /** Opens the tab's export dialog for a result's statement; stable across renders. */
-  onExport: (sql: string) => void;
+  /** Opens the tab's export dialog for a result's statement and what it was sent with; stable across renders. */
+  onExport: (sql: string, request: RequestOptions) => void;
 }
 
 /**
@@ -136,6 +136,7 @@ export function ResultsArea({
               set={set}
               requestId={execution.requestId}
               sql={execution.sql}
+              request={execution.request}
               loadingMore={execution.status === "running" && execution.resultSets.at(-1)?.index === set.index}
               stale={held.stale}
               canLoadMore={canLoadMore}

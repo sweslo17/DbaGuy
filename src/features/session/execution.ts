@@ -1,6 +1,22 @@
-import type { Classification, ColumnMeta, GuardReason, ServerEvent } from "@/lib/api/types";
+import type {
+  Classification,
+  ColumnMeta,
+  GuardReason,
+  QueryContext,
+  ServerEvent,
+  StatementParams,
+} from "@/lib/api/types";
 
 export type ExecutionKind = "execute" | "export" | "transaction";
+
+/**
+ * What a request is sent with besides its statement (Couchbase): the query context and the typed parameters.
+ * `queryContext` undefined means the session's default context (what `SessionController` fills in); null, none.
+ */
+export interface RequestOptions {
+  queryContext?: QueryContext | null;
+  params?: StatementParams | null;
+}
 
 export interface ResultSetState {
   index: number;
@@ -18,6 +34,8 @@ export interface ExecutionState {
   kind: ExecutionKind;
   /** The statement sent; "" for transaction commands. */
   sql: string;
+  /** What the request was sent with: an export of its result (run again) takes the same context and parameters. */
+  request: RequestOptions;
   status: "running" | "paused" | "done";
   resultSets: ResultSetState[];
   affected: { index: number; rows: number }[];
@@ -44,11 +62,17 @@ export const CONNECTION_LOST = "connection_lost";
 /** Error codes the backend sends for requests it never ran; the request is over even if `finished` goes missing. */
 const TERMINAL_ERROR_CODES = new Set(["no_open_result", "invalid_command"]);
 
-export function newExecution(requestId: string, kind: ExecutionKind, sql: string): ExecutionState {
+export function newExecution(
+  requestId: string,
+  kind: ExecutionKind,
+  sql: string,
+  request: RequestOptions = {},
+): ExecutionState {
   return {
     requestId,
     kind,
     sql,
+    request,
     status: "running",
     resultSets: [],
     affected: [],

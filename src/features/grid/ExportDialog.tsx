@@ -14,7 +14,7 @@ import { canChooseFiles, chooseSavePath } from "@/lib/native";
 import { useNow } from "@/lib/useNow";
 import { useEngineInfo } from "../connections/hooks";
 import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
-import type { SessionController } from "../session/SessionController";
+import type { RequestOptions, SessionController } from "../session/SessionController";
 import { cancelAbortsTransaction, EXPORT_CANCEL_ABORTS_TRANSACTION } from "../session/transactions";
 import { COPY_FORMAT_LABELS, copyFormatsFor } from "./copy";
 
@@ -25,6 +25,11 @@ export interface ExportSource {
   controller: SessionController;
   /** The statement that produced the result (the browse SELECT for table data). */
   sql: string;
+  /**
+   * What the statement was sent with (Couchbase: its query context and parameters): the export runs it the same way.
+   * Absent: the session's default context, no parameters.
+   */
+  request?: RequestOptions;
   /** Default file name stem. */
   title: string;
   /** Prefills the INSERT target (table data). */
@@ -147,7 +152,7 @@ export function ExportDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const { controller, sql, title } = source;
+  const { controller, sql, request, title } = source;
   const engine = useEngineInfo(controller.profileId);
   const prefill = source.tableName ?? null;
   // The formats of the engine's dialect: SQL++ has no INSERT by columns, and `copyFormatsFor` is where that is decided.
@@ -223,7 +228,7 @@ export function ExportDialog({
       null_text: spec.textTable ? nullText : "",
       ...(format === "insert" ? tableTarget(table, prefill) : {}),
     };
-    const requestId = controller.exportResult(sql, format, target, options);
+    const requestId = controller.exportResult(sql, format, target, options, request);
     setRunning({ requestId, path: target, startedAt: Date.now() });
     setCancelSent(null);
     setOutcome(null);

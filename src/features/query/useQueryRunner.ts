@@ -2,7 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { toast } from "@/components/ui/Toast";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
-import type { AppSettings, GuardDecision } from "@/lib/api/types";
+import type { AppSettings, GuardDecision, QueryContext } from "@/lib/api/types";
 import { refreshHistory } from "../history/useHistory";
 import { CONNECTION_LOST, type ExecutionState } from "../session/execution";
 import { busy, type SessionController } from "../session/SessionController";
@@ -55,6 +55,11 @@ export interface QueryRunnerArgs {
   settings: AppSettings;
   /** The per-execute timeout; null: none. */
   timeoutS: number | null;
+  /**
+   * Couchbase: the tab's effective query context (null: none), read when a run starts and sent with each of its
+   * statements. Undefined for engines without a context: the session's default (none) goes out as before.
+   */
+  queryContext?: QueryContext | null;
   listener?: RunListener;
 }
 
@@ -88,11 +93,13 @@ export interface StartOptions {
   unchanged?: () => boolean;
 }
 
-/** The run in progress: what cancel needs to reach it. */
+/** The run in progress: what cancel needs to reach it, and the context it was started in. */
 interface ActiveRun {
   controller: SessionController;
   requestId: string | null;
   cancelled: boolean;
+  /** The tab's query context when the run started: a change of the picker meanwhile does not reach its statements. */
+  queryContext: QueryContext | null | undefined;
 }
 
 /**
@@ -102,15 +109,15 @@ interface ActiveRun {
  * cancel stops the running statement and the run. A new run forgets the previous run's results. The run belongs to the
  * controller it ran on: a new session starts empty.
  */
-export function useQueryRunner({ controller, profileId, settings, timeoutS, listener }: QueryRunnerArgs) {
+export function useQueryRunner({ controller, profileId, settings, timeoutS, queryContext, listener }: QueryRunnerArgs) {
   const [result, setResult] = useState<{ controller: SessionController; run: RunState } | null>(null);
   const [prompt, setPrompt] = useState<ConfirmPrompt | null>(null);
   /** The statements are being checked (`/sql/analyze`) before any is sent: a long script takes a moment. */
   const [checking, setChecking] = useState(false);
   const qc = useQueryClient();
-  const latest = useRef({ controller, profileId, settings, timeoutS, listener });
+  const latest = useRef({ controller, profileId, settings, timeoutS, queryContext, listener });
   useLayoutEffect(() => {
-    latest.current = { controller, profileId, settings, timeoutS, listener };
+    latest.current = { controller, profileId, settings, timeoutS, queryContext, listener };
   });
   const active = useRef<ActiveRun | null>(null);
   /** The open confirmation's answer: a tab closed while it is open answers "no", so the run never hangs. */
@@ -186,6 +193,7 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
           timeoutS: timeout,
           confirmed: agreed,
           history: true,
+          queryContext: job.queryContext,
         });
         job.requestId = requestId;
         setStep(index, { requestId, status: "running" });
@@ -240,7 +248,7 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
 
   const start = useCallback(
     async (planned: PlannedStatement[], options: StartOptions = {}): Promise<void> => {
-      const { controller: session, profileId: profile } = latest.current;
+      const { controller: session, profileId: profile, queryContext: context } = latest.current;
       if (!session || !profile || planned.length === 0 || active.current) return;
       if (busy(session.store.getState())) return;
       if (planned.some((s) => s.repeat > MAX_GO_REPEAT)) {
@@ -253,7 +261,7 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, list
         toast("info", "GO 0 runs the batch zero times");
         return;
       }
-      const job: ActiveRun = { controller: session, requestId: null, cancelled: false };
+      const job: ActiveRun = { controller: session, requestId: null, cancelled: false, queryContext: context };
       active.current = job;
       try {
         const confirmed = await confirmUpFront(job, profile, sent);

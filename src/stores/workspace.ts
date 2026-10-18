@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { pathKey, type ObjectNode, type PathSegment } from "@/lib/api/types";
+import { pathKey, type ObjectNode, type PathSegment, type QueryContext } from "@/lib/api/types";
 import { baseName, isWithin, movedPath } from "@/lib/scriptPaths";
 import { relationOf } from "@/features/table-data/filterValue";
 
@@ -29,6 +29,11 @@ export interface QueryTabState {
   initialSelection?: { anchor: number; head: number };
   /** The desired auto-commit mode, applied when the session opens. */
   autocommit: boolean;
+  /**
+   * Couchbase: where unqualified names resolve (spec §3.11.1). Undefined follows the profile's default context (the
+   * session's); "none" is the user's choice of no context (ruling B14). The tab keeps `database = null` (ruling B15).
+   */
+  queryContext?: QueryContext | "none";
 }
 
 /** A relation (table, view, materialized view, partition): its data, columns and DDL. */
@@ -76,6 +81,8 @@ export interface OpenQueryOptions {
   /** Binds the tab to a script file; its `text` is then the saved content. */
   scriptPath?: string;
   title?: string;
+  /** Couchbase: the tab's query context (see `QueryTabState.queryContext`). */
+  queryContext?: QueryContext | "none";
 }
 
 interface WorkspaceState extends WorkspaceSnapshot {
@@ -184,6 +191,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
       textFromFile: false,
       initialText: text,
       autocommit: true,
+      queryContext: options.queryContext,
     };
     set((s) => ({ tabs: [...s.tabs, tab], activeTabId: id }));
     return id;

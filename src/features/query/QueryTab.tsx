@@ -1,6 +1,6 @@
 import { Prec, type Extension } from "@codemirror/state";
 import { keymap, placeholder, type EditorView } from "@codemirror/view";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Group, Panel } from "react-resizable-panels";
 import { PanelHandle } from "@/components/ui/PanelHandle";
 import { toast } from "@/components/ui/Toast";
@@ -20,7 +20,7 @@ import { currentStatementHighlight, refreshStatements, statementsExtension } fro
 import { ExportDialog } from "../grid/ExportDialog";
 import { useLongQueryNotifications } from "../notifications/useLongQueryNotifications";
 import type { ExecutionState } from "../session/execution";
-import { busy, isExporting, type SessionPhase } from "../session/SessionController";
+import { busy, isExporting, type RequestOptions, type SessionPhase } from "../session/SessionController";
 import { SessionError } from "../session/SessionError";
 import { useSessionGuards } from "../session/SessionGuards";
 import { useSession } from "../session/useSession";
@@ -30,12 +30,14 @@ import { ConfirmRunDialog } from "./ConfirmRunDialog";
 import { QueryToolbar } from "./QueryToolbar";
 import { ResultsArea } from "./ResultsArea";
 import { beginRunMarks, errorLocation, flashStatement, jumpToError, markStatementError } from "./runMarks";
+import { effectiveContext, seenFieldsOf } from "./queryContext";
 import { planRun, type PlannedStatement, type RunMode } from "./runPlan";
 import { useQueryTabActions } from "./tabActions";
 import { useQueryRunner, type RunListener } from "./useQueryRunner";
 import { useTransactionControls } from "./useTransactionControls";
 
 const NO_EXECUTIONS: Record<string, ExecutionState> = {};
+const NO_FIELDS: string[] = [];
 
 /**
  * A query tab (spec §3.5, §4.1, §4.2): toolbar, then the editor above the results. Its session opens the first time
@@ -44,7 +46,9 @@ const NO_EXECUTIONS: Record<string, ExecutionState> = {};
  * the cursor; ⌘⇧↵ runs every statement; ⌘⇧F formats. ⌘S saves the tab to its script file (⌘⇧S: Save As). Closing the
  * tab or switching its connection first stops a running export and ends an open transaction, asking each time;
  * closing also asks about unsaved script changes. The tab hosts the export dialog, so it outlives the result grids. A
- * long run that ends while DbaGuy is in the background notifies.
+ * long run that ends while DbaGuy is in the background notifies. For Couchbase the tab has a query context (picked in
+ * the toolbar, or by a click on the tree, or the one a browse tab or History entry opened with), which every run, export
+ * and completion request carries; without a choice it follows the profile's default.
  */
 export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean }) {
   const { settings } = useAppSettings();
@@ -53,6 +57,10 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   const { controller, snapshot, retry } = useSession(tab.profileId, tab.database, { enabled: shown });
   const engine = useEngineInfo(tab.profileId);
   const dialect = engine?.dialect ?? null;
+  /** Couchbase: where the tab's unqualified names resolve; undefined for engines without a query context. */
+  const takesContext = !!engine?.query_context;
+  const sessionDefault = snapshot?.info?.server.default_query_context ?? null;
+  const context = takesContext ? effectiveContext(tab.queryContext, sessionDefault) : undefined;
   /** Whether the engine has transactions; undefined while the engines load. Couchbase has none (spec §3.7.5). */
   const transactions = engine?.transactions;
   const profiles = useProfiles();
@@ -75,8 +83,21 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   const [ownTimeout, setOwnTimeout] = useState<number | null>(null);
   const timeout = ownTimeout ?? settings.run.statement_timeout_s;
   const timeoutS = timeout > 0 ? timeout : null;
-  const runner = useQueryRunner({ controller, profileId: tab.profileId, settings, timeoutS, listener });
+  const runner = useQueryRunner({
+    controller,
+    profileId: tab.profileId,
+    settings,
+    timeoutS,
+    queryContext: context,
+    listener,
+  });
   const { run } = runner;
+  // The field names of the latest run's results: SQL++ completion offers them (as "seen in results").
+  const executions = snapshot?.executions ?? NO_EXECUTIONS;
+  const seenFields = useMemo(
+    () => (takesContext ? seenFieldsOf(run, executions) : NO_FIELDS),
+    [takesContext, run, executions],
+  );
   /** The text is being split into statements for a run (a long script that was not split yet takes a moment). */
   const [splitting, setSplitting] = useState(false);
   /** Cancel was pressed while splitting: nothing is run. */
@@ -84,7 +105,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
 
   const profile = profiles.data?.find((entry) => entry.profile.id === tab.profileId)?.profile ?? null;
   const profileName = tab.profileId === null ? null : (profile?.name ?? "…");
-  useLongQueryNotifications(run, snapshot?.executions ?? NO_EXECUTIONS, profile?.name ?? null);
+  useLongQueryNotifications(run, executions, profile?.name ?? null);
   /** The tab and its connection, as dialogs and toasts name it. */
   const subject = profileName ? `${tab.title} · ${profileName}` : tab.title;
   const phase: SessionPhase = snapshot?.phase ?? "opening";
@@ -114,6 +135,8 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
           ? "Setting the auto-commit mode…"
           : undefined;
   const runningReason = running || sessionBusy ? "Wait for the run to finish, or cancel it" : undefined;
+  /** What disables the connection and context pickers: only a run (a statement of it may still be sent). */
+  const pickerBlockedReason = running ? "Wait for the run to finish, or cancel it" : undefined;
 
   const transaction = useTransactionControls({
     tabId: tab.id,
@@ -150,15 +173,21 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     switching.current = true;
     try {
       if (!(await guards.exportStep("switch")) || !(await guards.transactionStep("switch"))) return;
-      updateTab(tab.id, "query", { profileId, database }); // useSession closes the old session and opens the new one
+      // useSession closes the old session and opens the new one; the new profile's own default context applies.
+      updateTab(tab.id, "query", { profileId, database, queryContext: undefined });
     } finally {
       switching.current = false;
     }
   };
 
   // The export dialog of the result whose grid asked; it stays mounted (with its settings) once opened.
-  const [exportRequest, setExportRequest] = useState<{ sql: string; open: boolean } | null>(null);
-  const openExport = useCallback((sql: string) => setExportRequest({ sql, open: true }), []);
+  const [exportRequest, setExportRequest] = useState<{ sql: string; request: RequestOptions; open: boolean } | null>(
+    null,
+  );
+  const openExport = useCallback(
+    (sql: string, request: RequestOptions) => setExportRequest({ sql, request, open: true }),
+    [],
+  );
 
   const planning = useRef(false);
   const start = async (mode: RunMode) => {
@@ -218,6 +247,8 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     database: tab.database,
     dialect,
     keywordCase: settings.editor.keyword_case,
+    queryContext: context ?? null,
+    seenFields,
   };
   const editorTarget = useRef(target);
   useLayoutEffect(() => {
@@ -289,8 +320,15 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
           phase,
           session: snapshot?.info ?? null,
           sessionFailed: !!snapshot?.error,
-          blockedReason: running ? "Wait for the run to finish, or cancel it" : undefined,
+          blockedReason: pickerBlockedReason,
           onChange: (profileId, database) => void changeConnection(profileId, database),
+          context: {
+            choice: tab.queryContext,
+            sessionDefault,
+            loading: !snapshot?.info,
+            blockedReason: pickerBlockedReason,
+            onChange: (next) => updateTab(tab.id, "query", { queryContext: next }),
+          },
         }}
         state={snapshot?.state ?? null}
         visible={active}
@@ -354,7 +392,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
           <Panel id="results" minSize="15%">
             <ResultsArea
               run={run}
-              executions={snapshot?.executions ?? NO_EXECUTIONS}
+              executions={executions}
               controller={controller}
               phase={phase}
               dialect={dialect}
@@ -370,7 +408,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
       <ConfirmRunDialog prompt={runner.prompt} context={subject} onClosed={() => editor.current?.focus()} />
       {controller && exportRequest && (
         <ExportDialog
-          source={{ controller, sql: exportRequest.sql, title: tab.title }}
+          source={{ controller, sql: exportRequest.sql, request: exportRequest.request, title: tab.title }}
           open={exportRequest.open}
           onOpenChange={(open) => setExportRequest((current) => current && { ...current, open })}
         />

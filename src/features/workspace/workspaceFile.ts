@@ -7,7 +7,8 @@ import { startSelection, type QueryTabState, type Tab, type WorkspaceSnapshot } 
  * `workspace.json` ↔ the tab store (spec §4.8). A query tab keeps its connection, script binding, editor text,
  * cursor/selection and auto-commit mode; a table or object tab keeps its connection and object path. A tab bound to a
  * script keeps no text while it holds just what its file does (`buffer: null`, ruling R-02c-21): it is restored from
- * the file as the file is then.
+ * the file as the file is then. A Couchbase query tab also keeps its query context: null is the profile's default,
+ * "none" the user's choice of no context (ruling B14).
  */
 
 const WORKSPACE_VERSION = 1;
@@ -59,6 +60,7 @@ function savedTab(tab: Tab, readBuffer: (tabId: string) => EditorBuffer | null):
     // Only a real range: a bare cursor is `cursor`.
     selection: selection && selection.anchor !== selection.head ? selection : null,
     autocommit: tab.autocommit,
+    query_context: tab.queryContext ?? null,
   };
 }
 
@@ -85,8 +87,8 @@ export interface RestoredWorkspace {
 
 /**
  * The saved workspace as store tabs, keeping their ids. A query tab whose profile is gone reopens without a
- * connection; a table or object tab whose profile is gone is dropped. A saved auto-commit of null means on: the tab's
- * mode must be definite, or nothing could run.
+ * connection (nor its query context); a table or object tab whose profile is gone is dropped. A saved auto-commit of
+ * null means on: the tab's mode must be definite, or nothing could run.
  */
 export function fromSavedWorkspace(saved: SavedWorkspace, profileExists: (id: string) => boolean): RestoredWorkspace {
   const tabs: Tab[] = [];
@@ -114,6 +116,7 @@ export function fromSavedWorkspace(saved: SavedWorkspace, profileExists: (id: st
         initialCursor: entry.cursor ?? undefined,
         initialSelection: entry.selection ?? undefined,
         autocommit: entry.autocommit ?? true,
+        queryContext: connected ? (entry.query_context ?? undefined) : undefined,
       });
     } else if (connected && entry.object_path?.length) {
       tabs.push({ id: entry.id, kind: entry.kind, profileId, path: entry.object_path, title: entry.title });

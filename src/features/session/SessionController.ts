@@ -9,8 +9,18 @@ import type {
   ServerEvent,
   SessionInfo,
   SessionStateEvent,
+  StatementParams,
 } from "@/lib/api/types";
-import { applyEvent, interruptExecution, newExecution, type ExecutionKind, type ExecutionState } from "./execution";
+import {
+  applyEvent,
+  interruptExecution,
+  newExecution,
+  type ExecutionKind,
+  type ExecutionState,
+  type RequestOptions,
+} from "./execution";
+
+export type { RequestOptions };
 
 export type SessionPhase = "opening" | "open" | "reconnecting" | "failed" | "closed";
 
@@ -41,16 +51,16 @@ export interface SessionSnapshot {
   sessionMessages: SessionMessage[];
 }
 
-export interface ExecuteOptions {
+/**
+ * `queryContext` is the Couchbase query context the statement runs in. Undefined: the session's default context
+ * (`info.server.default_query_context`); null: none. A tab's own choice goes through here. `params` are the typed
+ * parameters of the statement.
+ */
+export interface ExecuteOptions extends RequestOptions {
   pageSize?: number;
   timeoutS?: number | null;
   confirmed?: boolean;
   history?: boolean;
-  /**
-   * The Couchbase query context the statement runs in. Undefined: the session's default context
-   * (`info.server.default_query_context`); null: none. A tab's own choice goes through here.
-   */
-  queryContext?: QueryContext | null;
 }
 
 export interface SessionControllerOptions {
@@ -106,6 +116,9 @@ function stateView(event: SessionStateEvent): SessionStateView {
 
 const unfinished = (execution: ExecutionState) => execution.status !== "done";
 
+/** The command's `params` field, left out when the request has none (other engines' requests stay as they were). */
+const withParams = ({ params }: RequestOptions): { params?: StatementParams } => (params ? { params } : {});
+
 /** Ends every unfinished execution: the events it still needed can no longer arrive. */
 function interruptAll(executions: Record<string, ExecutionState>): Record<string, ExecutionState> {
   return Object.fromEntries(Object.entries(executions).map(([id, execution]) => [id, interruptExecution(execution)]));
@@ -152,17 +165,24 @@ export class SessionController {
 
   /** Runs one statement; returns its request id. */
   execute(sql: string, options: ExecuteOptions = {}): string {
-    return this.track("execute", sql, {
-      type: "execute",
-      request_id: crypto.randomUUID(),
+    const request = this.resolved(options);
+    return this.track(
+      "execute",
       sql,
-      page_size: options.pageSize ?? PAGE_SIZE,
-      confirmed: options.confirmed ?? false,
-      timeout_s: options.timeoutS ?? null,
-      history: options.history ?? true,
-      query_context: options.queryContext !== undefined ? options.queryContext : this.defaultQueryContext(),
-      profile_plan: false,
-    });
+      {
+        type: "execute",
+        request_id: crypto.randomUUID(),
+        sql,
+        page_size: options.pageSize ?? PAGE_SIZE,
+        confirmed: options.confirmed ?? false,
+        timeout_s: options.timeoutS ?? null,
+        history: options.history ?? true,
+        query_context: request.queryContext,
+        ...withParams(request),
+        profile_plan: false,
+      },
+      request,
+    );
   }
 
   /** Loads the next page of a paused result (ignored unless it is paused, so a double click asks only once). */
@@ -194,22 +214,43 @@ export class SessionController {
     return this.track("transaction", "", { type: "set_autocommit", request_id: crypto.randomUUID(), enabled });
   }
 
-  /** Runs `sql` again and writes its whole result to `path` on the backend; `progressRows` reports the rows written. */
-  exportResult(sql: string, format: FormatKind, path: string, options: RowFormatOptions): string {
-    return this.track("export", sql, {
-      type: "export",
-      request_id: crypto.randomUUID(),
+  /**
+   * Runs `sql` again and writes its whole result to `path` on the backend; `progressRows` reports the rows written.
+   * `request` is what the statement was run with (an execution's `request`): the same context and parameters.
+   */
+  exportResult(
+    sql: string,
+    format: FormatKind,
+    path: string,
+    options: RowFormatOptions,
+    request: RequestOptions = {},
+  ): string {
+    const resolved = this.resolved(request);
+    return this.track(
+      "export",
       sql,
-      format,
-      path,
-      options,
-      query_context: this.defaultQueryContext(),
-    });
+      {
+        type: "export",
+        request_id: crypto.randomUUID(),
+        sql,
+        format,
+        path,
+        options,
+        query_context: resolved.queryContext,
+        ...withParams(resolved),
+      },
+      resolved,
+    );
   }
 
   /** The context a request runs in unless the tab chose one: the profile's default (Couchbase), else none. */
   private defaultQueryContext(): QueryContext | null {
     return this.store.getState().info?.server.default_query_context ?? null;
+  }
+
+  /** `request` with the context filled in: undefined is the session's default, null none. */
+  private resolved({ queryContext, params }: RequestOptions): RequestOptions {
+    return { queryContext: queryContext !== undefined ? queryContext : this.defaultQueryContext(), params };
   }
 
   /** Drops a request's state (and its rows) from the store; later events for it are ignored. */
@@ -333,8 +374,8 @@ export class SessionController {
     return this.socket.trySend(command);
   }
 
-  private track(kind: ExecutionKind, sql: string, command: ClientCommand): string {
-    const execution = newExecution(command.request_id, kind, sql);
+  private track(kind: ExecutionKind, sql: string, command: ClientCommand, request: RequestOptions = {}): string {
+    const execution = newExecution(command.request_id, kind, sql, request);
     const sent = this.send(command);
     this.putExecution(sent ? execution : { ...execution, status: "done", error: NOT_CONNECTED });
     return command.request_id;

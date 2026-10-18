@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, unwrap } from "@/lib/api/client";
-import type { Dialect, EngineInfo, ProfileDraft, ProfileSecretsInput } from "@/lib/api/types";
+import type { Dialect, EngineInfo, ProfileDraft, ProfileEntry, ProfileSecretsInput } from "@/lib/api/types";
 import { invalidateExplorer } from "../explorer/explorerCache";
 
 export const profilesKey = ["profiles"] as const;
@@ -21,15 +21,22 @@ export function useEngines() {
   });
 }
 
+/** What the engine of profile `profileId` is and can do; null for an unknown profile or while either list is missing. */
+export function findEngineInfo(
+  profiles: readonly ProfileEntry[] | undefined,
+  engines: readonly EngineInfo[] | undefined,
+  profileId: string | null,
+): EngineInfo | null {
+  const engine = profiles?.find((entry) => entry.profile.id === profileId)?.profile.engine;
+  return engines?.find((info) => info.engine === engine) ?? null;
+}
+
 /**
  * What a profile's engine is and can do (dialect, capabilities); null without a profile and until profiles and engines
  * are loaded. It wraps queries, so call it unconditionally at the top of a component and derive booleans afterwards.
  */
 export function useEngineInfo(profileId: string | null): EngineInfo | null {
-  const profiles = useProfiles();
-  const engines = useEngines();
-  const engine = profiles.data?.find((entry) => entry.profile.id === profileId)?.profile.engine;
-  return engines.data?.find((info) => info.engine === engine) ?? null;
+  return findEngineInfo(useProfiles().data, useEngines().data, profileId);
 }
 
 /** SQL dialect of a profile's engine; null without a profile and until profiles and engines are loaded. */

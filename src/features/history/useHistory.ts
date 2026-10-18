@@ -11,7 +11,7 @@ import { api, errorMessage, unwrap } from "@/lib/api/client";
 import type { HistoryEntry, HistoryPage } from "@/lib/api/types";
 import { mountedEditor } from "@/stores/editorBuffers";
 import { useWorkspace } from "@/stores/workspace";
-import { useProfiles } from "../connections/hooks";
+import { findEngineInfo, useEngines, useProfiles } from "../connections/hooks";
 
 /*
  * The query history (spec §4.6): the backend's `/history` API, a search as one infinite query, and what the History
@@ -72,17 +72,24 @@ export function useHistory(q: string, profileId: string | null) {
 /**
  * What the History panel does with an entry: insert its SQL into the active query tab, open it in a new tab, and clear
  * the whole history. A new tab opens on the entry's connection and database, or on none (the user picks one) when that
- * connection is known to be deleted.
+ * connection is known to be deleted. On a connection with a query context (Couchbase) the tab opens with the context
+ * the entry ran in (no context when it ran with none) and keeps no database (ruling B15); inserting an entry into the
+ * active tab leaves that tab's context alone.
  */
 export function useHistoryActions() {
   const qc = useQueryClient();
   const profiles = useProfiles().data;
+  const engines = useEngines().data;
   return useMemo(() => {
     const openInNewTab = (entry: HistoryEntry) => {
       // Only a loaded list without the profile means it was deleted; while the list is unknown, the entry's own counts.
       const deleted = !!profiles && !profiles.some((item) => item.profile.id === entry.profile_id);
       const { openQuery } = useWorkspace.getState();
-      openQuery(deleted ? null : entry.profile_id, deleted ? null : entry.database, { text: entry.sql });
+      if (!deleted && findEngineInfo(profiles, engines, entry.profile_id)?.query_context) {
+        openQuery(entry.profile_id, null, { text: entry.sql, queryContext: entry.query_context ?? "none" });
+      } else {
+        openQuery(deleted ? null : entry.profile_id, deleted ? null : entry.database, { text: entry.sql });
+      }
       console.info(`Opened history entry ${entry.id} in a new query tab`);
       if (deleted) {
         toast("info", `The connection “${entry.profile_name}” no longer exists. Choose one for the new tab.`);
@@ -117,5 +124,5 @@ export function useHistoryActions() {
     };
 
     return { insert, openInNewTab, clear };
-  }, [qc, profiles]);
+  }, [qc, profiles, engines]);
 }

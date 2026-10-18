@@ -11,10 +11,12 @@ import type { Profile, ProfileEntry } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { useWorkspace } from "@/stores/workspace";
 import { ConnectionDialog, ENGINE_LABELS } from "../connections/ConnectionDialog";
-import { useDeleteProfile, useProfiles } from "../connections/hooks";
+import { findEngineInfo, useDeleteProfile, useEngines, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
 import { secretsNeeded, UnlockDialog, type SecretsNeeded } from "../connections/UnlockDialog";
+import { applyTreeContext } from "../query/queryContext";
 import { requestCloseTab, requestDisconnectTab } from "../workspace/closeGuards";
+import { openBrowseTab } from "./browse";
 import { forgetExplorer } from "./explorerCache";
 import { folderLabel, kindIcon } from "./kinds";
 import { nodeKeyPrefix, profileKey, useTreeRows, type Expansion, type TreeRow } from "./useTreeRows";
@@ -22,6 +24,8 @@ import { nodeKeyPrefix, profileKey, useTreeRows, type Expansion, type TreeRow } 
 const ROW_HEIGHT = 22;
 /** Nodes that group other nodes: double-click expands them instead of opening a detail tab. */
 const CONTAINER_KINDS = new Set(["folder", "database", "schema", "bucket", "scope"]);
+/** A Couchbase collection holds documents: double-click browses them (ruling B19); its detail is in its menu. */
+const BROWSABLE_KIND = "collection";
 
 type ErrorRow = Extract<TreeRow, { type: "error" }>;
 
@@ -54,6 +58,7 @@ function Chevron({ show, open, onToggle }: { show: boolean; open: boolean; onTog
 export function Explorer() {
   const qc = useQueryClient();
   const profiles = useProfiles();
+  const engines = useEngines().data;
   const deleteProfile = useDeleteProfile();
   const openObject = useWorkspace((s) => s.openObject);
   const openQuery = useWorkspace((s) => s.openQuery);
@@ -77,11 +82,18 @@ export function Explorer() {
     overscan: 20,
   });
 
-  /** Selects a row; its connection becomes the workspace's selected profile (the default of a new query tab). */
+  /**
+   * Selects a row; its connection becomes the workspace's selected profile (the default of a new query tab). A node of
+   * a connection whose engine has a query context (Couchbase) also sets the context of the active query tab on it
+   * (spec §3.11.1); a connection's own row only selects it.
+   */
   const selectRow = (row: TreeRow) => {
     setSelected(row.key);
     const profileId = rowProfileId(row);
     if (profileId) selectProfile(profileId);
+    if (row.type === "node" && findEngineInfo(entries, engines, row.profileId)?.query_context) {
+      applyTreeContext(row.profileId, row.node.path);
+    }
   };
 
   const toggle = useCallback(
@@ -100,7 +112,9 @@ export function Explorer() {
   );
 
   const activate = (row: TreeRow) => {
-    if (row.type === "node" && !CONTAINER_KINDS.has(row.node.kind)) {
+    if (row.type === "node" && row.node.kind === BROWSABLE_KIND) {
+      void openBrowseTab(row.profileId, row.node.path);
+    } else if (row.type === "node" && !CONTAINER_KINDS.has(row.node.kind)) {
       openObject(row.profileId, row.node);
     } else if (isExpandable(row)) {
       toggle(row);
@@ -135,7 +149,7 @@ export function Explorer() {
     // connection.
     const { tabs, closeTab, updateTab } = useWorkspace.getState();
     for (const tab of tabs.filter((t) => t.profileId === profileId)) {
-      if (tab.kind === "query") updateTab(tab.id, "query", { profileId: null, database: null });
+      if (tab.kind === "query") updateTab(tab.id, "query", { profileId: null, database: null, queryContext: undefined });
       else closeTab(tab.id);
     }
   };
@@ -267,7 +281,7 @@ export function Explorer() {
       case "node": {
         const Icon = kindIcon(row.node.kind, row.node.name);
         const label = row.node.kind === "folder" ? folderLabel(row.node.name) : row.node.name;
-        return (
+        const content = (
           <div
             {...aria}
             className={cn(base, row.node.system && "opacity-60")}
@@ -281,6 +295,17 @@ export function Explorer() {
             <span className="truncate">{label}</span>
             {row.node.detail && <span className="ml-auto shrink-[100] truncate pl-2 text-[11px] text-muted">{row.node.detail}</span>}
           </div>
+        );
+        if (row.node.kind !== BROWSABLE_KIND) return content;
+        return (
+          <ContextMenu
+            items={[
+              { label: "Browse documents", onSelect: () => void openBrowseTab(row.profileId, row.node.path) },
+              { label: "Details", onSelect: () => openObject(row.profileId, row.node) },
+            ]}
+          >
+            {content}
+          </ContextMenu>
         );
       }
       case "loading":

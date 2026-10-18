@@ -9,7 +9,7 @@ import {
 import type { Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { api } from "@/lib/api/client";
-import type { CompletionItem, Dialect, EditorSettings } from "@/lib/api/types";
+import type { CompletionItem, Dialect, EditorSettings, QueryContext } from "@/lib/api/types";
 import { kindLabel } from "../explorer/kinds";
 import { statementWindow } from "./statements";
 
@@ -30,6 +30,10 @@ export interface CompletionTarget {
   dialect: Dialect | null;
   /** `editor.keyword_case`: "upper" inserts keywords in upper case, "preserve" follows the typed prefix. */
   keywordCase: KeywordCase;
+  /** Couchbase: where the tab's unqualified names resolve; null for no context (and for engines without one). */
+  queryContext: QueryContext | null;
+  /** Couchbase: the field names of the tab's latest results, offered as fields "seen in results"; empty otherwise. */
+  seenFields: string[];
 }
 
 const DEBOUNCE_MS = 30;
@@ -120,7 +124,7 @@ function completionSource(target: () => CompletionTarget) {
     const timeout = window.setTimeout(() => request.abort(), TIMEOUT_MS);
     try {
       if (!context.explicit && !(await settle(DEBOUNCE_MS, request.signal))) return null;
-      const { profileId, database, dialect, keywordCase } = target();
+      const { profileId, database, dialect, keywordCase, queryContext, seenFields } = target();
       const { state, pos } = context;
       const bounds = statementWindow(state, pos);
       const client = await api();
@@ -130,6 +134,8 @@ function completionSource(target: () => CompletionTarget) {
           cursor: pos - bounds.from,
           database,
           ...(profileId ? { profile_id: profileId } : { dialect: dialect ?? "postgres" }),
+          ...(queryContext ? { query_context: queryContext } : {}),
+          ...(seenFields.length ? { seen_fields: seenFields } : {}),
         },
         signal: request.signal,
       });
@@ -182,7 +188,8 @@ const completionTheme = EditorView.theme({
 
 /**
  * Completion from `POST /sql/complete` as the only source (lang-sql's keyword list is replaced). `target` is read at
- * each request: the tab's connection, database, dialect and keyword case.
+ * each request: the tab's connection, database, dialect and keyword case, and for Couchbase its query context and the
+ * field names of its results.
  */
 export function sqlCompletion(target: () => CompletionTarget): Extension {
   return [
