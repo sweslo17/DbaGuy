@@ -59,7 +59,7 @@ const SSL_MODE_HINTS: Partial<Record<Engine, string>> = {
 };
 /** The mode a new profile starts with (the others start with `prefer`): Couchbase's TLS is on other ports, so HTTP. */
 const DEFAULT_SSL_MODES: Partial<Record<Engine, SslConfig["mode"]>> = { couchbase: "disable" };
-/** Shown instead of the SSL hint when the password would cross the network in clear text. */
+/** Shown under Host and instead of the SSL mode hint when the password would cross the network in clear text. */
 const PLAIN_TEXT_NOTE =
   "The password goes to the cluster in clear text (HTTP Basic auth): use TLS (require or verify-*) for a remote cluster";
 const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
@@ -76,10 +76,11 @@ const HOST_HINTS: Partial<Record<Engine, string>> = {
   couchbase: "One host, or several separated by commas (cb1,cb2); only one through an SSH tunnel",
 };
 const PORT_PLACEHOLDERS: Partial<Record<Engine, string>> = { couchbase: "8093 (18093 with TLS)" };
-const DATABASE_LABELS: Partial<Record<Engine, string>> = { couchbase: "Default query context" };
+const DATABASE_LABELS: Partial<Record<Engine, string>> = { couchbase: "Default context" };
 const DATABASE_PLACEHOLDERS: Partial<Record<Engine, string>> = { couchbase: "bucket or bucket.scope" };
 const DATABASE_HINTS: Partial<Record<Engine, string>> = {
-  couchbase: "A bucket alone whose name holds a dot goes in back-ticks: `my.bucket`",
+  couchbase:
+    "The default query context: where unqualified names (FROM users) resolve. A bucket alone whose name holds a dot goes in back-ticks: `my.bucket`",
 };
 const OPTIONS_HINTS: Partial<Record<Engine, string>> = { couchbase: "manager_port=8091, discover_nodes=false" };
 const SSL_FILE_FIELDS = [
@@ -277,6 +278,17 @@ function ConnectionDialogBody({
     !ssh.enabled &&
     !!server &&
     hasRemoteHost(server.host);
+  // Shown under Host (General) and under the SSL mode: the one place that decides it is this predicate.
+  const plainTextNote = plainTextPassword ? <span className="text-warning">{PLAIN_TEXT_NOTE}</span> : null;
+  const hostHint = plainTextNote ? (
+    <>
+      {HOST_HINTS[draft.engine]}
+      <br />
+      {plainTextNote}
+    </>
+  ) : (
+    HOST_HINTS[draft.engine]
+  );
 
   const patchCommon = (changes: Partial<Pick<ServerProfileDraft, CommonField>>) =>
     setDraft((d) => ({ ...d, ...changes }));
@@ -397,7 +409,7 @@ function ConnectionDialogBody({
         </FieldRow>
         {server ? (
           <>
-            <FieldRow label="Host" hint={HOST_HINTS[draft.engine]}>
+            <FieldRow label="Host" hint={hostHint}>
               <div className="flex gap-2">
                 <Input value={server.host} onChange={(e) => patchServer({ host: e.target.value })} />
                 <PortInput
@@ -461,7 +473,7 @@ function ConnectionDialogBody({
       </TabPanel>
 
       <TabPanel value="ssl" current={tab}>
-        <FieldRow label="Mode" hint={plainTextPassword ? PLAIN_TEXT_NOTE : SSL_MODE_HINTS[draft.engine]}>
+        <FieldRow label="Mode" hint={plainTextNote ?? SSL_MODE_HINTS[draft.engine]}>
           <Select value={ssl.mode} onChange={(e) => patchSsl({ mode: e.target.value as SslConfig["mode"] })}>
             {SSL_MODES.map((mode) => (
               <option key={mode} value={mode}>

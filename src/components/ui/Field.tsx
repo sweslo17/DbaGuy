@@ -61,7 +61,7 @@ export function FieldRow({
   children,
 }: {
   label: string;
-  hint?: string;
+  hint?: ReactNode;
   error?: string | null;
   children: ReactNode;
 }) {
