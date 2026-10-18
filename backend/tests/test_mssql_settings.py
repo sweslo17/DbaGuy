@@ -408,6 +408,46 @@ SECRET = "hunter2zq"
     f"sqlserver://h;password={{{SECRET}}};instanceName=SQLEXPRESS",
     f"sqlserver://h/SQLEXPRESS;password={SECRET}",
     f"mssql://u:{SECRET}@h/db?instanceName=SQLEXPRESS",
+    # R-03b-T6g (a): "?" as a separator, ASCII and lookalikes (fullwidth ？, U+2047 ⁇, small ﹖, ⁈)
+    f"mssql://h/db?user=me?password={SECRET}",
+    f"sqlserver://h?databaseName=d?user=u?password={SECRET}",
+    f"mssql://h/db\uff1fpassword={SECRET}",
+    f"mssql://h/db?user=u\uff1fpassword={SECRET}",
+    f"mssql://h/db?user=u\u2047password={SECRET}",
+    f"mssql://h/db\u2047password={SECRET}",
+    f"mssql://h/db?user=u\ufe56password={SECRET}",
+    f"mssql://h/db?database=d\u2048password={SECRET}",
+    f"mssql://h/db?user=u\uff1dpassword={SECRET}",  # fullwidth ＝
+    f"mssql://h/db?database=password={SECRET}",  # a key=value in a value
+    f"sqlserver://h;databaseName=password={SECRET}",
+    # (b): an ADO.NET connection string after a scheme, and an authority user name that is the rest of a URL
+    f"mssql://Password={SECRET};Server=h",
+    f"sqlserver://Password={SECRET}",
+    f"mssql://Password={SECRET}",
+    f"mssql://Server=h:1433;Password={SECRET};Database=d",
+    f"mssql://u&password={SECRET}@h/db",
+    f"mssql://u\uff06password={SECRET}@h/db",
+    f"mssql://u;password={SECRET}@h/db",
+    f"mssql://u?password={SECRET}@h/db",
+    f"mssql://u=password={SECRET}@h/db",
+    # (c): brace-quoted values that are not the password
+    f"sqlserver://h;databaseName={{d;password={SECRET}}}",
+    f"sqlserver://h;user={{u;password={{{SECRET}}}",
+    f"sqlserver://h;user={{u&password={SECRET}}};databaseName=d",
+    f"sqlserver://h;databaseName={{password={SECRET}}}",
+    # (d): percent-encoded separators
+    f"mssql://h/db?user=u%3Bpassword%3D{SECRET}",
+    f"mssql://u%26password%3D{SECRET}@h/db",
+    f"mssql://h/db%3Bpassword%3D{SECRET}",
+    f"mssql://h?database=d%3Bpassword%3D{SECRET}",
+    f"sqlserver://h;databaseName=d%3Bpassword%3D{SECRET}",
+    f"mssql://h/db?user=u%EF%BC%9Bpassword%3D{SECRET}",
+    f"mssql://h/db?user=u%3Fpassword%3D{SECRET}",
+    # (e): "@" in the path
+    f"mssql://u:{SECRET}/X@h/db",
+    f"mssql://u:{SECRET}/a/b@h/db",
+    f"sqlserver://u:{SECRET}/X@h;databaseName=d",
+    f"mssql://h/db%40{SECRET}",
 ])
 def test_a_password_in_a_url_is_never_echoed(url, logs):
     try:
@@ -505,11 +545,24 @@ def test_a_url_that_mixes_the_two_forms_is_refused_with_one_fixed_text(url):
 
 def test_only_the_password_may_hold_the_other_forms_separators():
     assert parse_mssql_url("mssql://u@h/db?password=a;b&encrypt=true").password == "a;b"
+    assert parse_mssql_url("mssql://u@h/db?password=a?b&encrypt=true").password == "a?b"
     assert parse_mssql_url("sqlserver://h;password=a&b?c;user=u").password == "a&b?c"
     assert parse_mssql_url("sqlserver://h;PWD=a&b;user=u").password == "a&b"
-    # a separator the URL percent-encoded is the value's own character
-    assert parse_mssql_url("mssql://h?database=a%3Bb%26c").profile.database == "a;b&c"
-    assert parse_mssql_url("mssql://h/a%26b").profile.database == "a&b"
+    assert parse_mssql_url("sqlserver://h;password={a;b=c&d?e};user=u").password == "a;b=c&d?e"
+    assert parse_mssql_url("mssql://u:a%3Bb%3Dc@h/db").password == "a;b=c"  # the authority's password: anything
+    assert parse_mssql_url("mssql://h/db?password=a%3Bb%3Dc").password == "a;b=c"
+
+
+@pytest.mark.parametrize("url", [  # R-03b-T6g (d): a percent-encoded separator is a separator in every part but the password
+    "mssql://h?database=a%3Bb", "mssql://h?database=a%26b", "mssql://h?database=a%3Fb", "mssql://h?database=a%3Db",
+    "mssql://h/a%26b", "mssql://h/a%3Bb", "mssql://h/a%3Db", "mssql://u%3Bx@h/db", "mssql://u%3Dx@h/db",
+    "mssql://h/db?user=u%3Bpassword%3DX", "sqlserver://h;databaseName=d%3Bx", "sqlserver://h;user=u%26x",
+    "mssql://h/db?user=u%EF%BC%9Bpassword%3DX",  # a percent-encoded fullwidth ；
+    "mssql://h/db?applicationName=a%3Bb",  # even a key that is dropped
+])
+def test_percent_encoded_separators_are_refused_outside_the_password(url):
+    with pytest.raises(ValidationFailed, match="mixes the"):
+        parse_mssql_url(url)
 
 
 def test_a_fullwidth_semicolon_is_malformed_text_not_a_separator():
@@ -524,7 +577,7 @@ def test_a_fullwidth_semicolon_is_malformed_text_not_a_separator():
     ("sqlserver://h;user=u;password={a;b=c}", "a;b=c", "u", None),
     ("sqlserver://h;password={a}}b};user=u", "a}b", "u", None),  # }} is a literal }
     ("sqlserver://h;password={}}};user=u", "}", "u", None),
-    ("sqlserver://h;password={x&y?z};databaseName={my;db&1}", "x&y?z", None, "my;db&1"),
+    ("sqlserver://h;password={x&y?z};databaseName={my db}", "x&y?z", None, "my db"),
     ("sqlserver://h;password= {a;b} ;user=u", "a;b", "u", None),  # blanks around a braced value
     ("sqlserver://h;password={ spaced };user=u", " spaced ", "u", None),  # inside the braces: as written
     ("sqlserver://h;password={a;b}", "a;b", None, None),  # the last property
@@ -545,7 +598,7 @@ def test_malformed_braces_are_refused(url):
 @pytest.mark.parametrize("url", [
     "sqlserver://h;instanceName=SQLEXPRESS", "sqlserver://h;INSTANCENAME=x;databaseName=d",
     "sqlserver://h;instance_name=x", "mssql://h/db?instanceName=SQLEXPRESS", "mssql://h/db?instance-name=x",
-    "sqlserver://h;instanceName={SQL;EXPRESS}",
+    "sqlserver://h;instanceName={SQL EXPRESS}",
     "sqlserver://h/SQLEXPRESS",  # go-mssqldb: the path is the instance
     "sqlserver://me@h/SQLEXPRESS?database=d", "sqlserver://h:1433/SQLEXPRESS;user=u",
     "sqlserver://h\\SQLEXPRESS?database=d",
@@ -660,3 +713,60 @@ def test_an_unwritable_location_fails_the_first_login_not_the_app(tmp_path, monk
 
 def test_the_freetds_docstring_says_what_the_sections_are_for():
     assert "never reads another file" in freetds.__doc__ and "[global]" in freetds.__doc__
+
+
+# ---- fix round 2 (R-03b-T6g): every part of a URL but the password is checked ----
+
+NUMERIC_SECRET = "12345"  # all digits, so that it also reads as a port
+
+
+@pytest.mark.parametrize("url", [
+    f"mssql://u:{NUMERIC_SECRET}/X@h/db",  # a "/" in the password ended the authority: host u, port 12345
+    f"mssql://me:{NUMERIC_SECRET}/abc@h:1433/db",
+    f"sqlserver://u:{NUMERIC_SECRET}/X@h;databaseName=d",
+    f"mssql://u:{NUMERIC_SECRET}/a/b@h/db",
+])
+def test_a_numeric_password_with_a_slash_does_not_split_into_host_port_and_database(url, logs):
+    with pytest.raises(ValidationFailed) as info:
+        parse_mssql_url(url)
+    assert NUMERIC_SECRET not in info.value.message and NUMERIC_SECRET not in "\n".join(logs)
+    assert "malformed" in info.value.message  # the authority ended early: the message says what to do
+
+
+@pytest.mark.parametrize("url", [
+    "mssql://h/db?user=me?password=x", "sqlserver://h?databaseName=d?user=u?password=x",
+    "mssql://h/db\uff1fpassword=x", "mssql://h/db?user=u\uff1fpassword=x", "mssql://h/db?user=u\u2047password=x",
+    "mssql://h/db\u2047password=x", "mssql://h/db?database=d\ufe56x",
+    "mssql://u&password=x@h/db", "mssql://u=x@h/db",
+    "mssql://u\uff06x@h/db", "mssql://u%26x@h/db",
+    "mssql://h/db?database=password=x", "sqlserver://h;databaseName=password=x", "sqlserver://h;serverName=a=b",
+    "sqlserver://h;databaseName={d;password=x}", "sqlserver://h;user={u;password={x}",
+    "sqlserver://h;user={u&x}", "sqlserver://h;databaseName={d?x}", "sqlserver://h;applicationName={a;b}",
+])
+def test_every_part_but_the_password_is_checked_for_separators(url):
+    with pytest.raises(ValidationFailed, match="mixes the"):
+        parse_mssql_url(url)
+
+
+@pytest.mark.parametrize("url", [
+    "mssql://Password=x;Server=h", "sqlserver://Password=x", "mssql://Password=x", "mssql://Server=h:1433;Password=x",
+    "mssql://h%3Dx/db", "mssql://h\uff1dx/db",  # = percent-encoded, fullwidth
+])
+def test_a_host_that_holds_an_assignment_is_refused_as_malformed(url):
+    with pytest.raises(ValidationFailed, match="malformed"):
+        parse_mssql_url(url)
+
+
+@pytest.mark.parametrize("url", ["mssql://h/db%40x", "mssql://h/x@y", "mssql://h/x%40y", "mssql://h/x\uff20y"])
+def test_an_at_sign_in_the_path_is_refused(url):
+    with pytest.raises(ValidationFailed):
+        parse_mssql_url(url)
+
+
+def test_ordinary_names_still_import_after_the_stricter_checks():
+    parsed = parse_mssql_url("mssql://me%40corp.com:p%40ss@db.example.com:1433/My%20Db?encrypt=true&trustServerCertificate=yes")
+    assert (parsed.profile.username, parsed.profile.database, parsed.password) == ("me@corp.com", "My Db", "p@ss")
+    domain = parse_mssql_url("sqlserver://h;user=CORP\\me;password=x;databaseName=sales-2026_q1")
+    assert (domain.profile.username, domain.profile.database) == ("CORP\\me", "sales-2026_q1")
+    assert parse_mssql_url("sqlserver://h;databaseName={my db};password={a}}b}").profile.database == "my db"
+    assert parse_mssql_url("sqlserver://h;applicationName={abc==};databaseName=d").profile.database == "d"  # dropped key

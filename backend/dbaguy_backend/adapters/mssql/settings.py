@@ -137,6 +137,7 @@ _SHARED_KEYS = {
     "integratedsecurity": "integrated", "authentication": "authentication",
 }
 _JDBC_KEYS = {"servername": "server", "portnumber": "port"}  # JDBC's spellings of the address
+_KEY_NAMES = {**_SHARED_KEYS, **_JDBC_KEYS}
 _FLAG_ON = frozenset({"true", "yes"})
 # encrypt values: JDBC's and go-mssqldb's, and pymssql's own `encryption` (off, request, require). The verifying
 # choice for `true` depends on trustServerCertificate: see `_ssl_mode`.
@@ -146,7 +147,11 @@ _ENCRYPT_MODES: dict[str, SslMode] = {
     "require": "require",
 }
 _ENCRYPT_ON = frozenset({"true", "yes", "mandatory"})
-_PAIR_SEPARATORS = {False: ";&", True: ";&?"}  # what must not appear in a value, by form (False: URL, True: JDBC)
+# What must not appear in any part of a URL but the password: the separators of both forms. Free text that lands in a
+# plain-text profile field (user, database, server) may not hold `=` either: `Password=x` is a property, not a name.
+_SEPARATORS = ";&?"
+_ASSIGNMENT = "="
+_STORED_TEXT = frozenset({"user", "database", "server"})
 
 
 def _fold(key: str) -> str:
@@ -154,17 +159,27 @@ def _fold(key: str) -> str:
     return "".join(key.lower().split()).replace("-", "").replace("_", "")
 
 
-def _is_password_key(key: str) -> bool:
-    return _SHARED_KEYS.get(_fold(key)) == "password"
+def _holds(chars: str, text: str) -> bool:
+    """Whether `text` holds one of `chars` as written, percent-decoded, or in a lookalike form: checked after NFKC, so
+    the fullwidth ；＆？＝＠ and U+2047 (`??`) count, and after percent-decoding, so `%3B` does."""
+    return any(c in chars for variant in (text, unquote(text)) for c in unicodedata.normalize("NFKC", variant))
 
 
-def _reject_mixed_forms(separators: str, *texts: str) -> None:
-    """A value that holds the other form's separators is the rest of a URL, not a value: `?encrypt=true;password=x`
-    would otherwise import `true;password=x` (the password into a field that is stored in plain text). Checked after
-    NFKC so that the fullwidth ＆ and ？ count too. Fixed text: the value may hold the password."""
-    for text in texts:
-        if any(c in separators for c in unicodedata.normalize("NFKC", text)):
-            raise ValidationFailed(_MIXED_FORMS)
+def _reject_mixed_forms(*texts: str, assignment: bool = False) -> None:
+    """A part of a URL that holds the separators of the other form is the rest of a URL, not a value:
+    `?encrypt=true;password=x` would otherwise import `true;password=x`, the password in a field that is stored in
+    plain text. Every part but the password's own value goes through this. Fixed text: the part may hold the password."""
+    separators = _SEPARATORS + (_ASSIGNMENT if assignment else "")
+    if any(_holds(separators, text) for text in texts):
+        raise ValidationFailed(_MIXED_FORMS)
+
+
+def _check_pair(key: str, raw_key: str, raw_value: str) -> None:
+    """`key` is the decoded key, which names the property; the password's value is the one thing allowed anything."""
+    name = _KEY_NAMES.get(_fold(key))
+    _reject_mixed_forms(raw_key)
+    if name != "password":
+        _reject_mixed_forms(raw_value, assignment=name in _STORED_TEXT)
 
 
 def _split_authority(text: str) -> tuple[SplitResult, int | None]:
@@ -190,12 +205,12 @@ def _port_number(text: str) -> int:
 
 
 def _query_pairs(query: str) -> Iterator[tuple[str, str]]:
-    """`k=v&k=v`, percent-decoded. A "+" stays a plus: a password is not form-encoded. Only the password may hold `;`."""
+    """`k=v&k=v`, percent-decoded. A "+" stays a plus: a password is not form-encoded."""
     for part in query.split("&"):
         if part:
             raw_key, _, raw_value = part.partition("=")
             key = unquote(raw_key)
-            _reject_mixed_forms(_PAIR_SEPARATORS[False], raw_key, "" if _is_password_key(key) else raw_value)
+            _check_pair(key, raw_key, raw_value)
             yield key, unquote(raw_value).strip()
 
 
@@ -215,7 +230,7 @@ def _braced(text: str, start: int) -> tuple[str, int]:
 
 def _jdbc_pairs(text: str) -> Iterator[tuple[str, str]]:
     """`key=value;key={a;b}` after the host: values are kept as written (stripped), a `{...}` value may hold `;`.
-    Empty parts (a trailing `;`) are skipped. Only the password may hold `&` and `?` outside braces."""
+    Empty parts (a trailing `;`) are skipped."""
     pos, end = 0, len(text)
     while pos < end:
         semicolon = text.find(";", pos)
@@ -238,12 +253,12 @@ def _jdbc_pairs(text: str) -> Iterator[tuple[str, str]]:
             stop = end if semicolon < 0 else semicolon
             if text[pos:stop].strip():
                 raise ValidationFailed(_KEY_VALUE)
-            _reject_mixed_forms(_PAIR_SEPARATORS[True], key)  # the braces quoted the value: any character is its own
+            _check_pair(key, key, value)  # braces quote a password, not a user name or a database
         else:
             semicolon = text.find(";", pos)
             stop = end if semicolon < 0 else semicolon
             value = text[pos:stop].strip()
-            _reject_mixed_forms(_PAIR_SEPARATORS[True], key, "" if _is_password_key(key) else value)
+            _check_pair(key, key, value)
         pos = stop + 1
         yield key, value
 
@@ -303,10 +318,14 @@ def parse_mssql_url(url: str) -> ParsedUrl:
     if dropped:  # a count, never names: a ';' or '&' inside the password splits it into pieces that look like keys
         logger.warning("Dropping {} SQL Server URL parameters the driver does not take", dropped)
     _refuse_windows_logins(values)
+    # The authority and the path: a host that holds `=` is `Password=x;Server=h` after a scheme, a path that holds `@`
+    # is a password with a `/` in it that ended the authority early (`u:12345/x@h/db` would split into host `u`).
+    host_text = split.hostname or ""
+    if _holds("=", host_text) or _holds("@", split.path):
+        raise ValidationFailed(MALFORMED_URL_MESSAGE)
+    _reject_mixed_forms(host_text, split.path, split.username or "", assignment=True)
     if values.get("instance", "").strip() or (split.scheme in _INSTANCE_PATH_SCHEMES and split.path.strip("/")):
         raise ValidationFailed(_NAMED_INSTANCE)
-
-    _reject_mixed_forms(_PAIR_SEPARATORS[jdbc], split.hostname or "", split.path)
     host = unquote(split.hostname) if split.hostname else values.get("server", "")
     if "\\" in host:
         raise ValidationFailed(_NAMED_INSTANCE)
