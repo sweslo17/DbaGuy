@@ -40,8 +40,10 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
   - `adapters/`：`base.py` 是 5 種 DB 共用的介面；每個 engine 一個子套件，在 `container.default_registry()` 註冊
     - `adapters/mysql/`：`settings`（連線參數、SSL、options）、`catalog`／`introspection`／`schema`（物件樹、DDL、補全用 snapshot）、`types`（型別表）、`adapter`（連線、執行、取消、交易）
     - `adapters/mssql/`：`settings`＋`freetds`（連線參數、URL 匯入、app 自己的 freetds.conf）、`catalog`／`introspection`／`schema`、`types`、`adapter`（連線、執行、交易）、`cancel`（取消的階段與決策）、`driver`（唯一 import pymssql 的地方；每次進 driver 都經 `GuardedConnection` 計數）
-  - `sessions/worker.py`：每個 session 一條連線、一個執行緒；分頁、暫停、取消都在這裡通用處理
-  - `sql/`：純函式的 SQL 文字處理（lexer、切分、分類、補全、copy/匯出格式、表格瀏覽 SELECT；`tsql.py` 是 T-SQL 批次內的語句切分）；API 位移一律 UTF-16，只在 `sql/offsets.py` 轉換。各方言的識別字引號與 literal 只從 `sql/dialects.py` 來，其他地方（含前端）不自己拼
+    - `adapters/couchbase/`：`settings`（URL 匯入、seed、TLS、options）、`nodes`（`nodeServices` 探索）、`http`（keep-alive 連線；任一執行緒可 shutdown；唯一碰網路的地方）、`stream`（回應的增量解析）、`rows`（signature、`*` 與 alias 展開、溢出欄）、`messages`（server 錯誤、warnings、metrics 的文字與位置）、`jsontext`（不經 parse 的 JSON 原文）、`result`（一個回應＝一個 `StatementResult`）、`adapter`（連線、執行、取消、唯讀）、`catalog`（物件樹、DDL、補全用 snapshot）
+    - `adapters/cancel_window.py`：PG／MySQL／SQLite／Couchbase 共用的 arm 視窗（見「新增 engine」；SQL Server 用自己的 `cancel.py` 階段）；`adapters/sockets.py`：共用的 TCP keepalive
+  - `sessions/worker.py`：每個 session 一條連線、一個執行緒；分頁、暫停、取消都在這裡通用處理；`sessions/options.py`：每次請求的選項與參數檢查（引擎只會收到它的能力欄位宣告過的選項）
+  - `sql/`：純函式的 SQL 文字處理（lexer、切分、分類、補全、copy/匯出格式、表格瀏覽 SELECT；`tsql.py` 是 T-SQL 批次內的語句切分；`format_guard.py` 是 formatter 的 token 守衛，所有方言：排版後的有意義 token 和原文不同就不採用）；API 位移一律 UTF-16，只在 `sql/offsets.py` 轉換。各方言的識別字引號與 literal 只從 `sql/dialects.py` 來，其他地方（含前端）不自己拼
   - `services/`：profile、連線（含 SSH tunnel）、metadata、schema 快取、安全政策、history、設定／工作區／scripts
   - `api/`：FastAPI routers；WS 在 `api/sessions.py`
 - `src/`：React 前端；API 型別由 `npm run gen:api` 從 OpenAPI 產生（`src/lib/api/schema.d.ts`，不要手改）
@@ -65,13 +67,14 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
 | 打包 `.app` | `npm run build:app` |
 | 量測啟動時間與記憶體 | `scripts/measure-startup.sh`（直接執行 build 出來的執行檔並給暫存的 `DBAGUY_DATA_DIR`，不碰正式的 app 資料；只停自己啟動的 PID，正在用的 DbaGuy 不受影響） |
 
-測試 DB：PG `127.0.0.1:54317`（dbaguy/dbaguy，另有 `analytics` database）；MySQL `127.0.0.1:33067`（dbaguy/dbaguy，root 同密碼，databases `dbaguy` 與 `analytics`，seed 在 `dev/mysql/init/`）；SQL Server `127.0.0.1:14337`（sa 與 dbaguy 密碼皆 Dbaguy_dev1；dbaguy 只能開 dbaguy、analytics；amd64 映像經 Rosetta，啟動約 20–40 秒；seed 在 `dev/mssql/init/`，由 `mssql-init` 執行）；SSH bastion `127.0.0.1:2222`（dev/dev，可連到 `postgres:5432`、`mysql:3306` 與 `mssql:1433`）。都只綁 `127.0.0.1`。MySQL 的 seed 只在第一次建 volume 時執行，改了 seed 要重建：`docker compose -f dev/docker-compose.yml rm -sfv mysql && docker compose -f dev/docker-compose.yml up -d --build --wait`（SQL Server 同理：`rm -sfv mssql mssql-init`）。
+測試 DB：PG `127.0.0.1:54317`（dbaguy/dbaguy，另有 `analytics` database）；MySQL `127.0.0.1:33067`（dbaguy/dbaguy，root 同密碼，databases `dbaguy` 與 `analytics`，seed 在 `dev/mysql/init/`）；SQL Server `127.0.0.1:14337`（sa 與 dbaguy 密碼皆 Dbaguy_dev1；dbaguy 只能開 dbaguy、analytics；amd64 映像經 Rosetta，啟動約 20–40 秒；seed 在 `dev/mssql/init/`，由 `mssql-init` 執行）；Couchbase Enterprise 7.6.12（arm64）`127.0.0.1` 的 8091／8093／18091／18093（同號：`nodeServices` 回報 server 自己的 port；沒開 KV port），cluster admin `dbaguy`/`dbaguy`、受限使用者 `dbaguy_reader`/`dbaguy`（只有 `dbaguy.app.users` 的 `query_select`＋`data_reader`）；bucket `dbaguy`（scope `app`；scope `many` 有 300 個 collection）與 `travel-sample`，約 1.2 GiB，seed 在 `dev/couchbase/`，由 `couchbase-init` 執行（第一次約 1.5 分鐘，`up --wait` 98 秒），種完保持閒置；SSH bastion `127.0.0.1:2222`（dev/dev，可連到 `postgres:5432`、`mysql:3306`、`mssql:1433` 與 `couchbase:8093`）。都只綁 `127.0.0.1`。MySQL 的 seed 只在第一次建 volume 時執行，改了 seed 要重建：`docker compose -f dev/docker-compose.yml rm -sfv mysql && docker compose -f dev/docker-compose.yml up -d --build --wait`（SQL Server 同理：`rm -sfv mssql mssql-init`；Couchbase：`rm -sfv couchbase couchbase-init`，兩個都要刪，只重建 `couchbase` 的話閒置的 `couchbase-init` 不會再種）。Couchbase 的 TLS 測試用的 CA 不入庫，測試時從 `/pools/default/trustedCAs` 取。
 
 開發用 backend 固定在 port `18765`（`DBAGUY_DEV_PORT` 可覆寫）。Token 由 `scripts/dev.sh` 每次啟動時隨機產生，傳給 backend（`DBAGUY_TOKEN`）、Vite（`VITE_BACKEND_TOKEN`）與 Tauri dev（`DBAGUY_DEV_BACKEND_TOKEN`）；`.env.development` 只放 URL，沒有固定 token。Backend 沒有 `DBAGUY_TOKEN` 會拒絕啟動（自己手動跑 uvicorn 時要自行設定），且只接受 Host 為 `127.0.0.1`／`localhost` 的請求（`TrustedHostMiddleware`）。
 
 ## 架構重點
 
 - 新增 engine：在 `adapters/<engine>/` 實作 `DatabaseAdapter` / `DatabaseConnection` / `StatementResult`，到 `container.default_registry()` 註冊；分頁、取消、事件都不用重寫。
+  - 也要實作 `arm_cancel()`／`disarm_cancel()`：worker 在最後一次檢查取消前 arm；armed 期間 `cancel()` 只保留這個取消，`run()` 一進來就丟 `StatementCancelled`、什麼都不送。共用的 helper 是 `adapters/cancel_window.py`。少了它們，剛好落在 `run()` 之前的取消會遺失（語句照跑完）。
 - WS 執行協定：`domain/execution.py`。結果分頁暫停時佔住連線；新指令會先 discard。
 - PG 採 text-first 載入（只有 bool/int2/int4/float/bytea 用原生型別），大數字與 JSON 不失真。Adapter 的 `fetch()` 回傳原始值，轉成 JSON-safe cell（`values.encode_row`）統一在 `SessionWorker` 做。
 - PG 交易中（`BEGIN` 之後）的單一 SELECT／VALUES／TABLE／WITH 走 server-side cursor（DECLARE/FETCH），提前關閉結果只會 `CLOSE`，不會取消語句而 abort 交易；其他會回傳列的語句在交易中改用 buffered。交易外照舊用 `stream()`。`finished` 事件帶 `transaction_failed`（交易已 abort，只能 ROLLBACK）。`COPY … FROM STDIN／TO STDOUT` 直接拒絕（`unsupported_copy`）。
@@ -94,6 +97,17 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
   - Metadata 連線（物件樹、detail、補全 snapshot）設 `READ UNCOMMITTED`、`LOCK_TIMEOUT 5000`、`XACT_ABORT ON`：別的 session 未 commit 的 DDL（例如手動 commit tab 裡的 ALTER）不會卡住樹與補全；snapshot 的名稱用 catalog view join，不用會鎖物件的 `COL_NAME`／`OBJECT_NAME`；還是要鎖的（`OBJECT_ID`、`OBJECT_DEFINITION`）5 秒後回「被另一個 session 未 commit 的變更鎖住」，不重連。
   - 通用（所有 engine）：含 U+0000 的文字在安全檢查前就被拒絕（driver 會在 NUL 截斷）；DbaGuy 自己組的字串常值不含原始 NUL（T-SQL 接 `NCHAR(0)`、MySQL 用 `\0`、SQLite 接 `char(0)`；PG 的文字本來就不能有 NUL）。
   - dev 的 `mssql-init` 種完資料後保持閒置，讓重複的 `up --wait` 成功。
+- Couchbase（Query Service REST，stdlib `http.client`，不用 SDK）：
+  - 不經 SDK 的理由：數字與 key 順序不失真（`1.10`、int64 邊界、超出 double 的指數都原樣）、沒有 C++ 的 abort 路徑會讓整個 sidecar 掛掉、signature 比列先到。回應邊到邊解析（`stream.py`）；JSON／JSONL 匯出寫的是 server 的原文。
+  - 連線：每個 session 一條 keep-alive HTTP 連線，閒置 < 30 秒才重用（server 實際留 ≥ 65 秒，A9）；只有 READ 遇到被 server 關掉的連線、而且一個回應 byte 都還沒到時才重送一次。port 沒填（或就是 TLS 模式的預設 query port）、沒有 SSH、`discover_nodes` 不是 false 時，用 cluster 的 `nodeServices` 找出所有 query node（填了自己的 port 或走 SSH 就是「只連這個」），連不上就換下一個；帳密或 TLS 錯誤立刻停（不會每個 node 都試）。
+  - 取消＝從任一執行緒對連線建立時保留的 socket 副本做 shutdown（不碰 `SSLSocket`，TLS 下也 0–1 ms 就中斷阻塞的讀取，A10），server 把請求標成 `closed`；提前關閉讀到一半的結果也一樣。不送 server 的 `timeout`：tab 的 timeout 由 worker 計時，server 自己的 timeout（1080）原文顯示。`arm_cancel()`／`disarm_cancel()` 用共用的 `CancelWindow`。
+  - 暫停的結果：暫停中的請求佔住 server 一個 servicer（每 node 32 個），而且 7.6.12 在 client 停止讀取 77–86 秒後會自己砍掉請求（1203 `service.slow_client`，A13：原先假設的 120 秒不成立）。所以 `PAUSED_RESULT_MAX_IDLE_S = 45`，**從結果的第一次暫停起算，Load more 不重算**（500 列的 Load more 由 server 17–37 MB 的 buffer 供應，不會讓 server 的停滯時鐘歸零），housekeeping 每 15 秒，所以暫停後 45–60 秒關閉，訊息說明原因，已載入的列保留、標 partial，不會出現 Reconnect。暫停時有上限的預讀（讓放得進 buffer 的結果可以一直 Load more）是 04b 的 carry。
+  - 欄位：依 signature 的順序；`*` 依首頁（500 列／8 MiB）的 key 展開，`SELECT META(d).id, * FROM ks AS d` 的 `{"id", "d": {…}}` 也展開 alias；首頁之後才出現的 key 進 `(other fields)`；MISSING 與 JSON cell（`JsonText`、`MISSING`、`ColumnCategory.MIXED`），數字原文保留。
+  - 每次請求帶 query context（協定裡 `None`＝沒有 context；前端預設送 profile 的 database，即 `SessionInfo.server.default_query_context`，選擇器是 04b）；參數 literal 原文進 request body（`sessions/options.py` 檢查名稱與 JSON 形狀、不 echo 值）。
+  - 唯讀＝每個請求（含 metadata）`readonly=true`＋分類器。server 以 1000 擋下實測過的寫入：DML、index／scope／collection／function／sequence 的 DDL、`EXECUTE FUNCTION`（含會寫入的 JS function）、`NEXT VALUE FOR`、EXECUTE 寫入的 prepared、對 `system:` 的 DELETE、GRANT／REVOKE、`FLUSH COLLECTION`；**`UPDATE STATISTICS`（含 `ANALYZE` 寫法）在 `readonly=true` 下照樣執行**，會把 optimizer statistics 寫進 `_system._query`，只有分類器擋（`test_safety.py`，M1）。
+  - 沒有交易（`transactions=false`）：`BEGIN WORK` 等逐句拒絕（`transactions_unsupported`），前端不顯示 auto-commit／Commit／Rollback。
+  - SQL++ 只用關鍵字分類（`KEYWORD_ONLY_DIALECTS`：沒有 sqlglot 方言，warm-up 不解析它）；引號與 literal 只從 `sql/dialects.py` 來（literal＝JSON）。物件樹與 snapshot 來自 system catalogs：具名參數、`readonly=true`、依使用者權限過濾。
+  - 實測（7.6.12 EE）：`--` 註解在 CR 結束（A6）；server 不把 NBSP／U+2003／U+3000／ZWSP／BOM 當空白（A7，VT 也不行，TAB／FF 可以）；dev 的 18093 憑證 SAN 只有 `127.0.0.1`，verify-full 對 `127.0.0.1` 通過（A11）。
 - 密碼只在 Keychain；`save_password=false` 的連線，在連線設定或 unlock 對話框輸入的密碼只暫存在記憶體到 app 結束。缺少的密碼（含 SSH 密碼驗證的 SSH 密碼）回 `password_required`，`detail` 指出缺哪一個。
   - Keychain service 由 data dir 決定（`container.keychain_service`）：預設的 `~/Library/Application Support/DbaGuy` 用 `app.dbaguy`；`DBAGUY_DATA_DIR` 指到別處（`scripts/dev.sh` 的 `dev/data`、測試、臨時 sidecar、`measure-startup.sh`）一律用 `app.dbaguy.dev`，開發時存的密碼不會寫進或讀到正式 app 的項目。這個改動之前 dev 存在 `app.dbaguy` 的密碼要重新輸入。
 - SSH tunnel：ssh 跑在一個 `/bin/sh` watchdog 底下，watchdog 的 stdin 是只有 backend 持有的 pipe，backend 一結束（含 SIGKILL）ssh 就跟著結束。Tunnel 以完整 SSH 設定與 SSH 密碼指紋為 key；連線測試一律用自己的 tunnel。
@@ -102,6 +116,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
   - `backend/entry.py` 先呼叫 `multiprocessing.freeze_support()`（防護用）：multiprocessing 若要啟動輔助程序，會重新執行凍結後的執行檔，少了這行每個子程序都會再啟動一個 backend，無限遞迴。以前 loguru 的 `enqueue=True` 會觸發這件事（resource tracker），現在已不用 `enqueue`。
   - MySQL 只打包 pure driver：spec 排除 C extension（`_mysql_connector`，連同它帶的 dylib）以及用不到的 aio、Django、OpenTelemetry instrumentation、Kerberos／LDAP／OCI／OpenID／WebAuthn plugin。`collect_submodules("mysql.connector")` 保留以 importlib 載入的 locales 與 auth plugins；sqlglot 的 MySQL 方言跟 PG／SQLite 一樣按名稱列在 hidden imports。Pure 套件在 PYZ 裡，不會出現在 `_internal/`，所以打包後的檢查是讓凍結的 sidecar 實際連 dev MySQL 跑一次查詢。
   - SQL Server：pymssql 的 `_mssql`／`_pymssql`（FreeTDS 連在裡面）與它自帶的 OpenSSL（`pymssql/.dylibs/libssl.3.dylib`、`libcrypto.3.dylib`）隨 sidecar 打包；spec 把兩個 extension 與 sqlglot 的 T-SQL 方言按名稱列在 hidden imports（`driver.py` 的 import 與 PyInstaller 的 hook 本來就會收，列名稱是保險）。PyInstaller 把 `@loader_path/.dylibs/…` 改寫成 `@rpath/…`（rpath `@loader_path/..`），`_internal/libssl.3.dylib`、`libcrypto.3.dylib` 是指向 pymssql 副本的 symlink，Python 的 `ssl`（MySQL TLS）也用這一份（和 Homebrew 的同為 OpenSSL 3.6.3、同一組設定）；psycopg_binary 自帶另一份。`build-backend.sh` 在 bundle 裡找不到 `_mssql*.so` 就失敗。sidecar 裡每個 `.so`／`.dylib` 都過 `codesign --verify --strict`，`finalize-app.sh` 不必另外重簽；bundle 的 libcrypto 版本和 venv Python 的 `ssl.OPENSSL_VERSION` 不同時 `build-backend.sh` 失敗。打包後的檢查：凍結的 sidecar 以 TLS 登入 SQL Server、分類 T-SQL、列物件樹、串流含即時訊息的批次，也測過取消。
+  - Couchbase：只用標準函式庫（`http.client`、`ssl`、`socket`、`json`、`decimal`），`collect_submodules("dbaguy_backend")` 本來就收得進來，spec 不需要 hidden import，sidecar 沒有新相依（48,896 → 49,020 KB）。打包後的檢查：凍結的 sidecar 以明文、verify-ca、verify-full 連 dev cluster（TLS 走 bundle 的 `ssl`）、分類 SQL++、列 300 個 collection、串流第一頁、取消（server 標 `closed`）、暫停 45 秒後關閉。
 - Backend 意外結束（Tauri）：前端（`src/app/BackendBanner.tsx`）立刻自動重啟，5 分鐘內最多 3 次，再多就顯示手動 Restart 的 banner；editor 內容在前端，重啟後照樣存到新 backend，開著的結果、交易與 session 都沒了（tab 提供 Reconnect）。
 - 選單（`src-tauri/src/menu.rs`）：照 Tauri 預設選單，但 Close Window 改成 ⌘⇧W，⌘W 留給前端關 tab（預設的 Close Window 綁 ⌘W，打包版會直接關掉整個視窗）。
 - Log：stderr 與 `~/Library/Logs/DbaGuy/backend.log` 都跟著 `DBAGUY_LOG_LEVEL`（預設 INFO）。SQL 文字是 DEBUG，只有明確開 DEBUG 才會寫進檔案（`scripts/dev.sh` 會開）。
@@ -138,7 +153,20 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
   - T-SQL 補全的範圍是整個批次（`;` 不切分）。
   - 每句多 2 次 round trip（狀態讀取＋describe），之後的效能項目。
   - 串流以絕對預算驗收（10 萬列 ≤ 2.0 秒、一頁 ≤ 25 ms）：本機實測（含 driver 防護每列的計數）10 萬列 0.27–0.32 秒、最慢一頁 ≤ 3.0 ms。
-- 打包版量測（Apple Silicon、macOS 26；03b 時量，已加入 mysql-connector 與 pymssql）：冷啟動到第一個 API 請求約 1.2–1.4 秒（每次重新 build 後的第一次啟動約 4 秒）；各程序 RSS 加總約 269–297 MB（上限值，共用頁面重複計算），`footprint` 加總約 173 MB（backend 約 72 MB）。和 03a（0.9–1.1 秒、156 MB）的差距沒有在 app 層級驗證過：只有 sidecar 做過同機 A/B（03a 與 03b 都約 0.47 秒、70–72 MB），所以差距不在 backend，原因（外殼、前端或機器負載）未查。Sidecar 約 41 MB → 約 49 MB：加入 SQL Server 多約 7 MB（`_mssql`／`_pymssql` 與 OpenSSL 共 6.9 MB），加入 MySQL 只多約 0.3 MB；如果讓 PyInstaller 自動收進 mysql 的 C extension 與它帶的 dylib，會再多約 13 MB。
+- Couchbase：
+  - 欄位：沒有 `*` 的結果，首頁之後才出現、signature 以外的 key 只有一則 WARNING（JSON／JSONL 匯出看得到全部）；`*` 的結果多一欄 `(other fields)`，而且第一批列要等首頁（≤ 500 列／8 MiB）讀完才出現。
+  - CSV／TSV 裡 NULL 與 MISSING 都是空字串，要分辨用 JSON 匯出。
+  - TLS：只信任 OpenSSL 預設的 CA bundle（不讀 macOS 鑰匙圈，打包版不一定找得到預設 bundle），verify-ca／verify-full 通常要給 cluster 的 CA 檔；SSL mode `prefer`＝`disable`（Couchbase 的 TLS 在另一個 port，沒有東西可以試），也就是明文 HTTP，連線對話框有提示。
+  - 多節點探索、`alternateAddresses`、Reconnect 換 node 只用 fixture 與單節點 dev 驗過（公司 cluster 的檢查清單）；探索在 worker 開連線時阻塞，每個 seed 最多 3 秒，DNS 與 connect 不會被取消打斷。
+  - 暫停：活躍使用 Load more 的結果也在第一次暫停後 45–60 秒關閉（列保留）；放得進 buffer 的結果可以一直 Load more 要等 04b 的預讀。server 在 77–86 秒的自砍是 7.6.12 實測，別的版本沒量。
+  - 受限使用者：`query_select`＋`data_reader` 不能列 `system:indexes`（A18），樹在 collection 下顯示提示列「No indexes shown (may need query_system_catalog)」，那不代表真的沒有 index；順序掃描要 `query_use_sequential_scans`，缺了 server 回 13014 並指出缺的角色，原文顯示。
+  - 唯讀：`UPDATE STATISTICS`／`ANALYZE` 在 7.6.12 的 `readonly=true` 下照樣執行，只有分類器擋（M1，見上）；EXPLAIN FUNCTION 在唯讀下沒測過。
+  - EXPLAIN／ADVISE 在 04a 以一欄 JSON 顯示（plan 檢視是 04b）；`ADVISE` 對 dev 的 `app.users` 失敗，server 回 5001（server 的 bug，A15；`app.orders` 正常）。
+  - Lexer：雙引號字串裡的 `""` 在 server 不是跳脫（`SELECT RAW "a""b"` 是語法錯誤 3000；單引號與 back-tick 的才是），lexer 把它讀成一個字串。兩種讀法吃掉的字元一樣，切句與安全檢查不受影響，只是 server 會拒絕該語句。
+  - Formatter：sql-formatter 的 n1ql 模式不認 `@name` 參數，含 `@name` 的語句按 Format 只會顯示既有的「Could not format」toast、文字不動；它也會把 `'it''s'` 拆成兩個字串，由 `sql/format_guard.py` 擋下（所有方言都過這個守衛）。
+  - 串流以絕對預算驗收（10 萬列、500 列一頁、含 `encode_row` ≤ 4.0 秒）：本機實測 0.76–1.12 秒。
+- 打包版量測（Apple Silicon、macOS 26；04a 時量，已加入 Couchbase；`scripts/measure-startup.sh` 跑 6 次，其中 3 次用同一份腳本加上 `footprint`）：冷啟動到第一個 API 請求約 1.1–1.2 秒（6 次裡有 4 次；一次 2.0 秒；每次重新 build 後的第一次啟動約 4 秒，這次 3.9 秒）；各程序 RSS 加總 263–299 MB（上限值，共用頁面重複計算），`footprint` 加總 175–177 MB（backend 72–75 MB）。和 03b（1.2–1.4 秒、269–297 MB、約 173 MB、backend 約 72 MB）相比沒有變化。Sidecar 48,896 → 49,020 KB（Couchbase 只用標準函式庫，多約 0.1 MB；之前的 41 → 49 MB 是 SQL Server 約 7 MB、MySQL 約 0.3 MB；03a 的 0.9–1.1 秒、156 MB 的差距仍沒有在 app 層級驗證，sidecar 同機 A/B 都約 0.47 秒、70–72 MB，不在 backend）。
+  - Couchbase（凍結的 sidecar 連 dev cluster）：第一頁（500 列，`SELECT META(d).id, * FROM events AS d`）31–64 ms，剛啟動的 sidecar 的第一次查詢曾量到 103 ms、另一次 42 ms（目標 < 100 ms）；300 個 collection 的樹第一次 39 ms、之後 8–9 ms（根 3 ms）；分頁讀 100 萬列（每列約 230 位元組、每頁 10,000 列、暫停 10 秒再繼續）：RSS 尖峰 99–104 MB，重複跑也不再上升，`footprint` 91 MB 持平（沒有累積）。RSS 的「增加」看基準線：從剛啟動並跑過一次查詢的 96 MB 起算增加 8 MB（目標 < 30 MB）；sidecar 閒置一陣子、macOS 把 RSS 收到 41 MB 之後再跑，增加 22–58 MB（隨基準線），尖峰一樣約 99–100 MB，所以那是一頁 10,000 列的工作集重新載入，不是累積。取消長聚合查詢 3 ms，server 標 `closed`。
 
 ## 進度
 
@@ -147,7 +175,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
 | ① | 地基：Tauri + sidecar、adapter 介面、連線管理、PG + SQLite 物件瀏覽 | 完成 |
 | ② | 核心查詢流程：編輯器、結果 grid、執行範圍、取消、history、安全 | 完成（followups：[02a](docs/superpowers/notes/2026-10-16-02a-query-backend-followups.md)、[02b](docs/superpowers/notes/2026-10-16-02b-grid-and-data-followups.md)、[02c](docs/superpowers/notes/2026-10-16-02c-editor-and-query-followups.md)，含打包版待驗清單與後續子專案的 carries） |
 | ③ | MySQL + MSSQL adapter | 完成（followups：[03a](docs/superpowers/notes/2026-10-18-03a-dialects-and-mysql-followups.md)、[03b](docs/superpowers/notes/2026-10-18-03b-sql-server-followups.md)，含公司 SQL Server 檢查清單與打包版待驗清單） |
-| ④ | Couchbase 一級支援 | 未開始 |
+| ④ | Couchbase 一級支援 | 進行中：04a 完成（SQL++ 方言、HTTP 引擎、dev cluster）；04b、04c 待做 |
 | ⑤ | Grid 內編輯（暫存修改、預覽 DML、一次 commit） | 未開始 |
 | ⑥ | 資料工具：SQL dump／還原、跨 DB 傳輸 | 未開始 |
 | ⑦ | ER 圖（唯讀） | 未開始 |

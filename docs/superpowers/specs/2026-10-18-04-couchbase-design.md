@@ -29,7 +29,7 @@
 - context `dbaguy.app` 下跑 `SELECT META(d).id, * FROM events AS d`：本機第一頁 < 100 ms，2 萬列逐頁載入；欄位依文件存放順序；文件沒有的欄位顯示灰色 `MISSING`。
 - int64 邊界文件（`u_numbers`）每個值與存放原文一致（`9007199254740993`、uint64 max、20 位數、`1.10`、長 π、`1E+3`、`1e400`）。
 - 245 秒的聚合查詢按 Cancel：1 秒內結束，server 端該請求為 `closed`，同 tab 立刻可再跑。串流中途關閉結果同樣立即釋放。
-- 暫停的結果 120 秒沒有載入更多 → 自動關閉並說明原因；已載入的列留著，狀態列顯示 `(partial)`。
+- 暫停的結果從第一次暫停起 45–60 秒 → 自動關閉並說明原因（Load more 不重算；7.6.12 的 server 在 77–86 秒自己會砍，見 R-04-6）；已載入的列留著，狀態列顯示 `(partial)`。
 - 唯讀 profile：`INSERT` 被 DbaGuy 擋；繞過分類器的寫入（例如 `EXECUTE` 一個寫入的 prepared statement）被 server 以 1000 拒絕。
 - `BEGIN WORK` 被明確拒絕；Couchbase tab 的 toolbar 沒有 Auto-commit／Commit／Rollback／交易徽章。
 - 參數：`SELECT $n + 1 AS n1`、`$n = 9007199254740993` → `9007199254740994`；有參數沒給值時不送出並指出是哪個。
@@ -53,7 +53,7 @@ R-04-x 是 coordinator 的裁決；D-04-x 是本設計的決定。全文的引�
 | **R-04-3** 開發環境 | CE 7.6.2；**EE 7.6.12** | **EE**。CE 沒有 ADVISE、UPDATE STATISTICS、CBO 估計、`profile` 輸出，RBAC 只有 admin／ro_admin／bucket_full_access（調查 §0.7、§9.1）；公司 cluster 多半是 EE。開發／測試使用免費，repo 只引用 image tag。一次性 `couchbase-init` 依 調查 §9.2–9.3 seed，假帳密、只綁 127.0.0.1。EE 專屬功能偵測 edition，在 CE 上顯示「Community Edition 不提供」而不是失敗。 |
 | **R-04-4** 交易 | v1 支援 REST 交易（`txid`＋固定 node）；**v1 不支援** | **不支援**。〔實測〕沒有 `txid` 時 `BEGIN WORK` 開了一個沒人會加入的交易，`COMMIT`／`ROLLBACK`／`SAVEPOINT` 回 17002（調查 §0.5）。TRANSACTION 類語句明確拒絕（`transactions_unsupported`）；新能力 `transactions: bool`（Couchbase 為 False）讓前端隱藏 Auto-commit／Commit／Rollback／交易徽章。之後的 v1.x 可用 `txid`＋同一 node（調查 §10 的表）。 |
 | **R-04-5** 取消與 timeout | `DELETE FROM system:active_requests`；SDK cancel；**任一執行緒 shutdown socket** | **shutdown socket**：〔實測〕0 ms、server 立即標成 `closed`，任何使用者都能做；DELETE 需要 admin（CE）或 `query_system_catalog`（EE），一般使用者連自己的請求都看不到（調查 §3.7）。`status:"stopped"`（別人停掉的）視為取消；server 自己的 timeout（1080）原樣顯示。**不送 server `timeout`**：它在 client 暫停時照樣計時，恢復後以 1080 結束（調查 §3.4）；worker 既有的計時器（涵蓋 `run()`＋第一頁）負責 tab timeout。 |
-| **R-04-6** 暫停的結果 | 不處理；**閒置 120 秒自動關閉** | **自動關閉**。〔實測〕暫停中的請求在 server 上仍是 `running`，佔住一個 servicer（EE 7.6.12 每 node 32 個）（調查 §3.8）。120 秒沒有 `fetch_more` 就關閉並在 Messages 說明「為釋放 query node 已關閉；要更多列請重跑」，已載入的列保留。秒數只定義一次：`adapters/couchbase/adapter.py` 的 `PAUSED_RESULT_MAX_IDLE_S = 120.0`，經能力欄位 `paused_result_max_idle_s` 傳給 worker（§3.7.4）。 |
+| **R-04-6** 暫停的結果 | 不處理；**暫停 45 秒後自動關閉（從第一次暫停起算）** | **自動關閉**。〔實測〕暫停中的請求在 server 上仍是 `running`，佔住一個 servicer（EE 7.6.12 每 node 32 個）（調查 §3.8）。**A13 不成立**：client 停止讀取的請求，7.6.12 在 77–86 秒後自己結束（1203 `service.slow_client`，狀態 `fatal`，之後的 Load more 只拿到 buffer 裡的列再被截斷），所以 120 秒的原設計會輸給 server；改成 **45 秒**（housekeeping 每 15 秒，實際 45–60 秒關閉，離 server 最早的 77 秒至少 17 秒）。時鐘從結果的**第一次**暫停起算，Load more 不重算（R-04a-T11b）：一次 500 列的 Load more 由 17–37 MB 的 buffer 供應，不會讓 server 的停滯時鐘歸零。關閉時在 Messages 說明「為釋放 query node 已關閉；要更多列請重跑」，已載入的列保留。秒數只定義一次：`adapters/couchbase/adapter.py` 的 `PAUSED_RESULT_MAX_IDLE_S = 45.0`，經能力欄位 `paused_result_max_idle_s` 傳給 worker（§3.7.4）。04b 的計畫帶「暫停時有上限的預讀」。 |
 | **R-04-7** `*` 的欄位 | (a) 串流中途重送欄位；(b) **signature 順序＋首頁 key 聯集，之後的 key 進溢出欄** | **(b)**，評估見下方「R-04-7 評估」。另加 D-04-1 的 alias 展開。 |
 | **R-04-8** MISSING ≠ NULL | 當 NULL；**獨立的 cell 標記** | 獨立標記 `{"$type":"missing"}`，grid 顯示灰色 `MISSING`；copy 與 CSV 為空字串；從 grid 複製成 JSON／JSONL 時省略該 key；JSON／JSONL 匯出本來就是 server 原文（R-04-15）。〔實測〕列裡可以同時有缺的 key 與 `null`（調查 §3.2）。 |
 | **R-04-9** Query context | 每個 profile 一個；**每個 tab 一個**，每次請求都送 | **每個 tab**：`{bucket, scope?}` 放在 tab 狀態與 workspace，toolbar 有選擇器，`execute`／`export` 每次帶上；點樹上 bucket／scope／collection 設定目前 tab 的 context（FP §4 Must 2）。Profile 的 database 欄位＝預設 context。〔實測〕`default:bucket.scope`、`bucket.scope`、`default:bucket` 與 back-tick 名稱都可用（調查 §3.4）。 |
@@ -74,7 +74,7 @@ R-04-x 是 coordinator 的裁決；D-04-x 是本設計的決定。全文的引�
 | **D-04-9** 文件操作的連線 | session 連線；**metadata 連線，寫入不重試** | 文件 tab 不綁 query tab 的 session；metadata 連線本來就是每個 profile 一條、閒置關閉。`MetadataService.with_connection()` 斷線會重試一次，寫入要關掉（`retry=False`）；有 CAS 的 replace／remove 就算重送也只會變成衝突，但 insert 會誤報「已存在」。 |
 | **D-04-10** Plan 分析放哪 | 前端 TS；**backend（`adapters/couchbase/explain.py`）** | 反模式規則是「容易出錯的邏輯」，backend 有 pytest；前端只畫樹。`POST /couchbase/plan` 收 plan 原文、回正規化的樹＋標記＋advice。 |
 | **D-04-11** 雙擊 collection | 表格資料 tab；detail tab；**開新的 query tab（帶 context 與瀏覽語句）** | 表格資料 tab 的 SELECT／篩選／排序是關聯式的；Couchbase 使用者本來就是寫 SQL++ 看資料。新 tab 的 context 設成該 scope，內容 ``SELECT META(d).id, * FROM `c` AS d``（兩行），不自動執行（「別耍聰明」，M5）。不加 LIMIT：分頁＋R-04-6 已保護 query node。Detail 從右鍵選單開。 |
-| **D-04-12** 120 秒怎麼計 | 每次暫停一個 Timer；**housekeeping（每 15 秒）** | 沿用閒置交易檢查的作法與 token 防競態（`SessionStateTracker.unchanged_since` 的模式）。實際在 120–135 秒之間關閉，夠用。 |
+| **D-04-12** 45 秒怎麼計 | 每次暫停一個 Timer；**housekeeping（每 15 秒）** | 沿用閒置交易檢查的作法與 token 防競態（`SessionStateTracker.unchanged_since` 的模式）。從第一次暫停起算、Load more 不重算（R-04a-T11b）；實際在 45–60 秒之間關閉，夠用。 |
 | **D-04-13** 交易語句在哪拒絕 | SafetyPolicy；**Couchbase adapter 的 `run()`** | 這不是安全決策而是引擎能力；SafetyPolicy 的 BLOCK 只有「唯讀」語意。adapter 用 `classifier.is_transaction_statement(sql, Dialect.SQLPP)`（與分類器同一張 `_TRANSACTION_STARTS`，DRY）在送出前拒絕。 |
 | **D-04-14** keep-alive 重用 | 每句新連線；**閒置 < 30 秒才重用；讀取類可重送一次** | TLS 握手每句一次在遠端 cluster 上明顯變慢。重用的連線在「還沒收到任何回應」就斷，只有語句被分類為 READ 時（worker 傳 `retry_safe`）才換新連線重送一次；其他回 `connection_lost`。〔未實測，A9〕server 的 idle 關閉時間。 |
 | **D-04-15** SQL++ 字串 literal | 單引號＋跳脫；**JSON 字串（雙引號）** | SQL++ 的雙引號是字串、跳脫規則與 JSON 相同，所以 `json.dumps(value, ensure_ascii=False)` 就是正確的 literal；物件／陣列 literal 也直接是 JSON。〔實測〕`\'`、`\"`、`\n`、`\t` 與 `\u` 四位 hex 的 Unicode 跳脫可用（調查 §8.1）；其餘跳脫 **〔未實測，A4〕**。 |
@@ -281,7 +281,7 @@ sqlglot 沒有 N1QL／SQL++ 方言（〔實測〕30.23.0 為最新）。SQLPP �
 #### 3.3.5 安全（`services/safety.py`）
 
 - 唯讀：READ 放行；TRANSACTION 在 Couchbase 由 adapter 拒絕；SESSION 沒有 SQLPP 條目 → 擋（SQL++ 本來就沒有 session 設定語句）；其餘擋。
-- 第二層：唯讀 profile 的每個請求（含 metadata 與文件的讀取）都送 `readonly=true`。〔實測〕server 拒絕 INSERT／UPSERT／UPDATE／DELETE／MERGE、所有 DDL、BEGIN WORK、CREATE FUNCTION、EXECUTE FUNCTION、`DELETE FROM system:active_requests`、`NEXT VALUE FOR`，以及 `EXECUTE` 一個寫入的 prepared（調查 §3.6）。CTE、EXPLAIN FUNCTION、ADVISE 在 `readonly=true` 下的行為 **〔未實測，A12〕**。
+- 第二層：唯讀 profile 的每個請求（含 metadata 與文件的讀取）都送 `readonly=true`。〔實測〕server 拒絕 INSERT／UPSERT／UPDATE／DELETE／MERGE、所有 DDL、BEGIN WORK、CREATE FUNCTION、EXECUTE FUNCTION、`DELETE FROM system:active_requests`、`NEXT VALUE FOR`，以及 `EXECUTE` 一個寫入的 prepared（調查 §3.6）。〔實測，A12〕CTE 與 ADVISE 在 `readonly=true` 下照常執行（EXPLAIN FUNCTION 沒有實測）。**例外（M1）：7.6.12 的 `UPDATE STATISTICS`（含 `ANALYZE` 寫法）在 `readonly=true` 下照樣執行**，會把 optimizer statistics 寫進 `_system._query`；其餘實測過的寫入（DML、index／scope／collection／function／sequence 的 DDL、`EXECUTE FUNCTION`（含會寫入的 JS function）、`NEXT VALUE FOR`、執行寫入的 prepared、`DELETE` 對 `system:`、GRANT／REVOKE、`FLUSH COLLECTION`）都被 server 以 1000 拒絕。所以唯讀 profile 的 `UPDATE STATISTICS` 只有分類器擋（`test_safety.py`）。
 - `server_read_only = True`（連線對話框不顯示 SQL Server 那段警語）。
 
 #### 3.3.6 補全的關鍵字（`sql/completion.py`）
@@ -463,7 +463,7 @@ sqlglot 沒有 N1QL／SQL++ 方言（〔實測〕30.23.0 為最新）。SQLPP �
 
 - `SessionWorker._pause()` 在 `_state_lock` 下記 `paused_since` 與一個遞增的 token；`_set_running(request)`、`_finish()` 清掉。
 - `WorkerHooks.paused_result_max_idle_s` 來自 adapter 能力（`SessionHooksFactory` 從 registry 取）。
-- `SessionManager.check_paused_results()` 由 container 的 housekeeping（每 15 秒）呼叫 → 每個 worker 的 `check_paused_result()`：暫停超過上限就 `_put(close_idle_paused(token))`；worker 執行緒上再確認 token 沒變、仍是同一個暫停的結果，才送 WARNING `Closed this result after 2 min without loading more rows, to free the query node — run the statement again to load more` 並 `_finish(ex)`。
+- `SessionManager.check_paused_results()` 由 container 的 housekeeping（每 15 秒）呼叫 → 每個 worker 的 `check_paused_result()`：距結果的**第一次**暫停超過上限（45 秒，R-04-6）就 `_put(close_idle_paused(token))`；Load more 不重算時鐘（它由 server 的 buffer 供應，不會讓 server 的停滯時鐘歸零；7.6.12 在 77–86 秒自己砍掉停滯的請求，A13）。worker 執行緒上再確認 token 沒變、仍是同一個暫停的結果，才送 WARNING `Closed this result 45 s after it first paused, to free the query node — run the statement again to load more, or export it to get every row`（文字由 `paused_result_closed_text(limit_s)` 組：整分鐘寫 `N min`，其餘寫 `N s`）並 `_finish(ex)`。
 - 前端不用改：`finished` 會把暫停中的 set 標成 `partial`，已載入的列留著；之後的 Load more 拿到 `no_open_result`（已結束的 execution 本來就不會再要）。
 
 #### 3.7.5 沒有交易（R-04-4）
@@ -710,7 +710,7 @@ TLS 測試用的 CA 不入庫：測試執行時從 `GET /pools/default/trustedCA
 | 需求 | 這個子專案怎麼解 | 踩到／退步 |
 |---|---|---|
 | Q1 輕快低記憶體 | 0 新 Python 相依；串流＋TCP backpressure，100 萬列 RSS 平穩（SDK 是 1.15 GB）；預讀上限 8 MiB、取樣 32 MiB | 每個 `*` 結果先預讀首頁（≤ 500 列）；dev 環境多 1.2 GiB（只影響開發機） |
-| Q2 穩定不丟工作 | 沒有 C++ abort 路徑（不用 SDK）；INFER 不自動跑、取樣不會弄垮 server；解析錯誤只會變成該句的錯誤；文件 tab 的未存內容進 workspace | 暫停 120 秒自動關閉會「拿走」使用者的暫停狀態——有訊息說明、列保留 |
+| Q2 穩定不丟工作 | 沒有 C++ abort 路徑（不用 SDK）；INFER 不自動跑、取樣不會弄垮 server；解析錯誤只會變成該句的錯誤；文件 tab 的未存內容進 workspace | 暫停 45 秒自動關閉會「拿走」使用者的暫停狀態——有訊息說明、列保留（server 自己 77–86 秒也會砍，所以不關也留不住） |
 | Q3 可信任 | 數字與 key 順序原文保留、MISSING ≠ NULL、server 強制唯讀、錯誤原文＋位置、存檔前顯示 server 會怎麼改、> int64 擋下、明文 HTTP 提示；密碼只在 Keychain、log 不含 header 與值 | 存檔仍會被 server 排序 key、正規化小數（B 方案的本質；有預覽與確認，SDK 方案可換） |
 | Q4 聚焦 | 遵守 FP §4 Won't 全部；三個 SQL++ Should 只做最便宜的（自動 back-tick），其餘列為之後 | — |
 | Q5 多引擎 | 走同一個 adapter／worker／協定；新增的都是通用能力（`RunOptions`、`presentation`、參數協定、`transactions`、MIXED cell），PG 之後可用參數與 plan 檢視 | 其他 adapter 要改 `run()` 簽章（一行）；tripwire 要承認「沒有 sqlglot 的方言」 |
@@ -737,7 +737,7 @@ TLS 測試用的 CA 不入庫：測試執行時從 `GET /pools/default/trustedCA
 |---|---|
 | 公司 cluster 的 edition／版本未知（INFER／ADVISE 的 bug、CBO、profile 都看它） | edition 偵測；EE 功能在 CE 停用；INFER 不自動跑；最終測試清單第一項就是看版本 |
 | 多節點、NAT（`alternateAddresses`）完全沒在真的 cluster 上測 | 探索失敗就退回 seed；SSH 永遠只連一個 node；R-04-14 的 Reconnect；列入最終測試清單 |
-| 很多 tab 同時暫停，佔滿 query node 的 servicer（每 node 32 個） | 120 秒自動關閉；`client_context_id`＋`User-Agent` 讓 DBA 看得出是 DbaGuy |
+| 很多 tab 同時暫停，佔滿 query node 的 servicer（每 node 32 個） | 45 秒自動關閉（第一次暫停起算）；`client_context_id`＋`User-Agent` 讓 DBA 看得出是 DbaGuy |
 | 打包版沒有 OpenSSL 預設 CA bundle，公開憑證的 cluster 驗證失敗 | fail closed＋提示設定 CA 檔；與 MySQL 同一個已知限制；之後可考慮 macOS trust store |
 | 未實測的回應形狀（A1、A15）讓 alias 展開或 plan 偵測不觸發 | 規則都退回無損的一般路徑；04a 第一個 task 先實測 |
 | `SELECT RAW $doc` 與實際存放不同（A2） | 04c 先實測；不同就改本地模擬並標「近似」 |
@@ -761,8 +761,8 @@ TLS 測試用的 CA 不入庫：測試執行時從 `GET /pools/default/trustedCA
 | A9 | query service 讓閒置的 keep-alive 連線活 ≥ 30 秒 | 04a 整合（閒置 35 秒後再查） |
 | A10 | TLS 下對 fd 副本 shutdown 能立即中斷讀取 | 04a T1 |
 | A11 | dev cluster 的 18093 憑證含 127.0.0.1（verify-full） | 04a T1 |
-| A12 | `readonly=true` 對 CTE、EXPLAIN FUNCTION、ADVISE 的行為 | 04a 整合 |
-| A13 | 暫停中的請求在 120 秒內不會被 server 自己關掉 | 04a 整合 |
+| A12 | `readonly=true` 對 CTE、EXPLAIN FUNCTION、ADVISE 的行為 | 04a 整合；〔實測〕CTE、ADVISE 照常執行，EXPLAIN FUNCTION 未測；**`UPDATE STATISTICS`／`ANALYZE` 在 `readonly=true` 下照樣執行**（M1，只有分類器擋），其餘寫入都被 1000 拒絕（§3.3.5） |
+| A13 | 暫停中的請求在 120 秒內不會被 server 自己關掉 | 04a 整合；〔實測〕**不成立**：77–86 秒後 server 自己結束（1203，`fatal`）→ 上限改 45 秒（R-04-6） |
 | A14 | query service 的錯誤回應（4xx／5xx）都是 JSON | 04a 整合 |
 | A15 | EXPLAIN 的 signature 形狀（字串或物件；兩者都處理） | 04a T1 |
 | A16 | `profile` 欄位在 metrics 之後、形狀 `executionTimings` | 04b |
@@ -801,12 +801,12 @@ TLS 測試用的 CA 不入庫：測試執行時從 `GET /pools/default/trustedCA
 - **R-04-2 細化**：「與編輯內容不同就預覽並確認」改成「**token** 不同才確認」。只差空白（server 一定會壓縮）也確認的話，每次存一份排版過的文件都要按一次確認，確認會變成反射動作而失去意義。
 - **R-04-12 細化**：token 比較不能逐字相同——`keyword_case` 預設 upper 會改關鍵字大小寫，逐字比較會拒絕所有格式化。規則：WORD 大小寫不敏感（SQLPP 只限保留字，因為 SQL++ 識別字大小寫敏感）、註解忽略空白，其餘逐字（§3.3.7）。
 - **R-04-15 細化**：JSONL 要一列一行，passthrough 文件的原文可能帶存放時的換行；寫入前在字串外壓掉空白，token 不變。JSON 陣列匯出則保留原文 byte。
-- **R-04-6 意見**：120 秒合理；housekeeping 每 15 秒檢查，所以實際是 120–135 秒（D-04-12）。若要精確可改成每次暫停一個 Timer，但目前沒有必要。
+- **R-04-6 意見**：原先認為 120 秒合理，但 A13 實測不成立（server 在 77–86 秒自己砍停滯的請求），改為 45 秒、從第一次暫停起算；housekeeping 每 15 秒檢查，所以實際是 45–60 秒（D-04-12）。若要精確可改成每次暫停一個 Timer，但目前沒有必要。
 - **R-04-8**：CSV 裡 NULL 與 MISSING 都是空字串（`null_text` 預設也是空），兩者在 CSV 無法區分——這是 CSV 的限制，需要分辨就用 JSON 匯出。
 - 其餘裁決照單全收，沒有發現錯誤。
 
 ## 13. 收尾時要更新的文件
 
-- `CLAUDE.md`：技術選型表的 Drivers 列把「couchbase 4.x（Couchbase）」改成「Couchbase：Query Service REST（stdlib `http.client`，無 SDK）」；Repo 結構加 `adapters/couchbase/` 的模組說明；開發指令與測試 DB 加 Couchbase（ports、帳密、seed、記憶體）；架構重點加 Couchbase 段落（REST＋增量解析、socket shutdown 取消、不送 server timeout、暫停 120 秒關閉、`*` 展開與溢出欄、MISSING、每 tab 的 query context、參數協定、沒有交易、文件經 SQL++ 與正規化預覽）；已知限制（存檔正規化、binary 唯讀、首頁之後的 key 在溢出欄、CA bundle、多節點未實測）；進度表 ④。
+- `CLAUDE.md`：技術選型表的 Drivers 列把「couchbase 4.x（Couchbase）」改成「Couchbase：Query Service REST（stdlib `http.client`，無 SDK）」；Repo 結構加 `adapters/couchbase/` 的模組說明；開發指令與測試 DB 加 Couchbase（ports、帳密、seed、記憶體）；架構重點加 Couchbase 段落（REST＋增量解析、socket shutdown 取消、不送 server timeout、暫停 45 秒關閉、`*` 展開與溢出欄、MISSING、每 tab 的 query context、參數協定、沒有交易、文件經 SQL++ 與正規化預覽）；已知限制（存檔正規化、binary 唯讀、首頁之後的 key 在溢出欄、CA bundle、多節點未實測）；進度表 ④。
 - feature-priorities §7「Couchbase」的「建議用 Python SDK」與「hidden import `pycbc_core`」已過時：在該段加註指向本 spec（不改寫研究文件本文）。
 - 每份 plan 的 followups note（`docs/superpowers/notes/`），含打包版待驗清單：真實 cluster 的版本與 edition、多節點探索與 Reconnect、TLS 與 CA、受限使用者的樹與 13014、取消與暫停關閉、文件存檔預覽與衝突。
