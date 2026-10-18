@@ -40,10 +40,10 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
   - `adapters/`：`base.py` 是 5 種 DB 共用的介面；每個 engine 一個子套件，在 `container.default_registry()` 註冊
     - `adapters/mysql/`：`settings`（連線參數、SSL、options）、`catalog`／`introspection`／`schema`（物件樹、DDL、補全用 snapshot）、`types`（型別表）、`adapter`（連線、執行、取消、交易）
     - `adapters/mssql/`：`settings`＋`freetds`（連線參數、URL 匯入、app 自己的 freetds.conf）、`catalog`／`introspection`／`schema`、`types`、`adapter`（連線、執行、交易）、`cancel`（取消的階段與決策）、`driver`（唯一 import pymssql 的地方；每次進 driver 都經 `GuardedConnection` 計數）
-    - `adapters/couchbase/`：`settings`（URL 匯入、seed、TLS、options）、`nodes`（`nodeServices` 探索）、`http`（keep-alive 連線；任一執行緒可 shutdown；唯一碰網路的地方）、`stream`（回應的增量解析）、`rows`（signature、`*` 與 alias 展開、溢出欄）、`messages`（server 錯誤、warnings、metrics 的文字與位置）、`jsontext`（不經 parse 的 JSON 原文）、`result`（一個回應＝一個 `StatementResult`）、`adapter`（連線、執行、取消、唯讀）、`catalog`（物件樹、DDL、補全用 snapshot）
+    - `adapters/couchbase/`：`settings`（URL 匯入、seed、TLS、options）、`nodes`（`nodeServices` 探索）、`http`（查詢的 keep-alive 連線；任一執行緒可 shutdown；`nodes` 的探索另外連 cluster manager）、`stream`（回應的增量解析）、`rows`（signature、`*` 與 alias 展開、溢出欄）、`messages`（server 錯誤、warnings、metrics 的文字與位置）、`result`（一個回應＝一個 `StatementResult`）、`adapter`（連線、執行、取消、唯讀）、`catalog`（物件樹、DDL、補全用 snapshot）
     - `adapters/cancel_window.py`：PG／MySQL／SQLite／Couchbase 共用的 arm 視窗（見「新增 engine」；SQL Server 用自己的 `cancel.py` 階段）；`adapters/sockets.py`：共用的 TCP keepalive
   - `sessions/worker.py`：每個 session 一條連線、一個執行緒；分頁、暫停、取消都在這裡通用處理；`sessions/options.py`：每次請求的選項與參數檢查（引擎只會收到它的能力欄位宣告過的選項）
-  - `sql/`：純函式的 SQL 文字處理（lexer、切分、分類、補全、copy/匯出格式、表格瀏覽 SELECT；`tsql.py` 是 T-SQL 批次內的語句切分；`format_guard.py` 是 formatter 的 token 守衛，所有方言：排版後的有意義 token 和原文不同就不採用）；API 位移一律 UTF-16，只在 `sql/offsets.py` 轉換。各方言的識別字引號與 literal 只從 `sql/dialects.py` 來，其他地方（含前端）不自己拼
+  - `sql/`：純函式的 SQL 文字處理（lexer、切分、分類、補全、copy/匯出格式、表格瀏覽 SELECT；`tsql.py` 是 T-SQL 批次內的語句切分；`format_guard.py` 是 formatter 的 token 守衛，所有方言：排版後的有意義 token 和原文不同就不採用；`jsontext.py` 是不經 parse 的 JSON 原文處理，Couchbase 的 JSON Lines 匯出用）；API 位移一律 UTF-16，只在 `sql/offsets.py` 轉換。各方言的識別字引號與 literal 只從 `sql/dialects.py` 來，其他地方（含前端）不自己拼
   - `services/`：profile、連線（含 SSH tunnel）、metadata、schema 快取、安全政策、history、設定／工作區／scripts
   - `api/`：FastAPI routers；WS 在 `api/sessions.py`
 - `src/`：React 前端；API 型別由 `npm run gen:api` 從 OpenAPI 產生（`src/lib/api/schema.d.ts`，不要手改）
@@ -100,9 +100,9 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
 - Couchbase（Query Service REST，stdlib `http.client`，不用 SDK）：
   - 不經 SDK 的理由：數字與 key 順序不失真（`1.10`、int64 邊界、超出 double 的指數都原樣）、沒有 C++ 的 abort 路徑會讓整個 sidecar 掛掉、signature 比列先到。回應邊到邊解析（`stream.py`）；JSON／JSONL 匯出寫的是 server 的原文。
   - 連線：每個 session 一條 keep-alive HTTP 連線，閒置 < 30 秒才重用（server 實際留 ≥ 65 秒，A9）；只有 READ 遇到被 server 關掉的連線、而且一個回應 byte 都還沒到時才重送一次。port 沒填（或就是 TLS 模式的預設 query port）、沒有 SSH、`discover_nodes` 不是 false 時，用 cluster 的 `nodeServices` 找出所有 query node（填了自己的 port 或走 SSH 就是「只連這個」），連不上就換下一個；帳密或 TLS 錯誤立刻停（不會每個 node 都試）。
-  - 取消＝從任一執行緒對連線建立時保留的 socket 副本做 shutdown（不碰 `SSLSocket`，TLS 下也 0–1 ms 就中斷阻塞的讀取，A10），server 把請求標成 `closed`；提前關閉讀到一半的結果也一樣。不送 server 的 `timeout`：tab 的 timeout 由 worker 計時，server 自己的 timeout（1080）原文顯示。`arm_cancel()`／`disarm_cancel()` 用共用的 `CancelWindow`。
+  - 取消＝從任一執行緒對連線建立時保留的 socket 副本做 shutdown（不碰 `SSLSocket`，TLS 下也 0–1 ms 就中斷阻塞的讀取，A10），server 把請求標成 `closed`；提前關閉讀到一半的結果也一樣。使用者的語句不送 server 的 `timeout`：tab 的 timeout 由 worker 計時，server 自己的 timeout（1080）原文顯示。內部的 metadata 查詢（`query()`：物件樹、snapshot、identify）送 `timeout: 30s`，client 端也在 40 秒收不到任何 byte 時放棄（socket timeout，每個 byte 重新計時）：沒有人能取消它們，`SessionWorker.close()` 打斷不了 `call()`，卡住的查詢會佔住 metadata worker 到 `call()` 120 秒才放棄並洩漏一條 thread 與一個 socket；1080 照一般 metadata 錯誤顯示。`arm_cancel()`／`disarm_cancel()` 用共用的 `CancelWindow`。
   - 暫停的結果：暫停中的請求佔住 server 一個 servicer（每 node 32 個），而且 7.6.12 在 client 停止讀取 77–86 秒後會自己砍掉請求（1203 `service.slow_client`，A13：原先假設的 120 秒不成立）。所以 `PAUSED_RESULT_MAX_IDLE_S = 45`，**從結果的第一次暫停起算，Load more 不重算**（500 列的 Load more 由 server 17–37 MB 的 buffer 供應，不會讓 server 的停滯時鐘歸零），housekeeping 每 15 秒，所以暫停後 45–60 秒關閉，訊息說明原因，已載入的列保留、標 partial，不會出現 Reconnect。暫停時有上限的預讀（讓放得進 buffer 的結果可以一直 Load more）是 04b 的 carry。
-  - 欄位：依 signature 的順序；`*` 依首頁（500 列／8 MiB）的 key 展開，`SELECT META(d).id, * FROM ks AS d` 的 `{"id", "d": {…}}` 也展開 alias；首頁之後才出現的 key 進 `(other fields)`；MISSING 與 JSON cell（`JsonText`、`MISSING`、`ColumnCategory.MIXED`），數字原文保留。
+  - 欄位：依 signature 的順序；`*` 依首頁（500 列／8 MiB）的 key 展開，`SELECT META(d).id, * FROM ks AS d` 的 `{"id", "d": {…}}` 也展開 alias；首頁之後才出現的 key 進 `(other fields)`；MISSING 與 JSON cell（`JsonText`、`MISSING`、`ColumnCategory.MIXED`），數字原文保留：整數只有在 ±(2^53−1) 內才是 number；浮點只有在 `repr` 與原文相同、沒有指數、不以 `.0` 結尾時才是 number，其餘（`1.0`、`-0.0`、`1e+16`、`1e-05`、`1.10`）是 `JsonText`，因為 grid 用 JavaScript 格式化，會把 `1.0` 顯示成 `1`，和複製、CSV／JSONL 匯出不一致。
   - 每次請求帶 query context（協定裡 `None`＝沒有 context；前端預設送 profile 的 database，即 `SessionInfo.server.default_query_context`，選擇器是 04b）；參數 literal 原文進 request body（`sessions/options.py` 檢查名稱與 JSON 形狀、不 echo 值）。
   - 唯讀＝每個請求（含 metadata）`readonly=true`＋分類器。server 以 1000 擋下實測過的寫入：DML、index／scope／collection／function／sequence 的 DDL、`EXECUTE FUNCTION`（含會寫入的 JS function）、`NEXT VALUE FOR`、EXECUTE 寫入的 prepared、對 `system:` 的 DELETE、GRANT／REVOKE、`FLUSH COLLECTION`；**`UPDATE STATISTICS`（含 `ANALYZE` 寫法）在 `readonly=true` 下照樣執行**，會把 optimizer statistics 寫進 `_system._query`，只有分類器擋（`test_safety.py`，M1）。
   - 沒有交易（`transactions=false`）：`BEGIN WORK` 等逐句拒絕（`transactions_unsupported`），前端不顯示 auto-commit／Commit／Rollback。
@@ -156,7 +156,7 @@ OrbStack 提供 Docker，測試 DB 放在 `dev/docker-compose.yml`，連線資�
 - Couchbase：
   - 欄位：沒有 `*` 的結果，首頁之後才出現、signature 以外的 key 只有一則 WARNING（JSON／JSONL 匯出看得到全部）；`*` 的結果多一欄 `(other fields)`，而且第一批列要等首頁（≤ 500 列／8 MiB）讀完才出現。
   - CSV／TSV 裡 NULL 與 MISSING 都是空字串，要分辨用 JSON 匯出。
-  - TLS：只信任 OpenSSL 預設的 CA bundle（不讀 macOS 鑰匙圈，打包版不一定找得到預設 bundle），verify-ca／verify-full 通常要給 cluster 的 CA 檔；SSL mode `prefer`＝`disable`（Couchbase 的 TLS 在另一個 port，沒有東西可以試），也就是明文 HTTP，連線對話框有提示。
+  - TLS：只信任 OpenSSL 預設的 CA bundle（不讀 macOS 鑰匙圈，打包版不一定找得到預設 bundle），verify-ca／verify-full 通常要給 cluster 的 CA 檔（失敗時的提示依 SSL 錯誤的種類：憑證沒有這個 host 名稱／發行者未知或自簽／這個 port 不是 TLS，其他只顯示 OpenSSL 的原文；連到 8091／18091 這類不是 query service 的 port 會收到 404，訊息指出 port 不對）；SSL mode `prefer`＝`disable`（Couchbase 的 TLS 在另一個 port，沒有東西可以試），也就是明文 HTTP，連線對話框有提示。
   - 多節點探索、`alternateAddresses`、Reconnect 換 node 只用 fixture 與單節點 dev 驗過（公司 cluster 的檢查清單）；探索在 worker 開連線時阻塞，每個 seed 最多 3 秒，DNS 與 connect 不會被取消打斷。
   - 暫停：活躍使用 Load more 的結果也在第一次暫停後 45–60 秒關閉（列保留）；放得進 buffer 的結果可以一直 Load more 要等 04b 的預讀。server 在 77–86 秒的自砍是 7.6.12 實測，別的版本沒量。
   - 受限使用者：`query_select`＋`data_reader` 不能列 `system:indexes`（A18），樹在 collection 下顯示提示列「No indexes shown (may need query_system_catalog)」，那不代表真的沒有 index；順序掃描要 `query_use_sequential_scans`，缺了 server 回 13014 並指出缺的角色，原文顯示。

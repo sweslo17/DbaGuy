@@ -13,7 +13,8 @@ a cancel for CONNECT_TIMEOUT_S (ruling R-04a-T7a).
 
 The server sends no status line until its first output is ready (a long aggregate: minutes), so `NodeClient.send()` can
 block that long; a cancel during that wait shuts the channel down like any other (the caller gets the channel from
-`attach` before anything is sent, and arms its own timer before calling `send`)."""
+`attach` before anything is sent, and arms its own timer before calling `send`). A caller that cannot be cancelled by
+anyone (the internal metadata queries) passes `read_timeout`: no bytes for that long ends the request (R-04a-F3)."""
 
 import base64
 import errno
@@ -29,6 +30,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 from loguru import logger
@@ -36,7 +38,8 @@ from loguru import logger
 from dbaguy_backend.adapters.sockets import enable_keepalive
 
 READ_CHUNK = 64 * 1024
-CONNECT_TIMEOUT_S = 10.0  # connect and TLS handshake; reads afterwards block with no timeout (a cancel ends them)
+CONNECT_TIMEOUT_S = 10.0  # connect and TLS handshake; reads afterwards block with no timeout (a cancel ends them),
+# unless the request asks for one (`NodeClient.send(read_timeout=...)`, the internal queries)
 _CONNECT_POLL_S = 0.05  # how often a connect in progress looks for a cancel (ruling R-04a-T7a)
 _IN_PROGRESS = frozenset({errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY})
 KEEPALIVE_REUSE_S = 30.0  # a connection idle for longer is replaced rather than reused
@@ -70,12 +73,13 @@ class QueryRequest:
     positional: Sequence[str] = ()
     profile: str | None = None
     preserve_expiry: bool = False
+    timeout: str | None = None  # a server duration such as "30s"; only the internal metadata queries set one (R-04a-F3)
 
 
 def build_body(request: QueryRequest) -> bytes:
     """The body as text, so parameter literals go out exactly as given (a number never passes through float; R-04-10).
-    Never `timeout` (it keeps counting while a result is paused, R-04-5) nor `scan_consistency`. A lone surrogate in
-    any text raises UnicodeEncodeError."""
+    `timeout` only when the request has one: a user's statement never does (it keeps counting while a result is paused,
+    R-04-5), and `scan_consistency` is never sent. A lone surrogate in any text raises UnicodeEncodeError."""
     parts = [f'"statement":{json.dumps(request.statement, ensure_ascii=False)}',
              f'"client_context_id":{json.dumps(request.client_context_id)}']
     if request.query_context is not None:
@@ -89,16 +93,49 @@ def build_body(request: QueryRequest) -> bytes:
         parts.append(f'"profile":{json.dumps(request.profile)}')
     if request.preserve_expiry:
         parts.append('"preserve_expiry":true')
+    if request.timeout is not None:
+        parts.append(f'"timeout":{json.dumps(request.timeout)}')
     return ("{" + ",".join(parts) + "}").encode("utf-8")
+
+
+class TlsFailure(StrEnum):
+    """What a failed TLS setup says about the cause, for the hint a message adds (R-04a-F1)."""
+
+    HOSTNAME = "hostname"  # the certificate is valid but does not name the host the client asked for
+    ISSUER = "issuer"  # its issuer is unknown: no CA file, or not the cluster's
+    NOT_TLS = "not_tls"  # the port answered something that is not TLS (a plain-HTTP port: 8093)
+    OTHER = "other"  # anything else: the OpenSSL text alone
+
+
+# OpenSSL verify codes (`SSLCertVerificationError.verify_code`): 62 is a host name that the certificate does not hold,
+# 64 the same for an IP address (Python verifies an address, as the dev cluster's `127.0.0.1`, as an IP); 18 and 19 a
+# self-signed certificate, 20 and 21 an issuer the client has no certificate for.
+_HOSTNAME_MISMATCH = frozenset({62, 64})
+_UNKNOWN_ISSUER = frozenset({18, 19, 20, 21})
+_WRONG_VERSION = "WRONG_VERSION_NUMBER"  # also what a TLS hello answered by a plain HTTP error page looks like
+
+
+def tls_failure(exc: ssl.SSLError) -> TlsFailure:
+    """The cause of a TLS setup failure, from the exception's own fields (never from its text)."""
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        code = getattr(exc, "verify_code", None)  # always set by OpenSSL; a hand-made exception may lack it
+        if code in _HOSTNAME_MISMATCH:
+            return TlsFailure.HOSTNAME
+        return TlsFailure.ISSUER if code in _UNKNOWN_ISSUER else TlsFailure.OTHER
+    return TlsFailure.NOT_TLS if getattr(exc, "reason", None) == _WRONG_VERSION else TlsFailure.OTHER
 
 
 class ChannelError(Exception):
     """The connection failed. `before_response`: no byte of the answer had arrived (what a kept-alive connection the
-    server closed meanwhile looks like); `tls`: setting up TLS failed (handshake, certificate)."""
+    server closed meanwhile looks like); `tls_failure`: setting up TLS failed (handshake, certificate), and why."""
 
-    def __init__(self, message: str, *, before_response: bool = False, tls: bool = False) -> None:
+    def __init__(self, message: str, *, before_response: bool = False, tls_failure: TlsFailure | None = None) -> None:
         super().__init__(message)
-        self.before_response, self.tls = before_response, tls
+        self.before_response, self.tls_failure = before_response, tls_failure
+
+    @property
+    def tls(self) -> bool:
+        return self.tls_failure is not None
 
 
 # What a kept-alive connection the server has closed meanwhile raises before any byte of the answer (RemoteDisconnected
@@ -333,18 +370,22 @@ class NodeClient:
         self._clock = clock
         self._channel: HttpChannel | None = None
 
-    def send(self, body: bytes, *, retry_safe: bool, attach: Callable[[HttpChannel], None]) -> QueryResponse:
+    def send(self, body: bytes, *, retry_safe: bool, attach: Callable[[HttpChannel], None],
+             read_timeout: float | None = None) -> QueryResponse:
         """POSTs `body` and waits for the status line. `attach(channel)` is called before anything is sent on a channel
-        (the caller records what a cancel shuts down); whatever it raises propagates and nothing is sent."""
+        (the caller records what a cancel shuts down); whatever it raises propagates and nothing is sent. `read_timeout`:
+        seconds without a byte, while waiting for the status line or reading the body, before the request fails with a
+        ChannelError (None: wait as long as it takes, a cancel ends it). It is a socket timeout, so every byte restarts
+        it: it ends a stall, not a slow answer."""
         channel = self._channel_for_request()
         reused = channel.used
         try:
-            return self._post(channel, body, attach)
+            return self._post(channel, body, attach, read_timeout)
         except ChannelError as exc:
             if not (reused and retry_safe and exc.before_response) or channel.shut_down:
                 raise  # a write, a fresh connection, a failure mid-answer, or a cancel: never resent
             logger.info("The server closed the kept-alive connection to {}; sending the read again", self.label)
-            return self._post(self._channel_for_request(), body, attach)
+            return self._post(self._channel_for_request(), body, attach, read_timeout)
 
     def _channel_for_request(self) -> HttpChannel:
         if self._channel is None or not self._channel.reusable(self._clock()):
@@ -358,12 +399,15 @@ class NodeClient:
                 raise ChannelError("invalid host name") from exc
         return self._channel
 
-    def _post(self, channel: HttpChannel, body: bytes, attach: Callable[[HttpChannel], None]) -> QueryResponse:
+    def _post(self, channel: HttpChannel, body: bytes, attach: Callable[[HttpChannel], None],
+              read_timeout: float | None) -> QueryResponse:
         attach(channel)  # raises when a cancel came first: nothing is sent
         reused = channel.used
         channel.used, channel.idle_since = True, None
         try:
             channel.conn.request("POST", QUERY_PATH, body=body, headers=self._headers)
+            if channel.conn.sock is not None:  # set for every request: a kept-alive channel carries a user's next one
+                channel.conn.sock.settimeout(read_timeout)
             response = channel.conn.getresponse()
         except ChannelError:  # cancelled while connecting
             channel.close()
@@ -372,8 +416,9 @@ class NodeClient:
             channel.close()
             # TLS failed only while setting it up, and not because a cancel cut the handshake: an error on a connection
             # that has answered before is a lost connection
-            tls = isinstance(exc, ssl.SSLError) and not reused and not channel.shut_down
-            raise ChannelError(failure_reason(exc), before_response=isinstance(exc, _STALE), tls=tls) from exc
+            failure = tls_failure(exc) if isinstance(exc, ssl.SSLError) and not reused and not channel.shut_down else None
+            raise ChannelError(failure_reason(exc), before_response=isinstance(exc, _STALE),
+                               tls_failure=failure) from exc
         return QueryResponse(channel, response, self._clock)
 
     def close(self) -> None:

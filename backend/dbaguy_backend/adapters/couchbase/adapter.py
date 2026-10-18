@@ -11,6 +11,7 @@ import json
 import threading
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -41,7 +42,9 @@ from ..base import (
 )
 from ..cancel_window import CancelWindow
 from . import catalog
-from .http import ChannelError, HttpChannel, NodeClient, QueryRequest, basic_auth, build_body, client_context_id
+from .http import (
+    ChannelError, HttpChannel, NodeClient, QueryRequest, TlsFailure, basic_auth, build_body, client_context_id,
+)
 from .nodes import candidate_nodes
 from .result import CouchbaseResult, EventStream, start_result
 from .rows import has_bare_star
@@ -72,9 +75,32 @@ _PLANS = frozenset({"EXPLAIN", "ADVISE"})
 _AUTH_FAILURES = frozenset({"2120", "10000", "13014", "http_401"})
 _AUTH_FAILED = "auth_failed"
 _TLS_FAILED = "tls_failed"
+_NOT_FOUND = "http_404"
 _NODE_DOWN = "node_down"
 _BAD_REQUEST_TEXT = "The query context or a parameter holds a character that is not valid text"
 _REASON_LIMIT = 100
+
+# What a failed TLS setup suggests, by cause (R-04a-F1); no hint for TlsFailure.OTHER: the OpenSSL text alone.
+_TLS_HINTS = {
+    TlsFailure.HOSTNAME: "The certificate does not name this host: connect by a name it holds, or use SSL mode verify-ca",
+    TlsFailure.ISSUER: "Set the cluster's CA file in the SSL tab (the app does not read the macOS keychain)",
+    TlsFailure.NOT_TLS: "This port does not speak TLS: the query service uses 18093 for TLS (8093 is plain HTTP)",
+}
+# The cluster manager (8091, 18091) answers a query request with 404; so does anything else that is not the service.
+_NOT_QUERY_SERVICE = "This port is not the query service (8093, or 18093 with TLS)"
+
+
+@dataclass(frozen=True)
+class _Deadline:
+    """How long an internal query may take (R-04a-F3): nobody can cancel it (`SessionWorker.close()` cannot interrupt a
+    `call()`), so a stalled catalog query would hold the metadata worker until `call()` gives up and leaks it."""
+
+    server: str  # the request's `timeout`: the server ends the statement and answers error 1080
+    client_s: float  # seconds without a byte before the client gives up, if the server cannot answer at all
+
+
+# A user's statement has none: the worker times tabs, and a paused result must not be timed by the server (spec, R-04-5).
+_INTERNAL_DEADLINE = _Deadline(server="30s", client_s=40.0)
 
 
 def _transaction_statement(sql: str) -> bool:
@@ -123,7 +149,7 @@ class CouchbaseConnection(DatabaseConnection):
     # ---- requests ----
 
     def _begin(self, sql: str, *, context: QueryContext | None, params: StatementParams | None, readonly: bool,
-               retry_safe: bool) -> EventStream:
+               retry_safe: bool, deadline: _Deadline | None = None) -> EventStream:
         """Send one request and wait for its status line. Busy from here until the response is read or abandoned."""
         with self._lock:
             self._busy, self._cancelled, self._channel = True, False, None
@@ -135,12 +161,14 @@ class CouchbaseConnection(DatabaseConnection):
                 statement=sql, client_context_id=client_context_id(uuid4().hex),
                 query_context=request_context(context) if context is not None else None, readonly=readonly,
                 named=params.named if params else {}, positional=params.positional if params else (),
+                timeout=deadline.server if deadline is not None else None,
             )
             self.last_client_context_id = request.client_context_id
             logger.debug("Couchbase request {} to {}{}", request.client_context_id, self._client.label,
                          " (read-only)" if readonly else "")
             body = build_body(request)
-            response = self._client.send(body, retry_safe=retry_safe, attach=self._attach)
+            response = self._client.send(body, retry_safe=retry_safe, attach=self._attach,
+                                         read_timeout=deadline.client_s if deadline is not None else None)
         except ChannelError as exc:
             self._end()
             raise self._channel_failure(exc) from exc
@@ -179,8 +207,10 @@ class CouchbaseConnection(DatabaseConnection):
     def _channel_failure(self, exc: ChannelError) -> StatementError:
         if self.cancelled():
             return StatementCancelled()
-        if exc.tls:
-            return StatementError(f"TLS failed: {exc}", code=_TLS_FAILED)
+        if exc.tls_failure is not None:
+            hint = _TLS_HINTS.get(exc.tls_failure)
+            logger.info("TLS to the query node {} failed ({}): {}", self._client.label, exc.tls_failure.value, exc)
+            return StatementError(f"TLS failed: {exc}" + (f"\n{hint}" if hint else ""), code=_TLS_FAILED)
         if not self._identified:  # opening: this node is down, try the next one
             return StatementError(str(exc), code=_NODE_DOWN)
         logger.warning("Connection to the query node {} was lost: {}", self._client.label, exc)
@@ -209,11 +239,13 @@ class CouchbaseConnection(DatabaseConnection):
 
     def query(self, statement: str, named: Mapping[str, str] | None = None) -> list[Any]:
         """An internal statement (catalog, identification): always read-only, read to the end, rows decoded with plain
-        JSON (an int stays an int: the catalog's num_replica, R-04a-C20). `named`: parameter names without `$` and
-        their JSON literal texts."""
+        JSON (an int stays an int: the catalog's num_replica, R-04a-C20), and with a deadline (_INTERNAL_DEADLINE: the
+        server's `timeout` of 30 s, whose error 1080 is raised like any other, and 40 s without a byte on the client).
+        `named`: parameter names without `$` and their JSON literal texts."""
         self._close_result()
         params = StatementParams(named=dict(named)) if named else None
-        stream = self._begin(statement, context=None, params=params, readonly=True, retry_safe=True)
+        stream = self._begin(statement, context=None, params=params, readonly=True, retry_safe=True,
+                             deadline=_INTERNAL_DEADLINE)
         result = start_result(stream, statement, plan=False, bare_star=False, dml=False, on_done=self._end)
         try:
             rows: list[Any] = []
@@ -374,9 +406,9 @@ class CouchbaseAdapter(DatabaseAdapter):
                     continue
                 if exc.code == _AUTH_FAILED:
                     raise ConnectionFailed(f"{exc.message}\nCheck the user name and password") from exc
-                if exc.code == _TLS_FAILED:
-                    raise ConnectionFailed(f"{exc.message}\nSet the cluster's CA file in the SSL tab") from exc
-                raise ConnectionFailed(exc.message) from exc
+                if exc.code == _NOT_FOUND:  # the answer to a query request on the cluster manager's port, say
+                    raise ConnectionFailed(f"{exc.message}\n{_NOT_QUERY_SERVICE}") from exc
+                raise ConnectionFailed(exc.message) from exc  # TLS failures carry their hint already
             except BaseException:
                 connection.close()
                 raise

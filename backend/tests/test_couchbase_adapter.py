@@ -27,8 +27,9 @@ from dbaguy_backend.storage.paths import profiles_file
 from dbaguy_backend.storage.profile_store import ProfileStore
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
 from tests.support import (
-    BASTION_PORT, COUCHBASE_PASSWORD, COUCHBASE_READER, LONG_AGGREGATE, completed_request_state, couchbase_ca_file,
-    couchbase_query, make_couchbase_profile, requires_couchbase, requires_couchbase_bastion, scaled,
+    BASTION_PORT, COUCHBASE_MANAGER_PORT, COUCHBASE_PASSWORD, COUCHBASE_PORT, COUCHBASE_READER, LONG_AGGREGATE,
+    completed_request_state, couchbase_ca_file, couchbase_query, make_couchbase_profile, requires_couchbase,
+    requires_couchbase_bastion, scaled,
 )
 from tests.test_dev_env import U_NUMBERS
 from tests.test_ssh_tunnel import TEST_SSH_OPTIONS
@@ -428,6 +429,31 @@ def test_tls_with_the_cluster_ca(tmp_path):  # A10, A11
             conn.close()
     with pytest.raises(ConnectionFailed, match="CA file"):
         open_couchbase(ssl=SslConfig(mode="verify-ca"))  # the default bundle does not know the cluster CA
+
+
+def test_a_failed_connect_names_its_cause_and_the_fix(tmp_path):  # R-04a-F1: the hint follows the failure
+    ca = str(couchbase_ca_file(tmp_path))
+    with pytest.raises(ConnectionFailed) as error:  # `require` on the plain-HTTP port: not a certificate problem
+        open_couchbase(port=COUCHBASE_PORT, ssl=SslConfig(mode="require"))
+    assert "WRONG_VERSION_NUMBER" in error.value.message and "CA" not in error.value.message
+    assert error.value.message.endswith(
+        "This port does not speak TLS: the query service uses 18093 for TLS (8093 is plain HTTP)")
+    with pytest.raises(ConnectionFailed) as error:  # the right CA, a name the certificate does not hold
+        open_couchbase(host="localhost", ssl=SslConfig(mode="verify-full", ca_file=ca))
+    assert "Hostname mismatch" in error.value.message and "CA file" not in error.value.message
+    assert error.value.message.endswith(
+        "The certificate does not name this host: connect by a name it holds, or use SSL mode verify-ca")
+    open_couchbase(host="localhost", ssl=SslConfig(mode="verify-ca", ca_file=ca)).close()  # the name was the only fault
+    for mode in ("verify-ca", "verify-full"):  # no CA file: the cluster's self-signed CA is unknown
+        with pytest.raises(ConnectionFailed) as error:
+            open_couchbase(ssl=SslConfig(mode=mode))
+        assert error.value.message.endswith(
+            "Set the cluster's CA file in the SSL tab (the app does not read the macOS keychain)")
+    for port, mode in ((COUCHBASE_MANAGER_PORT, "disable"), (18091, "require")):  # 18091: the manager with TLS
+        with pytest.raises(ConnectionFailed) as error:  # the cluster manager answers a query request with a 404
+            open_couchbase(port=port, ssl=SslConfig(mode=mode))
+        assert error.value.message == (
+            "HTTP 404 Object Not Found\nThis port is not the query service (8093, or 18093 with TLS)")
 
 
 @requires_couchbase_bastion

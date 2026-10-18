@@ -9,6 +9,8 @@ import pytest
 
 from dbaguy_backend import container
 from dbaguy_backend.adapters.base import Endpoint, RunOptions, StatementCancelled, StatementError
+from dbaguy_backend.adapters.couchbase import adapter as couchbase_adapter
+from dbaguy_backend.adapters.couchbase import settings as couchbase_settings
 from dbaguy_backend.adapters.couchbase.adapter import (
     PAUSED_RESULT_MAX_IDLE_S, TRANSACTIONS_UNSUPPORTED, CouchbaseAdapter, CouchbaseConnection,
 )
@@ -20,9 +22,11 @@ from dbaguy_backend.adapters.values import MISSING, JsonText
 from dbaguy_backend.domain.errors import ConnectionFailed
 from dbaguy_backend.domain.execution import ErrorPosition, MessageSeverity, QueryContext, StatementParams
 from dbaguy_backend.domain.metadata import ServerInfo
-from dbaguy_backend.domain.profiles import Engine
+from dbaguy_backend.domain.profiles import Engine, SslConfig
 from dbaguy_backend.sessions.worker import paused_result_closed_text
-from tests.couchbase_fakes import FakeQueryServer, FakeResponse, Reply
+from tests.couchbase_fakes import (
+    FailingContext, FakeQueryServer, FakeResponse, PlainHttpPort, Reply, cert_error, ssl_error,
+)
 from tests.support import make_couchbase_profile, scaled
 
 
@@ -308,11 +312,110 @@ def test_internal_queries_are_read_only_with_named_literals_and_plain_ints():  #
         ]
         [body] = sent(server)
         assert body["readonly"] is True and body["$b"] == "dbaguy" and '"$b":"dbaguy"' in server.bodies[0].decode()
+        assert body["timeout"] == "30s"  # R-04a-F3
         with pytest.raises(StatementError, match="late"):  # an error after the rows is not lost
             connection.query("SELECT RAW 1")
     finally:
         connection.close()
         server.close()
+
+
+def test_only_an_internal_query_carries_a_server_timeout():  # R-04a-F3: a user's statement is timed by the worker
+    server, connection = fake_connection([OK_ONE, OK_ONE])
+    try:
+        assert connection.query("SELECT 1 AS a") == [{"a": 1}]
+        connection.run("SELECT 1 AS a").close()
+        internal, user = sent(server)
+        assert internal["timeout"] == "30s" and "timeout" not in user
+        assert b'"timeout"' not in server.bodies[1]
+    finally:
+        connection.close()
+        server.close()
+
+
+def test_the_servers_timeout_error_is_a_normal_metadata_error():  # R-04a-F3: error 1080
+    body = b'{"requestID":"r","errors":[{"code":1080,"msg":"Timeout 30s exceeded"}],"status":"timeout"}'
+    server, connection = fake_connection([Reply(body)])
+    try:
+        with pytest.raises(StatementError) as error:
+            connection.list_children([])  # the catalog's first query
+        assert (error.value.code, error.value.message) == ("1080", "Timeout 30s exceeded")
+    finally:
+        connection.close()
+        server.close()
+
+
+def test_an_internal_query_gives_up_when_the_server_says_nothing(monkeypatch):  # R-04a-F3: the client's deadline
+    monkeypatch.setattr(couchbase_adapter, "_INTERNAL_DEADLINE", couchbase_adapter._Deadline(server="30s", client_s=0.3))
+    gate = threading.Event()
+    server, connection = fake_connection([OK_ONE, Reply(OK_ONE.body, before_head=gate), OK_ONE])
+    try:
+        assert connection.query("SELECT 1 AS a") == [{"a": 1}]  # the node has answered: a failure is a lost connection
+        started = time.monotonic()
+        with pytest.raises(StatementError, match="timed out") as error:
+            connection.query("SELECT 1 AS a")
+        assert error.value.code == "connection_lost" and time.monotonic() - started < scaled(3.0)
+        assert connection.query("SELECT 1 AS a") == [{"a": 1}]  # the connection is usable again, on a new channel
+    finally:
+        gate.set()
+        connection.close()
+        server.close()
+
+
+# ---- hints that match the failure (R-04a-F1) ----
+
+HOSTNAME_HINT = "The certificate does not name this host: connect by a name it holds, or use SSL mode verify-ca"
+ISSUER_HINT = "Set the cluster's CA file in the SSL tab (the app does not read the macOS keychain)"
+NOT_TLS_HINT = "This port does not speak TLS: the query service uses 18093 for TLS (8093 is plain HTTP)"
+NOT_QUERY_SERVICE = "This port is not the query service (8093, or 18093 with TLS)"
+
+
+@pytest.mark.parametrize("error, hint", [
+    (cert_error(62), HOSTNAME_HINT), (cert_error(64), HOSTNAME_HINT),
+    (cert_error(18), ISSUER_HINT), (cert_error(19), ISSUER_HINT), (cert_error(20), ISSUER_HINT),
+    (cert_error(21), ISSUER_HINT),
+    (ssl_error("WRONG_VERSION_NUMBER"), NOT_TLS_HINT),
+    (cert_error(10), None), (ssl_error("TLSV1_ALERT_PROTOCOL_VERSION"), None),  # expired, other: the OpenSSL text alone
+], ids=["hostname", "ip", "self-signed", "self-signed-in-chain", "no-local-issuer", "no-leaf-signature",
+        "wrong-version", "expired", "other"])
+def test_a_failed_handshake_says_what_to_do_about_it(monkeypatch, error, hint):
+    monkeypatch.setattr(couchbase_settings, "tls_context", lambda config: FailingContext(error))
+    server = FakeQueryServer([])
+    profile = make_couchbase_profile(port=server.port, ssl=SslConfig(mode="verify-full"))
+    try:
+        with pytest.raises(ConnectionFailed) as raised:
+            CouchbaseAdapter().open(profile, Endpoint("127.0.0.1", server.port), "p", None)
+        assert raised.value.message == f"TLS failed: {error}" + (f"\n{hint}" if hint else "")
+    finally:
+        server.close()
+
+
+def test_a_tls_profile_on_the_plain_http_port_names_the_tls_port():  # `require` and 8093, with a real OpenSSL
+    port = PlainHttpPort()
+    profile = make_couchbase_profile(port=port.port, ssl=SslConfig(mode="require"))
+    try:
+        with pytest.raises(ConnectionFailed) as raised:
+            CouchbaseAdapter().open(profile, Endpoint("127.0.0.1", port.port), "p", None)
+        first, hint = raised.value.message.split("\n")
+        assert "WRONG_VERSION_NUMBER" in first and hint == NOT_TLS_HINT and "CA" not in raised.value.message
+    finally:
+        port.close()
+
+
+def test_a_404_from_the_query_endpoint_says_it_is_not_the_query_service():  # the cluster manager's 8091 / 18091
+    with pytest.raises(ConnectionFailed) as raised:
+        open_fake([Reply(b"Requested resource not found.\n", status=404, content_type="text/plain")])
+    assert raised.value.message == f"HTTP 404 Reason\n{NOT_QUERY_SERVICE}"
+
+
+def test_other_failures_to_open_keep_their_texts():
+    with pytest.raises(ConnectionFailed) as raised:  # a gateway's page: the status alone, no port hint
+        open_fake([Reply(b"<html>bad gateway</html>", status=502, content_type="text/html")])
+    assert raised.value.message == "HTTP 502 Reason"
+    refused = Reply(b'{"errors":[{"code":3000,"msg":"syntax error"}],"status":"fatal"}', status=400)
+    with pytest.raises(ConnectionFailed) as raised:  # the version-only fallback is refused too
+        open_fake([refused, refused])
+    assert raised.value.message == "syntax error"
 
 
 IDENTIFIED = b'{"signature":{"v":"string","u":"array"},"results":[{"v":"7.6.2-3721-community","u":["local:me"]}],"status":"success"}'

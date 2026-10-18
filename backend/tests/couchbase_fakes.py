@@ -2,6 +2,7 @@
 
 import select
 import socket
+import ssl
 import threading
 from dataclasses import dataclass
 
@@ -78,6 +79,57 @@ class FakeQueryServer:
 
     def close(self) -> None:
         self._server.close()
+
+
+class PlainHttpPort:
+    """A port that speaks plain HTTP only, like the query service's 8093: whatever arrives (a TLS hello, say) is answered
+    with `400 Bad Request` and the connection closes. A TLS client reads that answer as a TLS record and fails with
+    OpenSSL's WRONG_VERSION_NUMBER, as it does against the real port."""
+
+    def __init__(self) -> None:
+        self._server = socket.create_server(("127.0.0.1", 0))
+        self.port = self._server.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self._server.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.recv(65536)
+                    conn.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        self._server.close()
+
+
+def cert_error(code: int) -> ssl.SSLCertVerificationError:
+    """A certificate verification failure with OpenSSL's verify code (62: host name, 20: unknown issuer, …)."""
+    error = ssl.SSLCertVerificationError(1, f"[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed ({code})")
+    error.verify_code = code
+    return error
+
+
+def ssl_error(reason: str | None) -> ssl.SSLError:
+    error = ssl.SSLError(1, f"[SSL: {reason}] {reason}")
+    if reason is not None:
+        error.reason = reason
+    return error
+
+
+class FailingContext:
+    """Stands in for an ssl.SSLContext whose handshake fails with `error` (the TCP connect itself works)."""
+
+    def __init__(self, error: ssl.SSLError) -> None:
+        self.error = error
+
+    def wrap_socket(self, sock, **kwargs):
+        raise self.error
 
 
 class FullListenQueue:

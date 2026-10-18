@@ -10,10 +10,13 @@ from loguru import logger
 
 from dbaguy_backend.adapters.couchbase import http as http_module
 from dbaguy_backend.adapters.couchbase.http import (
-    ChannelError, NodeClient, QueryRequest, basic_auth, build_body, client_context_id, failure_reason,
+    ChannelError, NodeClient, QueryRequest, TlsFailure, basic_auth, build_body, client_context_id, failure_reason,
+    tls_failure,
 )
 from dbaguy_backend.adapters.couchbase.stream import EndEvent, FieldEvent, ResponseParser, RowEvent
-from tests.couchbase_fakes import FakeQueryServer, FullListenQueue, Reply
+from tests.couchbase_fakes import (
+    FailingContext, FakeQueryServer, FullListenQueue, PlainHttpPort, Reply, cert_error, ssl_error,
+)
 from tests.support import (
     COUCHBASE_HOST, COUCHBASE_PASSWORD, COUCHBASE_PORT, COUCHBASE_TLS_PORT, COUCHBASE_USER, LONG_AGGREGATE,
     completed_request_state, couchbase_ca_file, requires_couchbase, scaled, wait_until,
@@ -57,6 +60,13 @@ def test_body_embeds_literals_unchanged():
     )
     assert json.loads(body)["$n"] == 9007199254740993  # still valid JSON
     assert b"timeout" not in body and b"scan_consistency" not in body  # never sent (R-04-5)
+
+
+def test_a_timeout_is_in_the_body_only_when_the_request_has_one():  # R-04a-F3
+    body = build_body(QueryRequest("SELECT 1", "dbaguy-r2", readonly=True, timeout="30s"))
+    assert body.decode() == '{"statement":"SELECT 1","client_context_id":"dbaguy-r2","readonly":true,"timeout":"30s"}'
+    assert json.loads(body)["timeout"] == "30s"
+    assert b"timeout" not in build_body(QueryRequest("SELECT 1", "dbaguy-r3"))  # a user's statement: never
 
 
 def test_a_lone_surrogate_cannot_be_sent():
@@ -248,7 +258,8 @@ def test_a_refused_connection():
     client = NodeClient("127.0.0.1", port, auth="", user_agent="DbaGuy/test", tls=None)
     with pytest.raises(ChannelError) as error:
         send(client)
-    assert (str(error.value), error.value.before_response, error.value.tls) == ("refused", False, False)
+    assert (str(error.value), error.value.before_response, error.value.tls, error.value.tls_failure) == (
+        "refused", False, False, None)
 
 
 def test_a_host_name_with_more_addresses_tries_the_next_one():  # `localhost`: ::1 refused, then 127.0.0.1
@@ -296,6 +307,85 @@ def test_a_connect_that_gets_no_answer_times_out(monkeypatch):
     finally:
         client.close()
         queue.close()
+
+
+@pytest.mark.parametrize("error, kind", [
+    (cert_error(62), TlsFailure.HOSTNAME), (cert_error(64), TlsFailure.HOSTNAME),  # a name / an IP address not held
+    (cert_error(18), TlsFailure.ISSUER), (cert_error(19), TlsFailure.ISSUER),  # self-signed (alone, in the chain)
+    (cert_error(20), TlsFailure.ISSUER), (cert_error(21), TlsFailure.ISSUER),  # no certificate for the issuer
+    (cert_error(10), TlsFailure.OTHER), (cert_error(9), TlsFailure.OTHER),  # expired, not yet valid
+    (ssl.SSLCertVerificationError(1, "no verify code"), TlsFailure.OTHER),
+    (ssl_error("WRONG_VERSION_NUMBER"), TlsFailure.NOT_TLS),
+    (ssl_error("TLSV1_ALERT_PROTOCOL_VERSION"), TlsFailure.OTHER), (ssl_error(None), TlsFailure.OTHER),
+    (ssl.SSLEOFError(8, "EOF occurred in violation of protocol"), TlsFailure.OTHER),
+])
+def test_a_tls_failure_is_told_by_its_fields(error, kind):  # R-04a-F1: never by parsing the message
+    assert tls_failure(error) == kind
+
+
+@pytest.mark.parametrize("error, kind", [
+    (cert_error(62), TlsFailure.HOSTNAME), (cert_error(20), TlsFailure.ISSUER), (cert_error(10), TlsFailure.OTHER),
+    (ssl_error("WRONG_VERSION_NUMBER"), TlsFailure.NOT_TLS),
+])
+def test_the_channel_error_carries_the_kind_of_a_failed_handshake(error, kind):
+    server = FakeQueryServer([])
+    client = NodeClient("127.0.0.1", server.port, auth="", user_agent="DbaGuy/test", tls=FailingContext(error))
+    try:
+        with pytest.raises(ChannelError) as raised:
+            send(client)
+        assert raised.value.tls and raised.value.tls_failure == kind and not raised.value.before_response
+    finally:
+        client.close()
+        server.close()
+
+
+def test_a_tls_client_on_a_plain_http_port_fails_with_a_wrong_version():  # a real OpenSSL, not a made-up error
+    port = PlainHttpPort()
+    client = NodeClient("127.0.0.1", port.port, auth="", user_agent="DbaGuy/test", tls=ssl.create_default_context())
+    try:
+        with pytest.raises(ChannelError) as raised:
+            send(client)
+        assert raised.value.tls_failure == TlsFailure.NOT_TLS and "WRONG_VERSION_NUMBER" in str(raised.value)
+    finally:
+        client.close()
+        port.close()
+
+
+def test_read_timeout_ends_a_stalled_status_line_and_a_stalled_body():  # R-04a-F3
+    stall = threading.Event()
+    server = FakeQueryServer([Reply(OK, before_head=stall), Reply(b'{"results":[' + b"1," * 1000 + b'1]}', hold=stall)])
+    client = node(server)
+    try:
+        started = time.monotonic()
+        with pytest.raises(ChannelError, match="timed out"):  # nothing arrives
+            client.send(b'{"statement":"SELECT 1"}', retry_safe=False, attach=lambda channel: None, read_timeout=0.3)
+        assert time.monotonic() - started < scaled(3.0)
+        response = client.send(b'{"statement":"SELECT 1"}', retry_safe=False, attach=lambda channel: None,
+                               read_timeout=0.3)
+        response.read_chunk()  # the first half; the server now waits
+        with pytest.raises(ChannelError, match="timed out"):  # the rest never comes
+            read_all(response)
+        assert not response.done
+    finally:
+        stall.set()
+        client.close()
+        server.close()
+
+
+def test_a_read_timeout_is_set_for_each_request_not_left_on_a_kept_alive_channel():  # R-04a-F3
+    server = FakeQueryServer([Reply(OK, chunked=False), Reply(OK, chunked=False), Reply(OK, chunked=False)])
+    client = node(server)
+    channels, timeouts = [], []
+    try:
+        for read_timeout in (40.0, None, 5.0):
+            response = client.send(b'{"statement":"SELECT 1"}', retry_safe=True, attach=channels.append,
+                                   read_timeout=read_timeout)
+            timeouts.append(channels[-1].conn.sock.gettimeout())
+            read_all(response)
+        assert timeouts == [40.0, None, 5.0] and server.connections == 1 and len(set(map(id, channels))) == 1
+    finally:
+        client.close()
+        server.close()
 
 
 def test_a_host_http_client_refuses_is_a_channel_error():
@@ -429,5 +519,6 @@ def test_a_certificate_the_client_does_not_trust_is_a_tls_failure():
             client.send(build_body(QueryRequest("SELECT RAW 1", "dbaguy-tls")), retry_safe=True,
                         attach=lambda channel: None)
         assert error.value.tls and "CERTIFICATE_VERIFY_FAILED" in str(error.value)
+        assert error.value.tls_failure == TlsFailure.ISSUER  # the cluster's CA is self-signed, the system does not know it
     finally:
         client.close()
