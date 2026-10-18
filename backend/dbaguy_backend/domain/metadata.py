@@ -26,6 +26,10 @@ class NodeKind(StrEnum):
     EVENT = "event"
     FOREIGN_KEY = "foreign_key"
     COLUMN = "column"
+    # Couchbase: bucket › scope › collection › index
+    BUCKET = "bucket"
+    SCOPE = "scope"
+    COLLECTION = "collection"
 
 
 class Folder(StrEnum):
