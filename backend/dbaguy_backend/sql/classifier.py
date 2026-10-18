@@ -125,10 +125,11 @@ _TSQL_FLOOR_PHRASES: dict[tuple[str, ...], StatementKind] = dict.fromkeys(
     StatementKind.WRITE,
 )
 # Where a floor word is neither a statement nor a hint. Before JOIN or UNION, MERGE is a query hint (INNER MERGE JOIN,
-# OPTION (MERGE UNION); a MERGE statement's target cannot be named JOIN or UNION, both reserved). After LEVEL,
-# SERIALIZABLE is an isolation level (SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, which the allow-list allows).
+# OPTION (MERGE UNION); a MERGE statement's target cannot be named JOIN or UNION, both reserved). After ISOLATION
+# LEVEL, SERIALIZABLE is an isolation level (SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, which the allow-list
+# allows); LEVEL alone is not enough, since an index may be named level (WITH (INDEX = level SERIALIZABLE)).
 _TSQL_FLOOR_NOT_BEFORE: dict[str, frozenset[str]] = {"MERGE": frozenset({"JOIN", "UNION"})}
-_TSQL_FLOOR_NOT_AFTER: dict[str, frozenset[str]] = {"SERIALIZABLE": frozenset({"LEVEL"})}
+_TSQL_FLOOR_NOT_AFTER: dict[str, tuple[str, ...]] = {"SERIALIZABLE": ("ISOLATION", "LEVEL")}
 
 
 def _has_version_comment(tokens: list[Token]) -> bool:
@@ -344,8 +345,9 @@ def _tsql_floor_kinds(tokens: list[Token], pieces: list[list[Token]]) -> Iterato
     of its words and phrases, and DDL for a SELECT … INTO that creates a table."""
     words = [t.upper if t.kind == TokenKind.WORD else "(" if t.kind == TokenKind.LPAREN else "" for t in tokens]
     for k, word in enumerate(words):
+        after = _TSQL_FLOOR_NOT_AFTER.get(word)
         exempt = (k + 1 < len(words) and words[k + 1] in _TSQL_FLOOR_NOT_BEFORE.get(word, ())) or (
-            k > 0 and words[k - 1] in _TSQL_FLOOR_NOT_AFTER.get(word, ())
+            after is not None and tuple(words[max(k - len(after), 0):k]) == after
         )
         if word in _TSQL_FLOOR and not exempt:
             yield _TSQL_FLOOR[word]

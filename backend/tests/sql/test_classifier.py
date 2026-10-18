@@ -605,6 +605,7 @@ TS = Dialect.TSQL
     ("DECLARE @x int = (SELECT a FROM t WITH (UPDLOCK))", K.WRITE, []),
     ("SELECT * FROM t OPTION (TABLE HINT (t, HOLDLOCK))", K.WRITE, []),
     ("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", K.SESSION, []),  # an isolation level, not a hint
+    ("SELECT * FROM t WITH (INDEX = level SERIALIZABLE)", K.WRITE, []),  # an index named level: still a hint
     ("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", K.SESSION, []),
     # R-03b-T3c: Service Broker words are plain names outside their statements
     ("SELECT a FROM t WHERE conversation = 1", K.READ, []),
