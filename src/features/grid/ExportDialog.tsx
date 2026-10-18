@@ -1,5 +1,5 @@
 import { Loader2 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useEffectEvent, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useStore } from "zustand";
 import { Button } from "@/components/ui/Button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
@@ -16,7 +16,7 @@ import { useEngineInfo } from "../connections/hooks";
 import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
 import type { SessionController } from "../session/SessionController";
 import { cancelAbortsTransaction, EXPORT_CANCEL_ABORTS_TRANSACTION } from "../session/transactions";
-import { COPY_FORMAT_LABELS } from "./copy";
+import { COPY_FORMAT_LABELS, copyFormatsFor } from "./copy";
 
 type TableName = { schema: string | null; name: string };
 
@@ -150,9 +150,12 @@ export function ExportDialog({
   const { controller, sql, title } = source;
   const engine = useEngineInfo(controller.profileId);
   const prefill = source.tableName ?? null;
-  // SQL++ has no INSERT by columns (it inserts a key and a document): the formats leave it out there.
-  const sqlpp = engine?.dialect === "sqlpp";
-  const formats = useMemo(() => FORMAT_ORDER.filter((kind) => kind !== "insert" || !sqlpp), [sqlpp]);
+  // The formats of the engine's dialect: SQL++ has no INSERT by columns, and `copyFormatsFor` is where that is decided.
+  const dialect = engine?.dialect ?? null;
+  const formats = useMemo(
+    () => FORMAT_ORDER.filter((kind) => kind !== "insert" || copyFormatsFor(dialect).includes("insert")),
+    [dialect],
+  );
   const [format, setFormat] = useState<ExportFormat>("csv");
   const [header, setHeader] = useState(true);
   const [nullText, setNullText] = useState("");
@@ -176,11 +179,6 @@ export function ExportDialog({
   useEffect(() => {
     isOpen.current = open;
   }, [open]);
-  // The engine arrives after the dialog may have been opened (or the tab's connection changed): a format it cannot
-  // write is not kept.
-  useEffect(() => {
-    if (!formats.includes(format)) setFormat("csv");
-  }, [formats, format]);
   // After an error or a cancel the form is back: the path is what usually changes before a retry.
   useEffect(() => {
     if (outcome) pathInput.current?.focus();
@@ -198,6 +196,15 @@ export function ExportDialog({
     if (path.endsWith(from)) setPath(`${path.slice(0, -from.length)}.${FORMATS[next].ext}`);
     setFormat(next);
   };
+
+  // The engine arrives after the dialog may have been opened (or the tab's connection changed): a format it cannot
+  // write is not kept; going through `changeFormat` also remaps a file name's extension.
+  const dropUnsupportedFormat = useEffectEvent(() => {
+    if (!formats.includes(format)) changeFormat("csv");
+  });
+  useEffect(() => {
+    dropUnsupportedFormat();
+  }, [formats, format]);
 
   const choose = async () => {
     try {

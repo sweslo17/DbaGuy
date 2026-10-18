@@ -1,4 +1,4 @@
-import { useState, type InputHTMLAttributes } from "react";
+import { Fragment, useState, type InputHTMLAttributes, type ReactNode } from "react";
 import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
 import { Checkbox, FieldRow, Input, Select, Textarea } from "@/components/ui/Field";
@@ -59,10 +59,12 @@ const SSL_MODE_HINTS: Partial<Record<Engine, string>> = {
 };
 /** The mode a new profile starts with (the others start with `prefer`): Couchbase's TLS is on other ports, so HTTP. */
 const DEFAULT_SSL_MODES: Partial<Record<Engine, SslConfig["mode"]>> = { couchbase: "disable" };
-/** Shown under Host and instead of the SSL mode hint when the password would cross the network in clear text. */
+/** Shown under Host and above the SSL mode hint when the password would cross the network in clear text. */
 const PLAIN_TEXT_NOTE =
   "The password goes to the cluster in clear text (HTTP Basic auth): use TLS (require or verify-*) for a remote cluster";
-const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+/** This machine: `localhost`, `::1` and any 127.x address (`[::1]` and a port are taken off first, see `hostName`). */
+const LOOPBACK_NAMES: ReadonlySet<string> = new Set(["localhost", "::1"]);
+const LOOPBACK_V4 = /^127(\.\d+){1,3}$/;
 /** The Import URL placeholder for the selected engine (PostgreSQL's when it has none). */
 const URL_EXAMPLES: Partial<Record<Engine, string>> = {
   postgres: "postgres://user@host:5432/db",
@@ -136,12 +138,33 @@ function emptyDraft(engine: Engine): ProfileDraft {
   };
 }
 
+/** One entry of a host list without its port or brackets: `cb1:8091` is `cb1`, `[::1]:8093` is `::1`. */
+function hostName(entry: string): string {
+  const name = entry.trim().toLowerCase();
+  const bracketed = /^\[([^\]]*)\](?::\d*)?$/.exec(name);
+  if (bracketed) return bracketed[1];
+  // One colon is host:port; several are a bare IPv6 address.
+  return name.indexOf(":") === name.lastIndexOf(":") ? name.split(":")[0] : name;
+}
+
 /** The host (or each host of a list) is not this machine: the password would travel the network. */
-function hasRemoteHost(host: string): boolean {
-  return host
+function hasRemoteHost(hosts: string): boolean {
+  return hosts
     .split(",")
-    .map((name) => name.trim().toLowerCase())
-    .some((name) => name !== "" && !LOOPBACK_HOSTS.has(name));
+    .map(hostName)
+    .some((name) => name !== "" && !LOOPBACK_NAMES.has(name) && !LOOPBACK_V4.test(name));
+}
+
+/** Hints one under the other; undefined when there are none (the row then shows no hint line). */
+function stacked(...hints: ReactNode[]): ReactNode {
+  const shown = hints.filter(Boolean);
+  if (shown.length === 0) return undefined;
+  return shown.map((hint, i) => (
+    <Fragment key={i}>
+      {i > 0 && <br />}
+      {hint}
+    </Fragment>
+  ));
 }
 
 function toDraft(entry: ProfileEntry): ProfileDraft {
@@ -280,15 +303,6 @@ function ConnectionDialogBody({
     hasRemoteHost(server.host);
   // Shown under Host (General) and under the SSL mode: the one place that decides it is this predicate.
   const plainTextNote = plainTextPassword ? <span className="text-warning">{PLAIN_TEXT_NOTE}</span> : null;
-  const hostHint = plainTextNote ? (
-    <>
-      {HOST_HINTS[draft.engine]}
-      <br />
-      {plainTextNote}
-    </>
-  ) : (
-    HOST_HINTS[draft.engine]
-  );
 
   const patchCommon = (changes: Partial<Pick<ServerProfileDraft, CommonField>>) =>
     setDraft((d) => ({ ...d, ...changes }));
@@ -409,7 +423,7 @@ function ConnectionDialogBody({
         </FieldRow>
         {server ? (
           <>
-            <FieldRow label="Host" hint={hostHint}>
+            <FieldRow label="Host" hint={stacked(HOST_HINTS[draft.engine], plainTextNote)}>
               <div className="flex gap-2">
                 <Input value={server.host} onChange={(e) => patchServer({ host: e.target.value })} />
                 <PortInput
@@ -473,7 +487,7 @@ function ConnectionDialogBody({
       </TabPanel>
 
       <TabPanel value="ssl" current={tab}>
-        <FieldRow label="Mode" hint={plainTextNote ?? SSL_MODE_HINTS[draft.engine]}>
+        <FieldRow label="Mode" hint={stacked(plainTextNote, SSL_MODE_HINTS[draft.engine])}>
           <Select value={ssl.mode} onChange={(e) => patchSsl({ mode: e.target.value as SslConfig["mode"] })}>
             {SSL_MODES.map((mode) => (
               <option key={mode} value={mode}>
