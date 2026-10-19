@@ -8,14 +8,15 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ContextMenu } from "@/components/ui/ContextMenu";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
-import type { ObjectNode, Profile, ProfileEntry } from "@/lib/api/types";
+import type { ObjectNode, ProfileEntry } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { ENGINE_LABELS } from "@/lib/engines";
 import { useWorkspace } from "@/stores/workspace";
 import { ConnectionDialog } from "../connections/ConnectionDialog";
 import { findEngineInfo, useDeleteProfile, useEngines, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
-import { secretsNeeded, UnlockDialog, type SecretsNeeded } from "../connections/UnlockDialog";
+import { secretsNeeded } from "../connections/UnlockDialog";
+import { joinUnlockPrompt } from "../connections/unlockPrompts";
 import { applyTreeContext } from "../query/queryContext";
 import { requestCloseTab, requestDisconnectTab } from "../workspace/closeGuards";
 import { openBrowseTab } from "./browse";
@@ -80,8 +81,8 @@ export function Explorer() {
   const [toDelete, setToDelete] = useState<ProfileEntry | null>(null);
   const [sampling, setSampling] = useState<{ profileId: string; node: ObjectNode } | null>(null);
   const [releasing, setReleasing] = useState(false);
-  const [unlock, setUnlock] = useState<{ profile: Profile; needs: SecretsNeeded } | null>(null);
-  const promptedErrors = useRef(new Set<string>());
+  // The failed rows that have asked for their profile's password (`joinUnlockPrompt`) and how to stop asking.
+  const asking = useRef(new Map<string, () => void>());
   const entries = profiles.data ?? [];
   const rows = useTreeRows(entries, expanded, expansions);
   const parentRef = useRef<HTMLDivElement>(null);
@@ -154,19 +155,31 @@ export function Explorer() {
     }
   };
 
-  // A children request failed with password_required: ask once per failure, then retry what failed.
+  // A children request failed with password_required: ask once per failure, in the profile's one unlock dialog. What
+  // failed is read again when the password is given (`useUnlockProfile`); a cancelled dialog leaves the row's Retry.
   useEffect(() => {
     const failing = rows.filter((r): r is ErrorRow => r.type === "error" && r.code === "password_required");
     const failingKeys = new Set(failing.map((r) => r.key));
-    for (const key of promptedErrors.current) if (!failingKeys.has(key)) promptedErrors.current.delete(key);
-    if (unlock) return;
-    const next = failing.find((r) => !promptedErrors.current.has(r.key));
-    const entry = next && entries.find((e) => e.profile.id === next.profileId);
-    if (next && entry) {
-      promptedErrors.current.add(next.key);
-      setUnlock({ profile: entry.profile, needs: secretsNeeded(next.detail) });
+    for (const [key, stopAsking] of asking.current) {
+      if (failingKeys.has(key)) continue;
+      stopAsking();
+      asking.current.delete(key);
     }
-  }, [rows, entries, unlock]);
+    for (const row of failing) {
+      const entry = entries.find((e) => e.profile.id === row.profileId);
+      if (!entry || asking.current.has(row.key)) continue;
+      const request = { profile: entry.profile, needs: secretsNeeded(row.detail) };
+      asking.current.set(row.key, joinUnlockPrompt(request, {}));
+    }
+  }, [rows, entries]);
+  // Rows that go with the tree stop asking.
+  useEffect(() => {
+    const own = asking.current;
+    return () => {
+      for (const stopAsking of own.values()) stopAsking();
+      own.clear();
+    };
+  }, []);
 
   /** Drops everything the tree and the workspace hold for a deleted profile. */
   const forgetProfile = (profileId: string) => {
@@ -433,15 +446,6 @@ export function Explorer() {
             setToDelete(null);
           }}
           onConfirm={() => void deleteEntry(toDelete)}
-        />
-      )}
-      {unlock && (
-        <UnlockDialog
-          open
-          profile={unlock.profile}
-          needs={unlock.needs}
-          onOpenChange={(open) => !open && setUnlock(null)}
-          onUnlocked={() => setUnlock(null)}
         />
       )}
     </div>

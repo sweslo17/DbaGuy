@@ -28,15 +28,20 @@ export function secretsNeeded(detail: unknown): SecretsNeeded {
   return needs.password || needs.ssh_password ? needs : DB_PASSWORD_ONLY;
 }
 
-function UnlockDialogBody({
+/**
+ * Asks for the secrets a profile is missing (the backend answered `password_required`; `needs` is its detail). It is
+ * always open and closes only when its owner stops rendering it: `onUnlocked` after the password was accepted,
+ * `onCancel` for Cancel and Escape. Who owns it, and that there is one per profile, is `UnlockPromptHost`.
+ */
+export function UnlockDialog({
   profile,
   needs,
-  onOpenChange,
+  onCancel,
   onUnlocked,
 }: {
   profile: Profile;
   needs: SecretsNeeded;
-  onOpenChange: (open: boolean) => void;
+  onCancel: () => void;
   onUnlocked: () => void;
 }) {
   const unlock = useUnlockProfile();
@@ -50,24 +55,19 @@ function UnlockDialogBody({
         id: profile.id,
         secrets: { password: needs.password ? password : null, ssh_password: needs.ssh_password ? sshPassword : null },
       },
-      {
-        onSuccess: () => {
-          onOpenChange(false);
-          onUnlocked();
-        },
-      },
+      { onSuccess: onUnlocked },
     );
   };
   const onEnter = (e: KeyboardEvent) => e.key === "Enter" && !isImeKeyEvent(e) && submit();
   return (
     <Dialog
       open
-      onOpenChange={onOpenChange}
+      onOpenChange={(open) => !open && onCancel()}
       title={`${needs.password ? "Password" : "SSH password"} for ${profile.name}`}
       width={420}
       footer={
         <>
-          <Button variant="ghost" onClick={() => onOpenChange(false)}>
+          <Button variant="ghost" onClick={onCancel}>
             Cancel
           </Button>
           <Button variant="primary" onClick={submit} disabled={!complete || unlock.isPending}>
@@ -109,31 +109,5 @@ function UnlockDialogBody({
         </p>
       )}
     </Dialog>
-  );
-}
-
-/** Asks for the secrets a profile is missing (the backend answered `password_required`; `needs` is its detail). */
-export function UnlockDialog({
-  profile,
-  needs = DB_PASSWORD_ONLY,
-  open,
-  onOpenChange,
-  onUnlocked,
-}: {
-  profile: Profile;
-  needs?: SecretsNeeded;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  onUnlocked: () => void;
-}) {
-  if (!open) return null;
-  return (
-    <UnlockDialogBody
-      key={profile.id}
-      profile={profile}
-      needs={needs}
-      onOpenChange={onOpenChange}
-      onUnlocked={onUnlocked}
-    />
   );
 }

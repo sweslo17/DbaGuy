@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { AppShell } from "./app/AppShell";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Sidebar } from "./app/Sidebar";
+import { UnlockPromptHost } from "./features/connections/UnlockPromptHost";
 import { PaletteHost } from "./features/palette/CommandPalette";
 import { togglePalette } from "./features/palette/paletteStore";
 import { Workspace } from "./features/workspace/Workspace";
@@ -57,6 +58,7 @@ export function App() {
     <ErrorBoundary name="App" title="DbaGuy hit an error" recover="reload">
       <AppShell sidebar={<Sidebar />} workspace={<Workspace />} />
       <PaletteHost />
+      <UnlockPromptHost />
     </ErrorBoundary>
   );
 }
