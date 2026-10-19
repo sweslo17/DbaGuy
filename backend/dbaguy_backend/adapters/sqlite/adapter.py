@@ -8,6 +8,7 @@ from urllib.parse import quote, unquote, urlparse
 
 from loguru import logger
 
+from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import ColumnCategory, ColumnMeta, ServerMessage
 from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
@@ -16,10 +17,12 @@ from ...domain.schema import SchemaSnapshot
 from ...sql.dialects import Dialect
 from ...sql.lexer import first_keyword
 from ..base import (
+    AdapterCapabilities,
     DatabaseAdapter,
     DatabaseConnection,
     Endpoint,
     ParsedUrl,
+    RowEditing,
     RunOptions,
     StatementCancelled,
     StatementError,
@@ -27,7 +30,7 @@ from ..base import (
     transaction_open_error,
 )
 from ..cancel_window import CancelWindow
-from . import introspection
+from . import editing, introspection
 from . import schema as sqlite_schema
 
 _PEEK_ROWS = 200
@@ -168,7 +171,7 @@ class SqliteStatementResult(StatementResult):
             self._cursor.close()
 
 
-class SqliteConnection(DatabaseConnection):
+class SqliteConnection(DatabaseConnection, RowEditing):
     def __init__(self, conn: sqlite3.Connection, path: Path) -> None:
         self._conn = conn  # isolation_level=None: the driver never begins a transaction on its own
         self._path = path
@@ -190,6 +193,12 @@ class SqliteConnection(DatabaseConnection):
     def object_detail(self, path: list[PathSegment]) -> ObjectDetail:
         try:
             return introspection.object_detail(self._conn, path)
+        except sqlite3.Error as exc:
+            raise _translate(exc) from exc
+
+    def edit_target(self, path: list[PathSegment]) -> EditTarget:
+        try:
+            return editing.edit_target(self._conn, path)
         except sqlite3.Error as exc:
             raise _translate(exc) from exc
 
@@ -268,6 +277,7 @@ class SqliteAdapter(DatabaseAdapter):
     url_schemes = ("sqlite",)
     default_port = None
     dialect = Dialect.SQLITE
+    capabilities = AdapterCapabilities(row_editing=True)
 
     def parse_url(self, url: str) -> ParsedUrl:
         """`sqlite:///abs/path` and `sqlite:////abs/path` (SQLAlchemy's absolute form) are absolute paths, `sqlite://rel`

@@ -171,6 +171,8 @@ def test_engines(client):
             continue
         assert info["transactions"] and info["plan_format"] is None
         assert not (info["query_context"] or info["parameters"] or info["documents"] or info["executed_plan"])
+    assert engines["postgres"]["row_editing"] and engines["sqlite"]["row_editing"]
+    assert not engines["couchbase"]["row_editing"]
 
 
 def test_metadata_and_session_over_websocket(client, sqlite_profile_id):

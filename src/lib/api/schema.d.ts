@@ -1202,6 +1202,8 @@ export interface components {
             executed_plan: boolean;
             /** Plan Format */
             plan_format: "couchbase" | null;
+            /** Row Editing */
+            row_editing: boolean;
         };
         /** ErrorEvent */
         ErrorEvent: {

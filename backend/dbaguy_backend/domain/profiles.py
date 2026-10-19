@@ -144,3 +144,4 @@ class EngineInfo(BaseModel):
     documents: bool  # the engine stores JSON documents by key
     executed_plan: bool  # a statement can also return the plan it ran with (04b)
     plan_format: Literal["couchbase"] | None  # how EXPLAIN / profile results are laid out; None: no plan view
+    row_editing: bool  # a table-data grid can be edited (spec ⑤)

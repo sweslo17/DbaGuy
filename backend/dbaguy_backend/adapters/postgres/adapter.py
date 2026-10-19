@@ -10,6 +10,7 @@ import psycopg
 from loguru import logger
 from psycopg import postgres, pq
 
+from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import ColumnMeta, ErrorPosition, MessageSeverity, ServerMessage
 from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
@@ -24,6 +25,7 @@ from ..base import (
     DatabaseConnection,
     Endpoint,
     ParsedUrl,
+    RowEditing,
     RunOptions,
     StatementCancelled,
     StatementError,
@@ -33,7 +35,7 @@ from ..base import (
 from ..cancel_window import CancelWindow
 from ..positions import offset_to_line_col
 from ..sql_text import first_keyword
-from . import ddl, introspection
+from . import ddl, editing, introspection
 from . import schema as pg_schema
 from .loaders import category_for_oid, configure_user_loaders
 
@@ -328,7 +330,7 @@ class _CursorResult(StatementResult):
             logger.warning("Error while closing PostgreSQL cursor: {}", exc)
 
 
-class PostgresConnection(DatabaseConnection):
+class PostgresConnection(DatabaseConnection, RowEditing):
     def __init__(self, conn: psycopg.Connection, read_only: bool = False) -> None:
         self._conn = conn
         self._read_only = read_only
@@ -416,6 +418,10 @@ class PostgresConnection(DatabaseConnection):
     def object_detail(self, path: list[PathSegment]) -> ObjectDetail:
         self._check_database(path)
         return ddl.object_detail(self._conn, path)
+
+    def edit_target(self, path: list[PathSegment]) -> EditTarget:
+        self._check_database(path)
+        return editing.edit_target(self._conn, path)
 
     def schema_snapshot(self) -> SchemaSnapshot:
         # The connection's own (native-loader) cursors: arrays come back as lists, unlike the text-first user cursors.
@@ -549,7 +555,7 @@ class PostgresAdapter(DatabaseAdapter):
     url_schemes = ("postgres", "postgresql")
     default_port = 5432
     dialect = Dialect.POSTGRES
-    capabilities = AdapterCapabilities(per_database_connection=True, cancel_aborts_transaction=True)
+    capabilities = AdapterCapabilities(per_database_connection=True, cancel_aborts_transaction=True, row_editing=True)
 
     def parse_url(self, url: str) -> ParsedUrl:
         parsed = urlparse(url)

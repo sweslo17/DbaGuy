@@ -3928,6 +3928,10 @@
               }
             ],
             "title": "Plan Format"
+          },
+          "row_editing": {
+            "type": "boolean",
+            "title": "Row Editing"
           }
         },
         "type": "object",
@@ -3944,7 +3948,8 @@
           "parameters",
           "documents",
           "executed_plan",
-          "plan_format"
+          "plan_format",
+          "row_editing"
         ],
         "title": "EngineInfo"
       },
