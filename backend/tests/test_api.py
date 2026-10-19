@@ -164,7 +164,7 @@ def test_engines(client):
     couchbase = engines["couchbase"]
     assert couchbase["dialect"] == "sqlpp" and couchbase["default_port"] == 8093 and couchbase["server_read_only"]
     assert not couchbase["transactions"] and couchbase["query_context"] and couchbase["parameters"]
-    assert not couchbase["documents"] and couchbase["executed_plan"] and couchbase["plan_format"] == "couchbase"
+    assert couchbase["documents"] and couchbase["executed_plan"] and couchbase["plan_format"] == "couchbase"
     assert couchbase["url_schemes"] == ["couchbase", "couchbases", "http", "https"]
     for name, info in engines.items():
         if name == "couchbase":

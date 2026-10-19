@@ -44,11 +44,13 @@ from ..base import (
     invalid_text_error,
 )
 from ..cancel_window import CancelWindow
+from ..documents import DocumentCapable, DocumentStore
 from . import catalog, sampling
+from .documents import SqlppDocumentStore
 from .http import (
     ChannelError, HttpChannel, NodeClient, QueryRequest, TlsFailure, basic_auth, build_body, client_context_id,
 )
-from .messages import PROTOCOL_ERROR
+from .messages import PROTOCOL_ERROR, is_server_error
 from .nodes import candidate_nodes
 from .params import parameter_warnings
 from .result import CouchbaseResult, EventStream, start_result
@@ -62,6 +64,7 @@ from .settings import (
     parse_couchbase_url,
     request_context,
 )
+from .stream import RawRow
 
 # R-04-6: a paused request holds a query servicer; the worker closes it after this (+ up to one 15 s housekeeping
 # pass). A13 (7.6.12): the server itself ends a request whose writes have stalled 77–86 s after the client stopped
@@ -134,12 +137,19 @@ def _edition(version: str) -> Literal["enterprise", "community"] | None:
     return "community" if version.endswith("-community") else None
 
 
-def is_server_error(exc: StatementError) -> bool:
-    """An error the query service answered with (a numeric code), not a failure to reach it."""
-    return exc.code is not None and exc.code.isdigit()
+def _read_all(result: CouchbaseResult) -> list[RawRow]:
+    """An internal statement's rows to the end, then an error that came after them; the result is closed in any case."""
+    try:
+        rows: list[RawRow] = []
+        while batch := result.fetch_rows(1000):
+            rows.extend(batch)
+        result.next_result()  # an error that came after the rows
+        return rows
+    finally:
+        result.close()
 
 
-class CouchbaseConnection(DatabaseConnection, FieldSampling):
+class CouchbaseConnection(DatabaseConnection, FieldSampling, DocumentCapable):
     """One session's connection: one keep-alive channel to one query node (NodeClient), one request at a time. All
     methods except cancel(), force_cancel() and abort() run on the owning worker thread."""
 
@@ -164,8 +174,10 @@ class CouchbaseConnection(DatabaseConnection, FieldSampling):
     # ---- requests ----
 
     def _begin(self, sql: str, *, context: QueryContext | None, params: StatementParams | None, readonly: bool,
-               retry_safe: bool, deadline: _Deadline | None = None, profile: str | None = None) -> EventStream:
-        """Send one request and wait for its status line. Busy from here until the response is read or abandoned."""
+               retry_safe: bool, deadline: _Deadline | None = None, profile: str | None = None,
+               preserve_expiry: bool = False) -> EventStream:
+        """Send one request and wait for its status line. Busy from here until the response is read or abandoned.
+        `preserve_expiry`: a write keeps the documents' expiration (a document save, R-04-2)."""
         with self._lock:
             self._busy, self._cancelled, self._channel = True, False, None
         try:
@@ -177,6 +189,7 @@ class CouchbaseConnection(DatabaseConnection, FieldSampling):
                 query_context=request_context(context) if context is not None else None, readonly=readonly,
                 named=params.named if params else {}, positional=params.positional if params else (),
                 timeout=deadline.server if deadline is not None else None, profile=profile,
+                preserve_expiry=preserve_expiry,
             )
             self.last_client_context_id = request.client_context_id
             logger.debug("Couchbase request {} to {}{}{}", request.client_context_id, self._client.label,
@@ -256,32 +269,37 @@ class CouchbaseConnection(DatabaseConnection, FieldSampling):
                                     messages=warnings)
         return self._result
 
-    def _internal_result(self, statement: str, named: Mapping[str, str] | None,
-                         context: QueryContext | None) -> CouchbaseResult:
-        """Start an internal statement (catalog, identification, ADVISE, a field sample) and read its head: always
-        read-only, retry-safe and with a deadline (_INTERNAL_DEADLINE: the server's `timeout` of 30 s, whose error 1080
-        is raised like any other, and 40 s without a byte on the client). The caller reads the rows and closes it.
-        `named`: parameter names without `$` and their JSON literal texts. `context`: the request's query context
-        (None: none is sent, as the catalog wants)."""
+    def _internal_result(self, statement: str, named: Mapping[str, str] | None, context: QueryContext | None, *,
+                         write: bool = False, preserve_expiry: bool = False) -> CouchbaseResult:
+        """Start an internal statement (catalog, identification, ADVISE, a field sample, a document's statements) and
+        read its head, with a deadline (_INTERNAL_DEADLINE: the server's `timeout` of 30 s, whose error 1080 is raised
+        like any other, and 40 s without a byte on the client). A read is read-only and retry-safe; a write (`write`, a
+        document store's UPDATE, INSERT or DELETE) is read-only only on a read-only profile (the server refuses it then,
+        too) and never sent again (D-04-9). The caller reads the rows and closes it. `named`: parameter names without
+        `$` and their JSON literal texts. `context`: the request's query context (None: none is sent, as the catalog
+        wants). `preserve_expiry`: see `_begin`."""
         self._close_result()
         params = StatementParams(named=dict(named)) if named else None
-        stream = self._begin(statement, context=context, params=params, readonly=True, retry_safe=True,
-                             deadline=_INTERNAL_DEADLINE)
-        return start_result(stream, statement, plan=False, bare_star=False, dml=False, on_done=self._end)
+        stream = self._begin(statement, context=context, params=params,
+                             readonly=self._read_only if write else True, retry_safe=not write,
+                             deadline=_INTERNAL_DEADLINE, preserve_expiry=preserve_expiry)
+        return start_result(stream, statement, plan=False, bare_star=False, dml=write, on_done=self._end)
 
     def query(self, statement: str, named: Mapping[str, str] | None = None, *,
               context: QueryContext | None = None) -> list[Any]:
-        """An internal statement read to the end (see `_internal_result`), rows decoded with plain JSON (an int stays an
-        int: the catalog's num_replica, R-04a-C20)."""
-        result = self._internal_result(statement, named, context)
-        try:
-            rows: list[Any] = []
-            while batch := result.fetch_raw(1000):
-                rows.extend(json.loads(text) for text in batch)
-            result.next_result()  # an error that came after the rows
-            return rows
-        finally:
-            result.close()
+        """A read-only internal statement read to its end (see `_internal_result`), rows decoded with plain JSON (an int
+        stays an int: the catalog's num_replica, R-04a-C20)."""
+        return [json.loads(row.text) for row in _read_all(self._internal_result(statement, named, context))]
+
+    def statement_rows(self, statement: str, named: Mapping[str, str] | None = None, *, write: bool = False,
+                       preserve_expiry: bool = False) -> list[RawRow]:
+        """An internal statement read to its end (see `_internal_result`; no query context: the statement names its
+        keyspace in full), each row as parsed: its exact text and an object row's members, nested values located, never
+        built. `named`: names without `$` → JSON literal texts."""
+        return _read_all(self._internal_result(statement, named, None, write=write, preserve_expiry=preserve_expiry))
+
+    def documents(self) -> DocumentStore:
+        return SqlppDocumentStore(self)
 
     def sample_fields(self, keyspace: Keyspace, size: int) -> FieldSample:
         """A manual sample (R-04-11): up to `size` documents, their field paths derived in Python (sampling.py). The rows
@@ -426,10 +444,10 @@ class CouchbaseAdapter(DatabaseAdapter):
     url_schemes = URL_SCHEMES
     default_port = QUERY_PORT
     dialect = Dialect.SQLPP
-    # documents: 04c. executed_plan: 04a's ruling P6 lifted in 04b, A16 holds (the `profile` field follows `metrics`,
-    # so it arrives after the last row as a second result set)
+    # executed_plan: 04a's ruling P6 lifted in 04b, A16 holds (the `profile` field follows `metrics`, so it arrives
+    # after the last row as a second result set); documents: lifted in 04c
     capabilities = AdapterCapabilities(
-        server_read_only=True, transactions=False, query_context=True, parameters=True, documents=False,
+        server_read_only=True, transactions=False, query_context=True, parameters=True, documents=True,
         executed_plan=True, plan_format="couchbase", paused_result_max_idle_s=PAUSED_RESULT_MAX_IDLE_S,
         read_ahead_bytes=READ_AHEAD_BYTES,
     )

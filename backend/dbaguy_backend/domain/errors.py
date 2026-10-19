@@ -94,3 +94,48 @@ class PasswordRequired(ConnectionFailed):
 
     code = "password_required"
     status = 428
+
+
+class DocumentMissing(NotFound):
+    code = "document_missing"
+
+    def __init__(self) -> None:
+        super().__init__("The document does not exist (it may have been deleted)")
+
+
+class DocumentConflict(DomainError):
+    """A CAS-checked write met a newer version of the document; `detail.cas` is the CAS it holds now."""
+
+    code = "document_conflict"
+    status = 409
+
+    def __init__(self, current_cas: str) -> None:
+        super().__init__("The document was changed after it was opened", detail={"cas": current_cas})
+
+
+class DocumentExists(DomainError):
+    code = "document_exists"
+    status = 409
+
+    def __init__(self) -> None:
+        super().__init__("A document with this ID already exists")
+
+
+class BinaryDocument(ValidationFailed):
+    code = "binary_document"
+
+    def __init__(self) -> None:
+        super().__init__("This is a binary document: DbaGuy shows it but never changes it")
+
+
+class WriteOutcomeUnknown(DomainError):
+    """A write whose answer never came (D-04-9): it may have been applied, so it is never sent again."""
+
+    code = "write_outcome_unknown"
+    status = 502
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The connection to the query node was lost during the write: the document may or may not have changed. "
+            "Reload it to see what the server holds"
+        )

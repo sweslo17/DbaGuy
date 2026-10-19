@@ -1,6 +1,7 @@
 """API models of the Couchbase features: the plan view (EXPLAIN, ADVISE and the profile of a statement as an operator
-tree with flags, index advice and timings, spec §3.10), the query contexts a tab can pick (§3.11.1) and the field paths
-of a keyspace's sampled documents (R-04-11), and what saving a document would change (§3.9.3)."""
+tree with flags, index advice and timings, spec §3.10), the query contexts a tab can pick (§3.11.1), the field paths
+of a keyspace's sampled documents (R-04-11), a document as read and as saved (§3.9.2), and what saving a document would
+change (§3.9.3)."""
 
 from datetime import datetime
 from typing import Literal
@@ -147,3 +148,29 @@ class ChangeCounts(BaseModel):
     number: int = 0
     duplicate_key: int = 0
     other: int = 0
+
+
+DOCUMENT_ID_MAX_BYTES = 250  # Couchbase's key limit, UTF-8 bytes
+DOCUMENT_TEXT_LIMIT = 20 * 1024 * 1024  # characters of a saved text; the server enforces its own 20 MiB
+CAS_PATTERN = r"^[1-9][0-9]{0,18}$"
+CAS_MAX = 2**63 - 1  # a CAS beyond int64 would be compared as a double by SQL++ (ruling C11)
+
+
+class DocumentView(BaseModel):
+    """One document as the server holds it (spec §3.9.2, R-04-2)."""
+
+    id: str
+    cas: str  # decimal text: a CAS is beyond 2^53
+    expiration: int  # Unix seconds; 0 = none
+    type: Literal["json", "base64"]  # base64: a binary document, shown but never changed
+    text: str | None  # the stored text exactly as the server holds it; None for a binary document
+    size: int  # bytes of the text; for a binary document what the server reports
+
+
+class DocumentSaved(BaseModel):
+    """A write that happened: the document's new CAS and its expiration."""
+
+    status: Literal["saved"]
+    cas: str
+    expiration: int  # as read right after the write (A28: RETURNING says 0)
+    size: int  # bytes of the saved text without the whitespace between its tokens (ruling C21)

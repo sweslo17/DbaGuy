@@ -394,6 +394,11 @@ class CouchbaseResult(StatementResult, RawJsonRows):
         """Each row's text as the server sent it (JSON / JSONL exports, R-04-15)."""
         return self._rows(n, _row_text)
 
+    def fetch_rows(self, n: int) -> list[RawRow]:
+        """The rows as parsed: each value's exact text, an object row's members by name (internal statements, the
+        document store). Rows read here are not returned by `fetch()` or `fetch_raw()` as well."""
+        return self._rows(n, _as_parsed)
+
     def affected_rows(self) -> int | None:
         """`metrics.mutationCount`; 0 for DML without it (the server leaves out a zero), else None (spec §3.5.5). None
         for the profile set."""
@@ -501,6 +506,10 @@ class CouchbaseResult(StatementResult, RawJsonRows):
 
 def _row_text(row: RawRow) -> str:
     return row.text
+
+
+def _as_parsed(row: RawRow) -> RawRow:
+    return row
 
 
 def start_result(stream: EventStream, sql: str, *, plan: bool, bare_star: bool, dml: bool,

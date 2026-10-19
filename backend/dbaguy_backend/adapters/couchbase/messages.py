@@ -1,5 +1,6 @@
 """What the query service says besides rows, as DbaGuy shows it (spec §3.5.4, §4): errors with the server's own text
-(M10), its code and a UTF-16 position; warnings and the metrics line as messages. Pure."""
+(M10), its code and a UTF-16 position, and whether an error is the server's own answer; warnings and the metrics line
+as messages. Pure."""
 
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -49,6 +50,11 @@ def statement_error(errors: Sequence[Any], sql: str) -> StatementError:
     message = "\n".join([_first_text(first), *(_line(error) for error in errors[1:])])
     code = first.get("code")
     return StatementError(message, code=str(code) if code is not None else None, position=_position(first, sql))
+
+
+def is_server_error(exc: StatementError) -> bool:
+    """An error the query service answered with (a numeric code), not a failure to reach it."""
+    return exc.code is not None and exc.code.isdigit()
 
 
 def warning_messages(warnings: Sequence[Any]) -> list[ServerMessage]:

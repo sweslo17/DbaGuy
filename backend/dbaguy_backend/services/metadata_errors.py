@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 from ..adapters.base import StatementError
-from ..adapters.couchbase.adapter import is_server_error
+from ..adapters.couchbase.messages import is_server_error
 from ..domain.errors import QueryFailed
 
 
