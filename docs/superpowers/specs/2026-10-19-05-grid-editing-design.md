@@ -468,6 +468,14 @@ interface StagedEdits {
 - 更強的並行檢查：SQL Server rowversion、PG `xmin`；MySQL／SQL Server 用 binary collation 比較（需依欄位字元集選 collation）。
 - SQL Server 合併批次以加快大量變更（每句仍要自己的列數）。
 
+### Coordinator 審核（2026-10-19）
+
+核准，並加上以下細化（與上文衝突時以這裡為準）：
+- **CR-1**：D-05-12 的「Refresh 保留位置、重讀已載入的列數」只用在 `row_editing` 為真的 engine 的表格資料 tab；Couchbase 的瀏覽 tab（雙擊 collection）照舊：一頁 8 MiB 的文件重讀一萬份太重（Q1）。
+- **CR-2**：plan id 是隨機的 UUID（`uuid4`），不是遞增編號；plan 只能被同一個 profile＋database 的 session 取走（D-05-7 已綁定）。
+- **CR-3**：同一張表開在兩個 tab：兩邊的暫存各自獨立，各自 commit；彼此的覆蓋由 R-05-5 的原始值檢查擋下（後 commit 的那邊整批 rollback，Refresh 後 Keep mine）。
+- **CR-4**：key 欄本身可以改（不是 identity／generated 時）：UPDATE 的 WHERE 用原始 key、SET 新值；暫存在重跑前依原始 key 綁定，commit 之後重跑就以新 key 顯示。overlay 的 RowKey 永遠是載入時的 key。
+
 ## 13. 收尾時要更新的文件
 
 - `CLAUDE.md`：Repo 結構加 `features/edits/`、`stores/stagedEdits.ts`、`sql/dml.py`、`sql/literals.py`、`adapters/*/editing.py`、`services/edit_service.py`、`api/edits.py`；架構重點加「Grid 內編輯」一段（表格資料 tab、key、overlay、plan、tab 自己的 session 與明確交易、exactly-1、結果四分類、PG `::text`、MySQL 符合列數、SQL Server 外框與 ASCII literal、重跑保留位置、workspace 暫存與 close guard）；已知限制（浮點等不檢查、collation、唯一值互換、MyISAM partial、64 KiB、不做 query 結果）；進度表 ⑤。
