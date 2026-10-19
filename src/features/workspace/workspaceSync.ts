@@ -5,8 +5,10 @@ import { api, ApiError, errorMessage, unwrap } from "@/lib/api/client";
 import type { SavedWorkspace } from "@/lib/api/types";
 import { getBackendInfo, isTauriRuntime, type BackendInfo } from "@/lib/backend";
 import { forgetEditorBuffersExcept, onEdited, readEditorBuffer } from "@/stores/editorBuffers";
-import { useWorkspace, type WorkspaceSnapshot } from "@/stores/workspace";
+import { forgetStagedEditsExcept, onStagedEditsChanged, putStagedEdits, readStagedEdits } from "@/stores/stagedEdits";
+import { useWorkspace } from "@/stores/workspace";
 import { fetchProfiles, profilesKey } from "../connections/hooks";
+import { restoredEdits, savedEdits } from "../edits/savedEdits";
 import { clearPendingWorkspace, readPendingWorkspace, writePendingWorkspace } from "./pendingWorkspace";
 import { fromSavedWorkspace, toSavedWorkspace, workspaceJson, type RestoredWorkspace } from "./workspaceFile";
 
@@ -37,16 +39,34 @@ interface Serialized {
   json: string;
 }
 
-/** The whole workspace as `workspace.json` holds it; the editors' text is read now. */
+/** A tab's staged edits as the file keeps them (`savedEdits`: null beyond the limits, B40). */
+const stagedFile = (tabId: string) => savedEdits(readStagedEdits(tabId)).file;
+
+/** The whole workspace as `workspace.json` holds it; the editors' text and the staged edits are read now. */
 function serialize(): Serialized {
   const { tabs, activeTabId, sidebarTab } = useWorkspace.getState();
-  forgetEditorBuffersExcept(new Set(tabs.map((tab) => tab.id)));
-  const file = toSavedWorkspace({ tabs, activeTabId, sidebarTab }, readEditorBuffer);
+  const open = new Set(tabs.map((tab) => tab.id));
+  forgetEditorBuffersExcept(open);
+  forgetStagedEditsExcept(open);
+  const file = toSavedWorkspace({ tabs, activeTabId, sidebarTab }, readEditorBuffer, stagedFile);
   return { file, json: workspaceJson(file) };
 }
 
-/** A restored state's JSON, before any editor is mounted (comparable whatever it was restored from). */
-const snapshotJson = (snapshot: WorkspaceSnapshot) => workspaceJson(toSavedWorkspace(snapshot, () => null));
+/**
+ * A restored state's JSON, before any editor is mounted (comparable whatever it was restored from). A staged set is
+ * normalized through the store's form: the backend's file adds defaults (`text: null`) that a local copy lacks (L3).
+ */
+const snapshotJson = ({ snapshot, staged }: RestoredWorkspace) =>
+  workspaceJson(
+    toSavedWorkspace(
+      snapshot,
+      () => null,
+      (tabId) => {
+        const file = staged.get(tabId);
+        return file ? savedEdits(restoredEdits(file)).file : null;
+      },
+    ),
+  );
 
 /**
  * The one workspace writer (spec §4.8, rulings R-02c-4 and R-02c-7). Every store mutation and editor change
@@ -87,6 +107,7 @@ class WorkspaceWriter {
       if (changed) this.schedule();
     });
     onEdited(this.schedule);
+    onStagedEditsChanged(this.schedule);
     window.addEventListener("pagehide", this.flush);
     window.addEventListener("beforeunload", this.flush);
     this.schedule(); // saves only if the state differs from `lastSaved`
@@ -188,6 +209,12 @@ class WorkspaceWriter {
     return Math.min(RETRY_FIRST_MS * 2 ** (this.failures - 1), RETRY_MAX_MS);
   }
 
+  /**
+   * Staged grid edits ride along (up to 8 MiB of text), and the browser's storage quota is far smaller (about 5 MB), so
+   * with a large staged set the copy may not fit and is not written at all. It is not written without them instead:
+   * a copy is newer than `workspace.json`, so on the next start it would win and drop the staged edits the file
+   * still holds (pre-flight L19; the known limit says so).
+   */
   private mirror(json: string): void {
     const at = Date.now();
     if (writePendingWorkspace(json, at)) this.mirroredAt = at;
@@ -301,12 +328,14 @@ async function restoreSaved(queryClient: QueryClient): Promise<WriterStart> {
   const profileExists = (id: string) => !profileIds || profileIds.has(id);
   const fromFile = saved && fromSavedWorkspace(saved, profileExists);
   let fromPending = pending && fromSavedWorkspace(pending.file, profileExists);
-  if (fromPending && fromFile && snapshotJson(fromPending.snapshot) === snapshotJson(fromFile.snapshot)) {
+  if (fromPending && fromFile && snapshotJson(fromPending) === snapshotJson(fromFile)) {
     clearPendingWorkspace(); // the backend has it after all
     fromPending = null;
   }
   const restored = fromPending ?? fromFile;
   if (!restored) throw new Error("Nothing to restore"); // unreachable: no file means there is a local copy
+  // Before the tabs: a table tab finds its staged edits when it mounts (spec ⑤ §3.7).
+  for (const [tabId, file] of restored.staged) putStagedEdits(tabId, restoredEdits(file));
   useWorkspace.getState().restore(restored.snapshot);
   const source = fromPending ? "the unsaved local copy" : "workspace.json";
   const { tabs } = restored.snapshot;

@@ -2712,6 +2712,73 @@ export interface components {
             /** Key File */
             key_file?: string | null;
         };
+        /**
+         * StagedCell
+         * @description A staged cell as `workspace.json` keeps it: one value of at most MAX_VALUE_CHARS (D-05-11), not a request's 4x.
+         */
+        StagedCell: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "value" | "null" | "default";
+            /** Text */
+            text?: string | null;
+        };
+        /**
+         * StagedEditsFile
+         * @description A table-data tab's staged grid edits in `workspace.json` (spec ⑤ §3.7, ruling H6): the changes as staged (an
+         *     UPDATE under its row's DELETE included), the key they were staged on, and whether the last commit's outcome is
+         *     unknown. Bounded like a commit (D-05-11) and by MAX_STAGED_CHARS in all: the frontend writes none that is larger
+         *     (`savedEdits`), and the workspace repair drops one this model refuses rather than the tab (B40).
+         */
+        StagedEditsFile: {
+            /**
+             * Version
+             * @default 1
+             * @constant
+             */
+            version: 1;
+            /** Key Columns */
+            key_columns: string[];
+            /** Updates */
+            updates?: components["schemas"]["StagedRowUpdate"][];
+            /** Inserts */
+            inserts?: components["schemas"]["StagedRowInsert"][];
+            /** Deletes */
+            deletes?: components["schemas"]["RowDelete"][];
+            /**
+             * Outcome Unknown
+             * @default false
+             */
+            outcome_unknown: boolean;
+        };
+        /** StagedRowInsert */
+        StagedRowInsert: {
+            /** Id */
+            id: string;
+            /** Values */
+            values?: {
+                [key: string]: components["schemas"]["StagedCell"];
+            };
+        };
+        /** StagedRowUpdate */
+        StagedRowUpdate: {
+            /** Id */
+            id: string;
+            /** Key */
+            key: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+            /** Set */
+            set: {
+                [key: string]: components["schemas"]["StagedCell"];
+            };
+            /** Original */
+            original: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+        };
         /** StartedEvent */
         StartedEvent: {
             /**
@@ -2857,6 +2924,7 @@ export interface components {
             } | null;
             /** Document Cas */
             document_cas?: string | null;
+            staged_edits?: components["schemas"]["StagedEditsFile"] | null;
         };
     };
     responses: never;

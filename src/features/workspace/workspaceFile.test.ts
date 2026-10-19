@@ -161,3 +161,66 @@ describe("restoring a document tab whose connection is gone (M6)", () => {
     expect(restore({ profile_id: null, buffer: "{}" }).detached).toEqual([DETACHED]);
   });
 });
+
+/* A table tab's staged grid edits (spec ⑤ §3.7): kept beside the tab, restored into the staged-edits store. */
+
+describe("a table tab's staged edits", () => {
+  const TABLE_PATH = [
+    { kind: "schema", name: "public" },
+    { kind: "folder", name: "tables" },
+    { kind: "table", name: "orders" },
+  ];
+  const tableTab: Tab = { id: "table:1", kind: "table", profileId: PROFILE, path: TABLE_PATH, title: "orders" };
+  const file = {
+    version: 1 as const,
+    key_columns: ["id"],
+    updates: [],
+    inserts: [{ id: "i:1", values: {} }],
+    deletes: [{ id: "d:2", key: { id: 7 } }],
+    outcome_unknown: false,
+  };
+  const workspace = (entry: Partial<SavedTab>): SavedWorkspace => ({
+    version: 1,
+    tabs: [{ id: "table:1", kind: "table", title: "orders", profile_id: PROFILE, object_path: TABLE_PATH, ...entry }],
+    active_tab_id: null,
+    sidebar_tab: null,
+  });
+
+  it("are saved from the staged-edits store, and only when there are some", () => {
+    const save = (staged: typeof file | null) =>
+      toSavedWorkspace(
+        { tabs: [tableTab], activeTabId: null, sidebarTab: null },
+        () => null,
+        () => staged,
+      ).tabs[0];
+    expect(save(file)).toMatchObject({ kind: "table", staged_edits: file });
+    expect(save(null)).not.toHaveProperty("staged_edits");
+  });
+
+  it("are restored beside their tab", () => {
+    const restored = fromSavedWorkspace(workspace({ staged_edits: file }), () => true);
+    expect(restored.snapshot.tabs).toEqual([tableTab]);
+    expect(restored.staged.get("table:1")).toEqual(file);
+  });
+
+  it("go with a tab whose connection is gone, and the closed list says how many", () => {
+    const restored = fromSavedWorkspace(workspace({ staged_edits: file }), () => false);
+    expect(restored.closed).toEqual(["orders (2 staged changes discarded)"]);
+    expect(restored.staged.size).toBe(0);
+  });
+
+  it("count an UPDATE under its row's DELETE once in that list, as the close question does (L20)", () => {
+    const hidden = {
+      ...file,
+      updates: [{ id: "u:1", key: { id: 7 }, set: { a: { kind: "null" as const } }, original: { a: 1 } }],
+    };
+    const restored = fromSavedWorkspace(workspace({ staged_edits: hidden }), () => false);
+    expect(restored.closed).toEqual(["orders (2 staged changes discarded)"]); // the new row and the delete, not three
+  });
+
+  it("are restored for a table tab only", () => {
+    const restored = fromSavedWorkspace(workspace({ kind: "object", staged_edits: file }), () => true);
+    expect(restored.snapshot.tabs).toHaveLength(1);
+    expect(restored.staged.size).toBe(0);
+  });
+});

@@ -7828,6 +7828,171 @@
         "type": "object",
         "title": "SslConfig"
       },
+      "StagedCell": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "value",
+              "null",
+              "default"
+            ],
+            "title": "Kind"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1048576
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "title": "StagedCell",
+        "description": "A staged cell as `workspace.json` keeps it: one value of at most MAX_VALUE_CHARS (D-05-11), not a request's 4x."
+      },
+      "StagedEditsFile": {
+        "properties": {
+          "version": {
+            "type": "integer",
+            "const": 1,
+            "title": "Version",
+            "default": 1
+          },
+          "key_columns": {
+            "items": {
+              "type": "string",
+              "maxLength": 1024,
+              "minLength": 1
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Key Columns"
+          },
+          "updates": {
+            "items": {
+              "$ref": "#/components/schemas/StagedRowUpdate"
+            },
+            "type": "array",
+            "title": "Updates"
+          },
+          "inserts": {
+            "items": {
+              "$ref": "#/components/schemas/StagedRowInsert"
+            },
+            "type": "array",
+            "title": "Inserts"
+          },
+          "deletes": {
+            "items": {
+              "$ref": "#/components/schemas/RowDelete"
+            },
+            "type": "array",
+            "title": "Deletes"
+          },
+          "outcome_unknown": {
+            "type": "boolean",
+            "title": "Outcome Unknown",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "key_columns"
+        ],
+        "title": "StagedEditsFile",
+        "description": "A table-data tab's staged grid edits in `workspace.json` (spec \u2464 \u00a73.7, ruling H6): the changes as staged (an\nUPDATE under its row's DELETE included), the key they were staged on, and whether the last commit's outcome is\nunknown. Bounded like a commit (D-05-11) and by MAX_STAGED_CHARS in all: the frontend writes none that is larger\n(`savedEdits`), and the workspace repair drops one this model refuses rather than the tab (B40)."
+      },
+      "StagedRowInsert": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "values": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/StagedCell"
+            },
+            "propertyNames": {
+              "maxLength": 1024,
+              "minLength": 1
+            },
+            "type": "object",
+            "title": "Values"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "title": "StagedRowInsert"
+      },
+      "StagedRowUpdate": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "key": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "propertyNames": {
+              "maxLength": 1024,
+              "minLength": 1
+            },
+            "type": "object",
+            "title": "Key"
+          },
+          "set": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/StagedCell"
+            },
+            "propertyNames": {
+              "maxLength": 1024,
+              "minLength": 1
+            },
+            "type": "object",
+            "minProperties": 1,
+            "title": "Set"
+          },
+          "original": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "propertyNames": {
+              "maxLength": 1024,
+              "minLength": 1
+            },
+            "type": "object",
+            "title": "Original"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "key",
+          "set",
+          "original"
+        ],
+        "title": "StagedRowUpdate"
+      },
       "StartedEvent": {
         "properties": {
           "type": {
@@ -8272,6 +8437,16 @@
               }
             ],
             "title": "Document Cas"
+          },
+          "staged_edits": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StagedEditsFile"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,

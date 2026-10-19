@@ -126,6 +126,8 @@ export type ApplyEditsCommand = S["ApplyEditsCommand"];
 export type EditOutcomeEvent = S["EditOutcomeEvent"];
 /** "committed", "rolled_back" (nothing was applied), "partial" (a table that cannot roll back) or "unknown". */
 export type EditOutcome = EditOutcomeEvent["outcome"];
+/** Grid editing (spec ⑤ §3.7): a table tab's staged edits as `workspace.json` keeps them. */
+export type StagedEditsFile = S["StagedEditsFile"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

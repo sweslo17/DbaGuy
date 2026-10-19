@@ -5,6 +5,7 @@ import pytest
 from loguru import logger
 from pydantic import ValidationError
 
+from dbaguy_backend.domain.edits import MAX_STAGED_CHARS, MAX_VALUE_CHARS
 from dbaguy_backend.domain.errors import AlreadyExists, NotFound, StorageError, ValidationFailed
 from dbaguy_backend.domain.execution import QueryContext
 from dbaguy_backend.domain.metadata import PathSegment
@@ -670,3 +671,110 @@ def test_workspace_keeps_the_tab_context_and_params(tmp_path):  # Review Focus 5
         WorkspaceTab(id="d", kind="query", params={"n": "1"})  # a draft is keyed by `$name` or `$n`
     with pytest.raises(ValidationError):
         WorkspaceTab(id="d", kind="query", query_context="all")
+
+
+STAGED_PATH = [{"kind": "database", "name": "dbaguy"}, {"kind": "schema", "name": "public"},
+               {"kind": "folder", "name": "tables"}, {"kind": "table", "name": "orders"}]
+
+
+def staged_edits(**overrides):
+    """A table tab's staged edits as the frontend writes them (`savedEdits`, spec ⑤ §3.7)."""
+    return {
+        "version": 1,
+        "key_columns": ["id"],
+        "updates": [{"id": "u:1", "key": {"id": "9007199254740993"},
+                     "set": {"label": {"kind": "value", "text": "b"}, "note": {"kind": "null"}},
+                     "original": {"label": "a", "note": ""}},
+                    {"id": "u:2", "key": {"id": 2}, "set": {"data": {"kind": "value", "text": "0xdead"}},
+                     "original": {"data": {"$type": "bytes", "size": 100, "preview": "ab" * 64}}}],
+        "inserts": [{"id": "i:3", "values": {"label": {"kind": "value", "text": ""}}}, {"id": "i:4", "values": {}}],
+        "deletes": [{"id": "d:5", "key": {"id": 2}}],
+        "outcome_unknown": True,
+        **overrides,
+    }
+
+
+def test_workspace_keeps_a_table_tabs_staged_edits(tmp_path):  # spec ⑤ §3.7, Review Focus 5
+    state = WorkspaceState.model_validate({"tabs": [
+        {"id": "t1", "kind": "table", "title": "orders", "object_path": STAGED_PATH, "staged_edits": staged_edits()},
+        {"id": "t2", "kind": "table", "title": "orders", "object_path": STAGED_PATH},
+    ]})
+    service = WorkspaceService(tmp_path / "workspace.json")
+    service.put(state)
+    assert service.get() == state
+    assert service.get().tabs[0].staged_edits.updates[0].key == {"id": "9007199254740993"}  # digits stay text
+
+
+@pytest.mark.parametrize("bad", [
+    {"updates": [{"id": "u:1", "key": {"id": 1}, "set": {"a": {"kind": "value", "text": "x" * (1_048_576 + 1)}},
+                  "original": {"a": None}}]},  # one value over 1 MiB (D-05-11)
+    {"inserts": [{"id": f"i:{n}", "values": {}} for n in range(10_001)], "updates": [], "deletes": []},
+    {"inserts": [{"id": "i:1", "values": {}}, {"id": "i:1", "values": {}}]},  # a repeated id
+    {"inserts": [{"id": f"i:{n}", "values": {"a": {"kind": "value", "text": "x" * 1_048_576}}} for n in range(9)]},
+    {"updates": [{"id": "u:1", "key": {"id": 1}, "set": {"a": {"kind": "null"}}, "original": {}}]},  # no original
+    {"updates": [{"id": "u:1", "key": {"id": 1}, "set": {}, "original": {}}]},  # an UPDATE that sets nothing
+    {"key_columns": []},
+    {"version": 2},
+    {"extra": True},
+])
+def test_staged_edits_beyond_their_limits_are_refused(bad):
+    with pytest.raises(ValidationError):
+        WorkspaceTab(id="t", kind="table", staged_edits=staged_edits(**bad))
+
+
+def test_only_a_table_tab_keeps_staged_edits():
+    with pytest.raises(ValidationError):
+        WorkspaceTab(id="q", kind="query", staged_edits=staged_edits())
+
+
+def test_a_tab_with_staged_edits_the_model_refuses_keeps_everything_else(tmp_path, logged_warnings):  # B40
+    path = tmp_path / "workspace.json"
+    secret = "secret-value"
+    path.write_text(json.dumps({"tabs": [
+        {"id": "t1", "kind": "table", "title": "orders", "object_path": STAGED_PATH,
+         "staged_edits": staged_edits(inserts=[{"id": "i:1", "values": {"a": {"kind": "value", "text": secret}}},
+                                               {"id": "i:1", "values": {}}])},
+        {"id": "q1", "kind": "query", "buffer": "kept", "staged_edits": staged_edits()},
+        {"id": "t2", "kind": "table", "title": "orders", "object_path": STAGED_PATH, "staged_edits": staged_edits()},
+    ]}))
+    t1, q1, t2 = WorkspaceService(path).get().tabs
+    assert (t1.id, t1.object_path is not None, t1.staged_edits) == ("t1", True, None)
+    assert (q1.buffer, q1.staged_edits) == ("kept", None)
+    assert t2.staged_edits is not None  # a good one is untouched
+    assert [line for line in logged_warnings if line.startswith("Repaired")] == [
+        "Repaired tab 0 of the saved workspace: dropped the staged edits",
+        "Repaired tab 1 of the saved workspace: dropped the staged edits"]
+    assert secret not in "".join(logged_warnings)
+    raw = {"tabs": [{"id": "t1", "kind": "table", "staged_edits": {"version": 1, "key_columns": []}}]}
+    assert WorkspaceState.model_validate(repaired_workspace(raw)).tabs[0].staged_edits is None  # `PUT /workspace`
+
+
+@pytest.mark.parametrize("original, original_chars", [
+    ("a", 1), ("\U0001F600", 1),  # a character beyond the BMP counts once, as `len` does (JavaScript's length says two)
+    ({"$type": "bytes", "size": 100, "preview": "ab" * 64}, 150),  # an object's names count too
+    (["ab", 3, None, [True]], 5)])  # an array's elements, nested ones too: 2 + 1 + 1 + 1
+def test_staged_text_is_counted_to_the_character(original, original_chars):  # pre-flight M3
+    """Eight updates: each key {id: n} counts "id" and 1, each original {label: …} counts "label" and its own text, so
+    a set of `total` characters in all is seven values of the limit and one that makes up the rest. The frontend's
+    `savedEdits.test.ts` builds the same sets: what it measures under the limit must be what this keeps."""
+    def tab(total):
+        last = total - 8 * (3 + 5 + original_chars) - 7 * MAX_VALUE_CHARS
+        updates = [{"id": f"u:{n}", "key": {"id": n}, "original": {"label": original},
+                    "set": {"label": {"kind": "value", "text": "x" * (MAX_VALUE_CHARS if n < 7 else last)}}}
+                   for n in range(8)]
+        return WorkspaceTab(id="t", kind="table", staged_edits=staged_edits(updates=updates, inserts=[], deletes=[]))
+    assert len(tab(MAX_STAGED_CHARS).staged_edits.updates) == 8
+    with pytest.raises(ValidationError):
+        tab(MAX_STAGED_CHARS + 1)
+
+
+def test_staged_keys_count_their_column_names():  # pre-flight M3
+    name = "k" * 900
+
+    def tab(count):
+        deletes = [{"id": f"d:{n}", "key": {name: n}} for n in range(count)]
+        return WorkspaceTab(id="t", kind="table", staged_edits=staged_edits(
+            key_columns=[name], updates=[], inserts=[], deletes=deletes))
+    assert len(tab(9_000).staged_edits.deletes) == 9_000  # 8,109,000 characters
+    with pytest.raises(ValidationError):
+        tab(10_000)  # 9,010,000: the frontend's `savedEdits` says the same
