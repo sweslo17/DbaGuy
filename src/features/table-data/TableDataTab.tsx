@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronRight, Loader2, RefreshCw, SquareTerminal } from "lucide-react";
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import type { MenuItem } from "@/components/ui/ContextMenu";
@@ -8,13 +8,18 @@ import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
 import type { ColumnMeta, Dialect } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
+import { isDialogOpen } from "@/lib/dialogs";
 import { plural } from "@/lib/format";
+import { isImeKeyEvent } from "@/lib/ime";
+import { isCommandKey } from "@/lib/shortcuts";
 import { useWorkspace, type TableTabState } from "@/stores/workspace";
 import { useEngineInfo, useProfiles } from "../connections/hooks";
 import { RecoverableError } from "../connections/RecoverableError";
+import { COMMIT_RUNNING, EXPORT_RUNNING } from "../edits/commitDialog";
 import { EditBar } from "../edits/EditBar";
 import { resultColumns } from "../edits/overlay";
 import { asksBeforeDiscard, discardQuestion } from "../edits/tableEditing";
+import { useCommit, useCommitState } from "../edits/useCommit";
 import { useTableEdits } from "../edits/useTableEdits";
 import { ColumnsView, DdlView } from "../explorer/ObjectDetailView";
 import { kindLabel } from "../explorer/kinds";
@@ -185,7 +190,8 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   const dialect = engine?.dialect ?? null;
   const openQuery = useWorkspace((s) => s.openQuery);
   const profiles = useProfiles();
-  const profileName = profiles.data?.find((entry) => entry.profile.id === tab.profileId)?.profile.name;
+  const profile = profiles.data?.find((entry) => entry.profile.id === tab.profileId)?.profile;
+  const profileName = profile?.name;
   const guards = useSessionGuards(table.controller, profileName ? `${tab.title} · ${profileName}` : tab.title);
   useCloseGuard(tab.id, CLOSE_GUARD_ORDER.export, (intent) => guards.exportStep(intent));
   const [exportOpen, setExportOpen] = useState(false);
@@ -207,6 +213,10 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   // An export runs on this session: filter, sort and refresh would only wait behind it.
   const exporting = isExporting(snapshot);
   const gridRef = useRef<DataGridHandle>(null);
+  // The commit's dialog and afterglow are held here, above the edits: a running commit locks the staging, and until
+  // the re-read is in the grid draws the staging as it was before the commit (pre-flight M5), in the same render.
+  const committing = useCommitState({ deliveredRequest: table.deliveredRequest, position: table.position });
+  const openAfterEdit = useRef<() => void>(() => undefined);
   const edits = useTableEdits({
     tab,
     columns,
@@ -214,8 +224,10 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
     rowEditing: engine?.row_editing === true,
     sessionOpen: phase === "open",
     stale: shown.stale,
-    locked: null,
+    locked: committing.applying ? COMMIT_RUNNING : null,
     gridRef,
+    onRequestCommit: () => openAfterEdit.current(),
+    afterglow: committing.afterglow,
   });
   const [askingDiscard, setAskingDiscard] = useState(false);
   /** Discard…: more than one change asks first (⌘Z brings them back either way). */
@@ -224,6 +236,47 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
     table.refresh();
     edits.refetchTarget(); // DDL since: the next edit uses the table as it is now (spec §3.2.1)
   };
+  const commit = useCommit({
+    tab,
+    table: relation ? qualifiedName(relation) : tab.title,
+    profile,
+    dialect,
+    controller: table.controller,
+    snapshot,
+    browse: {
+      execution,
+      // The rows are being read: held while a re-run loads them, or the first ones not there yet.
+      pending: shown.stale || (table.pending && !set),
+      deliveredRequest: table.deliveredRequest,
+      position: table.position,
+      reread: table.refresh,
+      refresh,
+    },
+    edits,
+    exporting,
+    gridRef,
+    retrySession: table.retry,
+    holder: committing,
+  });
+  useLayoutEffect(() => {
+    openAfterEdit.current = commit.openAfterEdit;
+  });
+  // ⌘S while this tab's Data view is shown, wherever the focus is in it (an editor stages first and asks itself):
+  // never the browser's Save page, nothing while a dialog has the keyboard or an input method composes.
+  const openCommit = useRef(commit.open);
+  useLayoutEffect(() => {
+    openCommit.current = commit.open;
+  });
+  useEffect(() => {
+    if (!active) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (isImeKeyEvent(e) || e.defaultPrevented || !isCommandKey(e, "s")) return;
+      e.preventDefault();
+      if (!isDialogOpen()) openCommit.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [active]);
   const tableKey = table.target?.key;
   const keyIndexes = useMemo(
     () => (columns && tableKey ? resultColumns(columns, tableKey).keyIndexes : null),
@@ -310,7 +363,7 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
             size="sm"
             onClick={refresh}
             disabled={phase !== "open" || exporting}
-            title={exporting ? "An export is running on this session" : "Run the query again"}
+            title={exporting ? EXPORT_RUNNING : "Run the query again"}
           >
             <RefreshCw size={12} /> Refresh
           </Button>
@@ -336,7 +389,8 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
             unknownOutcome={edits.staged?.unknownOutcome === "pending"}
             onAddRow={edits.addRow}
             onDiscard={requestDiscard}
-            commitDisabled={null}
+            onCommit={commit.open}
+            commitDisabled={commit.disabledReason}
           />
         </div>
       </div>
@@ -395,6 +449,7 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
           edits.discardAll();
         }}
       />
+      {commit.dialog}
       {guards.dialog}
     </div>
   );

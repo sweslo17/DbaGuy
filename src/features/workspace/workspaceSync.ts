@@ -245,12 +245,14 @@ class WorkspaceWriter {
 let writer: WorkspaceWriter | null = null;
 
 /**
- * Saves the workspace at once, skipping any pending retry: called when the backend is back (restarted, or reachable
- * again), so that what was typed meanwhile is not left waiting. Does nothing before the workspace is restored.
+ * Saves the workspace at once, skipping any delay or pending retry: called when the backend is back (restarted, or
+ * reachable again), so that what was typed meanwhile is not left waiting, and as a grid commit is sent, so that a
+ * reload, crash or quit before its outcome finds it unknown (05b pre-flight H1). `why` is the log line's reason. Does
+ * nothing before the workspace is restored.
  */
-export function saveWorkspaceNow(): void {
+export function saveWorkspaceNow(why = "The backend is back"): void {
   if (!writer) return;
-  console.info("The backend is back: saving the workspace now");
+  console.info(`${why}: saving the workspace now`);
   void writer.saveNow();
 }
 

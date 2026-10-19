@@ -253,7 +253,9 @@ export function useTableEdits(input: TableEditsInput): TableEdits {
   );
 
   const tableKey = target?.editable ? (target.key ?? null) : null;
-  const changes = staged ? changeCount(staged) : 0;
+  // Once per staging, not per render: the Data view renders on every event of its session, and an apply of 10,000
+  // changes sends one per statement (pre-flight H2).
+  const changes = useMemo(() => (staged ? changeCount(staged) : 0), [staged]);
   const keyChanged = !!staged && !!tableKey && changes > 0 && !sameElements(staged.keyColumns, tableKey);
   const tableEditable = !!target?.editable && !keyChanged;
   const readOnlyReason = target && !target.editable ? (target.reason ?? NOT_EDITABLE) : null;

@@ -320,15 +320,16 @@ export function commitReport(commit: EndedCommit, context: { total: number; sqlM
   }
 }
 
+/** Where a commit's new rows went (§3.6.5): the re-read shows them where the server puts them. */
+export const NEW_ROWS_NOTE = "New rows appear where the table's order puts them, which may be past the rows loaded";
+
 /** The toast of a commit (§3.6.5): how many, rows already gone, and where new rows went. */
 export function commitToast(event: EditOutcomeEvent, table: string, inserts: number): string {
   const gone = event.already_gone.length;
   const parts = [`Committed ${plural(event.applied.length, "change")} to ${table}`];
   if (gone) parts.push(alreadyGone(gone));
   const text = parts.join(" · ");
-  return inserts
-    ? `${text}. New rows appear where the table's order puts them, which may be past the rows loaded`
-    : text;
+  return inserts ? `${text}. ${NEW_ROWS_NOTE}` : text;
 }
 
 export const ROLLED_BACK_TEXT = "Rolled back this tab's open transaction: preview the changes again";
@@ -358,11 +359,19 @@ export function problemsOf(preview: EditPreview): Record<string, StagedProblem[]
   return Object.fromEntries(problems);
 }
 
-/** A change as the dialog names it: "New row", or its key ("id = 7"); the key is the user's data, never logged. */
+/** How the dialog names a new row, and a change it cannot find. */
+export const NEW_ROW_LABEL = "New row";
+export const SOME_CHANGE_LABEL = "A change";
+
+/** A loaded row as the dialog names it: by its key ("Row id = 7"); the key is the user's data, never logged. */
+export function keyLabel(key: Readonly<Record<string, unknown>>): string {
+  const cells = Object.entries(key).map(([column, cell]) => `${column} = ${plainValue(cell)}`);
+  return `Row ${cells.join(", ")}`;
+}
+
+/** A change as the dialog names it: "New row", or its row's key ("Row id = 7"). */
 export function changeLabel(staged: Staging, changeId: string): string {
   const found = findChange(staged, changeId);
-  if (!found) return "A change";
-  if (found.kind === "insert") return "New row";
-  const key = Object.entries(found.change.key).map(([column, cell]) => `${column} = ${plainValue(cell)}`);
-  return `Row ${key.join(", ")}`;
+  if (!found) return SOME_CHANGE_LABEL;
+  return found.kind === "insert" ? NEW_ROW_LABEL : keyLabel(found.change.key);
 }
