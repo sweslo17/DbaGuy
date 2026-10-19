@@ -15,6 +15,7 @@ import {
   applyEvent,
   interruptExecution,
   newExecution,
+  NOT_CONNECTED_CODE,
   type ExecutionKind,
   type ExecutionState,
   type RequestOptions,
@@ -74,9 +75,11 @@ export interface SessionControllerOptions {
 }
 
 export const PAGE_SIZE = 500;
+/** The largest page a request may ask for (`ExecuteCommand.page_size`): a re-run reloads at most this many rows. */
+export const MAX_PAGE_SIZE = 10_000;
 const MAX_SESSION_MESSAGES = 50;
 const SESSION_GONE = "The session is no longer available.";
-const NOT_CONNECTED: ExecutionState["error"] = { message: "Not connected", code: "not_connected" };
+const NOT_CONNECTED: ExecutionState["error"] = { message: "Not connected", code: NOT_CONNECTED_CODE };
 
 export function emptySnapshot(phase: SessionPhase): SessionSnapshot {
   return { phase, info: null, error: null, state: null, executions: {}, sessionMessages: [] };
@@ -214,6 +217,16 @@ export class SessionController {
 
   setAutocommit(enabled: boolean): string {
     return this.track("transaction", "", { type: "set_autocommit", request_id: crypto.randomUUID(), enabled });
+  }
+
+  /**
+   * Applies a previewed grid-edit plan (spec ⑤ §3.5): its statements as previewed, in one transaction. The execution
+   * ends with its `editOutcome`; one that ends without (the socket or the backend went away) is an unknown outcome, and
+   * is never sent again. Issued while the socket is not open, it ends at once with `not_connected`: it never left, so
+   * nothing happened (R-05-6, pre-flight H1). Returns the request id.
+   */
+  applyEdits(planId: string): string {
+    return this.track("edits", "", { type: "apply_edits", request_id: crypto.randomUUID(), plan_id: planId });
   }
 
   /**
