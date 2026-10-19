@@ -113,3 +113,51 @@ describe("restoring a document tab", () => {
     expect(snapshot.tabs[0]).toEqual({ ...tab, initialText: "typed" });
   });
 });
+
+describe("restoring a document tab whose connection is gone (M6)", () => {
+  const DETACHED = "u 1/😀 (unsaved document text, in a query tab)";
+
+  it.each([
+    ["edits to an existing document", { buffer: '{"edited": true}', document_cas: "100" }, '{"edited": true}'],
+    ["a new document", { buffer: "{}", document_cas: null }, "{}"],
+  ])("reopens the unsaved text of %s in a query tab without a connection, titled after the ID", (_, entry, text) => {
+    const { snapshot, closed, detached } = restore(entry, false);
+    expect(snapshot.tabs).toEqual([
+      {
+        id: "d1",
+        kind: "query",
+        title: "u 1/😀",
+        profileId: null,
+        database: null,
+        scriptPath: null,
+        savedText: null,
+        textFromFile: false,
+        initialText: text,
+        initialCursor: undefined,
+        initialSelection: undefined,
+        autocommit: true,
+        queryContext: undefined,
+        params: undefined,
+      },
+    ]);
+    expect(snapshot.activeTabId).toBe("d1");
+    expect({ closed, detached }).toEqual({ closed: [], detached: [DETACHED] });
+  });
+
+  it("keeps that text in the next save of the workspace", () => {
+    const [tab] = restore({ buffer: '{"edited": true}', document_cas: "100" }, false).snapshot.tabs;
+    expect(save(tab).saved).toMatchObject({ kind: "query", profile_id: null, buffer: '{"edited": true}' });
+  });
+
+  it("closes a clean one, and says so: the server has its text", () => {
+    expect(restore({ buffer: null, document_cas: "100" }, false)).toMatchObject({
+      snapshot: { tabs: [] },
+      closed: ["u1"],
+      detached: [],
+    });
+  });
+
+  it("keeps the text of a tab saved without a connection too", () => {
+    expect(restore({ profile_id: null, buffer: "{}" }).detached).toEqual([DETACHED]);
+  });
+});

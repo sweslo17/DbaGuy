@@ -5,11 +5,8 @@ import { Dialog } from "@/components/ui/Dialog";
 import type { DocumentChange, SavePreview } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { CodeEditor } from "../editor/CodeEditor";
-import { prettyJson } from "./documentApi";
+import { prettyJson, SERVER_TEXT_SHOWN_MAX } from "./documentApi";
 import { summarizePreview, totalChanges } from "./previewSummary";
-
-/** The server's text is shown in the dialog up to this many characters; a longer one is only offered for copying. */
-export const SERVER_TEXT_SHOWN_MAX = 1_048_576;
 
 function labelOf(change: DocumentChange): string {
   switch (change.kind) {

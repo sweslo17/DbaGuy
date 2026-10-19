@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "@/lib/api/client";
-import { classifyWriteError, problemMessage, unknownOutcome, type SaveProblem, type WriteKind } from "./documentApi";
+import {
+  classifyWriteError,
+  confirmedText,
+  deleteQuestion,
+  problemMessage,
+  SERVER_TEXT_SHOWN_MAX,
+  unknownOutcome,
+  type SaveProblem,
+  type WriteKind,
+} from "./documentApi";
 
 /*
  * What a failed save, insert or delete means for the tab (ruling C45 and the backend's codes): the one place that tells
@@ -155,5 +164,34 @@ describe("the line under the bar", () => {
     expect(problemMessage({ kind: "exists" })).toBe("A document with this ID already exists");
     expect(problemMessage({ kind: "outcome_unknown", message: "gone" })).toBe("gone");
     expect(problemMessage({ kind: "error", message: "read-only" })).toBe("read-only");
+  });
+});
+
+describe("the editor's text after a confirmed save (ruling C13, M4)", () => {
+  const SERVER = '{"a":1.1,"b":[1,2]}';
+  const PRETTY = '{\n  "a": 1.1,\n  "b": [\n    1,\n    2\n  ]\n}';
+  /** A compact server text of exactly `length` characters. */
+  const serverOf = (length: number) => `{"s":"${"x".repeat(length - 8)}"}`;
+
+  it("is the server's text laid out as the text that was sent, when that had line breaks", () => {
+    expect(confirmedText('{\n  "b": [1, 2],\n  "a": 1.10\n}', SERVER)).toBe(PRETTY);
+    expect(confirmedText('{"b":[1,2],"a":1.10}', SERVER)).toBe(SERVER);
+  });
+
+  it("is the server's text as it was sent beyond SERVER_TEXT_SHOWN_MAX characters: pretty-printing builds a tree", () => {
+    const atMax = serverOf(SERVER_TEXT_SHOWN_MAX);
+    expect(atMax).toHaveLength(SERVER_TEXT_SHOWN_MAX);
+    expect(confirmedText("{\n}", atMax)).toBe(`{\n  "s": "${"x".repeat(SERVER_TEXT_SHOWN_MAX - 8)}"\n}`);
+    const beyond = serverOf(SERVER_TEXT_SHOWN_MAX + 1);
+    expect(confirmedText("{\n}", beyond)).toBe(beyond);
+  });
+});
+
+describe("Delete…'s question (M2)", () => {
+  it("says that unsaved edits go with the document", () => {
+    expect(deleteQuestion("u 1", false)).toBe("Delete document u 1? This cannot be undone.");
+    expect(deleteQuestion("u 1", true)).toBe(
+      "Delete document u 1? Your unsaved edits are discarded too. This cannot be undone.",
+    );
   });
 });

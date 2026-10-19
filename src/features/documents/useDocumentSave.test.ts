@@ -12,6 +12,7 @@ const doc = (text: string) => Text.of(text.split("\n"));
 
 const save = (sent: Text, confirmed = false): Write => ({ kind: "save", cas: "5", text: sent.toString(), sent, confirmed });
 const insert = (sent: Text, confirmed = false): Write => ({ kind: "insert", text: sent.toString(), sent, confirmed });
+const remove = (sent: Text): Write => ({ kind: "remove", cas: "5", sent });
 
 describe("resending a write after the password was asked for", () => {
   it("sends the same write while the editor still holds the text it carries", () => {
@@ -36,8 +37,12 @@ describe("resending a write after the password was asked for", () => {
     expect(resendPlan(insert(doc("x")), null)).toBe("fresh");
   });
 
-  it("always sends a delete again: it carries no text, only the CAS the server checks", () => {
-    expect(resendPlan({ kind: "remove", cas: "5" }, doc("anything"))).toBe("same");
-    expect(resendPlan({ kind: "remove", cas: "5" }, null)).toBe("same");
+  it("sends a delete again while the tab holds the text it was asked for with", () => {
+    expect(resendPlan(remove(doc('{"a": 1}')), doc('{"a": 1}'))).toBe("same");
+  });
+
+  it("asks again before a delete once the text changed: the user agreed to discard other text (P9)", () => {
+    expect(resendPlan(remove(doc('{"a": 1}')), doc('{"a": 12}'))).toBe("ask");
+    expect(resendPlan(remove(doc("x")), null)).toBe("ask"); // nothing to compare with: never deleted unasked
   });
 });

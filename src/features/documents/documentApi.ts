@@ -94,6 +94,27 @@ export function prettyJson(text: string): string {
   return parsed ? formatJson(parsed.root) : text;
 }
 
+/**
+ * The server's text is pretty-printed, in the preview and in the editor after a confirmed save, up to this many
+ * characters: pretty-printing builds the whole tree (about 34× a token-dense text). The preview offers a longer one only
+ * for copying.
+ */
+export const SERVER_TEXT_SHOWN_MAX = 1_048_576;
+
+/**
+ * What the editor shows after a confirmed save (ruling C13): the server's form, laid out as the text that was sent when
+ * that had line breaks; beyond `SERVER_TEXT_SHOWN_MAX` characters, as the server sent it (compact), as for a text nested
+ * deeper than `parseJson` reads.
+ */
+export function confirmedText(sent: string, serverText: string): string {
+  return sent.includes("\n") && serverText.length <= SERVER_TEXT_SHOWN_MAX ? prettyJson(serverText) : serverText;
+}
+
+/** Delete…'s question. The tab closes once the document is gone, so unsaved edits go too: it says so (M2). */
+export function deleteQuestion(id: string, dirty: boolean): string {
+  return `Delete document ${id}?${dirty ? " Your unsaved edits are discarded too." : ""} This cannot be undone.`;
+}
+
 /** Why a write did not go through, as the tab says it: one line each (`problemMessage`), some with a button. */
 export type SaveProblem =
   | { kind: "invalid_json"; offset: number; reason: string; line: number; column: number }

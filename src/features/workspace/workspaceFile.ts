@@ -19,7 +19,8 @@ import { keyspaceOfPath } from "../explorer/fieldSamples";
  * "none" the user's choice of no context (ruling B14). A tab that uses SQL++ parameters keeps its panel's drafts, the
  * text as typed, so a crash or a restart loses none of them (`savedParams`). A Couchbase document tab keeps its
  * connection, its path (the collection, then the document), the CAS its text is based on, and its text only while it
- * is unsaved (a new document, or edited): a clean document is read again from the server (ruling C15).
+ * is unsaved (a new document, or edited): a clean document is read again from the server (ruling C15). Unsaved document
+ * text whose connection is gone comes back in a query tab without a connection (M6).
  */
 
 const WORKSPACE_VERSION = 1;
@@ -146,10 +147,50 @@ export function toSavedWorkspace(
 
 export interface RestoredWorkspace {
   snapshot: WorkspaceSnapshot;
-  /** Titles of the table, object and document tabs dropped because their connection or path no longer exists. */
+  /**
+   * Titles of the table, object and document tabs dropped because their connection or path no longer exists (a
+   * document tab only when it held no unsaved text, or its path names no document).
+   */
   closed: string[];
-  /** Titles of the query tabs reopened without a connection because theirs no longer exists. */
+  /**
+   * Titles of the query tabs reopened without a connection because theirs no longer exists, and of the document tabs
+   * whose unsaved text was reopened that way (said as such).
+   */
   detached: string[];
+}
+
+/** A query tab as saved; with `profileId` null it reopens without a connection (nor its database or query context). */
+function restoredQuery(entry: SavedTab, profileId: string | null): QueryTabState {
+  const connected = profileId !== null;
+  const scriptPath = entry.script_path ?? null;
+  return {
+    id: entry.id,
+    kind: "query",
+    title: entry.title || "Query",
+    profileId,
+    database: connected ? (entry.database ?? null) : null,
+    scriptPath,
+    savedText: null, // unknown until the script is read again
+    textFromFile: scriptPath !== null && entry.buffer == null,
+    initialText: entry.buffer ?? "",
+    initialCursor: entry.cursor ?? undefined,
+    initialSelection: entry.selection ?? undefined,
+    autocommit: entry.autocommit ?? true,
+    queryContext: connected ? (entry.query_context ?? undefined) : undefined,
+    params: savedParams(entry.params) ?? undefined,
+  };
+}
+
+/**
+ * A document tab whose connection is gone, holding unsaved text (a new document, or edits): that text in a query tab
+ * without a connection, titled after the document's ID, so the edits can still be copied and the next save of the
+ * workspace keeps them (Q2, M6). Null for a clean one: the server has its text, nothing is lost.
+ */
+function detachedDocumentText(entry: SavedTab): QueryTabState | null {
+  if (entry.buffer == null) return null;
+  const id = entry.object_path?.at(-1);
+  const title = id?.kind === "document" ? id.name : entry.title;
+  return restoredQuery({ id: entry.id, kind: "query", title, buffer: entry.buffer }, null);
 }
 
 /**
@@ -177,8 +218,9 @@ function restoredDocument(entry: SavedTab, profileId: string): DocumentTabState 
 
 /**
  * The saved workspace as store tabs, keeping their ids. A query tab whose profile is gone reopens without a
- * connection (nor its query context, but it keeps its parameter drafts); a table, object or document tab whose profile
- * is gone is dropped. A saved auto-commit of null means on: the tab's mode must be definite, or nothing could run.
+ * connection (nor its query context, but it keeps its parameter drafts); so does a document tab's unsaved text, in a
+ * query tab (`detachedDocumentText`); a table or object tab, or a document tab with nothing unsaved, whose profile is
+ * gone is dropped. A saved auto-commit of null means on: the tab's mode must be definite, or nothing could run.
  */
 export function fromSavedWorkspace(saved: SavedWorkspace, profileExists: (id: string) => boolean): RestoredWorkspace {
   const tabs: Tab[] = [];
@@ -192,27 +234,18 @@ export function fromSavedWorkspace(saved: SavedWorkspace, profileExists: (id: st
     const connected = profileId !== null && profileExists(profileId);
     if (entry.kind === "query") {
       if (profileId !== null && !connected) detached.push(entry.title);
-      const scriptPath = entry.script_path ?? null;
-      tabs.push({
-        id: entry.id,
-        kind: "query",
-        title: entry.title || "Query",
-        profileId: connected ? profileId : null,
-        database: connected ? (entry.database ?? null) : null,
-        scriptPath,
-        savedText: null, // unknown until the script is read again
-        textFromFile: scriptPath !== null && entry.buffer == null,
-        initialText: entry.buffer ?? "",
-        initialCursor: entry.cursor ?? undefined,
-        initialSelection: entry.selection ?? undefined,
-        autocommit: entry.autocommit ?? true,
-        queryContext: connected ? (entry.query_context ?? undefined) : undefined,
-        params: savedParams(entry.params) ?? undefined,
-      });
+      tabs.push(restoredQuery(entry, connected ? profileId : null));
     } else if (entry.kind === "document") {
       const document = connected ? restoredDocument(entry, profileId) : null;
-      if (document) tabs.push(document);
-      else closed.push(entry.title);
+      const kept = connected ? null : detachedDocumentText(entry);
+      if (document) {
+        tabs.push(document);
+      } else if (kept) {
+        tabs.push(kept);
+        detached.push(`${kept.title} (unsaved document text, in a query tab)`);
+      } else {
+        closed.push(entry.title);
+      }
     } else if (connected && entry.object_path?.length) {
       tabs.push({ id: entry.id, kind: entry.kind, profileId, path: entry.object_path, title: entry.title });
     } else {

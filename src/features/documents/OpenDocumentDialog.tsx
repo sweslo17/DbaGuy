@@ -86,11 +86,16 @@ function DocumentFields({
   // Decided once, as the dialog opens: what the user types later never moves the focus.
   const [target] = useState(() => firstEmpty(fields));
   // A menu that opened the dialog (the tree's, a grid's) hands the focus back to its trigger in a timeout once it closes,
-  // and the dialog then pulls it to its own box: the field takes it back a frame after that timeout.
+  // and the dialog then pulls it to its own box: the field takes it back a frame after that timeout, unless the user has
+  // already put the focus in a field of their own choosing.
   useEffect(() => {
     let frame = 0;
     const timer = window.setTimeout(() => {
-      frame = requestAnimationFrame(() => inputs.current[target]?.focus());
+      frame = requestAnimationFrame(() => {
+        const focused = document.activeElement;
+        const inField = Object.values(inputs.current).some((input) => input != null && input === focused);
+        if (!inField) inputs.current[target]?.focus();
+      });
     }, 0);
     return () => {
       window.clearTimeout(timer);

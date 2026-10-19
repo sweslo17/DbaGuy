@@ -8,10 +8,10 @@ import { useReadOnlyProfile } from "../connections/hooks";
 import type { CodeEditorHandle } from "../editor/CodeEditor";
 import {
   classifyWriteError,
+  confirmedText,
   documentRef,
   insertDocument,
   isPreview,
-  prettyJson,
   removeDocument,
   saveDocument,
   unknownOutcome,
@@ -44,8 +44,9 @@ export interface DocumentSaving {
   /**
    * A save, insert or delete answered `password_required` (rulings C31, C48): the tab shows `RecoverableError` with
    * `error` (it says the write was not done), and `resend` (its onRetry, also run once the unlock dialog has the
-   * password) goes on with it. Nothing was sent and the save is over: the editor is editable, and cancelling the unlock
-   * dialog leaves the tab as it was, with Save enabled.
+   * password) goes on with it (`resendPlan`). Nothing was sent and the save is over: the editor is editable, and
+   * cancelling the unlock dialog leaves the tab as it was, with Save enabled. A ⌘S that finds nothing to save takes it
+   * away.
    */
   passwordNeeded: { error: Error; resend: () => void } | null;
   /** The editor's text changed (the tab calls it from the editor's onChange): a problem about the text goes away. */
@@ -54,22 +55,25 @@ export interface DocumentSaving {
   clearProblem: () => void;
 }
 
-/** A write as it was asked for: what goes out again, unchanged, once the unlock dialog has the password (ruling C31). */
+/**
+ * A write as it was asked for: what goes out again, unchanged, once the unlock dialog has the password (ruling C31).
+ * `sent` is the editor's document when it was asked for: what a save or an insert writes, and what a delete discards.
+ */
 export type TextWrite =
   | { kind: "save"; cas: string; text: string; sent: Text; confirmed: boolean; shown?: string }
   | { kind: "insert"; text: string; sent: Text; confirmed: boolean; shown?: string };
-export type Write = TextWrite | { kind: "remove"; cas: string };
+export type Write = TextWrite | { kind: "remove"; cas: string; sent: Text };
 
 /**
  * What goes out once the unlock dialog has the password, or Retry is pressed (ruling C48). Nothing was sent, and the save
- * ended when the password was asked for, so the user may have typed since: a write goes out as asked (a confirmed one
- * with exactly the text that was previewed) only while the editor still holds the text it carries, or when it is a delete,
- * which carries no text; anything else is a fresh save of what the editor holds now, which checks the baseline again
- * (ruling C32) and may preview again.
+ * ended when the password was asked for, so the user may have typed since. A write goes out as asked (a confirmed one
+ * with exactly the text that was previewed) only while the editor still holds the document it was asked for with.
+ * Otherwise a save or an insert is a fresh save of what the editor holds now ("fresh": it checks the baseline again,
+ * ruling C32, and may preview again), and a delete asks again ("ask": the user agreed to discard other text, P9).
  */
-export function resendPlan(write: Write, current: Text | null): "same" | "fresh" {
-  if (write.kind === "remove") return "same";
-  return current !== null && current.eq(write.sent) ? "same" : "fresh";
+export function resendPlan(write: Write, current: Text | null): "same" | "fresh" | "ask" {
+  if (current !== null && current.eq(write.sent)) return "same";
+  return write.kind === "remove" ? "ask" : "fresh";
 }
 
 /** The problems that are about the text: they go away once it is edited (the others are about the document or the ID). */
@@ -124,6 +128,8 @@ export function useDocumentSave(
   tab: DocumentTabState,
   editor: RefObject<CodeEditorHandle | null>,
   loaded: DocumentState,
+  /** Shows Delete…'s confirmation again: a delete to resend whose tab's text changed since it was asked for (P9). */
+  askDelete: () => void,
 ): DocumentSaving {
   const ref = documentRef(tab);
   const readOnly = useReadOnlyProfile(tab.profileId);
@@ -250,12 +256,14 @@ export function useDocumentSave(
 
   /** The unlock dialog has its password, or Retry was pressed: see `resendPlan`. */
   const resend = (write: Write) => {
-    if (resendPlan(write, mounted(editor)?.view.state.doc ?? null) === "same") {
+    const plan = resendPlan(write, mounted(editor)?.view.state.doc ?? null);
+    if (plan === "same") {
       void attempt(write);
       return;
     }
-    setPasswordNeeded(null); // the line is about a save that is over; a fresh one has its own outcome
-    latestSave.current();
+    setPasswordNeeded(null); // the line is about a write that is over; a fresh one has its own outcome
+    if (plan === "ask") askDelete();
+    else latestSave.current();
   };
 
   const insertFrom = (doc: Text) => attempt({ kind: "insert", text: doc.toString(), sent: doc, confirmed: false });
@@ -281,6 +289,7 @@ export function useDocumentSave(
     // Decided now, from the editor's document: the `dirty` flag settles only once typing stops (ruling C32).
     const baseline = loaded.baseline();
     if (baseline ? doc.eq(baseline) : !facts.dirty) {
+      setPasswordNeeded(null); // a "Not saved: … password" line is about edits that are gone now
       toast("info", "No changes to save");
       return;
     }
@@ -293,8 +302,7 @@ export function useDocumentSave(
     if (!held || inFlight.current) return;
     const { write, preview: shownPreview } = held;
     // The server's form replaces the text; laid out as the text was, when it had line breaks (ruling C13).
-    const shown = write.text.includes("\n") ? prettyJson(shownPreview.server_text) : shownPreview.server_text;
-    void attempt({ ...write, confirmed: true, shown });
+    void attempt({ ...write, confirmed: true, shown: confirmedText(write.text, shownPreview.server_text) });
   };
 
   const cancelPreview = () => {
@@ -315,12 +323,13 @@ export function useDocumentSave(
 
   const remove = async (): Promise<boolean> => {
     const facts = factsOf(tab.id);
-    if (!facts || facts.isNew || readOnly || inFlight.current || loaded.saving) return false;
+    const handle = mounted(editor);
+    if (!facts || !handle || facts.isNew || readOnly || inFlight.current || loaded.saving) return false;
     if (facts.cas === null) {
       unknownVersion();
       return false;
     }
-    return attempt({ kind: "remove", cas: facts.cas });
+    return attempt({ kind: "remove", cas: facts.cas, sent: handle.view.state.doc });
   };
 
   useLayoutEffect(() => {

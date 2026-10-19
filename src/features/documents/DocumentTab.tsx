@@ -22,7 +22,7 @@ import { keyspaceLabel } from "../explorer/fieldSamples";
 import { formatJson, parseJson } from "../grid/json";
 import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
 import { ConflictDialog } from "./ConflictDialog";
-import { documentRef, problemMessage } from "./documentApi";
+import { deleteQuestion, documentRef, problemMessage } from "./documentApi";
 import { canEdit, panelOf, type DocumentLoad, type Panel } from "./documentState";
 import { DocumentBar } from "./DocumentBar";
 import { SavePreviewDialog } from "./SavePreviewDialog";
@@ -31,8 +31,11 @@ import { useDocumentSave } from "./useDocumentSave";
 
 const READ_ONLY_NOTICE = "Read-only connection: documents open for reading";
 const CHANGED_NOTICE = "The document changed on the server after these edits were made: saving will report a conflict";
+// ⌘S does nothing until the tab is a new document: the notice says Create it comes first (P6).
 const MISSING_WITH_EDITS_NOTICE =
-  "The document no longer exists: Create it to keep these edits as a new document (⌘S saves it)";
+  "The document no longer exists: Create it to keep these edits as a new document, then ⌘S saves it";
+const MISSING_WITH_EDITS_READ_ONLY_NOTICE =
+  "The document no longer exists, and this read-only connection cannot create it: Copy keeps these edits";
 
 const NOTICE_TONES = { muted: "text-muted", warning: "text-warning", danger: "text-danger" } as const;
 
@@ -63,6 +66,21 @@ function Notice({
   );
 }
 
+/**
+ * Under a panel that hides the editor of a tab with unsaved text (a read that keeps failing, a document that became
+ * binary): the edits are still in the hidden editor, and can be copied out (Q2, M1).
+ */
+function KeptEdits({ onCopy }: { onCopy: () => void }) {
+  return (
+    <div className="flex items-center gap-3 px-4 py-2 text-[12px] text-muted" data-selectable>
+      <span>Your unsaved edits are still in this tab.</span>
+      <Button size="sm" onClick={onCopy}>
+        Copy my edits
+      </Button>
+    </div>
+  );
+}
+
 /** What shows in place of the editor while it cannot be used (the editor stays mounted behind it, hidden). */
 function PanelView({
   panel,
@@ -73,6 +91,7 @@ function PanelView({
   onRetry,
   onReload,
   onCreate,
+  onCopyEdits,
 }: {
   panel: Panel;
   load: DocumentLoad;
@@ -83,12 +102,19 @@ function PanelView({
   onReload: () => void;
   /** "Create it": null on a read-only connection. */
   onCreate: (() => void) | null;
+  /** "Copy my edits": null when the tab holds no unsaved text. */
+  onCopyEdits: (() => void) | null;
 }) {
   switch (panel) {
     case "loading":
       return <p className="animate-delayed-show p-4 text-[12px] text-muted">Loading…</p>;
     case "error":
-      return <RecoverableError profileId={profileId} error={load.status === "error" ? load.error : null} onRetry={onRetry} />;
+      return (
+        <>
+          <RecoverableError profileId={profileId} error={load.status === "error" ? load.error : null} onRetry={onRetry} />
+          {onCopyEdits && <KeptEdits onCopy={onCopyEdits} />}
+        </>
+      );
     case "missing":
       return (
         <div className="flex items-center gap-3 p-4 text-[13px]" data-selectable>
@@ -108,9 +134,12 @@ function PanelView({
     case "binary": {
       const size = load.status === "ready" ? load.meta.size : 0;
       return (
-        <p className="p-4 text-[13px] text-muted" data-selectable>
-          Binary document ({plural(size, "byte")}) — view only
-        </p>
+        <>
+          <p className="p-4 text-[13px] text-muted" data-selectable>
+            Binary document ({plural(size, "byte")}) — view only
+          </p>
+          {onCopyEdits && <KeptEdits onCopy={onCopyEdits} />}
+        </>
       );
     }
   }
@@ -136,19 +165,20 @@ function focusEditor(editor: RefObject<CodeEditorHandle | null>): void {
  *
  * Save (⌘S) and Delete… send the writes (`useDocumentSave`: the preview, conflict and unlock dialogs, the problem line);
  * Format (⇧⌘F) pretty-prints a valid text; Reload reads the document again (asking first when the tab has unsaved
- * changes); Copy puts the text on the clipboard. Closing a tab with unsaved text asks first (ruling C20). The state
- * changes are `documentState`'s; `useDocument` runs them.
+ * changes); Copy puts the text on the clipboard, also while a panel hides the editor of a tab with unsaved text (M1).
+ * Closing a tab with unsaved text asks first (ruling C20). The state changes are `documentState`'s; `useDocument` runs
+ * them.
  */
 export function DocumentTab({ tab, active }: { tab: DocumentTabState; active: boolean }) {
   const [shown, setShown] = useState(active);
   if (active && !shown) setShown(true);
   const editor = useRef<CodeEditorHandle>(null);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const doc = useDocument(tab, shown, editor);
-  const saving = useDocumentSave(tab, editor, doc);
+  const saving = useDocumentSave(tab, editor, doc, () => setConfirmingDelete(true));
   const { load } = doc;
   const readOnlyProfile = useReadOnlyProfile(tab.profileId);
   const [confirmingReload, setConfirmingReload] = useState(false);
-  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [confirmingExisting, setConfirmingExisting] = useState(false);
   const ref = documentRef(tab);
 
@@ -294,7 +324,13 @@ export function DocumentTab({ tab, active }: { tab: DocumentTabState; active: bo
         >
           Reload
         </Button>
-        <Button size="sm" title="Copy the text" disabled={!editorShown} onClick={() => void copy()}>
+        {/* Also while a panel hides the editor of a tab with unsaved text: they can always be taken out (Q2). */}
+        <Button
+          size="sm"
+          title="Copy the text"
+          disabled={!editorShown && !tab.dirty}
+          onClick={() => void copy(editorShown ? undefined : "Copied your edits")}
+        >
           Copy
         </Button>
         {writable && !tab.isNew && (
@@ -321,7 +357,7 @@ export function DocumentTab({ tab, active }: { tab: DocumentTabState; active: bo
             )
           }
         >
-          {MISSING_WITH_EDITS_NOTICE}
+          {readOnlyProfile ? MISSING_WITH_EDITS_READ_ONLY_NOTICE : MISSING_WITH_EDITS_NOTICE}
         </Notice>
       )}
       {doc.changedOnServer && <Notice tone="warning">{CHANGED_NOTICE}</Notice>}
@@ -378,6 +414,7 @@ export function DocumentTab({ tab, active }: { tab: DocumentTabState; active: bo
               onRetry={doc.retry}
               onReload={reload}
               onCreate={readOnlyProfile ? null : create}
+              onCopyEdits={tab.dirty ? () => void copy("Copied your edits") : null}
             />
           </div>
         )}
@@ -435,7 +472,7 @@ export function DocumentTab({ tab, active }: { tab: DocumentTabState; active: bo
         <ConfirmDialog
           open
           title="Delete document"
-          message={`Delete document ${ref.id}? This cannot be undone.`}
+          message={deleteQuestion(ref.id, tab.dirty)}
           confirmLabel="Delete"
           pending={saving.busy}
           // The write is on its way once confirmed: the dialog stays until it has an answer.
