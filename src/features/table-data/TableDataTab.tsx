@@ -17,10 +17,11 @@ import { DataGrid } from "../grid/DataGrid";
 import { ExportDialog } from "../grid/ExportDialog";
 import type { GridSort } from "../grid/GridHeader";
 import { useHeldResult } from "../grid/useHeldResult";
-import { CONNECTION_LOST, firstPageDelivered } from "../session/execution";
+import { CONNECTION_LOST } from "../session/execution";
 import { isExporting } from "../session/SessionController";
 import { useSessionGuards } from "../session/SessionGuards";
 import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
+import { browseView, keptNotice } from "./browseView";
 import { FilterBar } from "./FilterBar";
 import { addCondition, valueCondition, type Relation } from "./filterValue";
 import { useTableData, type TableDataState } from "./useTableData";
@@ -162,13 +163,17 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   const openExport = useCallback(() => setExportOpen(true), []);
   const phase = snapshot?.phase ?? "opening";
   // Until a sort, filter or refresh has its whole first page, the grid keeps the previous rows (and its layout),
-  // dimmed: it never flashes empty, and a re-run that keeps the position finds it (A12).
-  const current = firstPageDelivered(execution) ? (execution?.resultSets[0] ?? null) : null;
-  const shown = useHeldResult(current, table.pending);
+  // dimmed: it never flashes empty, and a re-run that keeps the position finds it (A12). A Refresh that ends before
+  // its first page is complete (cancelled, failed, interrupted) leaves those rows as they were.
+  const view = browseView(execution, table.rerun);
+  const shown = useHeldResult(view.set, table.pending, Object.is, view.keepPrevious);
   const set = shown.value;
   const columns = set?.columns;
   const rows = set?.rows;
-  const firstPagePending = execution?.status === "running" && !current;
+  const firstPagePending = execution?.status === "running" && !view.set;
+  // The rows on screen are those from before a Refresh that ended early: their request is gone, nothing more to load.
+  const kept = view.keepPrevious && !!set;
+  const notice = keptNotice(execution, view, !!set);
   const filterByValue = useFilterByValue(state.filter, applyFilter);
   // An export runs on this session: filter, sort and refresh would only wait behind it.
   const exporting = isExporting(snapshot);
@@ -269,15 +274,17 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
           )}
         </div>
       )}
+      {notice && <div className="shrink-0 border-b border-border px-3 py-1.5 text-[12px] text-muted">{notice}</div>}
       {state.sql && <SqlRow sql={state.sql} onOpen={openInQueryTab} />}
       <div className="min-h-0 flex-1">
         {set ? (
           <DataGrid
             columns={set.columns}
             rows={set.rows}
-            hasMore={set.hasMore}
+            hasMore={set.hasMore && !kept}
+            partial={set.partial || view.partial || (kept && set.hasMore)}
             loadingMore={execution?.status === "running"}
-            onLoadMore={phase === "open" ? table.loadMore : undefined}
+            onLoadMore={phase === "open" && !kept ? table.loadMore : undefined}
             stale={shown.stale}
             resetScrollOn={table.position}
             dialect={dialect}

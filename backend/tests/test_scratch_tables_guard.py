@@ -31,6 +31,14 @@ ACCEPTED = [
     ("pg", "UPDATE public.zz_05b_items SET label = 'x' WHERE id IN (SELECT a FROM public.zz_05b_nokey)"),
     ("mysql", "DELETE FROM zz_05b_myisam WHERE id = 2"),
     ("mssql", "UPDATE dbo.zz_05b_items SET label = N'x' WHERE id = 3"),
+    ("mssql", "UPDATE dbo.zz_05b_items SET label = N'x' WHERE id = 3;"),
+    ("mssql", "UPDATE dbo.zz_05b_items SET label = N'DELETE orders SHUTDOWN' WHERE id = 3"),  # words inside a literal
+    ("mssql", "UPDATE dbo.zz_05b_items SET label = N'a' WHERE id IN (SELECT a FROM dbo.zz_05b_nokey)"),
+    ("mssql", "DELETE FROM dbo.zz_05b_nokey WHERE a = 1"),
+    ("mssql", "INSERT INTO dbo.zz_05b_items (label) VALUES (N'x')"),
+    ("mssql", "INSERT INTO dbo.zz_05b_nokey (a, b) SELECT a, b FROM dbo.zz_05b_nokey"),
+    ("mssql", "SELECT a FROM dbo.zz_05b_nokey UNION SELECT a FROM dbo.zz_05b_nokey"),
+    ("mssql", "SELECT id FROM dbo.zz_05b_items\n WHERE note IS NULL"),
     ("sqlite", "SELECT id FROM zz_05b_items"),
 ]
 
@@ -45,6 +53,21 @@ REFUSED = [
     ("mssql", "UPDATE dbo.zz_05b_items SET a = 1 UPDATE dbo.orders SET b = 2"),
     ("mssql", "UPDATE dbo.zz_05b_items SET a = 1 DELETE FROM dbo.orders"),
     ("mssql", "UPDATE dbo.zz_05b_items SET a = 1 DROP TABLE dbo.orders"),
+    # T-SQL: FROM and INTO are optional, so a second statement names no table of its own (review finding 1)
+    ("mssql", "UPDATE dbo.zz_05b_items SET a = 1 DELETE orders"),
+    ("mssql", "SELECT * FROM dbo.zz_05b_items DELETE orders"),
+    ("mssql", "DELETE FROM dbo.zz_05b_items WHERE id = 1 DELETE orders"),
+    ("mssql", "UPDATE dbo.zz_05b_items SET a = 1 INSERT orders VALUES (1)"),
+    ("mssql", "SELECT * FROM dbo.zz_05b_items INSERT orders VALUES (1)"),
+    ("mssql", "SELECT 1 FROM dbo.zz_05b_items SHUTDOWN"),
+    ("mssql", "SELECT 1 FROM dbo.zz_05b_items KILL 55"),
+    ("mssql", "SELECT 1 FROM dbo.zz_05b_items DBCC CHECKDB"),
+    ("mssql", "UPDATE dbo.zz_05b_items SET a = 1 UPDATE orders SET b = 2"),
+    ("mssql", "SELECT 1 FROM dbo.zz_05b_items\nSELECT 2"),
+    # server-level words are refused on every engine, whatever the splitter says
+    ("pg", "SELECT 1 FROM public.zz_05b_items SHUTDOWN"),
+    ("mysql", "SELECT 1 FROM zz_05b_items KILL 5"),
+    ("sqlite", "SELECT 1 FROM zz_05b_items DBCC CHECKDB"),
     # a name that only starts with the prefix, or ends in a catalogue name
     ("pg", "UPDATE public.zz_05b_other SET a = 1"),
     ("pg", "UPDATE zz_05b_ SET a = 1"),
@@ -89,6 +112,25 @@ def test_a_plain_statement_on_a_catalogue_table_is_accepted(engine, statement):
 @pytest.mark.parametrize(("engine", "statement"), REFUSED)
 def test_anything_else_is_refused_with_a_reason(engine, statement):
     assert violation(engine, statement)
+
+
+@pytest.mark.parametrize(
+    ("statement", "count"),
+    [
+        ("UPDATE dbo.zz_05b_items SET a = 1", 1),
+        ("UPDATE dbo.zz_05b_items SET a = 1 DELETE orders", 2),
+        ("SELECT * FROM dbo.zz_05b_items INSERT orders VALUES (1)", 2),
+        ("SELECT 1 FROM dbo.zz_05b_items SHUTDOWN", 2),
+        ("SELECT a FROM dbo.zz_05b_nokey UNION SELECT a FROM dbo.zz_05b_nokey", 1),
+    ],
+)
+def test_sql_server_statements_are_counted_by_the_repos_own_splitter(statement, count):
+    assert scratch_tables.ENGINES["mssql"].statement_count(statement) == count
+
+
+@pytest.mark.parametrize("engine", ["pg", "mysql", "sqlite"])
+def test_the_other_engines_take_no_second_statement_without_a_semicolon(engine):
+    assert scratch_tables.ENGINES[engine].statement_count("UPDATE zz_05b_items SET a = 1 DELETE orders") == 1
 
 
 def test_every_catalogue_object_is_a_scratch_name():

@@ -9,11 +9,12 @@ Run from the repository root with the backend's interpreter:
     backend/.venv/bin/python scripts/scratch_tables.py hold ENGINE SECONDS "STATEMENT"   # in a transaction kept open, then rolled back
 
 Only the objects of CATALOGUE are ever created or dropped, each by its exact name (`DROP … IF EXISTS <name>`, views
-first). `sql` and `hold` take one plain UPDATE, DELETE FROM, INSERT INTO or SELECT whose every table (also in a subquery
-or a JOIN) is a catalogue object of that engine, by its exact name (see `scratch_violation`): a typo or a stray `;` can
-not reach a seeded table. Seeded tables are never written. SQLite works on dev/data/scratch/zz_05b.sqlite (git-ignored,
-like all of dev/data), which stays, empty, after `drop`. Uses each engine's own driver and the dev credentials of
-backend/tests/support.py; never touches the app's data directory or the Keychain.
+first). `sql` and `hold` take one plain UPDATE, DELETE FROM, INSERT INTO or SELECT, one statement for the server, whose
+every table (also in a subquery or a JOIN) is a catalogue object of that engine, by its exact name (see
+`scratch_violation`). So `create`, `drop`, `sql` and `hold` never write a seeded table (a function a SELECT calls is the
+one thing they do not look into). SQLite works on dev/data/scratch/zz_05b.sqlite (git-ignored, like all of dev/data),
+which stays, empty, after `drop`. Uses each engine's own driver and the dev credentials of backend/tests/support.py;
+never touches the app's data directory or the Keychain.
 """
 
 import re
@@ -28,6 +29,9 @@ sys.path.insert(0, str(ROOT / "backend"))
 import mysql.connector  # noqa: E402
 import psycopg  # noqa: E402
 
+from dbaguy_backend.sql.dialects import Dialect  # noqa: E402
+from dbaguy_backend.sql.lexer import INSIGNIFICANT, tokenize  # noqa: E402
+from dbaguy_backend.sql.tsql import statements as tsql_statements  # noqa: E402
 from tests.support import (  # noqa: E402
     PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, mssql_connect, mysql_driver_kwargs,
 )
@@ -173,6 +177,11 @@ class Engine:
         names = {name.lower() for _, name in self.objects}
         return names | {name.rsplit(".", 1)[-1] for name in names}
 
+    def statement_count(self, statement: str) -> int:
+        """How many statements the server reads in `statement`. `;` is refused before this is asked, and only T-SQL
+        takes a second statement without one."""
+        return 1
+
     def connect(self):
         raise NotImplementedError
 
@@ -252,6 +261,12 @@ class Mysql(Engine):
 
 
 class Mssql(Engine):
+    def statement_count(self, statement):
+        """T-SQL needs no `;` between statements (`UPDATE t SET a = 1 DELETE u`), and FROM and INTO are optional
+        (`DELETE u`, `INSERT u VALUES (1)`): the repo's own splitter says where one ends."""
+        tokens = [token for token in tokenize(statement, Dialect.TSQL) if token.kind not in INSIGNIFICANT]
+        return len(tsql_statements(tokens))
+
     def connect(self):
         return mssql_connect(database="dbaguy")
 
@@ -315,10 +330,10 @@ _HEAD = re.compile(
 )
 _TABLE_KEYWORD = re.compile(r"\b(?:FROM|JOIN|UPDATE|INTO)\b\s*", re.I)
 _TABLE = re.compile(rf"({_IDENTIFIER})(?![\w.])")
-# Words that make a statement more than a plain data statement (T-SQL needs no `;` between two statements).
+# Words that make a statement more than a plain data statement: schema, privileges, transactions, the server itself.
 _NOT_DATA = re.compile(
-    r"\b(?:DROP|CREATE|ALTER|TRUNCATE|EXEC|EXECUTE|MERGE|GRANT|REVOKE|COPY|CALL|ATTACH|DETACH|PRAGMA|VACUUM|REINDEX"
-    r"|BEGIN|COMMIT|ROLLBACK)\b",
+    r"\b(?:DROP|CREATE|ALTER|TRUNCATE|EXEC|EXECUTE|MERGE|GRANT|REVOKE|DENY|COPY|CALL|ATTACH|DETACH|PRAGMA|VACUUM"
+    r"|REINDEX|BEGIN|COMMIT|ROLLBACK|KILL|DBCC|SHUTDOWN|RECONFIGURE|BACKUP|RESTORE)\b",
     re.I,
 )
 
@@ -327,9 +342,11 @@ def scratch_violation(statement: str, engine: Engine) -> str | None:
     """Why `sql` and `hold` refuse `statement` (None: they run it). A safety net against typos, not a sandbox.
 
     One plain UPDATE / DELETE FROM / INSERT INTO / SELECT; no comment, quoted name, backslash (its meaning differs per
-    engine) or `;` outside a string literal (one trailing `;` is fine); every table after FROM, JOIN, UPDATE or INTO, in
-    subqueries and in a second statement without `;` too, is a catalogue object of `engine` by its exact name (a name
-    that only starts with zz_05b_ is not one); the statement refers to at least one. A false refusal costs a rewrite.
+    engine) or `;` outside a string literal (one trailing `;` is fine); exactly one statement for the server
+    (`engine.statement_count`: T-SQL needs no `;`, so `UPDATE … SET a = 1 DELETE u` and `… SHUTDOWN` are cut by the
+    repo's own T-SQL splitter); every table after FROM, JOIN, UPDATE or INTO is a catalogue object of `engine` by its
+    exact name (a name that only starts with zz_05b_ is not one); the statement refers to at least one. A false refusal
+    costs a rewrite. What a function called inside a SELECT does is not looked at.
     """
     if "\\" in statement:
         return "no backslash (its meaning differs per engine)"
@@ -342,6 +359,8 @@ def scratch_violation(statement: str, engine: Engine) -> str | None:
         return "only UPDATE t SET, DELETE FROM t [WHERE], INSERT INTO t (…|VALUES|DEFAULT|SELECT), or SELECT"
     if _NOT_DATA.search(plain):
         return "data statements only"
+    if engine.statement_count(statement) != 1:
+        return f"one statement only ({engine.name} needs no `;` between two)"
     tables = engine.tables()
     named = [name for name in head.groups() if name]
     for keyword in _TABLE_KEYWORD.finditer(plain):

@@ -3,7 +3,7 @@ import { api, errorMessage, unwrap } from "@/lib/api/client";
 import type { PathSegment } from "@/lib/api/types";
 import type { TableTabState } from "@/stores/workspace";
 import { useEngineInfo } from "../connections/hooks";
-import { firstPageDelivered, INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
+import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
 import {
   isExporting,
   MAX_PAGE_SIZE,
@@ -12,6 +12,7 @@ import {
   type SessionSnapshot,
 } from "../session/SessionController";
 import { useSession } from "../session/useSession";
+import { firstPageComplete } from "./browseView";
 import { clearFilterHistory, readFilterHistory, rememberFilter } from "./filterHistory";
 import { relationOf, type Relation } from "./filterValue";
 
@@ -54,6 +55,8 @@ interface BrowseJob extends Job {
    * (Refresh, the re-read after a commit: D-05-12) keeps it.
    */
   position: number;
+  /** A Refresh of the browse the grid shows (same filter and sorts), not a new filter or sort. */
+  rerun: boolean;
 }
 
 /** The first page of a re-run that keeps the position: the rows loaded now (at least a page, at most MAX_PAGE_SIZE). */
@@ -175,6 +178,9 @@ export function useTableData(tab: TableTabState, active: boolean) {
   const [history, setHistory] = useState(() => readFilterHistory(profileId, path));
   const builds = useRef(0);
   const countRuns = useRef(0);
+  // The rows the grid shows, for the page size of a Refresh that keeps the position (D-05-12). Read when the re-run is
+  // asked for, never as a dependency (rows arrive page by page).
+  const loaded = useRef(0);
 
   const sentBrowse = useSessionJob(data.controller, data.snapshot, browseJob);
   const countReady = useMemo(
@@ -207,6 +213,7 @@ export function useTableData(tab: TableTabState, active: boolean) {
           if (ticket !== builds.current) return;
           setBuildError(null);
           if (newFilter) setFilterError(null);
+          loaded.current = 0; // a new filter or sort starts over: nothing of the old rows is "loaded" for its Refresh
           setBrowseJob((job) => ({
             run: (job?.run ?? 0) + 1,
             sql,
@@ -214,6 +221,7 @@ export function useTableData(tab: TableTabState, active: boolean) {
             sorts,
             pageSize: PAGE_SIZE,
             position: (job?.position ?? 0) + 1,
+            rerun: false,
           }));
         },
         (error: unknown) => {
@@ -275,14 +283,14 @@ export function useTableData(tab: TableTabState, active: boolean) {
     [browse, filter],
   );
   // D-05-12 (CR-1: only an engine whose table data can be edited): a re-run reloads as many rows as are loaded and the
-  // grid keeps its position. Read when the re-run is asked for, never as a dependency (rows arrive page by page).
+  // grid keeps its position.
   const keepsPosition = useEngineInfo(profileId)?.row_editing === true;
-  const loaded = useRef(0);
   useLayoutEffect(() => {
-    // The rows of a request that has its first page: one still loading it holds fewer, and a second Refresh pressed
-    // meanwhile must reload what the grid shows (the held rows), not what has arrived so far.
+    // The rows of the applied browse's request once its first page is in whole: one still loading it, or cut short,
+    // holds fewer, and a second Refresh meanwhile must reload what the grid shows (the held rows), not what has arrived
+    // so far. The request sent before a new filter or sort took over is not the applied browse's (`browse` reset it).
     const set = execution?.resultSets[0];
-    if (set && firstPageDelivered(execution)) loaded.current = set.rows.length;
+    if (set && sentBrowse?.job.run === browseJob?.run && firstPageComplete(execution)) loaded.current = set.rows.length;
   });
   /**
    * Runs the applied browse again (or builds the first one if that failed); a finished count is out of date. Where the
@@ -297,8 +305,8 @@ export function useTableData(tab: TableTabState, active: boolean) {
     }
     setBrowseJob((job) =>
       job && keepsPosition
-        ? { ...job, run: job.run + 1, pageSize: keptPageSize(loaded.current) }
-        : job && { ...job, run: job.run + 1, pageSize: PAGE_SIZE, position: job.position + 1 },
+        ? { ...job, run: job.run + 1, pageSize: keptPageSize(loaded.current), rerun: true }
+        : job && { ...job, run: job.run + 1, pageSize: PAGE_SIZE, position: job.position + 1, rerun: true },
     );
   }, [browse, browseJob, countRunning, keepsPosition]);
   /** Stops a browse that has not delivered its first page yet. */
@@ -332,9 +340,10 @@ export function useTableData(tab: TableTabState, active: boolean) {
   /** Escape (the input shows the applied filter again) or an edit: the rejected text is no longer what is shown. */
   const clearFilterError = useCallback(() => setFilterError(null), []);
 
-  // The request whose first page is shown: a commit whose outcome was unknown waits for another one (fresh rows, R-05-6),
-  // a Refresh or the same browse sent again on a new session alike.
-  const deliveredRequest = sentBrowse && firstPageDelivered(execution) ? sentBrowse.requestId : null;
+  // The request whose first page is in whole: a commit whose outcome was unknown waits for another one (fresh rows,
+  // R-05-6), a Refresh or the same browse sent again on a new session alike. A first page cut short (cancelled, failed,
+  // interrupted) is not fresh rows.
+  const deliveredRequest = sentBrowse && firstPageComplete(execution) ? sentBrowse.requestId : null;
 
   const state: TableDataState = {
     filter,
@@ -355,8 +364,10 @@ export function useTableData(tab: TableTabState, active: boolean) {
     pending,
     /** Changes only when the grid should scroll back to the top (D-05-12). */
     position: browseJob?.position ?? 0,
-    /** The browse request whose first page is in (null while one loads). */
+    /** The browse request whose first page is in whole (null while one loads, and when one ended before it did). */
     deliveredRequest,
+    /** The request on screen is a Refresh of what the grid shows: one that ends early leaves the rows as they were. */
+    rerun: sentBrowse?.job.rerun ?? false,
     controller: data.controller,
     snapshot: data.snapshot,
     relation,
