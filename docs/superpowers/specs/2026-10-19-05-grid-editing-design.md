@@ -4,7 +4,7 @@
 > 範圍依據：[feature-priorities.md](../../research/2026-10-15-feature-priorities.md) §2（Q1–Q6）、§3（S1：修改先暫存、預覽 DML 後一次 commit，依 §8 升為 Must；M7 值的呈現正確；M11 安全與交易；Won't 清單）、§7「型別」、§8（「Grid 內直接編輯：升為 Must」）
 > 技術依據：本設計在 dev 資料庫上的探測（2026-10-19；PostgreSQL 17.11／psycopg 3.3.6、MySQL 8.4.11／mysql-connector-python 26.7.0 pure、SQL Server 2022 CU27／pymssql 2.4.4、SQLite 3.53.4），標 **〔實測〕**；標 **〔未實測〕** 的是假設，§10 彙整並指定由哪個 plan task 先驗證。探測只建 `zz_spec05_*` scratch 表（SQLite 用 scratch 目錄裡的檔案），結束時以完整名稱 DROP；紀錄在附錄 A。本文的 A 編號自成一組（⑤ A1…）。
 > 建立在 ①–④ 之上：表格資料 tab（[② spec](2026-10-16-02-query-workflow-design.md) §4.5）、grid（§4.3）、`SessionWorker` 與 WS 協定（`domain/execution.py`）、`SafetyPolicy`、`sql/dialects.py` 的引號與 literal、`sql/formatting.py` 的 `value_condition`（Filter by this value）、④ 的 cell 編碼（[④ spec](2026-10-18-04-couchbase-design.md) §3.2.4），以及 04c 存檔流程的教訓（[04c notes](../notes/2026-10-19-04c-couchbase-documents-followups.md) C7、C12、C20、C28、C42、C45、C46、C48，B40）
-> **05a（backend）完成（2026-10-19）**：實作時的細化與實測結果記在被它們修訂的文字旁邊，以「〔05a〕」開頭（§2 的 R-／D- 列、§3.2.2、§3.3.3、§3.4、§3.5、§4–§9、§11–§13）與 §10 的結果欄；前文不改，衝突時以〔05a〕為準。編號 E 是 [05a plan](../plans/2026-10-19-05a-grid-editing-backend.md) 的規劃決定（E1–E25），F／G／L 是 plan 審查與 task review 的決定（內容寫在條目裡）。05b（frontend）還沒開始。
+> **05a（backend）完成（2026-10-19）**：實作時的細化與實測結果記在被它們修訂的文字旁邊，以「〔05a〕」開頭（§2 的 R-／D- 列、§3.2.2、§3.3.2、§3.3.3、§3.4、§3.5、§4–§9、§11–§13）與 §10 的結果欄；前文不改，衝突時以〔05a〕為準。編號 E 是 [05a plan](../plans/2026-10-19-05a-grid-editing-backend.md) 的規劃決定（E1–E25），F／G／L 是 plan 審查與 task review 的決定（內容寫在條目裡）；I／M 是 05a 最終審查（final review）的項目，最後的修正波（ruling G16）做了 I1、M1–M3、M5、M10 與 M4、M6、M8、M9 的文件，M7（被取代的預覽的 plan 仍可用 15 分鐘）留給 05b：05b 只套用畫面上那個對話框的 plan。05b（frontend）還沒開始。
 
 ## 1. 目標
 
@@ -55,7 +55,7 @@ R-05-x 回答 coordinator 列出的設計問題，D-05-x 是其下的設計決�
 | **R-05-11** 持久化與關閉保護 | — | 暫存存進 workspace（table tab 的 `staged_edits`），每次變更經唯一的 workspace writer 存檔（500 ms），當機或重開都在；還原後依 key 綁回。上限：10,000 個變更、單值 1 MiB、總文字 8 MiB；超過就不寫進 workspace 並在編輯列提示（B40：一個 backend 不收的值不能讓每次存檔都失敗）。關 tab：「Discard N staged changes to <table>?」（Discard／Cancel，沒有 Commit：commit 需要預覽，04c C20）；沒顯示過的還原 tab 也問（C28）；commit 進行中不能關（提示等它結束或在對話框 Cancel）。結束 app 不問（會保存）。還原時 profile 已不存在：tab 照舊被丟，「已關閉」清單註明暫存一起捨棄。 |
 | **R-05-12** Couchbase | — | 不做 grid 編輯（新能力 `row_editing`，Couchbase 為 False；Couchbase 也沒有表格資料 tab）。修改文件走 04c 的 Open document（grid 右鍵已有）。理由：沒有交易（R-04-4），SQL++ 存檔會正規化整份文件（R-04-2），一個 cell 的修改等於改整份文件，04c 已有預覽與 CAS。 |
 | **D-05-1** 職責分層 | — | engine 的知識（key、generated、型別、能不能比、交易性）在 adapter（`RowEditing.edit_target()`，ISP，同 `FieldSampling`）；SQL 文字在純函式 `sql/dml.py`；cell → literal、比對條件從 `sql/formatting.py` 抽到 `sql/literals.py`，Filter by this value、Copy as INSERT 與 DML 共用（DRY，行為不變）；流程（交易、逐句檢查、結果分類）在 worker，四個 engine 共用。 |
-| **D-05-2** literal 與比對規則 | — | 每個 dialect × `EditKind` 一張表（§3.3）。重點〔實測〕：PG 原始值檢查用 `col::text = '原文'`（text-first 載入的就是 server 的文字輸出，同一 session 設定下逐字相同；`json`、`xml`、`point` 沒有 `=` 也能比；`bpchar` 例外用 `=`，因 `::text` 去掉尾端空白）；key 條件一律 `=`（能用 index）。MySQL：JSON 用 `CAST(… AS JSON)`、零日期用 `CAST(col AS CHAR)`（`dialects` 已有）、數字不加引號。SQL Server：非 Unicode 欄位（char／varchar／text 家族）的值是純 ASCII 時不加 `N`——〔實測〕SQL collation 下 `vc = N'k42'` 變成 Clustered Index Scan（每句 UPDATE 掃整張表並加 U lock），Windows collation 才是 seek；非 ASCII 仍用 `N''`（正確優先）。SQLite：原始值依 cell 的儲存型別（數字不加引號、字串加引號；〔實測〕無 affinity 欄位裡的 `'42'` 不等於 `42`）。 〔05a〕沒有型別的 SQLite 欄的新值也依這條：只有 SQLite 存回來的文字就是輸入時才寫成數字（G1）；SQL Server 的日期時間常值與語系無關（F1）；帶指數的整數在 MySQL／SQL Server／SQLite 改寫成完整位數（F5、G6）。細節見 §3.3.3 的〔05a〕。 |
+| **D-05-2** literal 與比對規則 | — | 每個 dialect × `EditKind` 一張表（§3.3）。重點〔實測〕：PG 原始值檢查用 `col::text = '原文'`（text-first 載入的就是 server 的文字輸出，同一 session 設定下逐字相同；`json`、`xml`、`point` 沒有 `=` 也能比；`bpchar` 例外用 `=`，因 `::text` 去掉尾端空白）；key 條件一律 `=`（能用 index）。MySQL：JSON 用 `CAST(… AS JSON)`、零日期用 `CAST(col AS CHAR)`（`dialects` 已有）、數字不加引號。SQL Server：非 Unicode 欄位（char／varchar／text 家族）的值是純 ASCII 時不加 `N`——〔實測〕SQL collation 下 `vc = N'k42'` 變成 Clustered Index Scan（每句 UPDATE 掃整張表並加 U lock），Windows collation 才是 seek；非 ASCII 仍用 `N''`（正確優先）。SQLite：原始值依 cell 的儲存型別（數字不加引號、字串加引號；〔實測〕無 affinity 欄位裡的 `'42'` 不等於 `42`）。 〔05a〕沒有型別的 SQLite 欄的新值也依這條：只有 SQLite 存回來的文字就是輸入時才寫成數字（G1）；SQL Server 的日期時間常值與語系無關（F1）；帶指數的整數在 MySQL／SQL Server／SQLite 改寫成完整位數（F5、G6）；PG 的 bytea 也和 bpchar 一樣用 `=`（`::text` 跟著 `bytea_output`，最終審查 M3）。細節見 §3.3.3 的〔05a〕。 |
 | **D-05-3** 句子的形狀與順序 | — | 每列一句：UPDATE 只 SET 改過的欄、WHERE key＋原始值；INSERT 只列非 DEFAULT 的欄；DELETE WHERE key。順序 DELETE → UPDATE → INSERT，各組內依暫存先後：先刪可讓 UPDATE／INSERT 重用唯一值。兩列互換唯一值（A→B、B→A）仍會在中途撞唯一鍵 → rollback，要用 SQL 做（已知限制）。 〔05a〕key 的互換不等 rollback：預覽就拒絕（`key_collision`，G7，見 §3.3.3）；非 key 的唯一值互換仍如上。 |
 | **D-05-4** 交易外框 | — | 開頭與結尾是 dialect 表裡的文字、經 `run()` 送出，所以也出現在預覽：PG `BEGIN`／`COMMIT`；MySQL `START TRANSACTION`／`COMMIT`；SQL Server `SET NOCOUNT OFF;` 加 `BEGIN TRANSACTION`（一個批次）／`COMMIT TRANSACTION`；SQLite `BEGIN IMMEDIATE`／`COMMIT`。`SET NOCOUNT OFF`：server 的 `user options` 若預設開 NOCOUNT，pymssql 讀不到列數（A2）。SQLite 用 IMMEDIATE：寫入鎖一開始就拿，被其他連線擋住時在第一句之前就失敗（busy timeout 內）。失敗時用 adapter 的 `rollback()`（SQL Server 是 `WHILE @@TRANCOUNT > 0 ROLLBACK`，〔實測〕8114 這類錯誤已讓 server 自己 rollback、`@@TRANCOUNT` 為 0，它就什麼都不做）。 |
 | **D-05-5** 「影響列數」的來源 | — | 新增 `StatementResult.matched_rows()`，預設回 `affected_rows()`。MySQL 覆寫：UPDATE 讀 OK 封包 info 的 `Rows matched: N`——〔實測〕沒有 `CLIENT_FOUND_ROWS` 時 `affected_rows` 是「改變」的列數，值相同（含 `1.10` 改成 `1.1` 這種 decimal 相等）回 0，`ROW_COUNT()` 也是 0；`_VerbatimCursor` 是 DbaGuy 自己的類別，送出時保留 `cmd_query` 回傳的 dict 即可，不改全域的 client flag（使用者自己的 UPDATE 照舊顯示改變列數）。其他 engine〔實測〕：PG rowcount＝符合的列數（值相同也算）；SQL Server `rows_affected` 是該句自己的列數，AFTER trigger 另外插入 3 列時仍是 1；SQLite `changes()` 不算 trigger。讀不到列數（`None`／-1）→ fail closed：rollback，「無法確認改了幾列，什麼都沒套用」。 〔05a〕A1 成立（`_VerbatimCursor` 保留 OK 封包的 info）。MySQL 只對 UPDATE 讀 info，取其中三個整數的第一個：server 的 `lc_messages` 會翻譯 info 的文字（26 個語系有 18 個翻譯，數字的順序不變，G8）；不是剛好三個整數就讀不到，fail closed。SQL Server 的 trigger 回傳結果集時語句沒有列數（A3、E9），同樣 fail closed。 |
@@ -66,7 +66,7 @@ R-05-x 回答 coordinator 列出的設計問題，D-05-x 是其下的設計決�
 | **D-05-10** 暫存值怎麼顯示 | — | 用既有的 cell 編碼（`lib/cells.ts`）：文字、數字文字、日期、JSON → 字串（數字欄照樣靠右）；bool → boolean；binary → `{$type:"bytes", size, preview}`（由 hex 算出）；NULL → null；DEFAULT → null 加上 `default` 標記（畫成灰色 `DEFAULT`）。所以 copy、aggregate、值檢視器、record view 不必認識新的 cell 種類；複製 DEFAULT 得到空值（文件化）。 |
 | **D-05-11** 上限 | — | 一次 commit 最多 10,000 個變更（列）；單值 1,048,576 字元（同參數草稿）；workspace 保存的暫存文字總計 8 MiB。⌘⌫ 一次超過上限：提示改用 SQL。 〔05a〕`CellInput.text` 收到 4 × 單值上限（4,194,304 字元）為止：超過單值上限由預覽回 `value_too_large`，超過 4 倍是 422（E8）；一次 commit 的文字總量另有 64 MiB 的上限（L15，見 D-05-7）。 |
 | **D-05-12** 重讀保留位置 | — | commit 後的重跑與一般的 Refresh：同樣的欄位時保留垂直捲動位置與選取，載入列數＝原本已載入的列數（≤ 10,000）。sort 與 filter 照舊從頂端開始。編輯流程常常是「Refresh 看別人的修改 → 繼續改」，跳回頂端會失去位置。 |
-| **D-05-13** MySQL 反斜線 | — | target 讀 metadata 連線的 `@@SESSION.sql_mode`（session 與 metadata 連線套用同樣的 profile options）；含 `NO_BACKSLASH_ESCAPES` 時 literal 不把反斜線加倍。否則 `C:\tmp` 會被存成 `C:\\tmp`（靜默改值）。lexer 與 Filter by value 的既有限制不變（CLAUDE.md）。 〔05a〕A9 成立（見 §10）；`NO_BACKSLASH_ESCAPES` 下含 U+0000 的值是 `invalid_text`：`\0` 的跳脫需要反斜線（E16）。 |
+| **D-05-13** MySQL 反斜線 | — | target 讀 metadata 連線的 `@@SESSION.sql_mode`（session 與 metadata 連線套用同樣的 profile options）；含 `NO_BACKSLASH_ESCAPES` 時 literal 不把反斜線加倍。否則 `C:\tmp` 會被存成 `C:\\tmp`（靜默改值）。lexer 與 Filter by value 的既有限制不變（CLAUDE.md）。 〔05a〕A9 成立（見 §10）；`NO_BACKSLASH_ESCAPES` 下含 U+0000 的值是 `invalid_text`：`\0` 的跳脫需要反斜線（E16）。「session 與 metadata 連線同樣的 profile options」不保證兩者的 `sql_mode` 相同（profile 沒指定 `sql_mode` 時兩條連線各自取連上那一刻的 GLOBAL；proxy 後面的 server 可能不同），審查實測兩者不同時 `C:\tmp` 被存成 `C:\\tmp`、結果卻是 committed（最終審查 M2）。所以 plan 記下 target 的假設（`EditPlan.backslash_escapes`），apply 在 BEGIN 之後、任何 DML 之前比對 session 自己的模式（BEGIN 的 OK 封包的 status flag `SERVER_STATUS_NO_BACKSLASH_ESCAPES` = 512，不多一次往返），不同就 rollback、什麼 DML 都不送，`sql_mode_changed`（見 §3.5、§4 的〔05a〕）。 |
 | **D-05-14** 復原 | — | ⌘Z／⇧⌘Z 復原／重做暫存操作（一個使用者動作一步：改一格、對選取設 NULL、刪列、新增列、還原、全部捨棄、Keep mine），最多 100 步，只在記憶體；commit 成功後清空。reducer 是 immutable 的，歷史只是保留舊狀態。WKWebView 會不會把 ⌘Z 交給頁面要在打包版確認（A10）；可靠的路徑是右鍵的 Revert。 |
 | **D-05-15** 計畫拆分 | 一份；兩份；三份 | **兩份**：05a backend、05b frontend（§11）。 |
 
@@ -202,6 +202,8 @@ DELETE FROM <table> WHERE <k> = <key> [AND …]
 
 `<table>` 是 `qualified(dialect, schema, name)`（只在需要時加引號，與瀏覽的 SELECT 相同）；PG 與 SQL Server 是 session 的 database 內的 schema.name。原始值是 NULL 時檢查寫 `c IS NULL`。
 
+〔05a〕SQLite 寫成 `UPDATE OR ABORT <table> …` 與 `INSERT OR ABORT INTO <table> …`（含 `DEFAULT VALUES`；`dialects.update_head`／`insert_head`）。沒有 `OR` 子句時 SQLite 用 CREATE TABLE 裡約束自己的衝突處理：`UNIQUE … ON CONFLICT REPLACE`／`PRIMARY KEY ON CONFLICT REPLACE` 會刪掉持有那個值的另一列，`IGNORE` 會跳過語句，而 `changes()` 仍是 1，exactly-1 照樣通過（最終審查 I1，經真正的路徑實測：(1,a)、(2,b)、(3,c) 的表 UPDATE id 1 的 code 成 `b`、INSERT id 3，結果 `committed`，表裡只剩 (1,b)、(3,z)：沒在 plan 裡的兩列不見了；IGNORE 則讀成「changed or deleted since it was loaded」）。句子的 `OR` 子句蓋過表的設定；ABORT 是 SQLite 的預設，一般的表行為完全不變；撞到唯一鍵時是 `SQLITE_CONSTRAINT_UNIQUE`／`SQLITE_CONSTRAINT_PRIMARYKEY`，整批 rollback（`test_a_constraints_own_conflict_clause_never_applies`）。DELETE 沒有衝突子句。
+
 #### 3.3.3 literal 與比對（`EditKind` × dialect）
 
 新值（SET、VALUES）：
@@ -233,11 +235,12 @@ DELETE FROM <table> WHERE <k> = <key> [AND …]
 
 - **問題碼**另有 `default_not_allowed`（DEFAULT 只給新列，UPDATE 不能用，E8）與 `key_collision`（G7，見下）。有任何問題時 `statements` 與 `script` 是空的（`plan_id` 為 null；`begin`、`commit`、`counts`、`warnings` 照給，E8）：對話框顯示問題或句子，不會兩個一起。`invalid_text` 另含 MySQL 在 `NO_BACKSLASH_ESCAPES` 下的 U+0000（E16）；孤立 surrogate 到不了這裡：request model 先回 422，`detail[].loc` 指到那個 cell（pydantic 擋 `str` 欄位，`JsonValue` 擋不住，沒有 driver 送得出去，E19）；key 或原始值字串裡的孤立 surrogate 沒有比對條件（key 是 `key_incomplete`，原始值列入未檢查）。請求本身的形狀錯誤也是 422：沒有任何變更、超過 10,000 個、重複的 change id、UPDATE 缺了某個 SET 欄的 `original`、`text` 與 kind 不符、欄位名不是合法文字。
 - **原始值是 NULL**：一律 `c IS NULL`，不管欄的 `compare`（E5）。
-- **SQLite**：kind 依 affinity（見 §3.2.2 的〔05a〕，E6）；沒有型別的欄裡，key 或原始值是超過 ±(2⁵³−1) 的整數字串時寫 `c IN (n, 'n')`（E7）——`encode_value` 把那種整數當字串送，沒有 affinity 時 `'n'` 永遠不等於存著的整數，每個 UPDATE 都會衝突。沒有型別的欄（含 STRICT 的 `ANY`）的新值**只有在 SQLite 存回來的文字就是輸入時才寫成數字**（正規寫法的 int64，或 `repr(float(t)) == t`），`007`、`0912345678`、`1.10`、`-0`、`1e5`、超過 int64 的整數一律加引號、照輸入存成文字（G1：電話與代碼最常見，不能靜默改值）。
+- **SQLite**：kind 依 affinity（見 §3.2.2 的〔05a〕，E6）；沒有型別的欄裡，key 或原始值是超過 ±(2⁵³−1) 的整數字串時寫 `c IN (n, 'n')`（E7）——`encode_value` 把那種整數當字串送，沒有 affinity 時 `'n'` 永遠不等於存著的整數，每個 UPDATE 都會衝突。沒有型別的欄（含 STRICT 的 `ANY`）的新值**只有在 SQLite 存回來的文字就是輸入時才寫成數字**（正規寫法的 int64，或 `repr(float(t)) == t`），`007`、`0912345678`、`1.10`、`-0`、`1e5`、超過 int64 的整數一律加引號、照輸入存成文字（G1：電話與代碼最常見，不能靜默改值）。前後有空白的（` 42`）也加引號、照輸入存：bare 的 literal 會存成去掉空白的數字（最終審查 M10）。
+- **PG 的 bytea**（最終審查 M3）：原始值用 `=`（`c = '\x…'::bytea`，`compare` 是 `equals`），不用 `::text`：bytea 以原生的 bytes 載入，`::text` 卻跟著 `bytea_output`，escape（舊 server 的 database 或 role 預設）時每個原始值都對不上，這一欄的每次編輯都是假衝突（fail closed，但不能編輯）。`= '\x…'::bytea` 在兩種輸出下都精確（`test_a_bytea_original_matches_whatever_the_bytea_output`）。上表「bytea 寫 `'\x…'`」的 `as_text` 寫法因此不再用到；bool 與 int2／int4 的 `::text` 不受設定影響，照舊。
 - **SQL Server 的日期時間**（F1）：`datetime` 與 `smalldatetime` 讀 `2026-10-05` 與 `2026-10-05 12:34:56` 依 login 的 DATEFORMAT（dmy 的語系如 British 會存成 5 月 10 日，或回 242），`20261005` 與 `2026-10-05T12:34:56` 在每個語系都一樣。所以只有日期時寫 `N'20261005'`，日期加時間用 `T` 連起來；一位數的小時也照樣送，由 server 拒絕（241／295，兩種語系相同）而不是誤讀。〔實測〕（05a T10）：date、datetime、smalldatetime、datetime2、datetimeoffset 在 British 與 us_english 的 session 存下一樣的值，原始值的比對也一樣。
 - **帶指數的整數**（F5、G6）：`9007199254740993e0` 在 MySQL、SQL Server、SQLite 會被讀成 double，寫進 BIGINT 就失去末位，所以整數值改寫成完整的位數（至多 38 位）；有小數的（浮點欄最適合用原樣讀；MySQL 超過 30 位小數的 decimal 可能被切）、太長寫不出來的與 `Decimal` 裝不下的照輸入送，由 server 判斷；PG 把指數讀成精確的 numeric，不改。
 - **key_collision**（G7）：一個 UPDATE 把 key 改成**另一個 UPDATE 的原始 key**（互換、鏈、環）整份拒絕，問題標在後面那個改 key 的 change，沒有 plan，訊息「This change moves a row onto the key of another changed row: commit these changes separately」。〔實測〕PG：別人先刪掉其中一列時，互換的兩句都符合 1 列、commit 出錯的結果。改到被 DELETE 的 key 或沒變動的列的 key 可以（DELETE 先跑）。key 以 literal 文字比對：`2.0` 與 `2`、不分大小寫的 collation 抓不到，那時由 server 的唯一鍵或 exactly-1 擋；安全的鏈（1→2、2→3）也被拒，代價是分兩次 commit。key 欄本身可以改（不是 identity／generated 時，CR-4）：WHERE 用原始 key、SET 新值。
-- **未檢查的原因**（E22、G2）：`<type> values cannot be compared exactly`（`compare` 是 `none`）、`only a preview of the value was loaded`（被截斷的原始值）、`the loaded value holds a character that cannot be sent`（原始值含不能送出的字元：U+0000 或孤立 surrogate）；key 含不能送出的字元時有自己的訊息「This row cannot be identified: its key column X holds a character that cannot be sent」，與「was not loaded completely」分開。原因來自 `literals.unmatched_reason`，與 `invalid_text` 的判斷共用同一條規則。
+- **未檢查的原因**（E22、G2）：`<type> values cannot be compared exactly`（`compare` 是 `none`）、`only a preview of the value was loaded`（被截斷的原始值）、`the loaded value holds a character that cannot be sent`（原始值含不能送出的字元：U+0000 或孤立 surrogate）；key 含不能送出的字元時有自己的訊息「This row cannot be identified: its key column X holds a character that cannot be sent」，與「was not loaded completely」分開；change 根本沒給某個 key 欄（只有 client 的 bug 會這樣）是「This row cannot be identified: the change gives no value for its key column X」（最終審查 M10）。原因來自 `literals.unmatched_reason`，與 `invalid_text` 的判斷共用同一條規則。
 
 ### 3.4 預覽（`services/edit_service.py`、`api/edits.py`）
 
@@ -255,7 +258,7 @@ DELETE FROM <table> WHERE <k> = <key> [AND …]
 
 - 唯讀 profile 的 `/edits/target` **不連線**，直接回 `editable=False`、`reason="This connection is read-only"`（E20）：工具列要顯示原因，不必為它連一次；`/edits/preview` 是 403 `read_only`。沒有 `row_editing` 的 engine（Couchbase）兩個 route 都是 422 `not_editable`。view、沒有 key、key 欄比不了的表，`/edits/target` 是 200 加 `editable=False` 與原因，`/edits/preview` 才是 422 `not_editable`。
 - 預覽每次重讀 target（不快取），INFO log 記 profile、`schema.name`、三種計數、問題數與毫秒，不記值與 key（§5）。`build_plan` 對 1,000 個變更約 9 ms、10,000 個 94–129 ms（線性）；經 HTTP 的 10,000 個預覽 294 ms。
-- 一次 commit 的值、key、原始值文字合計超過 64 MiB 是 422（`EditChanges` 的驗證，L15），訊息在 `detail[0].msg`（通用的「Invalid request」之外）：05b 的預覽要顯示那一句，不是通用訊息。
+- 一次 commit 的值、key、原始值文字合計超過 64 MiB 是 422 `validation_failed`（`EditChanges` 的驗證，L15）：`error.message` 是通用的「Invalid request」，文字在 `detail[0].msg`（`type` 是 `commit_too_large`；驗證用 `PydanticCustomError`，所以沒有 pydantic 給 `ValueError` 加的「Value error, 」前綴，最終審查 M5）。單一 plan 的文字超過 128 MiB 是 `EditPlanStore.put` 的 `ValidationFailed`：同樣是 422 `validation_failed`，但文字就在 `error.message`，沒有 `detail`；不是 grid cell 的 key 或原始值（「Not a grid cell: …」）也是這種。05b 的預覽顯示 `detail?.[0]?.msg ?? message`，兩種都對，不是通用訊息。
 
 ### 3.5 套用（`sessions/worker.py`）
 
@@ -301,7 +304,13 @@ DELETE FROM <table> WHERE <k> = <key> [AND …]
 - **非交易的表**（E11、G10、G13）：每句都在執行時就生效，所以上表加了〔05a〕兩列：送出之後的失敗是 unknown，只有 0 列的衝突與送出前的取消才是 partial／rolled_back；失敗的 COMMIT 是 `committed` 加警告（「COMMIT reported an error after every statement had taken effect」）。訊息的結尾依情況寫「the statements before it stay applied (this table cannot roll back)」、「this change may have taken effect, and …」等，不再說「nothing was applied」。〔實測〕MyISAM 的 AUTO_INCREMENT 加一個會失敗的 trigger：每次 apply 都留下一列、卻回報 rolled_back，使用者重按三次就多三列；改為 unknown 後 Commit 停用到 Refresh。
 - **COMMIT 回來了卻還有交易開著**（L7、G11）：先 rollback，結果是 unknown，不說「什麼都沒套用」：SQL Server 在 trigger 的 `BEGIN TRAN` 之下 `COMMIT TRANSACTION` 只降低 `@@TRANCOUNT`（沒有 commit，worker 的 rollback 才把每一層都撤掉），MySQL `completion_type=CHAIN` 則已 commit 並立刻開下一個交易，兩者看不出來。代價是少見的假 unknown。
 - **SQL Server 3609**（trigger 內的 COMMIT／ROLLBACK 結束了交易）：在交易的表是 unknown（`TRANSACTION_ENDED` 依 dialect 分，MySQL 的 3609 是別的意思）。
-- **Cancel 在兩句之間**：`failed_change` 與 `statement` 是 null（那一句根本沒送出）。
+- **Cancel 在兩句之間**：`failed_change` 與 `statement` 是 null（那一句根本沒送出）。Cancel 剛好落在最後一刻——worker 在兩句之間的檢查之後、`_run_statement` 自己的檢查或 adapter 的 armed 視窗裡——被接住時，那一句同樣沒送出，但結果照「已送出」算：非交易的表是 unknown（帶 `failed_change`），交易的表指出那個 change；BEGIN 被這樣擋下時也會留下一筆 cancelled 的 History（`req.ran` 已為真）。偏保守，不會把可能生效的說成「什麼都沒套用」（最終審查 M10）。
+- **BEGIN 之後的檢查**（最終審查 M2）：BEGIN 回來之後、任何 DML 之前，`connection.backslash_escapes()`（MySQL：BEGIN 自己的 OK 封包的 `SERVER_STATUS_NO_BACKSLASH_ESCAPES`；其他 engine 回 None，不檢查）和 `plan.backslash_escapes` 不同 → rollback → `rolled_back`，`sql_mode_changed`「The session's sql_mode changed since the preview: preview the changes again」，`failed_change` 與 `statement` 是 null；History 記一筆 error（BEGIN 已送出）。重新預覽讀的仍是 metadata 連線的模式，所以兩條連線本來就不同時會再被拒，直到其中一條重連；在 profile 的 options 指定 `sql_mode` 就不會發生（CLAUDE.md 已知限制）。
+- **SQL Server 不 describe plan 的語句**（最終審查 M1）：worker 以 `RunOptions(describe=False)` 送 BEGIN、每句 DML 與 COMMIT：它們沒有要顯示的結果集，`sys.dm_exec_describe_first_result_set` 只是多一個往返（審查實測 1,000 句 6.92 → 2.83 秒；修正後 in-process 1.54–2.62 秒，見 §7）。每句之前的狀態讀取照舊（`@@TRANCOUNT` 等的快取，取消與 COMMIT 前後的檢查要用）；trigger 的 SELECT 照樣是一個有欄位的結果集、沒有列數（E9）；使用者自己的語句照舊 describe。合併批次仍是 §12 的之後項目。
+- **另外兩種事件形狀**（最終審查 M6）：除了上面的主順序與 E1 的「排隊時被取消」，前端還會收到：
+  - **在 WS 層就被拒絕**（`api/sessions.py` 的 `_fail_request`：指令不合法 `invalid_command`，或 `submit` 回 `session_busy`）：`error` → `edit_outcome(rolled_back)` → `finished`，沒有 `started`、沒有 `session_state`；連 `request_id` 都沒有的壞指令只有 `error`。
+  - **排隊時被取消，或 session 已關閉**：`started` → `message`（警告，通用的「Query cancelled before it started」或「Session closed before the query started」）→ `edit_outcome(rolled_back)` → `session_state` → `finished(cancelled=true)`，沒有 `error`。
+- **backend 在 apply 途中死掉**（最終審查 M9）：History 在 `_complete`（apply 的最後）才寫，所以可能已 commit 的 apply 不留紀錄；前端照 R-06 當 unknown。要留下紀錄得在 COMMIT 之前先寫一筆「pending」，目前沒有（已知限制）。
 - **History**（E14）：見 D-05-9 的〔05a〕。
 - **log 與 pymssql**（G12、G14）：SQL Server 的 `_attention` 與取消路徑在 WARNING 只記錯誤號碼，server 的文字在 DEBUG（文字會回顯常值，§5）；`server_text()` 只讀 `exc.args`，不讀 `.text`／`.message`／`.srvname`／`.procname`——那四個是 C 的 `char*` 屬性，沒被 pymssql 填過的例外（Python 裡自己建的）讀它們會 `PyBytes_FromString(NULL)`、整個 process segfault（開發時 probe 造成過兩次，macOS 跳出當機對話框），pymssql 自己 raise 的則指向連線的訊息緩衝，會被後來的訊息蓋掉、關連線時釋放；`translate_error` 的 `.procname` 只在 `number != 0` 時讀（pymssql 填了 number 才一起填它）。有子 process 隔離的回歸測試。
 
@@ -412,6 +421,7 @@ interface StagedEdits {
 | `read_only` | `/edits/preview` 403；apply 被 policy 擋下 | 「This connection is read-only」；apply 是既有的 `_read_only_message` |
 | `plan_expired`、`plan_mismatch` | apply（`rolled_back`，什麼都沒送） | 同一句：「The preview has expired: preview the changes again」（plan 被取走、逾時、被擠掉、重啟都是 expired；不符 profile 或 database 才是 mismatch） |
 | `transaction_open` | apply（`rolled_back`） | 「Commit or roll back the open transaction first」 |
+| `sql_mode_changed` | apply，BEGIN 之後（`rolled_back`，DML 一句都沒送） | 「The session's sql_mode changed since the preview: preview the changes again」（MySQL：session 讀反斜線的方式和預覽時的 metadata 連線不同，最終審查 M2） |
 | `edit_conflict` | apply 的語句 | UPDATE 0 列：「Row <key> was changed or deleted since it was loaded (or a trigger skipped it): nothing was applied」；> 1 列：「Row <key> matched N rows: its key is not unique. Nothing was applied」；INSERT 0 列：「The new row was not inserted (a trigger may have skipped it): …」；INSERT > 1 列：「Inserting one row reported N rows: …」。非交易的表，結尾換成它之前的語句留著的說明 |
 | `row_count_unknown` | apply 的語句 | 「Could not confirm how many rows changed: nothing was applied」（trigger 回傳結果集、NOCOUNT 讀不到、驅動沒給列數） |
 | `cancelled` | apply | 「Cancelled: nothing was applied」（非交易的表依情況帶前面的語句） |
@@ -419,7 +429,8 @@ interface StagedEdits {
 | `outcome_unknown` | unknown 的結果 | 「The transaction ended before COMMIT: the changes may or may not have been applied」、「COMMIT left a transaction open, which was rolled back: the changes may or may not have been applied」；斷線（`connection_lost`）、3609 與 worker 的例外（沒有 code）的 unknown 帶它們自己的 code；History 都記「Outcome unknown: …」 |
 | `connection_lost` | COMMIT 之前 → `rolled_back`；COMMIT 途中 → `unknown` | adapter 的文字 |
 | 其他 | server 的 code 與位置 | server 原文；COMMIT 被拒另加「The transaction was rolled back: nothing was applied」 |
-| 422（無 code） | 請求的形狀、64 MiB、單一 plan 超過 128 MiB | 「The changes are too large: at most 64 MiB of values per commit」、「The statements are too large to keep for the commit: at most 128 MiB of text. Commit fewer changes at once」等，在 `detail[0].msg` |
+| 422 `validation_failed`（`detail[]`） | 請求的形狀（沒有變更、超過 10,000 個、重複的 id、缺 `original`、孤立 surrogate…）、64 MiB | `error.message` 是通用的「Invalid request」；原因在 `detail[]`（`loc` 指出位置，不回顯 `input`）。64 MiB 是 `detail[0]` 的 `type` `commit_too_large`、`msg`「The changes are too large: at most 64 MiB of values per commit」，沒有「Value error, 」前綴（最終審查 M5） |
+| 422 `validation_failed`（`error.message`） | 單一 plan 超過 128 MiB；不是 grid cell 的 key 或原始值 | 文字就在 `error.message`，沒有 `detail`：「The statements are too large to keep for the commit: at most 128 MiB of text. Commit fewer changes at once」、「Not a grid cell: …」（最終審查 M5） |
 
 ## 5. Log（loguru）
 
@@ -453,13 +464,14 @@ interface StagedEdits {
 - **打包**：沒有新的 Python 或前端相依，不需要 hidden import；sidecar 49,148 → 49,224 KB（+76 KB，只有新的純 Python 模組）；JS 主 chunk 1,365.09 → 1,366.34 kB（05a 沒有新的前端程式，`src/` 只多了產生的 API 型別與 `types.ts` 的型別 export）；冷啟動 1.07–1.19 秒（7 次裡有 4 次，另 1.55 與 1.72 秒，第一次 2.72 秒；04c 是 1.03–1.11 秒），`footprint` 加總 163–172 MB（04c 176–184），backend 76–79 MB（04c 74–78）。
 - **預覽**：1,000 個 UPDATE 的產生與驗證，經 HTTP：PG 25–28 ms、MySQL 26–31 ms、SQL Server 78–96 ms、SQLite 24–26 ms（預算 < 300 ms）。
 - **A7 套用 1,000 個 UPDATE**（預算 PG／MySQL／SQLite ≤ 3 秒、SQL Server ≤ 10 秒）：PG 0.79–1.14 秒、MySQL 0.73–0.99 秒、SQL Server 7.22–9.56 秒、SQLite 0.41–0.43 秒。都在預算內；SQL Server 的餘裕只有 4–28%（每句三個往返、amd64 映像經 Rosetta；規劃時量的是 5.3–6.3 秒，同一台機器現在的非凍結 server 是 8.75 秒，所以差距來自機器的負載，不是打包）。合併批次（§12）仍是之後的項目。
+- **〔05a 最終修正〕A7 SQL Server，plan 的語句不做 describe**（M1，2026-10-20，in-process：EditService 預覽、tab 的 worker 套用，load average 6–8）：1,000 個 UPDATE 1.54–2.62 秒（6 次）；同一時間、同一種量法還做 describe 時 3.20–5.99 秒（3 次）。審查量的是 6.92 → 2.83 秒。沒有重量打包版。
 - **A6 結束暫停中的 100 萬列瀏覽結果後再套用**：PG 0.02 秒、MySQL 0.38–0.56 秒（KILL 與 drain；非凍結 0.27 秒）、SQL Server 0.22–0.24 秒（attention）、SQLite 0.00–0.02 秒。
 
 ## 8. 痛點對照
 
 | 需求 | 這個子專案怎麼解 | 踩到／退步 |
 |---|---|---|
-| Q1 輕快低記憶體 | overlay 不複製結果；只重畫被改的列；0 新相依 | commit 後重跑瀏覽（最多 10,000 列）；SQL Server 每句多兩個往返 |
+| Q1 輕快低記憶體 | overlay 不複製結果；只重畫被改的列；0 新相依 | commit 後重跑瀏覽（最多 10,000 列）；SQL Server 每句多兩個往返〔05a 最終修正：plan 的語句只多一個（狀態讀取），不做 describe，M1〕 |
 | Q2 穩定不丟工作 | 暫存進 workspace（當機、重開都在）；close guard；commit 失敗與不明時暫存都留著；不自動重送 | 超過 8 MiB 的暫存不跨重開（有提示）；undo 歷史不跨重開 |
 | Q3 可信任 | 送出的就是預覽的；樂觀並行檢查；exactly-1；結果四分類；commit 後顯示 server 真正存的值 | 浮點、datetime2(7)、text／xml 等不檢查（預覽逐句列出）；MySQL／SQL Server 依 collation 比較 〔05a〕另：非嚴格的 MySQL `sql_mode` 下，太長的字串被截斷、超出範圍的數字被夾住，server 只給警告，apply 照樣 commit（L16）。 |
 | Q4 聚焦 | 只做表格資料 tab；不做 query 結果、view、貼上、type-to-edit、只能新增的模式 | query 結果裡的值要先開表 |
@@ -484,7 +496,11 @@ interface StagedEdits {
 | 使用者在 grid 外（別的工具）同時改同一列的同一欄 | 這正是 R-05-5 要抓的；抓到就整批 rollback，Refresh 後 Keep mine |
 | 〔05a〕公司的 MySQL 沒有 `STRICT_TRANS_TABLES`（非嚴格 `sql_mode`） | 太長的字串被截斷、超出範圍的數字被夾住、非法的日期變 `0000-00-00`，server 只給警告（1265、1264…），apply 照樣 commit。「值不會被靜默改變」（Review Focus 1）只在嚴格模式成立。處理：文件化；apply 之後一定重讀（R-05-10），畫面顯示 server 真正存下的值；公司 MySQL 的檢查清單列 `SELECT @@sql_mode` 與一個超長值的實測 |
 | 〔05a〕MyISAM 等非交易的表在 trigger 或約束錯誤時已有部分生效 | 送出之後的失敗一律 unknown，Commit 停用到 Refresh（G10、G13，見 §3.5 的〔05a〕） |
-| 〔05a〕SQL Server 一千句 7–10 秒（預算 10 秒） | 進度與 Cancel；餘裕只有 4–28%，之後合併批次（§12） |
+| 〔05a〕SQL Server 一千句 7–10 秒（預算 10 秒） | 進度與 Cancel；餘裕只有 4–28%，之後合併批次（§12）。〔05a 最終修正〕plan 的語句不做 describe（M1）：in-process 1.5–2.6 秒 |
+| 〔05a 最終審查 I1〕SQLite 的 `ON CONFLICT REPLACE`／`IGNORE` 表：沒有 `OR` 子句的語句照表的設定刪掉別的列或跳過，回報 1 列 | 語句一律 `UPDATE OR ABORT`／`INSERT OR ABORT INTO`（§3.3.2 的〔05a〕），撞到唯一鍵就整批 rollback |
+| 〔05a 最終審查 M4〕SQLite：另一個 tab 的暫停結果（同一個檔案、超過一頁）持有 SHARED 鎖 | 每次 commit 都等 5 秒 busy timeout 再 rollback（A14，結果正確）；已知限制；05b 在對話框說明原因（「another tab's result of this file is still open: finish or close it」），也可以考慮 apply 前結束同一個檔案的其他暫停結果 |
+| 〔05a 最終審查 M8〕改寫或擴充語句的物件：PG 的 rule、SQL Server 的 `IGNORE_DUP_KEY`、交易的表上寫進 MyISAM 表的 trigger | 已知限制（CLAUDE.md）：rule 回報改寫後的列數（同 A3 的 INSTEAD OF）；`IGNORE_DUP_KEY` 讓重複的 INSERT 回 0 列，fail closed 但訊息說成 trigger；MyISAM 的寫入在 rollback 後留著，結果卻是「nothing was applied」。之後 PG 的 target 可以在 `relhasrules` 時警告 |
+| 〔05a 最終審查 M9〕backend 在 apply 途中死掉 | 前端當 unknown（R-06）；History 沒有紀錄（已知限制；要的話在 COMMIT 前先寫一筆 pending） |
 
 ## 10. 未實測的假設
 
@@ -496,7 +512,7 @@ interface StagedEdits {
 | A4 | PG 每種 text-first 型別的 `::text` 與載入的文字逐字相同（range、timetz、money、interval、composite 陣列、domain、citext、時區設定） | 05a 整合 | 〔實測〕（05a T9）成立，在 `Asia/Taipei` 的 session：numeric、timestamptz、timetz、interval、money、int4range、text[]、json、jsonb、xml、point、uuid、char(5)（bpchar 用 `equals`）、boolean、bytea、date 的 `::text` 原始值都與載入的逐字相同、commit 後存回；規劃時另在 UTC 與 Asia/Taipei 驗過 int4、int8、tstzrange、jsonb[]、inet、bit varying、real、domain、composite 與 composite 陣列。`test_originals_of_every_type_match_as_the_session_loaded_them`。 |
 | A5 | `begin`／`commit` 經各 adapter 的 `run()` 後狀態一致：psycopg 的 transaction status、SQL Server 的 `@@TRANCOUNT` 快取、MySQL 的 flag、SQLite 的 cancel gate | 05a T1 | 〔實測〕（05a T1）成立：四個 engine 的外框之後 `in_transaction()` 為真，COMMIT 或 `rollback()` 之後為假；PG 的錯誤後 `transaction_failed()` 為真；MySQL 1062、SQL Server 245、SQLite 的唯一鍵錯誤讓交易保持開著；SQLite 閒置的 `cancel()` 不會中斷下一句。 |
 | A6 | 結束大表（100 萬列）的暫停瀏覽結果再 apply 的等待時間，各 engine | 05a 量 | 〔實測〕（05a T11，凍結的 sidecar）PG 0.02 秒、MySQL 0.38–0.56 秒（非凍結 0.27 秒）、SQL Server 0.22–0.24 秒、SQLite 0.00–0.02 秒；見 §7 的〔05a 實測〕。 |
-| A7 | 本機 1,000 句 UPDATE 的時間（§7 的預算） | 05a 量 | 〔實測〕（05a T11，凍結的 sidecar）PG 0.79–1.14 秒、MySQL 0.73–0.99 秒、SQL Server 7.22–9.56 秒、SQLite 0.41–0.43 秒；預覽 24–96 ms；都在預算內，SQL Server 餘裕 4–28%，見 §7。 |
+| A7 | 本機 1,000 句 UPDATE 的時間（§7 的預算） | 05a 量 | 〔實測〕（05a T11，凍結的 sidecar）PG 0.79–1.14 秒、MySQL 0.73–0.99 秒、SQL Server 7.22–9.56 秒、SQLite 0.41–0.43 秒；預覽 24–96 ms；都在預算內，SQL Server 餘裕 4–28%，見 §7。〔05a 最終修正〕plan 的語句不做 describe 之後，SQL Server in-process 1.54–2.62 秒（M1，見 §7）。 |
 | A8 | SQL Server SQL collation 下 varchar key 用 `'…'`（不加 N）是 seek（〔實測〕`N'…'` 是 scan；plain 的 SHOWPLAN_TEXT 只有一個 Clustered Index Update 運算子，沒看到 Scan） | 05a T1 以 SHOWPLAN_XML 確認 | 〔實測〕（05a T1，SHOWPLAN_XML，`SQL_Latin1_General_CP1_CI_AS`）成立：`'k42'` 是 Clustered Index Seek，`N'k42'` 是 Clustered Index Scan。 |
 | A9 | `NO_BACKSLASH_ESCAPES` 下不加倍反斜線的 literal 存回原值 | 05a 整合（session 設 sql_mode 的 scratch 測試） | 〔實測〕（05a T10）成立：`C:\tmp\new\` 在預設模式（`SET label = 'C:\\tmp\\new\\'`）與 `NO_BACKSLASH_ESCAPES`（`'C:\tmp\new\'`）下都存回原值。`test_backslashes_are_stored_as_typed_in_both_sql_modes`。 |
 | A10 | 打包版 WKWebView 在預設的 Edit 選單下，grid 有焦點時 ⌘Z、⇧⌘Z、⌘⌫、⌥⌘N、F2 會到頁面 | 05b 打包版檢查（給使用者的清單） | 05b |
@@ -541,7 +557,7 @@ interface StagedEdits {
 - 多格貼上（TSV）、grid 上 ⌘V；打字即編輯（隱藏的 input 接住 IME）；Add row 的快捷鍵。
 - 沒有 key 的表的「只能新增」模式；讀完整值以編輯超過 64 KiB 的值；enum／bool／FK 的選單；record view 內編輯；檔案載入 binary。
 - 更強的並行檢查：SQL Server rowversion、PG `xmin`；MySQL／SQL Server 用 binary collation 比較（需依欄位字元集選 collation）。
-- SQL Server 合併批次以加快大量變更（每句仍要自己的列數）。〔05a〕1,000 句實測 7–10 秒（預算 10 秒），每句三個往返（狀態讀取、describe、語句）；先考慮對 plan 的語句略過 describe，再考慮合併。
+- SQL Server 合併批次以加快大量變更（每句仍要自己的列數）。〔05a〕1,000 句實測 7–10 秒（預算 10 秒），每句三個往返（狀態讀取、describe、語句）；先考慮對 plan 的語句略過 describe，再考慮合併。〔05a 最終修正〕describe 已略過（M1，in-process 1.5–2.6 秒）；合併批次會改變每句列數與錯誤位置的讀法，要另外設計，仍是之後的項目。
 - 〔05a〕key 互換與鏈要分兩次 commit（G7）；之後可以在預覽時排出安全的順序。
 - 〔05a〕公司的 MySQL 沒有 `STRICT_TRANS_TABLES` 時，可以在預覽或 apply 後讀 `SHOW WARNINGS`，把 1265／1264 變成對話框裡的提示。
 
