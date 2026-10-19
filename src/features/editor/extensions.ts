@@ -1,5 +1,5 @@
 import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
-import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
+import { defaultKeymap, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { json } from "@codemirror/lang-json";
 import { MSSQL, MySQL, PostgreSQL, sql, SQLDialect, SQLite, StandardSQL } from "@codemirror/lang-sql";
 import { bracketMatching, indentOnInput, indentUnit } from "@codemirror/language";
@@ -17,6 +17,7 @@ import {
 } from "@codemirror/view";
 import { vim } from "@replit/codemirror-vim";
 import type { Dialect, EditorSettings } from "@/lib/api/types";
+import { undoHistory } from "./startingPoint";
 import { editorTheme, fontSizeTheme } from "./theme";
 
 /** What an editor holds: SQL (a query tab's text) or JSON (a Couchbase document's). */
@@ -134,7 +135,7 @@ const STATIC: Extension = [
   lineNumbers(),
   highlightActiveLineGutter(),
   highlightSpecialChars(),
-  history(),
+  undoHistory,
   drawSelection(),
   dropCursor(),
   EditorState.allowMultipleSelections.of(true),

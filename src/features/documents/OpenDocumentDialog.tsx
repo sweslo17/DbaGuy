@@ -11,7 +11,7 @@ import {
   closeOpenDocument,
   lastCollection,
   rememberCollection,
-  useOpenDocumentRequest,
+  useOpenDocumentAsk,
   type OpenDocumentRequest,
 } from "./openDocument";
 
@@ -133,6 +133,7 @@ function OpenDocumentForm({ request }: { request: OpenDocumentRequest }) {
  * Mounted once, in the app shell.
  */
 export function OpenDocumentDialogHost() {
-  const request = useOpenDocumentRequest();
-  return request && <OpenDocumentForm request={request} />;
+  const ask = useOpenDocumentAsk();
+  // Keyed by the ask: the form's fields start from their request, so another ask while it is open needs a new form.
+  return ask && <OpenDocumentForm key={ask.serial} request={ask.request} />;
 }

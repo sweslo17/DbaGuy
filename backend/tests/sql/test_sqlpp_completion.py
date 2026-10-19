@@ -382,6 +382,21 @@ APP_USERS = Keyspace(bucket="dbaguy", scope="app", collection="users")
     ("SELECT (SELECT RAW 1) AS one FROM users", CTX, APP_USERS),  # a subquery with no FROM names nothing
     ("SELECT 1", CTX, None),
     ("", CTX, None),
+    # `default:` names the buckets: a full path after it is the keyspace, whatever the context says
+    ("SELECT * FROM default:dbaguy.app.users", CTX, APP_USERS),
+    ("SELECT * FROM default:dbaguy.app.users AS d", TRAVEL, APP_USERS),
+    ("SELECT * FROM default:`dbaguy`.`app`.`users` d", None, APP_USERS),
+    # a shorter path after `default:` is not a relative name (`default:users` is a bucket, not the context's collection)
+    ("SELECT * FROM default:users", CTX, None),
+    ("SELECT * FROM default:app.users", BUCKET_ONLY, None),
+    # no other namespace names a collection: `system:keyspaces` is not the context's collection `system`
+    ("SELECT * FROM system:keyspaces", CTX, None),
+    ("SELECT * FROM system:keyspaces AS k WHERE k.id = 'x'", CTX, None),
+    ("SELECT * FROM system:indexes", BUCKET_ONLY, None),
+    ("SELECT * FROM `system`:`keyspaces`", CTX, None),
+    ("SELECT * FROM system : keyspaces", CTX, None),
+    ("SELECT * FROM other:dbaguy.app.users", CTX, None),
+    ("SELECT * FROM system:", CTX, None),  # a namespace still being typed
 ])
 def test_a_statement_that_reads_one_keyspace_names_it(text, context, expected):
     assert statement_keyspace(text, context) == expected
@@ -395,6 +410,8 @@ def test_a_statement_that_reads_one_keyspace_names_it(text, context, expected):
     "SELECT * FROM users WHERE id IN (SELECT RAW uid FROM orders)",
     "SELECT * FROM users WHERE id IN (SELECT RAW uid FROM users)",
     "WITH recent AS (SELECT * FROM orders) SELECT * FROM users",
+    "SELECT * FROM users u JOIN system:keyspaces k ON k.id = u.id",  # a catalog is a term too: never a guess
+    "SELECT * FROM system:keyspaces k, users u",
 ])
 def test_a_statement_that_reads_several_keyspaces_names_none(text):
     assert statement_keyspace(text, CTX) is None
@@ -403,3 +420,39 @@ def test_a_statement_that_reads_several_keyspaces_names_none(text):
 def test_a_name_the_server_would_refuse_names_none():
     assert statement_keyspace(f"SELECT * FROM `{'b' * 101}`.app.users", None) is None
     assert statement_keyspace("SELECT * FROM `` ", CTX) is None
+
+
+# --- a catalog is not a collection of the context (a collection that happens to share its name has fields sampled) ----
+
+SYSTEM_NAMED = Keyspace(bucket="dbaguy", scope="app", collection="system")  # what `system:keyspaces` once resolved to
+SYSTEM_NAMED_FIELDS = {SYSTEM_NAMED: [path("sampled_in_a_collection_named_system")]}
+
+
+def run_with(fields, text, context=CTX):
+    cursor = text.index("|")
+    return complete_sqlpp(text.replace("|", ""), cursor, INDEX, context, fields.get, [])
+
+
+@pytest.mark.parametrize("text", [
+    "SELECT | FROM system:keyspaces",  # the only FROM term: its fields are offered only when it is a sampled collection
+    "SELECT | FROM system:keyspaces AS k",
+    "SELECT * FROM system:keyspaces AS k WHERE k.|",
+    "SELECT * FROM system:keyspaces AS k WHERE |",
+    "SELECT keyspaces.| FROM system:keyspaces",  # referred to by its own name
+    "SELECT * FROM system:keyspaces k WHERE k.|",
+])
+def test_a_system_catalog_offers_no_sampled_fields_of_a_collection_of_the_same_name(text):
+    found = run_with(SYSTEM_NAMED_FIELDS, text)
+    assert "sampled_in_a_collection_named_system" not in {i.label for i in found.items}
+
+
+def test_a_collection_named_system_still_offers_its_fields_when_it_is_named_plainly():
+    """The fix reads the namespace, not the word `system`: the collection itself still completes."""
+    for text in ("SELECT | FROM system", "SELECT s.| FROM system AS s", "SELECT s.| FROM default:dbaguy.app.system s"):
+        assert "sampled_in_a_collection_named_system" in items(run_with(SYSTEM_NAMED_FIELDS, text)), text
+
+
+def test_a_default_namespace_with_a_full_path_completes_like_the_plain_path():
+    assert "name" in items(run("SELECT u.| FROM default:dbaguy.app.users AS u", context=TRAVEL))
+    assert "name" in items(run("SELECT | FROM default:dbaguy.app.users", context=TRAVEL))
+    assert "name" not in items(run("SELECT | FROM default:users"))  # a bucket `users`, not the context's collection

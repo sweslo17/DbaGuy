@@ -25,12 +25,8 @@ export const NEW_DOCUMENT_TEXT = "{}";
 /** The dirty check runs this long after typing stops (a keystroke itself only marks the tab dirty). */
 export const DIRTY_CHECK_MS = 200;
 
-export interface DocumentMeta {
-  cas: string;
-  expiration: number;
-  type: "json" | "base64";
-  size: number;
-}
+/** What a document's tab shows of it besides its text: the server's own fields, so it follows the API's type. */
+export type DocumentMeta = Pick<DocumentView, "cas" | "expiration" | "type" | "size">;
 
 export type DocumentLoad =
   | { status: "new" } // not in the database yet: nothing to load

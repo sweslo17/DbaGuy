@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "@/lib/api/client";
 import type { ColumnMeta } from "@/lib/api/types";
 import { statementKeyspace } from "./documentApi";
-import { idPrefill, prefillKeyspace } from "./openDocument";
+import { askOpenDocument, closeOpenDocument, idPrefill, openDocumentAsk, prefillKeyspace } from "./openDocument";
 
 vi.mock("./documentApi", () => ({ statementKeyspace: vi.fn() }));
 const lookup = vi.mocked(statementKeyspace);
@@ -52,5 +52,30 @@ describe("the ID a grid cell suggests", () => {
     expect(idPrefill(columns("age"), [41], 0)).toBe("");
     expect(idPrefill(columns("doc"), [{ $type: "json", text: "{}" }], 0)).toBe("");
     expect(idPrefill(columns("a"), [null], 0)).toBe("");
+  });
+});
+
+describe("asking for the Open document dialog", () => {
+  afterEach(closeOpenDocument);
+
+  it("is a new ask each time, so a dialog already open starts over from the new request", () => {
+    const first = { profileId: "p", mode: "open", keyspace: { bucket: "a" }, id: "one" } as const;
+    const second = { profileId: "p", mode: "open", keyspace: { bucket: "b" }, id: "two" } as const;
+    expect(openDocumentAsk()).toBeNull();
+
+    askOpenDocument(first);
+    const firstAsk = openDocumentAsk();
+    expect(firstAsk?.request).toBe(first);
+
+    askOpenDocument(second); // while the first is still open
+    const secondAsk = openDocumentAsk();
+    expect(secondAsk?.request).toBe(second);
+    expect(secondAsk?.serial).not.toBe(firstAsk?.serial); // the dialog's key
+
+    askOpenDocument(second); // the same request again is an ask of its own too
+    expect(openDocumentAsk()?.serial).not.toBe(secondAsk?.serial);
+
+    closeOpenDocument();
+    expect(openDocumentAsk()).toBeNull();
   });
 });

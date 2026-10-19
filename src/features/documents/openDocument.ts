@@ -13,17 +13,28 @@ export interface OpenDocumentRequest {
   id?: string;
 }
 
-/** The one dialog (`OpenDocumentDialogHost`), as the tree's menu and a grid's cell menu ask for it. */
-const useOpenDocument = create<{ request: OpenDocumentRequest | null }>(() => ({ request: null }));
-
-export function askOpenDocument(request: OpenDocumentRequest): void {
-  useOpenDocument.setState({ request });
+/** A request being asked, and which ask it is: a number that is new for each, so a second ask starts the form over. */
+export interface OpenDocumentAsk {
+  request: OpenDocumentRequest;
+  serial: number;
 }
 
-export const useOpenDocumentRequest = (): OpenDocumentRequest | null => useOpenDocument((s) => s.request);
+let asks = 0;
+/** The one dialog (`OpenDocumentDialogHost`), as the tree's menu and a grid's cell menu ask for it. */
+const useOpenDocument = create<{ ask: OpenDocumentAsk | null }>(() => ({ ask: null }));
+
+/** Opens the dialog with `request`; asked again while it is open, it starts over from the new request. */
+export function askOpenDocument(request: OpenDocumentRequest): void {
+  useOpenDocument.setState({ ask: { request, serial: ++asks } });
+}
+
+/** The ask the dialog shows now, or null. */
+export const openDocumentAsk = (): OpenDocumentAsk | null => useOpenDocument.getState().ask;
+
+export const useOpenDocumentAsk = (): OpenDocumentAsk | null => useOpenDocument((s) => s.ask);
 
 export function closeOpenDocument(): void {
-  useOpenDocument.setState({ request: null });
+  useOpenDocument.setState({ ask: null });
 }
 
 /** The collection last opened in a scope, by connection, bucket and scope (this run of the app only). */

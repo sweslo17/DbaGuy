@@ -32,6 +32,7 @@ from .scope import IDENT, unquote, word
 SQLPP = Dialect.SQLPP
 FieldLookup = Callable[[Keyspace], Sequence[FieldPath] | None]  # a keyspace's sampled field paths; None: not sampled
 
+DEFAULT_NAMESPACE = "default"  # the namespace of the buckets; `system` holds the catalogs (`system:keyspaces`)
 SEEN_BOOST = 0  # a field seen in results follows the sampled ones (the same kind); every keyword comes after both
 _KEYSPACE_KEYWORDS = frozenset({"FROM", "JOIN", "NEST", "UPDATE", "INTO", "USING"})
 _NOT_AN_ALIAS = frozenset(
@@ -52,9 +53,10 @@ _OPENING, _CLOSING = "([{", ")]}"
 class _Reference:
     """One `path [AS] alias` of a FROM list, or `(subquery) alias`."""
 
-    parts: tuple[str, ...]  # the dotted path as written, unquoted; () for a subquery
+    parts: tuple[str, ...]  # the dotted path as written, unquoted (after any `namespace:`); () for a subquery
     alias: str | None
     group: int  # offset of the innermost "(" around the reference, -1 at the top level (as `ScopeRelation.group`)
+    namespace: str | None = None  # the `ns` of `ns:path`, as written, unquoted
 
     @property
     def name(self) -> str | None:
@@ -65,7 +67,20 @@ class _Reference:
     def detail(self) -> str:
         if not self.parts:
             return "subquery"
-        return ".".join(self.parts) if self.alias is not None else "keyspace"
+        if self.alias is None:
+            return "keyspace"
+        path = ".".join(self.parts)
+        return path if self.namespace is None else f"{self.namespace}:{path}"
+
+    @property
+    def names_collection(self) -> bool:
+        """Whether the path is a collection of a bucket, to be resolved under the context. A name with a namespace
+        (`system:keyspaces`, `system:indexes`) is a path of its own: never a collection of the context's scope. Only
+        `default:` names the buckets, and only with a full `bucket.scope.collection`: a shorter path after it is not
+        resolved as a relative name would be (`default:app` is a bucket, not a collection of the context's scope)."""
+        return bool(self.parts) and (
+            self.namespace is None or (self.namespace == DEFAULT_NAMESPACE and len(self.parts) == 3)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,13 +171,19 @@ def _read_reference(tokens: list[Token], i: int, group: int, parens: _Parens) ->
     if tokens[i].kind not in IDENT or word(tokens, i) in _NOT_AN_ALIAS:
         return None
     parts = [unquote(tokens[i])]
+    namespace = None
     i += 1
+    if i < len(tokens) and tokens[i].kind == TokenKind.OTHER and tokens[i].text == ":":  # `namespace:path`
+        if i + 1 >= len(tokens) or tokens[i + 1].kind not in IDENT:
+            return None  # a namespace still being typed, as a path ending in a dot is
+        namespace, parts = parts[0], [unquote(tokens[i + 1])]
+        i += 2
     while i + 1 < len(tokens) and tokens[i].kind == TokenKind.DOT and tokens[i + 1].kind in IDENT:
         parts.append(unquote(tokens[i + 1]))
         i += 2
     if i < len(tokens) and tokens[i].kind == TokenKind.DOT:
         return None
-    return _Reference(tuple(parts), _read_alias(tokens, i), group)
+    return _Reference(tuple(parts), _read_alias(tokens, i), group, namespace)
 
 
 def _references(tokens: list[Token]) -> list[_Reference]:
@@ -187,8 +208,9 @@ def _keyspace_of(reference: _Reference | None, context: QueryContext | None) -> 
     """The keyspace a reference names under the tab's context, as the server reads it with that `query_context`: a path
     of three parts as written; one part a collection of the context's scope (`_default` of its bucket without one); two
     parts `scope.collection` of the context's bucket under a bucket-only context (ruling B47), and none otherwise
-    (under a scope the server calls it ambiguous, and without a context there is no bucket)."""
-    match reference.parts if reference is not None else ():
+    (under a scope the server calls it ambiguous, and without a context there is no bucket). A name with a namespace
+    is no relative name (see `_Reference.names_collection`): `system:keyspaces` names no collection."""
+    match reference.parts if reference is not None and reference.names_collection else ():
         case (bucket, scope, collection):
             names = bucket, scope, collection
         case (scope, collection) if context is not None and context.scope is None:
