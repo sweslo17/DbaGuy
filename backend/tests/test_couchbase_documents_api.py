@@ -248,8 +248,8 @@ def test_a_text_beyond_the_limit_says_so_before_any_connection_is_used(app, cb, 
     beyond = send(DOCUMENT_TEXT_LIMIT + 1)
     assert error_of(beyond) == (422, "validation_failed")
     assert beyond.json()["error"]["message"] == "Documents are limited to 20 MiB"
-    # Far beyond (more than 1 MiB over), the request itself is refused: a bound on what is taken in at all.
-    assert send(DOCUMENT_TEXT_LIMIT + 1024 * 1024 + 1).json()["error"]["message"] == "Invalid request"
+    # Far beyond (more than 4× the limit), the request itself is invalid.
+    assert send(4 * DOCUMENT_TEXT_LIMIT + 1).json()["error"]["message"] == "Invalid request"
     assert not no_connection
 
 
