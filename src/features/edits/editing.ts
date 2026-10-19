@@ -38,13 +38,23 @@ export interface EditCellInput {
 const isBytes = (cell: unknown) => !!cell && typeof cell === "object" && (cell as { $type?: string }).$type === "bytes";
 const sizeOf = (cell: unknown) => ((cell as { size?: number }).size ?? 0).toLocaleString();
 
+/** Why a row marked for deletion is not edited. */
+export const MARKED_DELETED = "This row is marked for deletion: restore it first (⌘⌫)";
+/** Why a row whose key was not loaded whole is not edited (nothing could identify it). */
+export const KEY_INCOMPLETE = "This row cannot be edited: its key was not loaded completely";
+
+/** Why a cell of `name` cannot be written: the table has no such column (any more), or it is read-only. */
+export function notWritable(name: string, column: EditColumn | undefined): string {
+  if (!column) return `${name} is not a column of the table any more: Refresh`;
+  return `${name} is read-only: ${column.read_only_reason ?? "it cannot be written"}`;
+}
+
 /** How the cell's edit starts, or why it cannot (said in a toast). */
 export function editStart(input: EditCellInput): EditStart | { refuse: string } {
   const { column, name, row, staged, original } = input;
-  if (!column) return { refuse: `${name} is not a column of the table any more: Refresh` };
-  if (!column.writable) return { refuse: `${name} is read-only: ${column.read_only_reason ?? "it cannot be written"}` };
-  if (row === "deleted") return { refuse: "This row is marked for deletion: restore it first (⌘⌫)" };
-  if (row === "key_incomplete") return { refuse: "This row cannot be edited: its key was not loaded completely" };
+  if (!column || !column.writable) return { refuse: notWritable(name, column) };
+  if (row === "deleted") return { refuse: MARKED_DELETED };
+  if (row === "key_incomplete") return { refuse: KEY_INCOMPLETE };
   let initialText = "";
   let placeholder: string | null = null;
   if (staged) {

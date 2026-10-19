@@ -1,6 +1,7 @@
 import { ChevronDown, ChevronRight, Loader2, RefreshCw, SquareTerminal } from "lucide-react";
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import type { MenuItem } from "@/components/ui/ContextMenu";
 import { Tabs } from "@/components/ui/Tabs";
 import { toast } from "@/components/ui/Toast";
@@ -9,9 +10,12 @@ import type { ColumnMeta, Dialect } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { plural } from "@/lib/format";
 import { useWorkspace, type TableTabState } from "@/stores/workspace";
-import { useDialect, useProfiles } from "../connections/hooks";
+import { useEngineInfo, useProfiles } from "../connections/hooks";
 import { RecoverableError } from "../connections/RecoverableError";
+import { EditBar } from "../edits/EditBar";
 import { resultColumns } from "../edits/overlay";
+import { asksBeforeDiscard, discardQuestion } from "../edits/tableEditing";
+import { useTableEdits } from "../edits/useTableEdits";
 import { ColumnsView, DdlView } from "../explorer/ObjectDetailView";
 import { kindLabel } from "../explorer/kinds";
 import { DataGrid, type DataGridHandle } from "../grid/DataGrid";
@@ -36,6 +40,28 @@ const VIEWS: { value: View; label: string }[] = [
   { value: "columns", label: "Columns" },
   { value: "ddl", label: "DDL" },
 ];
+
+/**
+ * How long a Cancel that takes Refresh's place ignores clicks (05b K12): the second click of a double click on Refresh
+ * lands on it, and must not cancel the re-run the first one started.
+ */
+const CANCEL_ARMS_AFTER_MS = 400;
+
+/** Cancel, in Refresh's place while a browse's first page loads; a click in its first moments is not one on it. */
+function FirstPageCancel({ disabled, onCancel }: { disabled: boolean; onCancel: () => void }) {
+  const [shownAt] = useState(() => performance.now());
+  return (
+    <Button
+      size="sm"
+      onClick={() => {
+        if (performance.now() - shownAt >= CANCEL_ARMS_AFTER_MS) onCancel();
+      }}
+      disabled={disabled}
+    >
+      Cancel
+    </Button>
+  );
+}
 
 /** Count rows, then "N rows" (or the error) beside it; a spinner and Cancel while it runs. */
 function CountControl({
@@ -155,7 +181,8 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   const table = useTableData(tab, active);
   const { state, execution, snapshot, relation } = table;
   const { applyFilter, toggleSort, sortBy } = table;
-  const dialect = useDialect(tab.profileId);
+  const engine = useEngineInfo(tab.profileId);
+  const dialect = engine?.dialect ?? null;
   const openQuery = useWorkspace((s) => s.openQuery);
   const profiles = useProfiles();
   const profileName = profiles.data?.find((entry) => entry.profile.id === tab.profileId)?.profile.name;
@@ -180,6 +207,23 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   // An export runs on this session: filter, sort and refresh would only wait behind it.
   const exporting = isExporting(snapshot);
   const gridRef = useRef<DataGridHandle>(null);
+  const edits = useTableEdits({
+    tab,
+    columns,
+    rows,
+    rowEditing: engine?.row_editing === true,
+    sessionOpen: phase === "open",
+    stale: shown.stale,
+    locked: null,
+    gridRef,
+  });
+  const [askingDiscard, setAskingDiscard] = useState(false);
+  /** Discard…: more than one change asks first (⌘Z brings them back either way). */
+  const requestDiscard = () => (asksBeforeDiscard(edits.changes) ? setAskingDiscard(true) : edits.discardAll());
+  const refresh = () => {
+    table.refresh();
+    edits.refetchTarget(); // DDL since: the next edit uses the table as it is now (spec §3.2.1)
+  };
   const tableKey = table.target?.key;
   const keyIndexes = useMemo(
     () => (columns && tableKey ? resultColumns(columns, tableKey).keyIndexes : null),
@@ -191,7 +235,7 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
     columns,
     rows,
     keyIndexes,
-    0, // Task 9: the overlay's `leading` (new rows staged on top)
+    edits.display.leading, // the new rows staged on top: the selection was made over them
   );
 
   const gridSort = useMemo<GridSort[]>(
@@ -213,16 +257,19 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
     (col: number, descending: boolean) => columns && sortBy(columns[col].name, descending),
     [columns, sortBy],
   );
+  const { resultRowAt } = edits;
+  const { leading } = edits.display;
   const extraCellMenu = useCallback(
     (row: number, col: number): MenuItem[] => {
+      if (row < leading) return []; // a new row has no value on the server to filter by (§3.6.6)
       const column = columns?.[col];
-      if (!column || !rows || row >= rows.length || !dialect || exporting) {
-        return [{ label: FILTER_BY_VALUE, disabled: true }];
-      }
-      const value = rows[row][col];
+      // The loaded row under the display row: a changed cell filters by the server's value, not the staged one.
+      const source = resultRowAt(row);
+      if (!column || !source || !dialect || exporting) return [{ label: FILTER_BY_VALUE, disabled: true }];
+      const value = source[col];
       return [{ label: FILTER_BY_VALUE, onSelect: () => void filterByValue(dialect, column, value) }];
     },
-    [columns, rows, dialect, exporting, filterByValue],
+    [columns, resultRowAt, leading, dialect, exporting, filterByValue],
   );
   // Export writes the current browse SELECT (filter, sort and refresh wait while it runs).
   const exportSource = useMemo(
@@ -257,13 +304,11 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
           disabled={exporting}
         />
         {firstPagePending ? (
-          <Button size="sm" onClick={table.cancel} disabled={phase !== "open"}>
-            Cancel
-          </Button>
+          <FirstPageCancel onCancel={table.cancel} disabled={phase !== "open"} />
         ) : (
           <Button
             size="sm"
-            onClick={table.refresh}
+            onClick={refresh}
             disabled={phase !== "open" || exporting}
             title={exporting ? "An export is running on this session" : "Run the query again"}
           >
@@ -276,8 +321,28 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
           onCount={table.countRows}
           onCancel={table.cancelCount}
         />
+        <div className="flex max-w-[60%] min-w-0 shrink justify-end">
+          <EditBar
+            editable={edits.tableEditable}
+            paused={edits.paused}
+            checking={edits.checking}
+            readOnlyReason={edits.readOnlyReason}
+            targetError={edits.targetError}
+            onRetryTarget={edits.refetchTarget}
+            changes={edits.changes}
+            notShown={edits.display.notShown}
+            notKept={edits.notKept}
+            keyChanged={edits.keyChanged}
+            unknownOutcome={edits.staged?.unknownOutcome === "pending"}
+            onAddRow={edits.addRow}
+            onDiscard={requestDiscard}
+            commitDisabled={null}
+          />
+        </div>
       </div>
       <RecoverableError profileId={tab.profileId} error={snapshot?.error ?? null} onRetry={table.retry} />
+      {/* The edit target still wants a password after the session opened (L13): an unlock, then it is read again. */}
+      <RecoverableError profileId={tab.profileId} error={edits.targetUnlock} onRetry={edits.refetchTarget} />
       {state.error && (
         <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-1.5 text-[12px] text-danger">
           <span className="min-w-0 flex-1 whitespace-pre-wrap" data-selectable>
@@ -297,7 +362,7 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
           <DataGrid
             ref={gridRef}
             columns={set.columns}
-            rows={set.rows}
+            rows={edits.display.rows}
             hasMore={set.hasMore && !kept}
             partial={set.partial || view.partial || (kept && set.hasMore)}
             loadingMore={execution?.status === "running"}
@@ -311,12 +376,25 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
             onSortBy={exporting ? undefined : onSortBy}
             extraCellMenu={extraCellMenu}
             onExport={exportSource ? openExport : undefined}
+            edits={edits.grid}
+            onSelectionChange={edits.onSelectionChange}
           />
         ) : (
           placeholder && <p className="p-4 text-[12px] text-muted">{placeholder}</p>
         )}
       </div>
       {exportSource && <ExportDialog source={exportSource} open={exportOpen} onOpenChange={setExportOpen} />}
+      <ConfirmDialog
+        open={askingDiscard}
+        onOpenChange={setAskingDiscard}
+        title="Discard staged changes"
+        message={discardQuestion(edits.changes, relation?.name ?? tab.title)}
+        confirmLabel="Discard"
+        onConfirm={() => {
+          setAskingDiscard(false);
+          edits.discardAll();
+        }}
+      />
       {guards.dialog}
     </div>
   );

@@ -32,8 +32,11 @@ const ADDING: ReadonlySet<StageAction["type"]> = new Set([
   "keepMine",
 ]);
 
-/** Whether `action` would stage something new on `staged` (Delete over rows all marked already restores them). */
-function adds(staged: StagedEdits, action: StageAction): boolean {
+/**
+ * Whether `action` would stage something new on `staged` (Delete over rows all marked already restores them): what the
+ * table-data tab also refuses while its rows are being read again (`useTableEdits`).
+ */
+export function adds(staged: StagedEdits, action: StageAction): boolean {
   if (action.type === "deleteRows") return !restoresRows(staged, action.rows);
   return ADDING.has(action.type);
 }
