@@ -4,7 +4,9 @@ import { CopyButton } from "@/components/ui/CopyButton";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import { pathKey, type ColumnInfo, type ObjectDetail } from "@/lib/api/types";
 import type { ObjectTabState } from "@/stores/workspace";
+import { keyspaceOfPath } from "./fieldSamples";
 import { kindLabel } from "./kinds";
+import { SampledFields } from "./SampledFields";
 
 /** The object a detail view shows: an object tab, or the table tab's Columns and DDL views. */
 type ObjectRef = Pick<ObjectTabState, "profileId" | "path">;
@@ -125,7 +127,16 @@ export function DdlView({ tab }: { tab: ObjectRef }) {
   );
 }
 
-/** Detail tab of an object without rows (function, sequence, index, …): its comment, columns and DDL on one page. */
+/** The sampled fields of a Couchbase collection's detail page; nothing for any other object. */
+function CollectionFields({ tab, kind }: { tab: ObjectRef; kind: string }) {
+  const keyspace = kind === "collection" ? keyspaceOfPath(tab.path) : null;
+  return keyspace && <SampledFields profileId={tab.profileId} keyspace={keyspace} />;
+}
+
+/**
+ * Detail tab of an object without rows (function, sequence, index, …): its comment, columns and DDL on one page. A
+ * Couchbase collection adds its sampled fields under the DDL.
+ */
 export function ObjectDetailView({ tab }: { tab: ObjectRef }) {
   return (
     <WithDetail tab={tab}>
@@ -143,6 +154,7 @@ export function ObjectDetailView({ tab }: { tab: ObjectRef }) {
           {d.comment && <Comment text={d.comment} />}
           {d.columns && <ColumnsTable columns={d.columns} />}
           {d.ddl && <DdlText ddl={d.ddl} />}
+          <CollectionFields tab={tab} kind={d.kind} />
         </div>
       )}
     </WithDetail>

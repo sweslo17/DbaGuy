@@ -12,10 +12,10 @@ import { canChooseFiles, chooseFolder } from "@/lib/native";
 import { isSettingsKey } from "@/lib/shortcuts";
 import { useAppSettings } from "@/stores/settings";
 import { scriptsFolderChanged } from "../scripts/useScripts";
+import { NumberFieldRow } from "./NumberFieldRow";
 import {
   hasNumberProblem,
   NUMBER_FIELDS,
-  numberProblem,
   numberTexts,
   saveErrorText,
   scriptsDirValue,
@@ -42,30 +42,9 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
-/** A whole-number box with its unit; the range problem replaces the hint while there is one. */
+/** The whole-number box of one numeric setting. */
 function NumberRow({ id, texts, onChange }: { id: NumberId; texts: NumberTexts; onChange: (text: string) => void }) {
-  const field = NUMBER_FIELDS[id];
-  const problem = numberProblem(field, texts[id]);
-  return (
-    <FieldRow label={field.label} hint={"hint" in field ? field.hint : undefined} error={problem}>
-      <div className="flex items-center gap-2">
-        <div className="w-24 shrink-0">
-          <Input
-            type="number"
-            inputMode="numeric"
-            min={field.min}
-            max={"max" in field ? field.max : undefined}
-            step={1}
-            aria-invalid={problem !== null}
-            aria-label={field.label}
-            value={texts[id]}
-            onChange={(e) => onChange(e.target.value)}
-          />
-        </div>
-        {field.unit && <span className="text-[12px] text-muted">{field.unit}</span>}
-      </div>
-    </FieldRow>
-  );
+  return <NumberFieldRow field={NUMBER_FIELDS[id]} text={texts[id]} onChange={onChange} />;
 }
 
 /**
@@ -213,6 +192,10 @@ function SettingsForm({ initial }: { initial: AppSettings }) {
 
       <Section title="Notifications">
         <NumberRow id="long_query_seconds" texts={texts} onChange={setText("long_query_seconds")} />
+      </Section>
+
+      <Section title="Couchbase">
+        <NumberRow id="sample_size" texts={texts} onChange={setText("sample_size")} />
       </Section>
 
       {error && (

@@ -8,7 +8,7 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ContextMenu } from "@/components/ui/ContextMenu";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
-import type { Profile, ProfileEntry } from "@/lib/api/types";
+import type { ObjectNode, Profile, ProfileEntry } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { ENGINE_LABELS } from "@/lib/engines";
 import { useWorkspace } from "@/stores/workspace";
@@ -20,7 +20,9 @@ import { applyTreeContext } from "../query/queryContext";
 import { requestCloseTab, requestDisconnectTab } from "../workspace/closeGuards";
 import { openBrowseTab } from "./browse";
 import { forgetExplorer } from "./explorerCache";
+import { keyspaceOfPath } from "./fieldSamples";
 import { folderLabel, kindIcon } from "./kinds";
+import { SampleFieldsDialog } from "./SampleFieldsDialog";
 import { nodeKeyPrefix, profileKey, useTreeRows, type Expansion, type TreeRow } from "./useTreeRows";
 
 const ROW_HEIGHT = 22;
@@ -76,6 +78,7 @@ export function Explorer() {
   const [selected, setSelected] = useState<string | null>(null);
   const [dialog, setDialog] = useState<{ open: boolean; entry?: ProfileEntry }>({ open: false });
   const [toDelete, setToDelete] = useState<ProfileEntry | null>(null);
+  const [sampling, setSampling] = useState<{ profileId: string; node: ObjectNode } | null>(null);
   const [releasing, setReleasing] = useState(false);
   const [unlock, setUnlock] = useState<{ profile: Profile; needs: SecretsNeeded } | null>(null);
   const promptedErrors = useRef(new Set<string>());
@@ -333,6 +336,12 @@ export function Explorer() {
             items={[
               { label: "Browse documents", onSelect: () => void openBrowseTab(row.profileId, row.node.path) },
               { label: "Details", onSelect: () => openObject(row.profileId, row.node) },
+              {
+                label: "Sample fields…",
+                title: "Read some of its documents and list their fields (completion offers them)",
+                disabled: keyspaceOfPath(row.node.path) === null,
+                onSelect: () => setSampling({ profileId: row.profileId, node: row.node }),
+              },
             ]}
           >
             {content}
@@ -403,6 +412,14 @@ export function Explorer() {
         </div>
       </div>
       <ConnectionDialog open={dialog.open} entry={dialog.entry} onOpenChange={(open) => setDialog((d) => ({ ...d, open }))} />
+      {sampling && (
+        <SampleFieldsDialog
+          open
+          profileId={sampling.profileId}
+          node={sampling.node}
+          onOpenChange={(open) => !open && setSampling(null)}
+        />
+      )}
       {toDelete && (
         <ConfirmDialog
           open
