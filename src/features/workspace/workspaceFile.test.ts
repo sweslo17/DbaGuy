@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { SavedTab, SavedWorkspace } from "@/lib/api/types";
 import type { EditorBuffer } from "@/stores/editorBuffers";
-import type { DocumentTabState, Tab } from "@/stores/workspace";
-import { fromSavedWorkspace, toSavedWorkspace } from "./workspaceFile";
+import type { DocumentTabState, QueryTabState, Tab } from "@/stores/workspace";
+import { fromSavedWorkspace, toSavedWorkspace, workspaceJson } from "./workspaceFile";
 
 /*
  * What `workspace.json` keeps of a Couchbase document tab (rulings C15, C33): unsaved text and the CAS it is based on,
@@ -222,5 +222,66 @@ describe("a table tab's staged edits", () => {
     const restored = fromSavedWorkspace(workspace({ kind: "object", staged_edits: file }), () => true);
     expect(restored.snapshot.tabs).toHaveLength(1);
     expect(restored.staged.size).toBe(0);
+  });
+});
+
+/*
+ * Ruling K7: a lone surrogate (half an emoji, from a broken paste) cannot be written as UTF-8, and one in a tab's text
+ * would fail the backend's write of `workspace.json` for every tab (Q2, B40). The stored copy has U+FFFD in its place;
+ * the open editor keeps its exact text, and no other tab changes.
+ */
+
+describe("a lone surrogate in a tab's text", () => {
+  const queryTab = (id: string, overrides: Partial<QueryTabState> = {}): QueryTabState => ({
+    id,
+    kind: "query",
+    title: id,
+    profileId: PROFILE,
+    database: null,
+    scriptPath: null,
+    savedText: null,
+    textFromFile: false,
+    initialText: "",
+    autocommit: true,
+    ...overrides,
+  });
+  const EMOJI = "\u{1F600}";
+  const editors: Record<string, EditorBuffer> = {
+    broken: { text: `a\uD800b${EMOJI}\uD83D`, selection: { anchor: 0, head: 0 } },
+    fine: { text: `SELECT '${EMOJI}'`, selection: { anchor: 0, head: 0 } },
+  };
+
+  /** What the backend is sent, as it reads it. */
+  const stored = (tabs: Tab[]) => {
+    const file = toSavedWorkspace({ tabs, activeTabId: null, sidebarTab: null }, (id) => editors[id] ?? null);
+    const json = workspaceJson(file);
+    return { file, json, saved: JSON.parse(json) as SavedWorkspace };
+  };
+
+  it("is stored as U+FFFD, in the stored copy only, and the other tabs are untouched", () => {
+    const { file, json, saved } = stored([queryTab("broken"), queryTab("fine")]);
+    expect(saved.tabs.map((tab) => tab.buffer)).toEqual([`a\uFFFDb${EMOJI}\uFFFD`, `SELECT '${EMOJI}'`]);
+    expect(json).not.toMatch(/\\ud[89a-f]/i); // not even as an escape: the backend would decode it to the same surrogate
+    expect(editors.broken.text).toBe(`a\uD800b${EMOJI}\uD83D`); // the open editor keeps its exact text
+    expect(file.tabs[0].buffer).toBe(`a\uD800b${EMOJI}\uD83D`); // the state handed over is the editor's, as it is
+    expect(saved.tabs[1]).toEqual(JSON.parse(JSON.stringify(file.tabs[1]))); // nothing else changed
+  });
+
+  it("comes back with U+FFFD where the broken half was", () => {
+    const { saved } = stored([queryTab("broken")]);
+    const restored = fromSavedWorkspace(saved, () => true);
+    expect(restored.snapshot.tabs[0]).toMatchObject({ kind: "query", initialText: `a\uFFFDb${EMOJI}\uFFFD` });
+  });
+
+  it("is replaced in every kind of text: a script's, a document's and a parameter draft", () => {
+    const scripted = queryTab("script", { scriptPath: "a.sql", savedText: "SELECT 1" });
+    const withParams = queryTab("params", { params: { $a: "x\uDC00y" } });
+    const document = documentTab({ isNew: true, cas: null, initialText: '{"a": "\uD800"}' });
+    editors.script = { text: "SELECT '\uDC00'", selection: { anchor: 0, head: 0 } };
+    editors[document.id] = { text: '{"a": "\uD800"}', selection: { anchor: 0, head: 0 } };
+    const { saved } = stored([scripted, withParams, document]);
+    expect(saved.tabs[0].buffer).toBe("SELECT '\uFFFD'");
+    expect(saved.tabs[1].params).toEqual({ $a: "x\uFFFDy" });
+    expect(saved.tabs[2].buffer).toBe('{"a": "\uFFFD"}');
   });
 });

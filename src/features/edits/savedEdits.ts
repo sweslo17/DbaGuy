@@ -1,4 +1,5 @@
 import type { StagedEditsFile } from "@/lib/api/types";
+import { characterCount } from "@/lib/unicodeText";
 import type { CellInput } from "./cells";
 import {
   bySeq,
@@ -72,27 +73,9 @@ const NOT_KEPT: Readonly<Record<NotKept, SavedEdits>> = {
   other: { file: null, tooLarge: false, unsaveable: "other" },
 };
 
-/**
- * A string's length in characters as Python's `len` gives it (a surrogate pair is one, not two), or null when it is not
- * valid text: it holds a surrogate that is not half of a pair, which the backend cannot take or write.
- */
-function characters(text: string): number | null {
-  if (!/[\ud800-\udfff]/.test(text)) return text.length; // the usual case, scanned natively
-  let length = text.length;
-  for (let index = 0; index < text.length; index += 1) {
-    const unit = text.charCodeAt(index);
-    if (unit < 0xd800 || unit > 0xdfff) continue;
-    const next = text.charCodeAt(index + 1); // NaN past the end
-    if (unit > 0xdbff || !(next >= 0xdc00 && next <= 0xdfff)) return null;
-    length -= 1;
-    index += 1;
-  }
-  return length;
-}
-
 /** Whether `name` is one the backend takes for a column (`ColumnName`). */
 function isColumnName(name: string): boolean {
-  const length = characters(name);
+  const length = characterCount(name);
   return length !== null && length >= 1 && length <= MAX_NAME_CHARS;
 }
 
@@ -110,14 +93,14 @@ function jsonChars(cell: unknown): number | NotKept {
     const [item, level] = next;
     if (level > MAX_CELL_LEVELS) return "other";
     if (typeof item === "string") {
-      const length = characters(item);
+      const length = characterCount(item);
       if (length === null) return "value";
       total += length;
     } else if (Array.isArray(item)) {
       for (const element of item) pending.push([element, level + 1]); // not a spread: a long array has no argument limit
     } else if (item !== null && typeof item === "object") {
       for (const [name, value] of Object.entries(item)) {
-        const length = characters(name);
+        const length = characterCount(name);
         if (length === null) return "value";
         total += length;
         pending.push([value, level + 1]);
@@ -132,7 +115,7 @@ function valuesChars(values: Readonly<Record<string, CellInput>>): number | NotK
   let total = 0;
   for (const input of Object.values(values)) {
     if (input.kind !== "value") continue;
-    const length = characters(input.text);
+    const length = characterCount(input.text);
     if (length === null) return "value";
     if (length > MAX_SAVED_VALUE_CHARS) return "too_large";
     total += length;
@@ -160,7 +143,7 @@ function measure(keyColumns: readonly string[], { updates, inserts, deletes }: C
   if (!keyColumns.every(isColumnName)) return "name";
   const ids = new Set<string>();
   const hasId = (id: string) => {
-    const length = characters(id);
+    const length = characterCount(id);
     if (length === null || length < 1 || length > MAX_ID_CHARS || ids.has(id)) return false;
     ids.add(id);
     return true;

@@ -15,6 +15,7 @@ from ..domain.workspace import (
     WorkspaceState,
     WorkspaceTab,
 )
+from ..domain.well_formed import has_lone_surrogate, well_formed
 from ..storage.json_files import JsonDocument, error_fields
 
 # Each judged with the model's own definition of it, so what is kept is exactly what the model accepts
@@ -32,6 +33,36 @@ class _Repair(NamedTuple):
     context_reset: bool = False
     cas_reset: bool = False
     staged_reset: bool = False
+    texts_repaired: int = 0
+
+
+def _well_formed_value(value: Any, depth: int = 0) -> tuple[Any, int]:
+    """`value` with each lone surrogate in its strings replaced by U+FFFD, and how many strings held one. Lists and
+    objects are read three levels down (the deepest text of a tab is a path segment's name); object names are not."""
+    if isinstance(value, str):
+        return (well_formed(value), 1) if has_lone_surrogate(value) else (value, 0)
+    if depth < 3 and isinstance(value, list):
+        items = [_well_formed_value(item, depth + 1) for item in value]
+        count = sum(found for _, found in items)
+        return ([item for item, _ in items], count) if count else (value, 0)
+    if depth < 3 and isinstance(value, dict):
+        fields = {name: _well_formed_value(item, depth + 1) for name, item in value.items()}
+        count = sum(found for _, found in fields.values())
+        return ({name: item for name, (item, _) in fields.items()}, count) if count else (value, 0)
+    return value, 0
+
+
+def _well_formed_tab(tab: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    """The tab with each lone surrogate in its text replaced by U+FFFD (as the frontend does when it writes the
+    workspace), and how many strings held one. pydantic takes one in a plain `str` (an editor buffer, a title), but
+    `workspace.json` cannot be written with it: the whole save would fail, for every tab. The text is the user's own, so
+    it is kept, not dropped. `staged_edits` is left alone: changing a value there would change what a commit writes
+    (its model refuses a lone surrogate instead, and the repair then drops the staged edits)."""
+    fixed, count = {}, 0
+    for name, value in tab.items():
+        fixed[name], found = (value, 0) if name == "staged_edits" else _well_formed_value(value)
+        count += found
+    return (fixed, count) if count else (tab, 0)
 
 
 def _valid(adapter: TypeAdapter[Any], value: Any, extra: _Extra) -> bool:
@@ -47,9 +78,11 @@ def _repair_tab(tab: Any, extra: _Extra) -> _Repair:
     a draft with a name or a size the model refuses is removed (and the drafts beyond the limit), a context it refuses
     goes back to the profile's default, a CAS it refuses is forgotten (the document tab then reads as a new document),
     and staged edits it refuses (or on a tab that is not a table tab) are dropped, the tab kept (B40: one bad entry must
-    not cost every tab its saved state). Everything else, the buffer first, stays as it was."""
+    not cost every tab its saved state). A lone surrogate in any text is replaced (`_well_formed_tab`). Everything else,
+    the buffer first, stays as it was."""
     if not isinstance(tab, dict):
         return _Repair(tab)
+    tab, texts_repaired = _well_formed_tab(tab)
     repaired, removed, reset = tab, 0, False
     drafts = tab.get("params")
     if drafts is not None:
@@ -69,7 +102,7 @@ def _repair_tab(tab: Any, extra: _Extra) -> _Repair:
     staged_reset = staged is not None and (tab.get("kind") != "table" or not _valid(_STAGED, staged, extra))
     if staged_reset:
         repaired = {**repaired, "staged_edits": None}
-    return _Repair(repaired, removed, reset, cas_reset, staged_reset)
+    return _Repair(repaired, removed, reset, cas_reset, staged_reset, texts_repaired)
 
 
 def _repaired_tabs(raw: Any, where: str, extra: _Extra) -> Any:
@@ -84,7 +117,8 @@ def _repaired_tabs(raw: Any, where: str, extra: _Extra) -> Any:
         parts = (f"removed {result.drafts_removed} parameter draft(s)" if result.drafts_removed else "",
                  "reset the query context" if result.context_reset else "",
                  "reset the document CAS" if result.cas_reset else "",
-                 "dropped the staged edits" if result.staged_reset else "")
+                 "dropped the staged edits" if result.staged_reset else "",
+                 f"replaced a lone surrogate in {result.texts_repaired} text(s)" if result.texts_repaired else "")
         if any(parts):
             logger.warning("Repaired tab {} of the {}: {}", index, where, " and ".join(part for part in parts if part))
         repaired.append(result.tab)

@@ -1,7 +1,6 @@
 """Grid editing (spec ⑤ §3): how a table's rows are identified and written (EditTarget), the changes a tab stages
 (EditChanges), what a preview shows (EditPreview) and the one-time plan a session applies (EditPlan)."""
 
-import re
 from collections.abc import Iterator, Sequence
 from typing import Annotated, Literal, Self
 from uuid import UUID
@@ -11,6 +10,7 @@ from pydantic_core import PydanticCustomError
 
 from .column_category import ColumnCategory
 from .metadata import PathSegment
+from .well_formed import has_lone_surrogate
 
 EditKind = Literal["number", "text", "bool", "datetime", "binary", "json", "other"]
 Compare = Literal["equals", "as_text", "none"]
@@ -136,13 +136,10 @@ def _json_chars(cell: JsonValue) -> int:
     return sum(len(item) if isinstance(item, str) else 1 for item in _walk(cell))
 
 
-_SURROGATE = re.compile("[\ud800-\udfff]")
-
-
 def _is_text(cell: JsonValue) -> bool:
     """Whether every string of a key or original cell (an object's names too) can be written to a file: pydantic takes a
     lone surrogate inside a `JsonValue`, but it cannot be encoded, and the write of `workspace.json` would fail."""
-    return not any(isinstance(item, str) and _SURROGATE.search(item) for item in _walk(cell))
+    return not any(isinstance(item, str) and has_lone_surrogate(item) for item in _walk(cell))
 
 
 def _text_chars(updates: Sequence[RowUpdate], inserts: Sequence[RowInsert], deletes: Sequence[RowDelete]) -> int:

@@ -811,3 +811,39 @@ def test_the_repair_drops_what_the_model_refuses_and_keeps_the_rest(case):  # th
     query, table = WorkspaceState.model_validate(repaired_workspace(raw)).tabs
     assert query.buffer == "kept" and table.title == "orders"
     assert (table.staged_edits is not None) == case["accepted"]
+
+
+# ---- ruling K7: a lone surrogate in a tab's text must never fail the save of every tab ----
+# pydantic takes one in a plain `str` (a buffer, a title, a path segment's name) and the write of `workspace.json` then
+# fails. The frontend replaces it with U+FFFD before it sends (`workspaceJson`); this is the backstop for any client.
+
+def test_has_lone_surrogate_and_well_formed():
+    from dbaguy_backend.domain.well_formed import has_lone_surrogate, well_formed
+    assert not has_lone_surrogate("plain \U0001F600") and well_formed("plain \U0001F600") == "plain \U0001F600"
+    assert has_lone_surrogate("a\ud800b") and has_lone_surrogate("\udc00")
+    assert well_formed("a\ud800b\udc00\U0001F600") == "a\ufffdb\ufffd\U0001F600"
+
+
+def test_a_lone_surrogate_in_a_tab_text_is_replaced_not_dropped_and_the_save_works(tmp_path, logged_warnings):
+    broken = "\ud800"
+    raw = {"tabs": [
+        {"id": "q1", "kind": "query", "title": f"t{broken}", "buffer": f"a{broken}b\U0001F600", "database": "d",
+         "script_path": f"s{broken}.sql", "params": {"$a": f"x{broken}y"}},
+        {"id": "o1", "kind": "object", "title": "orders", "object_path": [{"kind": "table", "name": f"o{broken}"}]},
+        {"id": "q2", "kind": "query", "buffer": "kept \U0001F600"},
+        {"id": "t1", "kind": "table", "title": "orders", "object_path": STAGED_PATH,
+         "staged_edits": staged_edits(deletes=[{"id": "d:9", "key": {"id": broken}}])},
+    ]}
+    repaired = repaired_workspace(raw)
+    assert repaired["tabs"][2] is raw["tabs"][2]  # a tab without one is the very same object
+    q1, o1, q2, t1 = WorkspaceState.model_validate(repaired).tabs
+    assert (q1.title, q1.buffer, q1.script_path, q1.database) == ("t\ufffd", "a\ufffdb\U0001F600", "s\ufffd.sql", "d")
+    assert q1.params == {"$a": "x\ufffdy"} and o1.object_path[0].name == "o\ufffd" and q2.buffer == "kept \U0001F600"
+    assert t1.staged_edits is None  # not replaced: a value there would change what a commit writes (K5)
+    assert [line for line in logged_warnings if line.startswith("Repaired")] == [
+        "Repaired tab 0 of the workspace being saved: replaced a lone surrogate in 4 text(s)",
+        "Repaired tab 1 of the workspace being saved: replaced a lone surrogate in 1 text(s)",
+        "Repaired tab 3 of the workspace being saved: dropped the staged edits"]
+    service = WorkspaceService(tmp_path / "workspace.json")
+    service.put(WorkspaceState.model_validate(repaired))  # the write that failed for every tab
+    assert WorkspaceService(tmp_path / "workspace.json").get().tabs[0].buffer == "a\ufffdb\U0001F600"

@@ -2,6 +2,7 @@ import type { PathSegment, SavedTab, SavedWorkspace, StagedEditsFile, TextSelect
 import { plural } from "@/lib/format";
 import { PARAM_NAME } from "@/lib/paramNames";
 import { matchesFile } from "@/lib/scriptText";
+import { wellFormed } from "@/lib/unicodeText";
 import type { EditorBuffer } from "@/stores/editorBuffers";
 import {
   startSelection,
@@ -30,14 +31,10 @@ import { keyspaceOfPath } from "../explorer/fieldSamples";
 const WORKSPACE_VERSION = 1;
 
 /**
- * Lone UTF-16 surrogates (a broken paste, an odd object name): the backend cannot write them as UTF-8, which would
- * fail every save.
+ * The JSON `PUT /workspace` sends: every string well-formed (a title, a name or the text alike), each lone surrogate
+ * replaced by U+FFFD (a lone surrogate fails the backend's write of the file, for every tab). The stored copy only: the
+ * open editor keeps its exact text, and a restore shows the replacement where the broken half was.
  */
-const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
-
-const wellFormed = (text: string) => text.replace(LONE_SURROGATE, "\uFFFD");
-
-/** The JSON `PUT /workspace` sends: every string well-formed (a title, a name or the text alike). */
 export function workspaceJson(file: SavedWorkspace): string {
   return JSON.stringify(file, (_key, value: unknown) => (typeof value === "string" ? wellFormed(value) : value));
 }

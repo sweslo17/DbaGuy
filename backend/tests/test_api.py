@@ -449,6 +449,28 @@ def test_a_save_with_staged_edits_that_cannot_be_written_keeps_the_rest(client, 
     assert any("dropped the staged edits" in line for line in logged)
 
 
+def test_a_save_with_a_lone_surrogate_in_a_buffer_keeps_every_tab(client):  # ruling K7: it was a 500 for every tab
+    """A client that sends the text as it is (the frontend replaces it first, `workspaceJson`): pydantic takes a lone
+    surrogate in a plain `str`, but `workspace.json` cannot be written with one. It is replaced, not dropped."""
+    logged: list[str] = []
+    sink = logger.add(lambda m: logged.append(m.record["message"]), level="DEBUG")
+    tabs = [{"id": "q1", "kind": "query", "buffer": "SELECT 'a\ud800b \U0001F600'", "title": "t\udc00"},
+            {"id": "q2", "kind": "query", "buffer": "SELECT 1"}]
+    try:
+        saved = client.put("/workspace", content=json.dumps({"tabs": tabs, "active_tab_id": "q1"}).encode(),
+                           headers={**AUTH, "Content-Type": "application/json"})
+    finally:
+        logger.remove(sink)
+    assert saved.status_code == 204
+    read = client.get("/workspace", headers=AUTH)
+    assert read.status_code == 200
+    state = read.json()
+    assert [t["buffer"] for t in state["tabs"]] == ["SELECT 'a\ufffdb \U0001F600'", "SELECT 1"]
+    assert state["tabs"][0]["title"] == "t\ufffd" and state["active_tab_id"] == "q1"
+    assert any("replaced a lone surrogate in 2 text(s)" in line for line in logged)
+    assert "SELECT" not in "".join(logged)  # the text is the user's: never logged
+
+
 def test_settings_and_workspace_reject_bad_input(client):
     settings = client.get("/settings", headers=AUTH).json()
     assert client.put("/settings", json={**settings, "editor": {"font_size": 999}}, headers=AUTH).status_code == 422
