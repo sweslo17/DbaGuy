@@ -187,6 +187,10 @@ def test_a_swap_of_keys_is_refused():  # ruling G7: after a concurrent delete it
         {"id": "u:1", "key": {"a": 1, "b": "y"}, "set": {"n": value("z")}, "original": {"n": "w"}},
         {"id": "u:2", "key": {"a": 1, "b": "x"}, "set": {"b": value("y")}, "original": {"b": "x"}}]))
     assert [(p.change_id, p.code) for p in plan.problems] == [("u:2", "key_collision")]
+    chain = build_plan(PG, pg_target(), changes(updates=[move("u:1", 1, "2"), move("u:2", 2, "3")]))
+    assert [(p.change_id, p.code) for p in chain.problems] == [("u:1", "key_collision")]  # the move onto 2, not 2→3
+    cycle = build_plan(PG, pg_target(), changes(updates=[move("u:1", 1, "2"), move("u:2", 2, "3"), move("u:3", 3, "1")]))
+    assert [p.change_id for p in cycle.problems] == ["u:1", "u:2", "u:3"]
 
 
 def test_a_move_onto_a_deleted_rows_key_is_allowed():  # D-05-3: the DELETE runs first, so its key can be reused
@@ -196,6 +200,7 @@ def test_a_move_onto_a_deleted_rows_key_is_allowed():  # D-05-3: the DELETE runs
 
 
 def test_a_move_onto_an_unchanged_rows_key_is_left_to_the_server():  # its unique check refuses it: rollback
+    # u:1 moves onto key 2, a row the plan does not touch; u:2 sets its own key to itself, which moves nothing
     plan = build_plan(PG, pg_target(), changes(updates=[
         move("u:1", 1, "2"),
         {"id": "u:2", "key": {"id": 3}, "set": {"id": value("3"), "label": value("c2")},

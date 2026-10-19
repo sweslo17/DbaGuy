@@ -67,8 +67,9 @@ class _KeyChange:
 def _colliding(updates: list[_KeyChange]) -> list[str]:
     """The UPDATEs refused because one moves a row onto the key another UPDATE of the plan pins (ruling G7): after a
     concurrent delete of that row, the other UPDATE's WHERE would match the moved row, both would report one row and
-    the commit would keep a wrong result. Each pair is reported once, on its later change when that one moves a row
-    (a swap: the second), otherwise on the change that moves (the message speaks of a move). A move onto a DELETEd
+    the commit would keep a wrong result. A swap (each moves onto the other's key) is reported once, on its later
+    change; otherwise the problem goes on the change that moves onto another's key (the message speaks of that move,
+    so in a chain 1→2, 2→3 it is the first). A move onto a DELETEd
     key is no collision: every DELETE runs first (D-05-3). Keys compare as the terms the statements send, so notations
     that differ (`2.0` for `2`) or a collation's equal texts are left to the server's unique check."""
     pinned: dict[tuple[str, ...], list[int]] = {}
@@ -78,8 +79,8 @@ def _colliding(updates: list[_KeyChange]) -> list[str]:
     for index, update in enumerate(updates):
         if update.moves:
             for other in pinned.get(update.new, ()):  # never `index`: a move's new key is not its own original
-                later = max(index, other)
-                refused.add(later if updates[later].moves else index)
+                swap = updates[other].new == update.original
+                refused.add(max(index, other) if swap else index)
     return [updates[index].change_id for index in sorted(refused)]
 
 
