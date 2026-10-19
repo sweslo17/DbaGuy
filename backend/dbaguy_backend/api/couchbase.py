@@ -1,12 +1,15 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..adapters.values import PLAN_TEXT_LIMIT
 from ..container import AppContainer
-from ..domain.couchbase import ContextOption, FieldSample, Keyspace, PlanView
+from ..domain.couchbase import (
+    CAS_PATTERN, DOCUMENT_ID_MAX_BYTES, DOCUMENT_TEXT_LIMIT, ContextOption, DocumentSaved, DocumentView, FieldSample,
+    Keyspace, PlanView, SaveAnswer, SavePreview,
+)
 from ..domain.errors import ValidationFailed
 from ..domain.execution import QueryContext
 from ..domain.settings import SAMPLE_SIZE_MAX, SAMPLE_SIZE_MIN
@@ -35,6 +38,31 @@ class SampleRequest(_Input):
     profile_id: UUID
     keyspace: Keyspace
     size: int | None = Field(default=None, ge=SAMPLE_SIZE_MIN, le=SAMPLE_SIZE_MAX)  # None: the setting's sample_size
+
+
+_Cas = Annotated[str, Field(pattern=CAS_PATTERN)]  # decimal text: a CAS is beyond 2^53 (the store checks its range)
+_DocumentText = Annotated[str, Field(max_length=DOCUMENT_TEXT_LIMIT)]
+
+
+class DocumentRequest(_Input):
+    profile_id: UUID
+    keyspace: Keyspace
+    id: str = Field(min_length=1, max_length=DOCUMENT_ID_MAX_BYTES)  # characters here; the service checks the bytes
+
+
+class SaveDocumentRequest(DocumentRequest):
+    cas: _Cas  # the CAS the document had when it was opened or last saved
+    text: _DocumentText
+    confirmed: bool = False  # the user confirmed the preview of what the server would store
+
+
+class InsertDocumentRequest(DocumentRequest):
+    text: _DocumentText
+    confirmed: bool = False
+
+
+class RemoveDocumentRequest(DocumentRequest):
+    cas: _Cas
 
 
 @router.get("/contexts", response_model=list[ContextOption])
@@ -80,3 +108,33 @@ def cached_fields(
     """The keyspace's last sample, or null when it has none (nothing samples by itself)."""
     container.couchbase.require(profile_id)
     return container.field_samples.cached(profile_id, Keyspace(bucket=bucket, scope=scope, collection=collection))
+
+
+@router.post("/documents/get", response_model=DocumentView)
+def get_document(body: DocumentRequest, container: AppContainer = Depends(get_container)) -> DocumentView:
+    """The document as stored: its exact text and META (spec §3.9.4). 404 `document_missing` when there is none."""
+    return container.documents.get(body.profile_id, body.keyspace, body.id)
+
+
+@router.post("/documents/save", response_model=SaveAnswer)
+def save_document(
+    body: SaveDocumentRequest, container: AppContainer = Depends(get_container)
+) -> DocumentSaved | SavePreview:
+    """Write the text over the document if it still has `cas`, or answer what the server would store instead
+    (`needs_confirmation`) until `confirmed`."""
+    return container.documents.save(body.profile_id, body.keyspace, body.id, body.cas, body.text, body.confirmed)
+
+
+@router.post("/documents/insert", response_model=SaveAnswer)
+def insert_document(
+    body: InsertDocumentRequest, container: AppContainer = Depends(get_container)
+) -> DocumentSaved | SavePreview:
+    """Create the document, previewed like a save; 409 `document_exists` when the ID is taken."""
+    return container.documents.insert(body.profile_id, body.keyspace, body.id, body.text, body.confirmed)
+
+
+@router.post("/documents/remove", status_code=204)
+def remove_document(body: RemoveDocumentRequest, container: AppContainer = Depends(get_container)) -> Response:
+    """Delete the document if it still has `cas`."""
+    container.documents.remove(body.profile_id, body.keyspace, body.id, body.cas)
+    return Response(status_code=204)

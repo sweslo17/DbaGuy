@@ -139,3 +139,35 @@ class WriteOutcomeUnknown(DomainError):
             "The connection to the query node was lost during the write: the document may or may not have changed. "
             "Reload it to see what the server holds"
         )
+
+
+class InvalidJson(ValidationFailed):
+    """A document text that is not one JSON value (or nests too deeply to check): `detail.offset` is where, in UTF-16
+    code units as the editor counts; `detail.reason` a fixed text, never a quote of the document."""
+
+    code = "invalid_json"
+
+    def __init__(self, offset: int, reason: str) -> None:
+        super().__init__(f"Not valid JSON: {reason}", detail={"offset": offset, "reason": reason})
+
+
+class NumberOutOfRange(ValidationFailed):
+    """Numbers the server would store with another value (ruling C4). Their paths travel in `detail`, never in the
+    message, so they never reach the INFO log."""
+
+    code = "number_out_of_range"
+
+    def __init__(self, paths: list[str]) -> None:
+        super().__init__(
+            "Couchbase would change these numbers (integers beyond 64 bits or numbers beyond a double's range): write "
+            "them as strings to save",
+            detail={"paths": paths},
+        )
+
+
+class ReadOnlyProfile(DomainError):
+    code = "read_only"
+    status = 403
+
+    def __init__(self) -> None:
+        super().__init__("This connection is read-only")

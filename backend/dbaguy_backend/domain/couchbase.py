@@ -4,7 +4,7 @@ of a keyspace's sampled documents (R-04-11), a document as read and as saved (§
 change (§3.9.3)."""
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -175,3 +175,15 @@ class DocumentSaved(BaseModel):
     cas: str
     expiration: int  # as read right after the write (A28: RETURNING says 0)
     size: int  # bytes of the saved text without the whitespace between its tokens (ruling C21)
+
+
+class SavePreview(BaseModel):
+    """What the server would store instead of the edited text: nothing is written until the user confirms."""
+
+    status: Literal["needs_confirmation"]
+    server_text: str  # the server's form of the text (SELECT RAW $doc, A2)
+    changes: list[DocumentChange]  # value changes first, at most CHANGES_LISTED (ruling C2)
+    counts: ChangeCounts  # every change, by kind
+
+
+SaveAnswer = Annotated[DocumentSaved | SavePreview, Field(discriminator="status")]

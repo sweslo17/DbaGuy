@@ -345,6 +345,87 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/couchbase/documents/get": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Get Document
+         * @description The document as stored: its exact text and META (spec §3.9.4). 404 `document_missing` when there is none.
+         */
+        post: operations["get_document_couchbase_documents_get_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/couchbase/documents/save": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Save Document
+         * @description Write the text over the document if it still has `cas`, or answer what the server would store instead
+         *     (`needs_confirmation`) until `confirmed`.
+         */
+        post: operations["save_document_couchbase_documents_save_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/couchbase/documents/insert": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Insert Document
+         * @description Create the document, previewed like a save; 409 `document_exists` when the ID is taken.
+         */
+        post: operations["insert_document_couchbase_documents_insert_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/couchbase/documents/remove": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Remove Document
+         * @description Delete the document if it still has `cas`.
+         */
+        post: operations["remove_document_couchbase_documents_remove_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/settings": {
         parameters: {
             query?: never;
@@ -734,6 +815,29 @@ export interface components {
             /** Request Id */
             request_id: string;
         };
+        /** ChangeCounts */
+        ChangeCounts: {
+            /**
+             * Key Order
+             * @default 0
+             */
+            key_order: number;
+            /**
+             * Number
+             * @default 0
+             */
+            number: number;
+            /**
+             * Duplicate Key
+             * @default 0
+             */
+            duplicate_key: number;
+            /**
+             * Other
+             * @default 0
+             */
+            other: number;
+        };
         /** Classification */
         Classification: {
             kind: components["schemas"]["StatementKind"];
@@ -948,6 +1052,74 @@ export interface components {
             type: "discard";
             /** Request Id */
             request_id: string;
+        };
+        /**
+         * DocumentChange
+         * @description One thing the server would store differently from the edited text (spec §3.9.3, ruling C2).
+         */
+        DocumentChange: {
+            /** Path */
+            path: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "key_order" | "number" | "duplicate_key" | "other";
+            /** Before */
+            before: string;
+            /** After */
+            after: string;
+            /** Value Changed */
+            value_changed: boolean;
+        };
+        /** DocumentRequest */
+        DocumentRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            keyspace: components["schemas"]["Keyspace"];
+            /** Id */
+            id: string;
+        };
+        /**
+         * DocumentSaved
+         * @description A write that happened: the document's new CAS and its expiration.
+         */
+        DocumentSaved: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "saved";
+            /** Cas */
+            cas: string;
+            /** Expiration */
+            expiration: number;
+            /** Size */
+            size: number;
+        };
+        /**
+         * DocumentView
+         * @description One document as the server holds it (spec §3.9.2, R-04-2).
+         */
+        DocumentView: {
+            /** Id */
+            id: string;
+            /** Cas */
+            cas: string;
+            /** Expiration */
+            expiration: number;
+            /**
+             * Type
+             * @enum {string}
+             */
+            type: "json" | "base64";
+            /** Text */
+            text: string | null;
+            /** Size */
+            size: number;
         };
         /** EditorSettings */
         EditorSettings: {
@@ -1352,6 +1524,24 @@ export interface components {
             /** Update Statistics */
             update_statistics?: string | null;
         };
+        /** InsertDocumentRequest */
+        InsertDocumentRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            keyspace: components["schemas"]["Keyspace"];
+            /** Id */
+            id: string;
+            /** Text */
+            text: string;
+            /**
+             * Confirmed
+             * @default false
+             */
+            confirmed: boolean;
+        };
         /**
          * Keyspace
          * @description A collection by its three names. Frozen: it is the key of the field-sample cache.
@@ -1629,6 +1819,19 @@ export interface components {
             /** Scope */
             scope?: string | null;
         };
+        /** RemoveDocumentRequest */
+        RemoveDocumentRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            keyspace: components["schemas"]["Keyspace"];
+            /** Id */
+            id: string;
+            /** Cas */
+            cas: string;
+        };
         /** ResultSetEndEvent */
         ResultSetEndEvent: {
             /**
@@ -1770,6 +1973,42 @@ export interface components {
             keyspace: components["schemas"]["Keyspace"];
             /** Size */
             size?: number | null;
+        };
+        /** SaveDocumentRequest */
+        SaveDocumentRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            keyspace: components["schemas"]["Keyspace"];
+            /** Id */
+            id: string;
+            /** Cas */
+            cas: string;
+            /** Text */
+            text: string;
+            /**
+             * Confirmed
+             * @default false
+             */
+            confirmed: boolean;
+        };
+        /**
+         * SavePreview
+         * @description What the server would store instead of the edited text: nothing is written until the user confirms.
+         */
+        SavePreview: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "needs_confirmation";
+            /** Server Text */
+            server_text: string;
+            /** Changes */
+            changes: components["schemas"]["DocumentChange"][];
+            counts: components["schemas"]["ChangeCounts"];
         };
         /** SchemaRefreshRequest */
         SchemaRefreshRequest: {
@@ -2998,6 +3237,144 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["FieldSample"] | null;
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_document_couchbase_documents_get_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocumentRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentView"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    save_document_couchbase_documents_save_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveDocumentRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentSaved"] | components["schemas"]["SavePreview"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    insert_document_couchbase_documents_insert_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InsertDocumentRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentSaved"] | components["schemas"]["SavePreview"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    remove_document_couchbase_documents_remove_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemoveDocumentRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

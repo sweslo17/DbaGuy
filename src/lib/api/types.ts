@@ -76,6 +76,18 @@ export type Keyspace = S["Keyspace"];
 export type FieldPath = S["FieldPath"];
 /** Couchbase (R-04-11): the field paths of a keyspace's sampled documents, as `POST /couchbase/fields/sample` answers. */
 export type FieldSample = S["FieldSample"];
+/** Couchbase (spec §3.9.2): a document as stored, its exact text (null when binary) and META; `cas` in decimal. */
+export type DocumentView = S["DocumentView"];
+/** Couchbase (spec §3.9.3): a write that happened, with the document's new CAS and its expiration. */
+export type DocumentSaved = S["DocumentSaved"];
+/** Couchbase (spec §3.9.3): what the server would store instead of the edited text, written only once confirmed. */
+export type SavePreview = S["SavePreview"];
+/** Couchbase (ruling C2): one token change of a preview; value changes come first. */
+export type DocumentChange = S["DocumentChange"];
+/** Couchbase (ruling C2): every change of a preview by kind, listed or not. */
+export type ChangeCounts = S["ChangeCounts"];
+/** Couchbase: what `POST /couchbase/documents/save` and `/insert` answer, told apart by `status`. */
+export type SaveAnswer = DocumentSaved | SavePreview;
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

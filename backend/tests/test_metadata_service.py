@@ -4,6 +4,7 @@ import pytest
 from dbaguy_backend.adapters.postgres.adapter import PostgresAdapter
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager, write_askpass_script
+from dbaguy_backend.domain.errors import QueryFailed
 from dbaguy_backend.domain.metadata import MetadataRequest, PathSegment
 from dbaguy_backend.domain.profiles import ProfileSecretsInput, ProfileUpsertRequest
 from dbaguy_backend.services.connection_service import ConnectionService
@@ -52,3 +53,19 @@ def test_reconnects_after_server_drops_connection(service_and_profile):
                          autocommit=True, application_name="pytest-admin") as admin:
         admin.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'DbaGuy'")
     assert service.children(request)  # transparently reconnected
+
+
+def test_without_retry_a_failure_is_raised_once_and_never_sent_again(service_and_profile):  # D-04-9, ruling C26
+    service, pid = service_and_profile
+    calls = []
+
+    def failing(connection):
+        calls.append(connection)
+        raise RuntimeError("the answer was lost")
+
+    with pytest.raises(QueryFailed):
+        service.with_connection(pid, "dbaguy", failing, retry=False)
+    assert len(calls) == 1
+    with pytest.raises(QueryFailed):
+        service.with_connection(pid, "dbaguy", failing)
+    assert len(calls) == 3  # the default reconnects once and runs it again

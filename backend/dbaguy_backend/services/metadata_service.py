@@ -67,23 +67,30 @@ class MetadataService:
         for key in keys:
             self._drop(key)
 
-    def with_connection(self, profile_id: UUID, database: str | None, fn: Callable[[DatabaseConnection], T]) -> T:
+    def with_connection(
+        self, profile_id: UUID, database: str | None, fn: Callable[[DatabaseConnection], T], *, retry: bool = True
+    ) -> T:
         """Run `fn` on the metadata connection of (profile, database), reconnecting once if it was lost.
 
-        `database` only selects a connection for engines that open one per database.
+        `database` only selects a connection for engines that open one per database. `retry=False` (a write, D-04-9):
+        one attempt only; a failure that is not a DomainError still drops the connection and is raised as QueryFailed,
+        and `fn` is never run a second time (it may have sent its statement before it failed).
         """
         profile = self._profiles.get(profile_id)
         adapter = self._registry.get(profile.engine)
-        return self._call_on(profile, database if adapter.capabilities.per_database_connection else None, fn)
+        return self._call_on(profile, database if adapter.capabilities.per_database_connection else None, fn, retry)
 
     def _call(self, request: MetadataRequest, fn: Callable[[DatabaseConnection], T]) -> T:
         head = request.path[0] if request.path else None
         database = head.name if head is not None and head.kind == NodeKind.DATABASE else None
         return self.with_connection(request.profile_id, database, fn)
 
-    def _call_on(self, profile: AnyProfile, database: str | None, fn: Callable[[DatabaseConnection], T]) -> T:
+    def _call_on(
+        self, profile: AnyProfile, database: str | None, fn: Callable[[DatabaseConnection], T], retry: bool
+    ) -> T:
         key = (profile.id, database)
-        for attempt in (1, 2):
+        attempts = (1, 2) if retry else (1,)
+        for attempt in attempts:
             worker = self._worker(key, profile, database)
             try:
                 return worker.call(fn)
@@ -91,7 +98,7 @@ class MetadataService:
                 raise  # NotFound / ValidationFailed from introspection: the connection is fine
             except Exception as exc:
                 self._drop(key)
-                if attempt == 2:
+                if attempt == attempts[-1]:
                     message = exc.message if isinstance(exc, StatementError) else str(exc)
                     raise QueryFailed(message) from exc
                 logger.warning("Metadata query failed on {} ({}); reconnecting", profile.name, exc)

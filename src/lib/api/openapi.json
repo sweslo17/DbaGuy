@@ -1331,6 +1331,269 @@
         }
       }
     },
+    "/couchbase/documents/get": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Get Document",
+        "description": "The document as stored: its exact text and META (spec \u00a73.9.4). 404 `document_missing` when there is none.",
+        "operationId": "get_document_couchbase_documents_get_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DocumentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DocumentView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/couchbase/documents/save": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Save Document",
+        "description": "Write the text over the document if it still has `cas`, or answer what the server would store instead\n(`needs_confirmation`) until `confirmed`.",
+        "operationId": "save_document_couchbase_documents_save_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveDocumentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/DocumentSaved"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SavePreview"
+                    }
+                  ],
+                  "discriminator": {
+                    "propertyName": "status",
+                    "mapping": {
+                      "saved": "#/components/schemas/DocumentSaved",
+                      "needs_confirmation": "#/components/schemas/SavePreview"
+                    }
+                  },
+                  "title": "Response Save Document Couchbase Documents Save Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/couchbase/documents/insert": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Insert Document",
+        "description": "Create the document, previewed like a save; 409 `document_exists` when the ID is taken.",
+        "operationId": "insert_document_couchbase_documents_insert_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InsertDocumentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/DocumentSaved"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SavePreview"
+                    }
+                  ],
+                  "discriminator": {
+                    "propertyName": "status",
+                    "mapping": {
+                      "saved": "#/components/schemas/DocumentSaved",
+                      "needs_confirmation": "#/components/schemas/SavePreview"
+                    }
+                  },
+                  "title": "Response Insert Document Couchbase Documents Insert Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/couchbase/documents/remove": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Remove Document",
+        "description": "Delete the document if it still has `cas`.",
+        "operationId": "remove_document_couchbase_documents_remove_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemoveDocumentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/settings": {
       "get": {
         "tags": [
@@ -2707,6 +2970,32 @@
         ],
         "title": "CancelCommand"
       },
+      "ChangeCounts": {
+        "properties": {
+          "key_order": {
+            "type": "integer",
+            "title": "Key Order",
+            "default": 0
+          },
+          "number": {
+            "type": "integer",
+            "title": "Number",
+            "default": 0
+          },
+          "duplicate_key": {
+            "type": "integer",
+            "title": "Duplicate Key",
+            "default": 0
+          },
+          "other": {
+            "type": "integer",
+            "title": "Other",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "ChangeCounts"
+      },
       "Classification": {
         "properties": {
           "kind": {
@@ -3304,6 +3593,152 @@
           "request_id"
         ],
         "title": "DiscardCommand"
+      },
+      "DocumentChange": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "key_order",
+              "number",
+              "duplicate_key",
+              "other"
+            ],
+            "title": "Kind"
+          },
+          "before": {
+            "type": "string",
+            "title": "Before"
+          },
+          "after": {
+            "type": "string",
+            "title": "After"
+          },
+          "value_changed": {
+            "type": "boolean",
+            "title": "Value Changed"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "kind",
+          "before",
+          "after",
+          "value_changed"
+        ],
+        "title": "DocumentChange",
+        "description": "One thing the server would store differently from the edited text (spec \u00a73.9.3, ruling C2)."
+      },
+      "DocumentRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "keyspace": {
+            "$ref": "#/components/schemas/Keyspace"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 250,
+            "minLength": 1,
+            "title": "Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "keyspace",
+          "id"
+        ],
+        "title": "DocumentRequest"
+      },
+      "DocumentSaved": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "saved",
+            "title": "Status"
+          },
+          "cas": {
+            "type": "string",
+            "title": "Cas"
+          },
+          "expiration": {
+            "type": "integer",
+            "title": "Expiration"
+          },
+          "size": {
+            "type": "integer",
+            "title": "Size"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "cas",
+          "expiration",
+          "size"
+        ],
+        "title": "DocumentSaved",
+        "description": "A write that happened: the document's new CAS and its expiration."
+      },
+      "DocumentView": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "cas": {
+            "type": "string",
+            "title": "Cas"
+          },
+          "expiration": {
+            "type": "integer",
+            "title": "Expiration"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "json",
+              "base64"
+            ],
+            "title": "Type"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          },
+          "size": {
+            "type": "integer",
+            "title": "Size"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "cas",
+          "expiration",
+          "type",
+          "text",
+          "size"
+        ],
+        "title": "DocumentView",
+        "description": "One document as the server holds it (spec \u00a73.9.2, R-04-2)."
       },
       "EditorSettings": {
         "properties": {
@@ -4392,6 +4827,43 @@
         ],
         "title": "IndexAdvice"
       },
+      "InsertDocumentRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "keyspace": {
+            "$ref": "#/components/schemas/Keyspace"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 250,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 20971520,
+            "title": "Text"
+          },
+          "confirmed": {
+            "type": "boolean",
+            "title": "Confirmed",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "keyspace",
+          "id",
+          "text"
+        ],
+        "title": "InsertDocumentRequest"
+      },
       "Keyspace": {
         "properties": {
           "bucket": {
@@ -5182,6 +5654,38 @@
         "title": "QueryContext",
         "description": "Couchbase: the bucket (and scope) that unqualified keyspace names resolve against, sent with every request\n(D-04-5: a structure, because a bucket name may hold a dot)."
       },
+      "RemoveDocumentRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "keyspace": {
+            "$ref": "#/components/schemas/Keyspace"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 250,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "cas": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]{0,18}$",
+            "title": "Cas"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "keyspace",
+          "id",
+          "cas"
+        ],
+        "title": "RemoveDocumentRequest"
+      },
       "ResultSetEndEvent": {
         "properties": {
           "type": {
@@ -5465,6 +5969,81 @@
           "keyspace"
         ],
         "title": "SampleRequest"
+      },
+      "SaveDocumentRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "keyspace": {
+            "$ref": "#/components/schemas/Keyspace"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 250,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "cas": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]{0,18}$",
+            "title": "Cas"
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 20971520,
+            "title": "Text"
+          },
+          "confirmed": {
+            "type": "boolean",
+            "title": "Confirmed",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "keyspace",
+          "id",
+          "cas",
+          "text"
+        ],
+        "title": "SaveDocumentRequest"
+      },
+      "SavePreview": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "needs_confirmation",
+            "title": "Status"
+          },
+          "server_text": {
+            "type": "string",
+            "title": "Server Text"
+          },
+          "changes": {
+            "items": {
+              "$ref": "#/components/schemas/DocumentChange"
+            },
+            "type": "array",
+            "title": "Changes"
+          },
+          "counts": {
+            "$ref": "#/components/schemas/ChangeCounts"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "server_text",
+          "changes",
+          "counts"
+        ],
+        "title": "SavePreview",
+        "description": "What the server would store instead of the edited text: nothing is written until the user confirms."
       },
       "SchemaRefreshRequest": {
         "properties": {
