@@ -2,6 +2,8 @@
 refusals, no resend of a write whose answer was lost, nothing of a document in the log. Writes only zz_04c_ keys in
 dbaguy.app.orders (removed by key)."""
 
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait
 from uuid import UUID
 
 import pytest
@@ -9,12 +11,13 @@ from loguru import logger
 
 from dbaguy_backend.adapters.base import StatementError
 from dbaguy_backend.adapters.couchbase.adapter import CouchbaseConnection
-from dbaguy_backend.adapters.couchbase.documents import SqlppDocumentStore
+from dbaguy_backend.adapters.couchbase.documents import SqlppDocumentRules
 from dbaguy_backend.domain.couchbase import Keyspace
 from dbaguy_backend.domain.errors import ValidationFailed
+from dbaguy_backend.domain.metadata import MetadataRequest
 from dbaguy_backend.services import document_service
 from tests.support import (
-    COUCHBASE_PASSWORD, put_raw_document, requires_couchbase, scratch_documents, scratch_key, stored_document,
+    COUCHBASE_PASSWORD, put_raw_document, requires_couchbase, scaled, scratch_documents, scratch_key, stored_document,
 )
 from tests.test_api import AUTH
 from tests.test_couchbase_api import COUCHBASE, app, cb  # noqa: F401  (fixtures)
@@ -220,15 +223,17 @@ def no_connection(app, monkeypatch):
     return used
 
 
-@pytest.mark.parametrize(("path", "extra", "text"), [
-    ("save", {"cas": "1"}, '{"a": 1,}'),
-    ("insert", {}, '{"a":' * 101 + "1" + "}" * 101),  # deeper than MAX_DOCUMENT_DEPTH
-    ("insert", {}, ""),
+@pytest.mark.parametrize(("path", "extra", "text", "code"), [
+    ("save", {"cas": "1"}, '{"a": 1,}', "invalid_json"),
+    ("insert", {}, '{"a":' * 101 + "1" + "}" * 101, "invalid_json"),  # deeper than MAX_DOCUMENT_DEPTH
+    ("insert", {}, "", "invalid_json"),
+    ("save", {"cas": "1", "confirmed": True}, '{"u":18446744073709551615}', "number_out_of_range"),  # ruling C43
+    ("insert", {}, '{"h":1e400}', "number_out_of_range"),
 ])
-def test_a_text_that_is_not_json_is_refused_before_any_connection_is_used(app, cb, no_connection, path, extra, text):
+def test_a_text_is_checked_before_any_connection_is_used(app, cb, no_connection, path, extra, text, code):
     client, _ = app
     answer = post(client, path, profile_id=cb, keyspace=ORDERS, id=NEVER, text=text, **extra)
-    assert error_of(answer) == (422, "invalid_json") and not no_connection
+    assert error_of(answer) == (422, code) and not no_connection
 
 
 def test_an_id_beyond_250_utf8_bytes_is_refused_before_any_connection_is_used(app, cb, no_connection):
@@ -253,9 +258,9 @@ WRITES = {"save": "UPDATE", "insert": "INSERT", "remove": "DELETE"}
 
 @pytest.mark.parametrize("write", list(WRITES))
 def test_a_write_that_fails_after_it_went_out_is_never_run_again(app, cb, scratch, monkeypatch, write):  # C26
-    """A failure that is not a DomainError (a bug, the worker call's timeout) after the server answered the write:
-    without `retry=False` the metadata call would reconnect and run the whole call again, write included (an insert
-    would then report "exists", a remove "missing")."""
+    """A failure that is not a DomainError (a bug, the worker call's timeout) after the server answered the write: its
+    outcome is unknown (ruling C42). Without `retry=False` the metadata call would reconnect and run the whole call
+    again, write included (an insert would then report "exists", a remove "missing")."""
     client, _ = app
     if write == "insert":
         key = scratch_key()
@@ -280,7 +285,7 @@ def test_a_write_that_fails_after_it_went_out_is_never_run_again(app, cb, scratc
 
     monkeypatch.setattr(CouchbaseConnection, "_begin", failing)
     answer = post(client, write, profile_id=cb, keyspace=ORDERS, id=key, **body)
-    assert error_of(answer) == (400, "query_failed") and len(sent) == 1
+    assert error_of(answer) == (502, "write_outcome_unknown") and len(sent) == 1
     stored = stored_document(key)
     assert stored is None if write == "remove" else stored.text == '{"a":2}'
 
@@ -288,7 +293,7 @@ def test_a_write_that_fails_after_it_went_out_is_never_run_again(app, cb, scratc
 @pytest.mark.parametrize("check", ["blocked_numbers", "diff"])
 def test_a_document_too_deep_for_the_checks_is_invalid_json(app, cb, monkeypatch, check):  # ruling C27
     """`json_problem` refuses more than MAX_DOCUMENT_DEPTH levels, so this cannot happen today; were the limit raised
-    past Python's recursion limit, the checks' RecursionError must not drop the connection as a failed call."""
+    past Python's recursion limit, the checks' RecursionError must not be an internal error."""
     client, _ = app
 
     def too_deep(*args):
@@ -297,7 +302,7 @@ def test_a_document_too_deep_for_the_checks_is_invalid_json(app, cb, monkeypatch
     if check == "diff":
         monkeypatch.setattr(document_service, "diff", too_deep)
     else:
-        monkeypatch.setattr(SqlppDocumentStore, "blocked_numbers", too_deep)
+        monkeypatch.setattr(SqlppDocumentRules, "blocked_numbers", too_deep)
     answer = post(client, "save", profile_id=cb, keyspace=ORDERS, id=NEVER, cas="1", text='{"a":1}')
     assert error_of(answer) == (422, "invalid_json")
     assert answer.json()["error"]["detail"] == {"offset": 0, "reason": "Nested too deeply to check before saving"}
@@ -312,3 +317,28 @@ def test_numbers_the_server_would_change_are_refused_even_when_confirmed(app, cb
         answer = post(client, path, profile_id=cb, keyspace=ORDERS, text=text, confirmed=True, **extra)
         assert error_of(answer) == (422, "number_out_of_range")
     assert stored_document(key) is None
+
+
+def test_the_tree_is_answered_while_a_save_compares_texts(app, cb, monkeypatch):  # ruling C43
+    """The comparison runs on the request thread after the metadata call for the server's form: while it runs (here
+    held at a gate, as a long diff of a big document would be), the profile's tree is answered at once."""
+    _, container = app
+    pid, comparing, release = UUID(cb), threading.Event(), threading.Event()
+    real_diff = document_service.diff
+
+    def held_diff(edited, server):
+        comparing.set()
+        release.wait(scaled(30))
+        return real_diff(edited, server)
+
+    monkeypatch.setattr(document_service, "diff", held_diff)
+    with ThreadPoolExecutor(2) as pool:
+        save = pool.submit(container.documents.save, pid, Keyspace(**ORDERS), NEVER, "1", '{"b":1,"a":2}', False)
+        try:
+            assert comparing.wait(scaled(30))
+            tree = pool.submit(container.metadata.children, MetadataRequest(profile_id=pid))
+            assert wait([tree], timeout=scaled(10)).done, "the tree waited for the comparison"
+        finally:
+            release.set()
+        assert "dbaguy" in [node.name for node in tree.result()]
+        assert save.result(scaled(30)).status == "needs_confirmation"  # a preview: nothing was written

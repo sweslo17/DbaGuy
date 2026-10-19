@@ -129,16 +129,16 @@ class BinaryDocument(ValidationFailed):
 
 
 class WriteOutcomeUnknown(DomainError):
-    """A write whose answer never came (D-04-9): it may have been applied, so it is never sent again."""
+    """A write whose answer never came (D-04-9): it may have been applied, so it is never sent again. The message says
+    why: by default the store's (the connection was lost), or the metadata call's (a timeout, ruling C42)."""
 
     code = "write_outcome_unknown"
     status = 502
+    LOST = ("The connection to the query node was lost during the write: the document may or may not have changed. "
+            "Reload it to see what the server holds")
 
-    def __init__(self) -> None:
-        super().__init__(
-            "The connection to the query node was lost during the write: the document may or may not have changed. "
-            "Reload it to see what the server holds"
-        )
+    def __init__(self, message: str = LOST) -> None:
+        super().__init__(message)
 
 
 class InvalidJson(ValidationFailed):

@@ -46,9 +46,9 @@ from ..base import (
     invalid_text_error,
 )
 from ..cancel_window import CancelWindow
-from ..documents import DocumentCapable, DocumentStore
+from ..documents import DocumentCapable, DocumentEngine, DocumentRules, DocumentStore
 from . import catalog, sampling
-from .documents import SqlppDocumentStore
+from .documents import SqlppDocumentRules, SqlppDocumentStore
 from .http import (
     ChannelError, HttpChannel, LiteralNotJson, NodeClient, QueryRequest, TlsFailure, basic_auth, build_body,
     client_context_id,
@@ -464,7 +464,10 @@ class CouchbaseConnection(DatabaseConnection, FieldSampling, DocumentCapable):
             self._client.close()
 
 
-class CouchbaseAdapter(DatabaseAdapter):
+_DOCUMENT_RULES = SqlppDocumentRules()  # pure: one for every profile
+
+
+class CouchbaseAdapter(DatabaseAdapter, DocumentEngine):
     engine = Engine.COUCHBASE
     url_schemes = URL_SCHEMES
     default_port = QUERY_PORT
@@ -479,6 +482,9 @@ class CouchbaseAdapter(DatabaseAdapter):
 
     def parse_url(self, url: str) -> ParsedUrl:
         return parse_couchbase_url(url)
+
+    def document_rules(self) -> DocumentRules:
+        return _DOCUMENT_RULES
 
     def relation_path(
         self, database: str | None, schema: str, name: str, kind: RelationKind

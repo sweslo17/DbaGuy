@@ -32,7 +32,7 @@ from ...domain.errors import (
 from ...sql.dialects import Dialect, keyspace_path, quote_literal
 from ...sql.jsontext import number_paths, one_line, without_strings
 from ..base import INVALID_PARAMS, INVALID_TEXT, StatementError, StatementNotSent
-from ..documents import DocumentStore
+from ..documents import DocumentRules, DocumentStore
 from .messages import PROTOCOL_ERROR, is_server_error
 from .stream import RawRow, RowField
 
@@ -138,6 +138,15 @@ def _path(keyspace: Keyspace) -> str:
     return keyspace_path(keyspace.bucket, keyspace.scope, keyspace.collection)
 
 
+class SqlppDocumentRules(DocumentRules):
+    """Couchbase's rules for a document text (ruling C4): pure, no connection."""
+
+    def blocked_numbers(self, text: str) -> list[str]:
+        if not _SUSPECT.search(without_strings(text)):
+            return []  # almost every save
+        return number_paths(text, changed_by_server, BLOCKED_PATHS_MAX)[0]
+
+
 class SqlppDocumentStore(DocumentStore):
     """DocumentStore over a Couchbase connection's internal statements (see the module docstring). Runs on the
     profile's metadata worker thread, as the connection does."""
@@ -188,11 +197,6 @@ class SqlppDocumentStore(DocumentStore):
         if len(rows) != 1:
             raise _protocol_error()
         return rows[0].text
-
-    def blocked_numbers(self, text: str) -> list[str]:
-        if not _SUSPECT.search(without_strings(text)):
-            return []  # almost every save
-        return number_paths(text, changed_by_server, BLOCKED_PATHS_MAX)[0]
 
     # ---- writes ----
 

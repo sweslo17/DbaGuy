@@ -1,10 +1,20 @@
 """The engine-neutral contract of a document store (spec §3.9.1, ruling C8): the save flow (DocumentService) depends on
 this, never on an engine's package. Couchbase implements it over SQL++ (`adapters/couchbase/documents.py`); an SDK store
-would implement the same."""
+would implement the same. What a store would do to a text that the text alone tells (DocumentRules) is pure and comes
+from the adapter, without a connection: the save flow checks it on the request thread, never on the profile's metadata
+worker (ruling C43)."""
 
 from abc import ABC, abstractmethod
 
 from ..domain.couchbase import DocumentSaved, DocumentView, Keyspace
+
+
+class DocumentRules(ABC):
+    """What an engine's store would do to a text, told by the text alone: pure, no connection, any thread."""
+
+    @abstractmethod
+    def blocked_numbers(self, text: str) -> list[str]:
+        """Paths of the numbers in `text` (valid JSON) the store would change in value: a save is refused."""
 
 
 class DocumentStore(ABC):
@@ -19,10 +29,6 @@ class DocumentStore(ABC):
     @abstractmethod
     def server_form(self, text: str) -> str:
         """What this store would store for `text` (an SDK store: `text`)."""
-
-    @abstractmethod
-    def blocked_numbers(self, text: str) -> list[str]:
-        """Paths of the numbers in `text` (valid JSON) this store would change in value: a save is refused."""
 
     @abstractmethod
     def replace(self, keyspace: Keyspace, doc_id: str, text: str, cas: int) -> DocumentSaved:
@@ -44,3 +50,10 @@ class DocumentCapable(ABC):
 
     @abstractmethod
     def documents(self) -> DocumentStore: ...
+
+
+class DocumentEngine(ABC):
+    """An adapter whose engine stores JSON documents by key (capability `documents`): its rules need no connection."""
+
+    @abstractmethod
+    def document_rules(self) -> DocumentRules: ...

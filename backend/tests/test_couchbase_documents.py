@@ -8,7 +8,7 @@ import pytest
 
 from dbaguy_backend.adapters.base import StatementError
 from dbaguy_backend.adapters.couchbase import adapter as couchbase_adapter
-from dbaguy_backend.adapters.couchbase.adapter import CouchbaseConnection
+from dbaguy_backend.adapters.couchbase.adapter import CouchbaseAdapter, CouchbaseConnection
 from dbaguy_backend.adapters.couchbase.documents import SqlppDocumentStore
 from dbaguy_backend.adapters.couchbase.stream import parse_row
 from dbaguy_backend.domain.couchbase import Keyspace
@@ -78,11 +78,12 @@ def test_server_form_is_what_the_server_would_store(store):  # A2
     assert store.server_form(U_KEYORDER) == '{"alpha":{"a":2,"z":1},"mid":"a b","ws":[1,2],"zeta":1}'
 
 
-def test_blocked_numbers_name_their_paths(store):  # ruling C4
-    assert store.blocked_numbers(U_NUMBERS) == ["$.u64max", "$.beyond", "$.huge"]
+def test_blocked_numbers_name_their_paths():  # ruling C4; pure since ruling C43: the adapter's rules, no connection
+    rules = CouchbaseAdapter().document_rules()
+    assert rules.blocked_numbers(U_NUMBERS) == ["$.u64max", "$.beyond", "$.huge"]
     fine = '{"i":9223372036854775807,"j":-9223372036854775808,"k":1.7976931348623157e308,"t":1e-400,"s":"1e400"}'
-    assert store.blocked_numbers(fine) == []
-    assert store.blocked_numbers("[9223372036854775808, -9223372036854775809, 2e308, 1234567890123456789012.5]") == [
+    assert rules.blocked_numbers(fine) == []
+    assert rules.blocked_numbers("[9223372036854775808, -9223372036854775809, 2e308, 1234567890123456789012.5]") == [
         "$[0]", "$[1]", "$[2]"]
 
 

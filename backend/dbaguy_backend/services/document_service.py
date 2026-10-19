@@ -1,14 +1,18 @@
 """Documents by key (spec §3.9.3, R-04-2): read, save, insert and remove through the engine's DocumentStore, on the
 profile's metadata connection (D-04-9: a document tab has no session of its own).
 
-- A text to write is checked before any connection is used: text UTF-8 can carry, then one JSON value no deeper than
-  MAX_DOCUMENT_DEPTH (`json_problem`; its offset is sent in UTF-16 code units, as the editor counts).
-- On the connection: numbers the server would store with another value are refused, also when confirmed (ruling C4).
-  Unless confirmed, the server's form of the text is compared with it token by token (`diff`): any difference comes
-  back as a SavePreview and nothing is written; whitespace is no difference (spec §12), so such a save is written at
-  once.
-- A write runs with `retry=False`: whatever fails after it may have been sent, it is never sent again (D-04-9, C26).
-  A read keeps the metadata call's one reconnect.
+- Every check that needs only the text runs on the request thread before any connection is used (ruling C43): text
+  UTF-8 can carry, one JSON value no deeper than MAX_DOCUMENT_DEPTH (`json_problem`; its offset is sent in UTF-16 code
+  units, as the editor counts), and the engine's rules: numbers the server would store with another value are refused,
+  also when confirmed (ruling C4).
+- Unless confirmed, one short metadata call fetches the server's form of the text; the comparison (`diff`) runs after
+  it, on the request thread, so the profile's tree, completion and sampling never wait for it. Any token difference
+  comes back as a SavePreview and nothing is written; whitespace is no difference (spec §12), so such a save is written
+  at once.
+- The write is a metadata call of its own with `retry=False` (D-04-9, C26, C42): never sent twice; given up on while
+  queued, it never runs; failing after it started without a final answer, it is WriteOutcomeUnknown. The CAS goes with
+  it, so the store still catches a change made since the document was read. A read keeps the metadata call's one
+  reconnect.
 - Not through SafetyPolicy (spec §3.9.3 step 5): a document write is an explicit action with its own confirmation.
 
 Logs: INFO a write's keyspace and a preview's change counts by kind; DEBUG the document's ID; never a text, a path or a
@@ -22,7 +26,7 @@ from uuid import UUID
 from loguru import logger
 
 from ..adapters.base import DatabaseConnection
-from ..adapters.documents import DocumentCapable, DocumentStore
+from ..adapters.documents import DocumentCapable, DocumentEngine, DocumentRules, DocumentStore
 from ..adapters.registry import AdapterRegistry
 from ..domain.couchbase import (
     DOCUMENT_ID_MAX_BYTES, ChangeCounts, DocumentSaved, DocumentView, Keyspace, SavePreview,
@@ -70,7 +74,7 @@ def _check_text(text: str) -> None:
 def _within_depth[T](check: Callable[[], T]) -> T:
     """`blocked_numbers` and `diff` recurse one Python frame per level (ruling C27). `json_problem` refuses more than
     MAX_DOCUMENT_DEPTH levels, far below the recursion limit; should that ever not hold, the text is refused like
-    invalid JSON, instead of leaving the metadata call as a failure that drops the connection."""
+    invalid JSON, not answered as an internal error."""
     try:
         return check()
     except RecursionError:
@@ -103,17 +107,17 @@ class DocumentService:
     ) -> DocumentSaved | SavePreview:
         """Write `text` over the document if it still has `cas` (the store checks its range), keeping its expiration;
         a SavePreview instead while the server would store other tokens and the user has not confirmed them."""
-        self._admit(profile_id, keyspace, doc_id, "save")
+        rules = self._admit(profile_id, keyspace, doc_id, "save")
         version = int(cas)
-        return self._write_text(profile_id, keyspace, "save", text, confirmed,
+        return self._write_text(profile_id, keyspace, rules, "save", text, confirmed,
                                 lambda store: store.replace(keyspace, doc_id, text, version))
 
     def insert(
         self, profile_id: UUID, keyspace: Keyspace, doc_id: str, text: str, confirmed: bool
     ) -> DocumentSaved | SavePreview:
         """Create the document (DocumentExists when the ID is taken), previewed like a save."""
-        self._admit(profile_id, keyspace, doc_id, "insert")
-        return self._write_text(profile_id, keyspace, "insert", text, confirmed,
+        rules = self._admit(profile_id, keyspace, doc_id, "insert")
+        return self._write_text(profile_id, keyspace, rules, "insert", text, confirmed,
                                 lambda store: store.insert(keyspace, doc_id, text))
 
     def remove(self, profile_id: UUID, keyspace: Keyspace, doc_id: str, cas: str) -> None:
@@ -123,43 +127,39 @@ class DocumentService:
         self._on_store(profile_id, lambda store: store.remove(keyspace, doc_id, version), retry=False)
         logger.info("Deleted a document in {}", _where(keyspace))
 
-    def _admit(self, profile_id: UUID, keyspace: Keyspace, doc_id: str, action: Action) -> None:
+    def _admit(self, profile_id: UUID, keyspace: Keyspace, doc_id: str, action: Action) -> DocumentRules:
         """The checks every call makes first: an engine with documents, a writable profile for a write, an ID the
-        server can hold."""
+        server can hold. Answers the engine's rules for a text."""
         profile = self._profiles.get(profile_id)
-        if not self._registry.get(profile.engine).capabilities.documents:
+        adapter = self._registry.get(profile.engine)
+        if not adapter.capabilities.documents or not isinstance(adapter, DocumentEngine):
             raise ValidationFailed(_NO_DOCUMENTS)
         if action != "get" and profile.read_only:
             raise ReadOnlyProfile()
         _check_id(doc_id)
         logger.debug("Document {} in {}: {}", doc_id, _where(keyspace), action)
+        return adapter.document_rules()
 
     def _write_text(
-        self, profile_id: UUID, keyspace: Keyspace, action: Literal["save", "insert"], text: str, confirmed: bool,
-        write: Callable[[DocumentStore], DocumentSaved],
+        self, profile_id: UUID, keyspace: Keyspace, rules: DocumentRules, action: Literal["save", "insert"], text: str,
+        confirmed: bool, write: Callable[[DocumentStore], DocumentSaved],
     ) -> DocumentSaved | SavePreview:
-        """Spec §3.9.3 steps 2–4: the local checks, then on one metadata call the blocked numbers, the preview
-        (unless confirmed) and the write, which is never sent twice."""
+        """Spec §3.9.3 steps 2–4 (ruling C43): the pure checks here, then the server's form and the write, each a
+        short metadata call; the comparison between them runs here too."""
         _check_text(text)
-
-        def run(store: DocumentStore) -> DocumentSaved | SavePreview:
-            blocked = _within_depth(lambda: store.blocked_numbers(text))
-            if blocked:
-                raise NumberOutOfRange(blocked)
-            if not confirmed:
-                server = store.server_form(text)
-                found = _within_depth(lambda: diff(text, server))
-                if found.changes:
-                    return SavePreview(status="needs_confirmation", server_text=server, changes=found.changes,
-                                       counts=found.counts)
-            return write(store)
-
-        answer = self._on_store(profile_id, run, retry=False)
-        if isinstance(answer, SavePreview):
-            logger.info("A save in {} needs confirmation: {}", _where(keyspace), _counted(answer.counts))
-        else:
-            logger.info("{} a document in {}", "Saved" if action == "save" else "Inserted", _where(keyspace))
-        return answer
+        blocked = _within_depth(lambda: rules.blocked_numbers(text))
+        if blocked:
+            raise NumberOutOfRange(blocked)
+        if not confirmed:
+            server = self._on_store(profile_id, lambda store: store.server_form(text), retry=True)
+            found = _within_depth(lambda: diff(text, server))
+            if found.changes:
+                logger.info("A save in {} needs confirmation: {}", _where(keyspace), _counted(found.counts))
+                return SavePreview(status="needs_confirmation", server_text=server, changes=found.changes,
+                                   counts=found.counts)
+        saved = self._on_store(profile_id, write, retry=False)
+        logger.info("{} a document in {}", "Saved" if action == "save" else "Inserted", _where(keyspace))
+        return saved
 
     def _on_store[T](self, profile_id: UUID, fn: Callable[[DocumentStore], T], *, retry: bool) -> T:
         """`fn` on the profile's document store, on its metadata connection. The server's own error answer is final
