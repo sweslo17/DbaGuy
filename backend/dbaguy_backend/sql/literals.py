@@ -5,7 +5,7 @@ matched in a WHERE (spec ⑤ D-05-1). Pure: no I/O; quoting and literal syntax c
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 from typing import Any, Literal
 
 from pydantic import JsonValue
@@ -261,16 +261,24 @@ def _int64_text(text: str) -> bool:
 
 
 def _exact_number(dialect: Dialect, value: str) -> str:
-    """A number literal the dialect reads exactly. MySQL, SQL Server and SQLite read one with an exponent as a double
-    (`9007199254740993e0` would lose its last digit), so it goes in plain decimal form when that has at most
-    `_EXACT_DIGITS` digits; beyond, as typed, for the server to judge. PostgreSQL reads it as an exact numeric."""
+    """A number literal the dialect reads exactly. MySQL, SQL Server and SQLite read one with an exponent as a double,
+    so an integer written that way (`9007199254740993e0` into a BIGINT) would lose its last digit: it goes as its plain
+    digits when they are at most `_EXACT_DIGITS` (ruling G6). Everything else keeps the typed text, for the server to
+    judge: a fraction (a float column reads it best that way, and MySQL may cut a decimal of more than 30 places), an
+    integer too long to write out, a number Decimal cannot hold. PostgreSQL reads an exponent as an exact numeric."""
     if dialect is Dialect.POSTGRES or not ("e" in value or "E" in value):
         return value
-    number = Decimal(value)
-    _, digits, exponent = number.as_tuple()
-    if len(digits) + abs(int(exponent)) > 2 * _EXACT_DIGITS:  # the plain form is longer still: never build it (1e999999)
+    try:
+        number = Decimal(value)
+        _, digits, exponent = number.as_tuple()
+        if len(digits) + abs(int(exponent)) > 2 * _EXACT_DIGITS:  # longer still written out: never build it (1e999999)
+            return value
+        integral = number.to_integral_value()
+    except DecimalException:  # InvalidOperation: an exponent beyond the context's limits (1e1000000000000000000)
         return value
-    plain = format(number, "f")
+    if number != integral:
+        return value
+    plain = format(integral, "f")
     return plain if sum(character.isdigit() for character in plain) <= _EXACT_DIGITS else value
 
 

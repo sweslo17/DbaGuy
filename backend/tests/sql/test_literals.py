@@ -37,7 +37,7 @@ def value(text: str) -> CellInput:
     (PG, "number", " 42 ", PLAIN, "42"),
     (PG, "number", "9007199254740993", PLAIN, "9007199254740993"),
     (MY, "number", "1.10", PLAIN, "1.10"),
-    (TS, "number", "-1e3", PLAIN, "-1000"),  # an exponent makes a float literal: plain decimal form instead
+    (TS, "number", "-1e3", PLAIN, "-1000"),  # an integer with an exponent would be a float literal: plain digits
     (PG, "number", "NaN", PLAIN, "'NaN'"),
     (PG, "number", "-infinity", PLAIN, "'-Infinity'"),
     (PG, "text", "it's", PLAIN, "'it''s'"),
@@ -74,15 +74,24 @@ def test_input_literals(dialect, kind, text, style, expected):  # Review Focus 1
 
 @pytest.mark.parametrize(("dialect", "text", "expected"), [
     (MY, "9007199254740993e0", "9007199254740993"),
-    (TS, "1.5E-3", "0.0015"),
+    (MY, "1e3", "1000"),
     (LITE, "1e2", "100"),
+    (TS, "10E-1", "1"),  # integral once scaled
     (MY, "1e37", "1" + "0" * 37),  # 38 digits
     (MY, "1e38", "1e38"),  # 39 digits: as typed, for the server to judge
-    (TS, "1e-40", "1e-40"),
     (MY, "1e999999999", "1e999999999"),  # never written out in full
+    # a fraction keeps the typed form (ruling G6): a float column reads it best, MySQL may cut a long decimal
+    (MY, "1e-5", "1e-5"),
+    (MY, "1.5e-35", "1.5e-35"),
+    (TS, "1.5E-3", "1.5E-3"),
+    (LITE, "15e-1", "15e-1"),
+    # beyond Decimal's exponent limits (InvalidOperation): as typed, never an error (review N1)
+    (MY, "1e1000000000000000000", "1e1000000000000000000"),
+    (TS, "1e-9999999999999999999999", "1e-9999999999999999999999"),
+    (LITE, "-1e1000000000000000000", "-1e1000000000000000000"),
     (PG, "9007199254740993e0", "9007199254740993e0"),  # PostgreSQL reads it as an exact numeric
 ])
-def test_a_number_with_an_exponent_is_sent_exactly(dialect, text, expected):  # review F5: not as a double
+def test_an_integer_with_an_exponent_is_sent_exactly(dialect, text, expected):  # review F5, ruling G6: not a double
     assert input_literal(dialect, col("number"), value(text), PLAIN) == expected
 
 
