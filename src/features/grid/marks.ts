@@ -18,9 +18,13 @@ export interface CellMark {
   readonly conflict?: string;
 }
 
-/** A new row, a loaded row with staged values, or a loaded row marked for deletion. */
+/**
+ * A new row, a loaded row with staged values, a loaded row marked for deletion, or a loaded row whose key another
+ * loaded row has too ("repeated_key"): those cannot be told apart, so none is editable and no staged change is drawn
+ * on them (they all share one mark object, the overlay's `REPEATED_KEY_MARK`).
+ */
 export interface RowMark {
-  readonly kind: "new" | "changed" | "deleted";
+  readonly kind: "new" | "changed" | "deleted" | "repeated_key";
   /** Why the last preview or commit refused the row's change as a whole. */
   readonly problem?: string;
   /** By column index. */
