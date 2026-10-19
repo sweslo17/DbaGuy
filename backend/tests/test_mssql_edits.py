@@ -3,6 +3,7 @@
 import pytest
 
 from dbaguy_backend.adapters.editing import NO_KEY, VIEWS
+from dbaguy_backend.adapters.mssql.editing import GRAPH_TABLE, HISTORY_TABLE, LEDGER_TABLE, table_flags_reason
 from dbaguy_backend.domain.errors import NotFound
 from tests.edit_support import MssqlScratch, scratch
 from tests.support import requires_mssql
@@ -93,3 +94,34 @@ def test_a_hypothetical_index_is_not_a_key(ms):  # a Tuning Advisor leftover: un
         db.execute(f"CREATE UNIQUE INDEX u_a ON {db.table(table)} (a) WITH STATISTICS_ONLY = -1")
         target = connection.edit_target(db.path(table))
     assert target.reason == NO_KEY
+
+
+def test_graph_and_history_tables_are_read_only(ms):  # G9
+    db, connection = ms
+    with scratch(db) as make:
+        node = make("TABLE", "CREATE TABLE {t} (id int NOT NULL PRIMARY KEY, name nvarchar(50)) AS NODE")
+        edge = make("TABLE", "CREATE TABLE {t} (w int) AS EDGE")
+        plain = make("TABLE", "CREATE TABLE {t} (id int NOT NULL PRIMARY KEY)")
+        found = {name: connection.edit_target(db.path(name)) for name in (node, edge, plain)}
+        history = make("TABLE", "CREATE TABLE {t} (id int NOT NULL, v int, vf datetime2 NOT NULL, vt datetime2 NOT NULL)")
+        current = make("TABLE", "CREATE TABLE {t} (id int NOT NULL PRIMARY KEY, v int, "
+                                "vf datetime2 GENERATED ALWAYS AS ROW START NOT NULL, "
+                                "vt datetime2 GENERATED ALWAYS AS ROW END NOT NULL, PERIOD FOR SYSTEM_TIME (vf, vt)) "
+                                f"WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = {db.table(history)}))")
+        try:
+            found[history] = connection.edit_target(db.path(history))
+            found[current] = connection.edit_target(db.path(current))
+        finally:
+            db.execute(f"ALTER TABLE {db.table(current)} SET (SYSTEM_VERSIONING = OFF)")
+    assert (found[node].reason, found[edge].reason) == ("Graph node and edge tables are read-only here",) * 2
+    assert found[history].reason == "History table of a system-versioned table: read-only here"
+    assert found[current].editable and found[plain].editable
+
+
+def test_the_table_flags_that_make_a_table_read_only():  # G9; a ledger table cannot be dropped, so none is made
+    assert table_flags_reason(0, False, False, 0) is None
+    assert table_flags_reason(2, False, False, 0) is None  # the current table of a system-versioned pair
+    assert table_flags_reason(1, False, False, 0) == HISTORY_TABLE
+    assert table_flags_reason(0, True, False, 0) == table_flags_reason(0, False, True, 0) == GRAPH_TABLE
+    # sys.tables.ledger_type: 1 the ledger's history table, 2 updatable, 3 append-only
+    assert [table_flags_reason(0, False, False, kind) for kind in (1, 2, 3)] == [LEDGER_TABLE] * 3

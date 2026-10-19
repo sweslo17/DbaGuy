@@ -71,14 +71,15 @@ _READ_ONLY_SESSION = "SET SESSION TRANSACTION READ ONLY"
 # diagnostic statement, keeps what SHOW WARNINGS, SHOW ERRORS and GET DIAGNOSTICS report (R-03a-T9e; `DO 0` cleared it).
 _STATUS_PROBE = "SHOW WARNINGS LIMIT 0"
 _PARSE_ERRNOS = frozenset({1064, 1065})  # syntax error, empty query: rejected before anything ran
-_ROWS_MATCHED = re.compile(r"Rows matched: (\d+)")
+_INFO_COUNT = re.compile(r"[0-9]+")  # the server prints the counts with %ld: ASCII digits
 
 
 def rows_matched(info: str | None) -> int | None:
-    """The rows an UPDATE matched, from its OK packet's info (`Rows matched: 1  Changed: 0  Warnings: 0`, ⑤ A1); None
-    for any other statement (an INSERT or a DELETE has no such info)."""
-    found = _ROWS_MATCHED.match(info or "")
-    return int(found.group(1)) if found else None
+    """The rows an UPDATE matched, from its OK packet's info: `Rows matched: 1  Changed: 0  Warnings: 0` (⑤ A1), which
+    lc_messages translates (`Datensätze gefunden: 1  Geändert: 0  Warnungen: 0`, `該当した行: 1  変更: 0  警告: 0`) with
+    the three counts in the same order (ruling G8): the first of exactly three numbers; None otherwise (fail closed)."""
+    counts = _INFO_COUNT.findall(info or "")
+    return int(counts[0]) if len(counts) == 3 else None
 
 
 class _VerbatimCursor(MySQLCursorRaw):
@@ -108,8 +109,9 @@ class _VerbatimCursor(MySQLCursorRaw):
 
 
 class MysqlResult(StatementResult):
-    def __init__(self, owner: "MysqlConnection", cursor: _VerbatimCursor) -> None:
+    def __init__(self, owner: "MysqlConnection", cursor: _VerbatimCursor, *, update: bool = False) -> None:
         self._owner, self._cursor = owner, cursor
+        self._update = update  # an UPDATE: its rows matched are in the OK packet's info (matched_rows)
         self._closed = False
         # After an error packet the statement is over: never ask for another result set (the flags are stale then).
         # A cancel seen after a successful read is not a failure: the rest of the statement is still on the wire.
@@ -145,8 +147,7 @@ class MysqlResult(StatementResult):
         return rowcount if self._columns is None and rowcount >= 0 else None
 
     def matched_rows(self) -> int | None:
-        matched = rows_matched(self._cursor.ok_info)
-        return matched if matched is not None else self.affected_rows()
+        return rows_matched(self._cursor.ok_info) if self._update else self.affected_rows()
 
     def next_result(self) -> bool:
         if self._closed or self._failed:
@@ -384,7 +385,8 @@ class MysqlConnection(DatabaseConnection, RowEditing):
 
     def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
         self._killed.clear()
-        if _MENTIONS_AUTOCOMMIT.search(sql) or first_keyword(sql, Dialect.MYSQL) in _MAY_SET_AUTOCOMMIT:
+        keyword = first_keyword(sql, Dialect.MYSQL)
+        if _MENTIONS_AUTOCOMMIT.search(sql) or keyword in _MAY_SET_AUTOCOMMIT:
             self._autocommit_stale = True
         # Right before the first send, after the clear: a cancel kept while armed means nothing is sent; from here
         # one sets the KILL flag and KILLs.
@@ -398,7 +400,7 @@ class MysqlConnection(DatabaseConnection, RowEditing):
             with suppress(mysql.connector.Error):
                 cursor.close()
             raise error from exc
-        result = MysqlResult(self, cursor)
+        result = MysqlResult(self, cursor, update=keyword == "UPDATE")
         if self._killed.is_set():  # it ended normally after KILL QUERY (SLEEP() returns 1): still a cancel
             result.close()  # finish() clears the flag
             raise StatementCancelled()

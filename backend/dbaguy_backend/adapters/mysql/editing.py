@@ -62,7 +62,10 @@ def edit_target(conn: MySQLConnection, path: list[PathSegment]) -> EditTarget:
     table_type, transactions = found
     if table_type != "BASE TABLE":
         return read_only_relation(path, VIEWS if table_type == "VIEW" else "System views are read-only here")
-    columns = [_column(*row) for row in catalog.query(conn, _COLUMNS, (schema, name))]
+    # An INVISIBLE column is not in the grid's SELECT *: it is left out of the target, so it is never the key (a generated
+    # invisible primary key, my_row_id: the key is then a visible unique key, or there is none)
+    columns = [_column(*row) for row in catalog.query(conn, _COLUMNS, (schema, name))
+               if "INVISIBLE" not in (row[5] or "").upper()]
     parts: dict[str, list[str | None]] = {}
     for index, column in catalog.query(conn, _KEYS, (schema, name)):
         parts.setdefault(index, []).append(column)

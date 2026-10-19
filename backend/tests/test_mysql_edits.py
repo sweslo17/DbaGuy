@@ -26,8 +26,39 @@ def my():
 def test_rows_matched_is_read_from_an_updates_info():  # A1
     assert rows_matched("Rows matched: 1  Changed: 0  Warnings: 0") == 1
     assert rows_matched("Rows matched: 12  Changed: 3  Warnings: 1") == 12
-    assert rows_matched("Records: 2  Duplicates: 0  Warnings: 0") is None
-    assert rows_matched(None) is None
+    assert rows_matched("Datensätze gefunden: 2  Geändert: 0  Warnungen: 0") == 2  # lc_messages (G8)
+    assert rows_matched("일치하는 Rows : 3개 변경됨: 2개  경고: 1개") == 3
+    assert rows_matched("Rows matched: 1") is None
+    assert rows_matched("") is None and rows_matched(None) is None
+
+
+def test_matched_rows_under_a_translated_lc_messages(my):  # G8
+    db, connection = my
+    with scratch(db) as make:
+        table = db.table(items_table(db, make))
+        connection.run("SET SESSION lc_messages = 'de_DE'").close()
+
+        def counts(sql):
+            result = connection.run(sql)
+            try:
+                return result.matched_rows(), result.affected_rows()
+            finally:
+                result.close()
+
+        assert counts(f"UPDATE {table} SET label = 'a' WHERE id = 1") == (1, 0)
+        assert counts(f"INSERT INTO {table} (id, label) VALUES (5, 'e'), (6, 'f')") == (2, 2)  # Records: … not read
+
+
+def test_an_invisible_key_column_is_not_a_key(my):  # SELECT * leaves it out (a generated invisible primary key)
+    db, connection = my
+    with scratch(db) as make:
+        hidden = make("TABLE", "CREATE TABLE {t} (my_row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT INVISIBLE "
+                               "PRIMARY KEY, code INT NOT NULL, UNIQUE KEY u_code (code))")
+        only = make("TABLE", "CREATE TABLE {t} (my_row_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT INVISIBLE "
+                             "PRIMARY KEY, v INT)")
+        found = {name: connection.edit_target(db.path(name)) for name in (hidden, only)}
+    assert (found[hidden].key, found[hidden].key_source) == (["code"], "unique")
+    assert found[only].reason == NO_KEY
 
 
 def test_an_update_to_the_same_value_still_matched_its_row(my):  # D-05-5: affected rows would say 0
