@@ -10,7 +10,9 @@ their events, so no row is lost to it.
 Rows keep the server's exact text (`RawRow.text`, and each member's text for an object row): numbers are never turned
 into Python numbers here (`1.10`, `-0`, `1E+3`, `9007199254740993`, `1e400` stay as sent), keys stay in order. A row's
 `value` is decoded with numbers left as text, so it only means something for strings, true, false and null; the cell
-decision (Task 8's `value_cell`) reads the text.
+decision (Task 8's `value_cell`) reads the text. An object or array inside a row is located with `jsontext.value_end`
+(checked by the C decoder, never decoded) and its `value` is None: a 20 MiB document costs about three times its text
+while it is parsed, not a tree (ruling C9).
 
 How bytes become events:
 - A strict incremental UTF-8 decoder (a character cut between chunks waits for its other bytes).
@@ -30,10 +32,13 @@ How bytes become events:
 import codecs
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from json.decoder import scanstring
 from typing import Any, Literal, NoReturn
+
+from ...sql.jsontext import value_end
 
 JsonKind = Literal["string", "number", "boolean", "null", "object", "array"]
 
@@ -41,7 +46,7 @@ JsonKind = Literal["string", "number", "boolean", "null", "object", "array"]
 @dataclass(frozen=True, slots=True)
 class RowField:
     """One member of an object row: its key, the value's exact text, and the value decoded with numbers left as text
-    (meaningful only for strings, true, false and null)."""
+    (meaningful only for strings, true, false and null; None for an object or an array, which is located, not built)."""
 
     key: str
     text: str
@@ -51,7 +56,7 @@ class RowField:
 @dataclass(frozen=True, slots=True)
 class RawRow:
     """One row as sent. `fields`: the members of an object row in order (then `value` is None); None for any other row
-    (then `value` as in RowField)."""
+    (then `value` as in RowField: None for an array)."""
 
     text: str
     value: Any
@@ -119,6 +124,11 @@ _ROW_DECODER = json.JSONDecoder(parse_int=str, parse_float=str, parse_constant=_
 # Top-level metadata (signature, errors, warnings, status, metrics, profile): small, decoded as usual.
 _META_DECODER = json.JSONDecoder(parse_constant=_reject_constant)
 
+# A scan: the value at s[i] and the index after it (json.JSONDecodeError when there is no complete value there).
+_Scan = Callable[[str, int], tuple[Any, int]]
+_META = _META_DECODER.raw_decode
+_SCALAR = _ROW_DECODER.raw_decode  # strings, numbers (as text), true, false, null
+
 
 class _Incomplete(Exception):
     """The buffer ends inside the value being read: wait for more."""
@@ -152,9 +162,9 @@ def _failure(exc: json.JSONDecodeError, s: str, eof: bool) -> Exception:
     return ValueError(f"malformed JSON ({exc.msg})")
 
 
-def _decode(decoder: json.JSONDecoder, s: str, i: int, eof: bool) -> tuple[Any, int]:
+def _decode(scan: _Scan, s: str, i: int, eof: bool) -> tuple[Any, int]:
     try:
-        value, end = decoder.raw_decode(s, i)
+        value, end = scan(s, i)
     except json.JSONDecodeError as exc:
         raise _failure(exc, s, eof) from None
     if end < len(s) and s[end] not in _FOLLOWERS:
@@ -166,6 +176,16 @@ def _decode(decoder: json.JSONDecoder, s: str, i: int, eof: bool) -> tuple[Any, 
         # `[1,2` is `[1,23` cut short, not a row `2`.
         raise _short(eof, "the text ends after a value")
     return value, end
+
+
+def _located(s: str, i: int) -> tuple[None, int]:
+    """An object or array inside a row: where it ends, checked but never built (its text is all a cell needs)."""
+    return None, value_end(s, i)
+
+
+def _row_value(s: str, i: int, eof: bool) -> tuple[Any, int]:
+    """A row, or a member of an object row: an object or array is located only (value None), anything else decoded."""
+    return _decode(_located if s[i:i + 1] in ("{", "[") else _SCALAR, s, i, eof)
 
 
 def _scan_object(s: str, start: int, eof: bool) -> tuple[tuple[RowField, ...], int]:
@@ -189,7 +209,7 @@ def _scan_object(s: str, start: int, eof: bool) -> tuple[tuple[RowField, ...], i
         if s[i] != ":":
             raise ValueError("expected a colon")
         i = _skip(s, i + 1)
-        value, end = _decode(_ROW_DECODER, s, i, eof)
+        value, end = _row_value(s, i, eof)
         fields.append(RowField(key, s[i:end], value))
         i = _skip(s, end)
         if i >= len(s):
@@ -222,7 +242,7 @@ def parse_row(text: str) -> RawRow:
             raise ValueError("text after the row")
         return RawRow(text, None, fields)
     # _decode refuses a value at the very end of its input (a number may go on): give it one delimiter after the text
-    value, end = _decode(_ROW_DECODER, text + ",", 0, eof=True)
+    value, end = _row_value(text + ",", 0, eof=True)
     if end != len(text):
         raise ValueError("text after the row")
     return RawRow(text, value, None)
@@ -356,7 +376,7 @@ class ResponseParser:
                     self._pos, self._state = i + 1, _State.FIRST_ROW
                     return
                 self.attempts += 1
-                value, end = _decode(_META_DECODER, s, i, eof)
+                value, end = _decode(_META, s, i, eof)
                 events.append(FieldEvent(self._key, value, s[i:end]))
                 self._pos, self._state = end, _State.AFTER_VALUE
             case _State.AFTER_VALUE:
@@ -389,7 +409,7 @@ class ResponseParser:
             fields, end = _scan_object(s, i, eof)
             row = RawRow(s[i:end], None, fields)
         else:
-            value, end = _decode(_ROW_DECODER, s, i, eof)
+            value, end = _row_value(s, i, eof)
             row = RawRow(s[i:end], value, None)
         self._pos = end
         return row

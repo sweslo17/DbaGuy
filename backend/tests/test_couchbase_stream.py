@@ -1,12 +1,13 @@
 import json
 import random
 import time
+import tracemalloc
 
 import pytest
 
 from dbaguy_backend.adapters.couchbase.stream import (
-    EndEvent, FieldEvent, ProtocolError, ResponseParser, ResultsEnd, ResultsStart, RowEvent, RowField, json_kind,
-    split_object,
+    EndEvent, FieldEvent, ProtocolError, RawRow, ResponseParser, ResultsEnd, ResultsStart, RowEvent, RowField,
+    json_kind, parse_row, split_object,
 )
 from tests.support import scaled
 
@@ -108,7 +109,69 @@ def test_scalar_rows_keep_their_text():
     rows = [e.row for e in parse(RAW, []) if isinstance(e, RowEvent)]
     assert [r.text for r in rows] == ["1e400", "-0.0", "12345678901234567890", '"x"', "null", "true", "[1, 2]", '{"a": {}}']
     assert (rows[3].value, rows[4].value, rows[5].value, rows[0].fields) == ("x", None, True, None)
-    assert rows[7].fields == (RowField("a", "{}", {}),)
+    assert rows[7].fields == (RowField("a", "{}", None),)
+
+
+def test_nested_values_are_located_not_built():  # ruling C9: a cell needs the text only
+    rows = [e.row for e in parse(FULL, []) if isinstance(e, RowEvent)]
+    assert rows[0].fields[1].value is None and rows[0].fields[1].text.startswith('{"name":"中文😀"')
+    assert rows[2].fields[1].value == "just a string"
+    raw = [e.row for e in parse(RAW, []) if isinstance(e, RowEvent)]
+    assert (raw[6].text, raw[6].value) == ("[1, 2]", None)
+    assert [f.value for f in split_object('{"a":{"x":1e400},"b":[],"c":"s","n":-1.10}')] == [None, None, "s", "-1.10"]
+    assert all(parse_row(row.text) == row for row in rows + raw)
+
+
+@pytest.mark.parametrize("data", [
+    b'{"results":[{"a":[1,}]}', b'{"results":[[1,{"x":tru}]]}', b'{"results":[{"a":{"b":NaN}}]}',
+    b'{"results":[{"a":{"b":1 "c":2}}]}',
+])
+def test_malformed_nested_values_are_still_reported(data):
+    for cut in range(len(data) + 1):
+        events, error = parse_until_failure(data, [cut])
+        assert not error.truncated, cut
+
+
+def _big_document(shape: str, size: int) -> str:
+    """A JSON object of about `size` characters: many small objects, many numbers, or many short strings."""
+    rng = random.Random(7)
+    parts, length, i = [], 0, 0
+    while length < size:
+        if shape == "objects":
+            part = json.dumps({"id": i, "name": f"name {i}", "price": round(rng.random() * 1000, 2),
+                               "tags": ["a", "b", str(i)], "nested": {"x": i, "y": [1, 2, {"z": 'q"<>'}], "f": True}})
+        elif shape == "numbers":
+            part = str(rng.randrange(10**6))
+        else:
+            part = json.dumps(f"s{i}")
+        parts.append(part)
+        length += len(part) + 1
+        i += 1
+    return '{"items":[' + ",".join(parts) + "]}"
+
+
+def _first_row(data: bytes) -> RawRow:
+    parser, events = ResponseParser(), []
+    for i in range(0, len(data), 64 * 1024):  # as the wire delivers it
+        events += parser.feed(data[i:i + 64 * 1024])
+    events += parser.finish()
+    return next(e.row for e in events if isinstance(e, RowEvent))
+
+
+@pytest.mark.parametrize("shape, peak_limit", [("objects", 4.0), ("numbers", 4.0), ("strings", 8.0)])
+def test_a_big_document_costs_its_text_not_a_decoded_tree(shape, peak_limit):  # Review Focus 5, ruling C9
+    doc = _big_document(shape, 4 * 1024 * 1024)
+    data = ('{"signature":{"cas":"json","expiration":"json","type":"json","d":"json"},"results":['
+            '{"cas":1792325990605258752,"expiration":0,"type":"json","d":' + doc + '}],"status":"success"}').encode()
+    tracemalloc.start()
+    try:
+        row = _first_row(data)
+        held, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert row.fields[3].text == doc and row.fields[3].value is None
+    assert peak < peak_limit * len(doc), peak / len(doc)  # decoding the tree took 9.3×, 11.1× and 8.7×
+    assert held < 2.5 * len(doc), held / len(doc)  # the row's text and the member's text
 
 
 def test_numbers_in_rows_never_pass_through_a_python_number():  # R-04a-C13: the cell decision (Task 8) gets the text
