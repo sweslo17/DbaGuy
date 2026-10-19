@@ -101,7 +101,9 @@ export interface PlanResultProps {
  */
 export function PlanResult({ set, execution, profileId, edition, grid, stale = false }: PlanResultProps) {
   const source = useMemo(() => planSource(set.rows), [set.rows]);
-  const analysed = usePlanView(source.kind === "text" ? source.text : null);
+  const analysed = usePlanView(
+    source.kind === "text" ? { requestId: execution.requestId, setIndex: set.index, text: source.text } : null,
+  );
   const [mode, setMode] = useState<Mode>("plan");
   /** The grid mounts the first time it is shown and then stays, so its scroll and widths survive the switch. */
   const [gridShown, setGridShown] = useState(false);
