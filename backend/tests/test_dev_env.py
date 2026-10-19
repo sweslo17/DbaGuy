@@ -6,6 +6,7 @@ import psycopg
 import pytest
 from pymssql import _mssql
 
+from tests.edit_support import ENGINES, SCRATCH_PREFIX, items_table, scratch, scratch_db
 from tests.fake_ssh import wait_until
 from tests.support import (
     COUCHBASE_HOST,
@@ -198,3 +199,19 @@ def test_scratch_documents_are_stored_as_sent_and_removed():
         assert stored_document(binary).type == "base64"
         assert stored_document(expiring).expiration == 2_000_000_000
     assert [stored_document(key) for key in (text, binary, expiring)] == [None, None, None]
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_scratch_objects_are_made_and_dropped_by_exact_name(engine, tmp_path):
+    db = scratch_db(engine, tmp_path)
+    try:
+        with scratch(db) as make:
+            table = items_table(db, make)
+            assert table.startswith(SCRATCH_PREFIX + "table_")
+            assert db.rows(f"SELECT id, label FROM {db.table(table)} ORDER BY id") == [(1, "a"), (2, "b"), (3, "c")]
+            db.fill(db.table(table), 1000, 100)
+            assert db.rows(f"SELECT COUNT(*) FROM {db.table(table)}") == [(1003,)]
+        with pytest.raises(Exception):  # the driver's own "no such table" error
+            db.rows(f"SELECT 1 FROM {db.table(table)}")
+    finally:
+        db.close()
