@@ -34,6 +34,12 @@ export interface QueryTabState {
    * session's); "none" is the user's choice of no context (ruling B14). The tab keeps `database = null` (ruling B15).
    */
   queryContext?: QueryContext | "none";
+  /**
+   * Couchbase: the parameter panel's drafts, keyed `$name` / `$n`, each the text as typed (valid JSON or not yet).
+   * Kept for names the statements no longer use, so a name that comes back finds its value; undefined: none.
+   * `workspace.json` keeps them through `savedParams` (ruling B40).
+   */
+  params?: Record<string, string>;
 }
 
 /** A relation (table, view, materialized view, partition): its data, columns and DDL. */

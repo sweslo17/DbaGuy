@@ -1,6 +1,7 @@
 import type { EditorView } from "@codemirror/view";
-import type { Dialect } from "@/lib/api/types";
+import type { Dialect, StatementParams } from "@/lib/api/types";
 import { currentStatements, rangeAt, splitText, type StatementRange } from "../editor/statements";
+import { paramsFor, type ParamProblem } from "./params";
 
 /** ⌘↵ runs by the `run.default` setting (or the selection); ⌘⇧↵ runs every statement. */
 export type RunMode = "default" | "all";
@@ -8,7 +9,9 @@ export type RunMode = "default" | "all";
 /**
  * One statement to send: its text and where it is in the editor (UTF-16 offsets, without the `;`). `repeat` is how
  * many times it is sent (T-SQL `GO n`; 1 otherwise, 0 for `GO 0`). `position` is its place in the run plan (0-based):
- * what the user counts, kept when `GO 0` batches are dropped and `GO n` copies are made.
+ * what the user counts, kept when `GO 0` batches are dropped and `GO n` copies are made. `params` are the parameters
+ * it uses (SQL++, see `StatementRange`); `values` is what it is sent with, set by the tab once every one has a value
+ * (`bindParams`): undefined or null sends none.
  */
 export interface PlannedStatement {
   sql: string;
@@ -16,6 +19,8 @@ export interface PlannedStatement {
   to: number;
   repeat: number;
   position: number;
+  params: string[];
+  values?: StatementParams | null;
 }
 
 /**
@@ -38,6 +43,7 @@ export async function planRun(
       to: selection.from + r.to,
       repeat: r.repeat,
       position,
+      params: r.params,
     }));
   }
   const { state, ranges } = await currentStatements(view, dialect);
@@ -45,7 +51,31 @@ export async function planRun(
   const chosen: (StatementRange | null)[] = all ? ranges : [rangeAt(ranges, state.selection.main.head)];
   return chosen
     .filter((r) => r !== null)
-    .map((r, position) => ({ sql: state.sliceDoc(r.from, r.to), from: r.from, to: r.to, repeat: r.repeat, position }));
+    .map((r, position) => ({
+      sql: state.sliceDoc(r.from, r.to),
+      from: r.from,
+      to: r.to,
+      repeat: r.repeat,
+      position,
+      params: r.params,
+    }));
+}
+
+/**
+ * The statements with the values they are sent with, from the tab's drafts; or the first parameter that has none (or
+ * text that is not JSON), when nothing may be sent or analysed.
+ */
+export function bindParams(
+  planned: readonly PlannedStatement[],
+  drafts: Readonly<Record<string, string>>,
+): { statements: PlannedStatement[] } | ParamProblem {
+  const statements: PlannedStatement[] = [];
+  for (const statement of planned) {
+    const result = paramsFor(statement.params, drafts);
+    if ("problem" in result) return result;
+    statements.push({ ...statement, values: result.params });
+  }
+  return { statements };
 }
 
 /**

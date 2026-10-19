@@ -1,10 +1,12 @@
 import { Prec, type Extension } from "@codemirror/state";
 import { keymap, placeholder, type EditorView } from "@codemirror/view";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { Group, Panel } from "react-resizable-panels";
 import { PanelHandle } from "@/components/ui/PanelHandle";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
+import { isImeKeyEvent } from "@/lib/ime";
+import { isCommandKey } from "@/lib/shortcuts";
 import { markEdited, readEditorBuffer, registerEditor, rememberEditorBuffer } from "@/stores/editorBuffers";
 import { useAppSettings } from "@/stores/settings";
 import { useReportTabStatus } from "@/stores/tabStatus";
@@ -27,17 +29,20 @@ import { useSession } from "../session/useSession";
 import { useScriptBinding } from "../scripts/useScriptBinding";
 import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
 import { ConfirmRunDialog } from "./ConfirmRunDialog";
+import { NO_SLOTS, paramsWatcher, problemMessage, type ParamProblem } from "./params";
+import { ParamsPanel } from "./ParamsPanel";
 import { QueryToolbar } from "./QueryToolbar";
 import { ResultsArea } from "./ResultsArea";
 import { beginRunMarks, errorLocation, flashStatement, jumpToError, markStatementError } from "./runMarks";
 import { effectiveContext, seenFieldsOf } from "./queryContext";
-import { planRun, type PlannedStatement, type RunMode } from "./runPlan";
+import { bindParams, planRun, type PlannedStatement, type RunMode } from "./runPlan";
 import { useQueryTabActions } from "./tabActions";
 import { useQueryRunner, type RunListener } from "./useQueryRunner";
 import { useTransactionControls } from "./useTransactionControls";
 
 const NO_EXECUTIONS: Record<string, ExecutionState> = {};
 const NO_FIELDS: string[] = [];
+const NO_DRAFTS: Record<string, string> = {};
 
 /**
  * A query tab (spec §3.5, §4.1, §4.2): toolbar, then the editor above the results. Its session opens the first time
@@ -48,7 +53,10 @@ const NO_FIELDS: string[] = [];
  * closing also asks about unsaved script changes. The tab hosts the export dialog, so it outlives the result grids. A
  * long run that ends while DbaGuy is in the background notifies. For Couchbase the tab has a query context (picked in
  * the toolbar, or by a click on the tree, or the one a browse tab or History entry opened with), which every run, export
- * and completion request carries; without a choice it follows the profile's default.
+ * and completion request carries; without a choice it follows the profile's default. For an engine that takes
+ * parameters (Couchbase) a bar at the bottom of the editor pane holds one field per parameter the statements use
+ * (JSON literals, kept with the tab in the workspace): a run needs a valid value for every parameter of the statements
+ * it sends, and each statement is sent with its own.
  */
 export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean }) {
   const { settings } = useAppSettings();
@@ -65,6 +73,24 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   const transactions = engine?.transactions;
   const profiles = useProfiles();
   const updateTab = useWorkspace((s) => s.updateTab);
+  // SQL++ parameters: the fields come from the editor's split (`paramsWatcher`), the values are the tab's drafts.
+  const takesParams = !!engine?.parameters;
+  const drafts = tab.params ?? NO_DRAFTS;
+  const draftsRef = useRef(drafts);
+  useLayoutEffect(() => {
+    draftsRef.current = drafts;
+  });
+  const [slots, setSlots] = useState(NO_SLOTS);
+  const [paramsOpen, setParamsOpen] = useState(true);
+  /** The field a refused run asks the panel to focus; cleared once the panel has had it (the same one may repeat). */
+  const [focusParam, setFocusParam] = useState<string | null>(null);
+  useEffect(() => {
+    if (focusParam !== null) setFocusParam(null);
+  }, [focusParam]);
+  const changeParam = useCallback(
+    (name: string, text: string) => updateTab(tab.id, "query", { params: { ...draftsRef.current, [name]: text } }),
+    [tab.id, updateTab],
+  );
   const editor = useRef<CodeEditorHandle>(null);
   const view = () => editor.current?.view ?? null;
   const withView = (fn: (v: EditorView) => void) => {
@@ -189,6 +215,13 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     [],
   );
 
+  /** A run that cannot start for want of a parameter's value: says which, and opens the panel on its field. */
+  const refuseRun = (problem: ParamProblem) => {
+    toast("error", problemMessage(problem));
+    setParamsOpen(true);
+    setFocusParam(problem.name);
+  };
+
   const planning = useRef(false);
   const start = async (mode: RunMode) => {
     const current = view();
@@ -207,8 +240,18 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
       } finally {
         setSplitting(false);
       }
-      if (planCancelled.current) return;
-      if (planned.length) await runner.start(planned, { unchanged: () => view()?.state.doc === plannedDoc });
+      if (planCancelled.current || !planned.length) return;
+      let statements = planned;
+      if (takesParams) {
+        // Before anything is analysed or sent: a statement needs a valid value for each parameter it uses.
+        const bound = bindParams(planned, draftsRef.current);
+        if ("problem" in bound) {
+          refuseRun(bound);
+          return;
+        }
+        statements = bound.statements;
+      }
+      await runner.start(statements, { unchanged: () => view()?.state.doc === plannedDoc });
     } finally {
       planning.current = false;
     }
@@ -231,6 +274,15 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     commit: { enabled: transactions !== false && canEnd, run: transaction.commit },
     rollback: { enabled: transactions !== false && canEnd, run: transaction.rollback },
   });
+
+  // ⌘↵ and ⌘⇧↵ run from a parameter's field as they do in the editor (which handles its own keys and prevents them).
+  const runFromParams = (e: KeyboardEvent<HTMLElement>) => {
+    if (isImeKeyEvent(e) || e.defaultPrevented || !(e.target instanceof HTMLInputElement)) return;
+    const mode = isCommandKey(e, "enter") ? "default" : isCommandKey(e, "enter", { shift: true }) ? "all" : null;
+    if (!mode) return;
+    e.preventDefault();
+    void start(mode);
+  };
 
   // The editor's keymap is built once: it calls the latest `start`, `format` and script commands through refs.
   const startRef = useRef(start);
@@ -276,6 +328,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     errorMarksExtension(),
     sqlCompletion(() => editorTarget.current),
     describeOnDemand(() => editorTarget.current),
+    paramsWatcher(setSlots),
   ]);
 
   // The split depends on the dialect, which is known only once the profiles have loaded (or a connection is chosen).
@@ -363,29 +416,47 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
       <div className="min-h-0 flex-1">
         <Group orientation="vertical">
           <Panel id="editor" defaultSize="55%" minSize="15%">
-            {/* The connection's colour as the editor's top border. */}
-            <div className="relative h-full" style={tint ? { borderTop: `2px solid ${tint}` } : undefined}>
-              {script.loading && (
-                <span
-                  className="pointer-events-none absolute top-1 right-3 z-10 animate-delayed-show text-[11px] text-muted"
-                >
-                  Loading…
-                </span>
+            {/* The connection's colour as the editor's top border; the parameters' bar sits under the editor. */}
+            <div
+              className="flex h-full flex-col"
+              style={tint ? { borderTop: `2px solid ${tint}` } : undefined}
+              onKeyDown={runFromParams}
+            >
+              <div className="relative min-h-0 flex-1">
+                {script.loading && (
+                  <span
+                    className="pointer-events-none absolute top-1 right-3 z-10 animate-delayed-show text-[11px] text-muted"
+                  >
+                    Loading…
+                  </span>
+                )}
+                <div className="absolute inset-0">
+                  <CodeEditor
+                    ref={editor}
+                    initialText={remembered?.text ?? tab.initialText}
+                    initialSelection={initialSelection}
+                    dialect={dialect}
+                    readOnly={script.loading}
+                    extensions={extensions}
+                    onChange={() => {
+                      markEdited();
+                      script.docChanged();
+                    }}
+                    onSelectionChange={markEdited}
+                    onUnmount={(content) => rememberEditorBuffer(tab.id, content)}
+                  />
+                </div>
+              </div>
+              {takesParams && slots.named.length + slots.positional > 0 && (
+                <ParamsPanel
+                  slots={slots}
+                  drafts={drafts}
+                  open={paramsOpen}
+                  focus={focusParam}
+                  onToggle={() => setParamsOpen((open) => !open)}
+                  onChange={changeParam}
+                />
               )}
-              <CodeEditor
-                ref={editor}
-                initialText={remembered?.text ?? tab.initialText}
-                initialSelection={initialSelection}
-                dialect={dialect}
-                readOnly={script.loading}
-                extensions={extensions}
-                onChange={() => {
-                  markEdited();
-                  script.docChanged();
-                }}
-                onSelectionChange={markEdited}
-                onUnmount={(content) => rememberEditorBuffer(tab.id, content)}
-              />
             </div>
           </Panel>
           <PanelHandle orientation="vertical" />

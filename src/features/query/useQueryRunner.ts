@@ -105,7 +105,8 @@ interface ActiveRun {
 /**
  * Runs planned statements on the tab's session (spec §4.1): one `/sql/analyze` for all of them and one confirmation
  * dialog for the flagged ones up front, then one execute per statement, each awaited until it is done or paused
- * (`GO n` sends its batch n times, each an execute of its own). An error stops the run unless `run.continue_on_error`;
+ * (`GO n` sends its batch n times, each an execute of its own), with the parameter values the tab bound to it
+ * (`PlannedStatement.values`). An error stops the run unless `run.continue_on_error`;
  * cancel stops the running statement and the run. A new run forgets the previous run's results. The run belongs to the
  * controller it ran on: a new session starts empty.
  */
@@ -194,6 +195,7 @@ export function useQueryRunner({ controller, profileId, settings, timeoutS, quer
           confirmed: agreed,
           history: true,
           queryContext: job.queryContext,
+          params: planned[index].values ?? null,
         });
         job.requestId = requestId;
         setStep(index, { requestId, status: "running" });
