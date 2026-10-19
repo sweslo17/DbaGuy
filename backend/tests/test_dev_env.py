@@ -21,11 +21,15 @@ from tests.support import (
     mssql_connect,
     mysql_driver_kwargs,
     plan_fixture,
+    put_raw_document,
     request_active,
     requires_couchbase,
     requires_mssql,
     requires_mysql,
     requires_pg,
+    scratch_documents,
+    scratch_key,
+    stored_document,
 )
 
 
@@ -179,3 +183,18 @@ def test_request_active_follows_a_request():
 ])
 def test_plan_fixtures_hold_the_server_shapes(name, key):  # files only: no cluster needed
     assert key in json.loads(plan_fixture(name))
+
+
+@requires_couchbase
+def test_scratch_documents_are_stored_as_sent_and_removed():
+    with scratch_documents() as keys:
+        text, binary, expiring = scratch_key("t"), scratch_key("b"), scratch_key("x")
+        keys += [text, binary, expiring]
+        put_raw_document(text, '{"b": 1,\n "a": 1.10}')
+        put_raw_document(binary, "not json")
+        put_raw_document(expiring, '{"a":1}', expiry=2_000_000_000)
+        assert stored_document(text).text == '{"b": 1,\n "a": 1.10}'
+        assert stored_document(text).cas.isdigit() and stored_document(text).type == "json"
+        assert stored_document(binary).type == "base64"
+        assert stored_document(expiring).expiration == 2_000_000_000
+    assert [stored_document(key) for key in (text, binary, expiring)] == [None, None, None]

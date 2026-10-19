@@ -6,11 +6,12 @@ import json
 import os
 import socket
 import time
+import urllib.parse
 from collections.abc import Iterator
 from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import uuid4
 
 import mysql.connector
@@ -19,6 +20,7 @@ import pytest
 from pymssql import _mssql
 
 from dbaguy_backend.domain.profiles import ServerProfile, SslConfig
+from dbaguy_backend.sql.dialects import keyspace_path
 
 PG_HOST = "127.0.0.1"
 PG_PORT = int(os.environ.get("DBAGUY_TEST_PG_PORT", "54317"))
@@ -264,6 +266,100 @@ def request_active(client_context_id: str) -> bool:
     """Whether the query service is running that request now (system:active_requests, admin)."""
     statement = "SELECT RAW r.state FROM system:active_requests AS r WHERE r.clientContextID = $id"
     return bool(couchbase_query(statement, {"$id": client_context_id})["results"])
+
+
+SCRATCH_BUCKET = "dbaguy"
+SCRATCH_SCOPE = "app"
+SCRATCH_COLLECTION = "orders"
+SCRATCH_PREFIX = "zz_04c_"  # a test writes only keys with this prefix, and only in app.orders (never app.users)
+_KEY_GONE = "Key doesn't exist"  # the docs endpoint's 400 for a key that is already gone (7.6.12)
+
+
+def scratch_key(tag: str = "") -> str:
+    return SCRATCH_PREFIX + tag + uuid4().hex[:10]
+
+
+def _docs_request(method: str, key: str, scope: str, collection: str, body: str | None = None) -> tuple[int, str]:
+    """One request to the cluster manager's documents endpoint (what the web console uses): (status, body text)."""
+    path = (
+        f"/pools/default/buckets/{SCRATCH_BUCKET}/scopes/{scope}/collections/{collection}"
+        f"/docs/{urllib.parse.quote(key, safe='')}"
+    )
+    headers = {"Authorization": _basic(COUCHBASE_USER, COUCHBASE_PASSWORD)}
+    if body is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    conn = http.client.HTTPConnection(COUCHBASE_HOST, COUCHBASE_MANAGER_PORT, timeout=30)
+    try:
+        conn.request(method, path, body=body, headers=headers)
+        response = conn.getresponse()
+        return response.status, response.read().decode("utf-8", "replace")
+    finally:
+        conn.close()
+
+
+def put_raw_document(
+    key: str,
+    text: str,
+    *,
+    expiry: int | None = None,
+    scope: str = SCRATCH_SCOPE,
+    collection: str = SCRATCH_COLLECTION,
+) -> None:
+    """Stores `text` byte for byte as the document `key` (SQL++ would normalise it). A text that is not JSON becomes a
+    binary document (`META().type` `base64`). `expiry`: an absolute Unix time, at most 2147483647 (A31)."""
+    form = {"value": text} | ({} if expiry is None else {"expiry": str(expiry)})
+    status, answer = _docs_request("POST", key, scope, collection, urllib.parse.urlencode(form))
+    assert status == 200, f"storing {key!r} answered {status}: {answer}"
+
+
+def delete_documents(*keys: str, scope: str = SCRATCH_SCOPE, collection: str = SCRATCH_COLLECTION) -> None:
+    """Removes the documents by exact key. Every key is tried before the one assertion, so a failure never leaves the
+    later keys behind. A key that is already gone answers 400 `Key doesn't exist`: fine; a 404 means the collection is
+    missing."""
+    failed = []
+    for key in keys:
+        status, answer = _docs_request("DELETE", key, scope, collection)
+        if status != 200 and not (status == 400 and _KEY_GONE in answer):
+            failed.append(f"{key!r}: {status} {answer}")
+    assert not failed, "removing failed for " + "; ".join(failed)
+
+
+class StoredDocument(NamedTuple):
+    text: str  # the stored text exactly as the query service sends it
+    cas: str  # the decimal text of the CAS
+    expiration: int
+    type: str  # `json` or `base64`
+
+
+def stored_document(
+    key: str, *, scope: str = SCRATCH_SCOPE, collection: str = SCRATCH_COLLECTION
+) -> StoredDocument | None:
+    """The document `key` as the store reads it (04c: one SELECT … USE KEYS), or None when there is none."""
+    from dbaguy_backend.adapters.couchbase.stream import FieldEvent, ResponseParser, RowEvent
+
+    statement = (
+        "SELECT META(d).cas AS cas, META(d).expiration AS e, META(d).type AS t, d "
+        f"FROM {keyspace_path(SCRATCH_BUCKET, scope, collection)} AS d USE KEYS $k"
+    )
+    parser = ResponseParser()
+    events = parser.feed(couchbase_query_text(statement, {"$k": key}).encode()) + parser.finish()
+    errors = [event.value for event in events if isinstance(event, FieldEvent) and event.name == "errors"]
+    assert not errors, f"reading {key!r} failed: {errors}"
+    row = next((event.row for event in events if isinstance(event, RowEvent)), None)
+    if row is None:
+        return None
+    fields = {member.key: member for member in row.fields}
+    return StoredDocument(fields["d"].text, fields["cas"].text, int(fields["e"].text), json.loads(fields["t"].text))
+
+
+@contextmanager
+def scratch_documents() -> Iterator[list[str]]:
+    """The list a test appends its scratch keys to; whatever happens, they are removed by exact key afterwards."""
+    keys: list[str] = []
+    try:
+        yield keys
+    finally:
+        delete_documents(*keys)
 
 
 def _couchbase_ready() -> bool:
