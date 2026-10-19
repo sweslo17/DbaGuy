@@ -32,7 +32,7 @@ import { useDocumentSave } from "./useDocumentSave";
 const READ_ONLY_NOTICE = "Read-only connection: documents open for reading";
 const CHANGED_NOTICE = "The document changed on the server after these edits were made: saving will report a conflict";
 const MISSING_WITH_EDITS_NOTICE =
-  "The document no longer exists: Create it saves these edits as a new document";
+  "The document no longer exists: Create it to keep these edits as a new document (⌘S saves it)";
 
 const NOTICE_TONES = { muted: "text-muted", warning: "text-warning", danger: "text-danger" } as const;
 
@@ -159,7 +159,7 @@ export function DocumentTab({ tab, active }: { tab: DocumentTabState; active: bo
   useReportTabStatus(tab.id, { busy: load.status === "loading" || saving.busy, dirty: tab.dirty });
 
   const panel = panelOf(load, tab.dirty);
-  // Never while a write is in flight or waits for the user (ruling C14): its answer replaces the baseline.
+  // Never while a write is in flight or its preview waits for the user (ruling C14): its answer replaces the baseline.
   const editable = canEdit(load, readOnlyProfile, doc.saving);
   const binary = load.status === "ready" && load.meta.type === "base64";
   // Save and Delete… exist for documents that can be written (never a binary one, never on a read-only connection).

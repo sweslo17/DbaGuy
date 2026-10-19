@@ -303,8 +303,8 @@ export function panelOf(load: DocumentLoad, dirty: boolean): Panel | null {
 
 /**
  * Whether the text can be typed in: a document that is read (JSON) or new, on a connection that is not read-only, and
- * not while a save, insert or delete is in flight or waits on the user's answer (ruling C14: its answer replaces the
- * baseline, and after a confirmed save the text).
+ * not while a save, insert or delete is in flight or its preview waits on the user's answer (ruling C14: its answer
+ * replaces the baseline, and after a confirmed save the text).
  */
 export function canEdit(load: DocumentLoad, readOnlyProfile: boolean, saving = false): boolean {
   if (readOnlyProfile || saving) return false;

@@ -1,5 +1,5 @@
 import type { Text } from "@codemirror/state";
-import { useRef, useState, type RefObject } from "react";
+import { useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { toast } from "@/components/ui/Toast";
 import { ApiError, errorMessage } from "@/lib/api/client";
 import type { SaveAnswer, SavePreview } from "@/lib/api/types";
@@ -14,6 +14,7 @@ import {
   prettyJson,
   removeDocument,
   saveDocument,
+  unknownOutcome,
   type DocumentRef,
   type SaveProblem,
   type WriteFailure,
@@ -41,8 +42,10 @@ export interface DocumentSaving {
   /** Delete…, after its confirmation: true when the document is gone (the tab then closes). */
   remove: () => Promise<boolean>;
   /**
-   * A save, insert or delete answered `password_required` (ruling C31): the tab shows `RecoverableError` with `error`,
-   * and `resend` (its onRetry, also run once the unlock dialog has the password) sends the same request.
+   * A save, insert or delete answered `password_required` (rulings C31, C48): the tab shows `RecoverableError` with
+   * `error` (it says the write was not done), and `resend` (its onRetry, also run once the unlock dialog has the
+   * password) goes on with it. Nothing was sent and the save is over: the editor is editable, and cancelling the unlock
+   * dialog leaves the tab as it was, with Save enabled.
    */
   passwordNeeded: { error: Error; resend: () => void } | null;
   /** The editor's text changed (the tab calls it from the editor's onChange): a problem about the text goes away. */
@@ -52,10 +55,22 @@ export interface DocumentSaving {
 }
 
 /** A write as it was asked for: what goes out again, unchanged, once the unlock dialog has the password (ruling C31). */
-type TextWrite =
+export type TextWrite =
   | { kind: "save"; cas: string; text: string; sent: Text; confirmed: boolean; shown?: string }
   | { kind: "insert"; text: string; sent: Text; confirmed: boolean; shown?: string };
-type Write = TextWrite | { kind: "remove"; cas: string };
+export type Write = TextWrite | { kind: "remove"; cas: string };
+
+/**
+ * What goes out once the unlock dialog has the password, or Retry is pressed (ruling C48). Nothing was sent, and the save
+ * ended when the password was asked for, so the user may have typed since: a write goes out as asked (a confirmed one
+ * with exactly the text that was previewed) only while the editor still holds the text it carries, or when it is a delete,
+ * which carries no text; anything else is a fresh save of what the editor holds now, which checks the baseline again
+ * (ruling C32) and may preview again.
+ */
+export function resendPlan(write: Write, current: Text | null): "same" | "fresh" {
+  if (write.kind === "remove") return "same";
+  return current !== null && current.eq(write.sent) ? "same" : "fresh";
+}
 
 /** The problems that are about the text: they go away once it is edited (the others are about the document or the ID). */
 const TEXT_PROBLEMS: ReadonlySet<SaveProblem["kind"]> = new Set(["invalid_json", "numbers", "error"]);
@@ -98,10 +113,12 @@ function sendWrite(ref: DocumentRef, write: Write): Promise<SaveAnswer | undefin
  * back; what the tab then is — saved, new, missing, with or without its edits — is `documentState`'s, through `loaded`'s
  * commands. Only this hook sends a write, only on the user's action (⌘S, Save, Save as shown, Delete…), and never again
  * by itself: a write that lost contact with the backend is reported as unknown (ruling C45), and the one retry there is
- * (after the unlock dialog, ruling C31) is of a request that never left the backend.
+ * (after the unlock dialog, rulings C31 and C48) is of a request that never left the backend.
  *
- * The editor is read-only from the moment a write starts until it is over, previews and a pending unlock included
- * (`loaded.saving`), so the text a confirmation or a resend carries is the text the user was shown.
+ * The editor is read-only from the moment a write starts until it is over, a preview waiting for the user's answer
+ * included (`loaded.saving`), so the text a confirmation carries is the text the user was shown. A write that asked for
+ * the password is over at once (nothing was sent): a resend goes out as asked only while the text is still the one it
+ * carries (`resendPlan`).
  */
 export function useDocumentSave(
   tab: DocumentTabState,
@@ -122,6 +139,9 @@ export function useDocumentSave(
   /** `problem` for the keystrokes: they never render the tab, so they must not set state unless it changes. */
   const problemShown = useRef<SaveProblem | null>(null);
 
+  /** The latest `save`, for a resend that finds the text changed: it must see this render's tab, not the one it was made in. */
+  const latestSave = useRef<() => void>(() => undefined);
+
   const showProblem = (next: SaveProblem | null) => {
     problemShown.current = next;
     setProblem(next);
@@ -141,9 +161,9 @@ export function useDocumentSave(
       return true;
     }
     if (!answer) {
-      // A save or an insert always answers: this is a bug, and the text is still in the editor.
+      // A save or an insert always answers: this is a bug, and the write may have been done (the text is still in the editor).
       loaded.saveEnded();
-      showProblem({ kind: "error", message: "The backend sent no answer to the save: Reload to see what is stored." });
+      showProblem(unknownOutcome(write.kind, "The backend sent no answer to the save"));
       return false;
     }
     if (isPreview(answer)) {
@@ -181,8 +201,10 @@ export function useDocumentSave(
         setConflict("deleted");
         return false;
       case "password":
-        // Nothing was sent. The tab stays busy (editor read-only) until the same request goes out after the unlock.
-        setPasswordNeeded({ error: failure.error, resend: () => void attempt(write) });
+        // Nothing was sent, so the save is over (ruling C48): the editor is editable and Save enabled again, whatever the
+        // user does with the unlock dialog. Its answer, or Retry, goes on with this write while the text is unchanged.
+        loaded.saveEnded();
+        setPasswordNeeded({ error: failure.error, resend: () => resend(write) });
         return false;
       case "problem":
         loaded.saveEnded();
@@ -214,16 +236,26 @@ export function useDocumentSave(
     try {
       if ("error" in outcome) {
         console.warn("A document write failed", outcome.error instanceof ApiError ? outcome.error.code : outcome.error);
-        return applyFailure(write, classifyWriteError(outcome.error, (offset) => lineColumn(editor, offset)));
+        return applyFailure(write, classifyWriteError(outcome.error, write.kind, (offset) => lineColumn(editor, offset)));
       }
       return applyAnswer(write, outcome.answer);
     } catch (error) {
       // A bug in showing the outcome must not leave the editor read-only for good: the text is still in it.
       console.error("Could not show the outcome of a document write", error);
       loaded.saveEnded();
-      showProblem({ kind: "error", message: `Could not show the outcome of the write (${errorMessage(error)}): Reload to see what is stored.` });
+      showProblem(unknownOutcome(write.kind, `Could not show the outcome of the ${write.kind === "remove" ? "delete" : "save"} (${errorMessage(error)})`));
       return false;
     }
+  };
+
+  /** The unlock dialog has its password, or Retry was pressed: see `resendPlan`. */
+  const resend = (write: Write) => {
+    if (resendPlan(write, mounted(editor)?.view.state.doc ?? null) === "same") {
+      void attempt(write);
+      return;
+    }
+    setPasswordNeeded(null); // the line is about a save that is over; a fresh one has its own outcome
+    latestSave.current();
   };
 
   const insertFrom = (doc: Text) => attempt({ kind: "insert", text: doc.toString(), sent: doc, confirmed: false });
@@ -291,6 +323,10 @@ export function useDocumentSave(
     return attempt({ kind: "remove", cas: facts.cas });
   };
 
+  useLayoutEffect(() => {
+    latestSave.current = save;
+  });
+
   return {
     busy,
     preview,
@@ -309,6 +345,7 @@ export function useDocumentSave(
     },
     clearProblem: () => {
       if (problemShown.current) showProblem(null);
+      setPasswordNeeded(null);
     },
   };
 }

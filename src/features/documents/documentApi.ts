@@ -102,19 +102,39 @@ export type SaveProblem =
   | { kind: "outcome_unknown"; message: string }
   | { kind: "error"; message: string };
 
+/** The three writes of a document tab: the first two are a "save" to the user, the third a "delete". */
+export type WriteKind = "save" | "insert" | "remove";
+
+/** What a write is called, and what may have become of the document, in a message. */
+const WORDING: Record<WriteKind, { noun: string; done: string }> = {
+  save: { noun: "save", done: "written" },
+  insert: { noun: "save", done: "written" },
+  remove: { noun: "delete", done: "deleted" },
+};
+
+/**
+ * A write whose outcome is not known (rulings C45, F3): it may have been done. `cause` says why ("Lost contact with the
+ * backend during the save"). It stays on screen while the text is edited and offers Reload; the write is never sent again.
+ */
+export function unknownOutcome(kind: WriteKind, cause: string): Extract<SaveProblem, { kind: "outcome_unknown" }> {
+  return {
+    kind: "outcome_unknown",
+    message: `${cause}: it may or may not have been ${WORDING[kind].done}. Reload to see what is stored.`,
+  };
+}
+
 /** What a failed save, insert or delete means for the tab. */
 export type WriteFailure =
   /** `document_conflict`: the document was changed after it was opened. */
   | { kind: "changed" }
   /** `document_missing`: the document does not exist (any more). */
   | { kind: "deleted" }
-  /** `password_required` (ruling C31): the request never left the backend, so it can be sent again once unlocked. */
+  /**
+   * `password_required` (rulings C31, C48): nothing was sent. `error` is the one the unlock dialog reads (same code and
+   * detail), its message saying the write was not done.
+   */
   | { kind: "password"; error: ApiError }
   | { kind: "problem"; problem: SaveProblem };
-
-/** Shown when the backend did not answer a write (ruling C45): it may have reached the server. */
-export const LOST_CONTACT_MESSAGE =
-  "Lost contact with the backend during the save: it may or may not have been written. Reload to see what is stored.";
 
 const detailOf = (error: ApiError): Record<string, unknown> =>
   typeof error.detail === "object" && error.detail !== null ? (error.detail as Record<string, unknown>) : {};
@@ -123,22 +143,24 @@ const detailOf = (error: ApiError): Record<string, unknown> =>
 const messageProblem = (error: Error): WriteFailure => ({ kind: "problem", problem: { kind: "error", message: error.message } });
 
 /**
- * Reads the failure of a save, insert or delete by its `ApiError.code` (backend `domain/errors.py`).
+ * Reads the failure of a save, insert or delete (`kind`) by its `ApiError.code` (backend `domain/errors.py`).
  *
  * A failure without an `ApiError` (a fetch `TypeError` from a backend that restarted or died mid-write, any other throw)
- * is `outcome_unknown` (ruling C45): the request may have reached the server, so it is never sent again. A
- * `write_outcome_unknown` answer is the same, with the backend's own message. Every other answer carries the server's
- * message as it is (`binary_document`, `read_only`, a `query_failed` that says nothing was sent, …).
+ * is `outcome_unknown` (ruling C45): the request may have reached the server, so it is never sent again. So is a
+ * `write_outcome_unknown` answer (with the backend's own message) and an `internal_error`, which may have happened after
+ * the write. Every other answer carries the server's message as it is (`binary_document`, `read_only`, a `query_failed`
+ * that says nothing was sent, …).
  *
  * `position` turns a UTF-16 offset into a line and column of the text that was sent (the editor's); it is only asked for
  * `invalid_json`.
  */
 export function classifyWriteError(
   error: unknown,
+  kind: WriteKind,
   position: (offset: number) => { line: number; column: number },
 ): WriteFailure {
   if (!(error instanceof ApiError)) {
-    return { kind: "problem", problem: { kind: "outcome_unknown", message: LOST_CONTACT_MESSAGE } };
+    return { kind: "problem", problem: unknownOutcome(kind, `Lost contact with the backend during the ${WORDING[kind].noun}`) };
   }
   const detail = detailOf(error);
   switch (error.code) {
@@ -146,12 +168,21 @@ export function classifyWriteError(
       return { kind: "changed" };
     case "document_missing":
       return { kind: "deleted" };
-    case "password_required": // the profile's unlock dialog asks for it (`RecoverableError`; `isPasswordRequired`)
-      return { kind: "password", error };
+    case "password_required": {
+      // The profile's unlock dialog asks for it (`RecoverableError`; `isPasswordRequired`): the same code and detail.
+      const done = kind === "remove" ? "Not deleted" : "Not saved";
+      const message = `${done}: the connection needs its password. ${error.message}`;
+      return { kind: "password", error: new ApiError(message, error.code, error.status, error.detail) };
+    }
     case "document_exists":
       return { kind: "problem", problem: { kind: "exists" } };
     case "write_outcome_unknown":
       return { kind: "problem", problem: { kind: "outcome_unknown", message: error.message } };
+    case "internal_error":
+      return {
+        kind: "problem",
+        problem: unknownOutcome(kind, `The backend reported an internal error during the ${WORDING[kind].noun}`),
+      };
     case "invalid_json": {
       const { offset, reason } = detail;
       if (typeof offset !== "number" || !Number.isFinite(offset) || typeof reason !== "string") return messageProblem(error);

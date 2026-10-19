@@ -2,32 +2,14 @@ import { useMemo } from "react";
 import { Button } from "@/components/ui/Button";
 import { CopyButton } from "@/components/ui/CopyButton";
 import { Dialog } from "@/components/ui/Dialog";
-import type { ChangeCounts, DocumentChange, SavePreview } from "@/lib/api/types";
+import type { DocumentChange, SavePreview } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
-import { plural } from "@/lib/format";
 import { CodeEditor } from "../editor/CodeEditor";
 import { prettyJson } from "./documentApi";
+import { summarizePreview, totalChanges } from "./previewSummary";
 
 /** The server's text is shown in the dialog up to this many characters; a longer one is only offered for copying. */
 export const SERVER_TEXT_SHOWN_MAX = 1_048_576;
-
-/** One kind's share of the summary line ("2 keys reordered"); the kinds in the order the API lists them. */
-const SUMMARY: Record<keyof ChangeCounts, (count: number) => string> = {
-  key_order: (count) => `${plural(count, "key")} reordered`,
-  number: (count) => `${plural(count, "number")} written differently`,
-  duplicate_key: (count) => plural(count, "duplicate key"),
-  other: (count) => plural(count, "other change"),
-};
-
-/** "2 keys reordered · 1 number written differently": the kinds with a change only. */
-function summarize(counts: ChangeCounts): string {
-  return (Object.keys(SUMMARY) as (keyof ChangeCounts)[])
-    .filter((kind) => counts[kind] > 0)
-    .map((kind) => SUMMARY[kind](counts[kind]))
-    .join(" · ");
-}
-
-const total = (counts: ChangeCounts): number => Object.values(counts).reduce((sum, count) => sum + count, 0);
 
 function labelOf(change: DocumentChange): string {
   switch (change.kind) {
@@ -81,7 +63,8 @@ export function SavePreviewDialog({
   const { server_text: serverText, changes, counts } = preview;
   // The server lists value changes first; sorted again (stable), so the order never depends on it.
   const ordered = useMemo(() => [...changes].sort((a, b) => Number(b.value_changed) - Number(a.value_changed)), [changes]);
-  const more = total(counts) - changes.length;
+  const more = totalChanges(counts) - changes.length;
+  const summary = summarizePreview(preview);
   const showsText = serverText.length <= SERVER_TEXT_SHOWN_MAX;
   const shown = useMemo(() => (showsText ? prettyJson(serverText) : ""), [showsText, serverText]);
 
@@ -106,7 +89,9 @@ export function SavePreviewDialog({
       <div className="flex flex-col gap-3">
         <p className="text-[13px]" data-selectable>
           Couchbase would store <span className="font-mono">{documentId}</span> differently from your text:{" "}
-          {summarize(counts)}. Nothing is saved until you confirm.
+          {summary.values && <span className="font-medium text-danger">{summary.values}</span>}
+          {summary.values && summary.others.length > 0 && " · "}
+          {summary.others.join(" · ")}. Nothing is saved until you confirm.
         </p>
         <ul className="max-h-52 overflow-y-auto rounded-md border border-border [scrollbar-gutter:stable]">
           {ordered.map((change, index) => (
