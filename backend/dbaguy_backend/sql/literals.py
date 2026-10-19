@@ -15,11 +15,12 @@ from ..adapters.values import MAX_SAFE_INT, MISSING, JsonText, encode_value
 from ..domain.column_category import ColumnCategory
 from ..domain.edits import MAX_VALUE_CHARS, CellInput, EditColumn, EditKind, EditProblemCode, kind_category
 from ..domain.errors import ValidationFailed
+from ..domain.well_formed import LONE_SURROGATE
 from .dialects import (
     NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, datetime_literal, in_list, json_literal, quote_ident,
     quote_literal, zero_date_as_text,
 )
-from .jsontext import LONE_SURROGATE, json_problem
+from .jsontext import json_problem
 
 Source = Literal["encoded", "raw"]
 HEX_BYTES = re.compile(r"(?:[0-9a-fA-F]{2})*")

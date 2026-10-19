@@ -449,6 +449,40 @@ def test_a_save_with_staged_edits_that_cannot_be_written_keeps_the_rest(client, 
     assert any("dropped the staged edits" in line for line in logged)
 
 
+def nested(levels, leaf):
+    """`leaf` inside `levels` lists and objects, alternating."""
+    for index in range(levels):
+        leaf = {"a": leaf} if index % 2 else [leaf]
+    return leaf
+
+
+def deep_staged_edits(levels):
+    return {"version": 1, "key_columns": ["id"], "outcome_unknown": False, "inserts": [],
+            "updates": [{"id": "u:1", "key": {"id": nested(levels, 1)}, "set": {"a": {"kind": "value", "text": "x"}},
+                         "original": {"a": nested(levels, "was")}}],
+            "deletes": [{"id": "d:1", "key": {"id": nested(levels - 1, [])}}]}  # an empty list counts as a level too
+
+
+@pytest.mark.parametrize("levels, kept", [(64, True), (65, False), (254, False)])
+def test_staged_edits_nested_to_the_limit_are_saved_and_read_back(client, levels, kept):  # B40: a file must read back
+    """A cell of 254 levels was taken by the model, the file was written, and then `GET /workspace` failed to serialize
+    it: the next start lost every tab. The cap is 64 (`MAX_CELL_LEVELS`): at 64 the file reads back as it was written,
+    beyond it the staged edits are dropped (the tab and the others are kept) and the workspace still reads."""
+    staged = deep_staged_edits(levels)
+    tabs = [{"id": "q1", "kind": "query", "buffer": "SELECT 1"},
+            {"id": "t1", "kind": "table", "title": "orders", "staged_edits": staged,
+             "object_path": [{"kind": "schema", "name": "public"}, {"kind": "table", "name": "orders"}]}]
+    assert client.put("/workspace", json={"tabs": tabs}, headers=AUTH).status_code == 204
+    read = client.get("/workspace", headers=AUTH)
+    assert read.status_code == 200
+    state = read.json()
+    assert [t["id"] for t in state["tabs"]] == ["q1", "t1"] and state["tabs"][0]["buffer"] == "SELECT 1"
+    assert (state["tabs"][1]["staged_edits"] == staged) if kept else state["tabs"][1]["staged_edits"] is None
+    # and it is still there after the file is read again from disk
+    again = client.get("/workspace", headers=AUTH)
+    assert again.status_code == 200 and again.json() == state
+
+
 def test_a_save_with_a_lone_surrogate_in_a_buffer_keeps_every_tab(client):  # ruling K7: it was a 500 for every tab
     """A client that sends the text as it is (the frontend replaces it first, `workspaceJson`): pydantic takes a lone
     surrogate in a plain `str`, but `workspace.json` cannot be written with one. It is replaced, not dropped."""
@@ -469,6 +503,27 @@ def test_a_save_with_a_lone_surrogate_in_a_buffer_keeps_every_tab(client):  # ru
     assert state["tabs"][0]["title"] == "t\ufffd" and state["active_tab_id"] == "q1"
     assert any("replaced a lone surrogate in 2 text(s)" in line for line in logged)
     assert "SELECT" not in "".join(logged)  # the text is the user's: never logged
+
+
+@pytest.mark.parametrize("state", [
+    {"tabs": [], "sidebar_tab": "a\ud800"},
+    {"sidebar_tab": "a\ud800"},  # no `tabs` at all: the repair of the tabs is not reached
+    {"tabs": [{"id": "q1", "kind": "query", "buffer": "SELECT 1"}], "active_tab_id": "q1", "sidebar_tab": "a\udc00"},
+])
+def test_a_save_with_a_lone_surrogate_outside_the_tabs_works_too(client, state):  # ruling K7: it was a 500
+    """The workspace's own text fields (the sidebar's tab, the active tab's id) are repaired like a tab's."""
+    logged: list[str] = []
+    sink = logger.add(lambda m: logged.append(m.record["message"]), level="DEBUG")
+    try:
+        saved = client.put("/workspace", content=json.dumps(state).encode(),
+                           headers={**AUTH, "Content-Type": "application/json"})
+    finally:
+        logger.remove(sink)
+    assert saved.status_code == 204
+    read = client.get("/workspace", headers=AUTH)
+    assert read.status_code == 200 and read.json()["sidebar_tab"] == "a\ufffd"
+    assert read.json()["active_tab_id"] == state.get("active_tab_id")
+    assert any("replaced a lone surrogate in 1 text(s)" in line for line in logged)
 
 
 def test_settings_and_workspace_reject_bad_input(client):

@@ -26,6 +26,7 @@ from dbaguy_backend.adapters.couchbase.stream import RawRow, RowField, json_kind
 from dbaguy_backend.adapters.values import MAX_SAFE_INT, MISSING, JsonText
 from dbaguy_backend.domain.column_category import ColumnCategory
 from dbaguy_backend.domain.execution import ColumnMeta
+from dbaguy_backend.domain.well_formed import LONE_SURROGATE
 from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.lexer import INSIGNIFICANT, TokenKind, tokenize
 
@@ -38,7 +39,6 @@ PLAN_COLUMN = "plan"
 _STAR = "*"
 _SIGNATURE_CATEGORY = {"number": ColumnCategory.NUMBER, "string": ColumnCategory.TEXT, "boolean": ColumnCategory.BOOL}
 _INTEGER = re.compile(r"-?\d+")
-_LONE_SURROGATE = re.compile("[\ud800-\udfff]")  # a character from a \uD800-style escape: never half of a pair
 _SAFE_DIGITS = 17  # ±(2^53 − 1) has 16 digits: longer literals are never converted (and int() has a digit limit)
 # Words that end the projection of a SELECT at its own nesting level (RAW / ELEMENT / VALUE make the rows plain values).
 _PROJECTION_ENDS = frozenset({"FROM", "LET", "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "UNION", "INTERSECT",
@@ -47,14 +47,14 @@ _LATE_KEYS = "Some rows have keys outside the columns (from row {:,}); export as
 
 
 def _has_lone_surrogate(text: str) -> bool:
-    return not text.isascii() and _LONE_SURROGATE.search(text) is not None
+    return not text.isascii() and LONE_SURROGATE.search(text) is not None
 
 
 def _escape_surrogates(text: str) -> str:
     """`text` with each lone surrogate written as the JSON escape `\\uXXXX`: text that any UTF-8 encoder takes."""
     if text.isascii():
         return text
-    return _LONE_SURROGATE.sub(lambda match: f"\\u{ord(match.group()):04x}", text)
+    return LONE_SURROGATE.sub(lambda match: f"\\u{ord(match.group()):04x}", text)
 
 
 def value_cell(text: str, value: Any) -> Any:

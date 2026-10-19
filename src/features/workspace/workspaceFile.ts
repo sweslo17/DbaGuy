@@ -11,7 +11,7 @@ import {
   type Tab,
   type WorkspaceSnapshot,
 } from "@/stores/workspace";
-import { restoredEdits } from "../edits/savedEdits";
+import { readableEdits } from "../edits/savedEdits";
 import { changeCount } from "../edits/staging";
 import { keyspaceOfPath } from "../explorer/fieldSamples";
 
@@ -175,7 +175,10 @@ export interface RestoredWorkspace {
 }
 
 /** The changes a staged set holds as the close question counts them (L20): an UPDATE under its DELETE is not one. */
-const stagedCount = (file: StagedEditsFile) => changeCount(restoredEdits(file));
+const stagedCount = (file: StagedEditsFile) => {
+  const edits = readableEdits(file);
+  return edits ? changeCount(edits) : 0;
+};
 
 /** A query tab as saved; with `profileId` null it reopens without a connection (nor its database or query context). */
 function restoredQuery(entry: SavedTab, profileId: string | null): QueryTabState {
@@ -267,7 +270,9 @@ export function fromSavedWorkspace(saved: SavedWorkspace, profileExists: (id: st
       }
     } else if (connected && entry.object_path?.length) {
       tabs.push({ id: entry.id, kind: entry.kind, profileId, path: entry.object_path, title: entry.title });
-      if (entry.kind === "table" && entry.staged_edits) staged.set(entry.id, entry.staged_edits);
+      // a set that does not read costs the tab its staged edits, never the restore (`readableEdits` says so once)
+      if (entry.kind === "table" && entry.staged_edits && readableEdits(entry.staged_edits))
+        staged.set(entry.id, entry.staged_edits);
     } else {
       // R-05-11: a table tab's staged edits go with it, and the list of closed tabs says so.
       const lost = entry.staged_edits ? stagedCount(entry.staged_edits) : 0;

@@ -27,8 +27,9 @@ import {
  * - What the model refuses (`StagedEditsFile` and the models it holds): a text that is not valid Unicode (a lone
  *   surrogate; pydantic takes one inside a key or an original too, but the file cannot be written with it, so the
  *   backend refuses it there), a column name of 0 or over 1,024 characters, an id of 0 or over 100 characters or one
- *   used twice, an UPDATE that sets nothing or has no original for a set column, no key columns, and a cell nested
- *   more than 255 levels (pydantic-core's recursion guard).
+ *   used twice, an UPDATE that sets nothing or has no original for a set column, no key columns, and a cell with
+ *   lists and objects nested more than 64 deep (`MAX_CELL_LEVELS`; our own cap, far below the depth pydantic reads and
+ *   writes: a file with 254 levels was taken, written, and then could not be read back).
  * `fixtures/staged_edits_cases.json` in the backend's tests holds the same files for both sides: `savedEdits.test.ts`
  * and `test_local_stores.py` each show that this keeps exactly what the model takes.
  */
@@ -41,8 +42,8 @@ export const MAX_SAVED_CHARS = 8 * 1_048_576;
 const MAX_NAME_CHARS = 1_024;
 /** `ChangeId`: an id has 1 to this many characters. */
 const MAX_ID_CHARS = 100;
-/** How many levels deep pydantic validates a key's or an original's values: a value is level 1, what it holds level 2… */
-const MAX_CELL_LEVELS = 255;
+/** `MAX_CELL_LEVELS` in `domain/edits.py`: how many lists and objects may hold one another in a key or an original. */
+const MAX_CELL_LEVELS = 64;
 
 /**
  * Why staged edits cannot be kept across a restart though they are within the limits: "value" a value, key or original
@@ -88,22 +89,23 @@ const hasColumnNames = (cells: Readonly<Record<string, unknown>>) => Object.keys
  */
 function jsonChars(cell: unknown): number | NotKept {
   let total = 0;
-  const pending: [unknown, number][] = [[cell, 0]]; // the key or original itself is no level: its values are level 1
+  // `enclosing`: how many lists and objects hold the item (the key or original itself is no level: -1)
+  const pending: [unknown, number][] = [[cell, -1]];
   for (let next = pending.pop(); next; next = pending.pop()) {
-    const [item, level] = next;
-    if (level > MAX_CELL_LEVELS) return "other";
+    const [item, enclosing] = next;
+    if (typeof item === "object" && item !== null && enclosing >= MAX_CELL_LEVELS) return "other";
     if (typeof item === "string") {
       const length = characterCount(item);
       if (length === null) return "value";
       total += length;
     } else if (Array.isArray(item)) {
-      for (const element of item) pending.push([element, level + 1]); // not a spread: a long array has no argument limit
+      for (const element of item) pending.push([element, enclosing + 1]); // not a spread: a long array has no argument limit
     } else if (item !== null && typeof item === "object") {
       for (const [name, value] of Object.entries(item)) {
         const length = characterCount(name);
         if (length === null) return "value";
         total += length;
-        pending.push([value, level + 1]);
+        pending.push([value, enclosing + 1]);
       }
     } else total += 1;
   }
@@ -240,4 +242,24 @@ export function restoredEdits(file: StagedEditsFile): StagedEdits {
     unknownOutcome: file.outcome_unknown ? "pending" : null,
     nextSeq: seq,
   };
+}
+
+/**
+ * `restoredEdits` of a set that is read from a local copy, or null when it does not read as staged edits (a field
+ * missing, the wrong type). `workspace.json` is validated by the backend, but the local copy is only checked for its
+ * tabs, and one malformed set must cost that tab its staged edits, never the restore of every tab (Q2, B40). It is also
+ * measured as the writer will measure it (`savedEdits`, which then answers from its cache), so a set that would throw
+ * on every save is caught here. The warning names the kind of error and nothing of the set: never a value.
+ */
+export function readableEdits(file: StagedEditsFile): StagedEdits | null {
+  try {
+    const edits = restoredEdits(file);
+    savedEdits(edits);
+    return edits;
+  } catch (error) {
+    console.warn(
+      `Dropped a tab's staged edits: they do not read as staged edits (${error instanceof Error ? error.name : "unknown error"})`,
+    );
+    return null;
+  }
 }

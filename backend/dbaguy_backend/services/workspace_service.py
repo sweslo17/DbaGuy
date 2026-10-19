@@ -6,6 +6,7 @@ from loguru import logger
 from pydantic import TypeAdapter, ValidationError
 
 from ..domain.edits import StagedEditsFile
+from ..domain.well_formed import has_lone_surrogate, well_formed
 from ..domain.workspace import (
     MAX_PARAM_DRAFTS,
     DocumentCas,
@@ -15,7 +16,6 @@ from ..domain.workspace import (
     WorkspaceState,
     WorkspaceTab,
 )
-from ..domain.well_formed import has_lone_surrogate, well_formed
 from ..storage.json_files import JsonDocument, error_fields
 
 # Each judged with the model's own definition of it, so what is kept is exactly what the model accepts
@@ -52,17 +52,18 @@ def _well_formed_value(value: Any, depth: int = 0) -> tuple[Any, int]:
     return value, 0
 
 
-def _well_formed_tab(tab: dict[str, Any]) -> tuple[dict[str, Any], int]:
-    """The tab with each lone surrogate in its text replaced by U+FFFD (as the frontend does when it writes the
-    workspace), and how many strings held one. pydantic takes one in a plain `str` (an editor buffer, a title), but
-    `workspace.json` cannot be written with it: the whole save would fail, for every tab. The text is the user's own, so
-    it is kept, not dropped. `staged_edits` is left alone: changing a value there would change what a commit writes
-    (its model refuses a lone surrogate instead, and the repair then drops the staged edits)."""
+def _well_formed_fields(fields: dict[str, Any], skip: str) -> tuple[dict[str, Any], int]:
+    """`fields` (a tab, or the workspace besides its tabs) with each lone surrogate in its text replaced by U+FFFD (as
+    the frontend does when it writes the workspace), and how many strings held one. pydantic takes one in a plain `str`
+    (an editor buffer, a title, the active tab's id), but `workspace.json` cannot be written with it: the whole save
+    would fail, for every tab. The text is the user's own, so it is kept, not dropped. The field `skip` is left alone:
+    a tab's `staged_edits` (changing a value there would change what a commit writes; its model refuses a lone
+    surrogate instead, and the repair then drops the staged edits) and the workspace's `tabs` (each is repaired)."""
     fixed, count = {}, 0
-    for name, value in tab.items():
-        fixed[name], found = (value, 0) if name == "staged_edits" else _well_formed_value(value)
+    for name, value in fields.items():
+        fixed[name], found = (value, 0) if name == skip else _well_formed_value(value)
         count += found
-    return (fixed, count) if count else (tab, 0)
+    return (fixed, count) if count else (fields, 0)
 
 
 def _valid(adapter: TypeAdapter[Any], value: Any, extra: _Extra) -> bool:
@@ -78,11 +79,11 @@ def _repair_tab(tab: Any, extra: _Extra) -> _Repair:
     a draft with a name or a size the model refuses is removed (and the drafts beyond the limit), a context it refuses
     goes back to the profile's default, a CAS it refuses is forgotten (the document tab then reads as a new document),
     and staged edits it refuses (or on a tab that is not a table tab) are dropped, the tab kept (B40: one bad entry must
-    not cost every tab its saved state). A lone surrogate in any text is replaced (`_well_formed_tab`). Everything else,
+    not cost every tab its saved state). A lone surrogate in any text is replaced (`_well_formed_fields`). Everything else,
     the buffer first, stays as it was."""
     if not isinstance(tab, dict):
         return _Repair(tab)
-    tab, texts_repaired = _well_formed_tab(tab)
+    tab, texts_repaired = _well_formed_fields(tab, skip="staged_edits")
     repaired, removed, reset = tab, 0, False
     drafts = tab.get("params")
     if drafts is not None:
@@ -108,7 +109,12 @@ def _repair_tab(tab: Any, extra: _Extra) -> _Repair:
 def _repaired_tabs(raw: Any, where: str, extra: _Extra) -> Any:
     """`raw` (a workspace object) with every tab repaired (`_repair_tab`); each repair is one WARNING that counts what
     it took out and never names or shows it (a name or a draft is the user's text). Anything else is returned as is."""
-    tabs = raw.get("tabs") if isinstance(raw, dict) else None
+    if not isinstance(raw, dict):
+        return raw
+    raw, texts_repaired = _well_formed_fields(raw, skip="tabs")  # the active tab's id, the sidebar's tab
+    if texts_repaired:
+        logger.warning("Repaired the {}: replaced a lone surrogate in {} text(s)", where, texts_repaired)
+    tabs = raw.get("tabs")
     if not isinstance(tabs, list):
         return raw
     repaired = []

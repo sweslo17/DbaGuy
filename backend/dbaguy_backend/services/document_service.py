@@ -31,7 +31,8 @@ from ..domain.couchbase import (
     DOCUMENT_ID_MAX_BYTES, DOCUMENT_TEXT_LIMIT, ChangeCounts, DocumentSaved, DocumentView, Keyspace, SavePreview,
 )
 from ..domain.errors import DocumentMissing, InvalidJson, NumberOutOfRange, ReadOnlyProfile, ValidationFailed
-from ..sql.jsontext import LONE_SURROGATE, diff, json_problem
+from ..domain.well_formed import LONE_SURROGATE
+from ..sql.jsontext import diff, json_problem
 from ..sql.offsets import utf16_offset
 from .metadata_errors import server_errors_are_final
 from .metadata_service import MetadataService

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { SavedTab, SavedWorkspace } from "@/lib/api/types";
 import type { EditorBuffer } from "@/stores/editorBuffers";
 import type { DocumentTabState, QueryTabState, Tab } from "@/stores/workspace";
@@ -216,6 +216,59 @@ describe("a table tab's staged edits", () => {
     };
     const restored = fromSavedWorkspace(workspace({ staged_edits: hidden }), () => false);
     expect(restored.closed).toEqual(["orders (2 staged changes discarded)"]); // the new row and the delete, not three
+  });
+
+  it("that do not read (a local copy is only checked for its tabs) cost that tab its staged edits, not the restore", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const secret = "secret-value";
+      // a key missing, as a damaged or older local copy could have it
+      const malformed = {
+        ...file,
+        updates: [{ id: "u:1", set: { a: { kind: "value", text: secret } }, original: { a: 1 } }],
+      };
+      const saved: SavedWorkspace = {
+        version: 1,
+        tabs: [
+          {
+            id: "table:bad",
+            kind: "table",
+            title: "bad",
+            profile_id: PROFILE,
+            object_path: TABLE_PATH,
+            staged_edits: malformed as never,
+          },
+          {
+            id: "table:1",
+            kind: "table",
+            title: "orders",
+            profile_id: PROFILE,
+            object_path: TABLE_PATH,
+            staged_edits: file,
+          },
+          {
+            id: "table:gone",
+            kind: "table",
+            title: "gone",
+            profile_id: null,
+            object_path: TABLE_PATH,
+            staged_edits: malformed as never,
+          },
+        ],
+        active_tab_id: null,
+        sidebar_tab: null,
+      };
+      const restored = fromSavedWorkspace(saved, (id) => id === PROFILE);
+      expect(restored.snapshot.tabs.map((tab) => tab.id)).toEqual(["table:bad", "table:1"]); // the tab stays
+      expect([...restored.staged.keys()]).toEqual(["table:1"]); // the good set stays, the malformed one is dropped
+      expect(restored.closed).toEqual(["gone"]); // a dropped tab with a set that does not read: no count to give
+      const said = warn.mock.calls.flat().join(" ");
+      expect(warn).toHaveBeenCalledTimes(2);
+      expect(said).toContain("TypeError"); // the kind of error
+      expect(said).not.toContain(secret); // never a value
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("are restored for a table tab only", () => {

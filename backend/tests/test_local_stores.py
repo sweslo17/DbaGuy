@@ -847,3 +847,25 @@ def test_a_lone_surrogate_in_a_tab_text_is_replaced_not_dropped_and_the_save_wor
     service = WorkspaceService(tmp_path / "workspace.json")
     service.put(WorkspaceState.model_validate(repaired))  # the write that failed for every tab
     assert WorkspaceService(tmp_path / "workspace.json").get().tabs[0].buffer == "a\ufffdb\U0001F600"
+
+
+def test_a_lone_surrogate_in_the_workspaces_own_text_is_replaced_too(logged_warnings):
+    broken = "\ud800"
+    raw = {"tabs": [{"id": "q1", "kind": "query", "buffer": "kept"}],
+           "active_tab_id": f"a{broken}", "sidebar_tab": f"s{broken}"}
+    repaired = repaired_workspace(raw)
+    assert repaired["tabs"][0] is raw["tabs"][0]  # a tab without one is the very same object
+    state = WorkspaceState.model_validate(repaired)
+    assert (state.active_tab_id, state.sidebar_tab, state.tabs[0].buffer) == ("a\ufffd", "s\ufffd", "kept")
+    assert logged_warnings == ["Repaired the workspace being saved: replaced a lone surrogate in 2 text(s)"]
+    no_tabs = repaired_workspace({"sidebar_tab": broken})  # `tabs` missing: the default list
+    assert WorkspaceState.model_validate(no_tabs).sidebar_tab == "\ufffd"
+
+
+def test_the_change_limit_says_what_is_done_with_the_changes():
+    from dbaguy_backend.domain.edits import EditChanges
+    many = [{"id": f"i:{n}", "values": {}} for n in range(10_001)]
+    with pytest.raises(ValidationError, match="at most 10,000 changes are committed at once"):
+        EditChanges.model_validate({"inserts": many})
+    with pytest.raises(ValidationError, match="at most 10,000 changes are kept at once"):
+        WorkspaceTab(id="t", kind="table", staged_edits=staged_edits(inserts=many, updates=[], deletes=[]))

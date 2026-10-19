@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { characterCount, hasLoneSurrogate, wellFormed } from "./unicodeText";
+import { characterCount, wellFormed } from "./unicodeText";
 
 /* The one rule for text that cannot be written as UTF-8 (a lone surrogate), checked against a plain loop. */
 
@@ -45,7 +45,7 @@ describe("lone surrogates", () => {
     [EMOJI + LOW, true, `${EMOJI}\uFFFD`, null],
     [HIGH + HIGH + LOW, true, `\uFFFD${EMOJI}`, null],
   ])("%j: lone %s, replaced as %j, %s characters", (text, lone, replaced, characters) => {
-    expect(hasLoneSurrogate(text)).toBe(lone);
+    expect(characterCount(text) === null).toBe(lone);
     expect(wellFormed(text)).toBe(replaced);
     expect(characterCount(text)).toBe(characters);
   });
@@ -61,7 +61,7 @@ describe("lone surrogates", () => {
     expect(texts).toHaveLength(1 + 3 + 9 + 27 + 81 + 243);
     for (const text of texts) {
       const expected = reference(text);
-      expect(hasLoneSurrogate(text), text).toBe(expected.lone);
+      expect(characterCount(text) === null, text).toBe(expected.lone);
       expect(wellFormed(text), text).toBe(expected.replaced);
       expect(characterCount(text), text).toBe(expected.lone ? null : expected.characters);
     }

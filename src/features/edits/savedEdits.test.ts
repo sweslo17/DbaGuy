@@ -1,10 +1,11 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { StagedEditsFile } from "@/lib/api/types";
 import { rowKeyOf } from "./overlay";
 import {
   MAX_SAVED_CHARS,
   MAX_SAVED_VALUE_CHARS,
+  readableEdits,
   restoredEdits,
   savedEdits,
   UNSAVEABLE_HINT,
@@ -382,11 +383,48 @@ describe("staged edits that cannot be kept (ruling K5)", () => {
     expect(savedEdits(state)).toMatchObject({ file: null, unsaveable: "other" });
   });
 
-  it("finds a cell nested too deep, and takes the deepest the backend does", () => {
+  it("finds a cell nested more than 64 deep (the backend's MAX_CELL_LEVELS), and takes 64", () => {
+    // 254 levels were taken by the model and written, and the file then could not be read back (B40)
     const nested = (levels: number) => Array.from({ length: levels }).reduce<unknown>((cell) => [cell], 1);
     const deep = (levels: number) => staged(edit(1, "b", nested(levels)));
-    expect(savedEdits(deep(253)).file).not.toBeNull(); // the original is level 1, its scalar level 254
-    expect(savedEdits(deep(254)).file).not.toBeNull();
-    expect(savedEdits(deep(255))).toMatchObject({ file: null, unsaveable: "other" });
+    expect(savedEdits(deep(63)).file).not.toBeNull();
+    expect(savedEdits(deep(64)).file).not.toBeNull();
+    expect(savedEdits(deep(65))).toMatchObject({ file: null, tooLarge: false, unsaveable: "other" });
+    expect(savedEdits(deep(254))).toMatchObject({ file: null, unsaveable: "other" });
+  });
+});
+
+describe("reading a set from a local copy", () => {
+  const good = savedEdits(staged(edit(1, "b"), { type: "addRow", id: "i:x" })).file!;
+  const warned = (run: () => unknown) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      return { result: run(), said: warn.mock.calls.flat().join(" "), calls: warn.mock.calls.length };
+    } finally {
+      warn.mockRestore();
+    }
+  };
+
+  it("gives the staged edits of a set that reads, silently", () => {
+    const { result, calls } = warned(() => readableEdits(good));
+    expect(result).toEqual(restoredEdits(good));
+    expect(calls).toBe(0);
+  });
+
+  it.each([
+    ["a key missing", { ...good, updates: [{ ...good.updates![0], key: undefined }] }],
+    ["an original missing", { ...good, updates: [{ ...good.updates![0], original: undefined }] }],
+    ["a set that is null", { ...good, updates: [{ ...good.updates![0], set: null }] }],
+    [
+      "the key columns missing, with an outcome to keep",
+      { ...good, updates: [], inserts: [], key_columns: undefined, outcome_unknown: true },
+    ],
+    ["nothing at all", null],
+  ])("drops one that does not read (%s), with a warning that names no value", (_, malformed) => {
+    const { result, said, calls } = warned(() => readableEdits(malformed as unknown as StagedEditsFile));
+    expect(result).toBeNull();
+    expect(calls).toBe(1);
+    expect(said).toMatch(/Dropped a tab's staged edits.*\((TypeError|RangeError)\)/);
+    expect(said).not.toContain('"b"'); // no part of the set is in it
   });
 });
