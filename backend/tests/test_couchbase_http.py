@@ -92,7 +92,7 @@ def test_a_literal_that_is_not_one_json_value_is_never_embedded(named, positiona
 
 def test_a_big_or_deep_literal_with_whitespace_around_it_is_one_value():  # ruling C39: the check builds nothing
     big = ' \n{"items": [' + ",".join(f'{{"n": {i}, "s": "x, ]}}\\" 1"}}' for i in range(150_000)) + "]}\t\r\n"
-    deep = "[" * 1000 + "]" * 1000  # deeper than the walkers of jsontext go; the C decoder takes it (as json_problem)
+    deep = "[" * 1000 + "]" * 1000  # one value: the body's check is its shape (a document's depth is json_problem's)
     body = build_body(QueryRequest("SELECT $doc, $d", "dbaguy-big", named={"doc": big, "d": deep},
                                    positional=[" 1e400 "]))
     assert len(big) > 4_000_000 and body.endswith(f'"$doc":{big},"$d":{deep},"args":[ 1e400 ]}}'.encode())

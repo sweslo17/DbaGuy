@@ -4,13 +4,16 @@ stored text exactly (key order, whitespace, `1e400`) with its META; writes are C
 - Every UPDATE and DELETE carries `AND META(d).type = "json"` (A30): without it an UPDATE turns a binary document into
   JSON. A save keeps the expiration (`preserve_expiry`), which is read again after the write (A28: RETURNING says 0).
 - A CAS-checked write that changed nothing reads the document's state to say why: missing, binary, or a conflict with
-  the CAS it holds now (ruling C6). The server answers 12009 both to a concurrent change and to an INSERT of a key that
-  exists (A29).
-- A write is sent once (D-04-9): the server's own error answer is final (`QueryFailed`, B39); any other failure means
-  the answer never came, so it may have been applied (`WriteOutcomeUnknown`). So does a failed read right after a
-  write that was answered (ruling C25): the document was written, but its META cannot be reported. A failure the
-  connection knows came before the write went out (`StatementNotSent`: the read it sends first on a channel that may be
-  stale, ruling C40) is raised as it is, like a read's.
+  the CAS it holds now (ruling C6). 12009 is the server's general write error: a concurrent change, an INSERT of a key
+  that exists (A29), but also a durability level it cannot meet, a temporary failure or a value too large. So a conflict
+  is reported only when the CAS has changed; a 12009 for a document that still has the CAS sent is the server's own
+  refusal (`QueryFailed`), or "Overwrite" would meet it again and again.
+- A write is sent once (D-04-9): the server's own error answer is final (`QueryFailed`, B39), except its timeout (1080),
+  after which the write may have been applied (live: 45 of 192); that, and any failure to get the answer, is
+  `WriteOutcomeUnknown`. So is a failed read right after a write that was answered (ruling C25): the document was
+  written, but its META cannot be reported. A failure the connection knows came before the write went out
+  (`StatementNotSent`: the read it sends first on a channel that may be stale, ruling C40) is raised as it is, like a
+  read's.
 
 Literals and identifiers only from `sql/dialects.py`; `$doc` is the caller's text, which `json_problem` has accepted.
 The connection refuses a literal that is not one JSON value before anything is sent (ruling C39), `ValidationFailed`
@@ -48,7 +51,8 @@ _REPLACE = ('UPDATE {ks} AS d USE KEYS $id SET d = $doc WHERE META(d).cas = $cas
 _INSERT = "INSERT INTO {ks} AS d (KEY, VALUE) VALUES ($id, $doc) RETURNING META(d).cas AS cas"
 _REMOVE = ('DELETE FROM {ks} AS d USE KEYS $id WHERE META(d).cas = $cas AND META(d).type = "json" '
            "RETURNING RAW META(d).id")
-_CONCURRENT = "12009"  # a concurrent change, and also (INSERT) a duplicate key (A29: reason 17012)
+_CONCURRENT = "12009"  # a concurrent change, and also (INSERT) a duplicate key (A29: reason 17012), and other refusals
+_TIMED_OUT = "1080"  # the server's timeout: a write may have been applied all the same
 _BINARY_SIZE = re.compile(r'"<binary \((\d+) b\)>"')
 
 _INTEGER = re.compile(r"-?(?:0|[1-9][0-9]*)")
@@ -57,6 +61,8 @@ _INT64_DIGITS = 19
 # and a number beyond a double's range needs a three-digit positive exponent or a mantissa of 309 digits.
 _SUSPECT = re.compile(r"[0-9]{19,}|[eE]\+?[0-9]{3,}")
 _NOT_A_CAS = "Not a CAS value of this server"
+_NOTHING_WRITTEN = ("The server wrote nothing and gave no reason, although the document still has the CAS it was "
+                    "opened with")
 _REFUSED_BEFORE_SENDING = frozenset({INVALID_PARAMS, INVALID_TEXT})  # a literal or a text the request cannot carry
 
 
@@ -198,18 +204,22 @@ class SqlppDocumentStore(DocumentStore):
         except StatementError as exc:
             if exc.code == _CONCURRENT:
                 raise _Concurrent(exc) from exc
-            if is_server_error(exc):
+            if is_server_error(exc) and exc.code != _TIMED_OUT:
                 raise QueryFailed(exc.message) from exc  # the server's answer is final (B39)
             raise WriteOutcomeUnknown() from exc  # it may have been written: never sent again (D-04-9)
 
-    def _refusal(self, ks: str, key: str) -> DomainError:
-        """Why a CAS-checked UPDATE or DELETE changed nothing (spec §3.9.2), from the document's state now."""
+    def _refusal(self, ks: str, key: str, sent_cas: str, server_message: str | None = None) -> DomainError:
+        """Why a CAS-checked UPDATE or DELETE changed nothing (spec §3.9.2), from the document's state now: missing,
+        binary, a conflict when its CAS is no longer `sent_cas`; else the server's own refusal (`server_message`, its
+        12009 text), never a conflict carrying the user's own CAS."""
         state = self._state(ks, key)
         if state is None:
             return DocumentMissing()
         if state.type != "json":
             return BinaryDocument()
-        return DocumentConflict(state.cas)
+        if state.cas != sent_cas:
+            return DocumentConflict(state.cas)
+        return QueryFailed(server_message if server_message is not None else _NOTHING_WRITTEN)
 
     def _saved(self, ks: str, key: str, rows: list[RawRow], text: str) -> DocumentSaved:
         """A write the server answered: its CAS from RETURNING, the expiration read now (A28). Anything failing here
@@ -226,14 +236,14 @@ class SqlppDocumentStore(DocumentStore):
                              size=_utf8_size(one_line(text)))
 
     def replace(self, keyspace: Keyspace, doc_id: str, text: str, cas: int) -> DocumentSaved:
-        ks = _path(keyspace)
-        named = {"id": _key(doc_id), "doc": text, "cas": _cas_literal(cas)}
+        ks, sent = _path(keyspace), _cas_literal(cas)
         try:
-            rows = self._write(_REPLACE.format(ks=ks), named, preserve_expiry=True)
-        except _Concurrent:
-            rows = []
+            rows = self._write(_REPLACE.format(ks=ks), {"id": _key(doc_id), "doc": text, "cas": sent},
+                               preserve_expiry=True)
+        except _Concurrent as exc:
+            raise self._refusal(ks, doc_id, sent, exc.message) from exc
         if not rows:
-            raise self._refusal(ks, doc_id)
+            raise self._refusal(ks, doc_id, sent)
         return self._saved(ks, doc_id, rows, text)
 
     def insert(self, keyspace: Keyspace, doc_id: str, text: str) -> DocumentSaved:
@@ -247,11 +257,15 @@ class SqlppDocumentStore(DocumentStore):
         return self._saved(ks, doc_id, rows, text)
 
     def remove(self, keyspace: Keyspace, doc_id: str, cas: int) -> None:
-        ks = _path(keyspace)
-        named = {"id": _key(doc_id), "cas": _cas_literal(cas)}
+        # Known limitation (ruling C41): a DELETE racing a save sent with the same CAS can let both report success, and
+        # the document is gone (live: 21 of 80 rounds). The server checks the DELETE's `META(d).cas = $cas` on its own
+        # read of the document and then deletes by key, without the CAS; a save that lands in between is deleted with
+        # it. Claiming the document first (`UPDATE … SET d = d`) is not done: it would silently re-encode the stored
+        # text into the server's form (numbers beyond int64 changed) and leave it so if the DELETE then failed.
+        ks, sent = _path(keyspace), _cas_literal(cas)
         try:
-            rows = self._write(_REMOVE.format(ks=ks), named)
-        except _Concurrent:
-            rows = []
+            rows = self._write(_REMOVE.format(ks=ks), {"id": _key(doc_id), "cas": sent})
+        except _Concurrent as exc:
+            raise self._refusal(ks, doc_id, sent, exc.message) from exc
         if not rows:
-            raise self._refusal(ks, doc_id)
+            raise self._refusal(ks, doc_id, sent)

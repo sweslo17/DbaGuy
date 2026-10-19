@@ -7,12 +7,13 @@ import tracemalloc
 import pytest
 
 from dbaguy_backend.adapters.base import StatementError
+from dbaguy_backend.adapters.couchbase import adapter as couchbase_adapter
 from dbaguy_backend.adapters.couchbase.adapter import CouchbaseConnection
 from dbaguy_backend.adapters.couchbase.documents import SqlppDocumentStore
 from dbaguy_backend.adapters.couchbase.stream import parse_row
 from dbaguy_backend.domain.couchbase import Keyspace
 from dbaguy_backend.domain.errors import (
-    BinaryDocument, DocumentConflict, DocumentExists, DocumentMissing, WriteOutcomeUnknown,
+    BinaryDocument, DocumentConflict, DocumentExists, DocumentMissing, QueryFailed, WriteOutcomeUnknown,
 )
 from tests.support import (
     COUCHBASE_READER, StoredDocument, put_raw_document, requires_couchbase, scratch_documents, scratch_key,
@@ -179,3 +180,24 @@ def test_a_failed_read_after_a_write_is_an_unknown_outcome():  # ruling C25: wri
         SqlppDocumentStore(Statements()).replace(ORDERS, NEVER, "{}", 1)
     with pytest.raises(WriteOutcomeUnknown):
         SqlppDocumentStore(Statements()).insert(ORDERS, NEVER, "{}")
+
+
+def test_a_write_the_server_refuses_for_another_reason_is_not_a_conflict(store, scratch, monkeypatch):  # fix round 2
+    real = couchbase_adapter.build_body
+
+    def durable(request):  # a durability level the one-node dev cluster cannot meet: 12009, nothing written
+        body = real(request)
+        return body[:-1] + b',"durability_level":"majority"}' if request.statement.split()[0] in ("UPDATE", "DELETE") \
+            else body
+
+    key = scratch_key()
+    scratch.append(key)
+    put_raw_document(key, '{"a": 1}')
+    opened = store.get(ORDERS, key)
+    monkeypatch.setattr(couchbase_adapter, "build_body", durable)
+    for write in (lambda: store.replace(ORDERS, key, '{"a": 2}', int(opened.cas)),
+                  lambda: store.remove(ORDERS, key, int(opened.cas))):
+        with pytest.raises(QueryFailed) as refused:  # was DocumentConflict carrying the user's own CAS
+            write()
+        assert "Unable to complete action" in refused.value.message  # the server's own 12009 text
+    assert stored_document(key) == StoredDocument('{"a": 1}', opened.cas, 0, "json")
