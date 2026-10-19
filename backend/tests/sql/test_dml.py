@@ -132,6 +132,30 @@ def test_text_no_literal_can_carry_is_a_problem_or_unchecked_never_an_error():  
         ("label", "the loaded value holds a character that cannot be sent")]
 
 
+def test_a_key_or_original_without_a_term_says_why():  # ruling E4, G2 (`literals.unmatched_reason`)
+    pg = pg_target(columns=[column("id", "number", nullable=False), column("doc", "json"), column("g", writable=False)])
+    nul_doc = {"$type": "json", "text": '"a\x00"'}
+    json_nul = build_plan(PG, pg, changes(updates=[
+        {"id": "u:1", "key": {"id": 1}, "set": {"doc": value("{}")}, "original": {"doc": nul_doc}}]))
+    assert [(u.column, u.reason) for u in json_nul.statements[0].unchecked] == [
+        ("doc", "the loaded value holds a character that cannot be sent")]
+    read_only = build_plan(PG, pg, changes(updates=[
+        {"id": "u:1", "key": {"id": 1}, "set": {"g": value("x")}, "original": {"g": "y"}}]))
+    assert [p.message for p in read_only.problems] == ["g cannot be written: read-only here"]
+    keyed = [column("code", compare="equals"), column("note", compare="equals")]
+    no_escapes = EditTarget(path=MY_PATH, editable=True, key=["code"], key_source="primary_key", columns=keyed,
+                            backslash_escapes=False)
+    nul_key = build_plan(MY, no_escapes, changes(deletes=[{"id": "d:1", "key": {"code": "k\x00"}}]))
+    assert [(p.code, p.message) for p in nul_key.problems] == [
+        ("key_incomplete", "This row cannot be identified: its key column code holds a character that cannot be sent")]
+    lite = EditTarget(path=LITE_PATH, editable=True, key=["code"], key_source="primary_key", columns=keyed)
+    null_key = build_plan(LITE, lite, changes(deletes=[{"id": "d:1", "key": {"code": None}},
+                                                      {"id": "d:2", "key": {}}]))
+    assert [(p.change_id, p.code, p.message) for p in null_key.problems] == [
+        ("d:1", "key_incomplete", "This row cannot be identified: its key column code is NULL"),
+        ("d:2", "key_incomplete", "This row cannot be identified: its key column code was not loaded completely")]
+
+
 def test_a_key_column_set_is_pinned_by_its_key_only():  # CR-4
     plan = build_plan(PG, pg_target(), changes(updates=[
         {"id": "u:1", "key": {"id": 2}, "set": {"id": value("20")}, "original": {"id": 2}}]))

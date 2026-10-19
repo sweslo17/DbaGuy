@@ -5,24 +5,31 @@ worker later sends exactly these texts (R-05-7)."""
 
 from dataclasses import dataclass
 
-from pydantic import JsonValue
-
 from ..domain.edits import (
     CellInput, EditChanges, EditColumn, EditCounts, EditProblem, EditProblemCode, EditTarget, EditWarning,
     PlannedStatement, RowDelete, RowInsert, RowUpdate, UncheckedColumn,
 )
 from .dialects import Dialect, insert_defaults, qualified, quote_ident, script_text, transaction_frame
-from .literals import LiteralStyle, ValueProblem, cell_text, input_literal, match_condition, normalise_encoded
+from .literals import (
+    LiteralStyle, UnmatchedReason, ValueProblem, cell_text, input_literal, match_condition, unmatched_reason,
+)
 from .select_builder import relation_from_path
 
 _UNKNOWN_COLUMN = "No column {name} in this table (it may have been dropped or renamed)"
 _READ_ONLY_COLUMN = "{name} cannot be written: {reason}"
+_READ_ONLY_HERE = "read-only here"  # a non-writable column the adapter gave no reason
 _NOT_NULLABLE = "{name} cannot be NULL"
 _DEFAULT_ONLY_NEW = "DEFAULT applies only to a new row"
-_KEY_INCOMPLETE = "This row cannot be identified: its key column {name} was not loaded completely"
-_PREVIEW_ONLY = "only a preview of the value was loaded"
+_KEY_MESSAGES: dict[UnmatchedReason | None, str] = {  # key_incomplete; None: a NULL key cell (ruling E4)
+    "preview_only": "This row cannot be identified: its key column {name} was not loaded completely",
+    "unsendable": "This row cannot be identified: its key column {name} holds a character that cannot be sent",
+    None: "This row cannot be identified: its key column {name} is NULL",
+}
+_UNCHECKED_REASONS: dict[UnmatchedReason, str] = {  # ruling E22, pre-flight L6, ruling G2
+    "preview_only": "only a preview of the value was loaded",
+    "unsendable": "the loaded value holds a character that cannot be sent",
+}
 _NOT_EXACT = "{type} values cannot be compared exactly"
-_UNSENDABLE = "the loaded value holds a character that cannot be sent"
 _NON_TRANSACTIONAL = (
     "This table's storage engine cannot roll back: if a statement fails, the statements before it stay applied"
 )
@@ -40,17 +47,6 @@ class DmlPlan:
     warnings: list[EditWarning]
     counts: EditCounts
     script: str
-
-
-def _unchecked_reason(column: EditColumn, original: JsonValue) -> str:
-    """Why `match_condition` wrote no term for an original (ruling E22, pre-flight L6): the column cannot be compared
-    exactly; or the whole text is known (a plain string) but holds a character no literal can carry (a lone surrogate,
-    or U+0000 in MySQL without backslash escapes); or else only a preview of the cell was loaded."""
-    if column.compare == "none":
-        return _NOT_EXACT.format(type=column.type_name)
-    if isinstance(normalise_encoded(original), str):  # match_condition read it already: well-formed
-        return _UNSENDABLE
-    return _PREVIEW_ONLY
 
 
 class _Builder:
@@ -82,7 +78,8 @@ class _Builder:
             term = None if cell is None else match_condition(
                 self.dialect, self.columns[name], cell, self.styles[name], key=True)
             if term is None:
-                self._problem(change_id, name, "key_incomplete", _KEY_INCOMPLETE.format(name=name))
+                why = unmatched_reason(self.dialect, cell, self.styles[name]) if name in key else "preview_only"
+                self._problem(change_id, name, "key_incomplete", _KEY_MESSAGES[why].format(name=name))
                 return None
             terms.append(term)
         return terms
@@ -94,7 +91,7 @@ class _Builder:
         """A new value's literal, or None after recording why it has none."""
         if not column.writable:
             self._problem(change_id, column.name, "read_only_column",
-                          _READ_ONLY_COLUMN.format(name=column.name, reason=column.read_only_reason))
+                          _READ_ONLY_COLUMN.format(name=column.name, reason=column.read_only_reason or _READ_ONLY_HERE))
             return None
         if cell.kind == "null" and not column.nullable:
             self._problem(change_id, column.name, "not_nullable", _NOT_NULLABLE.format(name=column.name))
@@ -137,7 +134,9 @@ class _Builder:
             original = change.original[name]
             term = match_condition(self.dialect, column, original, self.styles[name], key=False)
             if term is None:
-                unchecked.append(UncheckedColumn(column=name, reason=_unchecked_reason(column, original)))
+                reason = (_NOT_EXACT.format(type=column.type_name) if column.compare == "none"
+                          else _UNCHECKED_REASONS[unmatched_reason(self.dialect, original, self.styles[name])])
+                unchecked.append(UncheckedColumn(column=name, reason=reason))
             else:
                 checks.append(term)
         if not complete or terms is None:
