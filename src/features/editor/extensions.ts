@@ -20,8 +20,8 @@ import type { Dialect, EditorSettings } from "@/lib/api/types";
 import { undoHistory } from "./startingPoint";
 import { editorTheme, fontSizeTheme } from "./theme";
 
-/** What an editor holds: SQL (a query tab's text) or JSON (a Couchbase document's). */
-export type EditorLanguage = "sql" | "json";
+/** What an editor holds: SQL (a query tab's text), JSON (a Couchbase document's), or plain text (a cell's value). */
+export type EditorLanguage = "sql" | "json" | "text";
 
 /** What the live settings and the tab's connection decide about an editor. */
 export interface EditorOptions {
@@ -120,15 +120,27 @@ const LIVE_SLOTS: readonly LiveSlot[] = [
   // The language and the label that names it for assistive technology.
   slot(
     (o) => `${o.language}:${o.dialect}:${o.upperCaseKeywords}`,
-    (o) =>
-      o.language === "json"
-        ? [json(), EditorView.contentAttributes.of({ "aria-label": "JSON editor" })]
-        : [
-            sql({ dialect: o.dialect ? SQL_DIALECTS[o.dialect] : StandardSQL, upperCaseKeywords: o.upperCaseKeywords }),
-            EditorView.contentAttributes.of({ "aria-label": "SQL editor" }),
-          ],
+    (o) => {
+      if (o.language === "json") return [json(), EditorView.contentAttributes.of({ "aria-label": "JSON editor" })];
+      // A value is typed as it is: no bracket or quote is ever added (H10).
+      if (o.language === "text")
+        return [NO_AUTO_CLOSE, EditorView.contentAttributes.of({ "aria-label": "Value editor" })];
+      return [
+        sql({ dialect: o.dialect ? SQL_DIALECTS[o.dialect] : StandardSQL, upperCaseKeywords: o.upperCaseKeywords }),
+        EditorView.contentAttributes.of({ "aria-label": "SQL editor" }),
+      ];
+    },
   ),
 ];
+
+/** Language data that gives `closeBrackets` no brackets (it reads them from the language data), so it closes nothing. */
+const NO_AUTO_CLOSE: Extension = EditorState.languageData.of(() => [{ closeBrackets: { brackets: [] } }]);
+
+/**
+ * The editor's own scroller keeps room for its scrollbar (the user's Mac shows classic scrollbars, which take room):
+ * for an editor in a fixed-height box (the preview's statements, the value editor).
+ */
+export const STABLE_SCROLLBAR: Extension = EditorView.theme({ ".cm-scroller": { scrollbarGutter: "stable" } });
 
 /** The parts that never change: editing, selection, search, comments and the look. */
 const STATIC: Extension = [

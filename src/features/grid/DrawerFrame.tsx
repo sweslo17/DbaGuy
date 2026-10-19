@@ -1,6 +1,7 @@
 import { X } from "lucide-react";
 import type { KeyboardEvent, ReactNode } from "react";
 import { Button } from "@/components/ui/Button";
+import { isImeKeyEvent } from "@/lib/ime";
 
 interface DrawerFrameProps {
   /** Accessible name of the drawer. */
@@ -18,10 +19,11 @@ interface DrawerFrameProps {
 
 /**
  * Chrome of the grid's right-side drawer: header with a Close button, optional toolbar, scrolling body. The drawer
- * takes focus when clicked (tabIndex -1); Escape anywhere inside closes it.
+ * takes focus when clicked (tabIndex -1); Escape anywhere inside closes it, except an input method's own.
  */
 export function DrawerFrame({ label, title, actions, toolbar, onKeyDown, onClose, children }: DrawerFrameProps) {
   const keyDown = (e: KeyboardEvent<HTMLElement>) => {
+    if (isImeKeyEvent(e)) return; // the Escape that ends a composition is not the drawer's (the editor's text stays)
     onKeyDown?.(e);
     if (e.defaultPrevented || e.key !== "Escape") return;
     e.preventDefault();

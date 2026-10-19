@@ -48,9 +48,9 @@ export interface EditorContent {
 export interface CodeEditorProps {
   initialText: string;
   initialSelection?: { anchor: number; head: number };
-  /** The SQL mode; null → generic SQL. Ignored for `language="json"`. */
+  /** The SQL mode; null → generic SQL. Ignored unless `language` is "sql". */
   dialect: Dialect | null;
-  /** What the text is: SQL (the default) or JSON (a Couchbase document). */
+  /** What the text is: SQL (the default), JSON (a Couchbase document) or plain text (a cell's value). */
   language?: EditorLanguage;
   /** No typing (the text can still be set through the handle). */
   readOnly?: boolean;
