@@ -7,12 +7,11 @@ import math
 import re
 from typing import NoReturn
 
-from ..adapters.base import AdapterCapabilities, RunOptions, StatementError
+from ..adapters.base import INVALID_PARAMS, AdapterCapabilities, RunOptions, StatementError
 from ..domain.execution import PARAM_NAME, ExecuteCommand, ExportCommand, StatementParams
 
 MAX_PARAM_BYTES = 1024 * 1024
 UNSUPPORTED_OPTION = "unsupported_option"
-INVALID_PARAMS = "invalid_params"
 _NAME = re.compile(PARAM_NAME)
 _BEYOND_DOUBLE = "Parameter {label}: a number in it is too large for the query service (beyond a double)"
 

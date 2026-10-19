@@ -1,6 +1,6 @@
 """The query service over HTTP/1.1 with the standard library (spec §3.4.1): one keep-alive connection at a time to one
-query node, request bodies assembled as text (parameter literals embedded unchanged), and a shutdown any thread may call
-to stop the request at once (the server marks it `closed`, survey §3.7).
+query node, request bodies assembled as text (parameter literals embedded unchanged, each checked to be one JSON value),
+and a shutdown any thread may call to stop the request at once (the server marks it `closed`, survey §3.7).
 
 Threads: the session's worker thread sends, reads and closes. Another thread only calls `HttpChannel.shutdown()`, which
 acts on a duplicate of the TCP socket taken right after connecting and kept until close(): http.client may close its own
@@ -41,6 +41,7 @@ from typing import Any
 from loguru import logger
 
 from dbaguy_backend.adapters.sockets import enable_keepalive
+from dbaguy_backend.sql.jsontext import NotJson, value_end
 
 READ_CHUNK = 64 * 1024
 CONNECT_TIMEOUT_S = 10.0  # connect and TLS handshake; reads afterwards block with no timeout (a cancel ends them),
@@ -81,19 +82,47 @@ class QueryRequest:
     timeout: str | None = None  # a server duration such as "30s"; only the internal metadata queries set one (R-04a-F3)
 
 
+_JSON_SPACE = re.compile(r"[ \t\n\r]*")
+
+
+class LiteralNotJson(ValueError):
+    """A parameter literal that is not exactly one JSON value (ruling C39): embedded as it is, it would end its value
+    early and add fields of its own to the body (`1, "readonly": false`). `label`: `$name` or `$n`, never the value."""
+
+    def __init__(self, label: str) -> None:
+        super().__init__(f"Parameter {label} is not one JSON value")
+        self.label = label
+
+
+def _one_value(label: str, literal: str) -> str:
+    """`literal` when it is one JSON value with only JSON whitespace around it, else LiteralNotJson. Checked by the C
+    decoder, which builds no tree (`jsontext.value_end`): a 20 MiB document in about 0.1 s."""
+    start = _JSON_SPACE.match(literal).end()
+    try:
+        end = value_end(literal, start)
+    except (json.JSONDecodeError, NotJson, RecursionError):
+        raise LiteralNotJson(label) from None
+    if _JSON_SPACE.match(literal, end).end() != len(literal):
+        raise LiteralNotJson(label)
+    return literal
+
+
 def build_body(request: QueryRequest) -> bytes:
     """The body as text, so parameter literals go out exactly as given (a number never passes through float; R-04-10).
     `timeout` only when the request has one: a user's statement never does (it keeps counting while a result is paused,
-    R-04-5), and `scan_consistency` is never sent. A lone surrogate in any text raises UnicodeEncodeError."""
+    R-04-5), and `scan_consistency` is never sent. A literal that is not one JSON value raises LiteralNotJson (C39), a
+    lone surrogate in any text UnicodeEncodeError: nothing is sent."""
     parts = [f'"statement":{json.dumps(request.statement, ensure_ascii=False)}',
              f'"client_context_id":{json.dumps(request.client_context_id)}']
     if request.query_context is not None:
         parts.append(f'"query_context":{json.dumps(request.query_context, ensure_ascii=False)}')
     if request.readonly:
         parts.append('"readonly":true')
-    parts.extend(f"{json.dumps('$' + name, ensure_ascii=False)}:{literal}" for name, literal in request.named.items())
+    parts.extend(f"{json.dumps('$' + name, ensure_ascii=False)}:{_one_value('$' + name[:40], literal)}"
+                 for name, literal in request.named.items())
     if request.positional:
-        parts.append('"args":[' + ",".join(request.positional) + "]")
+        parts.append('"args":[' + ",".join(_one_value(f"${index}", literal)
+                                           for index, literal in enumerate(request.positional, start=1)) + "]")
     if request.profile is not None:
         parts.append(f'"profile":{json.dumps(request.profile)}')
     if request.preserve_expiry:
@@ -506,6 +535,14 @@ class NodeClient:
                 raise  # a write, a fresh connection, a failure mid-answer, or a cancel: never resent
             logger.info("The server closed the kept-alive connection to {}; sending the read again", self.label)
             return self._post(self._channel_for_request(), body, attach, read_timeout)
+
+    def answered_within(self, seconds: float) -> bool:
+        """The next request would go out on a kept-alive channel whose last answer was read to its end at most `seconds`
+        ago, so the server is unlikely to have closed it meanwhile (ruling C40). False when it would open a new one."""
+        channel, now = self._channel, self._clock()
+        if channel is None or channel.idle_since is None or not channel.reusable(now):
+            return False
+        return now - channel.idle_since <= seconds
 
     def _channel_for_request(self) -> HttpChannel:
         if self._channel is None or not self._channel.reusable(self._clock()):

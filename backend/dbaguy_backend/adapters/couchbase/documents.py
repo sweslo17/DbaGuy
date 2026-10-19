@@ -8,11 +8,13 @@ stored text exactly (key order, whitespace, `1e400`) with its META; writes are C
   exists (A29).
 - A write is sent once (D-04-9): the server's own error answer is final (`QueryFailed`, B39); any other failure means
   the answer never came, so it may have been applied (`WriteOutcomeUnknown`). So does a failed read right after a
-  write that was answered (ruling C25): the document was written, but its META cannot be reported.
+  write that was answered (ruling C25): the document was written, but its META cannot be reported. A failure the
+  connection knows came before the write went out (`StatementNotSent`: the read it sends first on a channel that may be
+  stale, ruling C40) is raised as it is, like a read's.
 
-Literals and identifiers only from `sql/dialects.py`; `$doc` is the caller's text, which must be one JSON value
-(`json_problem` found nothing): it goes into the request body as it is, as parameter literals do. Logs nothing (the
-service does), never a text."""
+Literals and identifiers only from `sql/dialects.py`; `$doc` is the caller's text, which `json_problem` has accepted.
+The connection refuses a literal that is not one JSON value before anything is sent (ruling C39), `ValidationFailed`
+here. Logs nothing (the service does), never a text."""
 
 import math
 import re
@@ -26,7 +28,7 @@ from ...domain.errors import (
 )
 from ...sql.dialects import Dialect, keyspace_path, quote_literal
 from ...sql.jsontext import number_paths, one_line, without_strings
-from ..base import StatementError
+from ..base import INVALID_PARAMS, INVALID_TEXT, StatementError, StatementNotSent
 from ..documents import DocumentStore
 from .messages import PROTOCOL_ERROR, is_server_error
 from .stream import RawRow, RowField
@@ -55,10 +57,12 @@ _INT64_DIGITS = 19
 # and a number beyond a double's range needs a three-digit positive exponent or a mantissa of 309 digits.
 _SUSPECT = re.compile(r"[0-9]{19,}|[eE]\+?[0-9]{3,}")
 _NOT_A_CAS = "Not a CAS value of this server"
+_REFUSED_BEFORE_SENDING = frozenset({INVALID_PARAMS, INVALID_TEXT})  # a literal or a text the request cannot carry
 
 
 class Statements(Protocol):
-    """What the store sends its statements through: `CouchbaseConnection.statement_rows`."""
+    """What the store sends its statements through: `CouchbaseConnection.statement_rows` (StatementNotSent when
+    nothing of the statement went out)."""
 
     def statement_rows(self, statement: str, named: Mapping[str, str] | None = None, *, write: bool = False,
                        preserve_expiry: bool = False) -> list[RawRow]: ...
@@ -135,10 +139,21 @@ class SqlppDocumentStore(DocumentStore):
     def __init__(self, statements: Statements) -> None:
         self._statements = statements
 
+    def _rows(self, statement: str, named: Mapping[str, str], *, write: bool = False,
+              preserve_expiry: bool = False) -> list[RawRow]:
+        """Every statement goes through here. One the request cannot carry (C39) is ValidationFailed: nothing was sent,
+        and a reconnect would not change it."""
+        try:
+            return self._statements.statement_rows(statement, named, write=write, preserve_expiry=preserve_expiry)
+        except StatementError as exc:
+            if exc.code in _REFUSED_BEFORE_SENDING:
+                raise ValidationFailed(exc.message) from exc
+            raise
+
     # ---- reads ----
 
     def _one(self, statement: str, ks: str, doc_id: str) -> RawRow | None:
-        rows = self._statements.statement_rows(statement.format(ks=ks), {"id": _key(doc_id)})
+        rows = self._rows(statement.format(ks=ks), {"id": _key(doc_id)})
         return rows[0] if rows else None
 
     def get(self, keyspace: Keyspace, doc_id: str) -> DocumentView | None:
@@ -163,7 +178,7 @@ class SqlppDocumentStore(DocumentStore):
         return _State(fields["cas"].text, _integer(fields["expiration"]), fields["type"].value)
 
     def server_form(self, text: str) -> str:
-        rows = self._statements.statement_rows(_SERVER_FORM, {"doc": text})
+        rows = self._rows(_SERVER_FORM, {"doc": text})
         if len(rows) != 1:
             raise _protocol_error()
         return rows[0].text
@@ -177,7 +192,9 @@ class SqlppDocumentStore(DocumentStore):
 
     def _write(self, statement: str, named: Mapping[str, str], *, preserve_expiry: bool = False) -> list[RawRow]:
         try:
-            return self._statements.statement_rows(statement, named, write=True, preserve_expiry=preserve_expiry)
+            return self._rows(statement, named, write=True, preserve_expiry=preserve_expiry)
+        except StatementNotSent:
+            raise  # the write did not go out (C40): a failure like a read's
         except StatementError as exc:
             if exc.code == _CONCURRENT:
                 raise _Concurrent(exc) from exc

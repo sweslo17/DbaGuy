@@ -87,6 +87,7 @@ def transaction_open_error() -> StatementError:
 
 
 INVALID_TEXT = "invalid_text"
+INVALID_PARAMS = "invalid_params"  # a parameter refused before sending; the message names it, never its value
 
 
 def invalid_text_error(sql: str, index: int) -> StatementError:
@@ -102,6 +103,11 @@ def invalid_text_error(sql: str, index: int) -> StatementError:
 class StatementCancelled(StatementError):
     def __init__(self, message: str = "Query cancelled") -> None:
         super().__init__(message, code="cancelled")
+
+
+class StatementNotSent(StatementError):
+    """Nothing of the statement went out (raised where an adapter knows it): a check refused it before sending, or a
+    request that had to go first on its connection failed. A write that raises it was not applied."""
 
 
 class ReadAheadState(StrEnum):

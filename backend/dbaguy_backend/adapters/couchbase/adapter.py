@@ -30,6 +30,7 @@ from ...sql.lexer import first_keyword
 from ...sql.splitter import split
 from ...version import app_version
 from ..base import (
+    INVALID_PARAMS,
     INVALID_TEXT,
     AdapterCapabilities,
     DatabaseAdapter,
@@ -40,6 +41,7 @@ from ..base import (
     RunOptions,
     StatementCancelled,
     StatementError,
+    StatementNotSent,
     StatementResult,
     invalid_text_error,
 )
@@ -48,7 +50,8 @@ from ..documents import DocumentCapable, DocumentStore
 from . import catalog, sampling
 from .documents import SqlppDocumentStore
 from .http import (
-    ChannelError, HttpChannel, NodeClient, QueryRequest, TlsFailure, basic_auth, build_body, client_context_id,
+    ChannelError, HttpChannel, LiteralNotJson, NodeClient, QueryRequest, TlsFailure, basic_auth, build_body,
+    client_context_id,
 )
 from .messages import PROTOCOL_ERROR, is_server_error
 from .nodes import candidate_nodes
@@ -119,6 +122,11 @@ class _Deadline:
 
 # A user's statement has none: the worker times tabs, and a paused result must not be timed by the server (spec, R-04-5).
 _INTERNAL_DEADLINE = _Deadline(server="30s", client_s=40.0)
+# Ruling C40: an internal write is never sent again (D-04-9), so it goes out only on a channel that answered at most
+# this long ago. A channel idle for longer (the server may have closed it) or a new one first carries _PING, a read: a
+# closed kept-alive channel is replaced and the read sent again (NodeClient.send), and the write follows on a fresh one.
+WRITE_CHANNEL_IDLE_MAX_S = 2.0
+_PING = "SELECT RAW 1"
 
 
 def _transaction_statement(sql: str) -> bool:
@@ -202,7 +210,10 @@ class CouchbaseConnection(DatabaseConnection, FieldSampling, DocumentCapable):
             raise self._channel_failure(exc) from exc
         except UnicodeEncodeError:  # a lone surrogate in a context name or a parameter (the SQL is checked in run())
             self._end()
-            raise StatementError(_BAD_REQUEST_TEXT, code=INVALID_TEXT) from None
+            raise StatementNotSent(_BAD_REQUEST_TEXT, code=INVALID_TEXT) from None
+        except LiteralNotJson as exc:  # C39: it would add fields of its own to the body; named, never echoed
+            self._end()
+            raise StatementNotSent(f"{exc}: nothing was sent", code=INVALID_PARAMS) from None
         except BaseException:
             self._end()
             raise
@@ -275,15 +286,29 @@ class CouchbaseConnection(DatabaseConnection, FieldSampling, DocumentCapable):
         read its head, with a deadline (_INTERNAL_DEADLINE: the server's `timeout` of 30 s, whose error 1080 is raised
         like any other, and 40 s without a byte on the client). A read is read-only and retry-safe; a write (`write`, a
         document store's UPDATE, INSERT or DELETE) is read-only only on a read-only profile (the server refuses it then,
-        too) and never sent again (D-04-9). The caller reads the rows and closes it. `named`: parameter names without
-        `$` and their JSON literal texts. `context`: the request's query context (None: none is sent, as the catalog
-        wants). `preserve_expiry`: see `_begin`."""
+        too), never sent again (D-04-9), and goes out only on a channel that has just answered (ruling C40, a read
+        first otherwise). The caller reads the rows and closes it. `named`: parameter names without `$` and their JSON
+        literal texts (each must be one JSON value, C39). `context`: the request's query context (None: none is sent,
+        as the catalog wants). `preserve_expiry`: see `_begin`."""
         self._close_result()
+        if write:
+            self._fresh_channel_for_write()
         params = StatementParams(named=dict(named)) if named else None
         stream = self._begin(statement, context=context, params=params,
                              readonly=self._read_only if write else True, retry_safe=not write,
                              deadline=_INTERNAL_DEADLINE, preserve_expiry=preserve_expiry)
         return start_result(stream, statement, plan=False, bare_star=False, dml=write, on_done=self._end)
+
+    def _fresh_channel_for_write(self) -> None:
+        """Ruling C40 (see WRITE_CHANNEL_IDLE_MAX_S); a failed read is StatementNotSent (the write never went out)."""
+        if self._client.answered_within(WRITE_CHANNEL_IDLE_MAX_S):
+            return
+        logger.debug("Couchbase: a read before the write, on a channel that has not answered within {} s",
+                     WRITE_CHANNEL_IDLE_MAX_S)
+        try:
+            self.query(_PING)
+        except StatementError as exc:
+            raise StatementNotSent(exc.message, code=exc.code) from exc
 
     def query(self, statement: str, named: Mapping[str, str] | None = None, *,
               context: QueryContext | None = None) -> list[Any]:

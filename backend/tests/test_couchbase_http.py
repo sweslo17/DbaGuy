@@ -10,8 +10,8 @@ from loguru import logger
 
 from dbaguy_backend.adapters.couchbase import http as http_module
 from dbaguy_backend.adapters.couchbase.http import (
-    ChannelError, ChunkedBody, NodeClient, QueryRequest, TlsFailure, basic_auth, build_body, client_context_id,
-    failure_reason, tls_failure,
+    ChannelError, ChunkedBody, LiteralNotJson, NodeClient, QueryRequest, TlsFailure, basic_auth, build_body,
+    client_context_id, failure_reason, tls_failure,
 )
 from dbaguy_backend.adapters.couchbase.stream import EndEvent, FieldEvent, ResponseParser, RowEvent
 from tests.couchbase_fakes import (
@@ -67,6 +67,35 @@ def test_a_timeout_is_in_the_body_only_when_the_request_has_one():  # R-04a-F3
     assert body.decode() == '{"statement":"SELECT 1","client_context_id":"dbaguy-r2","readonly":true,"timeout":"30s"}'
     assert json.loads(body)["timeout"] == "30s"
     assert b"timeout" not in build_body(QueryRequest("SELECT 1", "dbaguy-r3"))  # a user's statement: never
+
+
+@pytest.mark.parametrize(("named", "positional", "label"), [
+    ({"doc": '1, "readonly": false'}, [], "$doc"),
+    ({"doc": '{}, "statement": "DELETE FROM b"'}, [], "$doc"),
+    ({"n": '"a" "b"'}, [], "$n"),
+    ({"n": "{}}"}, [], "$n"),
+    ({"n": "1 2"}, [], "$n"),
+    ({"n": ""}, [], "$n"),
+    ({"n": " \n "}, [], "$n"),
+    ({"n": "NaN"}, [], "$n"),
+    ({"n": "\x0b1"}, [], "$n"),  # not JSON whitespace
+    ({"n": '{"a": 1'}, [], "$n"),
+    ({"ok": "1", "n": "[1]]"}, [], "$n"),
+    ({}, ['1], "readonly": false, "x": [1'], "$1"),
+    ({}, ["1", "2,3"], "$2"),
+])
+def test_a_literal_that_is_not_one_json_value_is_never_embedded(named, positional, label):  # ruling C39
+    with pytest.raises(LiteralNotJson) as refused:
+        build_body(QueryRequest("SELECT 1", "dbaguy-c39", readonly=True, named=named, positional=positional))
+    assert refused.value.label == label and str(refused.value) == f"Parameter {label} is not one JSON value"
+
+
+def test_a_big_or_deep_literal_with_whitespace_around_it_is_one_value():  # ruling C39: the check builds nothing
+    big = ' \n{"items": [' + ",".join(f'{{"n": {i}, "s": "x, ]}}\\" 1"}}' for i in range(150_000)) + "]}\t\r\n"
+    deep = "[" * 1000 + "]" * 1000  # deeper than the walkers of jsontext go; the C decoder takes it (as json_problem)
+    body = build_body(QueryRequest("SELECT $doc, $d", "dbaguy-big", named={"doc": big, "d": deep},
+                                   positional=[" 1e400 "]))
+    assert len(big) > 4_000_000 and body.endswith(f'"$doc":{big},"$d":{deep},"args":[ 1e400 ]}}'.encode())
 
 
 def test_a_lone_surrogate_cannot_be_sent():

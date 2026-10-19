@@ -8,7 +8,7 @@ import time
 import pytest
 
 from dbaguy_backend import container
-from dbaguy_backend.adapters.base import Endpoint, RunOptions, StatementCancelled, StatementError
+from dbaguy_backend.adapters.base import Endpoint, RunOptions, StatementCancelled, StatementError, StatementNotSent
 from dbaguy_backend.adapters.couchbase import adapter as couchbase_adapter
 from dbaguy_backend.adapters.couchbase import settings as couchbase_settings
 from dbaguy_backend.adapters.couchbase.adapter import (
@@ -19,7 +19,8 @@ from dbaguy_backend.adapters.couchbase.result import EventStream, start_result
 from dbaguy_backend.adapters.couchbase.rows import OVERFLOW_NAME
 from dbaguy_backend.adapters.couchbase.settings import connection_settings
 from dbaguy_backend.adapters.values import MISSING, JsonText
-from dbaguy_backend.domain.errors import ConnectionFailed
+from dbaguy_backend.domain.couchbase import Keyspace
+from dbaguy_backend.domain.errors import ConnectionFailed, ValidationFailed
 from dbaguy_backend.domain.execution import ErrorPosition, MessageSeverity, QueryContext, StatementParams
 from dbaguy_backend.domain.metadata import ServerInfo
 from dbaguy_backend.domain.profiles import Engine, SslConfig
@@ -358,6 +359,104 @@ def test_an_internal_query_gives_up_when_the_server_says_nothing(monkeypatch):  
         assert connection.query("SELECT 1 AS a") == [{"a": 1}]  # the connection is usable again, on a new channel
     finally:
         gate.set()
+        connection.close()
+        server.close()
+
+
+# ---- what a request body can carry (ruling C39), and where a write may go out (ruling C40) ----
+
+# Ends `$doc` early and adds fields of its own: the server may keep the last of two `readonly` or `statement` fields
+INJECTION = '1, "readonly": false, "statement": "DELETE FROM dbaguy.app.orders"'
+KEYSPACE = Keyspace(bucket="dbaguy", scope="app", collection="orders")
+DOCUMENT = (b'{"signature":{"cas":"json","expiration":"json","type":"json","d":"json"},'
+            b'"results":[{"cas":5,"expiration":0,"type":"json","d":{"a":1}}],"status":"success"}')
+STATE = (b'{"signature":{"cas":"json","expiration":"json","type":"json"},'
+         b'"results":[{"cas":6,"expiration":0,"type":"json"}],"status":"success"}')
+PONG = b'{"signature":{"$1":"number"},"results":[1],"status":"success"}'
+WRITTEN = b'{"signature":{"cas":"json"},"results":[{"cas":6}],"status":"success"}'  # RETURNING META(d).cas AS cas
+DELETED = b'{"signature":"json","results":["k"],"status":"success"}'  # RETURNING RAW META(d).id
+
+
+def statements(server):
+    return [body["statement"] for body in sent(server)]
+
+
+@pytest.mark.parametrize("params", [StatementParams(named={"n": INJECTION}),
+                                    StatementParams(positional=["1", '2], "readonly": false, "x": [3'])],
+                         ids=["named", "positional"])
+def test_run_never_sends_a_literal_that_is_not_one_json_value(params):  # ruling C39
+    server, connection = fake_connection([OK_ONE])
+    try:
+        with pytest.raises(StatementError) as refused:
+            connection.run("SELECT $n, $1, $2", RunOptions(params=params))
+        assert refused.value.code == "invalid_params" and server.bodies == []
+        assert "readonly" not in refused.value.message and "$" in refused.value.message  # named, never echoed
+        assert connection.run("SELECT 1").fetch(10) == [[1]]  # nothing is left busy
+    finally:
+        connection.close()
+        server.close()
+
+
+def test_the_document_store_never_sends_a_literal_that_is_not_one_json_value(monkeypatch):  # ruling C39
+    monkeypatch.setattr(couchbase_adapter, "WRITE_CHANNEL_IDLE_MAX_S", 60.0)  # the channel stays fresh (C40)
+    server, connection = fake_connection([OK_ONE])
+    store = connection.documents()
+    try:
+        connection.query("SELECT 1 AS a")  # the channel has just answered: a write needs no read first
+        for refused_call in (lambda: store.server_form(INJECTION), lambda: store.replace(KEYSPACE, "k", INJECTION, 1),
+                             lambda: store.insert(KEYSPACE, "k", INJECTION)):
+            with pytest.raises(ValidationFailed) as refused:  # not WriteOutcomeUnknown: nothing went out
+                refused_call()
+            assert refused.value.message == "Parameter $doc is not one JSON value: nothing was sent"
+        assert len(server.bodies) == 1  # the SELECT 1 only
+    finally:
+        connection.close()
+        server.close()
+
+
+def test_a_write_never_goes_out_on_a_channel_the_server_may_have_closed(monkeypatch):  # ruling C40
+    monkeypatch.setattr(couchbase_adapter, "WRITE_CHANNEL_IDLE_MAX_S", 0.05)
+    # the server closes the kept-alive connection after the read (an idle timeout), as a node does after a while
+    server, connection = fake_connection([Reply(DOCUMENT, drop_after=True), Reply(PONG), Reply(DELETED)])
+    store = connection.documents()
+    try:
+        assert store.get(KEYSPACE, "k").cas == "5"
+        time.sleep(0.2)  # idle for longer than the limit
+        store.remove(KEYSPACE, "k", 5)  # without the read first: sent on the closed channel, write_outcome_unknown
+        sent_now = statements(server)
+        assert [text.split()[0] for text in sent_now] == ["SELECT", "SELECT", "DELETE"]
+        assert sent_now[1] == "SELECT RAW 1"
+        assert server.connections == 2  # the read met the closed channel and went out again on a new one
+    finally:
+        connection.close()
+        server.close()
+
+
+def test_a_write_right_after_an_answer_needs_no_read_first_and_a_new_channel_does():  # ruling C40
+    server, connection = fake_connection([Reply(PONG), Reply(WRITTEN), Reply(STATE), Reply(DOCUMENT), Reply(WRITTEN),
+                                          Reply(STATE)])
+    store = connection.documents()
+    try:
+        assert store.insert(KEYSPACE, "k", "{}").cas == "6"  # the channel was never used: a read goes first
+        store.get(KEYSPACE, "k")
+        assert store.replace(KEYSPACE, "k", '{"a": 2}', 5).cas == "6"  # right after the get: nothing first
+        assert [text.split()[0] for text in statements(server)] == [
+            "SELECT", "INSERT", "SELECT", "SELECT", "UPDATE", "SELECT"]
+        assert statements(server)[0] == "SELECT RAW 1" and statements(server).count("SELECT RAW 1") == 1
+    finally:
+        connection.close()
+        server.close()
+
+
+def test_when_the_read_before_a_write_fails_the_write_is_not_sent():  # ruling C40
+    server, connection = fake_connection([Reply(PONG, cut=True)])
+    store = connection.documents()
+    try:
+        with pytest.raises(StatementNotSent) as failed:  # a read's failure, not WriteOutcomeUnknown: nothing changed
+            store.remove(KEYSPACE, "k", 5)
+        assert failed.value.code == "connection_lost"
+        assert statements(server) == ["SELECT RAW 1"]
+    finally:
         connection.close()
         server.close()
 
