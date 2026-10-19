@@ -27,6 +27,11 @@ export interface EndedCommit {
    */
   readonly messages: Messages;
   readonly cancelled: boolean;
+  /**
+   * The session still had a transaction open when the apply finished (`finished.in_transaction`): the apply's rollback
+   * failed, or the transaction was open before it (`transaction_open`).
+   */
+  readonly inTransaction: boolean;
 }
 
 /** The command never left: the session was not connected (`not_connected`), so nothing happened. */
@@ -53,6 +58,7 @@ const ended = (execution: ExecutionState, outcome: EditOutcome, event: EditOutco
     ? execution.messages.filter((message) => message.text !== INTERRUPTED_MESSAGE)
     : execution.messages,
   cancelled: execution.cancelled,
+  inTransaction: execution.inTransaction,
 });
 
 /**
@@ -79,19 +85,30 @@ export function commitState(execution: ExecutionState): CommitState {
  */
 export function abandonedCommit(execution: ExecutionState | null): SettledCommit {
   if (execution) return settled(execution);
-  return { kind: "ended", outcome: "unknown", event: null, error: null, messages: [], cancelled: false };
+  return {
+    kind: "ended",
+    outcome: "unknown",
+    event: null,
+    error: null,
+    messages: [],
+    cancelled: false,
+    inTransaction: false,
+  };
 }
 
-/** How long COMMIT may be on its way without an answer before the dialog offers to stop waiting (pre-flight M2). */
+/** How long the apply may go without an event before the dialog offers to close it unknown (pre-flight M2). */
 export const OUTCOME_WAIT_MS = 30_000;
-/** The applying dialog's way out when the outcome does not come (pre-flight M2). */
-export const STOP_WAITING_LABEL = "Stop waiting";
+/** The applying dialog's way out when the outcome does not come (pre-flight M2, ruling K11). */
+export const CLOSE_UNKNOWN_LABEL = "Close — outcome unknown";
 
 /**
- * Whether the applying dialog offers to stop waiting (pre-flight M2: otherwise the modal can hold the whole app): the
- * session is not open (the outcome can no longer arrive on this socket), or every statement was counted (COMMIT is on
- * its way and Cancel no longer reaches it) and nothing came for OUTCOME_WAIT_MS. While a statement runs, Cancel is the
- * way out.
+ * Whether the applying dialog offers CLOSE_UNKNOWN_LABEL (pre-flight M2, ruling K11: otherwise the modal can hold the
+ * whole app), when any of these holds:
+ * - the session is not open: the outcome can no longer arrive on this socket;
+ * - every statement was counted (COMMIT is on its way, and Cancel no longer reaches it) and no event came for
+ *   OUTCOME_WAIT_MS after the last `affected`;
+ * - a Cancel was sent and no event came for OUTCOME_WAIT_MS since (the statement does not stop).
+ * Before that, while a statement runs, Cancel is the way out: it ends in a known outcome.
  */
 export function mayStopWaiting(wait: {
   phase: SessionPhase;
@@ -101,9 +118,12 @@ export function mayStopWaiting(wait: {
   statements: number;
   /** Milliseconds since the apply's last event (or since it was sent). */
   quietMs: number;
+  /** Milliseconds since the Cancel was sent; null when none was. */
+  sinceCancelMs: number | null;
 }): boolean {
   if (wait.phase !== "open") return true;
-  return wait.counted >= wait.statements && wait.quietMs >= OUTCOME_WAIT_MS;
+  if (wait.counted >= wait.statements && wait.quietMs >= OUTCOME_WAIT_MS) return true;
+  return wait.sinceCancelMs !== null && Math.min(wait.sinceCancelMs, wait.quietMs) >= OUTCOME_WAIT_MS;
 }
 
 /** What the staging takes from a command that never left (pre-flight H1): nothing happened; "applying" is cleared. */
@@ -168,6 +188,7 @@ export const SQLITE_BUSY_NOTE =
   "Another tab still has an open result of this database file, or another program is using it: finish or close that result, then commit again.";
 export const PARTIAL_NOTE = "This table cannot roll back: what took effect is no longer staged, the rest still is.";
 const CANCELLED_TITLE = "Cancelled: nothing was applied";
+const CLOSED_TITLE = "The session closed before the commit started: nothing was applied";
 
 /** The command never left (the session was not connected): nothing happened, so nothing changes in the staging. */
 export const NOT_SENT_REPORT: CommitReport = {
@@ -189,10 +210,15 @@ export const UNKNOWN_BEFORE =
 export const isSqliteBusy = (code: string | null | undefined): boolean =>
   !!code && (code.startsWith("SQLITE_BUSY") || code.startsWith("SQLITE_LOCKED"));
 
-/** The warning of a commit that stood though its COMMIT failed (non-transactional): `_end_apply` in worker.py. */
+/** The warning of a commit that stood though its COMMIT failed (non-transactional): `COMMIT_WARNING` in edit_apply.py. */
 const COMMIT_WARNING = "COMMIT reported an error after every statement had taken effect";
-/** The warning of a rollback that failed with the transaction still open: `ROLLBACK_FAILED` in edit_apply.py. */
+/**
+ * The warning of a rollback that failed with the transaction still open: `ROLLBACK_FAILED` in edit_apply.py. Only a
+ * fallback: `finished.in_transaction` says it (`EndedCommit.inTransaction`).
+ */
 const ROLLBACK_FAILED = "The transaction could not be rolled back";
+/** The message of a queued request whose session closed first: `CLOSED_BEFORE_START` in worker.py. */
+const CLOSED_BEFORE_START = "Session closed before the query started";
 
 const isCommitWarning = (message: Messages[number]) =>
   message.severity === "warning" && message.text.startsWith(COMMIT_WARNING);
@@ -211,13 +237,28 @@ export function listedMessages(commit: EndedCommit): Messages {
 }
 
 /**
- * The session's own database connection needs a new session (pre-flight L11): it was lost, or the apply's rollback
- * failed and left its transaction open ("close and reopen this tab").
+ * The session's own database connection needs a new session (pre-flight L11): it was lost, or a transaction is still
+ * open on it once the apply finished (its rollback failed: "close and reopen this tab"). The warning's text is only a
+ * fallback for `finished.in_transaction`.
  */
 const needsReconnect = (commit: EndedCommit) =>
-  commit.error?.code === CONNECTION_LOST || commit.messages.some((message) => message.text.startsWith(ROLLBACK_FAILED));
+  commit.error?.code === CONNECTION_LOST ||
+  commit.inTransaction ||
+  commit.messages.some((message) => message.text.startsWith(ROLLBACK_FAILED));
 
-/** The dialog's account of an ended apply; `sqlModeRefusals` counts this tab's `sql_mode_changed` refusals in a row. */
+/** The title of a rollback: a closed session and a cancel each say so (neither is the server's refusal). */
+function rolledBackTitle(commit: EndedCommit): string {
+  if (commit.messages.some((message) => message.text === CLOSED_BEFORE_START)) return CLOSED_TITLE;
+  return isCancel(commit) ? CANCELLED_TITLE : "Nothing was applied";
+}
+
+/** "1 row was already gone", "3 rows were already gone": the report's note and the toast's part. */
+const alreadyGone = (gone: number) => `${plural(gone, "row")} ${gone === 1 ? "was" : "were"} already gone`;
+
+/**
+ * The dialog's account of an ended apply. `sqlModeRefusals`: this tab's `sql_mode_changed` refusals in a row, this
+ * apply's own included (so the first refusal is 1).
+ */
 export function commitReport(commit: EndedCommit, context: { total: number; sqlModeRefusals: number }): CommitReport {
   const failedChange = commit.event?.failed_change ?? null;
   const failedStatement = commit.event?.statement ?? null;
@@ -236,7 +277,7 @@ export function commitReport(commit: EndedCommit, context: { total: number; sqlM
   switch (commit.outcome) {
     case "committed": {
       const gone = commit.event?.already_gone.length ?? 0;
-      const notes = gone ? [`${plural(gone, "row")} ${gone === 1 ? "was" : "were"} already gone`] : [];
+      const notes = gone ? [alreadyGone(gone)] : [];
       return { ...base, tone: "success", title: `Committed ${plural(applied, "change")}`, notes, actions: [] };
     }
     case "partial":
@@ -245,7 +286,7 @@ export function commitReport(commit: EndedCommit, context: { total: number; sqlM
         tone: "warning",
         title: `Partly applied: ${applied.toLocaleString()} of ${plural(context.total, "change")} took effect`,
         notes: [PARTIAL_NOTE],
-        actions,
+        actions: needsReconnect(commit) ? [...actions, "reconnect"] : actions,
       };
     case "unknown":
       return {
@@ -272,7 +313,7 @@ export function commitReport(commit: EndedCommit, context: { total: number; sqlM
       }
       if (isSqliteBusy(code)) notes.push(SQLITE_BUSY_NOTE);
       if (needsReconnect(commit)) offer("reconnect");
-      const title = isCancel(commit) ? CANCELLED_TITLE : "Nothing was applied";
+      const title = rolledBackTitle(commit);
       const detail = base.detail === title ? null : base.detail; // a cancel's text is the title itself
       return { ...base, tone: "danger", title, detail, notes, actions };
     }
@@ -283,7 +324,7 @@ export function commitReport(commit: EndedCommit, context: { total: number; sqlM
 export function commitToast(event: EditOutcomeEvent, table: string, inserts: number): string {
   const gone = event.already_gone.length;
   const parts = [`Committed ${plural(event.applied.length, "change")} to ${table}`];
-  if (gone) parts.push(`${plural(gone, "row")} ${gone === 1 ? "was" : "were"} already gone`);
+  if (gone) parts.push(alreadyGone(gone));
   const text = parts.join(" · ");
   return inserts
     ? `${text}. New rows appear where the table's order puts them, which may be past the rows loaded`

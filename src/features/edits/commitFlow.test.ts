@@ -17,6 +17,7 @@ import {
   commitWarning,
   listedMessages,
   LOST_TEXT,
+  CLOSE_UNKNOWN_LABEL,
   mayStopWaiting,
   NOT_SENT_OUTCOME,
   OUTCOME_WAIT_MS,
@@ -47,9 +48,10 @@ const apply = (events: object[]): ExecutionState =>
     (state, event) => applyEvent(state, { request_id: R, ...event } as ServerEvent),
     newExecution(R, "edits", ""),
   );
-const finished = (cancelled = false) => ({
+const finished = (cancelled = false, inTransaction = false) => ({
   type: "finished",
   elapsed_ms: 5,
+  in_transaction: inTransaction,
   cancelled,
   timed_out: false,
   skipped: false,
@@ -131,6 +133,25 @@ describe("reading an apply's events", () => {
     expect(commitReport(endedOf(queued), { total: 1, sqlModeRefusals: 0 }).title).toBe(
       "Cancelled: nothing was applied",
     );
+  });
+
+  it("says a session that closed before the apply started closed: the user cancelled nothing", () => {
+    const closed = endedOf(
+      apply([
+        { type: "started" },
+        { type: "message", severity: "warning", text: "Session closed before the query started" },
+        outcome("rolled_back"),
+        { type: "session_state", autocommit: true, in_transaction: false, transaction_failed: false },
+        finished(true),
+      ]),
+    );
+    expect(commitReport(closed, { total: 1, sqlModeRefusals: 0 })).toMatchObject({
+      tone: "danger",
+      title: "The session closed before the commit started: nothing was applied",
+      detail: null,
+      actions: [],
+    });
+    expect(stagedOutcome(closed)).toEqual(NOT_SENT_OUTCOME); // rolled back; no row turns red
   });
 
   it("calls an apply that ended without its outcome unknown", () => {
@@ -351,14 +372,21 @@ describe("every code an apply can end with", () => {
   const ROLLBACK_FAILED_TEXT = "The transaction could not be rolled back: close and reopen this tab";
 
   it("offers Reconnect when the rollback failed and left the transaction open", () => {
-    const stuck = report([
-      { type: "started" },
-      { type: "error", message: "deadlock", code: "1213" },
-      { type: "message", severity: "warning", text: ROLLBACK_FAILED_TEXT },
-      outcome("rolled_back"),
-      finished(),
-    ]);
-    expect(stuck.actions).toEqual(["reconnect"]);
+    const stuck = (warning: object[], inTransaction: boolean) =>
+      report([
+        { type: "started" },
+        { type: "error", message: "deadlock", code: "1213" },
+        ...warning,
+        outcome("rolled_back"),
+        finished(false, inTransaction),
+      ]);
+    const warning = [{ type: "message", severity: "warning", text: ROLLBACK_FAILED_TEXT }];
+    expect(stuck(warning, true).actions).toEqual(["reconnect"]); // as the backend sends it
+    expect(stuck([], true).actions).toEqual(["reconnect"]); // finished.in_transaction alone says it
+    expect(stuck(warning, false).actions).toEqual(["reconnect"]); // the text alone, as a fallback
+    expect(stuck([], false).actions).toEqual([]);
+    const unknown = report([outcome("unknown"), finished(false, true)]);
+    expect(unknown.actions).toEqual(["refresh", "reconnect"]);
     // a repeated sql_mode refusal whose rollback after BEGIN failed: two reasons to reconnect, one button
     const twice = report(
       [
@@ -427,6 +455,12 @@ describe("every code an apply can end with", () => {
       notes: [PARTIAL_NOTE],
       actions: [],
     });
+    // its rollback failed: the transaction is still open on the session
+    const stuck = report([outcome("partial", { applied: ["d:1"], failed_change: "u:2" }), finished(false, true)], {
+      total: 2,
+      sqlModeRefusals: 0,
+    });
+    expect(stuck.actions).toEqual(["show_in_grid", "reconnect"]);
   });
 
   it("reports a commit with the rows already gone", () => {
@@ -527,7 +561,7 @@ describe("what the staging takes", () => {
 });
 
 describe("when the outcome does not come (pre-flight M2)", () => {
-  it("stops waiting with an unknown outcome, or the one that arrived, or not sent", () => {
+  it("closes with an unknown outcome, or the one that arrived, or not sent", () => {
     expect(abandonedCommit(null)).toEqual({
       kind: "ended",
       outcome: "unknown",
@@ -535,6 +569,7 @@ describe("when the outcome does not come (pre-flight M2)", () => {
       error: null,
       messages: [],
       cancelled: false,
+      inTransaction: false,
     });
     const waiting = apply([{ type: "started" }, { type: "affected", index: 0, rows: 1 }]);
     expect(abandonedCommit(waiting)).toMatchObject({ kind: "ended", outcome: "unknown", event: null });
@@ -548,14 +583,26 @@ describe("when the outcome does not come (pre-flight M2)", () => {
     expect(abandonedCommit(never)).toEqual({ kind: "not_sent" });
   });
 
-  it("offers to stop waiting once the session is not open, or once COMMIT has gone unanswered too long", () => {
-    const wait = { phase: "open" as const, counted: 3, statements: 3, quietMs: OUTCOME_WAIT_MS };
+  it("offers to close it unknown once the session is not open, or once COMMIT has gone unanswered too long", () => {
+    expect(CLOSE_UNKNOWN_LABEL).toBe("Close — outcome unknown");
+    const wait = { phase: "open" as const, counted: 3, statements: 3, quietMs: OUTCOME_WAIT_MS, sinceCancelMs: null };
     expect(mayStopWaiting(wait)).toBe(true);
     expect(mayStopWaiting({ ...wait, quietMs: OUTCOME_WAIT_MS - 1 })).toBe(false);
     expect(mayStopWaiting({ ...wait, counted: 2 })).toBe(false); // a statement still runs: Cancel is the way out
     expect(mayStopWaiting({ ...wait, counted: 2, quietMs: 0, phase: "reconnecting" })).toBe(true);
     expect(mayStopWaiting({ ...wait, quietMs: 0, phase: "failed" })).toBe(true);
     expect(mayStopWaiting({ ...wait, quietMs: 0, phase: "closed" })).toBe(true);
+  });
+
+  it("offers it when a Cancel brought nothing back for OUTCOME_WAIT_MS (ruling K11)", () => {
+    const tenMinutes = 10 * 60_000;
+    // the review's case: nothing counted of 3, Cancel sent, nothing back for ten minutes
+    const stuck = { phase: "open" as const, counted: 0, statements: 3, quietMs: tenMinutes, sinceCancelMs: tenMinutes };
+    expect(mayStopWaiting(stuck)).toBe(true);
+    expect(mayStopWaiting({ ...stuck, sinceCancelMs: null })).toBe(false); // no Cancel yet: it is the way out
+    expect(mayStopWaiting({ ...stuck, sinceCancelMs: OUTCOME_WAIT_MS - 1 })).toBe(false); // the Cancel is fresh
+    expect(mayStopWaiting({ ...stuck, quietMs: OUTCOME_WAIT_MS - 1 })).toBe(false); // an event came since it
+    expect(mayStopWaiting({ ...stuck, quietMs: OUTCOME_WAIT_MS, sinceCancelMs: OUTCOME_WAIT_MS })).toBe(true);
   });
 });
 

@@ -75,6 +75,7 @@ async function opened(): Promise<{ controller: SessionController; socket: FakeSo
 
 const execution = (controller: SessionController, id: string) => controller.store.getState().executions[id];
 const applies = (socket: FakeSocket) => socket.sent.filter((command) => command.type === "apply_edits");
+const NOT_CANCELLED = { cancelled: false, timed_out: false, skipped: false };
 
 describe("an apply on the session", () => {
   it("never leaves while the session is not open: not sent, nothing happened, the session is not busy", () => {
@@ -103,7 +104,7 @@ describe("an apply on the session", () => {
       { type: "affected", request_id: id, index: 0, rows: 1 },
       { type: "edit_outcome", request_id: id, outcome: "committed", applied: ["u:1"], already_gone: [] },
       { type: "session_state", autocommit: true, in_transaction: false, transaction_failed: false },
-      { type: "finished", request_id: id, elapsed_ms: 4, cancelled: false, timed_out: false, skipped: false },
+      { type: "finished", request_id: id, elapsed_ms: 4, in_transaction: false, ...NOT_CANCELLED },
     ]) {
       socket.emit(event);
     }
@@ -147,7 +148,7 @@ describe("an apply on the session", () => {
     socket.emit({ type: "error", request_id: id, message: "Invalid command: …", code: "invalid_command" });
     expect(commitState(execution(controller, id))).toEqual({ kind: "running", done: 0 });
     socket.emit({ type: "edit_outcome", request_id: id, outcome: "rolled_back", applied: [], already_gone: [] });
-    socket.emit({ type: "finished", request_id: id, elapsed_ms: 0, cancelled: false, timed_out: false, skipped: false });
+    socket.emit({ type: "finished", request_id: id, elapsed_ms: 0, in_transaction: false, ...NOT_CANCELLED });
     expect(commitState(execution(controller, id))).toMatchObject({ kind: "ended", outcome: "rolled_back" });
   });
 });

@@ -224,6 +224,22 @@ describe("saving staged edits", () => {
       expect(rolledBack.outcome_unknown).toBe(false);
       expect(rolledBack.updates).toHaveLength(1);
     });
+
+    it("never writes what the apply in flight replaced (ruling K10): only that the outcome is unknown", () => {
+      const refreshed = stage(
+        stage(stage(staged(edit(1, "b")), { type: "applying" }), outcome("unknown")),
+        { type: "refreshed" },
+      );
+      const applying = stage(refreshed, { type: "applying" });
+      expect(applying.beforeApplying).toBe("refreshed");
+      const file = savedEdits(applying).file!;
+      expect(Object.keys(file).sort()).toEqual(
+        ["deletes", "inserts", "key_columns", "outcome_unknown", "updates", "version"],
+      );
+      expect(file).toEqual(savedEdits(refreshed).file); // the same file as before the apply
+      expect(JSON.stringify(file)).not.toMatch(/refreshed|applying|before/i);
+      expect(restoredEdits(file)).toMatchObject({ unknownOutcome: "pending", beforeApplying: null });
+    });
   });
 });
 

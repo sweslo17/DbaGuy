@@ -62,6 +62,12 @@ export interface ExecutionState {
   interrupted: boolean;
   /** An `edits` request's outcome (exactly one per apply, 05a E1); null until it arrives, and for other kinds. */
   editOutcome: EditOutcomeEvent | null;
+  /**
+   * A transaction was open on the session when the request finished (`finished.in_transaction`); false until then. After
+   * an apply it is one the apply could not end (its rollback failed, 05a contract) or one open before it
+   * (`transaction_open`): only a Rollback or a new session ends it.
+   */
+  inTransaction: boolean;
 }
 
 export const INTERRUPTED_MESSAGE = "Connection interrupted — results may be incomplete";
@@ -106,6 +112,7 @@ export function newExecution(
     skipped: false,
     interrupted: false,
     editOutcome: null,
+    inTransaction: false,
   };
 }
 
@@ -191,6 +198,7 @@ export function applyEvent(state: ExecutionState, event: ServerEvent): Execution
         cancelled: event.cancelled,
         timedOut: event.timed_out,
         skipped: event.skipped,
+        inTransaction: event.in_transaction,
         resultSets: endSets(state.resultSets),
       };
     default:

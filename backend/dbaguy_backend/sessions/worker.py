@@ -73,6 +73,7 @@ from ..sql.formatting import (
 )
 from ..storage.atomic_file import atomic_text_file
 from .edit_apply import (
+    COMMIT_WARNING,
     CONNECTION_LOST,
     ROLLBACK_FAILED,
     ROW_COUNT_UNKNOWN,
@@ -97,6 +98,9 @@ _READ_AHEAD = object()  # what `_next_task` gives when no task is queued and the
 _EXPORT_CHUNK = 1000  # rows fetched, written and checked for a cancel at a time
 _PROGRESS_EVERY = 10_000  # an export reports its row count each time it passes a multiple of this
 _EXPORT_SELECT_ONLY = "Only a statement that returns rows (SELECT, WITH, VALUES…) can be exported"
+# The warning of a queued request whose session closed before it ran. src/features/edits/commitFlow.ts matches it to say
+# so for an apply (rather than "Cancelled"): change both together
+CLOSED_BEFORE_START = "Session closed before the query started"
 # A grid commit's texts (BEGIN, its DML, COMMIT) return no result set to show: nothing to describe (05a review M1). A
 # trigger's SELECT still comes back as a result set, which has no count (row_count_unknown, ruling E9).
 _EDIT_OPTIONS = RunOptions(describe=False)
@@ -633,7 +637,7 @@ class SessionWorker:
             if cancelled:
                 return "Query cancelled before it started"
             if self._closed:
-                return "Session closed before the query started"
+                return CLOSED_BEFORE_START
             self._running_request = request_id
             self._cancel_requested = False
             self._cancels = 0
@@ -1150,7 +1154,7 @@ class SessionWorker:
         History record, session_state and finished (`_complete`)."""
         rid, error = req.request_id, report.error
         if error is not None and report.outcome == "committed":
-            text = f"COMMIT reported an error after every statement had taken effect: {error.message}"
+            text = f"{COMMIT_WARNING}: {error.message}"
             self._send(MessageEvent(request_id=rid, severity=MessageSeverity.WARNING, text=text))
         elif error is not None:
             self._send(ErrorEvent(request_id=rid, message=error.message, code=error.code, position=error.position))

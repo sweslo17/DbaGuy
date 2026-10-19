@@ -28,7 +28,11 @@ THIS_MAY_HAVE = "this change may have taken effect (this table cannot roll back)
 TRANSACTION_ENDED: dict[Dialect, frozenset[str]] = {Dialect.TSQL: frozenset({"3609"})}
 # Pre-flight L7: COMMIT returned with a transaction still open; the worker rolls that one back
 COMMIT_LEFT_OPEN = "COMMIT left a transaction open, which was rolled back: the changes may or may not have been applied"
-ROLLBACK_FAILED = "The transaction could not be rolled back: close and reopen this tab"  # pre-flight L8
+# Pre-flight L8. src/features/edits/commitFlow.ts matches its start (only as a fallback for finished.in_transaction)
+ROLLBACK_FAILED = "The transaction could not be rolled back: close and reopen this tab"
+# The warning of a commit that stood though its COMMIT failed (a table that cannot roll back), before the server's text.
+# src/features/edits/commitFlow.ts matches its start to toast it on its own: change both together
+COMMIT_WARNING = "COMMIT reported an error after every statement had taken effect"
 # The plan's literals read backslashes as the metadata connection's sql_mode did at the preview (D-05-13); the session
 # that applies reads them differently (a GLOBAL sql_mode changed between the two connects, a proxy's backends differ):
 # refused right after BEGIN, before any DML (05a review M2). Only MySQL says how its session reads them.

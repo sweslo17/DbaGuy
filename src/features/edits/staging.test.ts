@@ -7,11 +7,13 @@ import {
   stage,
   toChanges,
   UNDO_LIMIT,
+  type AppliedOutcome,
   type LoadedRowRef,
   type NewId,
   type StageAction,
   type StagedEdits,
 } from "./staging";
+import { NOT_SENT_OUTCOME } from "./commitFlow";
 
 /*
  * The staging reducer (spec ⑤ §3.6.1): changes by key, never by position; one undo step per action; no no-op UPDATE;
@@ -398,7 +400,7 @@ describe("apply outcomes", () => {
     expect(part.past).toEqual([]);
   });
 
-  it("an unknown outcome is pending until fresh rows are read, then refreshed until the next apply", () => {
+  it("an unknown outcome is pending until fresh rows are read, then refreshed until a commit (ruling K10)", () => {
     const unknown = stage(staged(), {
       type: "applyOutcome",
       outcome: { outcome: "unknown", applied: [], failedChange: null, message: null },
@@ -408,11 +410,16 @@ describe("apply outcomes", () => {
     const refreshed = stage(unknown, { type: "refreshed" });
     expect(refreshed.unknownOutcome).toBe("refreshed");
     expect(stage(refreshed, { type: "refreshed" })).toBe(refreshed);
-    const next = stage(refreshed, {
+    const rolledBack = stage(refreshed, {
       type: "applyOutcome",
       outcome: { outcome: "rolled_back", applied: [], failedChange: null, message: null },
     });
-    expect(next.unknownOutcome).toBeNull();
+    expect(rolledBack).toBe(refreshed); // the rows its warning is about are all still staged
+    const committed = stage(refreshed, {
+      type: "applyOutcome",
+      outcome: { outcome: "committed", applied: [], failedChange: null, message: null },
+    });
+    expect(committed.unknownOutcome).toBeNull();
   });
 
   it("an unknown outcome that names what took effect removes it and clears the history", () => {
@@ -460,8 +467,8 @@ describe("an apply in flight (pre-flight H1)", () => {
       { type: "edit", cell: { row: row(1), column: "a", original: 1 }, input: value("2") },
       { type: "addRow", id: "i:x" },
     );
-  const outcome = (kind: "rolled_back" | "unknown") =>
-    ({ type: "applyOutcome", outcome: { outcome: kind, applied: [], failedChange: null, message: null } }) as const;
+  const outcome = (kind: AppliedOutcome["outcome"], applied: string[] = []) =>
+    ({ type: "applyOutcome", outcome: { outcome: kind, applied, failedChange: null, message: null } }) as const;
 
   it("is an outcome not known yet (saved as unknown) until its own outcome arrives, and never an undo step", () => {
     const state = staged();
@@ -475,6 +482,41 @@ describe("an apply in flight (pre-flight H1)", () => {
     // Its outcome replaces it: nothing sent → nothing pending; lost → pending.
     expect(stage(applying, outcome("rolled_back")).unknownOutcome).toBeNull();
     expect(stage(applying, outcome("unknown")).unknownOutcome).toBe("pending");
+  });
+
+  describe("after an unknown outcome and fresh rows (ruling K10)", () => {
+    const refreshed = () =>
+      stage(stage(stage(staged(), { type: "applying" }), outcome("unknown")), { type: "refreshed" });
+    const applying = () => stage(refreshed(), { type: "applying" });
+
+    it("keeps the warning through an apply that took nothing: not sent, rolled back, or a partial one", () => {
+      expect(refreshed().unknownOutcome).toBe("refreshed");
+      expect(applying().unknownOutcome).toBe("applying");
+      expect(stage(applying(), { type: "applyOutcome", outcome: NOT_SENT_OUTCOME }).unknownOutcome).toBe("refreshed");
+      expect(stage(applying(), outcome("rolled_back")).unknownOutcome).toBe("refreshed"); // plan_expired, a conflict…
+      const part = stage(applying(), outcome("partial", ["u:1"]));
+      expect(part).toMatchObject({ unknownOutcome: "refreshed", beforeApplying: null });
+      expect(part.inserts).toHaveLength(1); // the new row the warning is about is still staged
+    });
+
+    it("drops it after a commit, and waits for fresh rows again after another unknown outcome", () => {
+      expect(stage(applying(), outcome("committed", ["u:1", "i:x"])).unknownOutcome).toBeNull();
+      expect(stage(applying(), outcome("unknown"))).toMatchObject({ unknownOutcome: "pending", beforeApplying: null });
+    });
+
+    it("remembers only what the first applying replaced", () => {
+      const first = applying();
+      const twice = stage(first, { type: "applying" });
+      expect(twice).toBe(first); // no new state, so "applying" is never what it remembers
+      expect(twice).toMatchObject({ unknownOutcome: "applying", beforeApplying: "refreshed" });
+      expect(stage(twice, outcome("rolled_back")).unknownOutcome).toBe("refreshed");
+    });
+
+    it("gives nothing to remember to an apply that started with no warning", () => {
+      const fresh = stage(staged(), { type: "applying" });
+      expect(fresh.beforeApplying).toBeNull();
+      expect(stage(fresh, outcome("rolled_back"))).toMatchObject({ unknownOutcome: null, beforeApplying: null });
+    });
   });
 });
 

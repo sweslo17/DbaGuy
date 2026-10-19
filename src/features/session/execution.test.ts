@@ -6,16 +6,19 @@ import { applyEvent, firstPageDelivered, interruptExecution, newExecution, type 
 
 const fold = (state: ExecutionState, events: ServerEvent[]) => events.reduce(applyEvent, state);
 const R = "r1";
+const NOT_CANCELLED = { cancelled: false, timed_out: false, skipped: false };
 
 describe("an apply request", () => {
   it("keeps its edit_outcome", () => {
     const state = fold(newExecution(R, "edits", ""), [
       { type: "started", request_id: R },
       { type: "edit_outcome", request_id: R, outcome: "committed", applied: ["u:1"], already_gone: [] },
-      { type: "finished", request_id: R, elapsed_ms: 3, cancelled: false, timed_out: false, skipped: false },
+      { type: "finished", request_id: R, elapsed_ms: 3, in_transaction: true, ...NOT_CANCELLED },
     ] as ServerEvent[]);
     expect(state.editOutcome?.outcome).toBe("committed");
     expect(state.status).toBe("done");
+    expect(state.inTransaction).toBe(true); // as finished said it (a failed rollback, after an apply)
+    expect(newExecution(R, "edits", "").inTransaction).toBe(false);
   });
 
   it("is not over at a terminal error: a refusal at the WebSocket layer still sends its outcome", () => {

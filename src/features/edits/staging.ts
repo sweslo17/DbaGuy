@@ -57,7 +57,8 @@ export interface Staging {
 }
 
 /**
- * Whether the last apply's outcome is not known (R-05-6, ruling H6), cleared by the next apply's outcome:
+ * Whether the last apply's outcome is not known (R-05-6, ruling H6). A commit clears it, an unknown outcome makes it
+ * "pending", and a rollback or a partial outcome leaves it as it was before that apply (ruling K10):
  * - "applying": an apply is being sent and its outcome has not arrived (pre-flight H1). `workspace.json` keeps it as an
  *   unknown outcome, so a reload, crash or quit before the outcome restores the staging as "pending", never as unsent
  *   (a Commit would send it again, and new rows would be inserted twice);
@@ -72,6 +73,12 @@ export interface StagedEdits extends Staging {
   /** By change id. */
   readonly problems: Readonly<Record<string, readonly StagedProblem[]>>;
   readonly unknownOutcome: UnknownOutcome;
+  /**
+   * The `unknownOutcome` the apply in flight replaced (ruling K10), which a rollback or a partial outcome puts back: a
+   * "refreshed" warning stays while the rows it is about are still staged. Null unless "applying". Memory only, never
+   * saved: the file keeps "applying" as an unknown outcome, which comes back "pending".
+   */
+  readonly beforeApplying: Exclude<UnknownOutcome, "applying">;
   /** The next change's `seq`: within each kind, changes are sent in the order they were staged (D-05-3). */
   readonly nextSeq: number;
   readonly past: readonly Staging[];
@@ -114,8 +121,12 @@ export type StageAction =
   /** The row's set columns are checked against `current` (the server's cells now) instead of what was loaded. */
   | { type: "keepMine"; row: LoadedRowRef; current: Cells }
   | { type: "setProblems"; problems: Readonly<Record<string, readonly StagedProblem[]>> }
-  /** The apply is about to be sent (pre-flight H1): its outcome is unknown until `applyOutcome`. Not an undo step. */
+  /**
+   * The apply is about to be sent (pre-flight H1): its outcome is unknown until `applyOutcome`. Not an undo step. A
+   * second one while applying changes nothing (the first remembers what it replaced).
+   */
   | { type: "applying" }
+  /** Every settled apply ends with this one action, a command that never left included (`NOT_SENT_OUTCOME`). */
   | { type: "applyOutcome"; outcome: AppliedOutcome }
   /** Fresh rows were read: an unknown outcome is "refreshed" now. */
   | { type: "refreshed" }
@@ -146,6 +157,7 @@ export function emptyStaged(keyColumns: readonly string[]): StagedEdits {
     deletes: {},
     problems: {},
     unknownOutcome: null,
+    beforeApplying: null,
     nextSeq: 0,
     past: [],
     future: [],
@@ -414,6 +426,17 @@ function keepMine(work: Work, row: LoadedRowRef, current: Cells): void {
   setUpdate(work, row.rowKey, rebased, existing.id);
 }
 
+/**
+ * The unknown outcome after an apply's (ruling K10): an unknown one waits for fresh rows ("pending"); a commit leaves
+ * nothing to warn about; a rollback or a partial outcome (a command that never left included) leaves the rest staged as
+ * it was, and so its warning: the one the apply in flight replaced, or the current one when none was in flight.
+ */
+function outcomeAfter(state: StagedEdits, outcome: AppliedOutcome["outcome"]): UnknownOutcome {
+  if (outcome === "unknown") return "pending";
+  if (outcome === "committed") return null;
+  return state.unknownOutcome === "applying" ? state.beforeApplying : state.unknownOutcome;
+}
+
 function applyOutcome(state: StagedEdits, outcome: AppliedOutcome): StagedEdits {
   const applied = new Set(outcome.applied);
   const updates = { ...state.updates };
@@ -436,17 +459,19 @@ function applyOutcome(state: StagedEdits, outcome: AppliedOutcome): StagedEdits 
   removed ||= inserts.length !== state.inserts.length;
   const { failedChange, message } = outcome;
   const failed = failedChange && message ? { [failedChange]: [{ column: null, message }] } : null;
-  const unknownOutcome = outcome.outcome === "unknown" ? "pending" : null;
+  const unknownOutcome = outcomeAfter(state, outcome.outcome);
   // Removed changes must never come back through undo (they took effect), and a commit empties the history (D-05-14).
   const hasHistory = state.past.length > 0 || state.future.length > 0;
   const clearHistory = (removed || outcome.outcome === "committed") && hasHistory;
   const sameProblems = !failed && isEmpty(state.problems);
-  if (!removed && !clearHistory && sameProblems && unknownOutcome === state.unknownOutcome) return state;
+  const same = unknownOutcome === state.unknownOutcome && state.beforeApplying === null;
+  if (!removed && !clearHistory && sameProblems && same) return state;
   return {
     ...state,
     ...(removed ? { updates, inserts, deletes } : {}),
     problems: sameProblems ? state.problems : (failed ?? {}),
     unknownOutcome,
+    beforeApplying: null,
     past: clearHistory ? [] : state.past,
     future: clearHistory ? [] : state.future,
   };
@@ -476,7 +501,8 @@ export function stage(state: StagedEdits, action: StageAction, newId: NewId = ne
       return same ? state : { ...state, problems: action.problems };
     }
     case "applying":
-      return state.unknownOutcome === "applying" ? state : { ...state, unknownOutcome: "applying" };
+      if (state.unknownOutcome === "applying") return state; // the first one remembers what it replaced
+      return { ...state, unknownOutcome: "applying", beforeApplying: state.unknownOutcome };
     case "applyOutcome":
       return applyOutcome(state, action.outcome);
     case "refreshed":

@@ -23,7 +23,7 @@ from dbaguy_backend.services.history_service import HistoryService
 from dbaguy_backend.services.profile_service import ProfileService
 from dbaguy_backend.services.safety import GuardAction, GuardDecision, SafetyPolicy
 from dbaguy_backend.sessions.edit_apply import (
-    COMMIT_LEFT_OPEN, ROLLBACK_FAILED, SQL_MODE_CHANGED, SQL_MODE_CHANGED_MESSAGE,
+    COMMIT_LEFT_OPEN, COMMIT_WARNING, ROLLBACK_FAILED, SQL_MODE_CHANGED, SQL_MODE_CHANGED_MESSAGE,
 )
 from dbaguy_backend.sessions.hooks import SessionHooksFactory
 from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks
@@ -247,6 +247,14 @@ def test_a_commit_the_server_refuses_is_rolled_back(env_of):  # R-05-6 (a deferr
     assert (outcome(events).outcome, outcome(events).statement, error(events).code) == ("rolled_back", None, "23503")
     assert error(events).message.endswith("\nThe transaction was rolled back: nothing was applied")
     assert env.conn.runs == ["BEGIN", "u0", "COMMIT"]
+
+
+def test_a_failed_commit_on_a_table_that_cannot_roll_back_is_committed_with_a_warning(env_of):  # D-05-6
+    refusal = StatementError("disk full", code="HY000")
+    env = env_of(EditFake(commit_error=refusal), make_plan(("update", "u0"), transactional=False))
+    events = env.apply()
+    warnings = [e.text for e in events if e.type == "message" and e.severity == MessageSeverity.WARNING]
+    assert (outcome(events).outcome, error(events), warnings) == ("committed", None, [f"{COMMIT_WARNING}: disk full"])
 
 
 def test_a_commit_whose_answer_is_lost_is_unknown_and_never_sent_again(env_of):  # R-05-6
