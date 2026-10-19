@@ -13,7 +13,7 @@ import { sameElements } from "@/features/grid/useHeldResult";
 /*
  * The table-data tabs' staged grid edits, by tab id (spec ⑤ §3.6.1). Outside React, like `editorBuffers`: the one
  * workspace writer and the close guard read them without waiting for a tab to mount, and a tab that is not shown still
- * has its restored changes. Every change notifies the writer (`onStagedEditsChanged`).
+ * has its restored changes. Every change notifies the writer (`onStagedEditsChanged`), except a closed tab's drop.
  */
 
 const useStore = create<Readonly<Record<string, StagedEdits>>>(() => ({}));
@@ -82,11 +82,17 @@ export function dispatchStaged(tabId: string, action: StageAction, keyColumns?: 
   return "staged";
 }
 
-/** Drops what is kept for tabs that are no longer open (the workspace writer calls it as it saves). */
+/**
+ * Drops what is kept for tabs that are no longer open. The workspace writer calls it as it saves, and a closed tab is
+ * not saved, so the listeners are not told (telling them would cost one more save per closed tab).
+ */
 export function forgetStagedEditsExcept(openTabIds: ReadonlySet<string>): void {
   const current = useStore.getState();
   const gone = Object.keys(current).filter((tabId) => !openTabIds.has(tabId));
-  for (const tabId of gone) putStagedEdits(tabId, null);
+  if (gone.length === 0) return;
+  const next = { ...current };
+  for (const tabId of gone) delete next[tabId];
+  useStore.setState(next, true);
 }
 
 export function onStagedEditsChanged(listener: () => void): () => void {

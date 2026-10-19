@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   changeCount,
   emptyStaged,
@@ -441,6 +441,17 @@ describe("apply outcomes", () => {
       }),
     ).toBe(state);
   });
+
+  it("an outcome without a failed change clears the last preview's problems, and keeps the changes", () => {
+    const problems = { "u:1": [{ column: "a", message: "Not a number" }] };
+    const state = stage(staged(), { type: "setProblems", problems });
+    const next = stage(state, {
+      type: "applyOutcome",
+      outcome: { outcome: "rolled_back", applied: [], failedChange: null, message: null },
+    });
+    expect(next.problems).toEqual({});
+    expect(next).toMatchObject({ updates: state.updates, inserts: state.inserts, deletes: state.deletes });
+  });
 });
 
 describe("an apply in flight (pre-flight H1)", () => {
@@ -495,6 +506,54 @@ describe("problems", () => {
     expect(stage(state, { type: "deleteRows", rows: [{ kind: "insert", id: "i:a" }] }).problems).toEqual({
       "u:1": [{ column: "n", message: "Not a number" }],
     });
+  });
+
+  it("stay the same map when an action drops none of them", () => {
+    const state = stage(run({ type: "edit", cell: { row: row(1), column: "n", original: 1 }, input: value("x") }), {
+      type: "setProblems",
+      problems: { "u:1": [{ column: "n", message: "Not a number" }] },
+    });
+    const other = stage(state, { type: "edit", cell: { row: row(2), column: "n", original: 1 }, input: value("y") });
+    expect(other.problems).toBe(state.problems);
+  });
+
+  it("leave the state as it is when a preview finds none and none were there, or brings the same ones", () => {
+    const state = run({ type: "edit", cell: { row: row(1), column: "n", original: 1 }, input: value("x") });
+    expect(stage(state, { type: "setProblems", problems: {} })).toBe(state);
+    expect(stage(state, { type: "setProblems", problems: state.problems })).toBe(state);
+    const some = { "u:1": [{ column: "n", message: "Not a number" }] };
+    const marked = stage(state, { type: "setProblems", problems: some });
+    expect(marked.problems).toBe(some);
+    expect(stage(marked, { type: "setProblems", problems: some })).toBe(marked);
+    expect(stage(marked, { type: "setProblems", problems: {} }).problems).toEqual({});
+  });
+
+  it("of every change one action touches go in one copy of the map (M1: linear at D-05-11's limit)", () => {
+    // The pre-flight's case, smaller: N staged UPDATEs, a preview with N problems, then Revert rows or ⌘⌫ over all.
+    const rows = Array.from({ length: 1_000 }, (_, i) => row(i));
+    const cells = rows.map((r) => ({ row: r, column: "n", original: 1 }));
+    const staged = stage(emptyStaged(["id"]), { type: "setNull", cells }, counter());
+    const problems = Object.fromEntries(
+      Object.values(staged.updates).map((u) => [u.id, [{ column: "n", message: "Not a number" }]]),
+    );
+    const state = stage(staged, { type: "setProblems", problems });
+    for (const action of [
+      { type: "revertRows", rows },
+      { type: "deleteRows", rows },
+    ] satisfies StageAction[]) {
+      // Every copy that takes entries out of a record is made by `Object.fromEntries` (`withoutAll`): count them.
+      const spy = vi.spyOn(Object, "fromEntries");
+      let next: StagedEdits;
+      let copies: number;
+      try {
+        next = stage(state, action);
+      } finally {
+        copies = spy.mock.calls.length;
+        spy.mockRestore();
+      }
+      expect(next.problems).toEqual({});
+      expect(copies).toBe(1);
+    }
   });
 });
 

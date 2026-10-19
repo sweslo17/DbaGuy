@@ -128,8 +128,8 @@ export const newChangeId: NewId = (prefix) => `${prefix}:${crypto.randomUUID()}`
 
 const DEFAULT_INPUT: CellInput = { kind: "default" };
 
-/** A record's own entry for `key`, never one its prototype has. */
-function own<T>(record: Readonly<Record<string, T>>, key: string): T | undefined {
+/** A record's own entry for `key`, never one its prototype has (a column may be named `constructor` or `__proto__`). */
+export function own<T>(record: Readonly<Record<string, T>>, key: string): T | undefined {
   return Object.hasOwn(record, key) ? record[key] : undefined;
 }
 
@@ -222,11 +222,24 @@ export function findChange(
   return insert ? { kind: "insert", rowKey: null, change: insert } : null;
 }
 
-const without = <T>(record: Readonly<Record<string, T>>, key: string): Record<string, T> => {
-  const copy = { ...record };
-  delete copy[key];
-  return copy;
-};
+const isEmpty = (record: object): boolean => Object.keys(record).length === 0;
+
+/**
+ * `record` without the entries named in `keys`, copied once however many go (M1: dropping the problems of 10,000
+ * changes stays linear), or `record` itself when none of them is in it. This is the one place a record is copied to
+ * take entries out; the copy holds own entries whatever their names (`fromEntries`, never an assignment to `__proto__`).
+ */
+function withoutAll<T>(record: Readonly<Record<string, T>>, keys: Iterable<string>): Readonly<Record<string, T>> {
+  let copy: Record<string, T> | null = null;
+  for (const key of keys) {
+    if (!Object.hasOwn(record, key)) continue;
+    copy ??= Object.fromEntries(Object.entries(record));
+    delete copy[key];
+  }
+  return copy ?? record;
+}
+
+const without = <T>(record: Readonly<Record<string, T>>, key: string) => withoutAll(record, [key]);
 
 const withoutColumn = (update: StagedUpdate, column: string): StagedUpdate => ({
   ...update,
@@ -260,15 +273,13 @@ function begin(state: StagedEdits, newId: NewId): Work {
 /** The state after `work` as one undo step; the state itself when nothing changed. */
 function finish(state: StagedEdits, work: Work): StagedEdits {
   if (!work.changed) return state;
-  let problems = state.problems;
-  for (const id of work.edited) if (id in problems) problems = without(problems, id);
   return {
     ...state,
     updates: work.updates,
     inserts: work.inserts,
     deletes: work.deletes,
     nextSeq: work.seq,
-    problems,
+    problems: withoutAll(state.problems, work.edited),
     past: [...state.past, stagingOf(state)].slice(-UNDO_LIMIT),
     future: [],
   };
@@ -429,7 +440,7 @@ function applyOutcome(state: StagedEdits, outcome: AppliedOutcome): StagedEdits 
   // Removed changes must never come back through undo (they took effect), and a commit empties the history (D-05-14).
   const hasHistory = state.past.length > 0 || state.future.length > 0;
   const clearHistory = (removed || outcome.outcome === "committed") && hasHistory;
-  const sameProblems = !failed && Object.keys(state.problems).length === 0;
+  const sameProblems = !failed && isEmpty(state.problems);
   if (!removed && !clearHistory && sameProblems && unknownOutcome === state.unknownOutcome) return state;
   return {
     ...state,
@@ -459,8 +470,11 @@ export function stage(state: StagedEdits, action: StageAction, newId: NewId = ne
         future: state.future.slice(1),
       };
     }
-    case "setProblems":
-      return { ...state, problems: action.problems };
+    case "setProblems": {
+      // A clean preview sends `{}` every time: no new state, so no render and no save, when nothing was there either.
+      const same = action.problems === state.problems || (isEmpty(action.problems) && isEmpty(state.problems));
+      return same ? state : { ...state, problems: action.problems };
+    }
     case "applying":
       return state.unknownOutcome === "applying" ? state : { ...state, unknownOutcome: "applying" };
     case "applyOutcome":

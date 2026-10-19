@@ -86,6 +86,18 @@ describe("keeping", () => {
     expect(readStagedEdits("open")).toBeNull();
   });
 
+  it("tells the writer nothing for the same staged edits put again, nor for a closed tab's drop", () => {
+    dispatchStaged("t1", { type: "addRow", id: "i:1" }, ["id"]);
+    const listener = vi.fn();
+    const stop = onStagedEditsChanged(listener);
+    putStagedEdits("t1", readStagedEdits("t1"));
+    putStagedEdits("t9", null);
+    forgetStagedEditsExcept(new Set());
+    expect(readStagedEdits("t1")).toBeNull();
+    expect(listener).not.toHaveBeenCalled();
+    stop();
+  });
+
   it("keeps an unknown outcome when the table's key is taken", () => {
     dispatchStaged("t1", { type: "addRow", id: "i:1" }, ["id"]);
     dispatchStaged("t1", {
