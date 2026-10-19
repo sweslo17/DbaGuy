@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import { canvasMeasure } from "../grid/columns";
+import { setNullEnds, type SetNullAnswer } from "./editing";
 import { cellEditorKey } from "./editKeys";
 
 /** The inline editor never grows wider than this (spec ⑤ §3.6.3). */
@@ -14,14 +15,18 @@ export interface CellEditorProps {
   initialText: string;
   /** Shown while it is empty (NULL, DEFAULT, or what typing replaces). */
   placeholder: string | null;
-  /** The cell's width: the input is never narrower, and grows with its text up to INPUT_MAX_WIDTH. */
+  /**
+   * The cell's width: the input is never narrower. It grows with its text, up to INPUT_MAX_WIDTH; a cell wider than
+   * that keeps its own width.
+   */
   width: number;
   /** A number column: the text is aligned right, as the grid aligns it. */
   numeric: boolean;
   /** `text` is null when nothing was typed (H4: then nothing is staged). */
   onDone: (text: string | null, how: EditEnd) => void;
   onCancel: () => void;
-  onSetNull: () => void;
+  /** Stages NULL. Answer `false` to refuse it (a NOT NULL column): the editor then stays, with what was typed (K16). */
+  onSetNull: () => SetNullAnswer;
 }
 
 /**
@@ -65,8 +70,9 @@ export function CellEditor({ initialText, placeholder, width, numeric, onDone, o
       done.current = true;
       onCancel();
     } else if (action === "setNull") {
+      // Ended while the owner answers, so a blur its focus change causes stages nothing over the NULL it sets.
       done.current = true;
-      onSetNull();
+      if (!setNullEnds(onSetNull())) done.current = false;
     } else finish(action);
   };
   const measured = canvasMeasure()(text || placeholder || "", "cell") + INPUT_PADDING;
@@ -89,7 +95,7 @@ export function CellEditor({ initialText, placeholder, width, numeric, onDone, o
       onDoubleClick={(e) => e.stopPropagation()}
       onContextMenu={(e) => e.stopPropagation()}
       className={`h-[22px] rounded-none border border-accent bg-elevated px-2 font-mono text-[12px] text-fg outline-none placeholder:text-muted placeholder:italic ${numeric ? "text-right" : ""}`}
-      style={{ width: Math.min(INPUT_MAX_WIDTH, Math.max(width, measured)) }}
+      style={{ width: Math.max(width, Math.min(INPUT_MAX_WIDTH, measured)) }}
     />
   );
 }

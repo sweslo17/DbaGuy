@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { EditColumn } from "@/lib/api/types";
 import { isImeKeyEvent } from "@/lib/ime";
-import { editorResult, editStart, INLINE_MAX_CHARS, nextWritable, type EditCellInput } from "./editing";
-import { cellEditorKey, gridEditKey } from "./editKeys";
+import {
+  editorResult,
+  editStart,
+  INLINE_MAX_CHARS,
+  nextWritable,
+  setNullEnds,
+  type EditCellInput,
+} from "./editing";
+import { cellEditorKey, gridEditKey, valueEditorKey, type ValueEditorKeyState } from "./editKeys";
 
 /*
  * How a cell's edit starts and ends (spec ⑤ §3.6.3, R-05-8) and the editing keys (§3.6.4): NULL is never turned into
@@ -82,6 +89,12 @@ describe("ending an edit", () => {
     expect(editorResult("hello", false)).toBeNull();
     expect(editorResult("", true)).toEqual({ kind: "value", text: "" });
     expect(editorResult("9007199254740993", true)).toEqual({ kind: "value", text: "9007199254740993" });
+  });
+
+  it("ends on Set NULL unless the owner refuses it: a NOT NULL column keeps the editor, and what was typed", () => {
+    expect(setNullEnds(undefined)).toBe(true);
+    expect(setNullEnds(true)).toBe(true);
+    expect(setNullEnds(false)).toBe(false);
   });
 
   it("moves to the next or previous writable column, and stops at the row's ends", () => {
@@ -171,6 +184,14 @@ describe("the cell editor's keys", () => {
     expect(cellEditorKey(key({ key: "Tab", metaKey: true }))).toBeNull();
   });
 
+  it("acts once on Return and on ⌥⌘N: the key repeat of the Return that opened the editor stages nothing", () => {
+    expect(cellEditorKey(key({ key: "Enter", repeat: true }))).toBeNull();
+    expect(cellEditorKey(key({ key: "Dead", code: "KeyN", metaKey: true, altKey: true, repeat: true }))).toBeNull();
+    // moving along the row and dropping an edit are not held back
+    expect(cellEditorKey(key({ key: "Tab", repeat: true }))).toBe("next");
+    expect(cellEditorKey(key({ key: "Escape", repeat: true }))).toBe("cancel");
+  });
+
   it("never stages on the Enter that picks a character", () => {
     expect(cellEditorKey(key({ key: "Enter", keyCode: 229 }))).toBeNull();
     expect(cellEditorKey(key({ key: "s", code: "KeyS", metaKey: true, isComposing: true }))).toBeNull();
@@ -184,6 +205,102 @@ describe("the cell editor's keys", () => {
     expect(cellEditorKey(key({ key: "Process" }))).toBeNull();
     const setNull = { key: "Dead", code: "KeyN", metaKey: true, altKey: true };
     expect(cellEditorKey(key({ ...setNull, isComposing: true }))).toBeNull();
+  });
+});
+
+describe("the drawer value editor's keys", () => {
+  const state = (overrides: Partial<ValueEditorKeyState> = {}): ValueEditorKeyState => ({
+    plain: true,
+    vim: false,
+    searching: false,
+    typing: true,
+    ...overrides,
+  });
+  const press = (event: Partial<KeyboardEvent>, overrides: Partial<ValueEditorKeyState> = {}) =>
+    valueEditorKey(key(event), state(overrides));
+  const setNull = { key: "Dead", code: "KeyN", metaKey: true, altKey: true };
+
+  it.each([
+    [{ key: "Enter", metaKey: true }, "apply"],
+    [{ key: "s", code: "KeyS", metaKey: true }, "save"],
+    [{ key: "Escape" }, "cancel"],
+    [setNull, "setNull"],
+    [{ key: "Enter" }, "newline"],
+    [{ key: "Tab" }, "tab"],
+    [{ key: "Tab", shiftKey: true }, "swallow"],
+    [{ key: "Backspace" }, "backspace"],
+    [{ key: "a" }, null],
+    [{ key: "s", code: "KeyS" }, null],
+    [{ key: "s", code: "KeyS", metaKey: true, shiftKey: true }, null],
+    [{ key: "Tab", altKey: true }, null],
+    [{ key: "Tab", ctrlKey: true, shiftKey: true }, null],
+    [{ key: "Enter", shiftKey: true }, null],
+    [{ key: "Enter", metaKey: true, shiftKey: true }, null],
+    [{ key: "Escape", shiftKey: true }, null],
+    [{ key: "Backspace", altKey: true }, null], // delete a word: CodeMirror's
+    [{ key: "Dead", code: "KeyM", metaKey: true, altKey: true }, null],
+  ])("plain text, %j → %s", (event, action) => {
+    expect(press(event)).toBe(action);
+  });
+
+  it("leaves a JSON value its language's Return, Tab and Backspace", () => {
+    for (const event of [{ key: "Enter" }, { key: "Tab" }, { key: "Tab", shiftKey: true }, { key: "Backspace" }]) {
+      expect(press(event, { plain: false })).toBeNull();
+    }
+    expect(press({ key: "Enter", metaKey: true }, { plain: false })).toBe("apply");
+    expect(press({ key: "Escape" }, { plain: false })).toBe("cancel");
+  });
+
+  it("never reads an input method's key, whatever it is", () => {
+    for (const name of ["Enter", "Tab", "Escape", "Backspace", "s"]) {
+      for (const event of [{ isComposing: true }, { keyCode: 229 }] as Partial<KeyboardEvent>[]) {
+        expect(press({ key: name, code: name === "s" ? "KeyS" : "", metaKey: name === "s", ...event })).toBeNull();
+        expect(press({ key: name, ...event }, { typing: false })).toBeNull();
+      }
+    }
+    expect(press({ key: "Process" })).toBeNull();
+    expect(press({ ...setNull, isComposing: true })).toBeNull();
+    expect(press({ key: "Enter", metaKey: true, isComposing: true })).toBeNull();
+    // a held Return from the grid is swallowed, but a repeating composition key is not Return
+    expect(press({ key: "Enter", repeat: true, isComposing: true }, { typing: false })).toBeNull();
+  });
+
+  it("acts once on ⌘↵, ⌘S, Escape and ⌥⌘N: a held key repeats none of them", () => {
+    expect(press({ key: "Enter", metaKey: true, repeat: true })).toBeNull();
+    expect(press({ key: "s", code: "KeyS", metaKey: true, repeat: true })).toBeNull();
+    expect(press({ key: "Escape", repeat: true })).toBeNull();
+    expect(press({ ...setNull, repeat: true })).toBeNull();
+  });
+
+  it("types line breaks, tabs and deletions held down once a key has been pressed in the editor", () => {
+    expect(press({ key: "Enter", repeat: true })).toBe("newline");
+    expect(press({ key: "Tab", repeat: true })).toBe("tab");
+    expect(press({ key: "Backspace", repeat: true })).toBe("backspace");
+    expect(press({ key: "Enter", repeat: true }, { plain: false })).toBeNull(); // JSON: CodeMirror's own
+  });
+
+  it("swallows the Return held down from the grid, which opened the editor, until a key that does not repeat", () => {
+    expect(press({ key: "Enter", repeat: true }, { typing: false })).toBe("swallow");
+    expect(press({ key: "Enter", repeat: true }, { typing: false, plain: false })).toBe("swallow");
+    expect(press({ key: "Enter", repeat: true }, { typing: false, vim: true })).toBe("swallow");
+    expect(press({ key: "Enter", metaKey: true, repeat: true }, { typing: false })).toBe("swallow");
+    // the first Return pressed in the editor itself is a line break, and then they repeat
+    expect(press({ key: "Enter" }, { typing: false })).toBe("newline");
+  });
+
+  it("under vim, Escape, Return, Tab and Backspace are vim's; apply, save and Set NULL stay (K15)", () => {
+    for (const event of [{ key: "Escape" }, { key: "Enter" }, { key: "Tab" }, { key: "Backspace" }]) {
+      expect(press(event, { vim: true })).toBeNull();
+    }
+    expect(press({ key: "Tab", shiftKey: true }, { vim: true })).toBeNull();
+    expect(press({ key: "Enter", metaKey: true }, { vim: true })).toBe("apply");
+    expect(press({ key: "s", code: "KeyS", metaKey: true }, { vim: true })).toBe("save");
+    expect(press(setNull, { vim: true })).toBe("setNull");
+  });
+
+  it("leaves Escape to the search panel while it is open", () => {
+    expect(press({ key: "Escape" }, { searching: true })).toBeNull();
+    expect(press({ key: "Escape" }, { searching: false })).toBe("cancel");
   });
 });
 

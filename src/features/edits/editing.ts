@@ -83,6 +83,14 @@ export function editorResult(text: string, touched: boolean): CellInput | null {
   return touched ? { kind: "value", text } : null;
 }
 
+/**
+ * What an owner answers to Set NULL: `false` refuses it (a NOT NULL column: it says so and keeps the editor open), so
+ * nothing has ended and what was typed is still the editor's to stage (K16). Any other answer, none included, ends the
+ * edit.
+ */
+export type SetNullAnswer = boolean | void;
+export const setNullEnds = (answer: SetNullAnswer): boolean => answer !== false;
+
 /** The next (`step` 1) or previous (-1) column after `from` that can be written, or -1 (Tab, ⇧Tab). */
 export function nextWritable(
   names: readonly string[],
