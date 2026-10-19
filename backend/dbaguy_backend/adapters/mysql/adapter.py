@@ -13,6 +13,7 @@ from loguru import logger
 from mysql.connector.connection import MySQLConnection
 from mysql.connector.cursor import MySQLCursorRaw
 
+from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import ColumnMeta, ErrorPosition, MessageSeverity, ServerMessage
 from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
@@ -26,6 +27,7 @@ from ..base import (
     DatabaseConnection,
     Endpoint,
     ParsedUrl,
+    RowEditing,
     RunOptions,
     StatementCancelled,
     StatementError,
@@ -35,7 +37,7 @@ from ..base import (
 )
 from ..cancel_window import CancelWindow
 from ..sockets import enable_keepalive
-from . import catalog, introspection
+from . import catalog, editing, introspection
 from . import schema as mysql_schema
 from .settings import URL_SCHEMES, connect_params, kill_params, parse_mysql_url, requires_tls, session_settings
 from .types import column_meta, row_converter
@@ -69,18 +71,31 @@ _READ_ONLY_SESSION = "SET SESSION TRANSACTION READ ONLY"
 # diagnostic statement, keeps what SHOW WARNINGS, SHOW ERRORS and GET DIAGNOSTICS report (R-03a-T9e; `DO 0` cleared it).
 _STATUS_PROBE = "SHOW WARNINGS LIMIT 0"
 _PARSE_ERRNOS = frozenset({1064, 1065})  # syntax error, empty query: rejected before anything ran
+_ROWS_MATCHED = re.compile(r"Rows matched: (\d+)")
+
+
+def rows_matched(info: str | None) -> int | None:
+    """The rows an UPDATE matched, from its OK packet's info (`Rows matched: 1  Changed: 0  Warnings: 0`, ⑤ A1); None
+    for any other statement (an INSERT or a DELETE has no such info)."""
+    found = _ROWS_MATCHED.match(info or "")
+    return int(found.group(1)) if found else None
 
 
 class _VerbatimCursor(MySQLCursorRaw):
     """Sends a statement exactly as written. `MySQLCursor.execute()` first runs any text containing `delimiter `
     through the connector's DELIMITER-script rewriter (even inside a comment or as an alias), which changes user SQL."""
 
+    ok_info: str | None = None  # the OK packet's info text of the last statement (`rows_matched`)
+
     def execute_verbatim(self, sql: str) -> None:
         self._connection.handle_unread_result()
         self._reset_result()
         statement = sql.encode(self._connection.python_charset)
         self._executed = statement
-        self._handle_result(self._connection.cmd_query(statement))
+        answer = self._connection.cmd_query(statement)
+        # An UPDATE's OK packet says how many rows it matched, which affected_rows (rows changed) does not (⑤ D-05-5)
+        self.ok_info = answer.get("info_msg") if isinstance(answer, dict) and "affected_rows" in answer else None
+        self._handle_result(answer)
 
     def next_set_within(self, seconds: float | None) -> bool:
         """nextset() that waits at most `seconds` for the next result set to start (ReadTimeoutError after that). The
@@ -129,6 +144,10 @@ class MysqlResult(StatementResult):
         rowcount = self._cursor.rowcount
         return rowcount if self._columns is None and rowcount >= 0 else None
 
+    def matched_rows(self) -> int | None:
+        matched = rows_matched(self._cursor.ok_info)
+        return matched if matched is not None else self.affected_rows()
+
     def next_result(self) -> bool:
         if self._closed or self._failed:
             return False
@@ -158,7 +177,7 @@ class MysqlResult(StatementResult):
         self._owner.finish(self._cursor, more_results=not self._failed)
 
 
-class MysqlConnection(DatabaseConnection):
+class MysqlConnection(DatabaseConnection, RowEditing):
     def __init__(self, conn: MySQLConnection, kill_params: dict[str, Any], read_only: bool, database: str | None) -> None:
         self._conn = conn
         self._kill_params = kill_params
@@ -453,6 +472,9 @@ class MysqlConnection(DatabaseConnection):
     def object_detail(self, path: list[PathSegment]) -> ObjectDetail:
         return introspection.object_detail(self._conn, path)
 
+    def edit_target(self, path: list[PathSegment]) -> EditTarget:
+        return editing.edit_target(self._conn, path)
+
     def schema_snapshot(self) -> SchemaSnapshot:
         return mysql_schema.build_snapshot(self._conn)
 
@@ -498,7 +520,8 @@ class MysqlAdapter(DatabaseAdapter):
     url_schemes = URL_SCHEMES
     default_port = 3306
     dialect = Dialect.MYSQL
-    capabilities = AdapterCapabilities()  # one connection sees every database; KILL QUERY keeps the transaction
+    # one connection sees every database; KILL QUERY keeps the transaction
+    capabilities = AdapterCapabilities(row_editing=True)
 
     def parse_url(self, url: str) -> ParsedUrl:
         return parse_mysql_url(url)

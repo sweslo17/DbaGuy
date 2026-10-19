@@ -46,10 +46,14 @@ _BY_CODE = {1: ColumnKind("nvarchar", _T), 3: ColumnKind("int", _N), 4: ColumnKi
 _UNKNOWN = ColumnKind("unknown", ColumnCategory.OTHER)
 
 
+def category_for_type(base: str) -> ColumnCategory:
+    """The grid category of a built-in type by its name (`decimal`, `nvarchar`, …)."""
+    return _CATEGORY_BY_TYPE.get(base.lower(), ColumnCategory.OTHER)
+
+
 def described_kind(system_type_name: str) -> ColumnKind:
     """From sys.dm_exec_describe_first_result_set's system_type_name, e.g. `decimal(38,10)`."""
-    base = system_type_name.split("(", 1)[0].strip().lower()
-    return ColumnKind(system_type_name, _CATEGORY_BY_TYPE.get(base, ColumnCategory.OTHER))
+    return ColumnKind(system_type_name, category_for_type(system_type_name.split("(", 1)[0].strip()))
 
 
 def guessed_kinds(header: Sequence[tuple], rows: Sequence[Sequence[Any]]) -> list[ColumnKind]:

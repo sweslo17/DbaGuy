@@ -27,6 +27,7 @@ from typing import Any
 from loguru import logger
 
 from ...domain.column_category import ColumnCategory
+from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, QueryFailed, ValidationFailed
 from ...domain.execution import ColumnMeta, ErrorPosition, MessageSeverity, ServerMessage
 from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
@@ -41,6 +42,7 @@ from ..base import (
     Endpoint,
     MessageListener,
     ParsedUrl,
+    RowEditing,
     RunOptions,
     StatementCancelled,
     StatementError,
@@ -48,7 +50,7 @@ from ..base import (
     invalid_text_error,
     transaction_open_error,
 )
-from . import catalog, driver, freetds, introspection
+from . import catalog, driver, editing, freetds, introspection
 from . import schema as mssql_schema
 from .cancel import Call, CallKind, CancelControl, CancelledWhileWaiting, CancelPending
 from .settings import CONNECT_TIMEOUT_S, URL_SCHEMES, connect_params, parse_mssql_url
@@ -235,7 +237,7 @@ class MssqlResult(StatementResult):
         self._owner.finish_result(self, complete=self._exhausted)
 
 
-class MssqlConnection(DatabaseConnection):
+class MssqlConnection(DatabaseConnection, RowEditing):
     def __init__(
         self, conn: driver.Connection, *, spid: int, database: str | None, read_only: bool,
         state: tuple[int, int, bool],  # (@@TRANCOUNT, XACT_STATE(), IMPLICIT_TRANSACTIONS) read at open
@@ -678,6 +680,10 @@ class MssqlConnection(DatabaseConnection):
         self._check_database(path)
         return self._metadata_call(lambda: introspection.object_detail(self._conn, path))
 
+    def edit_target(self, path: list[PathSegment]) -> EditTarget:
+        self._check_database(path)
+        return self._metadata_call(lambda: editing.edit_target(self._conn, path))
+
     def schema_snapshot(self) -> SchemaSnapshot:
         return self._metadata_call(lambda: mssql_schema.build_snapshot(self._conn))
 
@@ -712,7 +718,9 @@ class MssqlAdapter(DatabaseAdapter):
     default_port = 1433
     dialect = Dialect.TSQL
     # One connection works in one database; an attention keeps the transaction; read-only is DbaGuy's alone (spec §3.4).
-    capabilities = AdapterCapabilities(per_database_connection=True, cancel_aborts_transaction=False, server_read_only=False)
+    capabilities = AdapterCapabilities(
+        per_database_connection=True, cancel_aborts_transaction=False, server_read_only=False, row_editing=True,
+    )
 
     def parse_url(self, url: str) -> ParsedUrl:
         return parse_mssql_url(url)
