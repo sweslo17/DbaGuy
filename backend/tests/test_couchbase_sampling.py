@@ -16,6 +16,7 @@ from dbaguy_backend.domain.couchbase import FieldSample, Keyspace
 from dbaguy_backend.domain.errors import ValidationFailed
 from dbaguy_backend.services.field_sample_service import SAMPLES_PER_PROFILE_MAX, FieldSampleService
 from dbaguy_backend.services.settings_service import SettingsService
+from dbaguy_backend.sql.dialects import Dialect, quote_ident
 from tests.support import COUCHBASE_PASSWORD, COUCHBASE_READER, couchbase_query, requires_couchbase
 from tests.test_api import AUTH
 from tests.test_couchbase_adapter import open_couchbase
@@ -58,7 +59,55 @@ def test_array_elements_and_the_depth_cap():
     paths = [tuple(f.path) for f in collector.fields()]
     assert ("items", None, "sku") in paths and ("items", None, "qty") in paths
     assert max(len(p) for p in paths) == 6 and ("a", "b", "c", "d", "e", "f") in paths
-    assert not collector.paths_capped
+    assert not collector.paths_capped  # a different cap: the number of paths and the length of a key
+    assert collector.depth_capped  # `g` is below the cap and is not listed: the sample says so (ruling B50)
+
+
+def test_the_depth_cap_is_reported_only_when_something_below_it_is_left_out():
+    at_the_cap = '{"a":{"b":{"c":{"d":{"e":{"f":%s}}}}}}'
+    for value in ('1', '"text"', 'null', '{}', '[]'):  # a scalar or an empty container at the cap loses nothing
+        collector = collect(("json", at_the_cap % value))
+        assert not collector.depth_capped and ("a", "b", "c", "d", "e", "f") in by_path(collector), value
+    for value in ('{"g":1}', '[1]', '[[]]', '[{"g":1}]'):  # the first thing below the cap that is not listed
+        collector = collect(("json", at_the_cap % value))
+        assert collector.depth_capped and not collector.paths_capped, value
+        assert max(len(p) for p in by_path(collector)) == 6, value
+    assert not collect(("json", '{"a":{"b":1}}')).depth_capped
+    assert collect(("json", '{"ok":1}'), ("json", at_the_cap % '{"g":1}')).depth_capped  # any one document is enough
+
+
+def test_each_cap_sets_its_own_flag(monkeypatch):
+    monkeypatch.setattr(sampling, "FIELD_PATHS_MAX", 2)
+    many = collect(("json", '{"a":1,"b":2}'))
+    assert many.paths_capped and not many.depth_capped
+    monkeypatch.undo()
+    long = collect(("json", json.dumps({"k" * (sampling.FIELD_KEY_MAX_CHARS + 1): 1})))
+    assert long.paths_capped and not long.depth_capped
+    deep = collect(("json", '{"a":{"b":{"c":{"d":{"e":{"f":{"g":1}}}}}}}'))
+    assert deep.depth_capped and not deep.paths_capped
+
+
+def test_paths_display_as_sqlpp_writes_them():
+    document = {"x": {"a.b": 1, "c": 2}, "odd key": 3, "": 4, "[]": 5, "value": 6, "a`b": 7, "a\\b": 8, "(document)": 9,
+                "tags": [{"k": 1}], "ünï": 10}
+    shown = {tuple(f.path): f.display for f in collect(("json", json.dumps(document))).fields()}
+    assert shown[()] == "(document)"
+    assert shown[("x",)] == "x" and shown[("x", "c")] == "x.c"
+    assert shown[("x", "a.b")] == "x.`a.b`"  # a dot inside a key is not nesting
+    assert shown[("odd key",)] == "`odd key`"
+    assert shown[("",)] == "``" and shown[("[]",)] == "`[]`" and shown[("(document)",)] == "`(document)`"
+    assert shown[("value",)] == "`value`"  # a reserved word
+    assert shown[("a`b",)] == "`a``b`"  # the closing back-tick doubles
+    assert shown[("a\\b",)] == "`a\\\\b`"  # and so do backslashes, which escape inside back-ticks
+    assert shown[("ünï",)] == "`ünï`"  # SQL++ names are ASCII
+    assert shown[("tags",)] == "tags" and shown[("tags", None)] == "tags.[]"
+    assert shown[("tags", None, "k")] == "tags.[].k"
+    assert len(set(shown.values())) == len(shown)  # no two paths read alike
+
+
+def test_a_displayed_key_is_the_one_completion_inserts():
+    for key in ("name", "odd key", "a.b", "select", "x-y", "9lives", "", "[]", "naïve"):
+        assert sampling.display_path((key,)) == quote_ident(Dialect.SQLPP, key)
 
 
 def test_the_path_cap(monkeypatch):
@@ -130,6 +179,10 @@ def test_sampling_users_sees_every_shape():
     assert not sample.cut_at_bytes and sample.requested == 1000
     assert {"object", "string", "array", "number"} <= set(fields[()].types)
     assert fields[("u64max",)].types == {"number": 1} and ("address", "city") in fields
+    assert not sample.paths_capped and not sample.depth_capped
+    shown = {tuple(f.path): f.display for f in sample.fields}
+    assert shown[()] == "(document)" and shown[("address", "city")] == "address.city"
+    assert shown[("odd key",)] == "`odd key`"
 
 
 @requires_couchbase
@@ -225,6 +278,8 @@ def test_the_api_caches_until_sampled_again_or_the_profile_changes(app, cb):
     sample = client.post("/couchbase/fields/sample", json={"profile_id": cb, "keyspace": keyspace},
                          headers=AUTH).json()
     assert (sample["requested"], sample["documents"]) == (1000, 500)  # the settings' default size; o0 … o499
+    assert sample["paths_capped"] is False and sample["depth_capped"] is False
+    assert sample["fields"][0]["path"] == [] and sample["fields"][0]["display"] == "(document)"
     assert client.get("/couchbase/fields", params=query, headers=AUTH).json()["sampled_at"] == sample["sampled_at"]
     small = client.post("/couchbase/fields/sample", json={"profile_id": cb, "keyspace": keyspace, "size": 10},
                         headers=AUTH).json()
@@ -273,7 +328,7 @@ def test_a_connection_that_cannot_sample_is_refused_and_caches_nothing(tmp_path)
 
 def sample_of(keyspace: Keyspace) -> FieldSample:
     return FieldSample(keyspace=keyspace, sampled_at=datetime.now(UTC), requested=10, documents=0, cut_at_bytes=False,
-                       paths_capped=False, elapsed_ms=0, fields=[])
+                       paths_capped=False, depth_capped=False, elapsed_ms=0, fields=[])
 
 
 def test_the_cache_keeps_the_most_recently_used_samples_of_each_profile(tmp_path):

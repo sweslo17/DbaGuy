@@ -1127,6 +1127,8 @@ export interface components {
         FieldPath: {
             /** Path */
             path: (string | null)[];
+            /** Display */
+            display: string;
             /** Types */
             types: {
                 [key: string]: number;
@@ -1155,6 +1157,8 @@ export interface components {
             cut_at_bytes: boolean;
             /** Paths Capped */
             paths_capped: boolean;
+            /** Depth Capped */
+            depth_capped: boolean;
             /** Elapsed Ms */
             elapsed_ms: number;
             /** Fields */

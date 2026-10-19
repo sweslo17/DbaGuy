@@ -3,7 +3,6 @@ import { errorMessage } from "@/lib/api/client";
 import type { FieldSample, Keyspace } from "@/lib/api/types";
 import { plural } from "@/lib/format";
 import {
-  formatFieldPath,
   formatKinds,
   sampleNotes,
   useFieldSample,
@@ -27,7 +26,7 @@ function FieldsTable({ sample }: { sample: FieldSample }) {
       <tbody>
         {sample.fields.map((field) => (
           <tr key={JSON.stringify(field.path)} className="hover:bg-hover">
-            <td className="px-2 py-0.5 font-mono">{formatFieldPath(field.path)}</td>
+            <td className="px-2 py-0.5 font-mono">{field.display}</td>
             <td className="px-2 py-0.5 text-muted">{formatKinds(field.types)}</td>
             <td className="px-2 py-0.5">
               {field.docs.toLocaleString()} <span className="text-muted">· {field.percent}%</span>

@@ -90,11 +90,6 @@ export function useIsSampling(profileId: string, keyspace: Keyspace): boolean {
   return running > 0;
 }
 
-/** A field path as the table writes it: keys joined by `.`, `[]` for an array's elements, `(document)` for the root. */
-export function formatFieldPath(path: FieldPath["path"]): string {
-  return path.length === 0 ? "(document)" : path.map((key) => key ?? "[]").join(".");
-}
-
 /** The JSON kinds a path was seen with, most documents first: `string 8 · null 2`. */
 export function formatKinds(types: FieldPath["types"]): string {
   return Object.entries(types)
@@ -105,7 +100,8 @@ export function formatKinds(types: FieldPath["types"]): string {
 
 /**
  * What a sample left out, each with the reason. The limits are the backend's (`sampling.py`: SAMPLE_MAX_BYTES,
- * FIELD_PATHS_MAX, FIELD_KEY_MAX_CHARS); the sample says that a limit was reached, not what the limit is.
+ * FIELD_PATHS_MAX, FIELD_KEY_MAX_CHARS, FIELD_PATH_MAX_DEPTH); the sample says that a limit was reached, not what the
+ * limit is, so the numbers here are the ones the backend has today.
  */
 export function sampleNotes(sample: FieldSample): { label: string; explanation: string }[] {
   const notes: { label: string; explanation: string }[] = [];
@@ -117,9 +113,17 @@ export function sampleNotes(sample: FieldSample): { label: string; explanation: 
     });
   }
   if (sample.paths_capped) {
+    // One flag, two causes: the number of paths, and a key too long to list.
     notes.push({
       label: "only the first 2,000 paths",
-      explanation: "Paths after the first 2,000, and everything under a key longer than 1 KiB, are left out.",
+      explanation:
+        "Some paths are not listed: those after the first 2,000, and any key longer than 1 KiB with everything under it.",
+    });
+  }
+  if (sample.depth_capped) {
+    notes.push({
+      label: "only the first 6 levels",
+      explanation: "Fields nested deeper than 6 levels are not listed.",
     });
   }
   return notes;

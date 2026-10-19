@@ -98,6 +98,7 @@ class FieldPath(BaseModel):
     """One field path of a sample: how many documents have it and with which JSON kinds."""
 
     path: list[str | None]  # keys from the document's root; None: an element of an array; []: the document itself
+    display: str  # the path as SQL++ writes it (a key that needs back-ticks has them; `[]` an array's elements)
     types: dict[str, int]  # JSON kind ("binary" for a binary document) → documents in which the path has that kind
     docs: int  # documents in which the path occurs
     percent: float  # docs / documents sampled × 100, one decimal
@@ -112,5 +113,6 @@ class FieldSample(BaseModel):
     documents: int  # documents read
     cut_at_bytes: bool  # stopped at SAMPLE_MAX_BYTES before `requested` documents
     paths_capped: bool  # paths left out: more than FIELD_PATHS_MAX of them, or a key over FIELD_KEY_MAX_CHARS
+    depth_capped: bool  # fields left out below FIELD_PATH_MAX_DEPTH levels
     elapsed_ms: int
     fields: list[FieldPath]

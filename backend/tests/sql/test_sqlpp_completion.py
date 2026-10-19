@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 import pytest
 from loguru import logger
 
+from dbaguy_backend.adapters.couchbase.sampling import display_path
 from dbaguy_backend.domain.couchbase import FieldPath, Keyspace
 from dbaguy_backend.domain.execution import QueryContext
 from dbaguy_backend.domain.schema import SchemaSnapshot, SnapshotKeyspace
@@ -29,7 +30,8 @@ CTX = QueryContext(bucket="dbaguy", scope="app")
 
 
 def path(*segments, kind="string", docs=8):
-    return FieldPath(path=list(segments), types={kind: docs}, docs=docs, percent=docs * 10.0)
+    return FieldPath(path=list(segments), display=display_path(segments), types={kind: docs}, docs=docs,
+                     percent=docs * 10.0)
 
 
 FIELDS = {USERS: [

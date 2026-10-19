@@ -71,6 +71,7 @@ export type Keyspace = S["Keyspace"];
 /**
  * Couchbase (R-04-11): one field path of a manual sample. `path` runs from the document's root: a key, `null` for the
  * elements of an array, `[]` for the document itself; `types` counts the documents by JSON kind ("binary" included).
+ * `display` is the path as the backend writes it for the user (SQL++ quoting): show it, never build one from `path`.
  */
 export type FieldPath = S["FieldPath"];
 /** Couchbase (R-04-11): the field paths of a keyspace's sampled documents, as `POST /couchbase/fields/sample` answers. */

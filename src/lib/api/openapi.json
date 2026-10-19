@@ -3797,6 +3797,10 @@
             "type": "array",
             "title": "Path"
           },
+          "display": {
+            "type": "string",
+            "title": "Display"
+          },
           "types": {
             "additionalProperties": {
               "type": "integer"
@@ -3816,6 +3820,7 @@
         "type": "object",
         "required": [
           "path",
+          "display",
           "types",
           "docs",
           "percent"
@@ -3849,6 +3854,10 @@
             "type": "boolean",
             "title": "Paths Capped"
           },
+          "depth_capped": {
+            "type": "boolean",
+            "title": "Depth Capped"
+          },
           "elapsed_ms": {
             "type": "integer",
             "title": "Elapsed Ms"
@@ -3869,6 +3878,7 @@
           "documents",
           "cut_at_bytes",
           "paths_capped",
+          "depth_capped",
           "elapsed_ms",
           "fields"
         ],

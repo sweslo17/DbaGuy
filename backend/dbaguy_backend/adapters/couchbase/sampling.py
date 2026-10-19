@@ -11,19 +11,24 @@ decoded twice (once to split `t` from `d`, once more for the walk) would hold a 
 integer or `1e400` is just "number"). A path is `(key, …)` from the root, `None` for the elements of an array; a
 document contributes each `(path, kind)` once however many elements of an array have it. Three caps keep a sample
 bounded: paths go no deeper than FIELD_PATH_MAX_DEPTH segments, a path met after FIELD_PATHS_MAX others is left out,
-and so is a key longer than FIELD_KEY_MAX_CHARS (with everything below it). A left-out path sets `paths_capped`."""
+and so is a key longer than FIELD_KEY_MAX_CHARS (with everything below it). A path left out for its number or for a long
+key sets `paths_capped`; an object or array that has something below the depth cap sets `depth_capped`. A path is shown
+as SQL++ writes it (`display_path`): a key is back-ticked exactly when completion would back-tick it."""
 
 import json
 from typing import Any
 
 from ...domain.couchbase import FieldPath, Keyspace
-from ...sql.dialects import keyspace_path
+from ...sql.dialects import Dialect, keyspace_path, quote_ident
 
 # The rows read for a sample stop after the row that takes their texts (in characters, as the `*` peek counts) past this.
 SAMPLE_MAX_BYTES = 32 * 1024 * 1024
 FIELD_PATH_MAX_DEPTH = 6
 FIELD_PATHS_MAX = 2000
 FIELD_KEY_MAX_CHARS = 1024  # 2,000 paths of 10 KB keys would make a 20 MiB sample, and as large a response
+
+ROOT_DISPLAY = "(document)"  # how the table names the path of the document itself
+ARRAY_STEP = "[]"  # …and a step into an array's elements (a key that is literally `[]` is back-ticked: no clash)
 
 BINARY = "binary"  # `META(d).type` of a document that is not JSON (A24): the server answers `base64`
 _BINARY_META_TYPE = "base64"
@@ -63,6 +68,15 @@ def parse_sample_row(row_text: str) -> tuple[str, Any]:
     return row["t"], row["d"]
 
 
+def display_path(path: tuple[str | None, ...]) -> str:
+    """A field path as the detail page shows it: keys joined by `.`, each quoted as SQL++ (and completion) quotes a name
+    (`x.`a.b``, `` `odd key` ``, an empty key as two back-ticks), `[]` for the elements of an array, `(document)` for
+    the document itself. A key with a dot in it cannot read like nesting."""
+    if not path:
+        return ROOT_DISPLAY
+    return ".".join(ARRAY_STEP if key is None else quote_ident(Dialect.SQLPP, key) for key in path)
+
+
 class _PathStats:
     __slots__ = ("docs", "last_doc", "types")
 
@@ -78,6 +92,7 @@ class FieldCollector:
     def __init__(self) -> None:
         self.documents = 0
         self.paths_capped = False
+        self.depth_capped = False
         self._stats: dict[tuple[str | None, ...], _PathStats] = {}
 
     def add(self, meta_type: str, document_text: str) -> None:
@@ -98,6 +113,8 @@ class FieldCollector:
         kind = _KINDS[type(value)]
         self._record(path, kind, seen)
         if len(path) >= FIELD_PATH_MAX_DEPTH:
+            if kind in ("object", "array") and value:  # something below is not listed: an empty one loses nothing
+                self.depth_capped = True
             return
         if kind == "object":
             for key, child in value.items():
@@ -127,7 +144,7 @@ class FieldCollector:
 
     def fields(self) -> list[FieldPath]:
         return [
-            FieldPath(path=list(path), types=dict(stats.types), docs=stats.docs,
+            FieldPath(path=list(path), display=display_path(path), types=dict(stats.types), docs=stats.docs,
                       percent=round(stats.docs / self.documents * 100, 1))
             for path, stats in self._stats.items()
         ]
