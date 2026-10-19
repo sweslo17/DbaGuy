@@ -34,7 +34,6 @@ function SampleFieldsBody({
 
   const submit = () => {
     if (!canSample) return;
-    console.info("Sampling the fields of a collection");
     sample.mutate(
       { profileId, keyspace, size: Number(size.trim()) },
       {
@@ -43,7 +42,6 @@ function SampleFieldsBody({
           openObject(profileId, node);
           onOpenChange(false);
         },
-        onError: (error) => console.warn("Sampling the fields failed", error),
       },
     );
   };

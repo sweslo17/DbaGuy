@@ -1,6 +1,7 @@
 import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, unwrap } from "@/lib/api/client";
 import type { FieldPath, FieldSample, Keyspace, PathSegment } from "@/lib/api/types";
+import { formatBytes } from "@/lib/cells";
 
 /*
  * Couchbase field samples (R-04-11): the field paths of a collection's documents, read only when the user asks (the
@@ -58,8 +59,9 @@ const SAMPLE_MUTATION = ["sample-fields"] as const;
 /**
  * Samples a collection (`POST /couchbase/fields/sample`) and puts the result under `fieldSampleKey`. A server error
  * (13014 with the missing role, for a user who may not scan the keyspace) is the mutation's error with the server's
- * own text; it is not retried. The cache is filled here, not in a `mutate` callback: a sample whose dialog was closed
- * with Cancel still finishes in the background and lands in the cache.
+ * own text; it is not retried. The cache is filled, and the sample and its failure are logged (counts and the server's
+ * text, never a value), here and not in a `mutate` callback: a sample whose dialog was closed with Cancel still lands
+ * in the cache, and one that fails after that is still logged.
  */
 export function useSampleFields() {
   const qc = useQueryClient();
@@ -71,10 +73,12 @@ export function useSampleFields() {
           body: { profile_id: profileId, keyspace, size },
         }),
       ),
+    onMutate: () => console.info("Sampling the fields of a collection"),
     onSuccess: (sample, { profileId, keyspace }) => {
       qc.setQueryData<FieldSample | null>(fieldSampleKey(profileId, keyspace), sample);
       console.info(`Sampled ${sample.documents} documents: ${sample.fields.length} field paths in ${sample.elapsed_ms} ms`);
     },
+    onError: (error) => console.warn("Sampling the fields failed", error),
   });
 }
 
@@ -98,32 +102,45 @@ export function formatKinds(types: FieldPath["types"]): string {
     .join(" · ");
 }
 
+/** "32 MB", "512 KB": `formatBytes` without its ".0". */
+const sizeText = (bytes: number) => formatBytes(bytes).replace(".0 ", " ");
+
+/** One thing a sample left out: a short label and the reason. */
+export interface SampleNote {
+  label: string;
+  explanation: string;
+}
+
 /**
- * What a sample left out, each with the reason. The limits are the backend's (`sampling.py`: SAMPLE_MAX_BYTES,
- * FIELD_PATHS_MAX, FIELD_KEY_MAX_CHARS, FIELD_PATH_MAX_DEPTH); the sample says that a limit was reached, not what the
- * limit is, so the numbers here are the ones the backend has today.
+ * What a sample left out, each cause with its own note. The limits are the backend's, reported by the sample itself
+ * (`FieldSample.limits`): this holds no number of its own.
  */
-export function sampleNotes(sample: FieldSample): { label: string; explanation: string }[] {
-  const notes: { label: string; explanation: string }[] = [];
+export function sampleNotes(sample: FieldSample): SampleNote[] {
+  const { max_bytes: bytes, max_paths: paths, max_depth: depth, max_key_chars: keyChars } = sample.limits;
+  const notes: SampleNote[] = [];
   if (sample.cut_at_bytes) {
     notes.push({
-      label: "stopped at 32 MB",
+      label: `stopped at ${sizeText(bytes)}`,
       // The document that crossed the limit may have been the collection's last: "may", never "does".
-      explanation: `Reading stops once the documents read pass 32 MB, so this sample may hold fewer documents than the ${sample.requested.toLocaleString()} asked for.`,
+      explanation: `Reading stops once the documents read pass ${sizeText(bytes)}, so this sample may hold fewer documents than the ${sample.requested.toLocaleString()} asked for.`,
     });
   }
   if (sample.paths_capped) {
-    // One flag, two causes: the number of paths, and a key too long to list.
     notes.push({
-      label: "only the first 2,000 paths",
-      explanation:
-        "Some paths are not listed: those after the first 2,000, and any key longer than 1 KiB with everything under it.",
+      label: `only the first ${paths.toLocaleString()} paths`,
+      explanation: `Paths after the first ${paths.toLocaleString()} are not listed.`,
+    });
+  }
+  if (sample.long_keys_skipped) {
+    notes.push({
+      label: "long keys left out",
+      explanation: `Keys longer than ${keyChars.toLocaleString()} characters were left out, with everything under them.`,
     });
   }
   if (sample.depth_capped) {
     notes.push({
-      label: "only the first 6 levels",
-      explanation: "Fields nested deeper than 6 levels are not listed.",
+      label: `only the first ${depth} levels`,
+      explanation: `Fields nested deeper than ${depth} levels are not listed.`,
     });
   }
   return notes;

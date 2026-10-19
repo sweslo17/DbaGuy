@@ -3854,9 +3854,16 @@
             "type": "boolean",
             "title": "Paths Capped"
           },
+          "long_keys_skipped": {
+            "type": "boolean",
+            "title": "Long Keys Skipped"
+          },
           "depth_capped": {
             "type": "boolean",
             "title": "Depth Capped"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/SampleLimits"
           },
           "elapsed_ms": {
             "type": "integer",
@@ -3878,7 +3885,9 @@
           "documents",
           "cut_at_bytes",
           "paths_capped",
+          "long_keys_skipped",
           "depth_capped",
+          "limits",
           "elapsed_ms",
           "fields"
         ],
@@ -5395,6 +5404,35 @@
         "additionalProperties": false,
         "type": "object",
         "title": "SafetySettings"
+      },
+      "SampleLimits": {
+        "properties": {
+          "max_bytes": {
+            "type": "integer",
+            "title": "Max Bytes"
+          },
+          "max_paths": {
+            "type": "integer",
+            "title": "Max Paths"
+          },
+          "max_depth": {
+            "type": "integer",
+            "title": "Max Depth"
+          },
+          "max_key_chars": {
+            "type": "integer",
+            "title": "Max Key Chars"
+          }
+        },
+        "type": "object",
+        "required": [
+          "max_bytes",
+          "max_paths",
+          "max_depth",
+          "max_key_chars"
+        ],
+        "title": "SampleLimits",
+        "description": "What bounds a sample, as the backend has it: the UI words what a sample left out with these numbers."
       },
       "SampleRequest": {
         "properties": {

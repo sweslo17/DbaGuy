@@ -310,7 +310,8 @@ class CouchbaseConnection(DatabaseConnection, FieldSampling):
                      len(fields), " (cut at the byte cap)" if cut else "")
         return FieldSample(
             keyspace=keyspace, sampled_at=datetime.now(UTC), requested=size, documents=collector.documents,
-            cut_at_bytes=cut, paths_capped=collector.paths_capped, depth_capped=collector.depth_capped,
+            cut_at_bytes=cut, paths_capped=collector.paths_capped, long_keys_skipped=collector.long_keys_skipped,
+            depth_capped=collector.depth_capped, limits=sampling.limits(),
             elapsed_ms=int((time.monotonic() - started) * 1000), fields=fields,
         )
 

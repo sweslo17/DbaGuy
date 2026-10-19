@@ -2,6 +2,7 @@ import { Button } from "@/components/ui/Button";
 import { errorMessage } from "@/lib/api/client";
 import type { FieldSample, Keyspace } from "@/lib/api/types";
 import { plural } from "@/lib/format";
+import { useAppSettings } from "@/stores/settings";
 import {
   formatKinds,
   sampleNotes,
@@ -40,30 +41,30 @@ function FieldsTable({ sample }: { sample: FieldSample }) {
 
 /**
  * A collection's detail page, under its DDL (R-04-11): the field paths of its last manual sample, or an invitation to
- * take one. "Sample fields…" and "Sample again" sample at once with the setting's size; the tree's menu entry is the
- * one that asks. A sample that failed shows the server's text and leaves the previous one in place.
+ * take one. "Sample fields" and "Sample again" sample at once with the setting's size (their tooltip says how many);
+ * the tree's menu entry is the one that asks. A sample that failed shows the server's text, until a newer sample (from
+ * here or from the tree's dialog) replaces it, and leaves the previous sample in place.
  */
 export function SampledFields({ profileId, keyspace }: { profileId: string; keyspace: Keyspace }) {
   const cached = useFieldSample(profileId, keyspace);
   const run = useSampleFields();
   const sampling = useIsSampling(profileId, keyspace);
+  const { settings } = useAppSettings();
   const sample = cached.data ?? null;
-  const start = () => {
-    console.info("Sampling the fields of a collection");
-    run.mutate(
-      { profileId, keyspace, size: null },
-      { onError: (error) => console.warn("Sampling the fields failed", error) },
-    );
-  };
+  // This page's own failed sample, while nothing newer has been cached since (the tab stays mounted, so a later
+  // success from the dialog must not leave the old error standing).
+  const failed = run.isError && run.submittedAt > cached.dataUpdatedAt;
+  const start = () => run.mutate({ profileId, keyspace, size: null });
   const button = (
     <Button
       size="sm"
       variant={sample ? "ghost" : "secondary"}
       className={sample ? "text-accent" : undefined}
+      title={`Reads ${plural(settings.couchbase.sample_size, "document")} (Settings › Couchbase)`}
       disabled={sampling}
       onClick={start}
     >
-      {sampling ? "Sampling…" : sample ? "Sample again" : "Sample fields…"}
+      {sampling ? "Sampling…" : sample ? "Sample again" : "Sample fields"}
     </Button>
   );
 
@@ -72,9 +73,12 @@ export function SampledFields({ profileId, keyspace }: { profileId: string; keys
       <h3 className="text-[13px] font-semibold">Fields (sampled)</h3>
       {cached.isPending && <p className="text-[12px] text-muted">Loading…</p>}
       {cached.isError && (
-        <p className="text-[12px] whitespace-pre-wrap text-danger" data-selectable>
-          {errorMessage(cached.error)}
-        </p>
+        <>
+          <p className="text-[12px] whitespace-pre-wrap text-danger" data-selectable>
+            {errorMessage(cached.error)}
+          </p>
+          <div>{button}</div>
+        </>
       )}
       {cached.isSuccess && sample === null && (
         <>
@@ -101,7 +105,7 @@ export function SampledFields({ profileId, keyspace }: { profileId: string; keys
           ))}
         </>
       )}
-      {run.isError && (
+      {failed && (
         <p className="text-[12px] whitespace-pre-wrap text-danger" role="alert" data-selectable>
           {errorMessage(run.error)}
         </p>

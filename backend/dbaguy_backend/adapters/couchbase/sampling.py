@@ -11,14 +11,15 @@ decoded twice (once to split `t` from `d`, once more for the walk) would hold a 
 integer or `1e400` is just "number"). A path is `(key, …)` from the root, `None` for the elements of an array; a
 document contributes each `(path, kind)` once however many elements of an array have it. Three caps keep a sample
 bounded: paths go no deeper than FIELD_PATH_MAX_DEPTH segments, a path met after FIELD_PATHS_MAX others is left out,
-and so is a key longer than FIELD_KEY_MAX_CHARS (with everything below it). A path left out for its number or for a long
-key sets `paths_capped`; an object or array that has something below the depth cap sets `depth_capped`. A path is shown
-as SQL++ writes it (`display_path`): a key is back-ticked exactly when completion would back-tick it."""
+and so is a key longer than FIELD_KEY_MAX_CHARS (with everything below it). Each cap has its own flag: a path left out
+for their number sets `paths_capped`, a long key `long_keys_skipped`, and an object or array that has something below
+the depth cap `depth_capped`. `limits()` is what the sample reports of them, so the UI never has the numbers of its
+own. A path is shown as SQL++ writes it (`display_path`): a key is back-ticked exactly when completion would."""
 
 import json
 from typing import Any
 
-from ...domain.couchbase import FieldPath, Keyspace
+from ...domain.couchbase import FieldPath, Keyspace, SampleLimits
 from ...sql.dialects import Dialect, keyspace_path, quote_ident
 
 # The rows read for a sample stop after the row that takes their texts (in characters, as the `*` peek counts) past this.
@@ -32,6 +33,12 @@ ARRAY_STEP = "[]"  # …and a step into an array's elements (a key that is liter
 
 BINARY = "binary"  # `META(d).type` of a document that is not JSON (A24): the server answers `base64`
 _BINARY_META_TYPE = "base64"
+
+
+def limits() -> SampleLimits:
+    """The caps above as a sample reports them. Read when asked, not at import: a test lowers them."""
+    return SampleLimits(max_bytes=SAMPLE_MAX_BYTES, max_paths=FIELD_PATHS_MAX, max_depth=FIELD_PATH_MAX_DEPTH,
+                        max_key_chars=FIELD_KEY_MAX_CHARS)
 
 
 class _Number:
@@ -92,6 +99,7 @@ class FieldCollector:
     def __init__(self) -> None:
         self.documents = 0
         self.paths_capped = False
+        self.long_keys_skipped = False
         self.depth_capped = False
         self._stats: dict[tuple[str | None, ...], _PathStats] = {}
 
@@ -119,7 +127,7 @@ class FieldCollector:
         if kind == "object":
             for key, child in value.items():
                 if len(key) > FIELD_KEY_MAX_CHARS:  # its path, and every path below it, is left out
-                    self.paths_capped = True
+                    self.long_keys_skipped = True
                     continue
                 self._walk(child, (*path, key), seen)
         elif kind == "array":

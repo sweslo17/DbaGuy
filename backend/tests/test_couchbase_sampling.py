@@ -59,7 +59,7 @@ def test_array_elements_and_the_depth_cap():
     paths = [tuple(f.path) for f in collector.fields()]
     assert ("items", None, "sku") in paths and ("items", None, "qty") in paths
     assert max(len(p) for p in paths) == 6 and ("a", "b", "c", "d", "e", "f") in paths
-    assert not collector.paths_capped  # a different cap: the number of paths and the length of a key
+    assert not collector.paths_capped and not collector.long_keys_skipped  # each cap has its own flag
     assert collector.depth_capped  # `g` is below the cap and is not listed: the sample says so (ruling B50)
 
 
@@ -76,15 +76,26 @@ def test_the_depth_cap_is_reported_only_when_something_below_it_is_left_out():
     assert collect(("json", '{"ok":1}'), ("json", at_the_cap % '{"g":1}')).depth_capped  # any one document is enough
 
 
+def flags(collector: FieldCollector) -> tuple[bool, bool, bool]:
+    return collector.paths_capped, collector.long_keys_skipped, collector.depth_capped
+
+
 def test_each_cap_sets_its_own_flag(monkeypatch):
     monkeypatch.setattr(sampling, "FIELD_PATHS_MAX", 2)
-    many = collect(("json", '{"a":1,"b":2}'))
-    assert many.paths_capped and not many.depth_capped
+    assert flags(collect(("json", '{"a":1,"b":2}'))) == (True, False, False)  # the number of paths
     monkeypatch.undo()
-    long = collect(("json", json.dumps({"k" * (sampling.FIELD_KEY_MAX_CHARS + 1): 1})))
-    assert long.paths_capped and not long.depth_capped
-    deep = collect(("json", '{"a":{"b":{"c":{"d":{"e":{"f":{"g":1}}}}}}}'))
-    assert deep.depth_capped and not deep.paths_capped
+    long = json.dumps({"k" * (sampling.FIELD_KEY_MAX_CHARS + 1): 1})
+    assert flags(collect(("json", long))) == (False, True, False)  # a key too long to list
+    assert flags(collect(("json", '{"a":{"b":{"c":{"d":{"e":{"f":{"g":1}}}}}}}'))) == (False, False, True)  # depth
+    assert flags(collect(("json", '{"a":{"b":1}}'))) == (False, False, False)
+
+
+def test_a_sample_reports_the_limits_it_works_to(monkeypatch):
+    assert sampling.limits().model_dump() == {"max_bytes": 32 * 1024 * 1024, "max_paths": 2000, "max_depth": 6,
+                                              "max_key_chars": 1024}
+    monkeypatch.setattr(sampling, "SAMPLE_MAX_BYTES", 1024)  # read when asked: a test that lowers a cap is believed
+    monkeypatch.setattr(sampling, "FIELD_PATHS_MAX", 5)
+    assert (sampling.limits().max_bytes, sampling.limits().max_paths) == (1024, 5)
 
 
 def test_paths_display_as_sqlpp_writes_them():
@@ -113,7 +124,7 @@ def test_a_displayed_key_is_the_one_completion_inserts():
 def test_the_path_cap(monkeypatch):
     monkeypatch.setattr(sampling, "FIELD_PATHS_MAX", 5)
     collector = collect(("json", '{"a":1,"b":2,"c":3,"d":4,"e":5,"f":6}'))
-    assert len(collector.fields()) == 5 and collector.paths_capped
+    assert len(collector.fields()) == 5 and flags(collector) == (True, False, False)
 
 
 def test_numbers_are_never_parsed():
@@ -135,8 +146,9 @@ def test_a_path_keeps_counting_after_the_cap_and_each_kind_counts_once_per_docum
 def test_a_key_over_the_limit_is_left_out_with_everything_below_it():
     edge, long = "e" * sampling.FIELD_KEY_MAX_CHARS, "k" * (sampling.FIELD_KEY_MAX_CHARS + 1)
     collector = collect(("json", json.dumps({"ok": 1, edge: 2, long: {"inner": 3}})))
-    assert [tuple(f.path) for f in collector.fields()] == [(), ("ok",), (edge,)] and collector.paths_capped
-    assert not collect(("json", '{"a":{"b":1}}')).paths_capped
+    assert [tuple(f.path) for f in collector.fields()] == [(), ("ok",), (edge,)]
+    assert flags(collector) == (False, True, False)  # not `paths_capped`: far fewer than FIELD_PATHS_MAX were kept
+    assert flags(collect(("json", '{"a":{"b":1}}'))) == (False, False, False)
 
 
 def test_the_sample_statement_quotes_names():
@@ -179,7 +191,8 @@ def test_sampling_users_sees_every_shape():
     assert not sample.cut_at_bytes and sample.requested == 1000
     assert {"object", "string", "array", "number"} <= set(fields[()].types)
     assert fields[("u64max",)].types == {"number": 1} and ("address", "city") in fields
-    assert not sample.paths_capped and not sample.depth_capped
+    assert not (sample.paths_capped or sample.long_keys_skipped or sample.depth_capped)
+    assert sample.limits == sampling.limits()
     shown = {tuple(f.path): f.display for f in sample.fields}
     assert shown[()] == "(document)" and shown[("address", "city")] == "address.city"
     assert shown[("odd key",)] == "`odd key`"
@@ -206,6 +219,7 @@ def test_the_sample_stops_at_its_byte_cap(monkeypatch):
         connection.close()
     total = couchbase_query("SELECT RAW COUNT(*) FROM dbaguy.app.users")["results"][0]
     assert sample.cut_at_bytes and sample.documents < total
+    assert sample.limits.max_bytes == 1024 * 1024  # the cap that cut it, as reported
 
 
 @requires_couchbase
@@ -278,7 +292,8 @@ def test_the_api_caches_until_sampled_again_or_the_profile_changes(app, cb):
     sample = client.post("/couchbase/fields/sample", json={"profile_id": cb, "keyspace": keyspace},
                          headers=AUTH).json()
     assert (sample["requested"], sample["documents"]) == (1000, 500)  # the settings' default size; o0 … o499
-    assert sample["paths_capped"] is False and sample["depth_capped"] is False
+    assert [sample[flag] for flag in ("paths_capped", "long_keys_skipped", "depth_capped")] == [False] * 3
+    assert sample["limits"] == {"max_bytes": 32 * 1024 * 1024, "max_paths": 2000, "max_depth": 6, "max_key_chars": 1024}
     assert sample["fields"][0]["path"] == [] and sample["fields"][0]["display"] == "(document)"
     assert client.get("/couchbase/fields", params=query, headers=AUTH).json()["sampled_at"] == sample["sampled_at"]
     small = client.post("/couchbase/fields/sample", json={"profile_id": cb, "keyspace": keyspace, "size": 10},
@@ -328,7 +343,8 @@ def test_a_connection_that_cannot_sample_is_refused_and_caches_nothing(tmp_path)
 
 def sample_of(keyspace: Keyspace) -> FieldSample:
     return FieldSample(keyspace=keyspace, sampled_at=datetime.now(UTC), requested=10, documents=0, cut_at_bytes=False,
-                       paths_capped=False, depth_capped=False, elapsed_ms=0, fields=[])
+                       paths_capped=False, long_keys_skipped=False, depth_capped=False, limits=sampling.limits(),
+                       elapsed_ms=0, fields=[])
 
 
 def test_the_cache_keeps_the_most_recently_used_samples_of_each_profile(tmp_path):

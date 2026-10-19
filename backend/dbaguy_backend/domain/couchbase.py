@@ -104,6 +104,15 @@ class FieldPath(BaseModel):
     percent: float  # docs / documents sampled × 100, one decimal
 
 
+class SampleLimits(BaseModel):
+    """What bounds a sample, as the backend has it: the UI words what a sample left out with these numbers."""
+
+    max_bytes: int  # reading stops after the document that takes the documents read past this (SAMPLE_MAX_BYTES)
+    max_paths: int  # field paths kept; later ones are left out (FIELD_PATHS_MAX)
+    max_depth: int  # levels of a path kept; nothing deeper is listed (FIELD_PATH_MAX_DEPTH)
+    max_key_chars: int  # a longer key is left out with everything under it (FIELD_KEY_MAX_CHARS)
+
+
 class FieldSample(BaseModel):
     """A manual sample of a keyspace (R-04-11): the field paths derived in Python from the documents read."""
 
@@ -112,7 +121,9 @@ class FieldSample(BaseModel):
     requested: int  # the sample size asked for
     documents: int  # documents read
     cut_at_bytes: bool  # stopped at SAMPLE_MAX_BYTES before `requested` documents
-    paths_capped: bool  # paths left out: more than FIELD_PATHS_MAX of them, or a key over FIELD_KEY_MAX_CHARS
-    depth_capped: bool  # fields left out below FIELD_PATH_MAX_DEPTH levels
+    paths_capped: bool  # paths left out: more than `limits.max_paths` of them
+    long_keys_skipped: bool  # a key over `limits.max_key_chars` left out, with everything under it
+    depth_capped: bool  # fields left out below `limits.max_depth` levels
+    limits: SampleLimits
     elapsed_ms: int
     fields: list[FieldPath]

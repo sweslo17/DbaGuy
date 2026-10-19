@@ -1157,8 +1157,11 @@ export interface components {
             cut_at_bytes: boolean;
             /** Paths Capped */
             paths_capped: boolean;
+            /** Long Keys Skipped */
+            long_keys_skipped: boolean;
             /** Depth Capped */
             depth_capped: boolean;
+            limits: components["schemas"]["SampleLimits"];
             /** Elapsed Ms */
             elapsed_ms: number;
             /** Fields */
@@ -1742,6 +1745,20 @@ export interface components {
              * @default 0
              */
             idle_transaction_rollback_minutes: number;
+        };
+        /**
+         * SampleLimits
+         * @description What bounds a sample, as the backend has it: the UI words what a sample left out with these numbers.
+         */
+        SampleLimits: {
+            /** Max Bytes */
+            max_bytes: number;
+            /** Max Paths */
+            max_paths: number;
+            /** Max Depth */
+            max_depth: number;
+            /** Max Key Chars */
+            max_key_chars: number;
         };
         /** SampleRequest */
         SampleRequest: {
