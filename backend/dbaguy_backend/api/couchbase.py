@@ -34,6 +34,11 @@ class AdviseRequest(_Input):
     query_context: QueryContext | None = None  # the tab's context, as every request of the tab carries it
 
 
+class StatementKeyspaceRequest(_Input):
+    sql: str = Field(min_length=1, max_length=_STATEMENT_LIMIT)  # the statement a result came from
+    query_context: QueryContext | None = None  # the context the run used
+
+
 class SampleRequest(_Input):
     profile_id: UUID
     keyspace: Keyspace
@@ -88,6 +93,15 @@ def plan(body: PlanRequest, container: AppContainer = Depends(get_container)) ->
 @router.post("/advise", response_model=PlanView)
 def advise(body: AdviseRequest, container: AppContainer = Depends(get_container)) -> PlanView:
     return container.couchbase.advise(body.profile_id, body.statement, body.query_context)
+
+
+@router.post("/statement-keyspace", response_model=Keyspace | None)
+def statement_keyspace(
+    body: StatementKeyspaceRequest, container: AppContainer = Depends(get_container)
+) -> Keyspace | None:
+    """The collection the statement reads when it names exactly one (fully qualified, or resolved against the run's
+    context as SQL++ resolves it), else null. Pure: no connection, nothing logged."""
+    return container.couchbase.statement_keyspace(body.sql, body.query_context)
 
 
 @router.post("/fields/sample", response_model=FieldSample)

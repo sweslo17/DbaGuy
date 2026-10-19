@@ -7,12 +7,13 @@ from pydantic import ValidationError
 
 from dbaguy_backend.domain.errors import AlreadyExists, NotFound, StorageError, ValidationFailed
 from dbaguy_backend.domain.execution import QueryContext
+from dbaguy_backend.domain.metadata import PathSegment
 from dbaguy_backend.domain.settings import AppSettings
 from dbaguy_backend.domain.workspace import WorkspaceState, WorkspaceTab
 from dbaguy_backend.services import scripts_service
 from dbaguy_backend.services.scripts_service import ScriptsService
 from dbaguy_backend.services.settings_service import SettingsService
-from dbaguy_backend.services.workspace_service import WorkspaceService
+from dbaguy_backend.services.workspace_service import WorkspaceService, repaired_workspace
 from dbaguy_backend.storage.atomic_file import atomic_text_file
 from dbaguy_backend.storage.json_files import JsonDocument, write_text_atomic
 
@@ -258,6 +259,38 @@ def test_a_tab_with_bad_drafts_or_context_keeps_its_buffer_and_loses_only_those(
         assert secret not in everything
     WorkspaceService(path).put(state)  # the next save writes what was kept
     assert [t["id"] for t in json.loads(path.read_text())["tabs"]] == ["t1", "t2", "t3", "t4"]
+
+
+@pytest.mark.parametrize("cas", ["12ab", "0", "012", "", " 5", "-5", "1" * 20, 5, 1.5, True, ["1"]])
+def test_a_document_tab_with_a_bad_cas_keeps_its_buffer_and_loses_only_the_cas(tmp_path, logged_warnings, cas):
+    path = tmp_path / "workspace.json"
+    document = [{"kind": "bucket", "name": "b"}, {"kind": "scope", "name": "s"}, {"kind": "collection", "name": "c"},
+                {"kind": "document", "name": "secret-id"}]
+    path.write_text(json.dumps({"tabs": [
+        {"id": "d1", "kind": "document", "title": "secret-id", "object_path": document, "buffer": '{"edited": 1}',
+         "document_cas": cas},
+        {"id": "d2", "kind": "document", "title": "ok", "object_path": document, "buffer": "kept",
+         "document_cas": "1792325990605258752"},
+    ]}))
+    d1, d2 = WorkspaceService(path).get().tabs
+    assert (d1.id, d1.buffer, d1.document_cas, d1.object_path) == ("d1", '{"edited": 1}', None, [
+        PathSegment(**segment) for segment in document])  # the tab and its unsaved text stay
+    assert (d2.buffer, d2.document_cas) == ("kept", "1792325990605258752")  # a good CAS is untouched
+    assert list(tmp_path.glob("workspace.json.corrupt-*")) == []
+    assert [line for line in logged_warnings if line.startswith("Repaired")] == [
+        "Repaired tab 0 of the saved workspace: reset the document CAS"]
+    assert "secret-id" not in "".join(logged_warnings) and "edited" not in "".join(logged_warnings)
+
+
+def test_a_workspace_being_saved_with_a_bad_cas_is_repaired_not_refused(logged_warnings):
+    raw = {"tabs": [{"id": "d1", "kind": "document", "buffer": "text", "document_cas": "12ab"},
+                    {"id": "d2", "kind": "document", "document_cas": "7"}]}
+    state = WorkspaceState.model_validate(repaired_workspace(raw))  # what `PUT /workspace` validates
+    assert [(t.buffer, t.document_cas) for t in state.tabs] == [("text", None), (None, "7")]
+    assert [line for line in logged_warnings if line.startswith("Repaired")] == [
+        "Repaired tab 0 of the workspace being saved: reset the document CAS"]
+    with pytest.raises(ValidationError):  # unrepaired, the model still refuses it
+        WorkspaceState.model_validate(raw)
 
 
 @pytest.mark.parametrize("content", ["{not json", "[]", '{"tabs": "nope"}', '{"version": "two", "tabs": []}'])

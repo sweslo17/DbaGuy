@@ -1,5 +1,5 @@
 import { api, ApiError, unwrap } from "@/lib/api/client";
-import type { DocumentView, Keyspace, PathSegment } from "@/lib/api/types";
+import type { DocumentView, Keyspace, PathSegment, QueryContext } from "@/lib/api/types";
 import type { DocumentTabState } from "@/stores/workspace";
 import { keyspaceOfPath } from "../explorer/fieldSamples";
 
@@ -42,3 +42,17 @@ export async function getDocument(ref: DocumentRef, signal?: AbortSignal): Promi
 /** Whether `error` says the document does not exist (not that reading it failed). */
 export const isDocumentMissing = (error: unknown): boolean =>
   error instanceof ApiError && error.code === "document_missing";
+
+/**
+ * The collection a statement reads when it names exactly one (fully qualified, or resolved against the run's context as
+ * SQL++ resolves it); null for none or several. The backend reads the statement (`POST /couchbase/statement-keyspace`):
+ * the frontend never parses SQL++.
+ */
+export async function statementKeyspace(
+  sql: string,
+  queryContext: QueryContext | null | undefined,
+  signal?: AbortSignal,
+): Promise<Keyspace | null> {
+  const body = { sql, query_context: queryContext ?? null };
+  return unwrap(await (await api()).POST("/couchbase/statement-keyspace", { body, signal }));
+}

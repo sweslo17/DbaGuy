@@ -1,8 +1,8 @@
 import { memo, useCallback } from "react";
 import type { MenuItem } from "@/components/ui/ContextMenu";
-import type { Dialect, Keyspace } from "@/lib/api/types";
+import type { Dialect } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
-import { askOpenDocument, idPrefill } from "../documents/openDocument";
+import { askOpenDocument, idPrefill, prefillKeyspace } from "../documents/openDocument";
 import { DataGrid } from "../grid/DataGrid";
 import type { ResultSetState } from "../session/execution";
 import type { RequestOptions, SessionController } from "../session/SessionController";
@@ -33,12 +33,6 @@ export interface ResultGridProps {
   hidden: boolean;
 }
 
-/** Where the statement ran, as far as a request tells: its context's bucket and scope (nothing known without one). */
-function contextKeyspace({ queryContext }: RequestOptions): Partial<Keyspace> {
-  if (!queryContext) return {};
-  return queryContext.scope ? { bucket: queryContext.bucket, scope: queryContext.scope } : { bucket: queryContext.bucket };
-}
-
 /**
  * One result tab's grid. Memoised on primitive or stable props: a session event re-renders only the grid whose set
  * changed (the reducer keeps the identity of every untouched execution and set), not every grid of the run.
@@ -48,23 +42,22 @@ export const ResultGrid = memo(function ResultGrid(props: ResultGridProps) {
   const { documentsProfileId } = props;
   const loadMore = useCallback(() => controller?.fetchMore(requestId, pageSize), [controller, requestId, pageSize]);
   const exportThis = useCallback(() => onExport(sql, request), [onExport, sql, request]);
-  // "Open document…": the ID is the row's `id` column or the clicked text; the collection is the one opened last.
+  // "Open document…": the ID is the row's `id` column or the clicked text, the collection the one the statement reads
+  // (when it reads exactly one), else the run's context and the collection opened last (ruling C44).
   const openDocumentItems = useCallback(
     (row: number, col: number): MenuItem[] => [
       {
         label: "Open document…",
         onSelect: () => {
           if (documentsProfileId === null) return;
-          askOpenDocument({
-            profileId: documentsProfileId,
-            mode: "open",
-            keyspace: contextKeyspace(request),
-            id: idPrefill(set.columns, set.rows[row] ?? [], col),
-          });
+          const id = idPrefill(set.columns, set.rows[row] ?? [], col); // as the cell is now: more rows may arrive
+          void prefillKeyspace(sql, request.queryContext).then((keyspace) =>
+            askOpenDocument({ profileId: documentsProfileId, mode: "open", keyspace, id }),
+          );
         },
       },
     ],
-    [documentsProfileId, request, set.columns, set.rows],
+    [documentsProfileId, sql, request, set.columns, set.rows],
   );
   return (
     <div className={cn("h-full", props.hidden && "hidden")}>

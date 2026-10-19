@@ -10,10 +10,11 @@ from ..adapters.base import DatabaseConnection
 from ..adapters.couchbase.adapter import CouchbaseConnection
 from ..adapters.couchbase.explain import analyze, analyze_value
 from ..adapters.registry import AdapterRegistry
-from ..domain.couchbase import DEFAULT, ContextOption, PlanNode, PlanView
+from ..domain.couchbase import DEFAULT, ContextOption, Keyspace, PlanNode, PlanView
 from ..domain.errors import NotFound, ValidationFailed
 from ..domain.execution import QueryContext
 from ..domain.history import HistoryPage
+from ..sql.sqlpp_completion import statement_keyspace
 from .metadata_errors import server_errors_are_final
 from .metadata_service import MetadataService
 from .profile_service import ProfileService
@@ -83,6 +84,11 @@ class CouchbaseService:
     def plan(self, text: str) -> PlanView:
         """The view of an EXPLAIN / ADVISE / profile text the user pasted: pure, no connection."""
         return _answered(analyze(text))
+
+    def statement_keyspace(self, sql: str, context: QueryContext | None) -> Keyspace | None:
+        """The collection a statement reads when it reads exactly one, under the run's context (what the grid's "Open
+        document…" starts from): pure, no connection."""
+        return statement_keyspace(sql, context)
 
     def advise(self, profile_id: UUID, statement: str, context: QueryContext | None) -> PlanView:
         """`ADVISE <statement>` on the profile's metadata connection, read-only like every internal query, in `context`

@@ -305,6 +305,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/couchbase/statement-keyspace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Statement Keyspace
+         * @description The collection the statement reads when it names exactly one (fully qualified, or resolved against the run's
+         *     context as SQL++ resolves it), else null. Pure: no connection, nothing logged.
+         */
+        post: operations["statement_keyspace_couchbase_statement_keyspace_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/couchbase/fields/sample": {
         parameters: {
             query?: never;
@@ -2406,6 +2427,12 @@ export interface components {
             /** Request Id */
             request_id: string;
         };
+        /** StatementKeyspaceRequest */
+        StatementKeyspaceRequest: {
+            /** Sql */
+            sql: string;
+            query_context?: components["schemas"]["QueryContext"] | null;
+        };
         /**
          * StatementKind
          * @enum {string}
@@ -3167,6 +3194,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PlanView"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    statement_keyspace_couchbase_statement_keyspace_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StatementKeyspaceRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Keyspace"] | null;
                 };
             };
             /** @description Validation Error */

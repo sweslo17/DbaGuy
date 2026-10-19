@@ -1170,6 +1170,74 @@
         }
       }
     },
+    "/couchbase/statement-keyspace": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Statement Keyspace",
+        "description": "The collection the statement reads when it names exactly one (fully qualified, or resolved against the run's\ncontext as SQL++ resolves it), else null. Pure: no connection, nothing logged.",
+        "operationId": "statement_keyspace_couchbase_statement_keyspace_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StatementKeyspaceRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/Keyspace"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Statement Keyspace Couchbase Statement Keyspace Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/couchbase/fields/sample": {
       "post": {
         "tags": [
@@ -6968,6 +7036,32 @@
           "request_id"
         ],
         "title": "StartedEvent"
+      },
+      "StatementKeyspaceRequest": {
+        "properties": {
+          "sql": {
+            "type": "string",
+            "maxLength": 1048576,
+            "minLength": 1,
+            "title": "Sql"
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "sql"
+        ],
+        "title": "StatementKeyspaceRequest"
       },
       "StatementKind": {
         "type": "string",

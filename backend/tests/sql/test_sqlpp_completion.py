@@ -15,7 +15,7 @@ from dbaguy_backend.domain.schema import SchemaSnapshot, SnapshotKeyspace
 from dbaguy_backend.sql.completion import CompletionResult, SnapshotIndex
 from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.keyspaces import NO_KEYSPACES, KeyspaceTree
-from dbaguy_backend.sql.sqlpp_completion import _complete, _Known, complete_sqlpp
+from dbaguy_backend.sql.sqlpp_completion import _complete, _Known, complete_sqlpp, statement_keyspace
 
 KEYSPACES = [SnapshotKeyspace(bucket=b, scope=s, collection=c) for b, s, c in [
     ("dbaguy", "_default", "_default"), ("dbaguy", "app", "events"), ("dbaguy", "app", "odd-name"),
@@ -350,3 +350,56 @@ def test_the_keyspace_tree_keeps_the_snapshot_order_and_flags_system_scopes():
     assert tree.collections == {("b", "s"): ("x", "z"), ("a", "_system"): ("q",), ("b", "t"): ("y",)}
     assert tree.system_scopes == {("a", "_system")} and tree.is_system("a", "_system") and not tree.is_system("b", "s")
     assert KeyspaceTree.of([]).buckets == ()
+
+
+# --- the one keyspace a statement reads (the grid's "Open document…", ruling C44) -------------------------------------
+
+TRAVEL = QueryContext(bucket="travel-sample", scope="inventory")
+BUCKET_ONLY = QueryContext(bucket="dbaguy")
+APP_USERS = Keyspace(bucket="dbaguy", scope="app", collection="users")
+
+
+@pytest.mark.parametrize("text, context, expected", [
+    # fully qualified: the statement's own keyspace, whatever the tab's context says (the grid's case)
+    ("SELECT META(d).id, * FROM dbaguy.app.users AS d", TRAVEL, APP_USERS),
+    ("SELECT * FROM dbaguy.app.users", None, APP_USERS),
+    ("SELECT * FROM `dbaguy`.`app`.`users` AS d;", CTX, APP_USERS),
+    ("SELECT * FROM `travel-sample`.inventory.airline a USE KEYS 'x'", CTX,
+     Keyspace(bucket="travel-sample", scope="inventory", collection="airline")),
+    # relative: resolved as the server resolves it under the run's context
+    ("SELECT * FROM users AS d", CTX, APP_USERS),  # a scoped context: a collection of that scope
+    ("SELECT * FROM users", BUCKET_ONLY, Keyspace(bucket="dbaguy", scope="_default", collection="users")),
+    ("SELECT * FROM app.users", BUCKET_ONLY, APP_USERS),  # a bucket-only context: scope.collection (ruling B47)
+    ("SELECT * FROM app.users", CTX, None),  # under a scope the server calls it ambiguous
+    ("SELECT * FROM users", None, Keyspace(bucket="users", scope="_default", collection="_default")),  # a bucket
+    ("SELECT * FROM app.users", None, None),  # no bucket to resolve it in
+    # other statements that name one keyspace
+    ("UPDATE users SET a = 1 WHERE b = 2", CTX, APP_USERS),
+    ("DELETE FROM users WHERE a = 1", CTX, APP_USERS),
+    ("INSERT INTO users (KEY, VALUE) VALUES ('k', {})", CTX, APP_USERS),
+    # words and brackets that are not keyspace references
+    ("SELECT EXTRACT(year FROM d.created), 'FROM orders' FROM users d -- FROM events", CTX, APP_USERS),
+    ("SELECT (SELECT RAW 1) AS one FROM users", CTX, APP_USERS),  # a subquery with no FROM names nothing
+    ("SELECT 1", CTX, None),
+    ("", CTX, None),
+])
+def test_a_statement_that_reads_one_keyspace_names_it(text, context, expected):
+    assert statement_keyspace(text, context) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "SELECT * FROM users u JOIN orders o ON o.uid = u.id",
+    "SELECT * FROM users, orders",
+    "SELECT * FROM dbaguy.app.users u JOIN dbaguy.app.users v ON u.id = v.boss",  # two terms, even for one keyspace
+    "SELECT * FROM (SELECT * FROM users) AS t",  # a subquery in FROM: the rows are its, not the keyspace's
+    "SELECT * FROM users WHERE id IN (SELECT RAW uid FROM orders)",
+    "SELECT * FROM users WHERE id IN (SELECT RAW uid FROM users)",
+    "WITH recent AS (SELECT * FROM orders) SELECT * FROM users",
+])
+def test_a_statement_that_reads_several_keyspaces_names_none(text):
+    assert statement_keyspace(text, CTX) is None
+
+
+def test_a_name_the_server_would_refuse_names_none():
+    assert statement_keyspace(f"SELECT * FROM `{'b' * 101}`.app.users", None) is None
+    assert statement_keyspace("SELECT * FROM `` ", CTX) is None

@@ -1,7 +1,8 @@
 """SQL++ completion (spec §3.12, SQL++ Should 1): keyspace paths from the schema snapshot, field paths from a manual
 sample and from the results seen in the tab, back-ticks where a name needs them.
 
-The statement's FROM lists are read here, not by `scope.py` (ruling B21): its alias rules are made for the other
+The statement's FROM lists are read here (`statement_keyspace` answers the grid's "Open document…" with the one
+keyspace a statement reads), not by `scope.py` (ruling B21): its alias rules are made for the other
 dialects, and NEST / UNNEST / LET among its stop words would break PostgreSQL's `FROM unnest(…) AS u`. The fields of a
 keyspace exist only when the user sampled it: this module only reads that cache, it never starts a sample. Pure: no
 I/O, SQL text is never logged above DEBUG. Offsets are Python code points, as in `complete()`.
@@ -21,11 +22,11 @@ from ..domain.couchbase import DEFAULT, FieldPath, Keyspace
 from ..domain.execution import QueryContext
 from .completion import (
     SYSTEM_BOOST, Candidate, CompletionKind, CompletionResult, SnapshotIndex, by_length, clause_context,
-    filter_candidates, guarded, keywords, qualifier, word_at_cursor,
+    filter_candidates, guarded, keywords, qualifier, significant, word_at_cursor,
 )
 from .dialects import Dialect, quote_ident
 from .keyspaces import NO_KEYSPACES, KeyspaceTree
-from .lexer import Token, TokenKind
+from .lexer import Token, TokenKind, tokenize
 from .scope import IDENT, unquote, word
 
 SQLPP = Dialect.SQLPP
@@ -204,6 +205,19 @@ def _keyspace_of(reference: _Reference | None, context: QueryContext | None) -> 
         return None
 
 
+def _only_keyspace(references: list[_Reference], context: QueryContext | None) -> Keyspace | None:
+    """The keyspace a statement reads when it reads exactly one: a single FROM term (subqueries counted, a subquery
+    with no FROM of its own is none), resolved as `_keyspace_of` says; never a guess between two."""
+    return _keyspace_of(references[0], context) if len(references) == 1 else None
+
+
+def statement_keyspace(text: str, context: QueryContext | None) -> Keyspace | None:
+    """The keyspace the statement `text` reads when it reads exactly one, resolved under the run's `context` as the
+    server resolves it; None for none, for several, or for a name that cannot be resolved (a relative name without a
+    context, `scope.collection` under a scope, a subquery in FROM). Whatever names completion would offer fields of."""
+    return _only_keyspace(_references(significant(tokenize(text, SQLPP))), context)
+
+
 # --- candidates ---------------------------------------------------------------------------------------------------
 
 
@@ -300,7 +314,7 @@ def _column_candidates(statement: list[Token], known: _Known) -> list[Candidate]
     exactly one (never a guess between two), the fields seen in results, then the keywords."""
     references = _references(statement)
     aliases = _reference_candidates(references)
-    only = _keyspace_of(references[0], known.context) if len(references) == 1 else None
+    only = _only_keyspace(references, known.context)
     sampled = _field_candidates(only, known.fields, [])
     offered = {candidate.label for candidate in (*aliases, *sampled)}
     return [*aliases, *sampled, *_seen_candidates(known.seen_fields, offered), *keywords(SQLPP, "clause")]

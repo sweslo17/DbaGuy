@@ -7,6 +7,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from ..domain.workspace import (
     MAX_PARAM_DRAFTS,
+    DocumentCas,
     ParamDraft,
     ParamName,
     TabQueryContext,
@@ -19,6 +20,7 @@ from ..storage.json_files import JsonDocument, error_fields
 _NAME = TypeAdapter(ParamName)
 _DRAFT = TypeAdapter(ParamDraft)
 _CONTEXT = TypeAdapter(TabQueryContext | None)
+_CAS = TypeAdapter(DocumentCas | None)
 _Extra = Literal["ignore"] | None  # as for `model_validate`: the file may come from a newer build, a request may not
 
 
@@ -26,6 +28,7 @@ class _Repair(NamedTuple):
     tab: Any
     drafts_removed: int = 0
     context_reset: bool = False
+    cas_reset: bool = False
 
 
 def _valid(adapter: TypeAdapter[Any], value: Any, extra: _Extra) -> bool:
@@ -37,9 +40,10 @@ def _valid(adapter: TypeAdapter[Any], value: Any, extra: _Extra) -> bool:
 
 
 def _repair_tab(tab: Any, extra: _Extra) -> _Repair:
-    """The tab without what is wrong in its saved parameter drafts and query context, which are conveniences: a draft
-    with a name or a size the model refuses is removed (and the drafts beyond the limit), and a context it refuses
-    goes back to the profile's default. Everything else, the SQL buffer first, stays as it was."""
+    """The tab without what is wrong in its saved parameter drafts, query context and document CAS, which are
+    conveniences: a draft with a name or a size the model refuses is removed (and the drafts beyond the limit), a
+    context it refuses goes back to the profile's default, and a CAS it refuses is forgotten (the document tab then
+    reads as a new document). Everything else, the buffer first, stays as it was."""
     if not isinstance(tab, dict):
         return _Repair(tab)
     repaired, removed, reset = tab, 0, False
@@ -54,7 +58,10 @@ def _repair_tab(tab: Any, extra: _Extra) -> _Repair:
             repaired = {**repaired, "params": kept or None}
     if tab.get("query_context") is not None and not _valid(_CONTEXT, tab["query_context"], extra):
         repaired, reset = {**repaired, "query_context": None}, True
-    return _Repair(repaired, removed, reset)
+    cas_reset = tab.get("document_cas") is not None and not _valid(_CAS, tab["document_cas"], extra)
+    if cas_reset:
+        repaired = {**repaired, "document_cas": None}
+    return _Repair(repaired, removed, reset, cas_reset)
 
 
 def _repaired_tabs(raw: Any, where: str, extra: _Extra) -> Any:
@@ -66,10 +73,11 @@ def _repaired_tabs(raw: Any, where: str, extra: _Extra) -> Any:
     repaired = []
     for index, tab in enumerate(tabs):
         result = _repair_tab(tab, extra)
-        if result.drafts_removed or result.context_reset:
+        if result.drafts_removed or result.context_reset or result.cas_reset:
             logger.warning("Repaired tab {} of the {}: {}", index, where, " and ".join(
                 part for part in (f"removed {result.drafts_removed} parameter draft(s)" if result.drafts_removed else "",
-                                  "reset the query context" if result.context_reset else "") if part))
+                                  "reset the query context" if result.context_reset else "",
+                                  "reset the document CAS" if result.cas_reset else "") if part))
         repaired.append(result.tab)
     return {**raw, "tabs": repaired}
 

@@ -50,6 +50,34 @@ def entry(profile_id, database, name="cb"):
                         started_at=datetime.now(UTC), elapsed_ms=1, rows=1, status="ok")
 
 
+def test_statement_keyspace_answers_the_collection_a_statement_reads_or_null(app):  # ruling C44, no cluster needed
+    client, _ = app
+
+    def ask(sql, context=None):
+        body = {"sql": sql, **({"query_context": context} if context else {})}
+        response = client.post("/couchbase/statement-keyspace", json=body, headers=AUTH)
+        assert response.status_code == 200
+        return response.json()
+
+    users = {"bucket": "dbaguy", "scope": "app", "collection": "users"}
+    travel = {"bucket": "travel-sample", "scope": "inventory"}
+    assert ask("SELECT META(d).id, * FROM dbaguy.app.users AS d", travel) == users  # not the tab's context
+    assert ask("SELECT * FROM users", {"bucket": "dbaguy", "scope": "app"}) == users
+    assert ask("SELECT * FROM app.users", {"bucket": "dbaguy"}) == users
+    assert ask("SELECT * FROM users u JOIN orders o ON o.uid = u.id", travel) is None  # two keyspaces
+    assert ask("SELECT * FROM users") == {"bucket": "users", "scope": "_default", "collection": "_default"}
+    assert ask("SELECT 1") is None
+
+
+@pytest.mark.parametrize("body", [
+    {"sql": ""}, {"sql": "x" * (1 << 20) + "y"}, {"sql": "SELECT 1", "query_context": {"bucket": ""}},
+    {"sql": "SELECT 1", "profile_id": "x"}, {},
+])
+def test_statement_keyspace_bounds_its_inputs(app, body):
+    client, _ = app
+    assert client.post("/couchbase/statement-keyspace", json=body, headers=AUTH).status_code == 422
+
+
 @requires_couchbase
 def test_contexts_list_buckets_and_scopes_with_their_texts(app, cb):
     client, _ = app

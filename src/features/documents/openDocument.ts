@@ -1,5 +1,7 @@
 import { create } from "zustand";
-import type { ColumnMeta, Keyspace } from "@/lib/api/types";
+import { ApiError } from "@/lib/api/client";
+import type { ColumnMeta, Keyspace, QueryContext } from "@/lib/api/types";
+import { statementKeyspace } from "./documentApi";
 
 /** What asks for the "Open document" dialog: where it opens, and what it starts with. */
 export interface OpenDocumentRequest {
@@ -47,4 +49,29 @@ export function idPrefill(columns: readonly ColumnMeta[], row: readonly unknown[
   if (typeof id === "string") return id;
   const clicked = row[col];
   return typeof clicked === "string" ? clicked : "";
+}
+
+/** What a run's context tells of the collection: its bucket and scope (nothing without a context). */
+function contextKeyspace(queryContext: QueryContext | null | undefined): Partial<Keyspace> {
+  if (!queryContext) return {};
+  return queryContext.scope ? { bucket: queryContext.bucket, scope: queryContext.scope } : { bucket: queryContext.bucket };
+}
+
+/**
+ * Where a grid's "Open document…" starts (ruling C44): the collection the executed statement names when it names
+ * exactly one, as the backend reads it under the run's context; otherwise the run's context (the dialog then fills the
+ * collection with the one opened last). A statement that reads other collections than the tab's context says is why the
+ * statement comes first. The lookup never stops the dialog: when it fails, the context is what is used.
+ */
+export async function prefillKeyspace(
+  sql: string,
+  queryContext: QueryContext | null | undefined,
+): Promise<Partial<Keyspace>> {
+  try {
+    const named = await statementKeyspace(sql, queryContext);
+    if (named) return named;
+  } catch (error) {
+    console.warn("Could not read the keyspace of a statement", error instanceof ApiError ? error.code : error);
+  }
+  return contextKeyspace(queryContext);
 }

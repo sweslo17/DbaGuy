@@ -12,6 +12,8 @@ from .metadata import PathSegment
 ParamName = Annotated[str, Field(pattern=rf"^\$(?:{PARAM_NAME}|[1-9][0-9]{{0,2}})$")]
 ParamDraft = Annotated[str, Field(max_length=1_048_576)]
 MAX_PARAM_DRAFTS = 400
+# The CAS a document tab's unsaved text is based on: decimal text, like the API's (a CAS is beyond 2^53)
+DocumentCas = Annotated[str, Field(pattern=CAS_PATTERN)]
 # None follows the profile's default context, "none" is the user's explicit No context (B14)
 TabQueryContext = QueryContext | Literal["none"]
 
@@ -40,7 +42,7 @@ class WorkspaceTab(BaseModel):
     query_context: TabQueryContext | None = None  # Couchbase
     params: dict[ParamName, ParamDraft] | None = Field(default=None, max_length=MAX_PARAM_DRAFTS)
     # Couchbase document tab: the CAS its unsaved `buffer` is based on (decimal text); None for a new document
-    document_cas: str | None = Field(default=None, pattern=CAS_PATTERN)
+    document_cas: DocumentCas | None = None
 
 
 class WorkspaceState(BaseModel):
