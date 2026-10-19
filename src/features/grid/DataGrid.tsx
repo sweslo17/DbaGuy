@@ -21,12 +21,14 @@ import { cn } from "@/lib/cn";
 import { aggregate } from "./aggregate";
 import { columnSignature, HEADER_HEIGHT, ROW_HEIGHT } from "./columns";
 import { copyDefault, copyFormatsFor, copySelection, type CopyFormat, type CopyInput } from "./copy";
-import { GridDrawerPanel, type GridDrawer } from "./GridDrawer";
+import { InlineEditorSlot, type GridEditing } from "./EditorSlot";
+import { DrawerPanel, GridDrawerPanel, type GridDrawer } from "./GridDrawer";
 import { GridHeader, type GridSort } from "./GridHeader";
 import { GridMenu } from "./GridMenu";
 import { GridRow } from "./GridRow";
 import { hitTest, useGridGeometry, viewportPoint } from "./hitTest";
 import { useColumnLayout, useColumnStrip } from "./layout";
+import { rowLabel } from "./marks";
 import { cellCount, move, selectCell, type CellPos, type GridSelection, type Rect } from "./selection";
 import { StatusBar } from "./StatusBar";
 import { gridKeyDown, usePointerSelection, useSelectionState } from "./useSelection";
@@ -37,6 +39,8 @@ export interface DataGridHandle {
    * that axis alone.
    */
   scrollToCell(row: number, col: number): void;
+  /** Makes the cell the active (and only selected) cell and shows it. */
+  selectCell(row: number, col: number): void;
   focus(): void;
   /** Where the grid is; null before it is laid out. */
   view(): GridView | null;
@@ -96,6 +100,8 @@ export interface DataGridProps {
    * export outlives a remounting grid.
    */
   onExport?: () => void;
+  /** An editing table's marks and editing (spec ⑤ §3.6); absent: a read-only grid, as every query tab's is. */
+  edits?: GridEditing;
   ref?: Ref<DataGridHandle>;
 }
 
@@ -147,7 +153,10 @@ function LoadMoreFooter({ rowCount, hasMore, loading, onLoadMore }: LoadMoreFoot
  */
 export function DataGrid(props: DataGridProps) {
   const { columns, rows, hasMore, sort, onHeaderClick, stale = false, ref } = props;
-  const { dialect, tableName, onSortBy, extraCellMenu, onSelectionChange, onExport, partial = false } = props;
+  const { dialect, tableName, onSortBy, extraCellMenu, onSelectionChange, onExport, partial = false, edits } = props;
+  /** Only an editable table's grid edits; one that cannot be edited now still draws the marks and offers `edits.menu`. */
+  const editing = edits?.editable ? edits : undefined;
+  const leading = edits?.leading ?? 0;
   // Stale rows are only shown: nothing is loaded for them.
   const loadingMore = props.loadingMore && !stale;
   const onLoadMore = stale ? undefined : props.onLoadMore;
@@ -159,9 +168,14 @@ export function DataGrid(props: DataGridProps) {
   const geometry = useGridGeometry(layout, rows.length, columns.length);
   const { dims, made, selection, rect, select } = useSelectionState(signature, columns.length, rows.length);
   const [drawer, setDrawer] = useState<GridDrawer>(null);
-  const [drawerWidth, setDrawerWidth] = useState(DRAWER_WIDTH);
-  /** The drawer's width while it is open; kept for the next opening when it closes. */
-  const liveDrawerWidth = useRef(DRAWER_WIDTH);
+  /**
+   * The drawer's width: a drag is kept here, not in state (a state change per pixel would re-render the grid). A drawer
+   * that opens starts as wide as the last one was, whichever it is (the value editor takes the viewer's place).
+   */
+  const drawerWidth = useRef(DRAWER_WIDTH);
+  const keepDrawerWidth = useCallback((width: number) => {
+    drawerWidth.current = width;
+  }, []);
   const footer = hasMore || loadingMore || rows.length === 0;
 
   const rowVirtualizer = useVirtualizer({
@@ -217,10 +231,11 @@ export function DataGrid(props: DataGridProps) {
   const lastRendered = virtualRows.length > 0 ? virtualRows[virtualRows.length - 1].index : -1;
   useEffect(() => {
     if (!hasMore || loadingMore || !onLoadMore || lastRendered < rows.length - LOAD_AHEAD) return;
-    if (requestedAt.current === rows.length) return;
-    requestedAt.current = rows.length;
+    // Counted over the loaded rows: a new row staged on top is not a page that came in.
+    if (requestedAt.current === rows.length - leading) return;
+    requestedAt.current = rows.length - leading;
     onLoadMore();
-  }, [hasMore, loadingMore, onLoadMore, lastRendered, rows.length]);
+  }, [hasMore, loadingMore, onLoadMore, lastRendered, rows.length, leading]);
 
   const scrollToCell = useCallback(
     (row: number, col: number) => {
@@ -236,6 +251,13 @@ export function DataGrid(props: DataGridProps) {
     [rowVirtualizer, columnVirtualizer, layout.pinnedCount, layout.fixedWidth],
   );
   const focusGrid = useCallback(() => rootRef.current?.focus({ preventScroll: true }), []);
+  const selectAndShow = useCallback(
+    (row: number, col: number) => {
+      select(selectCell({ row, col }));
+      scrollToCell(row, col);
+    },
+    [select, scrollToCell],
+  );
   const view = useCallback((): GridView | null => {
     const el = scrollRef.current;
     if (!el) return null;
@@ -254,8 +276,9 @@ export function DataGrid(props: DataGridProps) {
     },
     [select],
   );
-  useImperativeHandle(ref, () => ({ scrollToCell, focus: focusGrid, view, restore }), [
+  useImperativeHandle(ref, () => ({ scrollToCell, selectCell: selectAndShow, focus: focusGrid, view, restore }), [
     scrollToCell,
+    selectAndShow,
     focusGrid,
     view,
     restore,
@@ -281,7 +304,6 @@ export function DataGrid(props: DataGridProps) {
   const openValue = () => setDrawer({ kind: "value" });
   const openRecord = () => setDrawer({ kind: "record" });
   const closeDrawer = () => {
-    setDrawerWidth(liveDrawerWidth.current);
     setDrawer(null);
     focusGrid();
   };
@@ -303,6 +325,8 @@ export function DataGrid(props: DataGridProps) {
     return el && e.target !== el ? hitTest(geometry, viewportPoint(el, e.clientX, e.clientY)) : null;
   };
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    // An editing grid's keys first (Return edits there); keys typed into its editor are the editor's.
+    if (edits && e.target === e.currentTarget && edits.onKey(e, selection, rect)) return;
     gridKeyDown(e, {
       scrollRef,
       geometry,
@@ -335,11 +359,13 @@ export function DataGrid(props: DataGridProps) {
     emitSelection();
   }, [selection, top, left, bottom, right]);
   // Status-bar figures, only when the rect changes. `rows` is left out of the deps on purpose: pages are only
-  // appended, so its length stands for it.
+  // appended, so its length stands for it. Staged values replace cells in place (the length stays): the marks, which
+  // are new whenever the rows drawn change, stand for that.
+  const marks = edits?.marks;
   const aggregates = useMemo(() => {
     const area = { top, left, bottom, right };
     return top >= 0 && cellCount(area) > 1 ? aggregate(area, rows, columns) : null;
-  }, [top, left, bottom, right, rows.length, columns]);
+  }, [top, left, bottom, right, rows.length, columns, marks]);
 
   const focus = selection?.focus;
   return (
@@ -369,6 +395,8 @@ export function DataGrid(props: DataGridProps) {
                 copyDefault={copyDefaultSelection}
                 copy={copy}
                 copyFormats={copyFormatsFor(dialect)}
+                editItems={edits?.menu}
+                returnEdits={!!editing}
                 pin={layout.pin}
                 openValue={openAt(openValue)}
                 openRecord={openAt(openRecord)}
@@ -387,6 +415,10 @@ export function DataGrid(props: DataGridProps) {
                   onPointerUp={pointer.onPointerUp}
                   onPointerCancel={pointer.onPointerCancel}
                   onLostPointerCapture={pointer.onLostPointerCapture}
+                  onDoubleClick={(e) => {
+                    const hit = editing ? menuHit(e) : null;
+                    if (hit?.kind === "cell") editing?.onEdit({ row: hit.row, col: hit.col });
+                  }}
                 >
                   <div
                     className="relative isolate"
@@ -400,9 +432,11 @@ export function DataGrid(props: DataGridProps) {
                       onAutofit={layout.autofit}
                       selLeft={left}
                       selRight={right}
+                      marks={edits?.headerMarks}
                     />
                     {virtualRows.map((item) => {
                       const touched = item.index >= top && item.index <= bottom;
+                      const mark = edits?.marks[item.index];
                       return (
                         <GridRow
                           key={item.index}
@@ -414,9 +448,19 @@ export function DataGrid(props: DataGridProps) {
                           selRight={touched ? right : -1}
                           focusCol={focus?.row === item.index ? focus.col : -1}
                           focusId={focusId}
+                          label={rowLabel(mark, item.index, leading)}
+                          mark={mark}
                         />
                       );
                     })}
+                    {editing?.editor?.mode === "inline" && (
+                      <InlineEditorSlot
+                        editor={editing.editor}
+                        layout={layout}
+                        geometry={geometry}
+                        totalWidth={strip.totalWidth}
+                      />
+                    )}
                     {footer && (
                       <div
                         className="absolute left-0 flex"
@@ -451,25 +495,30 @@ export function DataGrid(props: DataGridProps) {
               <div className="pointer-events-none absolute inset-0 z-10 hidden border border-accent group-focus-visible/grid:block" />
             </div>
           </Panel>
-          {drawer && (
-            <GridDrawerPanel
-              drawer={drawer}
-              columns={columns}
-              rows={rows}
-              hasMore={hasMore}
-              focus={focus ?? null}
-              width={drawerWidth}
-              onWidthChange={(width) => {
-                liveDrawerWidth.current = width;
-              }}
-              onMove={moveRow}
-              onClose={closeDrawer}
-            />
+          {editing?.editor?.mode === "drawer" ? (
+            // The value editor takes the drawer while it edits; the viewer or record view shows again after.
+            <DrawerPanel width={drawerWidth.current} onWidthChange={keepDrawerWidth}>
+              {editing.editor.render(drawerWidth.current)}
+            </DrawerPanel>
+          ) : (
+            drawer && (
+              <GridDrawerPanel
+                drawer={drawer}
+                columns={columns}
+                rows={rows}
+                hasMore={hasMore}
+                focus={focus ?? null}
+                width={drawerWidth.current}
+                onWidthChange={keepDrawerWidth}
+                onMove={moveRow}
+                onClose={closeDrawer}
+              />
+            )
           )}
         </Group>
       </div>
       <StatusBar
-        rowCount={rows.length}
+        rowCount={rows.length - leading}
         columnCount={columns.length}
         hasMore={hasMore}
         partial={partial}

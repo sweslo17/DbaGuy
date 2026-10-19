@@ -4,6 +4,8 @@ import { describeCell } from "@/lib/cells";
 import { cn } from "@/lib/cn";
 import { ROW_HEIGHT } from "./columns";
 import { columnClass, columnStyle, SELECTED_CLASS, type ColumnStrip, type DrawnColumn } from "./layout";
+import { cellBackground, cellTitle, PROBLEM_CELL, rowTint, rowTitle, type CellMark, type RowMark } from "./marks";
+import { countRowRender } from "./renderCount";
 
 /** A cell shows one line, so characters beyond this never fit and are not laid out. */
 const CELL_CHARS = 1000;
@@ -19,14 +21,19 @@ interface GridCellProps extends DrawnColumn {
   selected: boolean;
   /** Set on the active cell only (the grid's `aria-activedescendant`). */
   id?: string;
+  /** The cell's staged change, if any (an object kept while it does not change). */
+  mark?: CellMark;
+  /** The row's tint (a new row, a row marked for deletion, a row that cannot be edited), if any. */
+  tint?: string;
 }
 
 /**
- * Memoized on primitives, so a row re-rendered for a horizontal scroll or a selection change only renders the cells
- * that came into view or changed state.
+ * Memoized on primitives (and on its mark, an object kept while unchanged), so a row re-rendered for a horizontal
+ * scroll or a selection change only renders the cells that came into view or changed state.
  */
-const GridCell = memo(function GridCell({ value, category, selected, id, ...column }: GridCellProps) {
+const GridCell = memo(function GridCell({ value, category, selected, id, mark, tint, ...column }: GridCellProps) {
   const cell = describeCell(value, category, CELL_CHARS);
+  const isDefault = mark?.isDefault === true;
   return (
     <div
       id={id}
@@ -36,18 +43,32 @@ const GridCell = memo(function GridCell({ value, category, selected, id, ...colu
       className={cn(
         CELL,
         columnClass(column),
-        column.left !== undefined && "bg-bg",
+        cellBackground(mark, tint, column.left !== undefined),
         selected && SELECTED_CLASS,
+        mark?.problem && !id && PROBLEM_CELL,
         id && FOCUSED,
-        cell.alignRight && "justify-end",
+        mark?.conflict && column.left === undefined && "relative",
+        cell.alignRight && !isDefault && "justify-end",
       )}
       style={columnStyle(column)}
-      title={cell.title}
+      title={cellTitle(cell.title, mark)}
     >
-      <span className={cn("truncate", (cell.kind === "null" || cell.kind === "missing") && "italic text-muted")}>
-        {cell.text}
-      </span>
-      {cell.detail && <span className="shrink-0 whitespace-pre text-muted">{cell.detail}</span>}
+      {isDefault ? (
+        <span className="truncate text-muted italic">DEFAULT</span>
+      ) : (
+        <>
+          <span className={cn("truncate", (cell.kind === "null" || cell.kind === "missing") && "italic text-muted")}>
+            {cell.text}
+          </span>
+          {cell.detail && <span className="shrink-0 whitespace-pre text-muted">{cell.detail}</span>}
+        </>
+      )}
+      {mark?.conflict && (
+        <span
+          aria-hidden
+          className="absolute top-0 right-0 border-t-[6px] border-l-[6px] border-t-danger border-l-transparent"
+        />
+      )}
     </div>
   );
 });
@@ -67,11 +88,17 @@ interface GridRowProps {
   focusCol: number;
   /** Element id of the active cell. */
   focusId: string;
+  /** What the row-number column shows: the row's number, `+` (a new row) or `−` (marked for deletion). */
+  label: string;
+  /** The row's staged change, if any (an object kept while it does not change). */
+  mark?: RowMark;
 }
 
 /** One body row: the fixed row number, then the strip's columns. */
 export const GridRow = memo(function GridRow(props: GridRowProps) {
-  const { index, row, top, strip, selLeft, selRight, focusCol, focusId } = props;
+  const { index, row, top, strip, selLeft, selRight, focusCol, focusId, label, mark } = props;
+  countRowRender(index);
+  const tint = rowTint(mark);
   return (
     <div
       role="row"
@@ -84,12 +111,14 @@ export const GridRow = memo(function GridRow(props: GridRowProps) {
         aria-colindex={1}
         className={cn(
           CELL,
-          "sticky left-0 z-20 justify-end border-r bg-panel text-muted",
+          "sticky left-0 z-20 justify-end border-r bg-panel",
+          mark?.problem ? "font-semibold text-danger" : "text-muted",
           selLeft >= 0 && SELECTED_CLASS,
         )}
         style={{ width: strip.rowNumberWidth }}
+        title={rowTitle(mark)}
       >
-        {index + 1}
+        {label}
       </div>
       {strip.drawn.map((column) => (
         <GridCell
@@ -99,6 +128,8 @@ export const GridRow = memo(function GridRow(props: GridRowProps) {
           category={strip.columns[column.col].category}
           selected={column.col >= selLeft && column.col <= selRight}
           id={column.col === focusCol ? focusId : undefined}
+          mark={mark?.cells?.[column.col]}
+          tint={tint}
         />
       ))}
     </div>

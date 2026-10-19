@@ -131,10 +131,10 @@ export interface Overlay {
 
 const NO_MARKS: readonly (RowMark | undefined)[] = [];
 
-/** Every row whose key another loaded row has too: one object, so the rows it is passed to stay memoized (Q1). */
-export const REPEATED_KEY_MARK: RowMark = { kind: "repeated_key" };
-/** Why such a row cannot be edited (the editor's refusal, a tooltip). */
+/** Why such a row cannot be edited (the editor's refusal, and the note the grid shows on the row). */
 export const REPEATED_KEY = "Another row in the result has the same key: this row cannot be edited here";
+/** Every row whose key another loaded row has too: one object, so the rows it is passed to stay memoized (Q1). */
+export const REPEATED_KEY_MARK: RowMark = { kind: "repeated_key", note: REPEATED_KEY };
 
 export interface OverlayInput {
   readonly rows: unknown[][];
