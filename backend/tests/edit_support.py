@@ -95,7 +95,14 @@ class ScratchDb(ABC):
                 PathSegment(kind=kind, name=name)]
 
     def drop(self, kind: str, name: str) -> None:
+        assert name.startswith(SCRATCH_PREFIX), f"{name!r} is not a scratch object: never dropped by these helpers"
         self.execute(f"DROP {kind} IF EXISTS {self.table(name)}")
+
+    def exists(self, name: str) -> bool:
+        """Whether the catalog lists a table or view of that bare name in `schema` (checked through the driver)."""
+        found = self.rows("SELECT COUNT(*) FROM information_schema.TABLES "
+                          f"WHERE TABLE_SCHEMA = {self.literal(self.schema)} AND TABLE_NAME = {self.literal(name)}")
+        return found[0][0] > 0
 
     def literal(self, value: Any) -> str:
         """A plain literal for set-up SQL (ASCII text, numbers, NULL only)."""
@@ -138,8 +145,10 @@ class PgScratch(ScratchDb):
             conn.execute(sql)
             yield
         finally:
-            conn.rollback()
-            conn.close()
+            try:
+                conn.rollback()
+            finally:
+                conn.close()
 
     def fill(self, table: str, count: int, start: int) -> None:
         self.execute(f"INSERT INTO {table} (id, label, {self.q('order')}) "
@@ -199,8 +208,10 @@ class MysqlScratch(ScratchDb):
             cursor.close()
             yield
         finally:
-            conn.rollback()
-            conn.close()
+            try:
+                conn.rollback()
+            finally:
+                conn.close()
 
     def fill(self, table: str, count: int, start: int) -> None:
         self.execute(
@@ -211,9 +222,14 @@ class MysqlScratch(ScratchDb):
         )
 
     def waiting(self, table: str) -> bool:
+        """MySQL shows a row-lock wait as a plain running UPDATE (State `updating`) and the dev login may not see
+        InnoDB's lock tables, so a statement counts as waiting once it has been running more than a second: TIME is
+        whole seconds on the wall clock, so `TIME >= 2` is never reached by a statement shorter than a second (`>= 1`
+        is, 0.4 s measured), and an UPDATE of the table that is merely slow (2 s or more) counts too. A lock wait is
+        therefore seen 1 to 2 s after it starts."""
         # `_` in a LIKE pattern is a wildcard, which only widens the match: the name is unique
         found = self.rows("SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID() "
-                          f"AND COMMAND = 'Query' AND INFO LIKE {self.literal(f'UPDATE %{table}%')}")
+                          f"AND COMMAND = 'Query' AND TIME >= 2 AND INFO LIKE {self.literal(f'UPDATE %{table}%')}")
         return found[0][0] > 0
 
     def close(self) -> None:
@@ -259,8 +275,10 @@ class MssqlScratch(ScratchDb):
             conn.execute_non_query(f"BEGIN TRANSACTION; {sql}")
             yield
         finally:
-            conn.execute_non_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
-            conn.close()
+            try:
+                conn.execute_non_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
+            finally:
+                conn.close()
 
     def fill(self, table: str, count: int, start: int) -> None:
         self.execute(
@@ -280,10 +298,12 @@ class MssqlScratch(ScratchDb):
         return found[0][0] > 0
 
     def close(self) -> None:
-        if self._sa is not None:
-            self._sa.close()
+        try:
+            if self._sa is not None:
+                self._sa.close()
+        finally:
             self._sa = None
-        self._conn.close()
+            self._conn.close()
 
 
 class SqliteScratch(ScratchDb):
@@ -301,6 +321,9 @@ class SqliteScratch(ScratchDb):
     def rows(self, sql: str) -> list[tuple]:
         return [tuple(row) for row in self._conn.execute(sql).fetchall()]
 
+    def exists(self, name: str) -> bool:
+        return self.rows(f"SELECT COUNT(*) FROM sqlite_master WHERE name = {self.literal(name)}")[0][0] > 0
+
     def profile(self, **fields: Any) -> dict:
         return {"profile": {"engine": "sqlite", "name": "sqlite edits", "path": str(self.file), **fields}}
 
@@ -316,8 +339,10 @@ class SqliteScratch(ScratchDb):
             conn.execute(sql)
             yield
         finally:
-            conn.execute("ROLLBACK")
-            conn.close()
+            try:
+                conn.execute("ROLLBACK")
+            finally:
+                conn.close()
 
     def fill(self, table: str, count: int, start: int) -> None:
         self.execute(f"WITH RECURSIVE s (n) AS (SELECT {start} UNION ALL SELECT n + 1 FROM s WHERE n < "
