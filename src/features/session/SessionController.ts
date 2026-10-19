@@ -377,7 +377,8 @@ export class SessionController {
   }
 
   private track(kind: ExecutionKind, sql: string, command: ClientCommand, request: RequestOptions = {}): string {
-    const execution = newExecution(command.request_id, kind, sql, request);
+    const profilePlan = command.type === "execute" && command.profile_plan;
+    const execution = newExecution(command.request_id, kind, sql, request, profilePlan);
     const sent = this.send(command);
     this.putExecution(sent ? execution : { ...execution, status: "done", error: NOT_CONNECTED });
     return command.request_id;

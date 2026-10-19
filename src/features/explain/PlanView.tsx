@@ -3,7 +3,7 @@ import { Info, Lightbulb, Loader2, TriangleAlert } from "lucide-react";
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/Button";
 import { CopyButton } from "@/components/ui/CopyButton";
-import type { IndexAdvice, PlanNode, PlanView as PlanViewData } from "@/lib/api/types";
+import type { IndexAdvice, PlanFinding, PlanNode, PlanView as PlanViewData } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import {
   BADGE_LABELS,
@@ -11,6 +11,7 @@ import {
   badgeNotes,
   estimateRows,
   estimateText,
+  findingsByNode,
   planRows,
   statRows,
   statsText,
@@ -39,6 +40,12 @@ const FIRST_FRAME_HEIGHT = 480;
 const INDENT = 14;
 const MAX_INDENT_LEVELS = 30;
 const STATEMENT_TOOLTIP_CHARS = 2000;
+/**
+ * The findings listed above the tree, at most: a plan of thousands of operators may have a finding for each, and the
+ * list is not virtualised. An operator's own findings are in its details, whatever the list shows.
+ */
+const MAX_FINDINGS_SHOWN = 100;
+const NO_FINDINGS: readonly PlanFinding[] = [];
 
 const KIND_LABELS: Record<PlanViewData["kind"], string> = {
   plan: "Plan",
@@ -216,12 +223,24 @@ function DetailSection({ title, rows }: { title: string; rows: [string, string][
   );
 }
 
-/** All the plan says of the selected operator: its details, estimates and statistics. */
-function NodeDetails({ node }: { node: PlanNode | null }) {
+/** A finding's marker: the warning colour for a warning, muted for a note. */
+function FindingMarker({ severity }: { severity: PlanFinding["severity"] }) {
+  return severity === "warning" ? (
+    <TriangleAlert size={13} className="mt-px shrink-0 text-warning" aria-label="Warning" />
+  ) : (
+    <Info size={13} className="mt-px shrink-0 text-muted" aria-label="Note" />
+  );
+}
+
+/**
+ * All the plan says of the selected operator: its findings, details, estimates and statistics. `findings` are its own,
+ * so every finding can be read here even when the list above the tree stops short.
+ */
+export function NodeDetails({ node, findings }: { node: PlanNode | null; findings: readonly PlanFinding[] }) {
   const details = node?.details.map((detail): [string, string] => [detail.label, detail.value]) ?? [];
   const estimates = estimateRows(node?.estimates);
   const stats = statRows(node?.stats);
-  const empty = details.length + estimates.length + stats.length === 0;
+  const empty = findings.length + details.length + estimates.length + stats.length === 0;
   return (
     <aside
       aria-label="Operator details"
@@ -235,6 +254,19 @@ function NodeDetails({ node }: { node: PlanNode | null }) {
           <h3 className="font-medium break-words">{node.title}</h3>
           {node.operator !== node.title && <p className="text-muted">{node.operator}</p>}
           {empty && <p className="mt-3 text-muted">This operator has no details</p>}
+          {findings.length > 0 && (
+            <section className="mt-3">
+              <h4 className="mb-1 text-[11px] font-medium tracking-wide text-muted uppercase">Findings</h4>
+              <ul className="flex flex-col gap-1">
+                {findings.map((finding, index) => (
+                  <li key={index} className="flex items-start gap-2">
+                    <FindingMarker severity={finding.severity} />
+                    <span className="min-w-0 break-words">{finding.text}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
           <DetailSection title="Details" rows={details} />
           <DetailSection title="Estimates" rows={estimates} />
           <DetailSection title="Statistics" rows={stats} />
@@ -244,12 +276,16 @@ function NodeDetails({ node }: { node: PlanNode | null }) {
   );
 }
 
-/** The warnings and notes the analysis found; a click shows the operator they are about. */
+/**
+ * The warnings and notes the analysis found; a click shows the operator they are about. At most `MAX_FINDINGS_SHOWN`
+ * are listed, then a line says how many more there are.
+ */
 function Findings({ findings, onSelect }: { findings: PlanViewData["findings"]; onSelect: (id: number) => void }) {
   if (findings.length === 0) return null;
+  const hidden = findings.length - MAX_FINDINGS_SHOWN;
   return (
     <ul className="flex flex-col px-1 pb-1">
-      {findings.map((finding, index) => (
+      {findings.slice(0, MAX_FINDINGS_SHOWN).map((finding, index) => (
         <li key={index}>
           <button
             type="button"
@@ -257,15 +293,16 @@ function Findings({ findings, onSelect }: { findings: PlanViewData["findings"]; 
             onClick={() => onSelect(finding.node_id)}
             className="flex w-full items-start gap-2 rounded px-2 py-1 text-left text-[12px] outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-accent/50"
           >
-            {finding.severity === "warning" ? (
-              <TriangleAlert size={13} className="mt-px shrink-0 text-warning" aria-label="Warning" />
-            ) : (
-              <Info size={13} className="mt-px shrink-0 text-muted" aria-label="Note" />
-            )}
+            <FindingMarker severity={finding.severity} />
             <span className="min-w-0 break-words">{finding.text}</span>
           </button>
         </li>
       ))}
+      {hidden > 0 && (
+        <li className="px-2 py-1 text-[12px] text-muted">
+          {`… and ${hidden.toLocaleString("en-US")} more ${hidden === 1 ? "finding" : "findings"} (select an operator to see its own)`}
+        </li>
+      )}
     </ul>
   );
 }
@@ -374,6 +411,7 @@ function Header({ view, advice }: { view: PlanViewData; advice?: AdviceControl }
 function PlanBody({ view, advice }: { view: PlanViewData; advice?: AdviceControl }) {
   const model = useMemo(() => planRows(view), [view]);
   const notes = useMemo(() => badgeNotes(view.findings), [view]);
+  const findings = useMemo(() => findingsByNode(view.findings), [view]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [reveal, setReveal] = useState<{ id: number } | null>(null);
   const select = useCallback((id: number) => setSelectedId(id), []);
@@ -397,7 +435,7 @@ function PlanBody({ view, advice }: { view: PlanViewData; advice?: AdviceControl
       {hasTree && (
         <div className="flex min-h-0 flex-1">
           <TreeList model={model} notes={notes} selectedId={selectedId} reveal={reveal} onSelect={select} />
-          <NodeDetails node={selected} />
+          <NodeDetails node={selected} findings={(selected && findings.get(selected.id)) || NO_FINDINGS} />
         </div>
       )}
     </div>

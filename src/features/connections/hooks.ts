@@ -13,9 +13,11 @@ export function useProfiles() {
   return useQuery({ queryKey: profilesKey, queryFn: fetchProfiles });
 }
 
+export const enginesKey = ["engines"] as const;
+
 export function useEngines() {
   return useQuery({
-    queryKey: ["engines"],
+    queryKey: enginesKey,
     queryFn: async () => unwrap(await (await api()).GET("/system/engines")),
     staleTime: Infinity,
   });

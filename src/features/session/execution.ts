@@ -38,6 +38,8 @@ export interface ExecutionState {
   sql: string;
   /** What the request was sent with: an export of its result (run again) takes the same context and parameters. */
   request: RequestOptions;
+  /** The request asked for the execution profile (Run with profile): a result set of the plan presentation is it. */
+  profilePlan: boolean;
   status: "running" | "paused" | "done";
   resultSets: ResultSetState[];
   affected: { index: number; rows: number }[];
@@ -69,12 +71,14 @@ export function newExecution(
   kind: ExecutionKind,
   sql: string,
   request: RequestOptions = {},
+  profilePlan = false,
 ): ExecutionState {
   return {
     requestId,
     kind,
     sql,
     request,
+    profilePlan,
     status: "running",
     resultSets: [],
     affected: [],

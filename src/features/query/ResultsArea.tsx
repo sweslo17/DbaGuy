@@ -2,6 +2,7 @@ import { useCallback, useMemo, useState } from "react";
 import type { Dialect } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { PlanResult } from "../explain/PlanResult";
+import { planSetLabel } from "../explain/planModel";
 import { sameElements, useHeldResult } from "../grid/useHeldResult";
 import type { ExecutionState, ResultSetState } from "../session/execution";
 import type { RequestOptions, SessionController, SessionPhase } from "../session/SessionController";
@@ -24,10 +25,6 @@ interface ResultTab {
   set: ResultSetState;
 }
 
-/** The tab labels of a plan set: the plan of the statement itself, or the profile that follows its rows. */
-const PLAN_LABEL = "Plan";
-const PROFILE_LABEL = "Profile";
-
 /** The statement's first 30 characters (code points, so an emoji is never cut in half), whitespace collapsed. */
 function statementTitle(sql: string): string {
   const chars = Array.from(sql.replace(/\s+/g, " ").trim());
@@ -42,17 +39,16 @@ const NO_TABS: ResultTab[] = [];
  */
 const tabsOfExecution = new WeakMap<ExecutionState, ResultTab[]>();
 
-/** A plan set is the statement's own result when it is the first (EXPLAIN), else the profile of its rows. */
-const planLabel = (ordinal: number) => (ordinal === 0 ? PLAN_LABEL : PROFILE_LABEL);
-
 function executionTabs(step: RunStep, stepIndex: number, execution: ExecutionState): ResultTab[] {
   if (!execution.resultSets.length) return NO_TABS;
   let tabs = tabsOfExecution.get(execution);
   if (!tabs) {
     const title = statementTitle(step.statement.sql);
+    const labelOf = (set: ResultSetState, ordinal: number) =>
+      set.presentation === "plan" ? planSetLabel(execution, ordinal) : ordinal === 0 ? title : `Result ${ordinal + 1}`;
     tabs = execution.resultSets.map((set, ordinal) => ({
       key: `${stepIndex}:${set.index}`,
-      label: set.presentation === "plan" ? planLabel(ordinal) : ordinal === 0 ? title : `Result ${ordinal + 1}`,
+      label: labelOf(set, ordinal),
       statementSql: step.statement.sql,
       execution,
       set,
@@ -95,7 +91,7 @@ export interface ResultsAreaProps extends Omit<RunMessagesProps, "run"> {
  * shown and then stays mounted while another tab is shown, so its scroll and widths survive switching (the export
  * dialog belongs to the query tab). Without a choice by the user, the first result is shown, or Messages once a statement failed.
  * A set of the `plan` presentation (Couchbase's EXPLAIN, ADVISE and execution profile) is drawn as a plan, with the
- * grid a switch away; it is labelled Plan, or Profile when it follows the rows of a statement.
+ * grid a switch away; it is labelled Plan, or Profile when it is the execution profile a run asked for.
  */
 export function ResultsArea({
   run,

@@ -14,7 +14,7 @@ import { closePalette, usePalette } from "./paletteStore";
 import { PaletteInput, PaletteItem, PaletteList, PaletteRoot, type Choose } from "./parts";
 import { QuickOpen } from "./QuickOpen";
 
-/** ⌘⇧P (spec §4.10): the commands, those that cannot run now greyed out. */
+/** ⌘⇧P (spec §4.10): the commands, those that cannot run now greyed out, those the engine lacks left out. */
 function CommandList({ choose }: { choose: Choose }) {
   const queryClient = useQueryClient();
   const settings = useAppSettings();
@@ -36,7 +36,7 @@ function CommandList({ choose }: { choose: Choose }) {
         hint={`${SHORTCUTS.quickOpen} Quick open`}
       />
       <PaletteList empty="No matching command">
-        {COMMANDS.map((command) => {
+        {COMMANDS.filter((command) => command.visible?.(context) ?? true).map((command) => {
           const checked = command.checked?.(context);
           const state = checked === undefined ? undefined : checked ? "On" : "Off";
           return (

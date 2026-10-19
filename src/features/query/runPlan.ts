@@ -1,6 +1,7 @@
 import type { EditorView } from "@codemirror/view";
 import type { Dialect, StatementParams } from "@/lib/api/types";
 import { currentStatements, rangeAt, splitText, type StatementRange } from "../editor/statements";
+import { EXPLAIN_PREFIX, isPlanRequest } from "../explain/explainText";
 import { paramsFor, type ParamProblem } from "./params";
 
 /** ⌘↵ runs by the `run.default` setting (or the selection); ⌘⇧↵ runs every statement. */
@@ -30,11 +31,6 @@ export function sentText(statement: PlannedStatement): string {
   return (statement.prefix ?? "") + statement.sql;
 }
 
-/** What Explain puts before a statement (SQL++: the plan of it comes back as a result, the statement does not run). */
-export const EXPLAIN_PREFIX = "EXPLAIN ";
-/** A statement that is an EXPLAIN or an ADVISE already: Explain sends it as it is (ruling B23). */
-const EXPLAINED = /^\s*(?:explain|advise)\b/i;
-
 /**
  * The statement as Explain sends it: after `EXPLAIN ` unless it starts with EXPLAIN or ADVISE (after whitespace), and
  * with the values the drafts give for the parameters it uses. A plan does not need the values, so a parameter without a
@@ -46,7 +42,7 @@ export function explainStatement(
 ): PlannedStatement {
   const result = paramsFor(statement.params, drafts, true);
   const values = "problem" in result ? null : result.params;
-  return { ...statement, values, prefix: EXPLAINED.test(statement.sql) ? undefined : EXPLAIN_PREFIX };
+  return { ...statement, values, prefix: isPlanRequest(statement.sql) ? undefined : EXPLAIN_PREFIX };
 }
 
 /**

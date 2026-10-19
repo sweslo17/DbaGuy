@@ -1,5 +1,7 @@
 import type { IndexAdvice, PlanFinding, PlanNode, PlanView } from "@/lib/api/types";
 import { jsonCellText, type EncodedCell } from "@/lib/cells";
+import type { ExecutionState } from "../session/execution";
+import { isPlanRequest, withoutExplain } from "./explainText";
 
 /*
  * What the plan view draws, as plain data (spec §3.10): the operator tree flattened into rows, the texts of a node's
@@ -62,6 +64,17 @@ export function planRows(view: PlanView): PlanRows {
     addTree(subquery.root, result);
   }
   return result;
+}
+
+/** The findings of each operator, by its id (an operator's details list its own). */
+export function findingsByNode(findings: readonly PlanFinding[]): Map<number, PlanFinding[]> {
+  const byNode = new Map<number, PlanFinding[]>();
+  for (const finding of findings) {
+    const own = byNode.get(finding.node_id);
+    if (own) own.push(finding);
+    else byNode.set(finding.node_id, [finding]);
+  }
+  return byNode;
 }
 
 /** What each finding says about its operator's badge: the tooltip of that badge (`${node id}:${badge}`). */
@@ -173,9 +186,24 @@ export function planSource(rows: readonly (readonly unknown[])[]): PlanSource {
 }
 
 /**
- * The statement to ask index advice for: the one the plan is of (EXPLAIN's `text`), else the one that ran, which is
- * what a profile (it carries no statement) is of.
+ * The statement to ask index advice for: the one the plan is of (EXPLAIN's `text`), else the one that ran, which is what
+ * a profile (it carries no statement) is of. What ran may be an EXPLAIN (Explain sends one, or the user typed it): its
+ * statement is what is advised, never `ADVISE EXPLAIN …`.
  */
 export function adviceStatement(view: PlanView, executed: string): string {
-  return view.statement_text?.trim() ? view.statement_text : executed;
+  return view.statement_text?.trim() ? view.statement_text : withoutExplain(executed);
+}
+
+const PLAN_LABEL = "Plan";
+const PROFILE_LABEL = "Profile";
+
+/**
+ * The tab of a plan set: `Profile` when the run asked for the execution profile and the set is that profile (it follows
+ * the rows of the statement, or is all a statement without rows has), `Plan` for the plan of an EXPLAIN. A run with
+ * profile of an EXPLAIN or ADVISE that gave one set only has the plan of the statement: no rows, no profile. `ordinal` is
+ * the set's place among the execution's sets.
+ */
+export function planSetLabel(execution: Pick<ExecutionState, "profilePlan" | "sql">, ordinal: number): string {
+  const profile = execution.profilePlan && (ordinal > 0 || !isPlanRequest(execution.sql));
+  return profile ? PROFILE_LABEL : PLAN_LABEL;
 }
