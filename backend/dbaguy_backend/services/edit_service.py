@@ -59,7 +59,7 @@ class EditService:
             plan = EditPlan(
                 plan_id=uuid4().hex, profile_id=profile_id, database=path_database(path), table=built.table,
                 begin=built.begin, statements=tuple(built.statements), commit=built.commit,
-                transactional=target.transactional, script=built.script,
+                transactional=target.transactional, script=built.script, backslash_escapes=target.backslash_escapes,
             )
             self.plans.put(plan)
             plan_id = plan.plan_id

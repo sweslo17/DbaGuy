@@ -22,7 +22,9 @@ from dbaguy_backend.services.edit_plans import EditPlanStore
 from dbaguy_backend.services.history_service import HistoryService
 from dbaguy_backend.services.profile_service import ProfileService
 from dbaguy_backend.services.safety import GuardAction, GuardDecision, SafetyPolicy
-from dbaguy_backend.sessions.edit_apply import COMMIT_LEFT_OPEN, ROLLBACK_FAILED
+from dbaguy_backend.sessions.edit_apply import (
+    COMMIT_LEFT_OPEN, ROLLBACK_FAILED, SQL_MODE_CHANGED, SQL_MODE_CHANGED_MESSAGE,
+)
 from dbaguy_backend.sessions.hooks import SessionHooksFactory
 from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks
 from dbaguy_backend.storage.paths import profiles_file
@@ -100,12 +102,13 @@ class EditFake(FakeConnection):
         return answer if isinstance(answer, Counted) else Counted(answer)
 
 
-def make_plan(*statements: tuple[str, str], transactional: bool = True, plan_id: str = "p1") -> EditPlan:
+def make_plan(*statements: tuple[str, str], transactional: bool = True, plan_id: str = "p1",
+              backslash_escapes: bool = True) -> EditPlan:
     planned = tuple(PlannedStatement(change_id=f"c{i}", kind=kind, sql=sql, row=f"id = {i}")
                     for i, (kind, sql) in enumerate(statements))
     script = "BEGIN;\n" + "".join(f"{s.sql};\n" for s in planned) + "COMMIT;"
     return EditPlan(plan_id=plan_id, profile_id=PROFILE, database=None, table="t", begin="BEGIN", statements=planned,
-                    commit="COMMIT", transactional=transactional, script=script)
+                    commit="COMMIT", transactional=transactional, script=script, backslash_escapes=backslash_escapes)
 
 
 THREE = (("delete", "d0"), ("update", "u1"), ("insert", "i2"))
@@ -308,6 +311,34 @@ def test_a_read_only_profile_and_an_open_transaction_send_nothing(env_of):  # R-
     busy.conn.tx = True
     events = busy.apply()
     assert (error(events).code, outcome(events).outcome, busy.conn.runs) == ("transaction_open", "rolled_back", [])
+
+
+class ReadsBackslashes(EditFake):
+    """A session whose last answer says how it reads a backslash (MySQL's OK packet; None: the engine does not say)."""
+
+    def __init__(self, escapes: bool | None) -> None:
+        super().__init__()
+        self.escapes = escapes
+
+    def backslash_escapes(self) -> bool | None:
+        return self.escapes
+
+
+@pytest.mark.parametrize(("session", "planned", "expected"), [
+    (False, True, "rolled_back"), (True, False, "rolled_back"), (True, True, "committed"), (False, False, "committed"),
+    (None, False, "committed"),
+])
+def test_a_session_that_reads_backslashes_unlike_the_plan_sends_no_dml(env_of, session, planned, expected):  # M2
+    env = env_of(ReadsBackslashes(session), make_plan(("update", "u0"), backslash_escapes=planned))
+    events = env.apply()
+    done = outcome(events)
+    assert done.outcome == expected
+    if expected == "rolled_back":
+        assert types(events) == ["started", "error", "edit_outcome", "session_state", "finished"]
+        assert (error(events).code, error(events).message) == (SQL_MODE_CHANGED, SQL_MODE_CHANGED_MESSAGE)
+        assert (done.applied, done.failed_change, done.statement) == ([], None, None)
+        assert (env.conn.runs, env.conn.rollbacks, env.conn.tx) == (["BEGIN"], 1, False)  # no DML went out
+        assert [record.status for record in env.records] == ["error"]
 
 
 def test_an_apply_cancelled_before_it_started_still_says_nothing_was_applied(env_of):  # ruling E1

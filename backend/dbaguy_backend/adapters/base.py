@@ -55,6 +55,9 @@ class RunOptions:
     params: StatementParams | None = None  # needs capabilities.parameters
     profile_plan: bool = False  # needs capabilities.executed_plan (04b)
     retry_safe: bool = False  # the statement was classified READ: an adapter may send it again after a stale connection
+    # False: the statement returns no result set to show (a grid commit's own texts, spec ⑤ §3.5), so an adapter may
+    # skip reading its result's column types first (SQL Server's describe: a round trip per statement, 05a review M1)
+    describe: bool = True
 
 
 @dataclass(frozen=True)
@@ -243,6 +246,12 @@ class DatabaseConnection(ABC):
     def transaction_failed(self) -> bool:
         """True when the open transaction is aborted and only accepts ROLLBACK (PostgreSQL); False otherwise."""
         return False
+
+    def backslash_escapes(self) -> bool | None:
+        """Whether the session reads a backslash in a string literal as an escape, as the answer to the last `run()`
+        said (no round trip; a grid commit checks it after its BEGIN, ⑤ D-05-13). None when the engine's answers do not
+        say (every engine but MySQL) or that answer did not (rows, an error)."""
+        return None
 
     @abstractmethod
     def autocommit(self) -> bool: ...

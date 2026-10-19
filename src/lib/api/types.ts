@@ -106,10 +106,16 @@ export type RowDelete = S["RowDelete"];
 export type EditChanges = S["EditChanges"];
 /** Grid editing (spec ⑤ §3.3.3): one cell or change the preview refuses, with a fixed message (never the value). */
 export type EditProblem = S["EditProblem"];
+/** Grid editing: why the preview refuses a cell or change ("invalid_number", "key_incomplete", "key_collision", …). */
+export type EditProblemCode = EditProblem["code"];
+/** Grid editing (spec ⑤ §3.3.3): a set column whose original value the UPDATE does not check, and why. */
+export type UncheckedColumn = S["UncheckedColumn"];
 /** Grid editing (spec ⑤ §3.4): one statement of a commit, exactly as the worker sends it, with the change it belongs to. */
 export type PlannedStatement = S["PlannedStatement"];
 /** Grid editing: something to know before committing (columns whose original is not checked, a non-transactional table). */
 export type EditWarning = S["EditWarning"];
+/** Grid editing: "unchecked_columns" (one per statement), "non_transactional" or "missing_required" (one per new row). */
+export type EditWarningCode = EditWarning["code"];
 /** Grid editing: how many updates, inserts and deletes a preview holds. */
 export type EditCounts = S["EditCounts"];
 /** Grid editing (spec ⑤ §3.4): the preview of a commit: its statements, problems, warnings and, when none, a one-time plan id. */

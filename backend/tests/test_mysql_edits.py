@@ -192,6 +192,43 @@ def test_backslashes_are_stored_as_typed_in_both_sql_modes(tmp_path, sql_mode): 
         db.close()
 
 
+@pytest.mark.parametrize(("profile_mode", "session_mode"), [
+    (None, "CONCAT(@@SESSION.sql_mode, ',NO_BACKSLASH_ESCAPES')"),
+    ("STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES", "'STRICT_TRANS_TABLES'"),
+])
+def test_a_session_whose_backslash_mode_differs_from_the_preview_sends_no_dml(tmp_path, profile_mode, session_mode):
+    # 05a review M2: the preview reads the mode on the metadata connection; the tab's session, unlike it (a GLOBAL
+    # sql_mode changed between their connects), would store C:\tmp doubled or swallowed. BEGIN's OK packet tells.
+    db = MysqlScratch()
+    app = EditApp(tmp_path)
+    try:
+        pid = app.add_profile(db.profile(options={"sql_mode": profile_mode} if profile_mode else {}))
+        typed = "C:\\tmp\\new\\"
+        with scratch(db, app.close_tabs) as make:
+            table = items_table(db, make)
+            tab = app.tab(pid, None)
+            tab.run(f"SET SESSION sql_mode = {session_mode}")
+            preview = app.preview(pid, db.path(table), updates=[update("u:1", {"id": 1}, {"label": val(typed)},
+                                                                       {"label": "a"})])
+            done = tab.apply(preview.plan_id)
+            assert (done.outcome.outcome, done.outcome.failed_change, done.outcome.statement) == (
+                "rolled_back", None, None)
+            assert (done.error.code, done.error.message) == (
+                "sql_mode_changed", "The session's sql_mode changed since the preview: preview the changes again")
+            assert done.affected == [] and not done.finished.in_transaction
+            assert db.rows(f"SELECT label FROM {db.table(table)} WHERE id = 1") == [("a",)]
+            [entry] = [entry for entry in app.history() if entry.sql == preview.script]
+            assert entry.status == "error"
+            tab.run("SET SESSION sql_mode = DEFAULT" if profile_mode is None else f"SET SESSION sql_mode = '{profile_mode}'")
+            again = app.preview(pid, db.path(table), updates=[update("u:1", {"id": 1}, {"label": val(typed)},
+                                                                     {"label": "a"})])
+            assert tab.apply(again.plan_id).outcome.outcome == "committed"  # the same mode again: as typed
+            assert db.rows(f"SELECT label FROM {db.table(table)} WHERE id = 1") == [(typed,)]
+    finally:
+        app.close()
+        db.close()
+
+
 def test_a_partial_apply_on_myisam_says_what_took_effect(my_env):  # D-05-6, Review Focus 5
     db, app, pid = my_env
     with scratch(db, app.close_tabs) as make:

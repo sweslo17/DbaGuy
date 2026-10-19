@@ -73,8 +73,8 @@ def test_a_preview_shows_the_statements_and_leaves_a_plan(client, lite):  # spec
     assert (preview["begin"], preview["commit"], preview["problems"]) == ("BEGIN IMMEDIATE", "COMMIT", [])
     assert [(s["change_id"], s["sql"]) for s in preview["statements"]] == [
         ("d:2", "DELETE FROM main.items WHERE id = 2"),
-        ("u:1", "UPDATE main.items SET label = 'A', price = 3 WHERE id = 1 AND label = 'a'"),
-        ("i:1", "INSERT INTO main.items (label) VALUES ('c')"),
+        ("u:1", "UPDATE OR ABORT main.items SET label = 'A', price = 3 WHERE id = 1 AND label = 'a'"),
+        ("i:1", "INSERT OR ABORT INTO main.items (label) VALUES ('c')"),
     ]
     assert preview["statements"][1]["unchecked"] == [{"column": "price", "reason": "REAL values cannot be compared exactly"}]
     assert [w["code"] for w in preview["warnings"]] == ["unchecked_columns"]
@@ -143,7 +143,8 @@ def test_a_commit_of_more_than_64_mib_is_refused_before_anything_is_read(client,
     response = post(client, "preview", profile_id=pid, path=path("items"), changes=changes)
     assert error_of(response) == (422, "validation_failed")
     detail = response.json()["error"]["detail"]
-    assert [error["msg"] for error in detail] == [f"Value error, {COMMIT_TOO_LARGE}"]
+    # the text itself in detail[0].msg, without pydantic's "Value error, " (05a review M5)
+    assert [(error["type"], error["msg"]) for error in detail] == [("commit_too_large", COMMIT_TOO_LARGE)]
     assert "input" not in detail[0] and "xxxx" not in response.text  # the 422 never echoes the values
 
 
@@ -153,6 +154,7 @@ def test_statements_too_large_to_keep_are_refused_and_leave_no_plan(client, lite
     edits.plans = EditPlanStore(max_chars=50)  # "DELETE FROM main.items WHERE id = 1" and the script need more
     response = post(client, "preview", profile_id=pid, path=path("items"), changes=ONE_DELETE)
     assert error_of(response) == (422, "validation_failed") and response.json()["error"]["message"] == PLAN_TOO_LARGE
+    assert "detail" not in response.json()["error"]  # this one's text is error.message (05a review M5)
     edits.plans = EditPlanStore()
     assert post(client, "preview", profile_id=pid, path=path("items"), changes=ONE_DELETE).json()["plan_id"]
 

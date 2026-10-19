@@ -56,7 +56,7 @@ def refusal(changes: dict) -> str:
 def test_a_commit_is_bounded_in_the_text_of_its_values():  # pre-flight L15: 10,000 changes of 4 MiB are not one request
     full = [insert(i, BIG) for i in range(FULL)]
     assert len(EditChanges.model_validate({"inserts": full}).inserts) == FULL  # exactly 64 MiB
-    assert refusal({"inserts": [*full, insert(FULL, "x")]}) == f"Value error, {COMMIT_TOO_LARGE}"  # one more character
+    assert refusal({"inserts": [*full, insert(FULL, "x")]}) == COMMIT_TOO_LARGE  # one more character
     assert COMMIT_TOO_LARGE == "The changes are too large: at most 64 MiB of values per commit"
 
 
@@ -72,7 +72,7 @@ def test_a_commit_is_bounded_in_the_text_of_its_values():  # pre-flight L15: 10,
     pytest.param({"deletes": [{"id": f"d:{i}", "key": {"id": BIG}} for i in range(FULL + 1)]}, id="many keys"),
 ])
 def test_every_kind_of_cell_counts_toward_the_bound(change):  # L15: values, keys and original cells
-    assert refusal(change) == f"Value error, {COMMIT_TOO_LARGE}"
+    assert refusal(change) == COMMIT_TOO_LARGE
 
 
 def test_a_nested_cell_is_counted_whole():  # L15: lists and objects count every string inside, as deep as pydantic goes
@@ -82,7 +82,7 @@ def test_a_nested_cell_is_counted_whole():  # L15: lists and objects count every
     one = {"deletes": [{"id": "d:1", "key": {"id": cell}}]}
     assert len(EditChanges.model_validate(one).deletes) == 1
     two = {"deletes": [*one["deletes"], {"id": "d:2", "key": {"id": cell}}]}  # 64 MiB and the 200 names above it
-    assert refusal(two) == f"Value error, {COMMIT_TOO_LARGE}"
+    assert refusal(two) == COMMIT_TOO_LARGE
 
 
 def test_a_lone_surrogate_is_refused_on_its_cell():  # ruling E19: pydantic refuses it in any str field

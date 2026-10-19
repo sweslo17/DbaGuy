@@ -3,6 +3,7 @@
 import pytest
 
 from dbaguy_backend.adapters.editing import NO_KEY, VIEWS
+from dbaguy_backend.adapters.mssql.adapter import MssqlConnection
 from dbaguy_backend.adapters.mssql.editing import GRAPH_TABLE, HISTORY_TABLE, LEDGER_TABLE, table_flags_reason
 from dbaguy_backend.domain.errors import NotFound
 from tests.edit_support import MssqlScratch, delete, edit_env, insert, items_table, scratch, update, val
@@ -333,3 +334,27 @@ def test_a_one_digit_hour_is_refused_alike_under_a_dmy_and_an_mdy_language(ms_en
     # never read as another date
     refused = {name: ("rolled_back", "241") for name in DATE_COLUMNS} | {"sdt": ("rolled_back", "295")}
     assert found["British"] == found["us_english"] == refused
+
+
+def test_a_commits_statements_are_not_described_and_a_users_still_are(ms_env, monkeypatch):  # 05a review M1
+    # The describe types a result's columns, a round trip per statement; a commit's texts return no result set
+    db, app, pid = ms_env
+    described: list[str] = []
+    describe = MssqlConnection._describe
+
+    def recording(self, sql):
+        described.append(sql)
+        return describe(self, sql)
+
+    monkeypatch.setattr(MssqlConnection, "_describe", recording)
+    with scratch(db, app.close_tabs) as make:
+        table = items_table(db, make)
+        tab = app.tab(pid, db.database)
+        preview = app.preview(pid, db.path(table), updates=[
+            update("u:1", {"id": 1}, {"label": val("x")}, {"label": "a"}),
+            update("u:2", {"id": 2}, {"label": val("y")}, {"label": "b"})])
+        done = tab.apply(preview.plan_id)
+        assert (done.outcome.outcome, done.affected) == ("committed", [(0, 1), (1, 1)])
+        assert described == []
+        assert tab.rows(f"SELECT label FROM {db.table(table)} WHERE id = 1") == [["x"]]
+        assert described == [f"SELECT label FROM {db.table(table)} WHERE id = 1"]

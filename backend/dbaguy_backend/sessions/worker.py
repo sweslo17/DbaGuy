@@ -76,6 +76,8 @@ from .edit_apply import (
     CONNECTION_LOST,
     ROLLBACK_FAILED,
     ROW_COUNT_UNKNOWN,
+    SQL_MODE_CHANGED,
+    SQL_MODE_CHANGED_MESSAGE,
     EditProgress,
     EditReport,
     history_error,
@@ -95,6 +97,9 @@ _READ_AHEAD = object()  # what `_next_task` gives when no task is queued and the
 _EXPORT_CHUNK = 1000  # rows fetched, written and checked for a cancel at a time
 _PROGRESS_EVERY = 10_000  # an export reports its row count each time it passes a multiple of this
 _EXPORT_SELECT_ONLY = "Only a statement that returns rows (SELECT, WITH, VALUES…) can be exported"
+# A grid commit's texts (BEGIN, its DML, COMMIT) return no result set to show: nothing to describe (05a review M1). A
+# trigger's SELECT still comes back as a result set, which has no count (row_count_unknown, ruling E9).
+_EDIT_OPTIONS = RunOptions(describe=False)
 
 
 def paused_result_closed_text(limit_s: float) -> str:
@@ -1029,8 +1034,10 @@ class SessionWorker:
         rid = req.request_id
         try:
             self._edit_statement(req, plan.begin)
+            self._check_literals(plan)
         except StatementError as exc:
-            # A BEGIN that failed opened nothing; one whose answer was lost died with its link
+            # A BEGIN that failed opened nothing; one whose answer was lost died with its link; one refused by the
+            # check after it sent nothing else
             self._rollback_quietly(rid)
             return refused(exc)
         progress.sent = True
@@ -1062,6 +1069,16 @@ class SessionWorker:
                 self._rollback_quietly(rid)  # SQLite keeps the transaction after a busy COMMIT (A14); a no-op elsewhere
             return progress.commit_failed(exc)
         return self._after_commit(rid, progress)
+
+    def _check_literals(self, plan: EditPlan) -> None:
+        """Right after BEGIN, before any DML: this session reads a backslash as the plan's literals were written for
+        (D-05-13; 05a review M2). The plan has that from the metadata connection; BEGIN's own answer says this
+        session's (MySQL's OK packet, no extra round trip). An engine whose answers do not say passes."""
+        session = self.connection.backslash_escapes()
+        if session is not None and session != plan.backslash_escapes:
+            logger.info("[{}] refused an apply: the session's backslash escapes are {}, the plan's {}", self.name,
+                        session, plan.backslash_escapes)
+            raise StatementError(SQL_MODE_CHANGED_MESSAGE, code=SQL_MODE_CHANGED)
 
     def _before_commit(self, request_id: str, progress: EditProgress, cancelled: bool) -> EditReport | None:
         """Spec §3.5 step 7 for a transactional target (ruling E12): what stops the COMMIT, or None to send it. Nothing
@@ -1098,7 +1115,7 @@ class SessionWorker:
         """Run one text of the plan: the rows it matched are read first, then the rest of its answer to the end, so
         SQL Server never has to stop it with an attention (ruling E9); its messages (a trigger's NOTICE or PRINT) go
         to the request."""
-        result = self._run_statement(req, "edit", sql, RunOptions())
+        result = self._run_statement(req, "edit", sql, _EDIT_OPTIONS)
         try:
             rows = result.matched_rows()
             self._forward_messages(req.request_id, result)

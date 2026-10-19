@@ -11,6 +11,7 @@ from typing import Any
 import mysql.connector
 from loguru import logger
 from mysql.connector.connection import MySQLConnection
+from mysql.connector.constants import ServerFlag
 from mysql.connector.cursor import MySQLCursorRaw
 
 from ...domain.edits import EditTarget
@@ -87,6 +88,7 @@ class _VerbatimCursor(MySQLCursorRaw):
     through the connector's DELIMITER-script rewriter (even inside a comment or as an alias), which changes user SQL."""
 
     ok_info: str | None = None  # the OK packet's info text of the last statement (`rows_matched`)
+    ok_status: int | None = None  # the OK packet's status flags of the last statement (`backslash_escapes`)
 
     def execute_verbatim(self, sql: str) -> None:
         self._connection.handle_unread_result()
@@ -94,8 +96,11 @@ class _VerbatimCursor(MySQLCursorRaw):
         statement = sql.encode(self._connection.python_charset)
         self._executed = statement
         answer = self._connection.cmd_query(statement)
-        # An UPDATE's OK packet says how many rows it matched, which affected_rows (rows changed) does not (⑤ D-05-5)
-        self.ok_info = answer.get("info_msg") if isinstance(answer, dict) and "affected_rows" in answer else None
+        # An UPDATE's OK packet says how many rows it matched, which affected_rows (rows changed) does not (⑤ D-05-5),
+        # and every OK packet whether the session reads backslashes as escapes (05a review M2)
+        ok = isinstance(answer, dict) and "affected_rows" in answer
+        self.ok_info = answer.get("info_msg") if ok else None
+        self.ok_status = answer.get("status_flag") if ok else None
         self._handle_result(answer)
 
     def next_set_within(self, seconds: float | None) -> bool:
@@ -191,6 +196,7 @@ class MysqlConnection(DatabaseConnection, RowEditing):
         # A cancel before run() has sent anything is kept here: KILL QUERY does nothing to an idle thread (Task 6b)
         self._window = CancelWindow("MySQL")
         self._lost = False  # the connection is gone (or was dropped): it has no transaction any more
+        self._ok_status: int | None = None  # the status flags of the last run()'s OK packet (backslash_escapes)
 
     # ---- statements ----
 
@@ -392,6 +398,7 @@ class MysqlConnection(DatabaseConnection, RowEditing):
         # one sets the KILL flag and KILLs.
         self._window.take_over()
         cursor = _VerbatimCursor(self._conn)  # not conn.cursor(): that sends a PING first, one round trip per statement
+        self._ok_status = None
         try:
             cursor.execute_verbatim(sql)
         except (mysql.connector.Error, UnicodeEncodeError) as exc:
@@ -400,6 +407,7 @@ class MysqlConnection(DatabaseConnection, RowEditing):
             with suppress(mysql.connector.Error):
                 cursor.close()
             raise error from exc
+        self._ok_status = cursor.ok_status
         result = MysqlResult(self, cursor, update=keyword == "UPDATE")
         if self._killed.is_set():  # it ended normally after KILL QUERY (SLEEP() returns 1): still a cancel
             result.close()  # finish() clears the flag
@@ -440,6 +448,12 @@ class MysqlConnection(DatabaseConnection, RowEditing):
     def in_transaction(self) -> bool:
         # The status flag of the last packet, no round trip; a lost connection has no transaction any more.
         return not self._lost and bool(self._conn.in_transaction)
+
+    def backslash_escapes(self) -> bool | None:
+        # SERVER_STATUS_NO_BACKSLASH_ESCAPES in the last run()'s OK packet: the session's own sql_mode, no round trip
+        if self._ok_status is None:
+            return None
+        return not self._ok_status & ServerFlag.STATUS_NO_BACKSLASH_ESCAPES
 
     def commit(self) -> None:
         try:

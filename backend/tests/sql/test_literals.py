@@ -6,8 +6,8 @@ import pytest
 from dbaguy_backend.domain.edits import MAX_VALUE_CHARS, CellInput, EditColumn
 from dbaguy_backend.domain.errors import ValidationFailed
 from dbaguy_backend.sql.dialects import (
-    Dialect, TransactionFrame, datetime_literal, insert_defaults, json_literal, quote_literal, script_text,
-    transaction_frame,
+    Dialect, TransactionFrame, datetime_literal, insert_defaults, insert_head, json_literal, quote_literal, script_text,
+    transaction_frame, update_head,
 )
 from dbaguy_backend.sql.literals import (
     LiteralStyle, ValueProblem, cell_text, input_literal, match_condition, unmatched_reason,
@@ -61,7 +61,7 @@ def value(text: str) -> CellInput:
     (TS, "datetime", "2026-10-19 12:34:56.123", PLAIN, "N'2026-10-19T12:34:56.123'"),
     (MY, "datetime", "0000-00-00", PLAIN, "'0000-00-00'"),
     (PG, "datetime", "2026-10-19 12:34:56+08", PLAIN, "'2026-10-19 12:34:56+08'"),
-    (LITE, "other", " 42 ", PLAIN, "42"),
+    (LITE, "other", " 42 ", PLAIN, "' 42 '"),  # stored as typed: bare, the spaces would be lost (05a review M10)
     (LITE, "other", "x42", PLAIN, "'x42'"),
     (PG, "other", "{1,2}", PLAIN, "'{1,2}'"),
     (MY, "text", "a\x00b", PLAIN, "'a\\0b'"),
@@ -96,7 +96,7 @@ def test_an_integer_with_an_exponent_is_sent_exactly(dialect, text, expected):  
 
 
 @pytest.mark.parametrize(("text", "expected"), [
-    ("42", "42"), (" -7 ", "-7"), ("0", "0"), ("1.5", "1.5"), ("-9223372036854775808", "-9223372036854775808"),
+    ("42", "42"), (" -7 ", "' -7 '"), ("0", "0"), ("1.5", "1.5"), ("-9223372036854775808", "-9223372036854775808"),
     ("007", "'007'"), ("0912345678", "'0912345678'"), ("1.10", "'1.10'"), ("-0", "'-0'"), ("1e5", "'1e5'"),
     ("12345678901234567890", "'12345678901234567890'"), ("9223372036854775808", "'9223372036854775808'"),
 ])
@@ -282,6 +282,9 @@ def test_transaction_frames_defaults_and_scripts():  # D-05-4, spec §3.4
         transaction_frame(Dialect.SQLPP)
     assert insert_defaults(PG, "public.t") == "INSERT INTO public.t DEFAULT VALUES"
     assert insert_defaults(MY, "dbaguy.t") == "INSERT INTO dbaguy.t () VALUES ()"
+    assert insert_defaults(LITE, "main.t") == "INSERT OR ABORT INTO main.t DEFAULT VALUES"  # 05a final review I1
+    assert [update_head(d, "s.t") for d in (PG, MY, TS, LITE)] == ["UPDATE s.t"] * 3 + ["UPDATE OR ABORT s.t"]
+    assert [insert_head(d, "s.t") for d in (PG, MY, TS, LITE)] == ["INSERT INTO s.t"] * 3 + ["INSERT OR ABORT INTO s.t"]
     assert script_text(PG, ["BEGIN", "DELETE FROM t WHERE id = 1", "COMMIT"]) == (
         "BEGIN;\nDELETE FROM t WHERE id = 1;\nCOMMIT;")
     assert script_text(TS, ["SET NOCOUNT OFF;\nBEGIN TRANSACTION", "DELETE FROM t WHERE id = 1", "COMMIT TRANSACTION"]) == (

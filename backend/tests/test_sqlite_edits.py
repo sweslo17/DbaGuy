@@ -153,8 +153,8 @@ def test_declared_types_shape_values_defaults_and_checks(lite_env):  # ruling E6
             insert("i:1", {"made": val("2026-10-19 12:00:00"), "ok": val("yes"), "price": val("1.5")}),
             insert("i:2", {})])
         assert [s.sql for s in preview.statements] == [
-            f"INSERT INTO main.{table} (made, ok, price) VALUES ('2026-10-19 12:00:00', 1, 1.5)",
-            f"INSERT INTO main.{table} DEFAULT VALUES"]
+            f"INSERT OR ABORT INTO main.{table} (made, ok, price) VALUES ('2026-10-19 12:00:00', 1, 1.5)",
+            f"INSERT OR ABORT INTO main.{table} DEFAULT VALUES"]
         tab = app.tab(pid, None)
         assert tab.apply(preview.plan_id).outcome.outcome == "committed"
         assert db.rows(f"SELECT id, made, ok, price, twice FROM {db.table(table)} WHERE id = 1") == [
@@ -166,3 +166,28 @@ def test_declared_types_shape_values_defaults_and_checks(lite_env):  # ruling E6
         refused = app.preview(pid, db.path(table), updates=[update("u:1", {"id": 1}, {"twice": val("9")},
                                                                    {"twice": 2})])
         assert [(p.column, p.code) for p in refused.problems] == [("twice", "read_only_column")]
+
+
+@pytest.mark.parametrize("clause", ["REPLACE", "IGNORE"])
+def test_a_constraints_own_conflict_clause_never_applies(lite_env, clause):  # 05a final review I1
+    # Without the statement's OR ABORT, REPLACE deleted rows 2 and 3 and the apply said committed; IGNORE skipped the
+    # change and read as a conflict
+    db, app, pid = lite_env
+    with scratch(db, app.close_tabs) as make:
+        table = make("TABLE", f"CREATE TABLE {{t}} (id INTEGER PRIMARY KEY ON CONFLICT {clause}, "
+                              f"code TEXT NOT NULL UNIQUE ON CONFLICT {clause}, label TEXT)")
+        rows = [(1, "a", "one"), (2, "b", "two"), (3, "c", "three")]
+        db.execute(f"INSERT INTO {db.table(table)} VALUES {', '.join(map(str, rows))}")
+        tab = app.tab(pid, None)
+        for change, errors in (
+            ({"updates": [update("u:1", {"id": 1}, {"code": val("b")}, {"code": "a"})]},
+             ("SQLITE_CONSTRAINT_UNIQUE", "UNIQUE constraint failed")),
+            ({"inserts": [insert("i:1", {"id": val("3"), "code": val("z"), "label": val("new")})]},
+             ("SQLITE_CONSTRAINT_PRIMARYKEY", "UNIQUE constraint failed")),
+        ):
+            preview = app.preview(pid, db.path(table), **change)
+            assert preview.statements[0].sql.startswith(("UPDATE OR ABORT ", "INSERT OR ABORT INTO "))
+            done = tab.apply(preview.plan_id)
+            assert (done.outcome.outcome, done.outcome.statement, done.outcome.applied) == ("rolled_back", 0, [])
+            assert (done.error.code, done.error.message.split(":")[0]) == errors
+            assert db.rows(f"SELECT id, code, label FROM {db.table(table)} ORDER BY id") == rows

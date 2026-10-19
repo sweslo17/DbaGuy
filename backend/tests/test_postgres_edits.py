@@ -41,7 +41,7 @@ def test_a_table_with_a_primary_key_and_every_kind_of_column(pg):
     assert described(target) == {
         "id": ("number", "as_text", True), "n": ("number", "as_text", True), "f": ("number", "none", True),
         "r": ("number", "none", True), "t": ("text", "as_text", True), "c": ("text", "equals", True),
-        "b": ("bool", "as_text", True), "by": ("binary", "as_text", True), "j": ("json", "as_text", True),
+        "b": ("bool", "as_text", True), "by": ("binary", "equals", True), "j": ("json", "as_text", True),
         "jb": ("json", "as_text", True), "x": ("text", "as_text", True), "p": ("other", "as_text", True),
         "u": ("text", "as_text", True), "m": ("other", "as_text", True), "a": ("other", "as_text", True),
         "ts": ("datetime", "as_text", True), "d": ("number", "as_text", True), "k": ("other", "as_text", True),
@@ -169,6 +169,31 @@ def test_originals_of_every_type_match_as_the_session_loaded_them(pg_env):  # A4
         assert done.outcome.outcome == "committed", done.error and done.error.message
         assert db.rows(f"SELECT n::text, j::text, by, c FROM {db.table(table)}") == [
             ("2.5000000000", '{"c": 3}', b"\x01", "zz   ")]
+
+
+def test_a_bytea_original_matches_whatever_the_bytea_output(pg_env):  # 05a review M3
+    # bytea::text follows bytea_output (escape: a database or role default on some old servers), so a ::text check
+    # made every edit of the column a false conflict; `= '\x…'::bytea` is exact under either output
+    db, app, pid = pg_env
+    with scratch(db, app.close_tabs) as make:
+        table = make("TABLE", "CREATE TABLE {t} (id int PRIMARY KEY, data bytea)")
+        db.execute(f"INSERT INTO {db.table(table)} VALUES (1, '\\x00ff')")
+        tab = app.tab(pid, db.database)
+        tab.run("SET bytea_output = escape")
+        assert tab.rows("SHOW bytea_output") == [["escape"]]
+        [[cell]] = tab.rows(f"SELECT data FROM {db.table(table)}")
+        preview = app.preview(pid, db.path(table), updates=[update("u:1", {"id": 1}, {"data": val("0x01")},
+                                                                   {"data": cell})])
+        assert preview.statements[0].sql == (
+            f"UPDATE public.{table} SET data = '\\x01'::bytea WHERE id = 1 AND data = '\\x00ff'::bytea")
+        done = tab.apply(preview.plan_id)
+        assert done.outcome.outcome == "committed", done.error and done.error.message
+        assert db.rows(f"SELECT data FROM {db.table(table)}") == [(b"\x01",)]
+        stale = app.preview(pid, db.path(table), updates=[update("u:1", {"id": 1}, {"data": val("0x02")},
+                                                                 {"data": cell})])  # loaded before the commit
+        done = tab.apply(stale.plan_id)
+        assert (done.outcome.outcome, done.error.code) == ("rolled_back", "edit_conflict")
+        assert db.rows(f"SELECT data FROM {db.table(table)}") == [(b"\x01",)]
 
 
 def test_a_floating_point_column_is_listed_unchecked(pg_env):  # known limitation (spec §8 Q3)

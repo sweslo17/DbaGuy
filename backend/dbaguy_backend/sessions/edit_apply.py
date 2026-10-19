@@ -29,6 +29,11 @@ TRANSACTION_ENDED: dict[Dialect, frozenset[str]] = {Dialect.TSQL: frozenset({"36
 # Pre-flight L7: COMMIT returned with a transaction still open; the worker rolls that one back
 COMMIT_LEFT_OPEN = "COMMIT left a transaction open, which was rolled back: the changes may or may not have been applied"
 ROLLBACK_FAILED = "The transaction could not be rolled back: close and reopen this tab"  # pre-flight L8
+# The plan's literals read backslashes as the metadata connection's sql_mode did at the preview (D-05-13); the session
+# that applies reads them differently (a GLOBAL sql_mode changed between the two connects, a proxy's backends differ):
+# refused right after BEGIN, before any DML (05a review M2). Only MySQL says how its session reads them.
+SQL_MODE_CHANGED = "sql_mode_changed"
+SQL_MODE_CHANGED_MESSAGE = "The session's sql_mode changed since the preview: preview the changes again"
 
 
 @dataclass(frozen=True)
@@ -49,8 +54,8 @@ def _as_cancel(error: StatementError, tail: str) -> StatementError:
 
 
 def refused(error: StatementError) -> EditReport:
-    """Stopped with nothing applied: before the BEGIN went out, by the BEGIN itself, or (a transactional target)
-    rolled back before COMMIT because its state could not be read."""
+    """Stopped with nothing applied: before the BEGIN went out, by the BEGIN itself or right after it (no DML sent), or
+    (a transactional target) rolled back before COMMIT because its state could not be read."""
     return EditReport("rolled_back", error=_as_cancel(error, NOTHING_APPLIED))
 
 

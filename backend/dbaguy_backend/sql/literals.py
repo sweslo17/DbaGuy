@@ -345,8 +345,10 @@ def input_literal(dialect: Dialect, column: EditColumn, cell: CellInput, style: 
         case "datetime":
             _sendable(dialect, text, style)
             return style.datetime(dialect, text)
-        case "other" if dialect is Dialect.SQLITE and _sqlite_reads_as_typed(text.strip()):
-            return text.strip()  # no affinity: a number is stored as that number (spec §3.3.3, ruling G1)
+        case "other" if dialect is Dialect.SQLITE and _sqlite_reads_as_typed(text):
+            # no affinity: a number is stored as that number (spec §3.3.3, ruling G1); not one with spaces around it,
+            # which a bare literal would store without them (05a review M10)
+            return text
         case _:
             _sendable(dialect, text, style)
             return style.quote(dialect, text)

@@ -47,7 +47,9 @@ GROUP BY ic.relname, i.indisprimary
 _STRINGS_NOT_STANDARD = "standard_conforming_strings is off: values with backslashes would be changed"
 _READ_ONLY = {"v": VIEWS, "m": "Materialized views are read-only here", "f": "Foreign tables are read-only here"}
 _NOT_EXACT = frozenset({"float4", "float8"})  # loaded as Python floats: their text is not the server's
-_PADDED = frozenset({"bpchar"})  # ::text drops the padding the loaded value has; `=` ignores it (A4)
+# Compared with `=`, not ::text: bpchar, whose ::text drops the padding the loaded value has (`=` ignores it, A4); bytea,
+# whose ::text follows bytea_output (escape: every original would differ) while `= '\x…'::bytea` is exact (05a review M3)
+_EQUALS = frozenset({"bpchar", "bytea"})
 
 
 def _column(
@@ -56,7 +58,7 @@ def _column(
 ) -> tuple[EditColumn, bool]:
     """The column, and whether its type is composite (a key on it cannot be written as `c = '…'`, 0A000)."""
     kind: EditKind = "other" if base == "money" else edit_kind(category_for_type_name(base))  # money: lc_monetary
-    compare: Compare = "none" if base in _NOT_EXACT else "equals" if base in _PADDED else "as_text"
+    compare: Compare = "none" if base in _NOT_EXACT else "equals" if base in _EQUALS else "as_text"
     reason = "generated column" if generated else "identity column (GENERATED ALWAYS)" if identity == "a" else None
     column = EditColumn(
         name=name, type_name=type_name, kind=kind, nullable=nullable,

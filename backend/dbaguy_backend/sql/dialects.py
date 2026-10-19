@@ -367,6 +367,12 @@ _ALL_DEFAULTS: dict[Dialect, str | None] = {  # an INSERT of a row whose every c
     Dialect.POSTGRES: "DEFAULT VALUES", Dialect.SQLITE: "DEFAULT VALUES", Dialect.TSQL: "DEFAULT VALUES",
     Dialect.MYSQL: "() VALUES ()", Dialect.SQLPP: None,
 }
+# The verbs of a grid commit's UPDATE and INSERT. SQLite applies a constraint's own conflict clause from CREATE TABLE
+# (`UNIQUE … ON CONFLICT REPLACE` deletes the other row that holds the value, IGNORE skips the statement) unless the
+# statement names one, and still reports one row changed; `OR ABORT` overrides it, and ABORT is SQLite's default, so
+# every other table behaves exactly as without it (05a final review I1). DELETE has no conflict clause.
+_UPDATE_VERBS: dict[Dialect, str] = {Dialect.SQLITE: "UPDATE OR ABORT"}
+_INSERT_VERBS: dict[Dialect, str] = {Dialect.SQLITE: "INSERT OR ABORT INTO"}
 
 
 def transaction_frame(dialect: Dialect) -> TransactionFrame:
@@ -376,11 +382,21 @@ def transaction_frame(dialect: Dialect) -> TransactionFrame:
     return frame
 
 
+def update_head(dialect: Dialect, table_sql: str) -> str:
+    """A grid commit's `UPDATE <table>` (SQLite: `UPDATE OR ABORT <table>`)."""
+    return f"{_UPDATE_VERBS.get(dialect, 'UPDATE')} {table_sql}"
+
+
+def insert_head(dialect: Dialect, table_sql: str) -> str:
+    """A grid commit's `INSERT INTO <table>` (SQLite: `INSERT OR ABORT INTO <table>`)."""
+    return f"{_INSERT_VERBS.get(dialect, 'INSERT INTO')} {table_sql}"
+
+
 def insert_defaults(dialect: Dialect, table_sql: str) -> str:
     rest = _ALL_DEFAULTS[dialect]
     if rest is None:
         raise ValueError(f"{dialect} has no grid editing")
-    return f"INSERT INTO {table_sql} {rest}"
+    return f"{insert_head(dialect, table_sql)} {rest}"
 
 
 def script_text(dialect: Dialect, statements: Sequence[str]) -> str:

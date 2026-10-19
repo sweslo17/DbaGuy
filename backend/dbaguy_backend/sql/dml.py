@@ -9,7 +9,9 @@ from ..domain.edits import (
     CellInput, EditChanges, EditColumn, EditCounts, EditProblem, EditProblemCode, EditTarget, EditWarning,
     PlannedStatement, RowDelete, RowInsert, RowUpdate, UncheckedColumn,
 )
-from .dialects import Dialect, insert_defaults, qualified, quote_ident, script_text, transaction_frame
+from .dialects import (
+    Dialect, insert_defaults, insert_head, qualified, quote_ident, script_text, transaction_frame, update_head,
+)
 from .literals import (
     LiteralStyle, UnmatchedReason, ValueProblem, cell_text, input_literal, match_condition, unmatched_reason,
 )
@@ -25,6 +27,8 @@ _KEY_MESSAGES: dict[UnmatchedReason | None, str] = {  # key_incomplete; None: a 
     "unsendable": "This row cannot be identified: its key column {name} holds a character that cannot be sent",
     None: "This row cannot be identified: its key column {name} is NULL",
 }
+# a change without one of the key's cells: only a client bug sends one (05a review M10)
+_KEY_NOT_GIVEN = "This row cannot be identified: the change gives no value for its key column {name}"
 _UNCHECKED_REASONS: dict[UnmatchedReason, str] = {  # ruling E22, pre-flight L6, ruling G2
     "preview_only": "only a preview of the value was loaded",
     "unsendable": "the loaded value holds a character that cannot be sent",
@@ -114,8 +118,9 @@ class _Builder:
             term = None if cell is None else match_condition(
                 self.dialect, self.columns[name], cell, self.styles[name], key=True)
             if term is None:
-                why = unmatched_reason(self.dialect, cell, self.styles[name]) if name in key else "preview_only"
-                self._problem(change_id, name, "key_incomplete", _KEY_MESSAGES[why].format(name=name))
+                message = (_KEY_MESSAGES[unmatched_reason(self.dialect, cell, self.styles[name])] if name in key
+                           else _KEY_NOT_GIVEN)
+                self._problem(change_id, name, "key_incomplete", message.format(name=name))
                 return None
             terms.append(term)
         return terms
@@ -182,7 +187,7 @@ class _Builder:
             self.keys.append(_KeyChange(change.id, tuple(terms), new))  # also with other problems: all are reported
         if not complete or terms is None:
             return None
-        sql = f"UPDATE {self.table} SET {', '.join(sets)} WHERE {' AND '.join([*terms, *checks])}"
+        sql = f"{update_head(self.dialect, self.table)} SET {', '.join(sets)} WHERE {' AND '.join([*terms, *checks])}"
         return PlannedStatement(change_id=change.id, kind="update", sql=sql, unchecked=unchecked,
                                 row=self._row(change.key))
 
@@ -215,7 +220,7 @@ class _Builder:
         if not complete:
             return None, missing
         if names:
-            sql = f"INSERT INTO {self.table} ({', '.join(names)}) VALUES ({', '.join(literals)})"
+            sql = f"{insert_head(self.dialect, self.table)} ({', '.join(names)}) VALUES ({', '.join(literals)})"
         else:
             sql = insert_defaults(self.dialect, self.table)
         return PlannedStatement(change_id=change.id, kind="insert", sql=sql), missing

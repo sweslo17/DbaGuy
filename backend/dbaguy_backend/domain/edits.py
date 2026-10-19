@@ -5,6 +5,7 @@ from typing import Annotated, Literal, Self
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic_core import PydanticCustomError
 
 from .column_category import ColumnCategory
 from .metadata import PathSegment
@@ -156,7 +157,8 @@ class EditChanges(_Input):
         total += sum(_json_chars(change.key) for change in (*self.updates, *self.deletes))
         total += sum(_json_chars(change.original) for change in self.updates)
         if total > MAX_COMMIT_CHARS:
-            raise ValueError(COMMIT_TOO_LARGE)
+            # a custom error, so `detail[0].msg` is the text itself (a ValueError's gets "Value error, " in front)
+            raise PydanticCustomError("commit_too_large", COMMIT_TOO_LARGE)
         return self
 
 
@@ -229,6 +231,9 @@ class EditPlan(BaseModel):
     commit: str
     transactional: bool
     script: str
+    # How the literals read a backslash (the target's, from the metadata connection, D-05-13): the session that
+    # applies must read it alike (05a review M2)
+    backslash_escapes: bool = True
 
 
 class PlanUnavailable(Exception):

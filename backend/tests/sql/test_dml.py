@@ -153,7 +153,7 @@ def test_a_key_or_original_without_a_term_says_why():  # ruling E4, G2 (`literal
                                                       {"id": "d:2", "key": {}}]))
     assert [(p.change_id, p.code, p.message) for p in null_key.problems] == [
         ("d:1", "key_incomplete", "This row cannot be identified: its key column code is NULL"),
-        ("d:2", "key_incomplete", "This row cannot be identified: its key column code was not loaded completely")]
+        ("d:2", "key_incomplete", "This row cannot be identified: the change gives no value for its key column code")]
 
 
 def test_a_key_column_set_is_pinned_by_its_key_only():  # CR-4
@@ -269,8 +269,14 @@ def test_each_dialect_writes_its_own_literals_and_frame():  # D-05-2, D-05-4, D-
         assert sql == f"UPDATE dbaguy.orders SET path = {literal} WHERE id = 1 AND path = {literal}"
     lite_columns = [column("id", "number", compare="equals", nullable=False), column("any", "other", compare="equals")]
     lite = EditTarget(path=LITE_PATH, editable=True, key=["id"], key_source="primary_key", columns=lite_columns)
-    plan = build_plan(LITE, lite, changes(inserts=[{"id": "i:1", "values": {"id": value("5"), "any": value("42")}}]))
-    assert (plan.begin, plan.statements[0].sql) == ("BEGIN IMMEDIATE", "INSERT INTO main.orders (id, any) VALUES (5, 42)")
+    plan = build_plan(LITE, lite, changes(
+        updates=[{"id": "u:1", "key": {"id": 1}, "set": {"any": value("x")}, "original": {"any": "y"}}],
+        inserts=[{"id": "i:1", "values": {"id": value("5"), "any": value("42")}}, {"id": "i:2", "values": {}}]))
+    # OR ABORT: a constraint's own ON CONFLICT REPLACE or IGNORE never applies (05a final review I1)
+    assert (plan.begin, [s.sql for s in plan.statements]) == ("BEGIN IMMEDIATE", [
+        "UPDATE OR ABORT main.orders SET any = 'x' WHERE id = 1 AND any = 'y'",
+        "INSERT OR ABORT INTO main.orders (id, any) VALUES (5, 42)",
+        "INSERT OR ABORT INTO main.orders DEFAULT VALUES"])
 
 
 def test_names_are_quoted_where_the_dialect_needs_it():  # Review Focus 2
