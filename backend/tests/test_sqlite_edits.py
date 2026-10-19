@@ -71,3 +71,33 @@ def test_only_a_rowid_alias_is_never_null_and_assigned_when_left_out(lite):
     assert {name: (t.key, t.columns[0].nullable, t.columns[0].has_default) for name, t in found.items()} == {
         alias: (["id"], False, True), no_rowid: (["id"], False, False), descending: (["id"], True, False),
     }
+
+
+def test_any_in_a_strict_table_keeps_values_as_given(lite):  # review G4: STRICT ANY has no affinity
+    db, connection = lite
+    with scratch(db) as make:
+        strict = make("TABLE", "CREATE TABLE {t} (id INTEGER PRIMARY KEY, a ANY, n INT, s TEXT) STRICT")
+        loose = make("TABLE", "CREATE TABLE {t} (id INTEGER PRIMARY KEY, a ANY)")
+        found = {name: connection.edit_target(db.path(name)) for name in (strict, loose)}
+        db.execute(*(f"INSERT INTO {db.table(name)} (a) VALUES ('007')" for name in (strict, loose)))
+        stored = [db.rows(f"SELECT typeof(a), a FROM {db.table(name)}")[0] for name in (strict, loose)]
+    assert {c.name: (c.kind, c.compare) for c in found[strict].columns} == {
+        "id": ("number", "equals"), "a": ("other", "equals"), "n": ("number", "equals"), "s": ("text", "equals"),
+    }
+    assert [(c.name, c.kind) for c in found[loose].columns] == [("id", "number"), ("a", "number")]
+    assert stored == [("text", "007"), ("integer", 7)]  # why: STRICT ANY keeps the text, NUMERIC affinity converts it
+
+
+def test_a_virtual_tables_internal_tables_are_read_only_and_names_match_in_any_case(lite):  # review G4
+    db, connection = lite
+    with scratch(db) as make:
+        fts = make("TABLE", "CREATE VIRTUAL TABLE {t} USING fts5(body)")
+        keyed = make("TABLE", "CREATE TABLE {t} (id INTEGER PRIMARY KEY)")
+        shadows = [f"{fts}_{part}" for part in ("data", "idx", "content", "docsize", "config")]
+        found = {name: connection.edit_target(db.path(name)) for name in (fts, *shadows)}
+        upper = connection.edit_target(db.path(keyed.upper()))  # SQLite finds a table whatever the case
+    assert {name: (t.editable, t.reason) for name, t in found.items()} == {
+        fts: (False, "Virtual tables are read-only here"),
+        **dict.fromkeys(shadows, (False, "Internal table of a virtual table: read-only here")),
+    }
+    assert (upper.editable, upper.key) == (True, ["id"])

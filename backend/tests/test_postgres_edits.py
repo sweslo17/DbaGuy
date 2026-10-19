@@ -120,3 +120,17 @@ def test_a_session_without_standard_conforming_strings_cannot_edit(pg):  # rulin
     assert (off.editable, off.reason, off.key) == (
         False, "standard_conforming_strings is off: values with backslashes would be changed", [])
     assert (on.editable, on.key) == (True, ["id"])  # read on every call, never cached
+
+
+def test_a_domain_is_read_through_every_level_to_its_base_type(pg):  # ruling E23, review G4
+    db, connection = pg
+    with scratch(db) as make:
+        inner = make("DOMAIN", "CREATE DOMAIN {t} AS float8")
+        outer = make("DOMAIN", f"CREATE DOMAIN {{t}} AS {db.table(inner)}")
+        whole = make("DOMAIN", "CREATE DOMAIN {t} AS integer")
+        counted = make("DOMAIN", f"CREATE DOMAIN {{t}} AS {db.table(whole)} CHECK (VALUE >= 0)")
+        table = make("TABLE", f"CREATE TABLE {{t}} (k {db.table(outer)} PRIMARY KEY, n {db.table(counted)})")
+        target = connection.edit_target(db.path(table))
+    assert described(target) == {"k": ("number", "none", True), "n": ("number", "as_text", True)}
+    assert not target.editable and target.reason == (
+        f"The key column k ({outer}) cannot be matched exactly: a row cannot be identified")

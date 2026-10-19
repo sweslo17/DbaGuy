@@ -14,13 +14,22 @@ from .loaders import category_for_type_name
 
 # standard_conforming_strings rides along (no round trip of its own): off, a backslash in '…' escapes (ruling G3)
 _RELKIND = "SELECT relkind::text, current_setting('standard_conforming_strings') FROM pg_class WHERE oid = %(oid)s"
-# A domain is read through its base type (one level, ruling E23); typtype 'c' marks a composite type (ruling E4).
+# A domain is read through its base type, however many domains deep (ruling E23): `base` follows typbasetype from each
+# column's type until a type that is not a domain, one row per column. typtype 'c' marks a composite type (ruling E4).
 _COLUMNS = """
+WITH RECURSIVE base (attnum, typname, typtype, typbasetype) AS (
+    SELECT a.attnum, t.typname, t.typtype, t.typbasetype
+    FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+    WHERE a.attrelid = %(oid)s AND a.attnum > 0 AND NOT a.attisdropped
+  UNION ALL
+    SELECT d.attnum, t.typname, t.typtype, t.typbasetype
+    FROM base d JOIN pg_type t ON t.oid = d.typbasetype
+    WHERE d.typtype = 'd'
+)
 SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, a.atthasdef, a.attidentity::text,
-       a.attgenerated::text, COALESCE(b.typname, t.typname)::text, COALESCE(b.typtype, t.typtype)::text
+       a.attgenerated::text, b.typname::text, b.typtype::text
 FROM pg_attribute a
-JOIN pg_type t ON t.oid = a.atttypid
-LEFT JOIN pg_type b ON t.typtype = 'd' AND b.oid = t.typbasetype
+JOIN base b ON b.attnum = a.attnum AND b.typtype <> 'd'
 WHERE a.attrelid = %(oid)s AND a.attnum > 0 AND NOT a.attisdropped
 ORDER BY a.attnum
 """

@@ -1,6 +1,7 @@
-"""What grid editing needs to know about a SQLite table (spec ⑤ §3.2.2): tables only (no view, no virtual table), each
-column read by its declared type's affinity (ruling E6), the primary key or a unique index on NOT NULL columns. The
-rowid is never a key: `SELECT *` does not return it."""
+"""What grid editing needs to know about a SQLite table (spec ⑤ §3.2.2): tables only (no view, no virtual table, none
+of a virtual table's internal tables), each column read by its declared type's affinity (ruling E6; ANY in a STRICT
+table has none), the primary key or a unique index on NOT NULL columns. The rowid is never a key: `SELECT *` does not
+return it."""
 
 import sqlite3
 
@@ -9,19 +10,27 @@ from ...domain.errors import NotFound
 from ...domain.metadata import PathSegment
 from ...sql.select_builder import relation_from_path
 from ..editing import VIEWS, KeyCandidate, build_target, read_only_relation
-from ..sql_text import quote_ident_sqlite as q
 
+# The pragma takes the name only (a second argument raises); it matches the name without case, as SQLite does
+_TABLE = "SELECT type, strict FROM pragma_table_list(?) WHERE schema = ?"
+_READ_ONLY = {
+    "view": VIEWS, "virtual": "Virtual tables are read-only here",
+    "shadow": "Internal table of a virtual table: read-only here",  # e.g. fts5's _data, _idx, _content, _config
+}
 _GENERATED = frozenset({2, 3})  # pragma_table_xinfo.hidden: a VIRTUAL or STORED generated column
 _COLUMNS = 'SELECT name, type, "notnull", dflt_value, pk, hidden FROM pragma_table_xinfo(?, ?) ORDER BY cid'
 _INDEXES = 'SELECT name, "unique", origin, partial FROM pragma_index_list(?, ?)'
 _INDEX_COLUMNS = "SELECT name FROM pragma_index_info(?, ?) ORDER BY seqno"
 
 
-def affinity_kind(declared: str) -> tuple[EditKind, Compare]:
+def affinity_kind(declared: str, strict: bool = False) -> tuple[EditKind, Compare]:
     """SQLite's affinity rules in their order — INT; CHAR, CLOB, TEXT; BLOB or no type; REAL, FLOA, DOUB; else NUMERIC
     — and inside NUMERIC what the declared name says: DATE / TIME, BOOL, JSON (ruling E6). REAL affinity holds floating
-    point, which is not compared."""
+    point, which is not compared. In a STRICT table ANY keeps every value as given, like no type ('007' stays text);
+    elsewhere it is NUMERIC ('007' is stored as 7)."""
     upper = declared.upper()
+    if strict and upper == "ANY":
+        return "other", "equals"
     if "INT" in upper:
         return "number", "equals"
     if any(word in upper for word in ("CHAR", "CLOB", "TEXT")):
@@ -44,16 +53,12 @@ def affinity_kind(declared: str) -> tuple[EditKind, Compare]:
 def edit_target(conn: sqlite3.Connection, path: list[PathSegment]) -> EditTarget:
     schema, name = relation_from_path(path)
     schema = schema or "main"
-    found = conn.execute(
-        f"SELECT type, sql FROM {q(schema)}.sqlite_master WHERE name = ? AND type IN ('table', 'view')", (name,)
-    ).fetchone()
+    found = conn.execute(_TABLE, (name, schema)).fetchone()
     if found is None:
         raise NotFound(f"Table {name} not found")
-    kind, ddl = found
-    if kind == "view":
-        return read_only_relation(path, VIEWS)
-    if (ddl or "").lstrip().upper().startswith("CREATE VIRTUAL TABLE"):
-        return read_only_relation(path, "Virtual tables are read-only here")
+    kind, strict = found
+    if kind != "table":
+        return read_only_relation(path, _READ_ONLY.get(kind, "This object is read-only here"))
     rows = conn.execute(_COLUMNS, (name, schema)).fetchall()
     indexes = conn.execute(_INDEXES, (name, schema)).fetchall()
     key = [column for _, column in sorted((pk, column) for column, _, _, _, pk, _ in rows if pk > 0)]
@@ -65,7 +70,7 @@ def edit_target(conn: sqlite3.Connection, path: list[PathSegment]) -> EditTarget
     ) else None
     columns = []
     for column, declared, notnull, default, _, hidden in rows:
-        kind_of, compare = affinity_kind(declared or "")
+        kind_of, compare = affinity_kind(declared or "", strict=bool(strict))
         generated = hidden in _GENERATED
         columns.append(EditColumn(
             name=column, type_name=declared or "", kind=kind_of, nullable=not notnull and column != rowid,
