@@ -4,6 +4,7 @@ row, pure."""
 import pytest
 
 from dbaguy_backend.adapters.base import StatementCancelled, StatementError
+from dbaguy_backend.domain.dialect import Dialect
 from dbaguy_backend.domain.edits import PlannedStatement
 from dbaguy_backend.sessions.edit_apply import EditProgress, EditReport, history_error, refused
 
@@ -20,9 +21,9 @@ def progress(*kinds: str, transactional: bool = True) -> EditProgress:
 
 
 def run(started: EditProgress, *rows: int | None) -> StatementError | None:
-    """Statement i matched rows[i], until one stops the apply (its error) or all ran (None)."""
+    """Statement i went out and matched rows[i], until one stops the apply (its error) or all ran (None)."""
     for index, count in enumerate(rows):
-        started.index = index
+        started.index, started.reached = index, True
         if (error := started.matched(count)) is not None:
             return error
     return None
@@ -58,7 +59,7 @@ def test_a_statement_that_matched_wrongly_stops_the_apply(kind, rows, code, text
 def test_any_failure_before_the_commit_rolls_everything_back(error):  # R-05-6
     started = progress("update", "update")
     run(started, 1)
-    started.index = 1
+    started.index, started.reached = 1, True  # statement 1 went out
     report = started.failed(error)
     assert (report.outcome, report.failed_change, report.statement, report.applied) == ("rolled_back", "c1", 1, [])
     if isinstance(error, StatementCancelled):
@@ -158,3 +159,62 @@ def test_a_commit_that_left_a_transaction_open_is_unknown_unless_nothing_could_r
     done = progress("update", transactional=False)
     run(done, 1)
     assert (done.commit_unconfirmed().outcome, done.commit_unconfirmed(LOST).error) == ("committed", None)
+
+
+DUPLICATE = StatementError("Duplicate entry '1' for key 'PRIMARY'", code="1062")  # e.g. an AFTER trigger's
+
+
+def at(started: EditProgress, index: int, *, reached: bool) -> EditProgress:
+    """Statements before `index` matched one row each; statement `index` went out (`reached`) or was stopped first."""
+    run(started, *([1] * index))
+    started.index, started.reached = index, reached
+    return started
+
+
+@pytest.mark.parametrize("error", [DUPLICATE, StatementCancelled("Query execution was interrupted")])
+def test_on_a_table_that_cannot_roll_back_any_failure_once_the_statement_went_out_is_unknown(error):  # ruling G13
+    first = at(progress("update", "update", transactional=False), 0, reached=True).failed(error)
+    later = at(progress("update", "update", transactional=False), 1, reached=True).failed(error)
+    assert (first.outcome, first.applied, first.failed_change, first.statement) == ("unknown", [], "c0", 0)
+    assert (later.outcome, later.applied, later.failed_change, later.statement) == ("unknown", ["c0"], "c1", 1)
+    if isinstance(error, StatementCancelled):  # the server's text is kept as it is; a cancel says what may stay
+        assert first.error.message == "Cancelled: this change may have taken effect (this table cannot roll back)"
+        assert later.error.message == ("Cancelled: this change may have taken effect, and the statements before it "
+                                       "stay applied (this table cannot roll back)")
+    else:
+        assert first.error is error and later.error is error
+    assert history_error(later, 2).message == f"Outcome unknown: {later.error.message}"
+
+
+def test_a_conflict_that_matched_no_row_and_a_cancel_before_sending_keep_their_outcome():  # G13's exceptions
+    started = at(progress("update", "update", transactional=False), 0, reached=True)
+    nothing = started.failed(started.matched(0))
+    assert (nothing.outcome, nothing.failed_change) == ("rolled_back", "c0")
+    assert nothing.error.message.endswith(": nothing was applied")  # item 3: nothing came before it
+    started = at(progress("update", "update", transactional=False), 1, reached=True)
+    assert started.failed(started.matched(0)).outcome == "partial"
+    unsent = at(progress("update", "update", transactional=False), 0, reached=False).failed(StatementCancelled())
+    assert (unsent.outcome, unsent.failed_change, unsent.statement, unsent.error.message) == (
+        "rolled_back", None, None, "Cancelled: nothing was applied")  # item 4: it names no unsent change
+    unsent = at(progress("update", "update", transactional=False), 1, reached=False).failed(StatementCancelled())
+    assert (unsent.outcome, unsent.applied, unsent.failed_change, unsent.statement, unsent.error.message) == (
+        "partial", ["c0"], None, None, "Cancelled: the statements before it stay applied (this table cannot roll back)")
+
+
+def test_a_cancel_caught_between_statements_names_no_change():  # fix round 1, item 4
+    report = at(progress("update", "update"), 1, reached=False).failed(StatementCancelled())
+    assert (report.outcome, report.failed_change, report.statement, report.error.message) == (
+        "rolled_back", None, None, "Cancelled: nothing was applied")
+
+
+@pytest.mark.parametrize(("dialect", "code", "expected"), [
+    (Dialect.TSQL, "3609", "unknown"), (Dialect.TSQL, "245", "rolled_back"), (Dialect.MYSQL, "3609", "rolled_back"),
+    (None, "3609", "rolled_back"),
+])
+def test_a_statement_whose_trigger_ended_the_transaction_is_unknown(dialect, code, expected):  # item 2
+    started = progress("update", "update")
+    started.dialect = dialect
+    error = StatementError("The transaction ended in the trigger. The batch has been aborted.", code=code)
+    report = at(started, 0, reached=True).failed(error)
+    assert (report.outcome, report.applied, report.failed_change, report.statement, report.error) == (
+        expected, [], "c0", 0, error)

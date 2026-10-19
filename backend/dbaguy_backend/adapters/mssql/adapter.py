@@ -101,11 +101,15 @@ def _text(raw: bytes | str | None) -> str:
 
 def server_text(exc: Exception) -> str:
     """The server's message without pymssql's "DB-Lib error message 20018, severity N: …" tail; "" when there is none.
-    MSSQLDatabaseException carries it in `.text` (bytes); MSSQLDriverException only in its args."""
-    raw = getattr(exc, "text", None)
-    if raw is None:
-        first = exc.args[0] if exc.args else ""
-        raw = first[1] if isinstance(first, tuple) and len(first) > 1 else str(first)
+    Read from `exc.args` only: pymssql raises MSSQLDatabaseException(((number, message_bytes),)), copying the message
+    into its args, and MSSQLDriverException carries just the text.
+
+    Never from `.text` (nor `.message`, `.srvname`, `.procname`), ruling G14: those are C char* properties. On an
+    exception pymssql did not fill in (one built in Python) they are NULL and reading one crashes the whole process;
+    on one it raised they point into the connection's message buffer, which a later message overwrites and closing the
+    connection frees."""
+    first = exc.args[0] if exc.args else ""
+    raw = first[1] if isinstance(first, tuple) and len(first) > 1 else str(first)
     text = _text(raw).split("DB-Lib error message", 1)[0].strip()
     return "" if text in ("", "Unknown error") else text
 
@@ -331,7 +335,11 @@ class MssqlConnection(DatabaseConnection, RowEditing):
             with self._control.call(CallKind.STOP):
                 self._conn.cancel()
         except driver.ERRORS as exc:  # e.g. an error the server sent before the attention: the statement ends anyway
-            logger.warning("Stopping the statement on SQL Server SPID {} reported: {}", self._spid, server_text(exc) or exc)
+            # The number only above DEBUG: the server's text may echo literals (spec ⑤ §5, G12)
+            logger.warning("Stopping the statement on SQL Server SPID {} reported error {}", self._spid,
+                           getattr(exc, "number", None) or type(exc).__name__)
+            logger.debug("Stopping the statement on SQL Server SPID {} reported: {}", self._spid,
+                         server_text(exc) or exc)
 
     def stop_stream(self, cancelled: bool = True) -> StatementError:
         """Worker thread: end the statement whose cancel was flagged (`cancelled`) or whose rows are no longer wanted.
@@ -616,6 +624,8 @@ class MssqlConnection(DatabaseConnection, RowEditing):
         if number == 0:
             return StatementError(text or "SQL Server ended the statement without an error message")
         line = int(getattr(exc, "line", 0) or 0)
+        # Safe only below the `number == 0` return (G14): pymssql sets `number` with its char* fields, and an exception
+        # built in Python has number 0 and a NULL `procname`, whose read would crash the process
         procedure = _text(getattr(exc, "procname", b""))
         message = text + (_PROCEDURE_LINE.format(procedure=procedure, line=line) if procedure else "")
         position = ErrorPosition(line=line, column=1) if line > 0 and not procedure else None

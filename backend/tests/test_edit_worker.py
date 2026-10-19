@@ -12,6 +12,7 @@ from dbaguy_backend.adapters.base import StatementCancelled, StatementError
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.domain.classification import Classification, StatementKind
+from dbaguy_backend.domain.dialect import Dialect
 from dbaguy_backend.domain.edits import (
     PLAN_EXPIRED, PLAN_EXPIRED_MESSAGE, PLAN_MISMATCH, EditPlan, PlannedStatement, PlanUnavailable,
 )
@@ -119,14 +120,15 @@ def read_only(sql, confirmed):
 
 
 class Env:
-    def __init__(self, conn: EditFake, *plans: EditPlan, check=writes) -> None:
+    def __init__(self, conn: EditFake, *plans: EditPlan, check=writes, dialect: Dialect = Dialect.SQLITE) -> None:
         self.conn = conn
         self.records = []
         self.plans = {plan.plan_id: plan for plan in plans}
         lease = FakeLease(conn)
         self.worker = SessionWorker("edits", lambda: lease)
         self.worker.start()
-        self.worker.configure(WorkerHooks(check=check, on_record=self.records.append, take_edit_plan=self._take))
+        self.worker.configure(WorkerHooks(dialect=dialect, check=check, on_record=self.records.append,
+                                          take_edit_plan=self._take))
         self.recorder = Recorder()
         self.worker.set_emitter(self.recorder)
 
@@ -518,3 +520,52 @@ def test_the_info_line_counts_each_kind_and_a_close_error_keeps_its_text_at_debu
     assert any("Error closing result on edits (HY000)" in text for level, text in records if level == 30)
     assert not [text for level, text in records if level >= 20 and "zz-secret" in text]
     assert [text for level, text in records if level == 10 and "zz-secret" in text]
+
+
+# ---- fix round 1: ruling G13, SQL Server 3609, a cancel between statements ----
+
+
+@pytest.mark.parametrize("transactional", [False, True])
+def test_a_cancel_caught_between_statements_sends_nothing_more_and_names_no_change(env_of, transactional):  # item 4
+    env = env_of(EditFake(), make_plan(*THREE, transactional=transactional))
+    env.conn.answers["d0"] = lambda: (env.worker.cancel("a"), 1)[1]  # d0 is done: the flag stops u1 before it is sent
+    events = env.apply()
+    done = outcome(events)
+    assert (done.failed_change, done.statement, env.conn.runs, env.conn.rollbacks) == (None, None, ["BEGIN", "d0"], 1)
+    if transactional:
+        assert (done.outcome, error(events).message, events[-1].cancelled) == (
+            "rolled_back", "Cancelled: nothing was applied", True)
+        assert env.records[0].status == "cancelled"
+    else:  # G13's exception: u1 never went out, so only d0 took effect
+        assert (done.outcome, done.applied, error(events).message) == (
+            "partial", ["c0"], "Cancelled: the statements before it stay applied (this table cannot roll back)")
+        assert env.records[0].error.startswith("Partly applied (1 of 3): Cancelled")
+
+
+def test_on_a_table_that_cannot_roll_back_a_failure_after_sending_is_unknown(env_of):  # ruling G13
+    trigger = StatementError("Duplicate entry '1' for key 'PRIMARY'", code="1062")  # an AFTER trigger's, say
+    plans = [make_plan(*THREE, transactional=False, plan_id=plan_id) for plan_id in ("p1", "p2", "p3")]
+    env = env_of(EditFake({"u1": trigger}), *plans)
+    failed = env.apply()
+    assert (outcome(failed).outcome, outcome(failed).applied, outcome(failed).failed_change, error(failed).code) == (
+        "unknown", ["c0"], "c1", "1062")
+    env.conn.answers["u1"] = BLOCK  # a cancel that reaches the statement once it was sent
+    env.submit("p2", rid="b")
+    assert env.conn.blocked.wait(5)
+    env.worker.cancel("b")
+    cancelled = env.events("b")
+    assert (outcome(cancelled).outcome, outcome(cancelled).applied, outcome(cancelled).failed_change) == (
+        "unknown", ["c0"], "c1")
+    assert error(cancelled).message.startswith("Cancelled: this change may have taken effect")
+    env.conn.answers["u1"] = 0  # the exception: a conflict that matched no row changed nothing
+    conflict = outcome(env.apply("p3", rid="c"))
+    assert (conflict.outcome, conflict.applied, conflict.failed_change) == ("partial", ["c0"], "c1")
+
+
+@pytest.mark.parametrize(("dialect", "expected"), [(Dialect.TSQL, "unknown"), (Dialect.SQLITE, "rolled_back")])
+def test_a_trigger_that_ended_the_transaction_makes_the_outcome_unknown(env_of, dialect, expected):  # item 2: 3609
+    ended = StatementError("The transaction ended in the trigger. The batch has been aborted.", code="3609")
+    env = env_of(EditFake({"u1": ended}), make_plan(*THREE), dialect=dialect)
+    events = env.apply()
+    assert (outcome(events).outcome, outcome(events).failed_change, outcome(events).statement) == (expected, "c1", 1)
+    assert env.conn.runs == ["BEGIN", "d0", "u1"] and env.conn.commits == 0

@@ -988,7 +988,7 @@ class SessionWorker:
         try:
             plan = self._take_plan(cmd.plan_id)
             req.sql = plan.script  # what History keeps (D-05-9)
-            progress = EditProgress(plan.statements, plan.transactional)
+            progress = EditProgress(plan.statements, plan.transactional, dialect=self._hooks.dialect)
             self._check_plan(plan)
             report = self._run_plan(req, plan, progress)
         except StatementError as exc:  # refused before anything was sent: _run_plan classifies every stop of its own
@@ -1035,8 +1035,10 @@ class SessionWorker:
             return refused(exc)
         progress.sent = True
         for index, statement in enumerate(plan.statements):
-            progress.index = index
+            progress.index, progress.reached = index, False
             try:
+                self._raise_if_cancelled()  # a Cancel between statements: this one was never sent
+                progress.reached = True
                 rows = self._edit_statement(req, statement.sql)
                 if rows is not None and rows >= 0:
                     req.rows += rows
