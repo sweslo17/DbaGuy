@@ -1811,7 +1811,7 @@ git commit -m "docs: 04c in CLAUDE.md and the spec (documents through SQL++, the
 | Byte-exact saves need a KV store (`DocumentStore` with the SDK or the KV protocol, R-04-2 option C); SQL++ always sorts keys, compacts whitespace and respells numbers. | ruling C12 |
 | Flags and user xattrs after a SQL++ save were not probed (an SDK-written document with a custom transcoder or xattrs may change). | company checklist |
 | No rename (insert + remove), no field-level editor, no Save from the close prompt. | spec §1, ruling C20 |
-| A TS test runner for the pure frontend helpers (`idPrefill`, the save hook's error mapping, `workspaceFile`'s document entries) — still none (04b carry). | B30 |
+| Vitest exists since 04c (C35) for the pure frontend modules (`documentState`, `startingPoint`, `summarizePreview`, `workspaceFile`); the React wiring (`useDocumentSave`, `DocumentTab`, the dialogs) has no component tests (the review's jsdom probes stayed in scratch). | C35; final review |
 | The save preview of a 20 MiB document whose every object the server re-sorts takes several seconds (about 0.4 s per MiB), shown as a busy tab. | ruling C3 |
 
 ## Planning rulings

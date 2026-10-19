@@ -540,10 +540,10 @@ CAS 以 JSON 整數 literal 送（uint64；〔實測〕目前 < 2⁶³，約到 
 
 04c 實作時的細化：
 - ⌘S 在文字與載入或上次存的相同時什麼都不送（前端以 baseline 判斷，C12、C32）；只有 Save、新文件的第一次存、Delete… 會寫入。這回答了使用者在 04a 的問題（byte-exact 存檔重不重要）：SQL++ 存不出 byte-exact，所以 DbaGuy 永遠不重新編碼使用者沒編輯的文件、每一個 token 的改變都在發生之前顯示。
-- 確認過的存檔之後，編輯器顯示 server 的形式（原文有換行就排版）並以它為新的 baseline（C13）；直接存之後保留使用者的文字。
+- 確認過的存檔之後，編輯器顯示 server 的形式（原文有換行、且 server 的文字不超過 `SERVER_TEXT_SHOWN_MAX` 時才排版，更大的顯示精簡形式，final review M4）並以它為新的 baseline（C13）；直接存之後保留使用者的文字。
 - 預覽用的 `server_form` 是一次短的 metadata 呼叫，比較（diff）在 request 執行緒，寫入是另一次短的 metadata 呼叫，所以一份要幾秒才比得完的文件不會擋住這個 profile 的樹、補全與取樣（C43）。寫入的呼叫帶「已放棄」旗標：在佇列裡就逾時的寫入永遠不會執行，開始後才逾時算 unknown（C42）。
 - 寫入前閒置超過 2 秒的連線先做一次可重送的檢查，讓被 server 關掉的 keep-alive 在寫入之前就換掉（C40）；request body 的每個原文 literal 組裝時檢查剛好是一個 JSON 值，否則一句都不送（C39）。
-- 刪除時 server 說文件已不存在＝使用者要的結果（C46）；密碼不在時（後端重啟後）寫入回 `password_required`，前端開 unlock 對話框，取消則這次存檔結束（C31、C48）。
+- 刪除時 server 說文件已不存在＝使用者要的結果（C46）；密碼不在時（後端重啟後）寫入回 `password_required`，前端開 unlock 對話框，取消則這次存檔結束（C31、C48）；之後的重送只在文字沒變時原樣送出，刪除也是：文字變過就再問一次 Delete 的確認（final review P9）。
 
 #### 3.9.4 API（`/couchbase/documents/*`，全部帶 `profile_id` 與 `keyspace{bucket, scope, collection}`）
 
@@ -555,7 +555,7 @@ CAS 以 JSON 整數 literal 送（uint64；〔實測〕目前 < 2⁶³，約到 
 | `POST /remove` | `id, cas` | 204 或錯誤 |
 | `POST /couchbase/statement-keyspace` | `sql, query_context` | 該語句讀的 collection（只有一個、完整寫出或照執行時的 context 解析）或 `null`；純函式，不連線；grid 的「Open document…」預填用（C44） |
 
-CAS 是 `^[1-9][0-9]{0,18}$` 的十進位字串且 ≤ int64（C11）；ID 1–250 UTF-8 bytes；文字最多 20 MiB。錯誤（C11）：`document_missing` 404、`document_conflict` 409（`detail.cas`）、`document_exists` 409、`binary_document` 422、`invalid_json` 422（`detail.offset` 是 UTF-16 位移、`detail.reason`）、`number_out_of_range` 422（`detail.paths`，路徑只在 detail，不進訊息與 log）、`read_only` 403、`write_outcome_unknown` 502。
+CAS 是 `^[1-9][0-9]{0,18}$` 的十進位字串且 ≤ int64（C11）；ID 1–250 UTF-8 bytes；文字最多 20 MiB（超過時 `validation_failed` "Documents are limited to 20 MiB"；API 收下的上限是 4 倍，只決定訊息，C51）。錯誤（C11）：`document_missing` 404、`document_conflict` 409（`detail.cas`）、`document_exists` 409、`binary_document` 422、`invalid_json` 422（`detail.offset` 是 UTF-16 位移、`detail.reason`）、`number_out_of_range` 422（`detail.paths`，路徑只在 detail，不進訊息與 log）、`read_only` 403、`write_outcome_unknown` 502。
 
 ### 3.10 EXPLAIN、ADVISE、profile（R-04-13；`adapters/couchbase/explain.py`）
 
@@ -634,8 +634,8 @@ Document tab：
 - 標題＝ID（tooltip 是 keyspace）；META 列：CAS、expiration（本地時間＋相對時間，或「none」）、type、大小。04c：tab 的所有狀態轉換（載入、Retry、Reload、dirty／baseline、衝突、已不存在、Create it、確認過的存檔、unlock）放在純函式 reducer `documentState.ts`，由 Vitest 測（C35）；`CodeEditor.setText` 一律把新文字當新的起點、清空 undo 歷史（`startingPoint.ts`）。
 - CodeMirror＋`@codemirror/lang-json`（新相依，約 10 KB，相依的 `@lezer/json` 很小、`@codemirror/language` 已有；plan 時確認最新版與發佈日期）。內容是存放原文；「Format」用 `json.ts` 的 `formatJson`（保留數字 literal 與 key 順序）。
 - ⌘S 存檔 → 預覽對話框（有 `changes` 時）→ 確認；`number_out_of_range` → 錯誤面板列出路徑、不可存。衝突 → 「文件在你開啟後被改過／被刪除」：Reload（放棄修改，先確認）、Copy my version、Cancel。04c：預覽的第一行先講改值的項目（「N values change」，列表不完整時是「at least N」），再講其他類別；沒改過的文件按 ⌘S 只提示 "No changes to save"（C12）；確認過的存檔之後編輯器顯示 server 的形式（C13）；存檔、新增、刪除進行中編輯器唯讀（C14）。衝突時若文件已被刪除，提供「Save as new document」（連同 Copy my version、Cancel）而不是 Reload（C22）。
-- Delete…（不可復原 → 確認對話框）、Reload、Copy。唯讀 profile → 編輯器唯讀＋提示。binary → 只顯示 META 與「binary document (N bytes) — view only」。04c：binary 文件顯示 META 與 "view only"（沒有 Save、Delete、編輯器）；文件已不存在時顯示「Create it」（tab 有未存文字時保留編輯器，唯讀，只能 Create it 或在衝突對話框選 Save as new document，C30、C47）；關閉有未存修改的 document tab 問「Discard unsaved changes?」（Discard／Cancel，沒有 Save，C20；沒顯示過的還原 tab 也問，C28）。
-- 未存的內容與所根據的 CAS 存進 workspace（`buffer`、`document_cas`），當機重開還在；存檔時照 CAS 檢查。04c：只保存新文件或有未存修改的文件（`buffer`＋`document_cas`），乾淨的文件重開時從 server 讀、tab 第一次顯示才讀（C15、C16）。
+- Delete…（不可復原 → 確認對話框；有未存修改時訊息說明一起捨棄，final review M2）、Reload、Copy（有未存修改時在錯誤／binary 面板下也能用，面板上有「Copy my edits」，M1）。唯讀 profile → 編輯器唯讀＋提示。binary → 只顯示 META 與「binary document (N bytes) — view only」。04c：binary 文件顯示 META 與 "view only"（沒有 Save、Delete、編輯器）；文件已不存在時顯示「Create it」（tab 有未存文字時保留編輯器，唯讀，只能 Create it 或在衝突對話框選 Save as new document，C30、C47；提示寫「先 Create it，再 ⌘S」，P6）；關閉有未存修改的 document tab 問「Discard unsaved changes?」（Discard／Cancel，沒有 Save，C20；沒顯示過的還原 tab 也問，C28）。
+- 未存的內容與所根據的 CAS 存進 workspace（`buffer`、`document_cas`），當機重開還在；存檔時照 CAS 檢查。04c：只保存新文件或有未存修改的文件（`buffer`＋`document_cas`），乾淨的文件重開時從 server 讀、tab 第一次顯示才讀（C15、C16）；還原時 profile 已不存在，有未存文字的文件 tab 以沒有連線的 query tab 重開、標題是文件 ID（final review M6）。
 - 開啟：樹的「Open document by ID…」、grid 的「Open document…」（ID 預填該列名為 `id` 的欄或被點的字串 cell，keyspace 預填 tab 的 context＋上次用的 collection，對話框可改）。04c：新增「New document…」（樹，唯讀 profile 沒有）：ID 在對話框決定，內容從 `{}` 開始，第一次存照樣預覽，ID 已存在時提供「Open the existing document」（確認後捨棄草稿，C19）；grid 的預填改用該語句自己的 keyspace（`/couchbase/statement-keyspace`），其次才是 tab 的 context 與上次用的 collection（C44）。
 
 ## 4. 錯誤處理
