@@ -3,10 +3,11 @@ numbers, key order and escapes stay exactly as they are. Here, not in the adapte
 `formatting.py` use them and `sql/` takes no import from an adapter.
 
 `value_end` locates a JSON value without building it: the response parser finds where an object or array inside a row
-ends this way, so a big document costs its text, not a decoded tree. The checks a document save needs are built on it
-(04c): `json_problem` says where a text stops being JSON, `number_paths` names the numbers the server would change, and
-`diff` lists what the server would store differently from the edited text. None of them builds a tree (ruling C3): they
-walk the text level by level, and `diff` skips every subtree whose text is the same on both sides."""
+ends this way, so a big document costs a few times its text (how many depends on its shape, see `_LEAN`), never a
+decoded tree. The checks a document save needs are built on it (04c): `json_problem` says where a text stops being
+JSON, `number_paths` names the numbers the server would change, and `diff` lists what the server would store
+differently from the edited text. None of them builds a tree (ruling C3): they walk the text level by level, and `diff`
+skips every subtree whose text is the same on both sides."""
 
 import json
 import re
@@ -29,17 +30,24 @@ class NotJson(ValueError):
     """NaN or Infinity: Python's decoder reads them, JSON has no such values."""
 
 
-def _not_json(name: str) -> NoReturn:
+def reject_constant(name: str) -> NoReturn:
+    """A JSON decoder's `parse_constant`: NaN, Infinity and -Infinity are not JSON."""
     raise NotJson(f"{name} is not JSON")
 
 
 # The C decoder with hooks that keep nothing: each object and number is handed to `bool` as soon as it has been read and
-# only a shared True or False is kept, so finding where a value ends costs its text, not a tree (an array still holds
-# its elements until it closes: an array of many short strings peaks at about 7× its text). Strings are still decoded,
-# which also checks their escapes. `bool` rather than a Python function: no Python frame runs per number or object
-# (number-dense text is located 20% faster than the row decoder decodes it, not 20% slower), and the nesting limit
-# stays the row decoder's (a Python hook called at the deepest level refused rows two levels shallower).
-_LEAN = json.JSONDecoder(object_pairs_hook=bool, parse_int=bool, parse_float=bool, parse_constant=_not_json)
+# only a shared True or False is kept. Strings are still decoded, which also checks their escapes. Arrays have no hook:
+# an array holds its elements until it closes (each closed inner array stays a list in it), and an open object holds its
+# members in a dict. So what locating a value costs depends on its shape. Peaks over a whole 4 MiB row (its texts
+# included), decoding the tree in brackets: objects or numbers 3.0× (9.9–11×); an object keyed by id 4.4× (12×);
+# `[[ts, value], …]` 6.2× (13×); an array of short strings 6.8× (8.8×); one flat object with many keys 8.5× (12×), and
+# 11.6× (14×) at 20 MiB; `[[1, 2], …]` 17× (19×); `[[], …]` 23× (25×). Never more than decoding.
+# `bool` rather than a Python function: no Python frame runs per number or object (number-dense text is located
+# 20% faster than the row decoder decodes it, not 20% slower), and the nesting limit stays the row decoder's (a Python
+# hook called at the deepest level refused rows two levels shallower). `object_hook` rather than `object_pairs_hook`:
+# an open object's member takes a dict slot, not a tuple and a list slot (one flat object with many keys 8.5×, not
+# 11.8×).
+_LEAN = json.JSONDecoder(object_hook=bool, parse_int=bool, parse_float=bool, parse_constant=reject_constant)
 
 
 # Runs of tokens with no whitespace between them: a string (kept whole), or anything else that is not whitespace (the

@@ -11,8 +11,10 @@ Rows keep the server's exact text (`RawRow.text`, and each member's text for an 
 into Python numbers here (`1.10`, `-0`, `1E+3`, `9007199254740993`, `1e400` stay as sent), keys stay in order. A row's
 `value` is decoded with numbers left as text, so it only means something for strings, true, false and null; the cell
 decision (Task 8's `value_cell`) reads the text. An object or array inside a row is located with `jsontext.value_end`
-(checked by the C decoder, never decoded) and its `value` is None: a 20 MiB document costs about three times its text
-while it is parsed, not a tree (ruling C9).
+(checked by the C decoder, never decoded) and its `value` is None, so a document is never held as a tree (ruling C9).
+While it is parsed, a document of objects, numbers or long strings costs about three times its text; an array of many
+short strings or `[ts, value]` pairs about 6–7×, one object with very many keys up to about 12×, an array of many tiny
+arrays (`[[1, 2], …]`, `[[], …]`) up to about 23×: never more than decoding it cost (measured at `jsontext._LEAN`).
 
 How bytes become events:
 - A strict incremental UTF-8 decoder (a character cut between chunks waits for its other bytes).
@@ -36,9 +38,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from json.decoder import scanstring
-from typing import Any, Literal, NoReturn
+from typing import Any, Literal
 
-from ...sql.jsontext import value_end
+from ...sql.jsontext import reject_constant, value_end
 
 JsonKind = Literal["string", "number", "boolean", "null", "object", "array"]
 
@@ -115,14 +117,10 @@ _KIND_BY_FIRST: dict[str, JsonKind] = {
 }
 
 
-def _reject_constant(name: str) -> NoReturn:
-    raise ValueError(f"{name} is not JSON")
-
-
 # Rows: numbers stay text (no float, no int() digit limit); values are decoded only to find their end and read strings.
-_ROW_DECODER = json.JSONDecoder(parse_int=str, parse_float=str, parse_constant=_reject_constant)
+_ROW_DECODER = json.JSONDecoder(parse_int=str, parse_float=str, parse_constant=reject_constant)
 # Top-level metadata (signature, errors, warnings, status, metrics, profile): small, decoded as usual.
-_META_DECODER = json.JSONDecoder(parse_constant=_reject_constant)
+_META_DECODER = json.JSONDecoder(parse_constant=reject_constant)
 
 # A scan: the value at s[i] and the index after it (json.JSONDecodeError when there is no complete value there).
 _Scan = Callable[[str, int], tuple[Any, int]]

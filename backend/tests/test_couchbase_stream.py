@@ -5,10 +5,13 @@ import tracemalloc
 
 import pytest
 
+from dbaguy_backend.adapters.base import StatementError
+from dbaguy_backend.adapters.couchbase.result import EventStream
 from dbaguy_backend.adapters.couchbase.stream import (
     EndEvent, FieldEvent, ProtocolError, RawRow, ResponseParser, ResultsEnd, ResultsStart, RowEvent, RowField,
     json_kind, parse_row, split_object,
 )
+from tests.couchbase_fakes import FakeResponse
 from tests.support import scaled
 
 FULL = (
@@ -132,8 +135,22 @@ def test_malformed_nested_values_are_still_reported(data):
         assert not error.truncated, cut
 
 
+def test_a_row_nested_deeper_than_python_allows_is_malformed_not_cut():  # the connection was not lost
+    deep = "[" * 100_000 + "]" * 100_000
+    data = ('{"results":[1,{"d":' + deep + '},' + deep + '],"status":"success"}').encode()
+    for cuts in ([], [len(data) // 3, len(data) // 2], list(range(64 * 1024, len(data), 64 * 1024))):
+        events, error = parse_until_failure(data, cuts)
+        assert [e.row.text for e in events if isinstance(e, RowEvent)] == ["1"]
+        assert not error.truncated and error.field == "results" and "recursion" in str(error), cuts
+    stream = EventStream(FakeResponse([data]), cancelled=lambda: False, node="n:8093")
+    with pytest.raises(StatementError) as failed:
+        while stream.next() is not None:
+            pass
+    assert failed.value.code == "protocol_error"
+
+
 def _big_document(shape: str, size: int) -> str:
-    """A JSON object of about `size` characters: many small objects, many numbers, or many short strings."""
+    """A JSON object of about `size` characters: many small objects, numbers, `[ts, value]` pairs or short strings."""
     rng = random.Random(7)
     parts, length, i = [], 0, 0
     while length < size:
@@ -142,6 +159,8 @@ def _big_document(shape: str, size: int) -> str:
                                "tags": ["a", "b", str(i)], "nested": {"x": i, "y": [1, 2, {"z": 'q"<>'}], "f": True}})
         elif shape == "numbers":
             part = str(rng.randrange(10**6))
+        elif shape == "pairs":  # a time series or coordinates: [[ts, value], …]
+            part = f"[{1700000000 + i},{round(rng.random() * 100, 2)}]"
         else:
             part = json.dumps(f"s{i}")
         parts.append(part)
@@ -158,7 +177,7 @@ def _first_row(data: bytes) -> RawRow:
     return next(e.row for e in events if isinstance(e, RowEvent))
 
 
-@pytest.mark.parametrize("shape, peak_limit", [("objects", 4.0), ("numbers", 4.0), ("strings", 8.0)])
+@pytest.mark.parametrize("shape, peak_limit", [("objects", 4.0), ("numbers", 4.0), ("strings", 8.0), ("pairs", 7.0)])
 def test_a_big_document_costs_its_text_not_a_decoded_tree(shape, peak_limit):  # Review Focus 5, ruling C9
     doc = _big_document(shape, 4 * 1024 * 1024)
     data = ('{"signature":{"cas":"json","expiration":"json","type":"json","d":"json"},"results":['
@@ -170,7 +189,7 @@ def test_a_big_document_costs_its_text_not_a_decoded_tree(shape, peak_limit):  #
     finally:
         tracemalloc.stop()
     assert row.fields[3].text == doc and row.fields[3].value is None
-    assert peak < peak_limit * len(doc), peak / len(doc)  # decoding the tree took 9.3×, 11.1× and 8.7×
+    assert peak < peak_limit * len(doc), peak / len(doc)  # decoding the tree took 9.3×, 11.1×, 8.7× and 13.3×
     assert held < 2.5 * len(doc), held / len(doc)  # the row's text and the member's text
 
 
