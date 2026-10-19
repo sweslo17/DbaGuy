@@ -1,5 +1,7 @@
 """The shape of grid-edit requests (spec ⑤ §3.3.1, D-05-11, ruling E8): refused as a whole (422) when malformed."""
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -37,6 +39,21 @@ def test_a_lone_surrogate_is_refused_on_its_cell():  # ruling E19: pydantic refu
     with pytest.raises(ValidationError) as raised:
         EditChanges.model_validate(bad)
     assert raised.value.errors()[0]["loc"] == ("inserts", 0, "values", "label", "text")
+
+
+@pytest.mark.parametrize(("change", "loc"), [
+    ({"deletes": [{"id": "d:1", "key": {"half \ud83d": 1}}]}, ("deletes", 0, "key")),
+    ({"updates": [{"id": "u:1", "key": {"id": 1}, "set": {"\ud83d": {"kind": "null"}}, "original": {"\ud83d": "x"}}]},
+     ("updates", 0, "set")),
+    ({"inserts": [{"id": "i:1", "values": {"": {"kind": "null"}}}]}, ("inserts", 0, "values")),
+    ({"inserts": [{"id": "i:1", "values": {"c" * 1025: {"kind": "null"}}}]}, ("inserts", 0, "values")),
+])
+def test_a_column_name_is_valid_text(change, loc):  # review F4: a 422 whose body can be sent, never a 500
+    with pytest.raises(ValidationError) as raised:
+        EditChanges.model_validate(change)
+    errors = raised.value.errors(include_input=False)
+    assert errors[0]["loc"][:3] == loc
+    json.dumps(errors, ensure_ascii=False).encode()  # what the 422 handler sends: no lone surrogate left in it
 
 
 def test_an_edit_kind_comes_from_the_grid_category():

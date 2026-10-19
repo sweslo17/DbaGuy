@@ -5,6 +5,7 @@ matched in a WHERE (spec ⑤ D-05-1). Pure: no I/O; quoting and literal syntax c
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic import JsonValue
@@ -15,8 +16,8 @@ from ..domain.column_category import ColumnCategory
 from ..domain.edits import MAX_VALUE_CHARS, CellInput, EditColumn, EditKind, EditProblemCode, kind_category
 from ..domain.errors import ValidationFailed
 from .dialects import (
-    NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, datetime_literal, json_literal, quote_ident, quote_literal,
-    zero_date_as_text,
+    NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, datetime_literal, in_list, json_literal, quote_ident,
+    quote_literal, zero_date_as_text,
 )
 from .jsontext import LONE_SURROGATE, json_problem
 
@@ -230,24 +231,60 @@ class ValueProblem(Exception):
 _TRUE = frozenset({"true", "t", "1", "yes"})
 _FALSE = frozenset({"false", "f", "0", "no"})
 _PG_SPECIAL_NUMBERS = {"nan": "NaN", "infinity": "Infinity", "-infinity": "-Infinity"}
-# A SQLite integer is 64-bit (at most 19 digits): longer digits are text, and int() of them could exceed Python's
-# 4,300-digit conversion limit (ValueError)
-_INTEGER = re.compile(r"-?[0-9]{1,19}")
+# A 64-bit integer as SQLite and encode_value write it: no leading zero, no sign on 0. The length bound also keeps int()
+# below Python's 4,300-digit conversion limit; the range is checked by _int64_text.
+_INT64 = re.compile(r"0|-?[1-9][0-9]{0,18}")
+_EXACT_DIGITS = 38  # the most digits an exact numeric literal holds on SQL Server (MySQL: 65)
 _SHOWN = 60  # characters of a key value a message shows
+_LONE_SURROGATE_TEXT = "The value holds a character that is not valid text (half of an emoji?)"
+_NUL_TEXT = "The value holds a NUL character (U+0000), which cannot be written here"
+
+
+def _unsendable(dialect: Dialect, text: str, style: LiteralStyle) -> str | None:
+    """Why `text` cannot go into a quoted literal, or None (spec §3.3.3, rulings E16, E19): a lone surrogate, which no
+    driver sends; U+0000 in PostgreSQL, whose text cannot hold it, and in MySQL without backslash escapes."""
+    if not text.isascii() and LONE_SURROGATE.search(text):
+        return _LONE_SURROGATE_TEXT
+    if "\x00" in text and (dialect is Dialect.POSTGRES or (dialect is Dialect.MYSQL and style.backslash_escapes is False)):
+        return _NUL_TEXT
+    return None
 
 
 def _sendable(dialect: Dialect, text: str, style: LiteralStyle) -> None:
-    """Text that can go into a quoted literal (`invalid_text`, spec §3.3.3, ruling E16)."""
-    if not text.isascii() and LONE_SURROGATE.search(text):
-        raise ValueProblem("invalid_text", "The value holds a character that is not valid text (half of an emoji?)")
-    if "\x00" in text and (dialect is Dialect.POSTGRES or (dialect is Dialect.MYSQL and style.backslash_escapes is False)):
-        raise ValueProblem("invalid_text", "The value holds a NUL character (U+0000), which cannot be written here")
+    """Text that can go into a quoted literal (`invalid_text`)."""
+    if (message := _unsendable(dialect, text, style)) is not None:
+        raise ValueProblem("invalid_text", message)
+
+
+def _int64_text(text: str) -> bool:
+    return _INT64.fullmatch(text) is not None and -(2**63) <= int(text) < 2**63
+
+
+def _exact_number(dialect: Dialect, value: str) -> str:
+    """A number literal the dialect reads exactly. MySQL, SQL Server and SQLite read one with an exponent as a double
+    (`9007199254740993e0` would lose its last digit), so it goes in plain decimal form when that has at most
+    `_EXACT_DIGITS` digits; beyond, as typed, for the server to judge. PostgreSQL reads it as an exact numeric."""
+    if dialect is Dialect.POSTGRES or not ("e" in value or "E" in value):
+        return value
+    number = Decimal(value)
+    _, digits, exponent = number.as_tuple()
+    if len(digits) + abs(int(exponent)) > 2 * _EXACT_DIGITS:  # the plain form is longer still: never build it (1e999999)
+        return value
+    plain = format(number, "f")
+    return plain if sum(character.isdigit() for character in plain) <= _EXACT_DIGITS else value
+
+
+def _sqlite_reads_as_typed(text: str) -> bool:
+    """SQLite stores a bare number whose text is `text` again: a 64-bit integer as it writes one, or a real as Python
+    (the grid) writes it (ruling G1). `007`, `0912345678`, `1.10`, `-0`, `1e5` and integers beyond 64 bits are not:
+    in a column without a declared type they are stored as the typed text."""
+    return _int64_text(text) or (NUMERIC_LITERAL.fullmatch(text) is not None and repr(float(text)) == text)
 
 
 def _number(dialect: Dialect, text: str) -> str:
     value = text.strip()
     if NUMERIC_LITERAL.fullmatch(value):
-        return value
+        return _exact_number(dialect, value)
     if dialect is Dialect.POSTGRES and (special := _PG_SPECIAL_NUMBERS.get(value.lower())):
         return quote_literal(dialect, special)
     raise ValueProblem("invalid_number", "Not a number")
@@ -300,8 +337,8 @@ def input_literal(dialect: Dialect, column: EditColumn, cell: CellInput, style: 
         case "datetime":
             _sendable(dialect, text, style)
             return style.datetime(dialect, text)
-        case "other" if dialect is Dialect.SQLITE and NUMERIC_LITERAL.fullmatch(text.strip()):
-            return text.strip()  # no affinity: a number is stored as a number (spec §3.3.3)
+        case "other" if dialect is Dialect.SQLITE and _sqlite_reads_as_typed(text.strip()):
+            return text.strip()  # no affinity: a number is stored as that number (spec §3.3.3, ruling G1)
         case _:
             _sendable(dialect, text, style)
             return style.quote(dialect, text)
@@ -320,38 +357,54 @@ def _server_text(cell: Cell) -> str:
             return str(cell)
 
 
+UnmatchedReason = Literal["preview_only", "unsendable"]
+
+
+def _unmatched(dialect: Dialect, cell: Cell, style: LiteralStyle) -> UnmatchedReason | None:
+    if cell is MISSING_CELL or _partial(cell):
+        return "preview_only"
+    text = cell.text if isinstance(cell, Json) else cell if isinstance(cell, str) else None
+    return "unsendable" if text is not None and _unsendable(dialect, text, style) is not None else None
+
+
+def unmatched_reason(dialect: Dialect, value: JsonValue, style: LiteralStyle) -> UnmatchedReason | None:
+    """Why `match_condition` writes no term for `value` whatever the column's compare, or None when the cell allows one
+    (NULL always does: `c IS NULL`). `preview_only`: the grid holds no complete value (cut text, partial bytes; SQL++
+    MISSING, which no table has). `unsendable`: its text holds a character no literal can carry (a lone surrogate;
+    U+0000 in PostgreSQL, or in MySQL without backslash escapes). A key is then incomplete, an original unchecked. An
+    original of a column whose compare is `none` has no term either: that reason is the column's. Raises
+    ValidationFailed for a malformed cell, as match_condition does."""
+    return None if value is None else _unmatched(dialect, _cell(value), style)
+
+
 def match_condition(
     dialect: Dialect, column: EditColumn, value: JsonValue, style: LiteralStyle, *, key: bool
 ) -> str | None:
     """The WHERE term that pins `column` to `value`, an encoded grid cell (spec §3.3.3, D-05-2): `c = <literal>` for a
     key (always `=`, so an index can be used) and for an `equals` original; `c::text = '<text>'` for an `as_text` one
     (PostgreSQL: exactly the text the session loaded, A4); `c IS NULL` for NULL whatever the compare (ruling E5). None
-    when no exact term exists: the cell is only a preview, or the column's compare is `none`."""
+    when no exact term exists: `unmatched_reason` says why, or else the original's column compares `none`."""
     name = quote_ident(dialect, column.name)
     if value is None:
         return f"{name} IS NULL"
     cell = _cell(value)
-    if cell is MISSING_CELL or _partial(cell):
-        return None
-    if isinstance(cell, str) and ((not cell.isascii() and LONE_SURROGATE.search(cell)) or
-                                  ("\x00" in cell and dialect is Dialect.MYSQL and style.backslash_escapes is False)):
-        # no literal can carry it: no driver sends a lone surrogate (ruling E19), and MySQL writes U+0000 only with
-        # backslash escapes (ruling E16, pre-flight L6). A key is then incomplete, an original unchecked
+    if _unmatched(dialect, cell, style) is not None:
         return None
     compare = "equals" if key else column.compare
     if compare == "none":
         return None
     if compare == "as_text":
         return f"{name}::text = {quote_literal(dialect, _server_text(cell))}"
-    if (dialect is Dialect.SQLITE and column.kind == "other" and isinstance(cell, str) and _INTEGER.fullmatch(cell)
+    if (dialect is Dialect.SQLITE and column.kind == "other" and isinstance(cell, str) and _int64_text(cell)
             and abs(int(cell)) > MAX_SAFE_INT):
         # ruling E7: no affinity, and encode_value sent this integer as text; it may be stored as either
-        return f"{name} IN ({cell}, {quote_literal(dialect, cell)})"
+        return f"{name} IN {in_list(dialect, [cell, quote_literal(dialect, cell)])}"
     return _equality(dialect, name, cell, kind_category(column.kind), style)
 
 
-def _cut(text: str) -> str:
-    return text if len(text) <= _SHOWN else text[:_SHOWN] + "…"
+def _cut(text: str, *, more: bool = False) -> str:
+    """At most `_SHOWN` characters, and one "…" when anything is left out, here or already by the grid (`more`)."""
+    return text[:_SHOWN] + "…" if more or len(text) > _SHOWN else text
 
 
 def cell_text(value: JsonValue, kind: EditKind) -> str:
@@ -368,9 +421,9 @@ def cell_text(value: JsonValue, kind: EditKind) -> str:
         case int() | float():
             return str(cell)
         case Binary():
-            return "0x" + _cut(cell.hex) + ("…" if cell.truncated else "")
+            return "0x" + _cut(cell.hex, more=cell.truncated)
         case Truncated():
-            return "'" + _cut(cell.preview) + "…'"
+            return "'" + _cut(cell.preview, more=True) + "'"
         case Json():
             return _cut(cell.text)
         case str() if kind == "number" and NUMERIC_LITERAL.fullmatch(cell):

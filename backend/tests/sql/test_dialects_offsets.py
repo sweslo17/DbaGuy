@@ -120,7 +120,7 @@ def test_no_literal_carries_a_raw_nul(dialect, expected, strings):  # the worker
 def test_tsql_datetime_literals_are_language_neutral():  # R-03b-P10
     assert datetime_literal(TS, "2026-10-18 12:34:56.123") == "N'2026-10-18T12:34:56.123'"
     assert datetime_literal(TS, "2026-10-18 12:34:56.123456+08:00") == "N'2026-10-18T12:34:56.123456+08:00'"
-    assert datetime_literal(TS, "2026-10-18") == "N'2026-10-18'"  # a date alone is neutral for date columns
+    assert datetime_literal(TS, "2026-10-18") == "N'20261018'"  # datetime reads 2026-10-18 by DATEFORMAT too
     assert datetime_literal(TS, "12:34:56") == "N'12:34:56'"
     assert datetime_literal(PG, "2026-10-18 12:34:56") == "'2026-10-18 12:34:56'"
     assert datetime_literal(MY, "2026-10-18 12:34:56") == "'2026-10-18 12:34:56'"

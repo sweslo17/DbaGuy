@@ -66,6 +66,9 @@ class _Input(BaseModel):
 
 
 ChangeId = Annotated[str, Field(min_length=1, max_length=100)]  # made by the client ("u:…", "i:…", "d:…"), echoed
+# A column a change names: valid text, so a lone surrogate in a name is a 422 (its `loc` shows U+FFFD) and never
+# reaches a statement or an error body that cannot be encoded
+ColumnName = Annotated[str, Field(min_length=1, max_length=1024)]
 
 
 class CellInput(_Input):
@@ -81,9 +84,9 @@ class CellInput(_Input):
 
 class RowUpdate(_Input):
     id: ChangeId
-    key: dict[str, JsonValue]  # the key cells as the grid loaded them (encode_value's output)
-    set: dict[str, CellInput] = Field(min_length=1)
-    original: dict[str, JsonValue]  # each set column's cell as loaded
+    key: dict[ColumnName, JsonValue]  # the key cells as the grid loaded them (encode_value's output)
+    set: dict[ColumnName, CellInput] = Field(min_length=1)
+    original: dict[ColumnName, JsonValue]  # each set column's cell as loaded
 
     @model_validator(mode="after")
     def _an_original_per_column(self) -> Self:
@@ -94,12 +97,12 @@ class RowUpdate(_Input):
 
 class RowInsert(_Input):
     id: ChangeId
-    values: dict[str, CellInput] = Field(default_factory=dict)  # a column left out takes its default
+    values: dict[ColumnName, CellInput] = Field(default_factory=dict)  # a column left out takes its default
 
 
 class RowDelete(_Input):
     id: ChangeId
-    key: dict[str, JsonValue]
+    key: dict[ColumnName, JsonValue]
 
 
 class EditChanges(_Input):

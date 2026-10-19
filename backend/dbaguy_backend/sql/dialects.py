@@ -239,7 +239,8 @@ _IN_LIST_BRACKETS: dict[Dialect, tuple[str, str]] = {  # SQL++: `x IN [1, 2]` (a
 KEYWORD_ONLY_DIALECTS: frozenset[Dialect] = frozenset({Dialect.SQLPP})
 # Unquoted identifiers keep their case: a formatter may not change it (format_guard).
 CASE_SENSITIVE_IDENTIFIERS: frozenset[Dialect] = frozenset({Dialect.SQLPP})
-_DATE_SPACE_TIME = re.compile(r"(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})")
+_DATE_ONLY = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
+_DATE_SPACE_TIME = re.compile(r"(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})", re.ASCII)
 NUMERIC_LITERAL = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?", re.ASCII)  # text that can be written as a bare number
 
 
@@ -303,10 +304,17 @@ def quote_literal(
 
 
 def datetime_literal(dialect: Dialect, text: str, *, backslash_escapes: bool | None = None) -> str:
-    """A date/time value given as the grid's text. SQL Server reads `2026-10-18 12:34:56` by the login's DATEFORMAT
-    (a dmy language such as British fails with error 242) but `2026-10-18T12:34:56` the same everywhere."""
-    if _ISO_DATETIME[dialect] and (found := _DATE_SPACE_TIME.match(text)):
-        text = f"{found.group(1)}T{found.group(2)}{text[found.end():]}"
+    """A date/time value given as the grid's text. SQL Server's datetime and smalldatetime read `2026-10-05` and
+    `2026-10-05 12:34:56` by the login's DATEFORMAT (a dmy language such as British stores 2026-05-10, or fails with
+    error 242) but `20261005` and `2026-10-05T12:34:56` the same everywhere, so T-SQL text is stripped, a date alone is
+    written without its dashes and a date and time are joined by a `T`. A time the server cannot read that way (a
+    one-digit hour) still goes with the `T`: the server refuses it rather than misreading it."""
+    if _ISO_DATETIME[dialect]:
+        text = text.strip()
+        if _DATE_ONLY.fullmatch(text):
+            text = text.replace("-", "")
+        elif found := _DATE_SPACE_TIME.match(text):
+            text = f"{found.group(1)}T{found.group(2)}{text[found.end():]}"
     return quote_literal(dialect, text, backslash_escapes=backslash_escapes)
 
 

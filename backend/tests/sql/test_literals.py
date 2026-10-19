@@ -9,7 +9,9 @@ from dbaguy_backend.sql.dialects import (
     Dialect, TransactionFrame, datetime_literal, insert_defaults, json_literal, quote_literal, script_text,
     transaction_frame,
 )
-from dbaguy_backend.sql.literals import LiteralStyle, ValueProblem, cell_text, input_literal, match_condition
+from dbaguy_backend.sql.literals import (
+    LiteralStyle, ValueProblem, cell_text, input_literal, match_condition, unmatched_reason,
+)
 
 PG, MY, TS, LITE = Dialect.POSTGRES, Dialect.MYSQL, Dialect.TSQL, Dialect.SQLITE
 PLAIN = LiteralStyle()
@@ -18,6 +20,7 @@ VARCHAR = LiteralStyle(national=False)
 BYTES = {"$type": "bytes", "size": 2, "preview": "00ff"}
 PARTIAL_BYTES = {"$type": "bytes", "size": 100, "preview": "00" * 64}
 CUT_TEXT = {"$type": "text", "preview": "abc", "size": 70_000, "truncated": True}
+JSON_NUL = {"$type": "json", "text": '"a\x00"'}
 
 
 def col(kind="text", compare="equals", name="c", **fields) -> EditColumn:
@@ -34,7 +37,7 @@ def value(text: str) -> CellInput:
     (PG, "number", " 42 ", PLAIN, "42"),
     (PG, "number", "9007199254740993", PLAIN, "9007199254740993"),
     (MY, "number", "1.10", PLAIN, "1.10"),
-    (TS, "number", "-1e3", PLAIN, "-1e3"),
+    (TS, "number", "-1e3", PLAIN, "-1000"),  # an exponent makes a float literal: plain decimal form instead
     (PG, "number", "NaN", PLAIN, "'NaN'"),
     (PG, "number", "-infinity", PLAIN, "'-Infinity'"),
     (PG, "text", "it's", PLAIN, "'it''s'"),
@@ -67,6 +70,43 @@ def value(text: str) -> CellInput:
 ])
 def test_input_literals(dialect, kind, text, style, expected):  # Review Focus 1
     assert input_literal(dialect, col(kind), value(text), style) == expected
+
+
+@pytest.mark.parametrize(("dialect", "text", "expected"), [
+    (MY, "9007199254740993e0", "9007199254740993"),
+    (TS, "1.5E-3", "0.0015"),
+    (LITE, "1e2", "100"),
+    (MY, "1e37", "1" + "0" * 37),  # 38 digits
+    (MY, "1e38", "1e38"),  # 39 digits: as typed, for the server to judge
+    (TS, "1e-40", "1e-40"),
+    (MY, "1e999999999", "1e999999999"),  # never written out in full
+    (PG, "9007199254740993e0", "9007199254740993e0"),  # PostgreSQL reads it as an exact numeric
+])
+def test_a_number_with_an_exponent_is_sent_exactly(dialect, text, expected):  # review F5: not as a double
+    assert input_literal(dialect, col("number"), value(text), PLAIN) == expected
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("42", "42"), (" -7 ", "-7"), ("0", "0"), ("1.5", "1.5"), ("-9223372036854775808", "-9223372036854775808"),
+    ("007", "'007'"), ("0912345678", "'0912345678'"), ("1.10", "'1.10'"), ("-0", "'-0'"), ("1e5", "'1e5'"),
+    ("12345678901234567890", "'12345678901234567890'"), ("9223372036854775808", "'9223372036854775808'"),
+])
+def test_an_untyped_sqlite_value_is_stored_as_typed(text, expected):  # ruling G1: bare only when it reads back so
+    assert input_literal(LITE, col("other"), value(text), PLAIN) == expected
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("2026-10-05", "N'20261005'"),
+    (" 2026-10-05 12:00:00", "N'2026-10-05T12:00:00'"),
+    ("2026-10-05  12:00:00", "N'2026-10-05T12:00:00'"),
+    ("2026-10-05 1:02:03", "N'2026-10-05T1:02:03'"),  # the server refuses it rather than misreading it
+    ("2026-10-05T12:00:00", "N'2026-10-05T12:00:00'"),
+    ("12:34:56", "N'12:34:56'"),
+])
+def test_tsql_dates_never_depend_on_dateformat(text, expected):  # review F1: datetime reads yyyy-mm-dd as ydm in dmy
+    assert input_literal(TS, col("datetime"), value(text), PLAIN) == expected
+    assert input_literal(TS, col("datetime"), value(text), VARCHAR) == expected  # datetimes keep N (ruling E17)
+    assert datetime_literal(LITE, " 2026-10-05") == "' 2026-10-05'"  # SQLite stores the text: never stripped
 
 
 def test_null_is_null_and_default_has_no_literal():
@@ -113,7 +153,7 @@ def test_a_value_beyond_the_limit_is_too_large():
     assert raised.value.code == "value_too_large"
 
 
-@pytest.mark.parametrize(("dialect", "column", "cell", "key", "style", "expected"), [
+MATCH_ROWS = [
     (PG, col("number", "as_text", "id"), 42, True, PLAIN, "id = 42"),
     (PG, col("number", "as_text", "id"), "9007199254740993", True, PLAIN, "id = 9007199254740993"),
     (PG, col("number", "as_text", "n"), "1.1000000000", False, PLAIN, "n::text = '1.1000000000'"),
@@ -147,15 +187,56 @@ def test_a_value_beyond_the_limit_is_too_large():
     (LITE, col("other", "equals", "o"), 42, False, PLAIN, "o = 42"),
     (LITE, col("other", "equals", "o"), "9007199254740993", True, PLAIN, "o IN (9007199254740993, '9007199254740993')"),
     (LITE, col("other", "equals", "o"), "9" * 5000, False, PLAIN, "o = '" + "9" * 5000 + "'"),  # text, not int64
+    (LITE, col("other", "equals", "o"), "9999999999999999999", True, PLAIN, "o = '9999999999999999999'"),  # > 2⁶³−1
+    (LITE, col("other", "equals", "o"), "-0009007199254740993", True, PLAIN, "o = '-0009007199254740993'"),
+    (LITE, col("other", "equals", "o"), "-9223372036854775808", True, PLAIN,
+     "o IN (-9223372036854775808, '-9223372036854775808')"),
+    (TS, col("datetime", "equals", "d"), "2026-10-05", True, PLAIN, "d = N'20261005'"),
+    (MY, col("json", "equals", "doc"), JSON_NUL, False, NO_BACKSLASH, None),
+    (MY, col("json", "equals", "doc"), JSON_NUL, False, PLAIN, "doc = CAST('\"a\\0\"' AS JSON)"),
+    (PG, col("json", "as_text", "j"), {"$type": "json", "text": '"\ud83d"'}, False, PLAIN, None),
+    (PG, col("text", "as_text", "t"), "a\x00", False, PLAIN, None),
     (LITE, col("number", "none", "r"), 1.5, False, PLAIN, None),
-])
+]
+
+
+@pytest.mark.parametrize(("dialect", "column", "cell", "key", "style", "expected"), MATCH_ROWS)
 def test_match_conditions(dialect, column, cell, key, style, expected):  # Review Focus 2, 3
     assert match_condition(dialect, column, cell, style, key=key) == expected
+
+
+@pytest.mark.parametrize(("dialect", "column", "cell", "key", "style", "expected"), MATCH_ROWS)
+def test_no_term_is_explained_by_the_cell_or_the_columns_compare(dialect, column, cell, key, style, expected):
+    """What the plan builder relies on to say why (review F3, G2): no term iff the cell is not NULL (`c IS NULL` always
+    is one) and it has an unmatched reason or it is an original whose column compares `none`."""
+    explained = cell is not None and (
+        unmatched_reason(dialect, cell, style) is not None or (not key and column.compare == "none"))
+    assert (expected is None) == explained
+
+
+@pytest.mark.parametrize(("dialect", "cell", "style", "reason"), [
+    (PG, None, PLAIN, None),
+    (PG, 42, PLAIN, None),
+    (PG, BYTES, PLAIN, None),
+    (PG, CUT_TEXT, PLAIN, "preview_only"),
+    (TS, PARTIAL_BYTES, PLAIN, "preview_only"),
+    (LITE, "half \ud83d", PLAIN, "unsendable"),
+    (PG, "a\x00", PLAIN, "unsendable"),
+    (MY, "a\x00", NO_BACKSLASH, "unsendable"),
+    (MY, "a\x00", PLAIN, None),
+    (TS, "a\x00", VARCHAR, None),
+    (LITE, "a\x00", PLAIN, None),
+    (MY, JSON_NUL, NO_BACKSLASH, "unsendable"),
+])
+def test_unmatched_reason(dialect, cell, style, reason):
+    assert unmatched_reason(dialect, cell, style) == reason
 
 
 def test_a_cell_that_is_not_a_grid_cell_is_refused():
     with pytest.raises(ValidationFailed):
         match_condition(PG, col(), {"$type": "nope"}, PLAIN, key=True)
+    with pytest.raises(ValidationFailed):
+        unmatched_reason(PG, {"$type": "nope"}, PLAIN)
 
 
 def test_cell_text_shows_a_key_as_a_message_would():
@@ -163,6 +244,14 @@ def test_cell_text_shows_a_key_as_a_message_would():
         "NULL", "42", "9007199254740993"]
     assert [cell_text("it's", "text"), cell_text(BYTES, "binary"), cell_text(True, "bool")] == ["'it's'", "0x00ff", "true"]
     assert cell_text("x" * 100, "text") == "'" + "x" * 60 + "…'"
+
+
+def test_a_cut_value_shows_one_ellipsis():
+    assert cell_text({"$type": "text", "preview": "x" * 100, "size": 200, "truncated": True}, "text") == (
+        "'" + "x" * 60 + "…'")
+    assert cell_text(CUT_TEXT, "text") == "'abc…'"
+    assert cell_text(PARTIAL_BYTES, "binary") == "0x" + "0" * 60 + "…"
+    assert cell_text({"$type": "bytes", "size": 2, "preview": "00"}, "binary") == "0x00…"
 
 
 def test_quote_literal_options():  # D-05-2 (A8), D-05-13, ruling E16
