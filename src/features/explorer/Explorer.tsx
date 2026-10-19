@@ -441,13 +441,7 @@ export function Explorer() {
           profile={unlock.profile}
           needs={unlock.needs}
           onOpenChange={(open) => !open && setUnlock(null)}
-          onUnlocked={() => {
-            void qc.refetchQueries({
-              queryKey: ["children", unlock.profile.id],
-              predicate: (query) => query.state.status === "error",
-            });
-            setUnlock(null);
-          }}
+          onUnlocked={() => setUnlock(null)}
         />
       )}
     </div>

@@ -14,6 +14,7 @@ import { useReportTabStatus } from "@/stores/tabStatus";
 import { startSelection, useWorkspace, type QueryTabState } from "@/stores/workspace";
 import { useEngineInfo, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
+import { RecoverableError } from "../connections/RecoverableError";
 import { CodeEditor, type CodeEditorHandle } from "../editor/CodeEditor";
 import { sqlCompletion, type CompletionTarget } from "../editor/completion";
 import { describeOnDemand } from "../editor/describe";
@@ -24,7 +25,6 @@ import { ExportDialog } from "../grid/ExportDialog";
 import { useLongQueryNotifications } from "../notifications/useLongQueryNotifications";
 import type { ExecutionState } from "../session/execution";
 import { busy, isExporting, type RequestOptions, type SessionPhase } from "../session/SessionController";
-import { SessionError } from "../session/SessionError";
 import { useSessionGuards } from "../session/SessionGuards";
 import { useSession } from "../session/useSession";
 import { useScriptBinding } from "../scripts/useScriptBinding";
@@ -498,7 +498,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
         onRollback={transaction.rollback}
       />
       {tab.profileId !== null && (
-        <SessionError profileId={tab.profileId} error={snapshot?.error ?? null} onRetry={retry} />
+        <RecoverableError profileId={tab.profileId} error={snapshot?.error ?? null} onRetry={retry} />
       )}
       <div className="min-h-0 flex-1">
         <Group orientation="vertical">

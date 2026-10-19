@@ -1,14 +1,14 @@
 import { useState } from "react";
 import { Button } from "@/components/ui/Button";
-import { ApiError } from "@/lib/api/client";
-import { useProfiles } from "../connections/hooks";
-import { secretsNeeded, UnlockDialog } from "../connections/UnlockDialog";
+import { useProfiles } from "./hooks";
+import { isPasswordRequired, secretsNeeded, UnlockDialog } from "./UnlockDialog";
 
 /**
- * Why a session could not open (or is gone), with Retry. A missing password (`password_required`) asks for it first;
- * once that dialog is dismissed, the error and Retry show instead. Each new failure asks again.
+ * Why something on a connection failed (a session that could not open or is gone, an object's detail that could not
+ * load), with Retry. A missing password (`password_required`) asks for it first; once that dialog is dismissed, the
+ * error and Retry show instead. Each new failure asks again. `onRetry` also runs once the password is given.
  */
-export function SessionError({
+export function RecoverableError({
   profileId,
   error,
   onRetry,
@@ -31,7 +31,7 @@ export function SessionError({
     onRetry();
   };
   const profile = profiles.data?.find((entry) => entry.profile.id === profileId)?.profile;
-  const needsPassword = error instanceof ApiError && error.code === "password_required" && !!profile;
+  const needsPassword = isPasswordRequired(error) && !!profile;
   return (
     <>
       {(!needsPassword || dismissed) && (

@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, unwrap } from "@/lib/api/client";
 import type { Dialect, EngineInfo, ProfileDraft, ProfileEntry, ProfileSecretsInput } from "@/lib/api/types";
-import { invalidateExplorer } from "../explorer/explorerCache";
+import { invalidateExplorer, retryFailedExplorer } from "../explorer/explorerCache";
 
 export const profilesKey = ["profiles"] as const;
 
@@ -89,7 +89,13 @@ export function useImportUrl() {
   });
 }
 
+/**
+ * Gives a profile the secrets it was missing (kept in memory). Wherever the dialog was opened (the tree, a query tab, a
+ * detail tab), whatever of the profile's explorer had failed is read again; the dialog's own `onUnlocked` is for the
+ * caller's own retry.
+ */
 export function useUnlockProfile() {
+  const qc = useQueryClient();
   return useMutation({
     mutationFn: async (input: { id: string; secrets: ProfileSecretsInput }) =>
       unwrap(
@@ -98,5 +104,7 @@ export function useUnlockProfile() {
           body: input.secrets,
         }),
       ),
+    // Not returned: the dialog closes now, the reads finish when they finish.
+    onSuccess: (_, { id }) => void retryFailedExplorer(qc, id),
   });
 }

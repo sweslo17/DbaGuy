@@ -1,9 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { CopyButton } from "@/components/ui/CopyButton";
-import { api, errorMessage, unwrap } from "@/lib/api/client";
+import { api, unwrap } from "@/lib/api/client";
 import { pathKey, type ColumnInfo, type ObjectDetail } from "@/lib/api/types";
 import type { ObjectTabState } from "@/stores/workspace";
+import { RecoverableError } from "../connections/RecoverableError";
+import { isPasswordRequired } from "../connections/UnlockDialog";
 import { keyspaceOfPath } from "./fieldSamples";
 import { kindLabel } from "./kinds";
 import { SampledFields } from "./SampledFields";
@@ -11,20 +13,26 @@ import { SampledFields } from "./SampledFields";
 /** The object a detail view shows: an object tab, or the table tab's Columns and DDL views. */
 type ObjectRef = Pick<ObjectTabState, "profileId" | "path">;
 
-/** Loads an object's detail (`/metadata/detail`) and renders it with `children`; shows loading and errors itself. */
+/** The app's one automatic retry of a failed read, except a missing password: that is asked for, not retried. */
+const retryOnce = (failures: number, error: Error) => failures < 1 && !isPasswordRequired(error);
+
+/**
+ * Loads an object's detail (`/metadata/detail`) and renders it with `children`; shows loading and errors itself. A
+ * failure offers Retry, and a missing password (the backend forgets it on restart) asks for it: the profile unlocked
+ * anywhere reads this detail again (`useUnlockProfile`).
+ */
 function WithDetail({ tab, children }: { tab: ObjectRef; children: (detail: ObjectDetail) => ReactNode }) {
   const detail = useQuery({
     queryKey: ["detail", tab.profileId, pathKey(tab.path)],
     queryFn: async () =>
       unwrap(await (await api()).POST("/metadata/detail", { body: { profile_id: tab.profileId, path: tab.path } })),
+    retry: retryOnce,
   });
   if (detail.isPending) return <p className="p-4 text-muted">Loading…</p>;
   if (detail.isError) {
-    return (
-      <p className="whitespace-pre-wrap p-4 text-danger" data-selectable>
-        {errorMessage(detail.error)}
-      </p>
-    );
+    // `cancelRefetch: false`: an unlock has started this read already, and asking again must not restart it.
+    const retry = () => void detail.refetch({ cancelRefetch: false });
+    return <RecoverableError profileId={tab.profileId} error={detail.error} onRetry={retry} />;
   }
   return children(detail.data);
 }

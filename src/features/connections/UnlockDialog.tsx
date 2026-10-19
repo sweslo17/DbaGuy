@@ -2,7 +2,7 @@ import { useState, type KeyboardEvent } from "react";
 import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
 import { FieldRow, Input } from "@/components/ui/Field";
-import { errorMessage } from "@/lib/api/client";
+import { ApiError, errorMessage } from "@/lib/api/client";
 import type { Profile } from "@/lib/api/types";
 import { isImeKeyEvent } from "@/lib/ime";
 import { useUnlockProfile } from "./hooks";
@@ -14,6 +14,11 @@ export interface SecretsNeeded {
 }
 
 const DB_PASSWORD_ONLY: SecretsNeeded = { password: true, ssh_password: false };
+
+/** Whether `error` is the backend's `password_required`: a secret is missing, and asking again cannot help before. */
+export function isPasswordRequired(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.code === "password_required";
+}
 
 /** Reads the `detail` of a `password_required` error; without one only the database password is asked for. */
 export function secretsNeeded(detail: unknown): SecretsNeeded {
