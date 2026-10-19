@@ -15,10 +15,17 @@ Compare = Literal["equals", "as_text", "none"]
 MAX_CHANGES = 10_000  # D-05-11: changes (rows) in one commit
 MAX_VALUE_CHARS = 1_048_576  # D-05-11: one value; beyond it the preview reports `value_too_large`
 VALUE_ACCEPTED_CHARS = 4 * MAX_VALUE_CHARS  # beyond this the request itself is invalid (422), ruling E8
+MAX_COMMIT_CHARS = 64 * 1_048_576  # L15: every value, key and original cell of one commit together (422 beyond it)
+MAX_PLAN_CHARS = 128 * 1_048_576  # L15: the statements and scripts of all stored plans together (EditPlanStore)
+COMMIT_TOO_LARGE = f"The changes are too large: at most {MAX_COMMIT_CHARS // 1_048_576} MiB of values per commit"
 PLAN_TTL_S = 15 * 60  # D-05-7
 MAX_PLANS = 32  # D-05-7
 PLAN_EXPIRED = "plan_expired"
 PLAN_MISMATCH = "plan_mismatch"
+PLAN_TOO_LARGE = (
+    f"The statements are too large to keep for the commit: at most {MAX_PLAN_CHARS // 1_048_576} MiB of text. "
+    "Commit fewer changes at once"
+)
 PLAN_EXPIRED_MESSAGE = "The preview has expired: preview the changes again"
 PLAN_MISMATCH_MESSAGE = PLAN_EXPIRED_MESSAGE  # spec §4: plan_expired and plan_mismatch share one text (pre-flight L2)
 
@@ -105,6 +112,25 @@ class RowDelete(_Input):
     key: dict[ColumnName, JsonValue]
 
 
+def _json_chars(cell: JsonValue) -> int:
+    """The text a key or original cell holds: the length of each string (an object's keys too), 1 for any other scalar.
+    Iterative, so however deep a cell nests it is measured, never a RecursionError."""
+    total = 0
+    pending = [cell]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            total += len(item)
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, dict):
+            total += sum(len(name) for name in item)
+            pending.extend(item.values())
+        else:
+            total += 1
+    return total
+
+
 class EditChanges(_Input):
     updates: list[RowUpdate] = Field(default_factory=list)
     inserts: list[RowInsert] = Field(default_factory=list)
@@ -119,6 +145,18 @@ class EditChanges(_Input):
             raise ValueError(f"at most {MAX_CHANGES:,} changes are committed at once")
         if len(set(ids)) != len(ids):
             raise ValueError("change ids must be unique")
+        return self
+
+    @model_validator(mode="after")
+    def _bounded_in_size(self) -> Self:
+        """L15: one value may be 4 MiB of text before it is invalid and 10,000 changes may carry one each, so the commit
+        as a whole is bounded too: what is previewed is held in memory twice (statements and script) until applied."""
+        total = sum(len(cell.text or "") for change in self.updates for cell in change.set.values())
+        total += sum(len(cell.text or "") for change in self.inserts for cell in change.values.values())
+        total += sum(_json_chars(change.key) for change in (*self.updates, *self.deletes))
+        total += sum(_json_chars(change.original) for change in self.updates)
+        if total > MAX_COMMIT_CHARS:
+            raise ValueError(COMMIT_TOO_LARGE)
         return self
 
 

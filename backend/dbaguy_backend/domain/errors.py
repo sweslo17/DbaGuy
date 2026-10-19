@@ -46,6 +46,12 @@ class UnsupportedFormat(ValidationFailed):
     code = "unsupported_format"
 
 
+class NotEditable(ValidationFailed):
+    """Grid editing refused for this table or engine (spec ⑤ §3.4): the message is the target's reason."""
+
+    code = "not_editable"
+
+
 class ConnectionFailed(DomainError):
     code = "connection_failed"
     status = 502

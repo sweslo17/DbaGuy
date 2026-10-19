@@ -88,6 +88,32 @@ export type DocumentChange = S["DocumentChange"];
 export type ChangeCounts = S["ChangeCounts"];
 /** Couchbase: what `POST /couchbase/documents/save` and `/insert` answer, told apart by `status`. */
 export type SaveAnswer = DocumentSaved | SavePreview;
+/** Grid editing (spec ⑤ §3.2): how a table's rows are identified and written, as `POST /edits/target` answers. */
+export type EditTarget = S["EditTarget"];
+/** Grid editing: one column of an edit target, with the `kind` that picks its cell editor and how its original is checked. */
+export type EditColumn = S["EditColumn"];
+/** Grid editing: how a column's new values are read ("number", "text", "bool", "datetime", "binary", "json", "other"). */
+export type EditKind = EditColumn["kind"];
+/** Grid editing (spec ⑤ §3.3.1): a staged cell value: typed text, NULL or DEFAULT (a new row only). */
+export type CellInput = S["CellInput"];
+/** Grid editing: a staged UPDATE: the row's key and original cells as loaded, and the cells to set. */
+export type RowUpdate = S["RowUpdate"];
+/** Grid editing: a staged INSERT; a column left out takes its default. */
+export type RowInsert = S["RowInsert"];
+/** Grid editing: a staged DELETE, by the row's key as loaded. */
+export type RowDelete = S["RowDelete"];
+/** Grid editing: every staged change of one commit, as `POST /edits/preview` takes them. */
+export type EditChanges = S["EditChanges"];
+/** Grid editing (spec ⑤ §3.3.3): one cell or change the preview refuses, with a fixed message (never the value). */
+export type EditProblem = S["EditProblem"];
+/** Grid editing (spec ⑤ §3.4): one statement of a commit, exactly as the worker sends it, with the change it belongs to. */
+export type PlannedStatement = S["PlannedStatement"];
+/** Grid editing: something to know before committing (columns whose original is not checked, a non-transactional table). */
+export type EditWarning = S["EditWarning"];
+/** Grid editing: how many updates, inserts and deletes a preview holds. */
+export type EditCounts = S["EditCounts"];
+/** Grid editing (spec ⑤ §3.4): the preview of a commit: its statements, problems, warnings and, when none, a one-time plan id. */
+export type EditPreview = S["EditPreview"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

@@ -16,6 +16,7 @@ from .connectivity.ssh_tunnel import SshTunnelManager
 from .services.connection_service import ConnectionService
 from .services.couchbase_service import CouchbaseService
 from .services.document_service import DocumentService
+from .services.edit_service import EditService
 from .services.field_sample_service import FieldSampleService
 from .services.history_service import HistoryService
 from .services.metadata_service import MetadataService
@@ -78,6 +79,7 @@ class AppContainer:
         self.schema_cache = SchemaCache(self.metadata, self.registry, self.profiles)
         self.couchbase = CouchbaseService(self.registry, self.profiles, self.schema_cache, self.metadata)
         self.documents = DocumentService(self.metadata, self.profiles, self.registry)
+        self.edits = EditService(self.metadata, self.profiles, self.registry)
         self.field_samples = FieldSampleService(self.metadata, self.app_settings)
         self.history = HistoryService(history_file(data_dir))
         self.policy = SafetyPolicy()

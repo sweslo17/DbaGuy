@@ -6,7 +6,10 @@ import pytest
 from pydantic import ValidationError
 
 from dbaguy_backend.domain.column_category import ColumnCategory
-from dbaguy_backend.domain.edits import MAX_CHANGES, CellInput, EditChanges, edit_kind, kind_category
+from dbaguy_backend.domain.edits import (
+    COMMIT_TOO_LARGE, MAX_CHANGES, MAX_COMMIT_CHARS, VALUE_ACCEPTED_CHARS, CellInput, EditChanges, edit_kind,
+    kind_category,
+)
 from dbaguy_backend.domain.metadata import PathSegment, path_database
 
 
@@ -32,6 +35,54 @@ def test_changes_are_counted_unique_and_not_empty():
                 {"deletes": [deletes[0], deletes[0]]}, {}):
         with pytest.raises(ValidationError):
             EditChanges.model_validate(bad)
+
+
+BIG = "x" * VALUE_ACCEPTED_CHARS  # one value of the most the request accepts; shared, so building the cases is cheap
+FULL = MAX_COMMIT_CHARS // VALUE_ACCEPTED_CHARS  # this many of them are exactly the most a commit may carry
+
+
+def insert(i: int, text: str) -> dict:
+    return {"id": f"i:{i}", "values": {"a": {"kind": "value", "text": text}}}
+
+
+def refusal(changes: dict) -> str:
+    """Why the request is refused. Not `str(error)`: that writes out the input, megabytes of it."""
+    with pytest.raises(ValidationError) as raised:
+        EditChanges.model_validate(changes)
+    (error,) = raised.value.errors(include_input=False)
+    return error["msg"]
+
+
+def test_a_commit_is_bounded_in_the_text_of_its_values():  # pre-flight L15: 10,000 changes of 4 MiB are not one request
+    full = [insert(i, BIG) for i in range(FULL)]
+    assert len(EditChanges.model_validate({"inserts": full}).inserts) == FULL  # exactly 64 MiB
+    assert refusal({"inserts": [*full, insert(FULL, "x")]}) == f"Value error, {COMMIT_TOO_LARGE}"  # one more character
+    assert COMMIT_TOO_LARGE == "The changes are too large: at most 64 MiB of values per commit"
+
+
+@pytest.mark.parametrize("change", [
+    pytest.param({"updates": [{"id": "u:1", "key": {"id": 1}, "set": {f"c{i}": {"kind": "value", "text": BIG}
+                                                                        for i in range(FULL + 1)},
+                               "original": {f"c{i}": None for i in range(FULL + 1)}}]}, id="set"),
+    pytest.param({"updates": [{"id": "u:1", "key": {"id": 1}, "set": {"a": {"kind": "null"}},
+                               "original": {"a": [BIG] * (FULL + 1)}}]}, id="original"),
+    pytest.param({"updates": [{"id": "u:1", "key": {"id": [BIG] * (FULL + 1)}, "set": {"a": {"kind": "null"}},
+                               "original": {"a": None}}]}, id="update key"),
+    pytest.param({"deletes": [{"id": "d:1", "key": {"id": {"k": [BIG] * (FULL + 1)}}}]}, id="delete key"),
+    pytest.param({"deletes": [{"id": f"d:{i}", "key": {"id": BIG}} for i in range(FULL + 1)]}, id="many keys"),
+])
+def test_every_kind_of_cell_counts_toward_the_bound(change):  # L15: values, keys and original cells
+    assert refusal(change) == f"Value error, {COMMIT_TOO_LARGE}"
+
+
+def test_a_nested_cell_is_counted_whole():  # L15: lists and objects count every string inside, as deep as pydantic goes
+    cell: object = [BIG] * (FULL // 2)  # 32 MiB
+    for _ in range(100):
+        cell = [{"k": cell}]
+    one = {"deletes": [{"id": "d:1", "key": {"id": cell}}]}
+    assert len(EditChanges.model_validate(one).deletes) == 1
+    two = {"deletes": [*one["deletes"], {"id": "d:2", "key": {"id": cell}}]}  # 64 MiB and the 200 names above it
+    assert refusal(two) == f"Value error, {COMMIT_TOO_LARGE}"
 
 
 def test_a_lone_surrogate_is_refused_on_its_cell():  # ruling E19: pydantic refuses it in any str field

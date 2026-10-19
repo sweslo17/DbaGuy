@@ -447,6 +447,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/edits/target": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Edit Target */
+        post: operations["edit_target_edits_target_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/edits/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Edit Preview */
+        post: operations["edit_preview_edits_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/settings": {
         parameters: {
             query?: never;
@@ -836,6 +870,16 @@ export interface components {
             /** Request Id */
             request_id: string;
         };
+        /** CellInput */
+        CellInput: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "value" | "null" | "default";
+            /** Text */
+            text?: string | null;
+        };
         /** ChangeCounts */
         ChangeCounts: {
             /**
@@ -1141,6 +1185,155 @@ export interface components {
             text: string | null;
             /** Size */
             size: number;
+        };
+        /** EditChanges */
+        EditChanges: {
+            /** Updates */
+            updates?: components["schemas"]["RowUpdate"][];
+            /** Inserts */
+            inserts?: components["schemas"]["RowInsert"][];
+            /** Deletes */
+            deletes?: components["schemas"]["RowDelete"][];
+        };
+        /** EditColumn */
+        EditColumn: {
+            /** Name */
+            name: string;
+            /** Type Name */
+            type_name: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "number" | "text" | "bool" | "datetime" | "binary" | "json" | "other";
+            /** Nullable */
+            nullable: boolean;
+            /** Has Default */
+            has_default: boolean;
+            /** Writable */
+            writable: boolean;
+            /** Read Only Reason */
+            read_only_reason?: string | null;
+            /**
+             * Compare
+             * @enum {string}
+             */
+            compare: "equals" | "as_text" | "none";
+            /**
+             * Unicode
+             * @default true
+             */
+            unicode: boolean;
+        };
+        /** EditCounts */
+        EditCounts: {
+            /**
+             * Updates
+             * @default 0
+             */
+            updates: number;
+            /**
+             * Inserts
+             * @default 0
+             */
+            inserts: number;
+            /**
+             * Deletes
+             * @default 0
+             */
+            deletes: number;
+        };
+        /** EditPreview */
+        EditPreview: {
+            /** Plan Id */
+            plan_id: string | null;
+            /** Begin */
+            begin: string;
+            /** Statements */
+            statements: components["schemas"]["PlannedStatement"][];
+            /** Commit */
+            commit: string;
+            /** Problems */
+            problems: components["schemas"]["EditProblem"][];
+            /** Warnings */
+            warnings: components["schemas"]["EditWarning"][];
+            counts: components["schemas"]["EditCounts"];
+            /** Script */
+            script: string;
+        };
+        /** EditPreviewRequest */
+        EditPreviewRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Path */
+            path: components["schemas"]["PathSegment"][];
+            changes: components["schemas"]["EditChanges"];
+        };
+        /** EditProblem */
+        EditProblem: {
+            /** Change Id */
+            change_id: string;
+            /** Column */
+            column?: string | null;
+            /**
+             * Code
+             * @enum {string}
+             */
+            code: "invalid_number" | "invalid_json" | "invalid_hex" | "invalid_bool" | "invalid_text" | "value_too_large" | "read_only_column" | "unknown_column" | "not_nullable" | "key_incomplete" | "default_not_allowed" | "key_collision";
+            /** Message */
+            message: string;
+        };
+        /** EditTarget */
+        EditTarget: {
+            /** Path */
+            path: components["schemas"]["PathSegment"][];
+            /** Editable */
+            editable: boolean;
+            /** Reason */
+            reason?: string | null;
+            /** Key */
+            key?: string[];
+            /** Key Source */
+            key_source?: ("primary_key" | "unique") | null;
+            /** Columns */
+            columns?: components["schemas"]["EditColumn"][];
+            /**
+             * Transactional
+             * @default true
+             */
+            transactional: boolean;
+            /**
+             * Backslash Escapes
+             * @default true
+             */
+            backslash_escapes: boolean;
+        };
+        /** EditTargetRequest */
+        EditTargetRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Path */
+            path: components["schemas"]["PathSegment"][];
+        };
+        /** EditWarning */
+        EditWarning: {
+            /**
+             * Code
+             * @enum {string}
+             */
+            code: "unchecked_columns" | "non_transactional" | "missing_required";
+            /** Message */
+            message: string;
+            /** Change Id */
+            change_id?: string | null;
+            /** Columns */
+            columns?: string[];
         };
         /** EditorSettings */
         EditorSettings: {
@@ -1565,6 +1758,7 @@ export interface components {
              */
             confirmed: boolean;
         };
+        JsonValue: unknown;
         /**
          * Keyspace
          * @description A collection by its three names. Frozen: it is the key of the field-sample cache.
@@ -1791,6 +1985,22 @@ export interface components {
              */
             phase_times: components["schemas"]["PlanDetail"][];
         };
+        /** PlannedStatement */
+        PlannedStatement: {
+            /** Change Id */
+            change_id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "update" | "insert" | "delete";
+            /** Sql */
+            sql: string;
+            /** Unchecked */
+            unchecked?: components["schemas"]["UncheckedColumn"][];
+            /** Row */
+            row?: string | null;
+        };
         /** ProfileEntry */
         ProfileEntry: {
             /** Profile */
@@ -1901,6 +2111,15 @@ export interface components {
             /** Request Id */
             request_id: string;
         };
+        /** RowDelete */
+        RowDelete: {
+            /** Id */
+            id: string;
+            /** Key */
+            key: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+        };
         /**
          * RowFormatOptions
          * @description Shared by copy (`/sql/format-rows`) and export (WS `export`).
@@ -1920,6 +2139,32 @@ export interface components {
             table_schema?: string | null;
             /** Table Name */
             table_name?: string | null;
+        };
+        /** RowInsert */
+        RowInsert: {
+            /** Id */
+            id: string;
+            /** Values */
+            values?: {
+                [key: string]: components["schemas"]["CellInput"];
+            };
+        };
+        /** RowUpdate */
+        RowUpdate: {
+            /** Id */
+            id: string;
+            /** Key */
+            key: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+            /** Set */
+            set: {
+                [key: string]: components["schemas"]["CellInput"];
+            };
+            /** Original */
+            original: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
         };
         /** RowsEvent */
         RowsEvent: {
@@ -2472,6 +2717,13 @@ export interface components {
             anchor: number;
             /** Head */
             head: number;
+        };
+        /** UncheckedColumn */
+        UncheckedColumn: {
+            /** Column */
+            column: string;
+            /** Reason */
+            reason: string;
         };
         /** ValidationError */
         ValidationError: {
@@ -3441,6 +3693,76 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    edit_target_edits_target_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EditTargetRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EditTarget"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    edit_preview_edits_preview_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EditPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EditPreview"];
+                };
             };
             /** @description Validation Error */
             422: {

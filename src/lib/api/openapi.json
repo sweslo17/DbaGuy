@@ -1662,6 +1662,124 @@
         }
       }
     },
+    "/edits/target": {
+      "post": {
+        "tags": [
+          "edits"
+        ],
+        "summary": "Edit Target",
+        "operationId": "edit_target_edits_target_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditTargetRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EditTarget"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/edits/preview": {
+      "post": {
+        "tags": [
+          "edits"
+        ],
+        "summary": "Edit Preview",
+        "operationId": "edit_preview_edits_preview_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditPreviewRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EditPreview"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/settings": {
       "get": {
         "tags": [
@@ -3038,6 +3156,37 @@
         ],
         "title": "CancelCommand"
       },
+      "CellInput": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "value",
+              "null",
+              "default"
+            ],
+            "title": "Kind"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 4194304
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "title": "CellInput"
+      },
       "ChangeCounts": {
         "properties": {
           "key_order": {
@@ -3807,6 +3956,403 @@
         ],
         "title": "DocumentView",
         "description": "One document as the server holds it (spec \u00a73.9.2, R-04-2)."
+      },
+      "EditChanges": {
+        "properties": {
+          "updates": {
+            "items": {
+              "$ref": "#/components/schemas/RowUpdate"
+            },
+            "type": "array",
+            "title": "Updates"
+          },
+          "inserts": {
+            "items": {
+              "$ref": "#/components/schemas/RowInsert"
+            },
+            "type": "array",
+            "title": "Inserts"
+          },
+          "deletes": {
+            "items": {
+              "$ref": "#/components/schemas/RowDelete"
+            },
+            "type": "array",
+            "title": "Deletes"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "EditChanges"
+      },
+      "EditColumn": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "type_name": {
+            "type": "string",
+            "title": "Type Name"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "number",
+              "text",
+              "bool",
+              "datetime",
+              "binary",
+              "json",
+              "other"
+            ],
+            "title": "Kind"
+          },
+          "nullable": {
+            "type": "boolean",
+            "title": "Nullable"
+          },
+          "has_default": {
+            "type": "boolean",
+            "title": "Has Default"
+          },
+          "writable": {
+            "type": "boolean",
+            "title": "Writable"
+          },
+          "read_only_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Read Only Reason"
+          },
+          "compare": {
+            "type": "string",
+            "enum": [
+              "equals",
+              "as_text",
+              "none"
+            ],
+            "title": "Compare"
+          },
+          "unicode": {
+            "type": "boolean",
+            "title": "Unicode",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "type_name",
+          "kind",
+          "nullable",
+          "has_default",
+          "writable",
+          "compare"
+        ],
+        "title": "EditColumn"
+      },
+      "EditCounts": {
+        "properties": {
+          "updates": {
+            "type": "integer",
+            "title": "Updates",
+            "default": 0
+          },
+          "inserts": {
+            "type": "integer",
+            "title": "Inserts",
+            "default": 0
+          },
+          "deletes": {
+            "type": "integer",
+            "title": "Deletes",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "EditCounts"
+      },
+      "EditPreview": {
+        "properties": {
+          "plan_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Id"
+          },
+          "begin": {
+            "type": "string",
+            "title": "Begin"
+          },
+          "statements": {
+            "items": {
+              "$ref": "#/components/schemas/PlannedStatement"
+            },
+            "type": "array",
+            "title": "Statements"
+          },
+          "commit": {
+            "type": "string",
+            "title": "Commit"
+          },
+          "problems": {
+            "items": {
+              "$ref": "#/components/schemas/EditProblem"
+            },
+            "type": "array",
+            "title": "Problems"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/EditWarning"
+            },
+            "type": "array",
+            "title": "Warnings"
+          },
+          "counts": {
+            "$ref": "#/components/schemas/EditCounts"
+          },
+          "script": {
+            "type": "string",
+            "title": "Script"
+          }
+        },
+        "type": "object",
+        "required": [
+          "plan_id",
+          "begin",
+          "statements",
+          "commit",
+          "problems",
+          "warnings",
+          "counts",
+          "script"
+        ],
+        "title": "EditPreview"
+      },
+      "EditPreviewRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "path": {
+            "items": {
+              "$ref": "#/components/schemas/PathSegment"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Path"
+          },
+          "changes": {
+            "$ref": "#/components/schemas/EditChanges"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "path",
+          "changes"
+        ],
+        "title": "EditPreviewRequest"
+      },
+      "EditProblem": {
+        "properties": {
+          "change_id": {
+            "type": "string",
+            "title": "Change Id"
+          },
+          "column": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Column"
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "invalid_number",
+              "invalid_json",
+              "invalid_hex",
+              "invalid_bool",
+              "invalid_text",
+              "value_too_large",
+              "read_only_column",
+              "unknown_column",
+              "not_nullable",
+              "key_incomplete",
+              "default_not_allowed",
+              "key_collision"
+            ],
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "change_id",
+          "code",
+          "message"
+        ],
+        "title": "EditProblem"
+      },
+      "EditTarget": {
+        "properties": {
+          "path": {
+            "items": {
+              "$ref": "#/components/schemas/PathSegment"
+            },
+            "type": "array",
+            "title": "Path"
+          },
+          "editable": {
+            "type": "boolean",
+            "title": "Editable"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "key": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Key"
+          },
+          "key_source": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "primary_key",
+                  "unique"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key Source"
+          },
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/EditColumn"
+            },
+            "type": "array",
+            "title": "Columns"
+          },
+          "transactional": {
+            "type": "boolean",
+            "title": "Transactional",
+            "default": true
+          },
+          "backslash_escapes": {
+            "type": "boolean",
+            "title": "Backslash Escapes",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "editable"
+        ],
+        "title": "EditTarget"
+      },
+      "EditTargetRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "path": {
+            "items": {
+              "$ref": "#/components/schemas/PathSegment"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Path"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "path"
+        ],
+        "title": "EditTargetRequest"
+      },
+      "EditWarning": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "unchecked_columns",
+              "non_transactional",
+              "missing_required"
+            ],
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "change_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Change Id"
+          },
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Columns"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "EditWarning"
       },
       "EditorSettings": {
         "properties": {
@@ -4937,6 +5483,7 @@
         ],
         "title": "InsertDocumentRequest"
       },
+      "JsonValue": {},
       "Keyspace": {
         "properties": {
           "bucket": {
@@ -5570,6 +6117,52 @@
         ],
         "title": "PlanView"
       },
+      "PlannedStatement": {
+        "properties": {
+          "change_id": {
+            "type": "string",
+            "title": "Change Id"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "update",
+              "insert",
+              "delete"
+            ],
+            "title": "Kind"
+          },
+          "sql": {
+            "type": "string",
+            "title": "Sql"
+          },
+          "unchecked": {
+            "items": {
+              "$ref": "#/components/schemas/UncheckedColumn"
+            },
+            "type": "array",
+            "title": "Unchecked"
+          },
+          "row": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Row"
+          }
+        },
+        "type": "object",
+        "required": [
+          "change_id",
+          "kind",
+          "sql"
+        ],
+        "title": "PlannedStatement"
+      },
       "ProfileEntry": {
         "properties": {
           "profile": {
@@ -5853,6 +6446,34 @@
         ],
         "title": "RollbackCommand"
       },
+      "RowDelete": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "key": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "propertyNames": {
+              "maxLength": 1024,
+              "minLength": 1
+            },
+            "type": "object",
+            "title": "Key"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "key"
+        ],
+        "title": "RowDelete"
+      },
       "RowFormatOptions": {
         "properties": {
           "header": {
@@ -5892,6 +6513,86 @@
         "type": "object",
         "title": "RowFormatOptions",
         "description": "Shared by copy (`/sql/format-rows`) and export (WS `export`)."
+      },
+      "RowInsert": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "values": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/CellInput"
+            },
+            "propertyNames": {
+              "maxLength": 1024,
+              "minLength": 1
+            },
+            "type": "object",
+            "title": "Values"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "title": "RowInsert"
+      },
+      "RowUpdate": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "key": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "propertyNames": {
+              "maxLength": 1024,
+              "minLength": 1
+            },
+            "type": "object",
+            "title": "Key"
+          },
+          "set": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/CellInput"
+            },
+            "propertyNames": {
+              "maxLength": 1024,
+              "minLength": 1
+            },
+            "type": "object",
+            "minProperties": 1,
+            "title": "Set"
+          },
+          "original": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "propertyNames": {
+              "maxLength": 1024,
+              "minLength": 1
+            },
+            "type": "object",
+            "title": "Original"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "key",
+          "set",
+          "original"
+        ],
+        "title": "RowUpdate"
       },
       "RowsEvent": {
         "properties": {
@@ -7160,6 +7861,24 @@
           "head"
         ],
         "title": "TextSelection"
+      },
+      "UncheckedColumn": {
+        "properties": {
+          "column": {
+            "type": "string",
+            "title": "Column"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "column",
+          "reason"
+        ],
+        "title": "UncheckedColumn"
       },
       "ValidationError": {
         "properties": {
