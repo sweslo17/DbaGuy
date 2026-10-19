@@ -191,6 +191,7 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
     columns,
     rows,
     keyIndexes,
+    0, // Task 9: the overlay's `leading` (new rows staged on top)
   );
 
   const gridSort = useMemo<GridSort[]>(

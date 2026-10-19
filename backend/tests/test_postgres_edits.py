@@ -3,13 +3,16 @@
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 
+import psycopg
 import pytest
+from psycopg import pq
 
 from dbaguy_backend.adapters.editing import NO_KEY, VIEWS
+from dbaguy_backend.adapters.postgres import editing
 from dbaguy_backend.domain.errors import NotFound, ValidationFailed
 from dbaguy_backend.domain.metadata import PathSegment
 from tests.edit_support import DEFAULT, PgScratch, edit_env, insert, items_table, scratch, update, val
-from tests.support import requires_pg
+from tests.support import PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, requires_pg
 
 pytestmark = requires_pg
 
@@ -183,13 +186,40 @@ def test_a_locked_table_gives_no_stable_order_in_time_and_the_session_is_as_it_w
             locked = reading.result()
         # Asked again and again (Refresh, previews): the plan is never a prepared statement, so it keeps working
         again = [connection.edit_target(db.path(table)).stable_order for _ in range(7)]
-        shown = connection.run("SHOW statement_timeout")
-        timeout = shown.fetch(1)
-        shown.close()
+        limits = []
+        for setting in ("statement_timeout", "lock_timeout"):
+            shown = connection.run(f"SHOW {setting}")
+            limits.append(shown.fetch(1))
+            shown.close()
+        still = connection.in_transaction()
     assert (locked.editable, locked.key, locked.stable_order) == (True, ["id"], None)
     assert 0.9 < waited < 3, waited
     assert again == [["id"]] * 7
-    assert timeout == [["0"]]  # SET LOCAL ended with the EXPLAIN's own implicit transaction
+    assert (limits, still) == ([[["0"]], [["0"]]], False)  # the SET LOCALs ended with the plan's own block
+
+
+def test_a_failed_plan_or_a_connection_without_auto_commit_leaves_nothing_behind(pg):  # 05b K13, review 6b
+    db, connection = pg
+    with scratch(db) as make:
+        table = make("TABLE", "CREATE TABLE {t} (id int PRIMARY KEY, v text)")
+        raw = psycopg.connect(host=PG_HOST, port=PG_PORT, user=PG_USER, password=PG_PASSWORD, dbname="dbaguy",
+                              autocommit=True)
+        try:
+            failed = editing._stable_order(raw, db.path(table), ["no_such_column"])  # 42703 inside the block
+            after_failure = (raw.info.transaction_status, raw.execute("SHOW lock_timeout").fetchone()[0],
+                             raw.execute("SHOW statement_timeout").fetchone()[0])
+            ordered = editing._stable_order(raw, db.path(table), ["id"])
+            raw.execute("BEGIN")  # auto-commit, but a transaction of someone's open: not planned inside it
+            inside = (editing._stable_order(raw, db.path(table), ["id"]), raw.info.transaction_status)
+            raw.execute("ROLLBACK")
+            raw.autocommit = False  # idle, but psycopg would send BEGIN first and leave the block open
+            manual = (editing._stable_order(raw, db.path(table), ["id"]), raw.info.transaction_status)
+        finally:
+            raw.close()
+    assert failed is None and after_failure == (pq.TransactionStatus.IDLE, "0", "0")
+    assert ordered == ["id"]
+    assert inside == (None, pq.TransactionStatus.INTRANS)
+    assert manual == (None, pq.TransactionStatus.IDLE)
 
 
 def test_inside_a_transaction_the_order_is_not_planned(pg):  # 05b K13: a failed EXPLAIN would abort the transaction

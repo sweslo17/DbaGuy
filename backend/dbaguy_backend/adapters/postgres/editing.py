@@ -62,8 +62,12 @@ _EQUALS = frozenset({"bpchar", "bytea"})
 _SMALL_SORT_ROWS = 10_000
 _SORTS = frozenset({"Sort", "Incremental Sort"})
 # The planning, and a wait for the table's lock (an uncommitted ALTER in another session), never hold the metadata
-# connection longer than this: the tab waits at most 2 s for the target anyway, then browses unsorted
+# connection longer than this: the tab waits at most 2 s for the target anyway, then browses unsorted. Both limits, in
+# a transaction block of their own so that SET LOCAL holds on every version: an older server (before 13) arms
+# statement_timeout once for the whole message, before the SET LOCAL ahead of the EXPLAIN; lock_timeout is read when
+# the lock wait starts, on every version.
 _PLAN_TIMEOUT_MS = 1_000
+_PLAN_LIMITS = f"SET LOCAL statement_timeout = {_PLAN_TIMEOUT_MS}; SET LOCAL lock_timeout = {_PLAN_TIMEOUT_MS}"
 
 
 def _column(
@@ -128,16 +132,33 @@ def ordered_plan(explained: object) -> bool:
 
 
 def _stable_order(conn: psycopg.Connection, path: list[PathSegment], key: list[str]) -> list[str] | None:
-    """`key` when the browse ordered by it plans as `ordered_plan` wants, else None. Planned between statements only
-    (a failed EXPLAIN must not end a transaction), with a time limit; any failure is None, logged with its code only."""
-    if conn.info.transaction_status != pq.TransactionStatus.IDLE:
+    """`key` when the browse ordered by it plans as `ordered_plan` wants, else None. Planned only on an auto-commit
+    connection between statements: inside a transaction a failed EXPLAIN would abort it, and without auto-commit
+    psycopg would open one first and leave it open, holding the table's lock with the limits still set. Any failure is
+    None, logged with its code only."""
+    if not conn.autocommit or conn.info.transaction_status != pq.TransactionStatus.IDLE:
         return None
     select = build_browse_select(Dialect.POSTGRES, path, None, [SortKey(column=column) for column in key])
-    # One round trip: the simple protocol runs both statements in one implicit transaction, which SET LOCAL lasts for
+    # One round trip (the simple protocol takes the statements as one message). The limits last until the block ends:
+    # COMMIT once planned; after an error or a timeout the server skips the rest and leaves the block aborted, and the
+    # ROLLBACK ends it, so nothing of them (or of the table's lock) outlives the plan either way.
     try:
-        cursor = conn.execute(f"SET LOCAL statement_timeout = {_PLAN_TIMEOUT_MS}; EXPLAIN (FORMAT JSON) {select}")
-        row = cursor.fetchone() if cursor.nextset() else None
+        cursor = conn.execute(f"BEGIN; {_PLAN_LIMITS}; EXPLAIN (FORMAT JSON) {select}; COMMIT")
+        while cursor.description is None and cursor.nextset():
+            pass  # past BEGIN and the SETs: the EXPLAIN is the one statement here that returns rows
+        row = cursor.fetchone() if cursor.description is not None else None
     except psycopg.Error as exc:
         logger.debug("Stable order not planned: {}", exc.sqlstate or type(exc).__name__)
+        _end_block(conn)
         return None
     return list(key) if row is not None and ordered_plan(row[0]) else None
+
+
+def _end_block(conn: psycopg.Connection) -> None:
+    """Rolls back the plan's block left open by its failure; a connection that is gone has nothing to roll back."""
+    if conn.info.transaction_status == pq.TransactionStatus.IDLE:
+        return
+    try:
+        conn.execute("ROLLBACK")
+    except psycopg.Error as exc:
+        logger.debug("Stable order's block not rolled back: {}", exc.sqlstate or type(exc).__name__)

@@ -42,3 +42,28 @@ export function firstSorts(ordersByKey: boolean | null, target: TargetRead, wait
       return null;
   }
 }
+
+/** What the user asked for while the first browse waited: a filter (null: none) and a sort (null: none). */
+export interface FirstAsk {
+  readonly filter: string | null;
+  readonly sorts: SortKey[] | null;
+}
+export const NOTHING_ASKED: FirstAsk = { filter: null, sorts: null };
+
+export interface FirstBrowse {
+  readonly filter: string;
+  readonly sorts: SortKey[];
+  /** A filter the user entered: built as one (a rejection is the filter's error, and the rows come unfiltered). */
+  readonly newFilter: boolean;
+}
+
+/**
+ * The first browse, or null while it waits (`defaultSorts` null). What the user asked for meanwhile is part of it,
+ * never thrown away: a filter waits for the sorts with it; a sort the user picked wins over the table's order and
+ * needs no wait.
+ */
+export function firstBrowse(defaultSorts: SortKey[] | null, asked: FirstAsk): FirstBrowse | null {
+  const sorts = asked.sorts ?? defaultSorts;
+  if (sorts === null) return null;
+  return { filter: asked.filter ?? "", sorts, newFilter: asked.filter !== null };
+}

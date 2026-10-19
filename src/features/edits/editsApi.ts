@@ -1,3 +1,4 @@
+import { queryOptions } from "@tanstack/react-query";
 import { api, ApiError, errorMessage, unwrap } from "@/lib/api/client";
 import { pathKey, type EditChanges, type EditPreview, type EditTarget, type PathSegment } from "@/lib/api/types";
 
@@ -16,6 +17,22 @@ export const editTargetsKey = (profileId: string) => ["edits", "target", profile
 /** The query key of a table's edit target: read once per table tab, again on Refresh and when the profile is saved. */
 export const editTargetKey = (profileId: string, path: PathSegment[]) =>
   [...editTargetsKey(profileId), pathKey(path)] as const;
+
+/**
+ * The edit target's query: the one every reader of a table's target uses (the table tab's first browse and its anchor,
+ * 05b K13/K14; Task 9's edits), so they share one read. Read when the tab is first shown and kept while a tab uses it
+ * (`staleTime: Infinity`: Refresh and a saved profile read it again), never retried, and dropped as soon as no tab uses
+ * it (`gcTime: 0`): a tab opened again reads the table as it is now, never a key renamed meanwhile (the first browse
+ * would sort by a column that is gone, with no header yet to clear the sort).
+ */
+export const editTargetQuery = (profileId: string, path: PathSegment[]) =>
+  queryOptions({
+    queryKey: editTargetKey(profileId, path),
+    queryFn: ({ signal }) => fetchEditTarget(profileId, path, signal),
+    staleTime: Infinity,
+    gcTime: 0,
+    retry: false,
+  });
 
 /** How the table's rows are identified and written; `editable` false with the reason the edit bar shows. */
 export async function fetchEditTarget(

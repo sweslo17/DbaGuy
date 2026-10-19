@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { EditTarget } from "@/lib/api/types";
-import { firstSorts, stableSorts, type TargetRead } from "./stableOrder";
+import { firstBrowse, firstSorts, NOTHING_ASKED, stableSorts, type TargetRead } from "./stableOrder";
 
 /* A PostgreSQL table tab's first browse (05b K13): sorted by the key when the target says so, never waiting long. */
 
@@ -63,5 +63,41 @@ describe("the first browse's sort", () => {
     expect(stableSorts(target({ key: ["constructor"], stable_order: ["constructor"] }))).toEqual([
       { column: "constructor", descending: false },
     ]);
+  });
+});
+
+describe("what the user asks for while the first browse waits", () => {
+  const BY_LABEL = [{ column: "label", descending: true }];
+
+  it("waits with a filter, then browses with it and the table's order", () => {
+    const asked = { ...NOTHING_ASKED, filter: "id > 3" };
+    expect(firstBrowse(null, asked)).toBeNull();
+    expect(firstBrowse(BY_ID, asked)).toEqual({ filter: "id > 3", sorts: BY_ID, newFilter: true });
+    // the target failed, or the wait is over
+    expect(firstBrowse([], asked)).toEqual({ filter: "id > 3", sorts: [], newFilter: true });
+  });
+
+  it("browses as before when nothing was asked", () => {
+    expect(firstBrowse(null, NOTHING_ASKED)).toBeNull();
+    expect(firstBrowse(BY_ID, NOTHING_ASKED)).toEqual({ filter: "", sorts: BY_ID, newFilter: false });
+  });
+
+  it("takes a cleared filter as asked for (the empty filter applies)", () => {
+    expect(firstBrowse(BY_ID, { filter: "", sorts: null })).toEqual({ filter: "", sorts: BY_ID, newFilter: true });
+  });
+
+  it("lets a sort the user picked win over the table's order, without waiting", () => {
+    expect(firstBrowse(null, { filter: null, sorts: BY_LABEL })).toEqual({
+      filter: "",
+      sorts: BY_LABEL,
+      newFilter: false,
+    });
+    expect(firstBrowse(BY_ID, { filter: "a = 1", sorts: BY_LABEL })).toEqual({
+      filter: "a = 1",
+      sorts: BY_LABEL,
+      newFilter: true,
+    });
+    // a sort cleared before the first browse: the server's order
+    expect(firstBrowse(BY_ID, { filter: null, sorts: [] })).toEqual({ filter: "", sorts: [], newFilter: false });
   });
 });
