@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { EditColumn } from "@/lib/api/types";
 import type { RowMark } from "../grid/marks";
-import type { Rect } from "../grid/selection";
+import type { GridSelection, Rect } from "../grid/selection";
 import { KEY_INCOMPLETE, MARKED_DELETED } from "./editing";
 import type { GridEditKey } from "./editKeys";
 import { REPEATED_KEY } from "./overlay";
@@ -11,17 +11,22 @@ import {
   asksBeforeDiscard,
   CHECKING,
   discardQuestion,
+  dispatchRefusal,
   editMenu,
   editMode,
   gridKeyAction,
   KEEP_MINE_TITLE,
+  KEY_CHANGED,
   keyComplete,
   notKeptHint,
   pickCells,
   pickRows,
+  placeAfterTop,
+  rowAfterTop,
   ROWS_LOADING,
   rowHasConflict,
   rowStateOf,
+  sameLoadedRows,
   selectedRows,
   selectionFacts,
   stagedInputOf,
@@ -29,13 +34,16 @@ import {
   startEdit,
   targetView,
   TOO_LARGE_TO_KEEP,
+  TOO_MANY_CHANGES,
   TOO_MANY_ROWS,
+  typedNotStaged,
   wasValueOf,
   type EditGate,
   type EditMenuInput,
   type GridLookup,
   type GridRowState,
   type SelectionFacts,
+  type ShownTop,
   type TargetRead,
 } from "./tableEditing";
 
@@ -112,6 +120,22 @@ describe("what may be staged now", () => {
   it("stages what an editor held when it ends on held rows (H12), but not while a commit runs", () => {
     expect(stageRefusal({ ...OPEN, waiting: ROWS_LOADING, readOnly: "x" }, true, true)).toBeNull();
     expect(stageRefusal({ ...OPEN, locked: LOCKED }, true, true)).toBe(LOCKED);
+  });
+});
+
+describe("a refusal", () => {
+  it("names why the store refused a dispatch, and nothing when it did not", () => {
+    expect(dispatchRefusal("too_many")).toBe(TOO_MANY_CHANGES);
+    expect(dispatchRefusal("key_changed")).toBe(KEY_CHANGED);
+    expect(dispatchRefusal("staged")).toBeNull();
+    expect(dispatchRefusal("unchanged")).toBeNull();
+    expect(dispatchRefusal(null)).toBeNull();
+  });
+
+  it("of an editor's text says it was not staged, once, whatever the reason ends with (K20)", () => {
+    expect(typedNotStaged(LOCKED)).toBe("A commit is running. What you typed was not staged.");
+    expect(typedNotStaged("Done.")).toBe("Done. What you typed was not staged.");
+    expect(typedNotStaged(TOO_MANY_CHANGES)).toBe(`${TOO_MANY_CHANGES}. What you typed was not staged.`);
   });
 });
 
@@ -435,5 +459,72 @@ describe("the edit bar's words", () => {
   it("asks before discarding more than one change", () => {
     expect([0, 1, 2].map(asksBeforeDiscard)).toEqual([false, false, true]);
     expect(discardQuestion(3, "zz_05b_items")).toBe("Discard 3 staged changes to zz_05b_items? ⌘Z brings them back.");
+  });
+});
+
+describe("new rows coming and going on top of the same loaded rows", () => {
+  const top = (...newIds: string[]): ShownTop => ({ leading: newIds.length, newIds });
+  const cells = (anchor: number, focus = anchor, col = 2): GridSelection => ({
+    anchor: { row: anchor, col },
+    focus: { row: focus, col },
+    mode: "cells",
+  });
+  const H = 22;
+
+  it("are the same rows when they are, or a page more of them", () => {
+    const rows = [[1], [2]];
+    expect(sameLoadedRows(rows, rows)).toBe(true);
+    expect(sameLoadedRows(rows, [...rows, [3]])).toBe(true);
+    expect(sameLoadedRows(rows, [[1], [2]])).toBe(false); // read again: the anchor's to place
+    expect(sameLoadedRows([], [[1]])).toBe(false);
+  });
+
+  it("move a loaded row by the new rows above it and find a new row by its id", () => {
+    expect(rowAfterTop(5, top("b"), top("c", "b"))).toBe(6);
+    expect(rowAfterTop(0, top("b"), top("c", "b"))).toBe(1);
+    expect(rowAfterTop(1, top("c", "b"), top("b"))).toBe(0);
+    expect(rowAfterTop(0, top("c", "b"), top("b"))).toBeNull(); // c went
+    expect(rowAfterTop(3, top("c", "b"), top())).toBe(1);
+  });
+
+  it("keep the selection on its row and the loaded rows where they were on screen (Add row, its undo)", () => {
+    const added = placeAfterTop({ selection: cells(10), scrollTop: 5 * H }, top(), top("a"), H);
+    expect(added).toEqual({ selection: cells(11), clearSelection: false, scrollTop: 6 * H });
+    const undone = placeAfterTop({ selection: cells(11, 13), scrollTop: 6 * H }, top("a"), top(), H);
+    expect(undone).toEqual({ selection: cells(10, 12), clearSelection: false, scrollTop: 5 * H });
+    const rows: GridSelection = { anchor: { row: 4, col: 0 }, focus: { row: 6, col: 0 }, mode: "rows" };
+    expect(placeAfterTop({ selection: rows, scrollTop: H }, top("a", "b"), top("b"), H).selection).toEqual({
+      ...rows,
+      anchor: { row: 3, col: 0 },
+      focus: { row: 5, col: 0 },
+    });
+  });
+
+  it("clear a selection on a new row that went, never moving it onto another row (K14b)", () => {
+    expect(placeAfterTop({ selection: cells(0), scrollTop: 3 * H }, top("a"), top(), H)).toEqual({
+      selection: null,
+      clearSelection: true,
+      scrollTop: 2 * H,
+    });
+    expect(placeAfterTop({ selection: cells(0, 4), scrollTop: 0 }, top("a"), top(), H).clearSelection).toBe(true);
+    // a new row that stays is followed
+    expect(placeAfterTop({ selection: cells(1), scrollTop: 0 }, top("b", "a"), top("a"), H).selection).toEqual(
+      cells(0),
+    );
+  });
+
+  it("stay at the very top when the view was there, so new rows show; whole columns keep their selection", () => {
+    expect(placeAfterTop({ selection: null, scrollTop: 0 }, top(), top("a"), H)).toEqual({
+      selection: null,
+      clearSelection: false,
+      scrollTop: 0,
+    });
+    expect(placeAfterTop({ selection: null, scrollTop: 10 }, top("a", "b"), top(), H).scrollTop).toBe(0);
+    const columns: GridSelection = { anchor: { row: 0, col: 1 }, focus: { row: 0, col: 2 }, mode: "columns" };
+    expect(placeAfterTop({ selection: columns, scrollTop: H }, top(), top("a"), H)).toEqual({
+      selection: null,
+      clearSelection: false,
+      scrollTop: 2 * H,
+    });
   });
 });

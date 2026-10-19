@@ -1,4 +1,4 @@
-import type { EditChanges } from "@/lib/api/types";
+import type { EditChanges, EditKind } from "@/lib/api/types";
 import { inputMatches, NULL_INPUT, sameCell, sameInput, type CellInput } from "./cells";
 
 /*
@@ -108,7 +108,8 @@ export interface AppliedOutcome {
 }
 
 export type StageAction =
-  | { type: "edit"; cell: CellTarget; input: CellInput }
+  /** `kind`: the column's (`inputMatches`): typed `yes` over a loaded true, or hex in another case, changes nothing. */
+  | { type: "edit"; cell: CellTarget; input: CellInput; kind?: EditKind }
   | { type: "setNull"; cells: readonly CellTarget[] }
   | { type: "useDefault"; cells: readonly CellTarget[] }
   | { type: "revertCells"; cells: readonly CellTarget[] }
@@ -118,8 +119,11 @@ export type StageAction =
   | { type: "restoreRows"; rows: readonly RowRef[] }
   | { type: "addRow"; id: string }
   | { type: "discardAll" }
-  /** The row's set columns are checked against `current` (the server's cells now) instead of what was loaded. */
-  | { type: "keepMine"; row: LoadedRowRef; current: Cells }
+  /**
+   * The row's set columns are checked against `current` (the server's cells now) instead of what was loaded; `kinds`
+   * (the columns', by name) as for `edit`.
+   */
+  | { type: "keepMine"; row: LoadedRowRef; current: Cells; kinds?: ReadonlyMap<string, EditKind> }
   | { type: "setProblems"; problems: Readonly<Record<string, readonly StagedProblem[]>> }
   /**
    * The apply is about to be sent (pre-flight H1): its outcome is unknown until `applyOutcome`. Not an undo step. A
@@ -304,12 +308,19 @@ function setUpdate(work: Work, rowKey: RowKey, update: StagedUpdate | null, id: 
   work.edited.add(id);
 }
 
-function editLoaded(work: Work, row: LoadedRowRef, column: string, input: CellInput, loaded: unknown): void {
+function editLoaded(
+  work: Work,
+  row: LoadedRowRef,
+  column: string,
+  input: CellInput,
+  loaded: unknown,
+  kind: EditKind | undefined,
+): void {
   if (row.rowKey in work.deletes) return; // a row marked for deletion is not edited (restore it first)
   const existing = work.updates[row.rowKey];
   const staged = existing !== undefined && Object.hasOwn(existing.set, column);
   const original = staged ? own(existing.original, column) : loaded;
-  if (inputMatches(input, original)) {
+  if (inputMatches(input, original, kind)) {
     // Back to the value it was loaded with: no change to the cell (there is no no-op UPDATE).
     if (staged) setUpdate(work, row.rowKey, withoutColumn(existing, column), existing.id);
     return;
@@ -338,9 +349,9 @@ function editInsert(work: Work, id: string, column: string, input: CellInput): v
   work.edited.add(id);
 }
 
-function editCell(work: Work, cell: CellTarget, input: CellInput): void {
+function editCell(work: Work, cell: CellTarget, input: CellInput, kind?: EditKind): void {
   if (cell.row.kind === "insert") editInsert(work, cell.row.id, cell.column, input);
-  else if (input.kind !== "default") editLoaded(work, cell.row, cell.column, input, cell.original);
+  else if (input.kind !== "default") editLoaded(work, cell.row, cell.column, input, cell.original, kind);
 }
 
 function revertCell(work: Work, cell: CellTarget): void {
@@ -402,7 +413,12 @@ function restoreRows(work: Work, rows: readonly RowRef[]): void {
   }
 }
 
-function keepMine(work: Work, row: LoadedRowRef, current: Cells): void {
+function keepMine(
+  work: Work,
+  row: LoadedRowRef,
+  current: Cells,
+  kinds: ReadonlyMap<string, EditKind> | undefined,
+): void {
   const existing = work.updates[row.rowKey];
   if (!existing) return;
   const set: [string, CellInput][] = [];
@@ -416,7 +432,8 @@ function keepMine(work: Work, row: LoadedRowRef, current: Cells): void {
       continue;
     }
     moved = true;
-    if (inputMatches(input, current[column])) continue; // the server holds the staged value now: nothing to change
+    // the server holds the staged value now: nothing to change
+    if (inputMatches(input, current[column], kinds?.get(column))) continue;
     set.push([column, input]);
     original.push([column, current[column] ?? null]);
   }
@@ -525,7 +542,7 @@ export function stage(state: StagedEdits, action: StageAction, newId: NewId = ne
   const work = begin(state, newId);
   switch (action.type) {
     case "edit":
-      editCell(work, action.cell, action.input);
+      editCell(work, action.cell, action.input, action.kind);
       break;
     case "setNull":
       for (const cell of action.cells) editCell(work, cell, NULL_INPUT);
@@ -552,7 +569,7 @@ export function stage(state: StagedEdits, action: StageAction, newId: NewId = ne
       work.changed = true;
       break;
     case "keepMine":
-      keepMine(work, action.row, action.current);
+      keepMine(work, action.row, action.current, action.kinds);
       break;
   }
   return finish(state, work);

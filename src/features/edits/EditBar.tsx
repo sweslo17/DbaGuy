@@ -1,6 +1,7 @@
 import { AlertTriangle, Lock, Plus } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { plural } from "@/lib/format";
+import { KEY_CHANGED } from "./tableEditing";
 
 export interface EditBarProps {
   /** The table's rows can be edited: + Row shows (off while `paused`). */
@@ -60,10 +61,7 @@ export function EditBar(props: EditBarProps) {
         </span>
       )}
       {keyChanged && (
-        <span
-          className={`${NOTE} text-warning`}
-          title="The table's key changed since these changes were staged: commit or discard them"
-        >
+        <span className={`${NOTE} text-warning`} title={KEY_CHANGED}>
           <AlertTriangle size={12} className="shrink-0" />
           <span className="truncate">Staged on another key</span>
         </span>

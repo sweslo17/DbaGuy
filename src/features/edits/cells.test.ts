@@ -36,6 +36,26 @@ describe("whether a staged value changes the loaded one", () => {
     expect(inputMatches({ kind: "value", text: "0xdead" }, bytes(2, "dead"))).toBe(true);
     expect(inputMatches({ kind: "default" }, null)).toBe(false);
   });
+
+  it("reads a bool's words and hex's case as the backend does, with the column's kind", () => {
+    const typed = (text: string) => ({ kind: "value", text }) as const;
+    for (const word of ["yes", "t", "1", "TRUE", " Yes "]) expect(inputMatches(typed(word), true, "bool")).toBe(true);
+    for (const word of ["no", "f", "0", "false"]) expect(inputMatches(typed(word), false, "bool")).toBe(true);
+    expect(inputMatches(typed("no"), true, "bool")).toBe(false);
+    expect(inputMatches(typed("maybe"), true, "bool")).toBe(false);
+    expect(inputMatches(typed("yes"), 1, "bool")).toBe(true); // SQLite keeps a BOOLEAN as an integer
+    expect(inputMatches(typed("yes"), 2, "bool")).toBe(false);
+    expect(inputMatches(typed("maybe"), 2, "bool")).toBe(false); // neither is a bool: the text decides
+    expect(inputMatches(typed("0xDEADBEEF"), bytes(4, "deadbeef"), "binary")).toBe(true);
+    expect(inputMatches(typed("DeadBeef"), bytes(4, "deadbeef"), "binary")).toBe(true);
+    expect(inputMatches(typed("0xdeadbe"), bytes(4, "deadbeef"), "binary")).toBe(false);
+    expect(inputMatches(typed("0xdeadbeef"), bytes(100, "deadbeef".repeat(16)), "binary")).toBe(false); // a preview
+    // without the kind, and for every other kind, the text decides: `1.0` and `1` may differ on the server
+    expect(inputMatches(typed("yes"), true)).toBe(false);
+    expect(inputMatches(typed("0xDEADBEEF"), bytes(4, "deadbeef"))).toBe(false);
+    expect(inputMatches(typed("1.0"), 1, "number")).toBe(false);
+    expect(inputMatches(typed("1"), true, "text")).toBe(false);
+  });
 });
 
 describe("cells read again", () => {

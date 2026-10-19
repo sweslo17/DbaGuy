@@ -43,10 +43,13 @@ export const MARKED_DELETED = "This row is marked for deletion: restore it first
 /** Why a row whose key was not loaded whole is not edited (nothing could identify it). */
 export const KEY_INCOMPLETE = "This row cannot be edited: its key was not loaded completely";
 
+/** Why a column cannot be written, as its header and its refusal say it. */
+export const readOnlyReasonOf = (column: EditColumn): string => column.read_only_reason ?? "it cannot be written";
+
 /** Why a cell of `name` cannot be written: the table has no such column (any more), or it is read-only. */
 export function notWritable(name: string, column: EditColumn | undefined): string {
   if (!column) return `${name} is not a column of the table any more: Refresh`;
-  return `${name} is read-only: ${column.read_only_reason ?? "it cannot be written"}`;
+  return `${name} is read-only: ${readOnlyReasonOf(column)}`;
 }
 
 /** How the cell's edit starts, or why it cannot (said in a toast). */

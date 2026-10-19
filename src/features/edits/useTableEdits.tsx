@@ -3,18 +3,27 @@ import { useCallback, useLayoutEffect, useMemo, useRef, useState, type RefObject
 import { flushSync } from "react-dom";
 import type { MenuItem } from "@/components/ui/ContextMenu";
 import { toast } from "@/components/ui/Toast";
-import type { ColumnMeta, EditColumn, EditKind, EditTarget } from "@/lib/api/types";
+import type { ColumnMeta, EditColumn, EditKind, EditTarget, PathSegment } from "@/lib/api/types";
 import { sameElements } from "@/lib/arrays";
+import { writeClipboard } from "@/lib/native";
 import { adds, dispatchStaged, readStagedEdits, useStagedEdits } from "@/stores/stagedEdits";
 import type { TableTabState } from "@/stores/workspace";
 import { isPasswordRequired } from "../connections/UnlockDialog";
+import { ROW_HEIGHT } from "../grid/columns";
 import type { DataGridHandle, GridSelectionState } from "../grid/DataGrid";
 import type { GridEditing } from "../grid/EditorSlot";
 import type { EditItems } from "../grid/GridMenu";
 import type { HeaderMark } from "../grid/marks";
 import type { CellPos, Rect } from "../grid/selection";
 import { CellEditor, type EditEnd } from "./CellEditor";
-import { editorResult, editStart, nextWritable, type EditStart, type SetNullAnswer } from "./editing";
+import {
+  editorResult,
+  editStart,
+  nextWritable,
+  readOnlyReasonOf,
+  type EditStart,
+  type SetNullAnswer,
+} from "./editing";
 import { gridEditKey } from "./editKeys";
 import { editsErrorMessage, editTargetQuery } from "./editsApi";
 import {
@@ -40,6 +49,9 @@ import {
 } from "./staging";
 import {
   CHECKING,
+  COPY_FAILED,
+  COPY_TEXT,
+  dispatchRefusal,
   EDIT_MENU_ITEMS,
   editMenu,
   editMode,
@@ -51,22 +63,25 @@ import {
   notNullSkipped,
   pickCells,
   pickRows,
+  placeAfterTop,
   rowHasConflict,
   ROWS_LOADING,
   rowStateOf,
+  sameLoadedRows,
   selectionFacts,
   stagedInputOf,
   stageRefusal,
   startEdit,
   targetView,
-  TOO_MANY_CHANGES,
   TOO_MANY_ROWS,
+  typedNotStaged,
   wasValueOf,
   type EditGate,
   type EditMenuEntry,
   type EditMenuId,
   type EditMenuInput,
   type GridLookup,
+  type ShownTop,
 } from "./tableEditing";
 import { ValueEditor } from "./ValueEditor";
 
@@ -88,6 +103,7 @@ const NO_COLUMNS: ColumnMeta[] = [];
 const NO_KINDS: ReadonlyMap<string, EditKind> = new Map();
 const NO_TARGET_COLUMNS: ReadonlyMap<string, EditColumn> = new Map();
 const NO_HEADER_MARKS: readonly (HeaderMark | undefined)[] = [];
+const NO_KEY: readonly string[] = [];
 /** What `adds` reads while nothing is staged yet. */
 const NOTHING_STAGED = emptyStaged([]);
 
@@ -181,18 +197,17 @@ function menuItem(entry: EditMenuEntry, run: () => void): MenuItem {
   };
 }
 
-export function useTableEdits(input: TableEditsInput): TableEdits {
-  const { tab, rowEditing, sessionOpen, stale, locked, gridRef } = input;
-  const columns = input.columns ?? NO_COLUMNS;
-  const rows = input.rows ?? EMPTY_ROWS;
-  const staged = useStagedEdits(tab.id);
-  /** What the grid draws: the store's staging, or Task 10's afterglow of a commit. */
-  const drawn = input.afterglow ?? staged;
+/** Puts an editor's text on the clipboard: what a refused staging of it offers (K20). */
+const copyTyped = (text: string) => void writeClipboard(text).catch(() => toast("error", COPY_FAILED));
 
-  // The edit target (`editTargetQuery`, the read `useTableData` makes when the tab is first shown: one read for both),
-  // read again on Refresh (DDL since). A read that wants the password before the session opened is the session's to
-  // ask for; one that still wants it after asks itself (L13), counted by its failures since the session opened.
-  const query = useQuery({ ...editTargetQuery(tab.profileId, tab.path), enabled: rowEditing && sessionOpen });
+/**
+ * The table's edit target as the tab shows it (`targetView`): read through `editTargetQuery`, the read `useTableData`
+ * makes when the tab is first shown (one read for both), again on Refresh (DDL since). A read that wants the password
+ * before the session opened is the session's to ask for; one that still wants it after asks itself (L13), told apart
+ * by its failures counted since the session opened.
+ */
+function useTargetView(profileId: string, path: PathSegment[], rowEditing: boolean, sessionOpen: boolean) {
+  const query = useQuery({ ...editTargetQuery(profileId, path), enabled: rowEditing && sessionOpen });
   const { refetch } = query;
   const refetchTarget = useCallback(() => void refetch(), [refetch]);
   const [failuresAtOpen, setFailuresAtOpen] = useState<number | null>(null);
@@ -205,8 +220,29 @@ export function useTableEdits(input: TableEditsInput): TableEdits {
     passwordRequired: query.isError && isPasswordRequired(query.error),
     failedSinceOpen: failuresAtOpen !== null && query.errorUpdateCount > failuresAtOpen,
   });
-  const target = view === "read" ? (query.data ?? null) : null;
-  const targetError = view === "error" ? editsErrorMessage(query.error) : null;
+  return {
+    view,
+    target: view === "read" ? (query.data ?? null) : null,
+    targetError: view === "error" ? editsErrorMessage(query.error) : null,
+    targetUnlock: view === "unlock" ? query.error : null,
+    refetchTarget,
+  };
+}
+
+export function useTableEdits(input: TableEditsInput): TableEdits {
+  const { tab, rowEditing, sessionOpen, stale, locked, gridRef } = input;
+  const columns = input.columns ?? NO_COLUMNS;
+  const rows = input.rows ?? EMPTY_ROWS;
+  const staged = useStagedEdits(tab.id);
+  /** What the grid draws: the store's staging, or Task 10's afterglow of a commit. */
+  const drawn = input.afterglow ?? staged;
+
+  const { view, target, targetError, targetUnlock, refetchTarget } = useTargetView(
+    tab.profileId,
+    tab.path,
+    rowEditing,
+    sessionOpen,
+  );
   const targetColumns = useMemo(
     () => (target ? new Map((target.columns ?? []).map((column) => [column.name, column])) : NO_TARGET_COLUMNS),
     [target],
@@ -231,12 +267,10 @@ export function useTableEdits(input: TableEditsInput): TableEdits {
   const mode = editMode(gate);
 
   // K1: the rows are keyed as the changes were staged while those are on another key, else by the table's key.
-  const keyColumns = keyChanged ? staged.keyColumns : (tableKey ?? staged?.keyColumns ?? null);
-  const keySignature = keyColumns ? JSON.stringify(keyColumns) : null;
-  const result = useMemo(
-    () => resultColumns(columns, keySignature ? (JSON.parse(keySignature) as string[]) : []),
-    [columns, keySignature],
-  );
+  // Both arrays keep their identity while their key does (the target's while it is read; the staging's across its
+  // actions), so the result, and the overlay's cache that keys on it, are made again only when the key changes.
+  const keyColumns = keyChanged ? staged.keyColumns : (tableKey ?? staged?.keyColumns ?? NO_KEY);
+  const result = useMemo(() => resultColumns(columns, keyColumns), [columns, keyColumns]);
   // K8: bound whenever the result has the key (17–21 ms per 100,000 rows once a result; Load more keys only its page).
   const bindingRef = useRef<Binding | null>(null);
   const binding = useMemo(() => {
@@ -274,21 +308,29 @@ export function useTableEdits(input: TableEditsInput): TableEdits {
     selection.current = state;
   }, []);
 
-  /** Stages `action`, or says why it cannot; true unless it was refused. `endingEdit`: an editor's text (H12). */
-  const stageAction = (action: StageAction, endingEdit = false): boolean => {
-    const refusal = stageRefusal(gate, adds(readStagedEdits(tab.id) ?? NOTHING_STAGED, action), endingEdit);
-    if (refusal) {
-      toast("info", refusal);
-      return false;
-    }
-    const outcome = dispatchStaged(tab.id, action, tableKey ?? undefined);
-    if (outcome === "too_many") toast("warning", TOO_MANY_CHANGES);
-    else if (outcome === "key_changed") toast("warning", KEY_CHANGED);
-    return outcome === "staged" || outcome === "unchanged";
+  /**
+   * The gate and the table's key as last committed. An editor that ends as it unmounts runs the callbacks of its last
+   * render, before a commit's lock reached it: what it stages is judged by these, never by that render's (a text staged
+   * into a change the running commit plans would be taken away with it).
+   */
+  const committed = useRef({ gate, tableKey });
+  /**
+   * Stages `action`, or says why it cannot; true unless it was refused. `typed`: what an editor that ended held (H12);
+   * a refusal then offers to copy it (K20).
+   */
+  const stageAction = (action: StageAction, typed?: string): boolean => {
+    const { gate: gateNow, tableKey: keyNow } = committed.current;
+    const adding = adds(readStagedEdits(tab.id) ?? NOTHING_STAGED, action);
+    const refusal = stageRefusal(gateNow, adding, typed !== undefined);
+    const why = refusal ?? dispatchRefusal(dispatchStaged(tab.id, action, keyNow ?? undefined));
+    if (why === null) return true;
+    if (typed === undefined) toast(refusal ? "info" : "warning", why);
+    else toast("warning", typedNotStaged(why), { label: COPY_TEXT, run: () => copyTyped(typed) });
+    return false;
   };
   /** Refuses (and says why) an action that would stage something new now. */
   const refusedToAdd = (): boolean => {
-    const refusal = stageRefusal(gate, true);
+    const refusal = stageRefusal(committed.current.gate, true);
     if (refusal) toast("info", refusal);
     return refusal !== null;
   };
@@ -300,10 +342,24 @@ export function useTableEdits(input: TableEditsInput): TableEdits {
   const editingCol = editing ? (result.byName.get(editing.column) ?? -1) : -1;
   const editorShown = mode === "edit" && editing !== null && editingPos >= 0 && editingCol >= 0;
   useLayoutEffect(() => {
+    committed.current = { gate, tableKey };
     editingNow.current = editing;
     // The edited row left the rows shown (a re-run, a sort) or editing stopped (held rows, a commit): the editor goes,
     // and what was typed in it is staged as it unmounts (H12).
     if (editing && !editorShown) setEditing(null);
+  });
+  // New rows came or went on top of the same loaded rows (Add row, its undo, a revert, a delete or Discard of a new
+  // row): the selection stays on its rows, never on the row that took its place (K14b for a new row that went).
+  const newIds = useMemo(() => (drawn?.inserts ?? []).map((insert) => insert.id).reverse(), [drawn?.inserts]);
+  const shownTop = useRef<ShownTop & { rows: unknown[][] }>({ rows, leading: display.leading, newIds });
+  useLayoutEffect(() => {
+    const before = shownTop.current;
+    const after = { rows, leading: display.leading, newIds };
+    shownTop.current = after;
+    if (before.leading === after.leading || !sameLoadedRows(before.rows, rows)) return;
+    const grid = gridRef.current;
+    const where = grid?.view();
+    if (grid && where) grid.restore(placeAfterTop(where, before, after, ROW_HEIGHT));
   });
   // The edited cell is the active one, and in view (Return, Tab, Add row).
   useLayoutEffect(() => {
@@ -335,9 +391,9 @@ export function useTableEdits(input: TableEditsInput): TableEdits {
   /** An editor ended: stage what was typed (H4), then close, move along the row (Tab), or open the preview (⌘S). */
   const endEdit = (current: Editing, text: string | null, how: EditEnd) => {
     const value = editorResult(text ?? "", text !== null);
-    if (value) {
+    if (value && text !== null) {
       const cell = { row: current.ref, column: current.column, original: current.original };
-      stageAction({ type: "edit", cell, input: value }, true);
+      stageAction({ type: "edit", cell, input: value, kind: current.kind }, text);
     }
     if (editingNow.current !== current) return; // another edit replaced it, or it was closed, meanwhile
     if (how === "next" || how === "previous") {
@@ -410,7 +466,8 @@ export function useTableEdits(input: TableEditsInput): TableEdits {
     const ref = lookup.refAt(pos.row);
     const row = resultRowAt(pos.row);
     if (ref?.kind !== "row" || !row) return;
-    stageAction({ type: "keepMine", row: ref, current: Object.fromEntries(names.map((name, i) => [name, row[i]])) });
+    const current = Object.fromEntries(names.map((name, i) => [name, row[i]]));
+    stageAction({ type: "keepMine", row: ref, current, kinds });
   };
   /** + Row: a new row at the top, its first writable column's editor open (spec §3.6.3, H3). */
   const addRow = () => {
@@ -488,7 +545,7 @@ export function useTableEdits(input: TableEditsInput): TableEdits {
     const key = new Set(target.key ?? []);
     return names.map((name) => {
       const meta = targetColumns.get(name);
-      const readOnly = meta && !meta.writable ? (meta.read_only_reason ?? "it cannot be written") : null;
+      const readOnly = meta && !meta.writable ? readOnlyReasonOf(meta) : null;
       return key.has(name) || readOnly ? { key: key.has(name), readOnly } : undefined;
     });
   }, [target, names, targetColumns]);
@@ -563,7 +620,7 @@ export function useTableEdits(input: TableEditsInput): TableEdits {
   return {
     target,
     targetError,
-    targetUnlock: view === "unlock" ? query.error : null,
+    targetUnlock,
     checking: view === "checking",
     refetchTarget,
     editable: mode === "edit",

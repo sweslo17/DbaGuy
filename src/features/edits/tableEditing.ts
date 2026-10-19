@@ -1,7 +1,8 @@
 import type { EditColumn } from "@/lib/api/types";
 import { plural } from "@/lib/format";
+import type { DispatchResult } from "@/stores/stagedEdits";
 import type { RowMark } from "../grid/marks";
-import type { Rect } from "../grid/selection";
+import type { GridSelection, Rect } from "../grid/selection";
 import { editText, type CellInput } from "./cells";
 import { editStart, KEY_INCOMPLETE, MARKED_DELETED, notWritable, type EditCellInput, type EditStart, type RowState } from "./editing";
 import type { GridEditKey } from "./editKeys";
@@ -36,6 +37,9 @@ export const CHECKING = "Checking whether this table's rows can be edited";
 export const NOT_EDITABLE = "Rows of this table cannot be edited";
 export const TOO_LARGE_TO_KEEP = "Too large to keep across a restart";
 export const KEEP_MINE_TITLE = "Check the staged values against the server's values now";
+
+export const COPY_TEXT = "Copy text";
+export const COPY_FAILED = "Could not copy the text";
 
 export const notNullSkipped = (cells: number) => `Skipped ${plural(cells, "cell")} of NOT NULL columns`;
 export const notNullColumn = (column: string) => `${column} is NOT NULL`;
@@ -72,6 +76,18 @@ export function stageRefusal(gate: EditGate, adds: boolean, endingEdit = false):
   if (!adds || endingEdit) return null;
   return gate.readOnly ?? gate.waiting;
 }
+
+/** Why the store refused a dispatch (`dispatchStaged`), or null when it did not. */
+export function dispatchRefusal(outcome: DispatchResult | null): string | null {
+  if (outcome === "too_many") return TOO_MANY_CHANGES;
+  return outcome === "key_changed" ? KEY_CHANGED : null;
+}
+
+/**
+ * What a refused staging of an editor's text says (ruling K20): the edit has ended (the editors never reopen), so the
+ * text is offered to copy (`COPY_TEXT`) rather than lost with only a toast.
+ */
+export const typedNotStaged = (why: string): string => `${why.replace(/\.$/, "")}. What you typed was not staged.`;
 
 /** Where a row of the grid stands for editing: `editing.ts`'s states, and a key that more than one loaded row has (K6). */
 export type GridRowState = RowState | "repeated";
@@ -395,3 +411,54 @@ export const asksBeforeDiscard = (changes: number): boolean => changes > 1;
 
 export const discardQuestion = (changes: number, table: string): string =>
   `Discard ${plural(changes, "staged change")} to ${table}? ⌘Z brings them back.`;
+
+/** The new rows drawn on top of the loaded rows: how many, and their ids from the top. */
+export interface ShownTop {
+  leading: number;
+  newIds: readonly string[];
+}
+
+/**
+ * The same loaded rows, or a page more of them (Load more appends; a re-run brings other row objects, and the anchor of
+ * `useAnchoredRerun` puts the grid back then).
+ */
+export const sameLoadedRows = (before: readonly unknown[], now: readonly unknown[]): boolean =>
+  before === now || (before.length > 0 && now.length >= before.length && now[0] === before[0]);
+
+/**
+ * Where a display row of `before` is in `after`: a loaded row moves with the new rows above it, a new row is found by
+ * its id; null when it is gone.
+ */
+export function rowAfterTop(row: number, before: ShownTop, after: ShownTop): number | null {
+  if (row >= before.leading) return row - before.leading + after.leading;
+  const index = after.newIds.indexOf(before.newIds[row]);
+  return index < 0 ? null : index;
+}
+
+/**
+ * The grid's place once the new rows on top changed over the same loaded rows (a new row added, undone, reverted,
+ * deleted, discarded): the selection stays on its rows and the loaded rows stay where they were on screen, the scroll
+ * moving by the rows added or taken away above them; a view at the very top stays there, so new rows show. A selection
+ * on a new row that went is cleared, never moved onto another row (K14b). Whole columns and select-all have no row.
+ */
+export function placeAfterTop(
+  view: { selection: GridSelection | null; scrollTop: number },
+  before: ShownTop,
+  after: ShownTop,
+  rowHeight: number,
+): { selection: GridSelection | null; clearSelection: boolean; scrollTop: number } {
+  const moved = view.scrollTop + (after.leading - before.leading) * rowHeight;
+  const scrollTop = view.scrollTop <= 0 ? 0 : Math.max(0, moved);
+  const selection = view.selection;
+  if (!selection || selection.mode === "columns" || selection.mode === "all") {
+    return { selection: null, clearSelection: false, scrollTop };
+  }
+  const anchor = rowAfterTop(selection.anchor.row, before, after);
+  const focus = rowAfterTop(selection.focus.row, before, after);
+  if (anchor === null || focus === null) return { selection: null, clearSelection: true, scrollTop };
+  return {
+    selection: { ...selection, anchor: { ...selection.anchor, row: anchor }, focus: { ...selection.focus, row: focus } },
+    clearSelection: false,
+    scrollTop,
+  };
+}

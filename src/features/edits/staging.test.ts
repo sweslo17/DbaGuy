@@ -73,6 +73,23 @@ describe("editing a loaded row", () => {
     );
   });
 
+  it("reads the typed value as the column's kind does: `yes` over true and hex in another case change nothing", () => {
+    const flag = { row: row(1), column: "flag", original: true };
+    expect(run({ type: "edit", cell: flag, input: value("yes"), kind: "bool" }).updates).toEqual({});
+    expect(changeCount(run({ type: "edit", cell: flag, input: value("no"), kind: "bool" }))).toBe(1);
+    const data = { row: row(1), column: "data", original: { $type: "bytes", size: 4, preview: "deadbeef" } };
+    expect(run({ type: "edit", cell: data, input: value("0xDEADBEEF"), kind: "binary" }).updates).toEqual({});
+    // back to the loaded value in another word removes the staged cell
+    const back = run(
+      { type: "edit", cell: flag, input: value("false"), kind: "bool" },
+      { type: "edit", cell: flag, input: value("t"), kind: "bool" },
+    );
+    expect(changeCount(back)).toBe(0);
+    // a number keeps its text: `1.0` over 1 is a change
+    const amount = { row: row(1), column: "amount", original: 1 };
+    expect(changeCount(run({ type: "edit", cell: amount, input: value("1.0"), kind: "number" }))).toBe(1);
+  });
+
   it("tells NULL from the empty string", () => {
     const empty = run({ type: "edit", cell: { row: row(1), column: "note", original: null }, input: value("") });
     expect(empty.updates[row(1).rowKey].set).toEqual({ note: value("") });
@@ -299,6 +316,14 @@ describe("keep mine", () => {
   it("changes nothing when nothing changed on the server", () => {
     const state = conflicted();
     expect(stage(state, { type: "keepMine", row: row(1), current: { a: "x", b: "y" } })).toBe(state);
+  });
+
+  it("drops a cell the server holds in another word of the column's kind", () => {
+    const state = run({ type: "edit", cell: { row: row(1), column: "flag", original: false }, input: value("yes") });
+    const kinds = new Map([["flag", "bool" as const]]);
+    const kept = stage(state, { type: "keepMine", row: row(1), current: { flag: true }, kinds });
+    expect(changeCount(kept)).toBe(0);
+    expect(changeCount(stage(state, { type: "keepMine", row: row(1), current: { flag: true } }))).toBe(1);
   });
 });
 

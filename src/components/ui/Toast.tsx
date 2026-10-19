@@ -5,10 +5,17 @@ import { cn } from "@/lib/cn";
 
 export type ToastKind = "info" | "success" | "warning" | "error";
 
+/** A button on a toast: running it dismisses the toast. */
+export interface ToastAction {
+  label: string;
+  run: () => void;
+}
+
 interface ToastItem {
   id: number;
   kind: ToastKind;
   text: string;
+  action?: ToastAction;
 }
 
 const MAX_VISIBLE = 4;
@@ -23,9 +30,12 @@ const STRIPE: Record<ToastKind, string> = {
 const useToasts = create<{ items: ToastItem[] }>(() => ({ items: [] }));
 let nextId = 1;
 
-/** Shows a toast in the bottom-right corner (app-wide; the oldest goes once more than MAX_VISIBLE are shown). */
-export function toast(kind: ToastKind, text: string): void {
-  const item = { id: nextId++, kind, text };
+/**
+ * Shows a toast in the bottom-right corner (app-wide; the oldest goes once more than MAX_VISIBLE are shown). One with an
+ * `action` stays as long as an error does: there is something to do with it.
+ */
+export function toast(kind: ToastKind, text: string, action?: ToastAction): void {
+  const item: ToastItem = { id: nextId++, kind, text, action };
   useToasts.setState((s) => ({ items: [...s.items, item].slice(-MAX_VISIBLE) }));
 }
 
@@ -35,7 +45,7 @@ function dismiss(id: number): void {
 
 /** One toast: dismisses itself after its kind's duration, counted only while the stack is not hovered. */
 function ToastView({ item, paused }: { item: ToastItem; paused: boolean }) {
-  const remaining = useRef(DURATION_MS[item.kind]);
+  const remaining = useRef(DURATION_MS[item.action ? "error" : item.kind]);
   useEffect(() => {
     if (paused) return;
     const started = Date.now();
@@ -55,6 +65,18 @@ function ToastView({ item, paused }: { item: ToastItem; paused: boolean }) {
       <div className="min-w-0 flex-1 px-3 py-2 break-words whitespace-pre-wrap" data-selectable>
         {item.text}
       </div>
+      {item.action && (
+        <button
+          type="button"
+          className="my-1 shrink-0 self-center rounded px-2 py-0.5 font-medium text-accent hover:bg-hover"
+          onClick={() => {
+            dismiss(item.id);
+            item.action?.run();
+          }}
+        >
+          {item.action.label}
+        </button>
+      )}
       <button
         type="button"
         aria-label="Dismiss"

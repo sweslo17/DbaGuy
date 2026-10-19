@@ -57,22 +57,48 @@ export function sameInput(a: CellInput, b: CellInput): boolean {
   return a.kind !== "value" || (b.kind === "value" && a.text === b.text);
 }
 
-/**
- * Whether staging `input` over the loaded cell `original` would change nothing: NULL over NULL, or exactly the text the
- * cell's editor starts with over a complete value (spec §3.6.1: there is no no-op UPDATE). DEFAULT never matches.
- */
-export function inputMatches(input: CellInput, original: unknown): boolean {
-  const cell = asNull(original);
-  if (input.kind === "null") return cell === null;
-  if (input.kind === "default" || cell === null) return false;
-  const { text, complete } = editText(cell);
-  return complete && text === input.text;
-}
-
 const TRUE_WORDS: ReadonlySet<string> = new Set(["true", "t", "1", "yes"]);
 const FALSE_WORDS: ReadonlySet<string> = new Set(["false", "f", "0", "no"]);
 /** Hex as the backend reads it (`literals._hex`): an optional 0x, then two digits a byte. */
 const HEX = /^(?:0[xX])?((?:[0-9a-fA-F]{2})*)$/;
+
+/** A bool's text as the backend reads it (true/t/1/yes, false/f/0/no, any case, around spaces), or null. */
+function boolOf(text: string): boolean | null {
+  const word = text.trim().toLowerCase();
+  if (TRUE_WORDS.has(word)) return true;
+  return FALSE_WORDS.has(word) ? false : null;
+}
+
+/** Bytes typed as hex, as their lower-case digits (no 0x), or null when the text is not hex. */
+function hexOf(text: string): string | null {
+  const match = HEX.exec(text.trim());
+  return match ? match[1].toLowerCase() : null;
+}
+
+/**
+ * Whether staging `input` over the loaded cell `original` would change nothing (spec §3.6.1: there is no no-op UPDATE):
+ * NULL over NULL, or the text the cell's editor starts with over a complete value. With the column's `kind`, a bool
+ * also matches in any of the backend's words for it (`yes` over true) and bytes in any case of their hex, with or
+ * without 0x. Every other kind compares the text exactly: a number's `1.0` and `1` can be different values on the
+ * server. DEFAULT never matches.
+ */
+export function inputMatches(input: CellInput, original: unknown, kind?: EditKind): boolean {
+  const cell = asNull(original);
+  if (input.kind === "null") return cell === null;
+  if (input.kind === "default" || cell === null) return false;
+  const { text, complete } = editText(cell);
+  if (!complete) return false;
+  if (text === input.text) return true;
+  if (kind === "bool") {
+    const typed = boolOf(input.text);
+    return typed !== null && typed === (typeof cell === "boolean" ? cell : boolOf(text));
+  }
+  if (kind === "binary" && typeof cell === "object") {
+    const typed = hexOf(input.text);
+    return typed !== null && typed === hexOf(text);
+  }
+  return false;
+}
 
 /**
  * A staged value as the grid draws it (D-05-10), in the encoding of a loaded cell, so copy, the aggregates, the value
@@ -83,16 +109,10 @@ const HEX = /^(?:0[xX])?((?:[0-9a-fA-F]{2})*)$/;
 export function displayCell(input: CellInput, kind: EditKind | undefined): unknown {
   if (input.kind !== "value") return null;
   const { text } = input;
-  if (kind === "bool") {
-    const word = text.trim().toLowerCase();
-    if (TRUE_WORDS.has(word)) return true;
-    if (FALSE_WORDS.has(word)) return false;
-    return text;
-  }
+  if (kind === "bool") return boolOf(text) ?? text;
   if (kind === "binary") {
-    const match = HEX.exec(text.trim());
-    if (!match) return text;
-    const hex = match[1].toLowerCase();
+    const hex = hexOf(text);
+    if (hex === null) return text;
     return { $type: "bytes", size: hex.length / 2, preview: hex.slice(0, BYTES_PREVIEW * 2) };
   }
   return text;
