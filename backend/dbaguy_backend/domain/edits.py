@@ -125,6 +125,7 @@ class EditChanges(_Input):
 EditProblemCode = Literal[
     "invalid_number", "invalid_json", "invalid_hex", "invalid_bool", "invalid_text", "value_too_large",
     "read_only_column", "unknown_column", "not_nullable", "key_incomplete", "default_not_allowed",
+    "key_collision",  # an UPDATE moves a row onto another changed row's key (ruling G7)
 ]
 
 

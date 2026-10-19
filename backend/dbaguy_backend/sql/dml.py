@@ -35,6 +35,7 @@ _NON_TRANSACTIONAL = (
 )
 _UNCHECKED = "Not checked for changes made since loading: {columns}"
 _MISSING_REQUIRED = "New row: no value for {columns} (NOT NULL, no default); the server will probably refuse it"
+_KEY_COLLISION = "This change moves a row onto the key of another changed row: commit these changes separately"
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,39 @@ class DmlPlan:
     script: str
 
 
+@dataclass(frozen=True, slots=True)
+class _KeyChange:
+    """An UPDATE's key as the WHERE terms that pin it: the row as loaded (`original`) and where the UPDATE leaves it
+    (`new`: the SET term of each key column it sets, the original term of the others)."""
+
+    change_id: str
+    original: tuple[str, ...]
+    new: tuple[str, ...]
+
+    @property
+    def moves(self) -> bool:
+        return self.new != self.original
+
+
+def _colliding(updates: list[_KeyChange]) -> list[str]:
+    """The UPDATEs refused because one moves a row onto the key another UPDATE of the plan pins (ruling G7): after a
+    concurrent delete of that row, the other UPDATE's WHERE would match the moved row, both would report one row and
+    the commit would keep a wrong result. Each pair is reported once, on its later change when that one moves a row
+    (a swap: the second), otherwise on the change that moves (the message speaks of a move). A move onto a DELETEd
+    key is no collision: every DELETE runs first (D-05-3). Keys compare as the terms the statements send, so notations
+    that differ (`2.0` for `2`) or a collation's equal texts are left to the server's unique check."""
+    pinned: dict[tuple[str, ...], list[int]] = {}
+    for index, update in enumerate(updates):
+        pinned.setdefault(update.original, []).append(index)
+    refused: set[int] = set()
+    for index, update in enumerate(updates):
+        if update.moves:
+            for other in pinned.get(update.new, ()):  # never `index`: a move's new key is not its own original
+                later = max(index, other)
+                refused.add(later if updates[later].moves else index)
+    return [updates[index].change_id for index in sorted(refused)]
+
+
 class _Builder:
     def __init__(self, dialect: Dialect, target: EditTarget) -> None:
         if not target.editable:
@@ -61,6 +95,7 @@ class _Builder:
         escapes = None if target.backslash_escapes else False
         self.styles = {c.name: LiteralStyle(national=c.unicode, backslash_escapes=escapes) for c in target.columns}
         self.problems: list[EditProblem] = []
+        self.keys: list[_KeyChange] = []  # every UPDATE whose original and new key are both known, in plan order
 
     def _problem(self, change_id: str, column: str | None, code: EditProblemCode, message: str) -> None:
         self.problems.append(EditProblem(change_id=change_id, column=column, code=code, message=message))
@@ -115,6 +150,7 @@ class _Builder:
         sets: list[str] = []
         checks: list[str] = []
         unchecked: list[UncheckedColumn] = []
+        new_key: dict[str, str] = {}  # each key column set: its SET term, which is also the term that pins it after
         for name, cell in change.set.items():
             column = self._column(change.id, name)
             if column is None:
@@ -130,6 +166,7 @@ class _Builder:
                 continue
             sets.append(f"{quote_ident(self.dialect, name)} = {literal}")
             if name in self.target.key:
+                new_key[name] = sets[-1]
                 continue  # its key term pins it (CR-4)
             original = change.original[name]
             term = match_condition(self.dialect, column, original, self.styles[name], key=False)
@@ -139,11 +176,19 @@ class _Builder:
                 unchecked.append(UncheckedColumn(column=name, reason=reason))
             else:
                 checks.append(term)
+        if terms is not None and new_key.keys() == {name for name in change.set if name in self.target.key}:
+            new = tuple(new_key.get(name, term) for name, term in zip(self.target.key, terms, strict=True))
+            self.keys.append(_KeyChange(change.id, tuple(terms), new))  # also with other problems: all are reported
         if not complete or terms is None:
             return None
         sql = f"UPDATE {self.table} SET {', '.join(sets)} WHERE {' AND '.join([*terms, *checks])}"
         return PlannedStatement(change_id=change.id, kind="update", sql=sql, unchecked=unchecked,
                                 row=self._row(change.key))
+
+    def refuse_key_collisions(self) -> None:
+        """After every UPDATE: a problem on each one that `_colliding` refuses (ruling G7)."""
+        for change_id in _colliding(self.keys):
+            self._problem(change_id, None, "key_collision", _KEY_COLLISION)
 
     def insert(self, change: RowInsert) -> tuple[PlannedStatement | None, list[str]]:
         """The statement (None with problems) and the required columns the row gives no value."""
@@ -197,6 +242,7 @@ def build_plan(dialect: Dialect, target: EditTarget, changes: EditChanges) -> Dm
     for update in changes.updates:
         if (statement := builder.update(update)) is not None:
             statements.append(statement)
+    builder.refuse_key_collisions()
     for insert in changes.inserts:
         statement, missing = builder.insert(insert)
         if statement is not None:

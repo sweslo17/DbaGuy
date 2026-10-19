@@ -162,6 +162,49 @@ def test_a_key_column_set_is_pinned_by_its_key_only():  # CR-4
     assert plan.statements[0].sql == "UPDATE public.orders SET id = 20 WHERE id = 2"
 
 
+def move(change_id, old, new):
+    return {"id": change_id, "key": {"id": old}, "set": {"id": value(new)}, "original": {"id": old}}
+
+
+COLLISION = "This change moves a row onto the key of another changed row: commit these changes separately"
+
+
+def test_a_swap_of_keys_is_refused():  # ruling G7: after a concurrent delete it would commit a wrong result
+    plan = build_plan(PG, pg_target(), changes(updates=[move("u:1", 1, "2"), move("u:2", 2, "1")]))
+    assert [(p.change_id, p.column, p.code, p.message) for p in plan.problems] == [
+        ("u:2", None, "key_collision", COLLISION)]
+    assert plan.statements == [] and plan.script == ""
+    big = build_plan(PG, pg_target(), changes(updates=[  # a key beyond 2^53 held as text meets the typed one
+        move("u:1", 1, "9007199254740993"), move("u:2", "9007199254740993", "1")]))
+    assert [(p.change_id, p.code) for p in big.problems] == [("u:2", "key_collision")]
+    edited_after = build_plan(PG, pg_target(), changes(updates=[  # the row moved onto is edited later: on the move
+        move("u:1", 1, "2"),
+        {"id": "u:2", "key": {"id": 2}, "set": {"label": value("x")}, "original": {"label": "b"}}]))
+    assert [(p.change_id, p.code) for p in edited_after.problems] == [("u:1", "key_collision")]
+    composite = EditTarget(path=PG_PATH, editable=True, key=["a", "b"], key_source="primary_key",
+                           columns=[column("a", "number", nullable=False), column("b", nullable=False), column("n")])
+    plan = build_plan(PG, composite, changes(updates=[  # the key column not set keeps its original term
+        {"id": "u:1", "key": {"a": 1, "b": "y"}, "set": {"n": value("z")}, "original": {"n": "w"}},
+        {"id": "u:2", "key": {"a": 1, "b": "x"}, "set": {"b": value("y")}, "original": {"b": "x"}}]))
+    assert [(p.change_id, p.code) for p in plan.problems] == [("u:2", "key_collision")]
+
+
+def test_a_move_onto_a_deleted_rows_key_is_allowed():  # D-05-3: the DELETE runs first, so its key can be reused
+    plan = build_plan(PG, pg_target(), changes(deletes=[{"id": "d:1", "key": {"id": 2}}], updates=[move("u:1", 1, "2")]))
+    assert plan.problems == [] and [s.sql for s in plan.statements] == [
+        "DELETE FROM public.orders WHERE id = 2", "UPDATE public.orders SET id = 2 WHERE id = 1"]
+
+
+def test_a_move_onto_an_unchanged_rows_key_is_left_to_the_server():  # its unique check refuses it: rollback
+    plan = build_plan(PG, pg_target(), changes(updates=[
+        move("u:1", 1, "2"),
+        {"id": "u:2", "key": {"id": 3}, "set": {"id": value("3"), "label": value("c2")},
+         "original": {"id": 3, "label": "c"}}]))  # a key set to itself moves nothing
+    assert plan.problems == [] and [s.sql for s in plan.statements] == [
+        "UPDATE public.orders SET id = 2 WHERE id = 1",
+        "UPDATE public.orders SET id = 3, label = 'c2' WHERE id = 3 AND label::text = 'c'"]
+
+
 def test_an_insert_leaves_defaults_out_and_an_all_default_row_is_default_values():
     plan = build_plan(PG, pg_target(), changes(inserts=[
         {"id": "i:1", "values": {"id": DEFAULT, "label": value("a"), "made": DEFAULT, "total": DEFAULT}},
