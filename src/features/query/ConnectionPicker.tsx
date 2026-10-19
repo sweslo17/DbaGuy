@@ -136,10 +136,7 @@ export function ConnectionPicker(props: ConnectionPickerProps) {
           className={cn(
             "max-w-[180px]",
             // A red profile keeps its red chip, also while disabled.
-            red
-              ? // The icons take the chip's text colour: the engine's own red would vanish on it.
-                "bg-danger font-medium text-accent-fg enabled:hover:brightness-110 [&_svg]:text-accent-fg"
-              : "enabled:hover:bg-hover",
+            red ? "bg-danger font-medium text-accent-fg enabled:hover:brightness-110" : "enabled:hover:bg-hover",
           )}
         >
           {profile && <EngineIcon engine={profile.engine} size={12} />}
