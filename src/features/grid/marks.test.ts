@@ -9,6 +9,8 @@ import {
   cellBackground,
   cellTitle,
   headerNotes,
+  keyColumnSignature,
+  keyColumnsOf,
   rowLabel,
   rowTint,
   rowTitle,
@@ -133,5 +135,27 @@ describe("headerNotes", () => {
     expect(headerNotes({ key: true, readOnly: null })).toEqual(["Key column"]);
     expect(headerNotes({ key: false, readOnly: "generated column" })).toEqual(["Read-only: generated column"]);
     expect(headerNotes({ key: true, readOnly: "identity" })).toEqual(["Key column", "Read-only: identity"]);
+  });
+});
+
+describe("keyColumnSignature", () => {
+  const key = { key: true, readOnly: null };
+  const plain = { key: false, readOnly: "generated" };
+
+  it("is the key columns' indexes, empty when there are none", () => {
+    expect(keyColumnSignature(undefined)).toBe("");
+    expect(keyColumnSignature([])).toBe("");
+    expect(keyColumnSignature([plain, undefined])).toBe("");
+    expect(keyColumnSignature([key, plain, key, undefined, key])).toBe("0,2,4");
+  });
+
+  it("is the same for another array of marks with the same keys", () => {
+    expect(keyColumnSignature([key, plain])).toBe(keyColumnSignature([{ ...key }, undefined]));
+  });
+
+  it("reads back to the set of columns", () => {
+    expect([...keyColumnsOf("")]).toEqual([]);
+    expect([...keyColumnsOf("3")]).toEqual([3]);
+    expect([...keyColumnsOf(keyColumnSignature([key, plain, key]))]).toEqual([0, 2]);
   });
 });

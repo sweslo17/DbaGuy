@@ -1,7 +1,7 @@
 import type { KeyboardEvent, ReactNode } from "react";
-import type { MenuItem } from "@/components/ui/ContextMenu";
 import { cn } from "@/lib/cn";
 import { HEADER_HEIGHT, ROW_HEIGHT } from "./columns";
+import type { EditItems } from "./GridMenu";
 import type { GridGeometry } from "./hitTest";
 import type { ColumnLayout } from "./layout";
 import type { HeaderMark, RowMark } from "./marks";
@@ -35,24 +35,24 @@ export interface GridEditing {
   /** A double click on a cell, while `editable`. */
   onEdit: (pos: CellPos) => void;
   /**
-   * A key pressed while the grid itself has the focus, before the grid handles it: true when it was an editing key
-   * that was handled (the grid then does nothing more with it). Asked also while `editable` is false, so that what is
-   * staged can still be undone (⌘Z): then it must leave Return and F2 alone (false: Return opens the value viewer).
+   * A key pressed while the grid itself has the focus (not an input method's: the grid leaves those out), before the
+   * grid handles it: true when it was an editing key that was handled (the grid then does nothing more with it). Asked
+   * also while `editable` is false, so that what is staged can still be undone (⌘Z): then it must leave Return and F2
+   * alone (false: Return opens the value viewer).
    */
   onKey: (e: KeyboardEvent<HTMLDivElement>, selection: GridSelection | null, rect: Rect | null) => boolean;
-  /**
-   * Items leading a cell's menu (`cell`) or the row numbers' menu (not `cell`), for the selection `rect`. Asked also
-   * while `editable` is false: then only the items that act on what is staged (Revert, Restore) belong in it.
-   */
-  menu: (pos: CellPos | null, cell: boolean, rect: Rect | null) => MenuItem[];
+  /** Items leading the cell and row-number menus. Asked also while `editable` is false: then only the items that act on what is staged (Revert, Restore) belong in it. */
+  menu: EditItems;
   /** The open editor, while `editable`. */
   editor: GridEditor | null;
 }
 
 /**
  * An inline editor laid over its cell inside the grid's scroll area, so it scrolls with the rows: a strip as wide as
- * the rows at the cell's row, holding the editor at the cell's left, sticky for a pinned column as its cells are. Above
- * the rows (and their sticky cells), under the sticky header. Only the editor itself takes the pointer.
+ * the rows at the cell's row, holding the editor at the cell's left, sticky for a pinned column as its cells are. Its
+ * layer is the cell's own, one above: an unpinned editor is above the unpinned cells (z-auto) but under the pinned
+ * cells (z-10) and the row numbers (z-20) it scrolls beneath, a pinned one above the pinned cells and under the row
+ * numbers; both under the sticky header (z-30). Only the editor itself takes the pointer.
  */
 export function InlineEditorSlot({
   editor,
@@ -72,7 +72,7 @@ export function InlineEditorSlot({
   const left = pinned ? layout.pinnedLeft[col] : geometry.unpinnedEnds[col - layout.pinnedCount] - width;
   return (
     <div
-      className="pointer-events-none absolute left-0 z-[25] flex"
+      className={cn("pointer-events-none absolute left-0 flex", pinned ? "z-[25]" : "z-[5]")}
       style={{ top: HEADER_HEIGHT + row * ROW_HEIGHT, height: ROW_HEIGHT, width: totalWidth }}
     >
       <div className={cn("pointer-events-auto", pinned && "sticky")} style={pinned ? { left } : { marginLeft: left }}>

@@ -95,3 +95,19 @@ export function headerNotes(mark: HeaderMark | undefined): string[] {
   if (mark?.readOnly) notes.push(`Read-only: ${mark.readOnly}`);
   return notes;
 }
+
+/**
+ * The key columns' indexes as a string, "" for none: what the column widths depend on, so that a new `marks` array with
+ * the same key columns does not estimate the widths again.
+ */
+export function keyColumnSignature(marks: readonly (HeaderMark | undefined)[] | undefined): string {
+  const keys: number[] = [];
+  marks?.forEach((mark, col) => {
+    if (mark?.key) keys.push(col);
+  });
+  return keys.join(",");
+}
+
+/** The key columns of a `keyColumnSignature`. */
+export const keyColumnsOf = (signature: string): ReadonlySet<number> =>
+  new Set(signature === "" ? [] : signature.split(",").map(Number));

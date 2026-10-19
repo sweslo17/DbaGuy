@@ -5,6 +5,13 @@ import { copyColumnNames, COPY_FORMAT_LABELS, type CopyFormat } from "./copy";
 import type { GridHit } from "./hitTest";
 import type { CellPos, Rect } from "./selection";
 
+/**
+ * An editing grid's menu items (spec ⑤ §3.6.4), leading a cell's menu (`cell`) or the row numbers' (not `cell`), for the
+ * selection `rect`. Asked whenever the grid has `edits`: a table that cannot be edited now may still have items (revert
+ * what is staged on it).
+ */
+export type EditItems = (pos: CellPos | null, cell: boolean, rect: Rect | null) => MenuItem[];
+
 /** What the grid's menus act on: the current selection, plus the cell or header the context click landed on. */
 export interface GridMenuActions {
   columns: ColumnMeta[];
@@ -27,12 +34,8 @@ export interface GridMenuActions {
   extraCellMenu?: (row: number, column: number) => MenuItem[];
   /** "Export…": the whole result to a file (shown only when set). */
   openExport?: () => void;
-  /**
-   * An editing grid's items (spec ⑤ §3.6.4), leading a cell's menu (`cell`) or the row numbers' (not `cell`), for the
-   * selection `rect`. Asked whenever it is set: a table that cannot be edited now may still have items (revert what is
-   * staged on it).
-   */
-  editItems?: (pos: CellPos | null, cell: boolean, rect: Rect | null) => MenuItem[];
+  /** An editing grid's items (`GridEditing.menu`). */
+  editItems?: EditItems;
   /** Return edits the active cell (the grid is editable now), so View value loses its ↵. */
   returnEdits?: boolean;
 }

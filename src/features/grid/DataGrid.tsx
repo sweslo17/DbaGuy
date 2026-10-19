@@ -18,6 +18,7 @@ import type { MenuItem } from "@/components/ui/ContextMenu";
 import { Button } from "@/components/ui/Button";
 import type { ColumnMeta, Dialect } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
+import { isImeKeyEvent } from "@/lib/ime";
 import { aggregate } from "./aggregate";
 import { columnSignature, HEADER_HEIGHT, ROW_HEIGHT } from "./columns";
 import { copyDefault, copyFormatsFor, copySelection, type CopyFormat, type CopyInput } from "./copy";
@@ -28,7 +29,7 @@ import { GridMenu } from "./GridMenu";
 import { GridRow } from "./GridRow";
 import { hitTest, useGridGeometry, viewportPoint } from "./hitTest";
 import { useColumnLayout, useColumnStrip } from "./layout";
-import { rowLabel } from "./marks";
+import { keyColumnSignature, keyColumnsOf, rowLabel } from "./marks";
 import { cellCount, move, selectCell, type CellPos, type GridSelection, type Rect } from "./selection";
 import { StatusBar } from "./StatusBar";
 import { gridKeyDown, usePointerSelection, useSelectionState } from "./useSelection";
@@ -154,17 +155,24 @@ function LoadMoreFooter({ rowCount, hasMore, loading, onLoadMore }: LoadMoreFoot
 export function DataGrid(props: DataGridProps) {
   const { columns, rows, hasMore, sort, onHeaderClick, stale = false, ref } = props;
   const { dialect, tableName, onSortBy, extraCellMenu, onSelectionChange, onExport, partial = false, edits } = props;
-  /** Only an editable table's grid edits; one that cannot be edited now still draws the marks and offers `edits.menu`. */
-  const editing = edits?.editable ? edits : undefined;
   const leading = edits?.leading ?? 0;
-  // Stale rows are only shown: nothing is loaded for them.
+  // Stale rows are only shown: nothing is loaded for them, and nothing is edited on them.
   const loadingMore = props.loadingMore && !stale;
+  /**
+   * Only an editable table's grid edits, and not while it shows held rows; one that cannot be edited now (or is held)
+   * still draws the marks and asks `edits.menu` and `edits.onKey` (what is staged can be reverted).
+   */
+  const editing = edits?.editable && !stale ? edits : undefined;
   const onLoadMore = stale ? undefined : props.onLoadMore;
   const rootRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const focusId = useId();
   const signature = useMemo(() => columnSignature(columns), [columns]);
-  const layout = useColumnLayout(columns, signature, rows, !!onHeaderClick);
+  // The key columns' headers have an icon, which the widths leave room for; by a string, so that a new array of marks
+  // with the same keys does not estimate them again.
+  const keySignature = keyColumnSignature(edits?.headerMarks);
+  const keyColumns = useMemo(() => keyColumnsOf(keySignature), [keySignature]);
+  const layout = useColumnLayout(columns, signature, rows, !!onHeaderClick, keyColumns);
   const geometry = useGridGeometry(layout, rows.length, columns.length);
   const { dims, made, selection, rect, select } = useSelectionState(signature, columns.length, rows.length);
   const [drawer, setDrawer] = useState<GridDrawer>(null);
@@ -325,8 +333,9 @@ export function DataGrid(props: DataGridProps) {
     return el && e.target !== el ? hitTest(geometry, viewportPoint(el, e.clientX, e.clientY)) : null;
   };
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    // An editing grid's keys first (Return edits there); keys typed into its editor are the editor's.
-    if (edits && e.target === e.currentTarget && edits.onKey(e, selection, rect)) return;
+    // An editing grid's keys first (Return edits there); keys typed into its editor are the editor's, and an input
+    // method's are nobody's here.
+    if (edits && !isImeKeyEvent(e) && e.target === e.currentTarget && edits.onKey(e, selection, rect)) return;
     gridKeyDown(e, {
       scrollRef,
       geometry,

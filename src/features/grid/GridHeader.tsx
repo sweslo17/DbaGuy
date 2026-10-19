@@ -1,7 +1,7 @@
 import { KeyRound } from "lucide-react";
 import { memo, type PointerEvent } from "react";
 import { cn } from "@/lib/cn";
-import { HEADER_HEIGHT } from "./columns";
+import { HEADER_HEIGHT, KEY_ICON_SIZE } from "./columns";
 import { columnClass, columnStyle, SELECTED_CLASS, type ColumnStrip } from "./layout";
 import { headerNotes, type HeaderMark } from "./marks";
 
@@ -133,7 +133,7 @@ export const GridHeader = memo(function GridHeader(props: GridHeaderProps) {
             title={[meta.name, meta.type_name, ...headerNotes(mark)].join("\n")}
           >
             <div className="flex min-w-0 items-center gap-1">
-              {mark?.key && <KeyRound size={11} className="shrink-0 text-muted" aria-label="Key column" />}
+              {mark?.key && <KeyRound size={KEY_ICON_SIZE} className="shrink-0 text-muted" aria-label="Key column" />}
               <span className={cn("truncate font-semibold", mark?.readOnly && "text-muted")}>{meta.name}</span>
               {onHeaderClick && (
                 <SortControl
