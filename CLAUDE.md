@@ -206,7 +206,7 @@ Couchbase 的 seed 文件不要改：`app.users` 的 `u_numbers`（數字原文�
 | ② | 核心查詢流程：編輯器、結果 grid、執行範圍、取消、history、安全 | 完成（followups：[02a](docs/superpowers/notes/2026-10-16-02a-query-backend-followups.md)、[02b](docs/superpowers/notes/2026-10-16-02b-grid-and-data-followups.md)、[02c](docs/superpowers/notes/2026-10-16-02c-editor-and-query-followups.md)，含打包版待驗清單與後續子專案的 carries） |
 | ③ | MySQL + MSSQL adapter | 完成（followups：[03a](docs/superpowers/notes/2026-10-18-03a-dialects-and-mysql-followups.md)、[03b](docs/superpowers/notes/2026-10-18-03b-sql-server-followups.md)，含公司 SQL Server 檢查清單與打包版待驗清單） |
 | ④ | Couchbase 一級支援 | 完成：04a、04b、04c（SQL++ 方言與 HTTP 引擎；query context、參數、plan 檢視、取樣與補全、暫停預讀；文件：開啟、存檔預覽、新增、刪除；followups：[04a](docs/superpowers/notes/2026-10-19-04a-couchbase-engine-followups.md)、[04b](docs/superpowers/notes/2026-10-19-04b-couchbase-query-workflow-followups.md)、[04c](docs/superpowers/notes/2026-10-19-04c-couchbase-documents-followups.md)，含公司 Couchbase 檢查清單與打包版待驗清單） |
-| ⑤ | Grid 內編輯（暫存修改、預覽 DML、一次 commit） | 未開始 |
+| ⑤ | Grid 內編輯（暫存修改、預覽 DML、一次 commit） | 進行中：[spec](docs/superpowers/specs/2026-10-19-05-grid-editing-design.md) 完成；05a（backend）執行中，05b（frontend）待做 |
 | ⑥ | 資料工具：SQL dump／還原、跨 DB 傳輸 | 未開始 |
 | ⑦ | ER 圖（唯讀） | 未開始 |
 | ⑧ | MCP server（唯讀） | 未開始 |
