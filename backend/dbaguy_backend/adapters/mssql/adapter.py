@@ -385,7 +385,7 @@ class MssqlConnection(DatabaseConnection, RowEditing):
             if self._control.cancel_requested:  # kept during STARTING: nothing is sent, not even the state read
                 raise CancelPending()
             self._batch, self._transaction_words = sql, None
-            self._refresh_state()  # the describe needs the current mode; normally fresh (the worker reads it per request)
+            self._refresh_state()  # the transaction state (and the describe's mode); normally fresh (read per request)
             self._stale = True
             described = self._describe(sql) if options is None or options.describe else None
             with self._control.call(CallKind.EXECUTE):  # not started when a cancel arrived first: the batch never runs

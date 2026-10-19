@@ -464,7 +464,7 @@ interface StagedEdits {
 - **打包**：沒有新的 Python 或前端相依，不需要 hidden import；sidecar 49,148 → 49,224 KB（+76 KB，只有新的純 Python 模組）；JS 主 chunk 1,365.09 → 1,366.34 kB（05a 沒有新的前端程式，`src/` 只多了產生的 API 型別與 `types.ts` 的型別 export）；冷啟動 1.07–1.19 秒（7 次裡有 4 次，另 1.55 與 1.72 秒，第一次 2.72 秒；04c 是 1.03–1.11 秒），`footprint` 加總 163–172 MB（04c 176–184），backend 76–79 MB（04c 74–78）。
 - **預覽**：1,000 個 UPDATE 的產生與驗證，經 HTTP：PG 25–28 ms、MySQL 26–31 ms、SQL Server 78–96 ms、SQLite 24–26 ms（預算 < 300 ms）。
 - **A7 套用 1,000 個 UPDATE**（預算 PG／MySQL／SQLite ≤ 3 秒、SQL Server ≤ 10 秒）：PG 0.79–1.14 秒、MySQL 0.73–0.99 秒、SQL Server 7.22–9.56 秒、SQLite 0.41–0.43 秒。都在預算內；SQL Server 的餘裕只有 4–28%（每句三個往返、amd64 映像經 Rosetta；規劃時量的是 5.3–6.3 秒，同一台機器現在的非凍結 server 是 8.75 秒，所以差距來自機器的負載，不是打包）。合併批次（§12）仍是之後的項目。
-- **〔05a 最終修正〕A7 SQL Server，plan 的語句不做 describe**（M1，2026-10-20，in-process：EditService 預覽、tab 的 worker 套用，load average 6–8）：1,000 個 UPDATE 1.54–2.62 秒（6 次）；同一時間、同一種量法還做 describe 時 3.20–5.99 秒（3 次）。審查量的是 6.92 → 2.83 秒。沒有重量打包版。
+- **〔05a 最終修正〕A7 SQL Server，plan 的語句不做 describe**（M1，2026-10-20，in-process：EditService 預覽、tab 的 worker 套用，load average 6–8）：1,000 個 UPDATE 1.54–2.62 秒（6 次）；同一時間、同一種量法還做 describe 時 3.20–5.99 秒（3 次）。審查量的是 6.92 → 2.83 秒。沒有重新量打包版。
 - **A6 結束暫停中的 100 萬列瀏覽結果後再套用**：PG 0.02 秒、MySQL 0.38–0.56 秒（KILL 與 drain；非凍結 0.27 秒）、SQL Server 0.22–0.24 秒（attention）、SQLite 0.00–0.02 秒。
 
 ## 8. 痛點對照
