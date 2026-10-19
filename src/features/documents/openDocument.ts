@@ -6,7 +6,7 @@ import { statementKeyspace } from "./documentApi";
 /** What asks for the "Open document" dialog: where it opens, and what it starts with. */
 export interface OpenDocumentRequest {
   profileId: string;
-  /** "new": the dialog asks for the ID of a document to create (Task 7). */
+  /** "new": the dialog asks for the ID of a document to create (its first save inserts it). */
   mode: "open" | "new";
   /** What is known of the collection: the dialog asks for the rest. */
   keyspace: Partial<Keyspace>;

@@ -76,6 +76,7 @@ class Session {
   missing = () => this.send({ type: "load-missing", generation: this.generation });
   retry = () => this.send({ type: "retry" });
   reload = () => this.send({ type: "reload" });
+  openExisting = () => this.send({ type: "open-existing" });
 
   /** The user types: the editor holds `text` and the tab hears of it. */
   type(text: string): void {
@@ -269,15 +270,6 @@ describe("Reload", () => {
     expect(session.editor).toBe("reloaded");
   });
 
-  it("turns a new document into the existing one it collided with (Task 7: Open the existing document)", () => {
-    const session = new Session({ isNew: true, dirty: true, initialText: "{}" }, "my draft");
-    session.reload();
-    session.answer(view({ cas: "7", text: "stored" }));
-    expect(session.editor).toBe("stored");
-    expect(session.tab).toMatchObject({ isNew: false, dirty: false, cas: "7" });
-    expect(session.load).toMatchObject({ status: "ready" });
-  });
-
   it("starts before the tab was ever shown, and the first read that follows does not override it", () => {
     const session = editedTab();
     session.reload();
@@ -322,7 +314,7 @@ describe("a document that is not there", () => {
     expect(session.tab.dirty).toBe(true);
   });
 
-  it("becomes a new document with the edits kept when it is created (Task 7: Create it)", () => {
+  it("becomes a new document with the edits kept when it is created (Create it)", () => {
     const session = editedTab();
     session.show();
     session.missing();
@@ -341,6 +333,126 @@ describe("a document that is not there", () => {
     expect(session.editor).toBe(NEW_DOCUMENT_TEXT);
     expect(session.tab).toMatchObject({ isNew: true, cas: null, dirty: false, initialText: NEW_DOCUMENT_TEXT });
     expect(session.model.baseline).toBeNull(); // a new document is saved even when it is still {}
+  });
+});
+
+describe("Open the existing document (a new document's ID was taken)", () => {
+  const draft = () => new Session({ isNew: true, dirty: true, initialText: "{}" }, "my draft");
+
+  it("makes the tab the existing document at once, then reads it and replaces the draft", () => {
+    const session = draft();
+    session.show();
+    session.openExisting();
+    expect(session.tab).toMatchObject({ isNew: false, dirty: false, cas: null, initialText: null });
+    expect(session.load).toEqual({ status: "loading" });
+    expect(session.model.request).toEqual({ generation: 1, mode: "reload" });
+    expect(session.editor).toBe("my draft"); // behind the loading panel until the answer
+    session.answer(view({ cas: "7", text: "stored" }));
+    expect(session.editor).toBe("stored");
+    expect(session.tab).toMatchObject({ isNew: false, dirty: false, cas: "7" });
+    expect(session.load).toMatchObject({ status: "ready" });
+    expect(session.model.baseline?.eq(doc("stored"))).toBe(true);
+  });
+
+  it("shows a failed read as the existing document's error, and Retry then reads the stored text", () => {
+    const session = draft();
+    session.openExisting();
+    session.fail(failure("password_required"));
+    expect(panelOf(session.load, session.tab.dirty)).toBe("error"); // not the new tab, which would hide the failure
+    session.retry();
+    session.answer(view({ cas: "8", text: "stored" }));
+    expect(session.editor).toBe("stored");
+    expect(session.tab).toMatchObject({ isNew: false, dirty: false, cas: "8" });
+  });
+
+  it("forgets any CAS the tab still held: it has none until the read answers", () => {
+    const session = new Session({ isNew: true, dirty: true, cas: "stale", initialText: "{}" }, "my draft");
+    session.openExisting();
+    expect(session.tab.cas).toBeNull();
+  });
+
+  it("finds the document gone again: a missing document, and creating it starts from {}", () => {
+    const session = draft();
+    session.openExisting();
+    session.missing();
+    expect(panelOf(session.load, session.tab.dirty)).toBe("missing");
+    session.send({ type: "created" });
+    expect(session.editor).toBe(NEW_DOCUMENT_TEXT);
+    expect(session.tab).toMatchObject({ isNew: true, cas: null });
+  });
+
+  it("does nothing for a tab that is not new (its edits stay), nor while a write is in flight", () => {
+    const edited = editedTab();
+    edited.show();
+    edited.answer();
+    const model = edited.model;
+    edited.openExisting();
+    expect(edited.model).toBe(model);
+    expect(edited.tab).toMatchObject({ dirty: true, cas: "100" });
+
+    const saving = draft();
+    saving.show();
+    saving.send({ type: "save-started" });
+    const busy = saving.model;
+    saving.openExisting();
+    expect(saving.model).toBe(busy);
+    expect(saving.tab).toMatchObject({ isNew: true, dirty: true });
+    expect(saving.editor).toBe("my draft");
+  });
+});
+
+describe("Save as new document (the edits of a document that was deleted)", () => {
+  it("makes the tab a new document with the edits kept, and the insert then makes it the stored one", () => {
+    const session = new Session({ cas: "100" });
+    session.show();
+    session.answer(view({ text: "one" }));
+    session.type("two");
+    session.send({ type: "save-started" });
+    session.send({ type: "deleted" });
+    session.send({ type: "save-as-new" });
+    expect(session.editor).toBe("two");
+    expect(session.tab).toMatchObject({ isNew: true, cas: null, dirty: true });
+    expect(session.load).toEqual({ status: "new" });
+    expect(session.model.load).toEqual({ status: "new" }); // the tab's own state, behind what `isNew` shows
+    expect(session.model).toMatchObject({ baseline: null, saving: false, changedOnServer: false });
+    session.send({ type: "save-started" });
+    session.send({ type: "saved", meta: meta("300"), baseline: doc("two"), doc: doc("two") });
+    expect(session.tab).toMatchObject({ isNew: false, cas: "300", dirty: false });
+    expect(session.load).toEqual({ status: "ready", meta: meta("300") });
+  });
+
+  it("keeps the text even when the tab was not marked dirty: it never starts from {} as Create it does", () => {
+    const session = new Session({ cas: "100", dirty: false }, "the text in the editor");
+    session.show();
+    session.missing();
+    session.send({ type: "save-as-new" });
+    expect(session.editor).toBe("the text in the editor");
+    expect(session.tab).toMatchObject({ isNew: true, cas: null, dirty: true });
+    expect(session.effects.some((effect) => effect.kind === "put-text" && effect.text === NEW_DOCUMENT_TEXT)).toBe(false);
+  });
+
+  it("has no baseline to be clean against: typing back to the old text never makes the new document clean", () => {
+    const session = new Session({ cas: "100" });
+    session.show();
+    session.answer(view({ text: "one" })); // a baseline of "one": the tab did not go through `deleted` first
+    session.type("two");
+    session.send({ type: "save-as-new" });
+    expect(session.model.baseline).toBeNull();
+    session.type("one");
+    session.settle();
+    expect(session.tab.dirty).toBe(true); // a clean flag here would let the tab close without asking, losing the insert
+  });
+
+  it("stays a new document when the insert fails, so the next save inserts again", () => {
+    const session = editedTab();
+    session.show();
+    session.missing();
+    session.send({ type: "save-as-new" });
+    session.send({ type: "save-started" });
+    session.send({ type: "save-ended" }); // e.g. the ID is taken again, or the text is not valid
+    expect(session.tab).toMatchObject({ isNew: true, cas: null, dirty: true });
+    expect(session.load).toEqual({ status: "new" });
+    expect(session.editor).toBe("x edits");
   });
 });
 
@@ -450,6 +562,34 @@ describe("saving", () => {
     expect(session.load).toMatchObject({ status: "ready" });
   });
 
+  it("shows the server's form after a confirmed save, as the new baseline, with the new CAS (ruling C13)", () => {
+    const session = readyTab();
+    session.type("{ \"b\": 1, \"a\": 1.10 }");
+    session.send({ type: "save-started" });
+    session.send({ type: "saved-as-shown", meta: meta("200"), text: "{\n  \"a\": 1.1,\n  \"b\": 1\n}" });
+    expect(session.editor).toBe("{\n  \"a\": 1.1,\n  \"b\": 1\n}");
+    expect(session.tab).toMatchObject({ cas: "200", dirty: false, isNew: false });
+    expect(session.model).toMatchObject({ saving: false, changedOnServer: false });
+    expect(session.load).toEqual({ status: "ready", meta: meta("200") });
+    expect(session.model.baseline?.eq(doc(session.editor))).toBe(true);
+    // Typing and undoing back to the shown text makes the tab clean again: it is the baseline, not the sent text.
+    session.type("{}");
+    session.type("{\n  \"a\": 1.1,\n  \"b\": 1\n}");
+    session.settle();
+    expect(session.tab.dirty).toBe(false);
+  });
+
+  it("makes a new document an existing one when its insert was confirmed", () => {
+    const session = new Session({ isNew: true, dirty: true, initialText: NEW_DOCUMENT_TEXT }, "{ \"b\": 1 }");
+    session.show();
+    session.send({ type: "save-started" });
+    session.send({ type: "saved-as-shown", meta: meta("9"), text: "{\"b\":1}" });
+    expect(session.editor).toBe('{"b":1}');
+    expect(session.tab).toMatchObject({ isNew: false, cas: "9", dirty: false });
+    expect(session.load).toEqual({ status: "ready", meta: meta("9") });
+    expect(session.model.baseline?.eq(doc('{"b":1}'))).toBe(true);
+  });
+
   it("reports a conflict without losing the text, and says so until a reload", () => {
     const session = readyTab();
     session.type("two");
@@ -503,5 +643,11 @@ describe("what hides the editor, and when it can be typed in", () => {
     expect(canEdit(ready("base64"), false)).toBe(false);
     expect(canEdit({ status: "missing" }, false)).toBe(false);
     expect(canEdit({ status: "loading" }, false)).toBe(false);
+  });
+
+  it("allows no typing while a write is in flight or waits for the user (ruling C14)", () => {
+    expect(canEdit(ready("json"), false, true)).toBe(false);
+    expect(canEdit({ status: "new" }, false, true)).toBe(false);
+    expect(canEdit(ready("json"), false, false)).toBe(true);
   });
 });

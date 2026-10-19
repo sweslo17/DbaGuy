@@ -15,8 +15,10 @@ import type { DocumentTabState } from "@/stores/workspace";
  * - a first read (the tab shown, or Retry and the unlock dialog after a failure) never replaces unsaved text: a tab is
  *   clean only when it is neither `dirty` nor `isNew` (not "its `initialText` is null": a tab edited and mounted
  *   again by its error boundary has none and unsaved text);
- * - only a reload discards edits, and only the user's Reload (or Task 7's "Open the existing document") sends one;
- * - a missing document keeps the editor when it holds unsaved text.
+ * - only a reload discards edits, and only the user's Reload, "Open the existing document" or a confirmed save (which
+ *   shows the server's form of the text it just wrote) puts other text in the editor;
+ * - a missing document keeps the editor when it holds unsaved text, read-only until it is created or saved as new
+ *   (ruling C47).
  */
 
 /** A new document starts as this text. */
@@ -90,8 +92,17 @@ export type DocumentEvent =
   | { type: "deleted" }
   /** A missing document's tab becomes a new one ("Create it"): its unsaved text stays. */
   | { type: "created" }
+  /**
+   * A deleted document's edits are to be saved as a new document with the same ID (the conflict dialog): the tab
+   * becomes a new one, whatever the editor holds stays, and the insert follows.
+   */
+  | { type: "save-as-new" }
+  /** A new document's tab became the existing document of that ID ("Open the existing document"): read it. */
+  | { type: "open-existing" }
   /** A save or insert went through: `baseline` is the document that was sent, `doc` the editor's now. */
-  | { type: "saved"; meta: DocumentMeta; baseline: Text; doc: Text };
+  | { type: "saved"; meta: DocumentMeta; baseline: Text; doc: Text }
+  /** A save or insert the user confirmed went through: the editor shows `text`, the server's form, as the new baseline. */
+  | { type: "saved-as-shown"; meta: DocumentMeta; text: string };
 
 export type DocumentEffect =
   /** `updateTab(id, "document", patch)`. */
@@ -153,23 +164,31 @@ const metaOf = ({ cas, expiration, type, size }: DocumentView): DocumentMeta => 
 
 const isCurrent = (model: DocumentModel, generation: number) => model.request?.generation === generation;
 
+/**
+ * The server's text goes into the editor (as the baseline, once it is in) and the tab is a clean, existing document at
+ * `meta.cas`: what a clean tab's first read, a reload and a confirmed save all end with.
+ */
+function showStored(model: DocumentModel, meta: DocumentMeta, text: string, tab: TabFacts): Transition {
+  return {
+    model: { ...model, request: null, load: { status: "ready", meta }, changedOnServer: false, baseline: null },
+    effects: [
+      { kind: "put-text", text, baseline: true },
+      ...patchTab(tab, { cas: meta.cas, dirty: false, isNew: false }),
+    ],
+  };
+}
+
 function loaded(model: DocumentModel, view: DocumentView, tab: TabFacts): Transition {
   const mode = model.request?.mode ?? "first";
   // A new document has nothing on the server to show: a first read that "New" overtook changes nothing.
   if (mode === "first" && tab.isNew) return stay({ ...model, request: null });
-  const ready: DocumentLoad = { status: "ready", meta: metaOf(view) };
+  const meta = metaOf(view);
   if (mode === "first" && tab.dirty) {
     // Unsaved text stays, whatever the server holds: only a save or the user's Reload decides about it.
-    return stay({ ...model, request: null, load: ready, changedOnServer: tab.cas !== view.cas });
+    return stay({ ...model, request: null, load: { status: "ready", meta }, changedOnServer: tab.cas !== view.cas });
   }
   // A clean tab, or a reload: the server's text goes in, and it is the baseline once it is in the editor.
-  return {
-    model: { ...model, request: null, load: ready, changedOnServer: false, baseline: null },
-    effects: [
-      { kind: "put-text", text: view.text ?? "", baseline: true },
-      ...patchTab(tab, { cas: view.cas, dirty: false, isNew: false }),
-    ],
-  };
+  return showStored(model, meta, view.text ?? "", tab);
 }
 
 /** Where the model goes from `event`, and what the hook then does. Pure: it reads and writes nothing else. */
@@ -227,6 +246,23 @@ export function transition(model: DocumentModel, event: DocumentEvent, tab: TabF
         ],
       };
     }
+    case "save-as-new":
+      // Whatever the editor holds is what is inserted, so it is unsaved by definition (and kept in `workspace.json`).
+      return {
+        model: { ...model, request: null, load: { status: "new" }, baseline: null, changedOnServer: false },
+        effects: patchTab(tab, { isNew: true, cas: null, dirty: true }),
+      };
+    case "open-existing": {
+      // Not for a tab that is not new, and never while a write is in flight. The draft is given up (the user was asked):
+      // the tab is the existing document from now on, so a failed read shows its error and a Retry that reads it again.
+      if (!tab.isNew || model.saving) return stay(model);
+      return {
+        model: begin({ ...model, baseline: null, changedOnServer: false }, "reload"),
+        effects: patchTab(tab, { isNew: false, cas: null, dirty: false, initialText: null }),
+      };
+    }
+    case "saved-as-shown":
+      return showStored({ ...model, saving: false }, event.meta, event.text, tab);
     case "saved": {
       const { meta, baseline, doc } = event;
       // What was sent is the clean state: text changed while the save ran stays told apart from it.
@@ -265,8 +301,12 @@ export function panelOf(load: DocumentLoad, dirty: boolean): Panel | null {
   }
 }
 
-/** Whether the text can be typed in: a document that is read (JSON) or new, on a connection that is not read-only. */
-export function canEdit(load: DocumentLoad, readOnlyProfile: boolean): boolean {
-  if (readOnlyProfile) return false;
+/**
+ * Whether the text can be typed in: a document that is read (JSON) or new, on a connection that is not read-only, and
+ * not while a save, insert or delete is in flight or waits on the user's answer (ruling C14: its answer replaces the
+ * baseline, and after a confirmed save the text).
+ */
+export function canEdit(load: DocumentLoad, readOnlyProfile: boolean, saving = false): boolean {
+  if (readOnlyProfile || saving) return false;
   return load.status === "new" || (load.status === "ready" && load.meta.type === "json");
 }

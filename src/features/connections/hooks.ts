@@ -13,6 +13,16 @@ export function useProfiles() {
   return useQuery({ queryKey: profilesKey, queryFn: fetchProfiles });
 }
 
+/** Whether profile `profileId` is read-only; false for an unknown profile and while the list is missing. */
+export function isReadOnlyProfile(entries: readonly ProfileEntry[] | undefined, profileId: string | null): boolean {
+  return entries?.find((entry) => entry.profile.id === profileId)?.profile.read_only === true;
+}
+
+/** Whether profile `profileId` is read-only (a document tab then neither saves nor deletes). */
+export function useReadOnlyProfile(profileId: string | null): boolean {
+  return isReadOnlyProfile(useProfiles().data, profileId);
+}
+
 export const enginesKey = ["engines"] as const;
 
 export function useEngines() {

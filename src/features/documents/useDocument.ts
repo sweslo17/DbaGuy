@@ -28,8 +28,18 @@ export interface DocumentState {
    * unsaved text (ruling C29). Never discards anything.
    */
   retry: () => void;
-  /** After a save or an insert (Task 7): the new META, and `baseline` (the editor's document) as the clean state. */
+  /** After a save or an insert: the new META, and `baseline` (the document that was sent) as the clean state. */
   saved: (meta: DocumentMeta, baseline: Text) => void;
+  /**
+   * After a save or an insert the user confirmed from a preview: the editor shows `text`, the server's form (outside the
+   * undo history, which this empties like any put text), and that document is the clean state (ruling C13).
+   */
+  savedAsShown: (meta: DocumentMeta, text: string) => void;
+  /**
+   * The editor's document as last loaded or saved, null when there is none to compare with. Read when called, from the
+   * model, never from what the last render saw: ⌘S asks it at the moment of the key (ruling C32).
+   */
+  baseline: () => Text | null;
   /** Restored unsaved text whose CAS is not the server's any more: a save will report a conflict. */
   changedOnServer: boolean;
   /** The editor's text changed (the tab calls it from CodeEditor's onChange). */
@@ -45,10 +55,17 @@ export interface DocumentState {
   deleted: () => void;
   /** A missing document's tab becomes a new one ("Create it"): its unsaved text stays, a clean one gets `{}`. */
   created: () => void;
+  /** A deleted document's edits are saved as a new document: the tab becomes a new one and keeps what the editor holds. */
+  saveAsNew: () => void;
+  /**
+   * A new document's ID turned out to be taken ("Open the existing document", after the user agreed to give up the
+   * draft): the tab becomes the existing document and reads it, replacing the draft.
+   */
+  openExisting: () => void;
 }
 
 /** The tab as the store holds it now (an event may follow an `updateTab` that has not rendered yet), or null. */
-function factsOf(tabId: string): TabFacts | null {
+export function factsOf(tabId: string): TabFacts | null {
   const tab = useWorkspace.getState().tabs.find((t) => t.id === tabId);
   return tab?.kind === "document" ? tab : null;
 }
@@ -180,8 +197,12 @@ export function useDocument(
       conflict: () => send({ type: "conflict" }),
       deleted: () => send({ type: "deleted" }),
       created: () => send({ type: "created" }),
+      saveAsNew: () => send({ type: "save-as-new" }),
+      openExisting: () => send({ type: "open-existing" }),
       saved: (meta: DocumentMeta, baseline: Text) =>
         send({ type: "saved", meta, baseline, doc: editorDoc(editor) ?? baseline }),
+      savedAsShown: (meta: DocumentMeta, text: string) => send({ type: "saved-as-shown", meta, text }),
+      baseline: () => current.current.baseline,
       edited: () => {
         if (putting.current) return;
         markEdited();

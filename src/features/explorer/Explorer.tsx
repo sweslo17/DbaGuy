@@ -13,7 +13,7 @@ import { cn } from "@/lib/cn";
 import { ENGINE_LABELS } from "@/lib/engines";
 import { useWorkspace } from "@/stores/workspace";
 import { ConnectionDialog } from "../connections/ConnectionDialog";
-import { findEngineInfo, useDeleteProfile, useEngines, useProfiles } from "../connections/hooks";
+import { findEngineInfo, isReadOnlyProfile, useDeleteProfile, useEngines, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
 import { secretsNeeded } from "../connections/UnlockDialog";
 import { joinUnlockPrompt } from "../connections/unlockPrompts";
@@ -346,22 +346,16 @@ export function Explorer() {
         );
         if (row.node.kind !== BROWSABLE_KIND) return content;
         const opensDocuments = findEngineInfo(entries, engines, row.profileId)?.documents === true;
+        // The dialog asks for the document's ID in this collection: to open it, or to create it (never on a read-only one).
+        const askDocument = (mode: "open" | "new") =>
+          askOpenDocument({ profileId: row.profileId, mode, keyspace: keyspaceOfPath(row.node.path) ?? {} });
         return (
           <ContextMenu
             items={[
               { label: "Browse documents", onSelect: () => void openBrowseTab(row.profileId, row.node.path) },
-              ...(opensDocuments
-                ? [
-                    {
-                      label: "Open document by ID…",
-                      onSelect: () =>
-                        askOpenDocument({
-                          profileId: row.profileId,
-                          mode: "open",
-                          keyspace: keyspaceOfPath(row.node.path) ?? {},
-                        }),
-                    },
-                  ]
+              ...(opensDocuments ? [{ label: "Open document by ID…", onSelect: () => askDocument("open") }] : []),
+              ...(opensDocuments && !isReadOnlyProfile(entries, row.profileId)
+                ? [{ label: "New document…", onSelect: () => askDocument("new") }]
                 : []),
               { label: "Details", onSelect: () => openObject(row.profileId, row.node) },
               {
