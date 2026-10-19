@@ -32,9 +32,15 @@ class _Entry:
     plan: EditPlan
 
 
+def _awake_or_asleep() -> float:
+    """Seconds that keep counting while the Mac sleeps: `time.monotonic` is `mach_absolute_time` there, which stops, so a
+    plan would outlive its 15 minutes across a closed lid."""
+    return time.clock_gettime(time.CLOCK_MONOTONIC)
+
+
 class EditPlanStore:
     def __init__(
-        self, ttl_s: float = PLAN_TTL_S, capacity: int = MAX_PLANS, clock: Callable[[], float] = time.monotonic,
+        self, ttl_s: float = PLAN_TTL_S, capacity: int = MAX_PLANS, clock: Callable[[], float] = _awake_or_asleep,
         max_chars: int = MAX_PLAN_CHARS,
     ) -> None:
         self._ttl_s = ttl_s

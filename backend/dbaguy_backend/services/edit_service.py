@@ -14,7 +14,7 @@ from ..adapters.base import DatabaseAdapter, DatabaseConnection, RowEditing
 from ..adapters.editing import read_only_relation
 from ..adapters.registry import AdapterRegistry
 from ..domain.edits import EditChanges, EditPlan, EditPreview, EditTarget
-from ..domain.errors import NotEditable, ReadOnlyProfile
+from ..domain.errors import READ_ONLY_MESSAGE, NotEditable, ReadOnlyProfile
 from ..domain.metadata import PathSegment, path_database
 from ..domain.profiles import AnyProfile
 from ..sql.dml import build_plan
@@ -22,7 +22,7 @@ from .edit_plans import EditPlanStore
 from .metadata_service import MetadataService
 from .profile_service import ProfileService
 
-READ_ONLY_REASON = "This connection is read-only"
+READ_ONLY_REASON = READ_ONLY_MESSAGE  # the target's reason is the API's refusal text
 NO_ROW_EDITING = "Rows of this connection cannot be edited in the grid"
 
 
@@ -34,7 +34,7 @@ class EditService:
         self._metadata = metadata
         self._profiles = profiles
         self._registry = registry
-        self.plans = plans or EditPlanStore()
+        self.plans = plans if plans is not None else EditPlanStore()
 
     def target(self, profile_id: UUID, path: list[PathSegment]) -> EditTarget:
         """How the rows of the table at `path` are identified and written. A read-only profile is answered without

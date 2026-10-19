@@ -171,9 +171,12 @@ class NumberOutOfRange(ValidationFailed):
         )
 
 
+READ_ONLY_MESSAGE = "This connection is read-only"
+
+
 class ReadOnlyProfile(DomainError):
     code = "read_only"
     status = 403
 
     def __init__(self) -> None:
-        super().__init__("This connection is read-only")
+        super().__init__(READ_ONLY_MESSAGE)
