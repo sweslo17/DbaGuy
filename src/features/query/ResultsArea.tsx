@@ -1,5 +1,7 @@
 import { useCallback, useMemo, useState } from "react";
 import type { Dialect } from "@/lib/api/types";
+import { cn } from "@/lib/cn";
+import { PlanResult } from "../explain/PlanResult";
 import { sameElements, useHeldResult } from "../grid/useHeldResult";
 import type { ExecutionState, ResultSetState } from "../session/execution";
 import type { RequestOptions, SessionController, SessionPhase } from "../session/SessionController";
@@ -22,6 +24,10 @@ interface ResultTab {
   set: ResultSetState;
 }
 
+/** The tab labels of a plan set: the plan of the statement itself, or the profile that follows its rows. */
+const PLAN_LABEL = "Plan";
+const PROFILE_LABEL = "Profile";
+
 /** The statement's first 30 characters (code points, so an emoji is never cut in half), whitespace collapsed. */
 function statementTitle(sql: string): string {
   const chars = Array.from(sql.replace(/\s+/g, " ").trim());
@@ -36,6 +42,9 @@ const NO_TABS: ResultTab[] = [];
  */
 const tabsOfExecution = new WeakMap<ExecutionState, ResultTab[]>();
 
+/** A plan set is the statement's own result when it is the first (EXPLAIN), else the profile of its rows. */
+const planLabel = (ordinal: number) => (ordinal === 0 ? PLAN_LABEL : PROFILE_LABEL);
+
 function executionTabs(step: RunStep, stepIndex: number, execution: ExecutionState): ResultTab[] {
   if (!execution.resultSets.length) return NO_TABS;
   let tabs = tabsOfExecution.get(execution);
@@ -43,7 +52,7 @@ function executionTabs(step: RunStep, stepIndex: number, execution: ExecutionSta
     const title = statementTitle(step.statement.sql);
     tabs = execution.resultSets.map((set, ordinal) => ({
       key: `${stepIndex}:${set.index}`,
-      label: ordinal === 0 ? title : `Result ${ordinal + 1}`,
+      label: set.presentation === "plan" ? planLabel(ordinal) : ordinal === 0 ? title : `Result ${ordinal + 1}`,
       statementSql: step.statement.sql,
       execution,
       set,
@@ -61,12 +70,21 @@ function resultTabs(run: RunState | null, executions: Record<string, ExecutionSt
   });
 }
 
+/** Couchbase: what a result of the `plan` presentation is drawn with (`EngineInfo.plan_format`). */
+export interface PlanSupport {
+  profileId: string;
+  /** The server's edition (the session reports it): Community Edition gives no index advice. */
+  edition: "enterprise" | "community" | null;
+}
+
 export interface ResultsAreaProps extends Omit<RunMessagesProps, "run"> {
   run: RunState | null;
   controller: SessionController | null;
   phase: SessionPhase;
   dialect: Dialect | null;
   pageSize: number;
+  /** The connection's engine draws plans (Couchbase): a `plan` set shows the plan view, switchable to the grid. */
+  plans: PlanSupport | null;
   /** Opens the tab's export dialog for a result's statement and what it was sent with; stable across renders. */
   onExport: (sql: string, request: RequestOptions) => void;
 }
@@ -76,6 +94,8 @@ export interface ResultsAreaProps extends Omit<RunMessagesProps, "run"> {
  * Until a new run delivers its first result, the previous grids stay, dimmed. A grid mounts the first time its tab is
  * shown and then stays mounted while another tab is shown, so its scroll and widths survive switching (the export
  * dialog belongs to the query tab). Without a choice by the user, the first result is shown, or Messages once a statement failed.
+ * A set of the `plan` presentation (Couchbase's EXPLAIN, ADVISE and execution profile) is drawn as a plan, with the
+ * grid a switch away; it is labelled Plan, or Profile when it follows the rows of a statement.
  */
 export function ResultsArea({
   run,
@@ -84,6 +104,7 @@ export function ResultsArea({
   phase,
   dialect,
   pageSize,
+  plans,
   onExport,
   ...messages
 }: ResultsAreaProps) {
@@ -130,7 +151,8 @@ export function ResultsArea({
         {shown.map((tab) => {
           if (tab.key !== selected && !visited.has(tab.key)) return null;
           const { execution, set } = tab;
-          return (
+          const drawsPlan = plans !== null && set.presentation === "plan";
+          const grid = (
             <ResultGrid
               key={tab.key}
               set={set}
@@ -145,8 +167,21 @@ export function ResultsArea({
               controller={controller}
               pageSize={pageSize}
               dialect={dialect}
-              hidden={tab.key !== selected}
+              hidden={!drawsPlan && tab.key !== selected}
             />
+          );
+          if (!drawsPlan) return grid;
+          return (
+            <div key={tab.key} className={cn("h-full", tab.key !== selected && "hidden")}>
+              <PlanResult
+                set={set}
+                execution={execution}
+                profileId={plans.profileId}
+                edition={plans.edition}
+                grid={grid}
+                stale={held.stale}
+              />
+            </div>
           );
         })}
         {selected === MESSAGES && <RunMessages run={run} executions={executions} {...messages} />}

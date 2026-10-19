@@ -1,6 +1,7 @@
-import { Check, ListEnd, Loader2, Play, Square, Timer, Undo2 } from "lucide-react";
+import { Check, ChevronDown, ListEnd, ListTree, Loader2, Play, Square, Timer, Undo2 } from "lucide-react";
 import { useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
+import { DropdownMenu, type MenuItem } from "@/components/ui/ContextMenu";
 import { toast } from "@/components/ui/Toast";
 import { cn } from "@/lib/cn";
 import { isImeKeyEvent } from "@/lib/ime";
@@ -32,6 +33,18 @@ export interface TimeoutControl {
   onDone: () => void;
 }
 
+/** Explain, and Run with profile in its menu (Couchbase, spec §3.10). */
+export interface PlanControl {
+  /** ⌘E: the plan of the statement, without running it. */
+  onExplain: () => void;
+  /** Run with profile: null for an engine that cannot report the plan a statement ran with. */
+  profile: {
+    onRun: () => void;
+    /** Why it is not possible (Community Edition): the item is disabled with this tooltip. */
+    blockedReason?: string;
+  } | null;
+}
+
 export interface QueryToolbarProps {
   connection: ConnectionPickerProps;
   state: SessionStateView | null;
@@ -51,6 +64,8 @@ export interface QueryToolbarProps {
   onRun: () => void;
   onRunAll: () => void;
   onCancel: () => void;
+  /** The engine draws plans (Couchbase): Explain, with Run with profile where it is offered; null shows neither. */
+  plan: PlanControl | null;
   /** The engine has transactions: without them (Couchbase) auto-commit, Commit, Rollback and the badge are not shown. */
   showTransactions: boolean;
   /** The tab's desired auto-commit mode. */
@@ -95,6 +110,62 @@ function AutocommitToggle({
       />
       <Label tight>Auto-commit</Label>
     </label>
+  );
+}
+
+const PROFILE_TOOLTIP =
+  "Runs the statement and shows the plan it ran with after its last row — a result closed before its last row has none";
+
+/**
+ * `Explain` (⌘E), with a menu of what else gives a plan: Run with profile, which runs the statement for real. Both are
+ * disabled whenever Run is, with Run's reason as the tooltip.
+ */
+function ExplainControl({
+  plan,
+  canRun,
+  blockedReason,
+}: {
+  plan: PlanControl;
+  canRun: boolean;
+  blockedReason?: string;
+}) {
+  const { profile } = plan;
+  const items: MenuItem[] = profile
+    ? [
+        {
+          label: "Run with profile",
+          onSelect: profile.onRun,
+          disabled: !!profile.blockedReason,
+          title: profile.blockedReason ?? PROFILE_TOOLTIP,
+        },
+      ]
+    : [];
+  return (
+    <div className="flex shrink-0 items-center">
+      <Button
+        size="sm"
+        className={cn(FIXED, profile && "rounded-r-none")}
+        onClick={plan.onExplain}
+        disabled={!canRun}
+        title={blockedReason ?? "Show the plan of the statement without running it (⌘E)"}
+      >
+        <ListTree size={12} />
+        <Label>Explain</Label>
+      </Button>
+      {profile && (
+        <DropdownMenu items={items}>
+          <Button
+            size="sm"
+            className="-ml-px rounded-l-none px-1"
+            aria-label="More ways to explain"
+            disabled={!canRun}
+            title={blockedReason ?? "Run with profile"}
+          >
+            <ChevronDown size={12} />
+          </Button>
+        </DropdownMenu>
+      )}
+    </div>
   );
 }
 
@@ -195,6 +266,7 @@ export function QueryToolbar(props: QueryToolbarProps) {
         <ListEnd size={12} />
         <Label>Run all</Label>
       </Button>
+      {props.plan && <ExplainControl plan={props.plan} canRun={canRun} blockedReason={runBlockedReason} />}
       <Button
         size="sm"
         className={FIXED}

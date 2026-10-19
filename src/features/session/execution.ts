@@ -20,6 +20,8 @@ export interface RequestOptions {
 
 export interface ResultSetState {
   index: number;
+  /** How the set is drawn: a `plan` (Couchbase EXPLAIN, ADVISE or a profile) is one cell holding the plan's JSON text. */
+  presentation: "grid" | "plan";
   columns: ColumnMeta[];
   rows: unknown[][];
   rowCount: number;
@@ -122,7 +124,15 @@ export function applyEvent(state: ExecutionState, event: ServerEvent): Execution
         ...state,
         resultSets: [
           ...state.resultSets,
-          { index: event.index, columns: event.columns, rows: [], rowCount: 0, hasMore: false, partial: false },
+          {
+            index: event.index,
+            presentation: event.presentation,
+            columns: event.columns,
+            rows: [],
+            rowCount: 0,
+            hasMore: false,
+            partial: false,
+          },
         ],
       };
     case "rows":

@@ -1,39 +1,13 @@
 import { useQuery } from "@tanstack/react-query";
-import { Check, Copy } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Button } from "@/components/ui/Button";
+import type { ReactNode } from "react";
+import { CopyButton } from "@/components/ui/CopyButton";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import { pathKey, type ColumnInfo, type ObjectDetail } from "@/lib/api/types";
-import { writeClipboard } from "@/lib/native";
 import type { ObjectTabState } from "@/stores/workspace";
 import { kindLabel } from "./kinds";
 
 /** The object a detail view shows: an object tab, or the table tab's Columns and DDL views. */
 type ObjectRef = Pick<ObjectTabState, "profileId" | "path">;
-
-const FEEDBACK_MS = 1500;
-
-function CopyDdlButton({ ddl }: { ddl: string }) {
-  const [result, setResult] = useState<"copied" | "failed" | null>(null);
-  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
-  useEffect(() => () => clearTimeout(timer.current), []);
-  const copy = async () => {
-    try {
-      await writeClipboard(ddl);
-      setResult("copied");
-    } catch {
-      setResult("failed"); // e.g. the webview denied clipboard access
-    }
-    clearTimeout(timer.current);
-    timer.current = setTimeout(() => setResult(null), FEEDBACK_MS);
-  };
-  return (
-    <Button size="sm" onClick={() => void copy()}>
-      {result === "copied" ? <Check size={12} /> : <Copy size={12} />}{" "}
-      {result === "copied" ? "Copied" : result === "failed" ? "Copy failed" : "Copy DDL"}
-    </Button>
-  );
-}
 
 /** Loads an object's detail (`/metadata/detail`) and renders it with `children`; shows loading and errors itself. */
 function WithDetail({ tab, children }: { tab: ObjectRef; children: (detail: ObjectDetail) => ReactNode }) {
@@ -137,7 +111,7 @@ export function DdlView({ tab }: { tab: ObjectRef }) {
             <div className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-2">
               <DdlBadge detail={d} />
               <div className="flex-1" />
-              <CopyDdlButton ddl={d.ddl} />
+              <CopyButton text={d.ddl} label="Copy DDL" />
             </div>
             <div className="min-h-0 flex-1 overflow-auto">
               <DdlText ddl={d.ddl} />
@@ -164,7 +138,7 @@ export function ObjectDetailView({ tab }: { tab: ObjectRef }) {
             </span>
             <DdlBadge detail={d} />
             <div className="flex-1" />
-            {d.ddl && <CopyDdlButton ddl={d.ddl} />}
+            {d.ddl && <CopyButton text={d.ddl} label="Copy DDL" />}
           </div>
           {d.comment && <Comment text={d.comment} />}
           {d.columns && <ColumnsTable columns={d.columns} />}

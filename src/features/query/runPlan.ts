@@ -11,7 +11,8 @@ export type RunMode = "default" | "all";
  * many times it is sent (T-SQL `GO n`; 1 otherwise, 0 for `GO 0`). `position` is its place in the run plan (0-based):
  * what the user counts, kept when `GO 0` batches are dropped and `GO n` copies are made. `params` are the parameters
  * it uses (SQL++, see `StatementRange`); `values` is what it is sent with, set by the tab once every one has a value
- * (`bindParams`): undefined or null sends none.
+ * (`bindParams`): undefined or null sends none. `prefix` is text sent before the statement that is not in the editor
+ * (Explain's `EXPLAIN `): `sentText` is what the database receives, and positions it reports count the prefix.
  */
 export interface PlannedStatement {
   sql: string;
@@ -21,6 +22,31 @@ export interface PlannedStatement {
   position: number;
   params: string[];
   values?: StatementParams | null;
+  prefix?: string;
+}
+
+/** The text a statement is sent as: its prefix, then the editor's text. */
+export function sentText(statement: PlannedStatement): string {
+  return (statement.prefix ?? "") + statement.sql;
+}
+
+/** What Explain puts before a statement (SQL++: the plan of it comes back as a result, the statement does not run). */
+export const EXPLAIN_PREFIX = "EXPLAIN ";
+/** A statement that is an EXPLAIN or an ADVISE already: Explain sends it as it is (ruling B23). */
+const EXPLAINED = /^\s*(?:explain|advise)\b/i;
+
+/**
+ * The statement as Explain sends it: after `EXPLAIN ` unless it starts with EXPLAIN or ADVISE (after whitespace), and
+ * with the values the drafts give for the parameters it uses. A plan does not need the values, so a parameter without a
+ * usable one is simply left out (`paramsFor` lenient) and Explain never refuses for one.
+ */
+export function explainStatement(
+  statement: PlannedStatement,
+  drafts: Readonly<Record<string, string>>,
+): PlannedStatement {
+  const result = paramsFor(statement.params, drafts, true);
+  const values = "problem" in result ? null : result.params;
+  return { ...statement, values, prefix: EXPLAINED.test(statement.sql) ? undefined : EXPLAIN_PREFIX };
 }
 
 /**

@@ -5,6 +5,7 @@ import { Group, Panel } from "react-resizable-panels";
 import { PanelHandle } from "@/components/ui/PanelHandle";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
+import type { Dialect } from "@/lib/api/types";
 import { isImeKeyEvent } from "@/lib/ime";
 import { isCommandKey } from "@/lib/shortcuts";
 import { markEdited, readEditorBuffer, registerEditor, rememberEditorBuffer } from "@/stores/editorBuffers";
@@ -31,13 +32,13 @@ import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
 import { ConfirmRunDialog } from "./ConfirmRunDialog";
 import { NO_SLOTS, paramsWatcher, problemMessage, type ParamProblem } from "./params";
 import { ParamsPanel } from "./ParamsPanel";
-import { QueryToolbar } from "./QueryToolbar";
-import { ResultsArea } from "./ResultsArea";
+import { QueryToolbar, type PlanControl } from "./QueryToolbar";
+import { ResultsArea, type PlanSupport } from "./ResultsArea";
 import { beginRunMarks, errorLocation, flashStatement, jumpToError, markStatementError } from "./runMarks";
 import { effectiveContext, seenFieldsOf } from "./queryContext";
-import { bindParams, planRun, type PlannedStatement, type RunMode } from "./runPlan";
+import { bindParams, explainStatement, planRun, type PlannedStatement, type RunMode } from "./runPlan";
 import { useQueryTabActions } from "./tabActions";
-import { useQueryRunner, type RunListener } from "./useQueryRunner";
+import { useQueryRunner, type RunListener, type StartOptions } from "./useQueryRunner";
 import { useTransactionControls } from "./useTransactionControls";
 
 const NO_EXECUTIONS: Record<string, ExecutionState> = {};
@@ -56,7 +57,10 @@ const NO_DRAFTS: Record<string, string> = {};
  * and completion request carries; without a choice it follows the profile's default. For an engine that takes
  * parameters (Couchbase) a bar at the bottom of the editor pane holds one field per parameter the statements use
  * (JSON literals, kept with the tab in the workspace): a run needs a valid value for every parameter of the statements
- * it sends, and each statement is sent with its own.
+ * it sends, and each statement is sent with its own. An engine that draws plans (Couchbase) adds ⌘E, Explain: the plan
+ * of the one statement (the selection, or under the cursor) as `EXPLAIN <statement>`, not recorded in the History and
+ * sent without the values of parameters that have none; and Run with profile, a run that also returns the plan the
+ * statement ran with.
  */
 export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean }) {
   const { settings } = useAppSettings();
@@ -69,6 +73,12 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   const takesContext = !!engine?.query_context;
   const sessionDefault = snapshot?.info?.server.default_query_context ?? null;
   const context = takesContext ? effectiveContext(tab.queryContext, sessionDefault) : undefined;
+  /** Couchbase: results of the `plan` presentation are drawn as plans, and Explain is offered (spec §3.10). */
+  const takesPlans = engine?.plan_format === "couchbase";
+  /** Couchbase: a run can also return the plan it ran with; Enterprise Edition only (the session reports it). */
+  const offersProfile = takesPlans && !!engine?.executed_plan;
+  /** The server's edition (Couchbase), once the session has reported it. */
+  const edition = snapshot?.info?.server.edition ?? null;
   /** Whether the engine has transactions; undefined while the engines load. Couchbase has none (spec §3.7.5). */
   const transactions = engine?.transactions;
   const profiles = useProfiles();
@@ -223,7 +233,16 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   };
 
   const planning = useRef(false);
-  const start = async (mode: RunMode) => {
+  /**
+   * Plans a run and hands it to the runner: `choose` gives the statements (the text is split first, which a long script
+   * takes a moment for), `prepare` makes them ready to send, or gives null when the run is refused (it has already said
+   * why). Nothing happens while the tab cannot run or another run is being planned.
+   */
+  const beginRun = async (
+    choose: (current: EditorView, dialect: Dialect) => Promise<PlannedStatement[]>,
+    prepare: (planned: PlannedStatement[]) => PlannedStatement[] | null,
+    options: Omit<StartOptions, "unchanged"> = {},
+  ) => {
     const current = view();
     if (!canRun || !current || dialect === null || planning.current) return;
     planning.current = true;
@@ -233,7 +252,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
       let planned: PlannedStatement[];
       setSplitting(true);
       try {
-        planned = await planRun(current, mode, settings.run.default, dialect);
+        planned = await choose(current, dialect);
       } catch (error) {
         toast("error", `Could not split the text into statements: ${errorMessage(error)}`);
         return;
@@ -241,20 +260,55 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
         setSplitting(false);
       }
       if (planCancelled.current || !planned.length) return;
-      let statements = planned;
-      if (takesParams) {
+      const statements = prepare(planned);
+      if (!statements) return;
+      await runner.start(statements, { ...options, unchanged: () => view()?.state.doc === plannedDoc });
+    } finally {
+      planning.current = false;
+    }
+  };
+
+  /** Run (⌘↵), Run all (⌘⇧↵) and Run with profile: every parameter a statement uses needs a valid value first. */
+  const start = (mode: RunMode, options: Omit<StartOptions, "unchanged"> = {}) =>
+    beginRun(
+      (v, d) => planRun(v, mode, settings.run.default, d),
+      (planned) => {
+        if (!takesParams) return planned;
         // Before anything is analysed or sent: a statement needs a valid value for each parameter it uses.
         const bound = bindParams(planned, draftsRef.current);
         if ("problem" in bound) {
           refuseRun(bound);
-          return;
+          return null;
         }
-        statements = bound.statements;
-      }
-      await runner.start(statements, { unchanged: () => view()?.state.doc === plannedDoc });
-    } finally {
-      planning.current = false;
-    }
+        return bound.statements;
+      },
+      options,
+    );
+
+  /**
+   * ⌘E: the plan of one statement, the selection's or the one under the cursor (whatever `run.default` says), without
+   * running it. It does not wait for parameter values (the plan does not need them) and is not recorded in the History.
+   */
+  const explain = async () => {
+    if (!takesPlans) return;
+    await beginRun(
+      (v, d) => planRun(v, "default", "statement", d),
+      (planned) => {
+        if (planned.length > 1) {
+          toast("info", "Explain one statement at a time");
+          return null;
+        }
+        return planned.map((statement) => explainStatement(statement, draftsRef.current));
+      },
+      { history: false },
+    );
+  };
+
+  /** Run with profile: why it is not possible (Community Edition gives no profile); undefined when it is. */
+  const profileBlockedReason =
+    edition === "community" ? "Community Edition does not give an execution profile" : undefined;
+  const runWithProfile = async () => {
+    if (offersProfile && !profileBlockedReason) await start("default", { profilePlan: true });
   };
 
   // ⌘⇧F: the selection, else the statement under the cursor, by the tab's dialect and the editor settings.
@@ -265,6 +319,11 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   useQueryTabActions(tab.id, {
     run: { enabled: canRun, run: () => void start("default") },
     runAll: { enabled: canRun, run: () => void start("all") },
+    explain: { enabled: canRun && takesPlans, run: () => void explain() },
+    runWithProfile: {
+      enabled: canRun && offersProfile && !profileBlockedReason,
+      run: () => void runWithProfile(),
+    },
     format: { enabled: true, run: format },
     toggleAutocommit: {
       enabled: transactions !== false && !autocommitBlockedReason,
@@ -286,10 +345,12 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
 
   // The editor's keymap is built once: it calls the latest `start`, `format` and script commands through refs.
   const startRef = useRef(start);
+  const explainRef = useRef(explain);
   const formatRef = useRef(format);
   const scriptRef = useRef(script);
   useLayoutEffect(() => {
     startRef.current = start;
+    explainRef.current = explain;
     formatRef.current = format;
     scriptRef.current = script;
   });
@@ -311,12 +372,18 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     void startRef.current(mode);
     return true;
   };
+  // ⌘E does nothing on an engine without plans, and is still handled: it never falls through to the editor or the app.
+  const explainFromKey = () => {
+    void explainRef.current();
+    return true;
+  };
   const [extensions] = useState<Extension[]>(() => [
     // CodeMirror keymaps skip key events during IME composition, so ⌘↵ never runs half-composed text.
     Prec.highest(
       keymap.of([
         { key: "Mod-Enter", run: () => runFromKey("default") },
         { key: "Shift-Mod-Enter", run: () => runFromKey("all") },
+        { key: "Mod-e", run: explainFromKey },
         { key: "Mod-s", run: () => (scriptRef.current.save(), true) },
         { key: "Shift-Mod-s", run: () => (scriptRef.current.saveAs(), true) },
         { key: "Shift-Mod-f", run: () => (formatRef.current(), true) },
@@ -363,6 +430,16 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   }, []);
   const initialSelection = remembered?.selection ?? startSelection(tab);
   const tint = profileColor(profile?.color);
+  /** Explain and Run with profile in the toolbar (Couchbase only). */
+  const planControl: PlanControl | null = takesPlans
+    ? {
+        onExplain: () => void explain(),
+        profile: offersProfile
+          ? { onRun: () => void runWithProfile(), blockedReason: profileBlockedReason }
+          : null,
+      }
+    : null;
+  const plans: PlanSupport | null = takesPlans && tab.profileId !== null ? { profileId: tab.profileId, edition } : null;
 
   return (
     <div className="flex h-full flex-col">
@@ -401,6 +478,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
         onRun={() => void start("default")}
         onRunAll={() => void start("all")}
         onCancel={cancel}
+        plan={planControl}
         showTransactions={transactions !== false}
         autocommit={tab.autocommit}
         autocommitBlockedReason={autocommitBlockedReason}
@@ -468,6 +546,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
               phase={phase}
               dialect={dialect}
               pageSize={settings.run.page_size}
+              plans={plans}
               onExport={openExport}
               locate={locate}
               onJump={jump}

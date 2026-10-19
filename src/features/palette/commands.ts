@@ -10,12 +10,13 @@ import { openSettings } from "../settings/SettingsDialog";
 import { requestCloseTab } from "../workspace/closeGuards";
 
 /**
- * The shortcut labels the palette shows, in one place. The bindings: ⌘↵, ⌘⇧↵ and ⌘⇧F are the query tab's editor
+ * The shortcut labels the palette shows, in one place. The bindings: ⌘↵, ⌘⇧↵, ⌘E and ⌘⇧F are the query tab's editor
  * keymap, ⌘W the workspace, ⌘, the settings dialog, ⌘P and ⌘⇧P the app. A command without a binding has none.
  */
 export const SHORTCUTS = {
   run: "⌘↵",
   runAll: "⌘⇧↵",
+  explain: "⌘E",
   format: "⌘⇧F",
   closeTab: "⌘W",
   settings: "⌘,",
@@ -101,6 +102,8 @@ export const COMMANDS: readonly PaletteCommand[] = [
   },
   tabCommand("run", "Run", SHORTCUTS.run),
   tabCommand("runAll", "Run all", SHORTCUTS.runAll),
+  tabCommand("explain", "Explain", SHORTCUTS.explain),
+  tabCommand("runWithProfile", "Run with profile"),
   tabCommand("format", "Format", SHORTCUTS.format),
   {
     id: "toggleVim",

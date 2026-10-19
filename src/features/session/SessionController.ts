@@ -54,13 +54,15 @@ export interface SessionSnapshot {
 /**
  * `queryContext` is the Couchbase query context the statement runs in. Undefined: the session's default context
  * (`info.server.default_query_context`); null: none. A tab's own choice goes through here. `params` are the typed
- * parameters of the statement.
+ * parameters of the statement. `profilePlan` (Couchbase Enterprise) asks for the execution profile: it arrives as a
+ * further result set of the plan presentation once the rows are over.
  */
 export interface ExecuteOptions extends RequestOptions {
   pageSize?: number;
   timeoutS?: number | null;
   confirmed?: boolean;
   history?: boolean;
+  profilePlan?: boolean;
 }
 
 export interface SessionControllerOptions {
@@ -179,7 +181,7 @@ export class SessionController {
         history: options.history ?? true,
         query_context: request.queryContext,
         ...withParams(request),
-        profile_plan: false,
+        profile_plan: options.profilePlan ?? false,
       },
       request,
     );
