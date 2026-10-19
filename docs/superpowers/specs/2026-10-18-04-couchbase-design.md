@@ -49,7 +49,7 @@ R-04-x 是 coordinator 的裁決；D-04-x 是本設計的決定。全文的引�
 | 決策 | 選項 | 結論與理由（含證據） |
 |---|---|---|
 | **R-04-1** 傳輸 | (A) Python SDK；(B) **Query Service REST + stdlib `http.client` + 增量串流解析**；(C) B＋SDK 只做文件；(D) Console 內部 REST | **(B)**。SDK 4.6.3 不適合 IDE：〔實測〕100 萬列（226 MB）第一列要 5.1 秒、RSS 1.15 GB；每列被 C++ 重新編碼（key 排序、`signature` 也排序，失去欄序；`1.10`→`1.1`）；遇到 `1e400`／400 位整數直接 abort 整個 process（違反 Q2）；signature 與 metrics 在最後一列之後才到（調查 §1.2）。REST：第一列 5–23 ms、27.2 萬列／秒、RSS 平穩約 21 MB、0 新相依（調查 §1.3）。(D) 的 docs endpoint 忽略 `cas`（調查 §6.3）。**CLAUDE.md 技術選型表的「couchbase 4.x」改成「Query Service REST（stdlib `http.client`，無 SDK）」**（§13）。 |
-| **R-04-2** 文件存取 | (B) **只用 SQL++**，放在 `DocumentStore` 介面後面；(C) lazy 載入 SDK 做 get/replace | **(B)**。開檔 `SELECT META(d).cas, META(d).expiration, META(d).type, d FROM ks d USE KEYS $id` 拿到存放原文（key 順序、空白、`1e400`），不需 index（調查 §6.2）。存檔 `UPDATE … USE KEYS $id SET d = $doc WHERE META(d).cas = $cas RETURNING META(d).cas` ＋ `preserve_expiry=true`，〔實測〕過期時間保留、CAS 不符回 0 列。副作用（key 排序、空白壓縮、小數正規化、> int64 被改值）由守衛處理：**> int64 擋下**；與編輯內容 token 不同時**先預覽再確認**（細化見 §12）；binary／base64 文件唯讀。`DocumentStore`（get／replace／insert／remove／server_form）讓 (C) 之後能整個換掉（+15 MB、KV 經 SSH 到多節點不通，調查 §6.4）。 |
+| **R-04-2** 文件存取 | (B) **只用 SQL++**，放在 `DocumentStore` 介面後面；(C) lazy 載入 SDK 做 get/replace | **(B)**。開檔 `SELECT META(d).cas, META(d).expiration, META(d).type, d FROM ks d USE KEYS $id` 拿到存放原文（key 順序、空白、`1e400`），不需 index（調查 §6.2）。存檔 `UPDATE … USE KEYS $id SET d = $doc WHERE META(d).cas = $cas RETURNING META(d).cas` ＋ `preserve_expiry=true`，〔實測〕過期時間保留、CAS 不符回 0 列。副作用（key 排序、空白壓縮、小數正規化、> int64 被改值）由守衛處理：**> int64 擋下**；與編輯內容 token 不同時**先預覽再確認**（細化見 §12）；binary／base64 文件唯讀。`DocumentStore`（get／replace／insert／remove／server_form）讓 (C) 之後能整個換掉（+15 MB、KV 經 SSH 到多節點不通，調查 §6.4）。04c：存檔語句另加 `AND META(d).type = "json"`（A30）；expiration 寫入後另讀（A28）；也擋超出 double 範圍的數字（C4）；`SELECT RAW $doc` 與存放只差字串跳脫寫法（A2）。 | |
 | **R-04-3** 開發環境 | CE 7.6.2；**EE 7.6.12** | **EE**。CE 沒有 ADVISE、UPDATE STATISTICS、CBO 估計、`profile` 輸出，RBAC 只有 admin／ro_admin／bucket_full_access（調查 §0.7、§9.1）；公司 cluster 多半是 EE。開發／測試使用免費，repo 只引用 image tag。一次性 `couchbase-init` 依 調查 §9.2–9.3 seed，假帳密、只綁 127.0.0.1。EE 專屬功能偵測 edition，在 CE 上顯示「Community Edition 不提供」而不是失敗。 |
 | **R-04-4** 交易 | v1 支援 REST 交易（`txid`＋固定 node）；**v1 不支援** | **不支援**。〔實測〕沒有 `txid` 時 `BEGIN WORK` 開了一個沒人會加入的交易，`COMMIT`／`ROLLBACK`／`SAVEPOINT` 回 17002（調查 §0.5）。TRANSACTION 類語句明確拒絕（`transactions_unsupported`）；新能力 `transactions: bool`（Couchbase 為 False）讓前端隱藏 Auto-commit／Commit／Rollback／交易徽章。之後的 v1.x 可用 `txid`＋同一 node（調查 §10 的表）。 |
 | **R-04-5** 取消與 timeout | `DELETE FROM system:active_requests`；SDK cancel；**任一執行緒 shutdown socket** | **shutdown socket**：〔實測〕0 ms、server 立即標成 `closed`，任何使用者都能做；DELETE 需要 admin（CE）或 `query_system_catalog`（EE），一般使用者連自己的請求都看不到（調查 §3.7）。`status:"stopped"`（別人停掉的）視為取消；server 自己的 timeout（1080）原樣顯示。**不送 server `timeout`**：它在 client 暫停時照樣計時，恢復後以 1080 結束（調查 §3.4）；worker 既有的計時器（涵蓋 `run()`＋第一頁）負責 tab timeout。 |
@@ -70,7 +70,7 @@ R-04-x 是 coordinator 的裁決；D-04-x 是本設計的決定。全文的引�
 | **D-04-5** Query context 的型別 | 字串 `bucket.scope`；**`{bucket, scope}`** | bucket 名稱可以含 `.`（`my.bucket`），字串會有歧義。協定與 workspace 都用結構；顯示與 history 用 `qualified()` 產生的文字（需要時加 back-tick）。Profile 的 database 欄位是文字，解析規則見 §3.11.1。 |
 | **D-04-6** 節點探索的時機 | 每次都探索；**只在預設 port 且沒有 SSH 時探索** | 使用者填了非預設 port（LB、proxy）或用 SSH，就表示「連這個 endpoint」。探索失敗（8091 不通、401、3 秒逾時）立即退回 seed 的 query port，記 INFO。 |
 | **D-04-7** TLS | 交給 driver；**自己包 `ssl`** | 自己呼叫 `wrap_socket(server_hostname=…)`，所以經 SSH tunnel 也能做 verify-full（用 `Endpoint.tls_server_name` 檢查），不像 mysql-connector 只能 fail closed。Couchbase 的 TLS 在另一個 port（18093），`prefer` 沒有意義：當成 disable（明文 HTTP），連線對話框標明（§3.6.4）。 |
-| **D-04-8** 存檔預覽怎麼算 | 本地模擬 server 的正規化；**問 server：`SELECT RAW $doc`** | 本地模擬要猜 Go 的 float 格式；`SELECT RAW $doc` 走 server 自己的值編碼，與 `SET d = $doc` 存下的應該相同 **〔未實測，A2〕**。04c 第一個 task 驗證；不同就退回本地模擬並標成「近似」。 |
+| **D-04-8** 存檔預覽怎麼算 | 本地模擬 server 的正規化；**問 server：`SELECT RAW $doc`** | 本地模擬要猜 Go 的 float 格式；`SELECT RAW $doc` 走 server 自己的值編碼，與 `SET d = $doc` 存下的應該相同 **〔未實測，A2〕**。04c 第一個 task 驗證；不同就退回本地模擬並標成「近似」。 04c T1：成立（值層級）；差別只在存放時字串裡的 `<>&` 寫成 `\u003c` 等，diff 以字串的值比較。 | |
 | **D-04-9** 文件操作的連線 | session 連線；**metadata 連線，寫入不重試** | 文件 tab 不綁 query tab 的 session；metadata 連線本來就是每個 profile 一條、閒置關閉。`MetadataService.with_connection()` 斷線會重試一次，寫入要關掉（`retry=False`）；有 CAS 的 replace／remove 就算重送也只會變成衝突，但 insert 會誤報「已存在」。 |
 | **D-04-10** Plan 分析放哪 | 前端 TS；**backend（`adapters/couchbase/explain.py`）** | 反模式規則是「容易出錯的邏輯」，backend 有 pytest；前端只畫樹。`POST /couchbase/plan` 收 plan 原文、回正規化的樹＋標記＋advice。 |
 | **D-04-11** 雙擊 collection | 表格資料 tab；detail tab；**開新的 query tab（帶 context 與瀏覽語句）** | 表格資料 tab 的 SELECT／篩選／排序是關聯式的；Couchbase 使用者本來就是寫 SQL++ 看資料。新 tab 的 context 設成該 scope，內容 ``SELECT META(d).id, * FROM `c` AS d``（兩行），不自動執行（「別耍聰明」，M5）。不加 LIMIT：分頁＋R-04-6 已保護 query node。Detail 從右鍵選單開。04b（B18）：back-tick 只在需要時加（同 §3.3.2），例如 `FROM events AS d`。 |
@@ -515,35 +515,47 @@ class DocumentStore(ABC):
 
 `CouchbaseConnection` 另外實作小介面 `DocumentCapable.documents() -> DocumentStore`（ISP；`DocumentService` 檢查 `isinstance` 或能力 `documents`）。
 
+04c：ABC 放在 `adapters/documents.py`（與 engine 無關，裁決 C8；`DocumentService` 依賴它而不是 Couchbase 的套件），`SqlppDocumentStore` 在 `adapters/couchbase/documents.py`；`is_server_error` 因此移到 `adapters/couchbase/messages.py`。`blocked_numbers` 另放在不用連線的 `DocumentRules`（`DocumentEngine.document_rules()`），讓只看文字的檢查在 request 執行緒做、不佔 metadata worker（C43）。
+
 #### 3.9.2 `SqlppDocumentStore`
 
 | 操作 | SQL++ |
 |---|---|
 | get | `SELECT META(d).cas AS cas, META(d).expiration AS expiration, META(d).type AS type, d FROM ks AS d USE KEYS $id` → 0 列＝不存在；`d` 是存放原文（〔實測〕key 順序、空白、`1e400`）；type `base64` → binary，`d` 是 `"<binary (9 b)>"`，取出大小，不給內容 |
 | server_form | `SELECT RAW $doc`（`readonly=true`）→ 該列原文 **〔A2〕** |
-| replace | `UPDATE ks AS d USE KEYS $id SET d = $doc WHERE META(d).cas = $cas RETURNING META(d).cas AS cas, META(d).expiration AS expiration`，`preserve_expiry=true`；1 列 → 新 CAS；0 列（〔實測〕CAS 不符時 success＋0 列）或 12009（〔實測〕中途被改）→ 再查一次 `SELECT RAW META(d).cas FROM ks d USE KEYS $id` 分辨 `document_conflict`／`document_missing` |
-| insert | `INSERT INTO ks AS d (KEY, VALUE) VALUES ($id, $doc) RETURNING META(d).cas AS cas`；重複 key → `document_exists` |
-| remove | `DELETE FROM ks AS d USE KEYS $id WHERE META(d).cas = $cas RETURNING RAW META(d).id`；0 列 → 同 replace 的分辨 |
-| blocked_numbers | 以 `parse_int` 檢查：超出 int64（±9,223,372,036,854,775,807）的整數 → 路徑清單（〔實測〕`12345678901234567890` 存成 `12345678901234567000`；int64 max 精確） |
+| replace | `UPDATE ks AS d USE KEYS $id SET d = $doc WHERE META(d).cas = $cas AND META(d).type = "json" RETURNING META(d).cas AS cas`，`preserve_expiry=true`；1 列 → 新 CAS，expiration 寫入後另讀 `SELECT META(d).cas, META(d).expiration, META(d).type FROM ks AS d USE KEYS $id`（〔實測〕RETURNING 的 expiration 一律是 0，A28）；0 列（〔實測〕CAS 不符時 success＋0 列）或 12009（〔實測〕中途被改）→ 再讀一次 META 分辨：沒有 → `document_missing`；type 不是 json → `binary_document`；CAS 變了 → `document_conflict`（帶目前的 CAS）；CAS 沒變的 12009 是 server 自己的拒絕（durability 做不到、暫時失敗、值太大），原文顯示（`QueryFailed`）。沒有 type 條件時 UPDATE 會把 binary 文件改成 JSON（A30） |
+| insert | `INSERT INTO ks AS d (KEY, VALUE) VALUES ($id, $doc) RETURNING META(d).cas AS cas`；重複 key → server 回 12009（`reason.code` 17012，A29；和並發修改同一個 code），讀 key 確認存在 → `document_exists`，不存在就是 server 自己的拒絕，原文顯示 |
+| remove | `DELETE FROM ks AS d USE KEYS $id WHERE META(d).cas = $cas AND META(d).type = "json" RETURNING RAW META(d).id`；0 列 → 同 replace 的分辨 |
+| blocked_numbers | 以 `parse_int` 檢查：超出 int64（±9,223,372,036,854,775,807）的整數 → 路徑清單（〔實測〕`12345678901234567890` 存成 `12345678901234567000`；int64 max 精確） 04c（C4）：也包含超出 double 範圍的數字（`1e400`、`2e308`，server 以 1040 拒絕）；精度損失（π 剩 16 位）與下溢（`1e-400`→`0`）不擋，在預覽標成改值。實作是 `jsontext.number_paths`，前面加一個預先篩選（19 位以上的數字、三位數的正指數），幾乎所有存檔都不必走完整個文件。 | |
 
-CAS 以 JSON 整數 literal 送（uint64；〔實測〕目前 < 2⁶³，約到 2262 年都在 int64 內）；API 與前端一律用字串傳 CAS（> 2⁵³）。非物件文件（字串、陣列、數字）能否用 `SET d = $doc` 取代 **〔未實測，A3〕**；不行就顯示 server 的錯誤原文。
+CAS 以 JSON 整數 literal 送（uint64；〔實測〕目前 < 2⁶³，約到 2262 年都在 int64 內）；API 與前端一律用字串傳 CAS（> 2⁵³）。非物件文件（字串、陣列、數字）能否用 `SET d = $doc` 取代：〔實測，04c T1：成立，A3〕。04c：CAS 一律用字串傳、store 拒絕超過 int64 的值（SQL++ 會把它當 double 比，可能對上別的 CAS，C11；〔實測〕CAS 超過 2⁵³ 時 `META(d).cas = $cas` 仍精確比較，A27）。
 
 #### 3.9.3 存檔流程（`DocumentService`）
 
 1. 唯讀 profile → 直接拒絕（`read_only`）；binary 文件 → `binary_document`。
-2. 本地檢查：不是合法 JSON → `invalid_json`（含位置）；`blocked_numbers` 有 → `number_out_of_range`（列出路徑，說明「Couchbase 會把超過 int64 的整數存成 double 而改值；請改成字串」），不送出。
-3. `server_form(text)`；用 `jsontext.diff(edited, server_form)` 比較：兩邊 token 相同（只差空白）→ 直接存；不同 → 回 `SavePreview{server_text, changes}`，`changes` 是 `DocumentChange{path, kind: key_order|number|duplicate_key, before, after}`（例如 `$.address` key 重排、`$.price` `1.10 → 1.1`、重複的 key 被丟掉），前端顯示後由使用者確認（`confirmed=true` 再送一次）。
-4. `replace`／`insert`，經 metadata 連線、`retry=False`（D-04-9）。成功回新 CAS 與 expiration。
+2. 本地檢查：不是合法 JSON → `invalid_json`（含位置）；`blocked_numbers` 有 → `number_out_of_range`（列出路徑，說明「Couchbase 會把超過 int64 的整數存成 double 而改值；請改成字串」），不送出。04c：巢狀超過 100 層（`MAX_DOCUMENT_DEPTH`）也是 `invalid_json`（C38：diff 與 `number_paths` 每層都重讀一次，100 層是它們的時間上限）；確認過的存檔也擋 `blocked_numbers`；這些只看文字的檢查在 request 執行緒做，還沒用到任何連線（C43）。
+3. `server_form(text)`；用 `jsontext.diff(edited, server_form)` 比較：兩邊 token 相同（只差空白）→ 直接存；不同 → 回 `SavePreview{server_text, changes, counts}`，`changes` 是 `DocumentChange{path, kind: key_order|number|duplicate_key|other, value_changed, before, after}`（例如 `$.address` key 重排、`$.price` `1.10 → 1.1`、重複的 key 被丟掉；`other` 讓沒預料到的差異不會被靜默吞掉；`value_changed`：數字以 `Decimal` 比，key 重排與只換寫法的數字不算改值），改值的項目排在前面（每一類、改值與否各自最多保留 100 個，列出最多 200 個），`counts` 是每一類的完整數量（C2）；前端顯示後由使用者確認（`confirmed=true` 再送一次）。
+4. `replace`／`insert`，經 metadata 連線、`retry=False`（D-04-9）。成功回新 CAS 與 expiration（寫入後另讀，A28）。server 的錯誤回應是最終答案；其他失敗（連線斷了、拿不到回應、server 的 1080 timeout、寫入成功後讀 META 失敗）→ `write_outcome_unknown`（502，「可能已寫入，Reload 看」），絕不重送（C7）。
 5. 文件 API 不經 SafetyPolicy（不是使用者打的 SQL；它本身就是明確的寫入動作，有自己的確認）。
+
+04c 實作時的細化：
+- ⌘S 在文字與載入或上次存的相同時什麼都不送（前端以 baseline 判斷，C12、C32）；只有 Save、新文件的第一次存、Delete… 會寫入。這回答了使用者在 04a 的問題（byte-exact 存檔重不重要）：SQL++ 存不出 byte-exact，所以 DbaGuy 永遠不重新編碼使用者沒編輯的文件、每一個 token 的改變都在發生之前顯示。
+- 確認過的存檔之後，編輯器顯示 server 的形式（原文有換行就排版）並以它為新的 baseline（C13）；直接存之後保留使用者的文字。
+- 預覽用的 `server_form` 是一次短的 metadata 呼叫，比較（diff）在 request 執行緒，寫入是另一次短的 metadata 呼叫，所以一份要幾秒才比得完的文件不會擋住這個 profile 的樹、補全與取樣（C43）。寫入的呼叫帶「已放棄」旗標：在佇列裡就逾時的寫入永遠不會執行，開始後才逾時算 unknown（C42）。
+- 寫入前閒置超過 2 秒的連線先做一次可重送的檢查，讓被 server 關掉的 keep-alive 在寫入之前就換掉（C40）；request body 的每個原文 literal 組裝時檢查剛好是一個 JSON 值，否則一句都不送（C39）。
+- 刪除時 server 說文件已不存在＝使用者要的結果（C46）；密碼不在時（後端重啟後）寫入回 `password_required`，前端開 unlock 對話框，取消則這次存檔結束（C31、C48）。
 
 #### 3.9.4 API（`/couchbase/documents/*`，全部帶 `profile_id` 與 `keyspace{bucket, scope, collection}`）
 
 | endpoint | 輸入 | 輸出 |
 |---|---|---|
 | `POST /get` | `id` | `DocumentView{id, cas: str, expiration: int（Unix 秒，0＝沒有）, type: "json"\|"base64", text: str \| None, size: int}`；不存在 → 404 `document_missing` |
-| `POST /save` | `id, cas, text, confirmed` | `{cas, expiration}` 或 `SavePreview`（`needs_confirmation`）或錯誤 |
-| `POST /insert` | `id, text, confirmed` | 同上 |
+| `POST /save` | `id, cas, text, confirmed` | `DocumentSaved{status:"saved", cas, expiration, size}` 或 `SavePreview{status:"needs_confirmation", server_text, changes, counts}`（以 `status` 區分）；`size` 是存檔的文字去掉 token 之間空白的 UTF-8 長度，到下次載入前是估計（C21） |
+| `POST /insert` | `id, text, confirmed` | 同 `/save` |
 | `POST /remove` | `id, cas` | 204 或錯誤 |
+| `POST /couchbase/statement-keyspace` | `sql, query_context` | 該語句讀的 collection（只有一個、完整寫出或照執行時的 context 解析）或 `null`；純函式，不連線；grid 的「Open document…」預填用（C44） |
+
+CAS 是 `^[1-9][0-9]{0,18}$` 的十進位字串且 ≤ int64（C11）；ID 1–250 UTF-8 bytes；文字最多 20 MiB。錯誤（C11）：`document_missing` 404、`document_conflict` 409（`detail.cas`）、`document_exists` 409、`binary_document` 422、`invalid_json` 422（`detail.offset` 是 UTF-16 位移、`detail.reason`）、`number_out_of_range` 422（`detail.paths`，路徑只在 detail，不進訊息與 log）、`read_only` 403、`write_outcome_unknown` 502。
 
 ### 3.10 EXPLAIN、ADVISE、profile（R-04-13；`adapters/couchbase/explain.py`）
 
@@ -616,15 +628,15 @@ CAS 以 JSON 整數 literal 送（uint64；〔實測〕目前 < 2⁶³，約到 
 | Plan | 新 `features/explain/PlanView.tsx`、`ResultsArea.tsx`、`QueryToolbar.tsx` | Explain 按鈕與選單、`presentation="plan"` 的結果、advice 與 Copy、EE 判斷（`server.edition`） |
 | 補全 | `features/editor/completion.ts` | SQLPP 時帶 `query_context` 與 `seen_fields` |
 | ⌘P、History | `features/palette/*`、`features/history/*` | collection 命中開瀏覽 tab；重開時設定 context |
-| 文件 | 新 `features/documents/`（`DocumentTab.tsx`、`OpenDocumentDialog.tsx`、`SavePreviewDialog.tsx`、`ConflictDialog.tsx`、`useDocument.ts`）、`stores/workspace.ts` | 見下 |
+| 文件 | 新 `features/documents/`（`documentState.ts`、`useDocument.ts`、`useDocumentSave.ts`、`documentApi.ts`、`openDocument.ts`、`previewSummary.ts`、`DocumentTab.tsx`、`DocumentBar.tsx`、`OpenDocumentDialog.tsx`、`SavePreviewDialog.tsx`、`ConflictDialog.tsx`）、`features/editor/startingPoint.ts`、`stores/workspace.ts` | 見下 |
 
 Document tab：
-- 標題＝ID（tooltip 是 keyspace）；META 列：CAS、expiration（本地時間＋相對時間，或「none」）、type、大小。
+- 標題＝ID（tooltip 是 keyspace）；META 列：CAS、expiration（本地時間＋相對時間，或「none」）、type、大小。04c：tab 的所有狀態轉換（載入、Retry、Reload、dirty／baseline、衝突、已不存在、Create it、確認過的存檔、unlock）放在純函式 reducer `documentState.ts`，由 Vitest 測（C35）；`CodeEditor.setText` 一律把新文字當新的起點、清空 undo 歷史（`startingPoint.ts`）。
 - CodeMirror＋`@codemirror/lang-json`（新相依，約 10 KB，相依的 `@lezer/json` 很小、`@codemirror/language` 已有；plan 時確認最新版與發佈日期）。內容是存放原文；「Format」用 `json.ts` 的 `formatJson`（保留數字 literal 與 key 順序）。
-- ⌘S 存檔 → 預覽對話框（有 `changes` 時）→ 確認；`number_out_of_range` → 錯誤面板列出路徑、不可存。衝突 → 「文件在你開啟後被改過／被刪除」：Reload（放棄修改，先確認）、Copy my version、Cancel。
-- Delete…（不可復原 → 確認對話框）、Reload、Copy。唯讀 profile → 編輯器唯讀＋提示。binary → 只顯示 META 與「binary document (N bytes) — view only」。
-- 未存的內容與所根據的 CAS 存進 workspace（`buffer`、`document_cas`），當機重開還在；存檔時照 CAS 檢查。
-- 開啟：樹的「Open document by ID…」、grid 的「Open document…」（ID 預填該列名為 `id` 的欄或被點的字串 cell，keyspace 預填 tab 的 context＋上次用的 collection，對話框可改）。
+- ⌘S 存檔 → 預覽對話框（有 `changes` 時）→ 確認；`number_out_of_range` → 錯誤面板列出路徑、不可存。衝突 → 「文件在你開啟後被改過／被刪除」：Reload（放棄修改，先確認）、Copy my version、Cancel。04c：預覽的第一行先講改值的項目（「N values change」，列表不完整時是「at least N」），再講其他類別；沒改過的文件按 ⌘S 只提示 "No changes to save"（C12）；確認過的存檔之後編輯器顯示 server 的形式（C13）；存檔、新增、刪除進行中編輯器唯讀（C14）。衝突時若文件已被刪除，提供「Save as new document」（連同 Copy my version、Cancel）而不是 Reload（C22）。
+- Delete…（不可復原 → 確認對話框）、Reload、Copy。唯讀 profile → 編輯器唯讀＋提示。binary → 只顯示 META 與「binary document (N bytes) — view only」。04c：binary 文件顯示 META 與 "view only"（沒有 Save、Delete、編輯器）；文件已不存在時顯示「Create it」（tab 有未存文字時保留編輯器，唯讀，只能 Create it 或在衝突對話框選 Save as new document，C30、C47）；關閉有未存修改的 document tab 問「Discard unsaved changes?」（Discard／Cancel，沒有 Save，C20；沒顯示過的還原 tab 也問，C28）。
+- 未存的內容與所根據的 CAS 存進 workspace（`buffer`、`document_cas`），當機重開還在；存檔時照 CAS 檢查。04c：只保存新文件或有未存修改的文件（`buffer`＋`document_cas`），乾淨的文件重開時從 server 讀、tab 第一次顯示才讀（C15、C16）。
+- 開啟：樹的「Open document by ID…」、grid 的「Open document…」（ID 預填該列名為 `id` 的欄或被點的字串 cell，keyspace 預填 tab 的 context＋上次用的 collection，對話框可改）。04c：新增「New document…」（樹，唯讀 profile 沒有）：ID 在對話框決定，內容從 `{}` 開始，第一次存照樣預覽，ID 已存在時提供「Open the existing document」（確認後捨棄草稿，C19）；grid 的預填改用該語句自己的 keyspace（`/couchbase/statement-keyspace`），其次才是 tab 的 context 與上次用的 collection（C44）。
 
 ## 4. 錯誤處理
 
@@ -644,6 +656,7 @@ Document tab：
 | body 不是 JSON | `http_<status>` | `HTTP 502 Bad Gateway` |
 | 回應 JSON 壞掉 | `protocol_error` | `The query service sent a malformed response`（WARNING log 只記 offset） |
 | 文件 | `document_missing`、`document_conflict`、`document_exists`、`number_out_of_range`、`binary_document`、`invalid_json`、`read_only` | §3.9 |
+| 寫入的結果不明 | `write_outcome_unknown`（502） | `The connection to the query node was lost during the write: the document may or may not have changed. Reload it to see what the server holds`（逾時等其他原因用該原因的固定文字；絕不重送，C7） |
 | 匯出 INSERT 格式 | `unsupported_format` | `INSERT statements are not offered for Couchbase` |
 
 原則：server 錯誤原文優先（M10）；DbaGuy 自己的錯誤是固定文字，不回顯 SQL、文件內容、參數值或密碼。
@@ -698,13 +711,13 @@ TLS 測試用的 CA 不入庫：測試執行時從 `GET /pools/default/trustedCA
   - formatting：`_Json`／`_Missing` 在每種 writer、原文 JSON writer、SQLPP 的 IN list 與 INSERT 拒絕。
   - worker：`unsupported_option`、`invalid_params`、暫停閒置關閉（假時鐘、token 競態）、原文匯出走 `RawJsonRows`。
 - **整合（dev cluster）**：連線與版本／edition、帳密錯、探索（單節點）、樹（`_default`、`_system`、300 個 collection、受限使用者只看到自己的）、index DDL 與 deferred、snapshot；2 萬列分頁與暫停後繼續、暫停閒置關閉；執行中取消（245 秒聚合，之後查 `system:completed_requests` 的 state）、串流中關閉、worker timeout；唯讀 profile 的 server 拒絕（直接呼叫 adapter 繞過分類器）；錯誤位置（中文＋emoji 那句，column 轉 UTF-16）；warnings 與 metrics 訊息；參數型別；每次請求的 context；交易語句拒絕；文件 get／save／衝突／expiry 保留／int64 擋下／binary 唯讀／insert 重複／remove；ADVISE 與 profile（EE）；SSH 經 bastion；TLS 18093＋CA（verify-ca，verify-full 視 A11）；JSONL 匯出與 server 原文 token 相同；取樣不受 binary 文件影響。
-- **前端**：手動，用 `scripts/dev.sh --web` 與內建瀏覽器（CLAUDE.md）；清單放進各 plan 與最後給使用者的測試清單。
+- **前端**：手動，用 `scripts/dev.sh --web` 與內建瀏覽器（CLAUDE.md）；清單放進各 plan 與最後給使用者的測試清單。04c 起純模組有 Vitest（`npm test`，dev 相依 Vitest 5.0.3；`documentState`、`startingPoint`、`previewSummary`、`documentApi`、`useDocumentSave` 的重送規則、`openDocument`、`workspaceFile`，C35）；React 元件沒有測試。
 
 ## 7. 打包與量測
 
 - 不加 Python 相依：只用 stdlib（`http.client`、`ssl`、`socket`、`json`、`codecs`、`decimal`）。PyInstaller 不需要 hidden import，sidecar 大小增加 ≈ 0（〔實測〕對照：SDK 會 +15 MB）。sqlglot 沒有新方言。
-- 前端只加 `@codemirror/lang-json`（04c）。
-- 打包後驗證：用凍結的 sidecar 連 dev cluster 跑一句查詢（HTTP 與 TLS 各一次）、開一份文件（04c）。
+- 前端只加 `@codemirror/lang-json`（04c，6.0.2；JS 主 chunk +33 kB／gzip +12 kB 含 04c 的前端）；dev 相依另有 Vitest（不進 bundle）。
+- 打包後驗證：用凍結的 sidecar 連 dev cluster 跑一句查詢（HTTP 與 TLS 各一次）、開一份文件（04c）。04c 的結果（`src-tauri/resources/backend` 與 `.app` 裡的 sidecar 各跑一次）：`u_numbers` 原文相同、`u_big`（5 MiB）0.06 秒、新增（預覽 → 確認）、CAS 過期的 save（409）、直接存、移除、讀回 404、TLS（verify-ca）讀文件，都符合預期；sidecar 49,100 → 49,148 KB，沒有 hidden import。
 - 量測（04a 收尾）：`scripts/measure-startup.sh` 的冷啟動與記憶體不應變化；另外記錄 sidecar 在 100 萬列分頁（暫停 10 秒、繼續）期間的 RSS（目標增加 < 30 MB；〔實測〕原型約 21 MB 平穩）。
 
 ## 8. 痛點對照
@@ -742,7 +755,7 @@ TLS 測試用的 CA 不入庫：測試執行時從 `GET /pools/default/trustedCA
 | 很多 tab 同時暫停，佔滿 query node 的 servicer（每 node 32 個） | 45 秒自動關閉（第一次暫停起算）；`client_context_id`＋`User-Agent` 讓 DBA 看得出是 DbaGuy |
 | 打包版沒有 OpenSSL 預設 CA bundle，公開憑證的 cluster 驗證失敗 | fail closed＋提示設定 CA 檔；與 MySQL 同一個已知限制；之後可考慮 macOS trust store |
 | 未實測的回應形狀（A1、A15）讓 alias 展開或 plan 偵測不觸發 | 規則都退回無損的一般路徑；04a 第一個 task 先實測 |
-| `SELECT RAW $doc` 與實際存放不同（A2） | 04c 先實測；不同就改本地模擬並標「近似」 |
+| `SELECT RAW $doc` 與實際存放不同（A2） | 04c 先實測；不同就改本地模擬並標「近似」。〔實測，04c T1〕值層級相同，只差字串跳脫的寫法，diff 以值比較，不需要「近似」 |
 | TLS 下的跨執行緒取消（A10） | 04a 先實測；不行就改呼叫 `SSLSocket.shutdown()`，讀取端拿到的任何例外（含 unwrap 造成的 `ValueError`）在取消旗標下都視為取消 |
 | keep-alive 被 server 提前關閉（A9） | 30 秒重用窗、READ 才重送；其他回 `connection_lost` |
 | 很大的文件（接近 20 MB）在 CodeMirror 裡卡 | 只在 document tab 出現；先接受，量測後再決定是否加大小提示 |
@@ -753,8 +766,8 @@ TLS 測試用的 CA 不入庫：測試執行時從 `GET /pools/default/trustedCA
 | # | 假設 | 驗證 |
 |---|---|---|
 | A1 | `SELECT META(d).id, * FROM ks AS d` 的列是 `{"id":…,"d":{文件}}` | 04a T1 |
-| A2 | `SELECT RAW $doc` 的輸出＝`SET d = $doc` 存下的文字 | 04c T1 |
-| A3 | 非物件文件可用 `SET d = $doc` 取代；§3.9.2 的 insert（`INSERT INTO ks AS d (KEY, VALUE) …`）與 remove 寫法 | 04c T1 |
+| A2 | `SELECT RAW $doc` 的輸出＝`SET d = $doc` 存下的文字 | 04c T1；〔實測〕成立（值層級）：key 順序（排序）、空白（壓縮）、重複 key（留最後一個）、數字（`1.10`→`1.1`、`-0`／`0.0`／`1.0`→`0`／`0`／`1`、`1e2`→`100`、`1E+3`→`1000`、`1.5e300` 展開成 301 位、`12345678901234567890.0`→`12345678901234567000`、`1e-400`→`0`、π 剩 16 位）與非物件文件都一致；只差字串跳脫：存放時物件／陣列裡字串的 `<`、`>`、`&` 寫成 `\u003c`、`\u003e`、`\u0026`（`SELECT RAW` 只在 key 裡逃脫 `<`），兩者都把 `é`、`\/`、surrogate pair 的 escape 轉成字元；兩者都以 1040 拒絕 `1e400`、`2e308`；超出 int64 的整數兩邊都被改值（`12345678901234567890`→`12345678901234567000`、`9223372036854775808`→`9223372036854775807`）；受限使用者可以執行 → 裁決 C1：diff 以字串的值比較 |
+| A3 | 非物件文件可用 `SET d = $doc` 取代；§3.9.2 的 insert（`INSERT INTO ks AS d (KEY, VALUE) …`）與 remove 寫法 | 04c T1；〔實測〕成立：字串、陣列、數字、`null`、`true` 可互相取代物件；`INSERT … RETURNING META(d).cas AS cas` 可插入它們；`DELETE … WHERE META(d).cas = $cas … RETURNING RAW META(d).id` 在 CAS 對時回 id，CAS 錯或沒給時沒有列 |
 | A4 | SQL++ 字串跳脫與 JSON 完全相同（`\/`、`\b`、`\f`、`\uXXXX` surrogate pair） | 04a 單元＋整合 |
 | A5 | back-tick 名稱裡 `\\` 是一個反斜線 | 04a 整合 |
 | A6 | `--` 註解在 CR 結束 | 04a T1（只影響安全側） |
@@ -777,6 +790,14 @@ TLS 測試用的 CA 不入庫：測試執行時從 `GET /pools/default/trustedCA
 | A24 | 取樣時能分辨 binary 文件 | 04b T1；〔實測〕`SELECT RAW d` 給 `"<binary (9 b)>"`（和字串文件無法分辨）；`SELECT META(d).type AS t, d` 的 `t` 對 binary 是 `"base64"`、其餘 `"json"` → §3.12 用後者（B16） |
 | A25 | plan 與 advice 的形狀（plan 檢視依賴） | 04b T1；〔實測〕EXPLAIN 列 `{plan, text}`（CBO 另有 `cost`、`cardinality`、`optimizer_hints`）；`~subqueries` 在列的頂層（不在 `plan` 裡），各 `{correlated, plan, subquery}`；`IntersectScan.scans[]`；join 是 Sequence 裡平的 `Join`（`on_keys`）；每個 operator 可有 `optimizer_estimates {cardinality, cost, fr_cost, size}`；ADVISE 列 `{#operator: Advise, advice: {#operator: IndexAdvice, adviseinfo: {current_indexes[], recommended_indexes}}, query}`，`recommended_indexes` 是 `{indexes[], covering_indexes[]}` 或字串 `"No index recommendation at this time."`；有 query context 時另有 `index_statement_relative`、`query_context`；十份答案存成 `backend/tests/fixtures/couchbase/` |
 | A26 | 參數綁定 | 04b T1；〔實測〕`@n` 綁 `$n`；`?` 依 `args` 順序、`$1` 是 `args[0]`（可混用）；`$n + 1` 加 9007199254740993 → 9007199254740994 精確；`18446744073709551615` → `18446744073709552000`；`3.141592653589793238462643383279` → `3.141592653589793`；`1.10` → `1.1` |
+| A27 | `META(d).cas = $cas` 在 CAS 超過 2⁵³ 時仍精確比較 | 04c T1；〔實測〕成立：CAS ±1、+255 都不符 |
+| A28 | `preserve_expiry` 的 UPDATE 之後 `RETURNING META(d).expiration` 給保留的 expiration | 04c T1；〔實測〕**不成立**：回 0，但存放的 expiration 保留（4102444800、2000000000）；沒有 `preserve_expiry` 時存放的 expiration 變成 0 → 寫入後另讀（C5） |
+| A29 | 重複的 INSERT 回 12009、`reason.code` 17012（`dml.statement.duplicatekey`） | 04c T1；〔實測〕成立（HTTP 200，`errors` 在 body）；12009 與並發修改是同一個 code → 讀 key 分辨（C6）；04c 審查另發現 12009 也用於 durability 做不到、暫時失敗、值太大，所以 CAS 沒變的 12009 不算衝突 |
+| A30 | `AND META(d).type = "json"` 讓 UPDATE 不動 binary 文件；沒有它 UPDATE 會把 binary 文件改成 JSON | 04c T1；〔實測〕兩半都成立（有條件：沒有列、仍是 `base64`；沒有條件：一列、type 變 `json`）→ 裁決 C5 |
+| A31 | cluster manager 的 docs endpoint 逐 byte 存文字、非 JSON 的值存成 binary、`expiry` 是絕對時間且 ≤ 2147483647 | 04c T1；〔實測〕成立（`expiry=4102444800` 被拒絕：必須是 0–2147483647；2000000000 可以；`flags` 被忽略）；DELETE 一個已不存在的 key 回 **400** `Key doesn't exist`，404 是 collection 不存在（C23）；測試的 helper 用 |
+| A32 | dev bucket 能放數 MiB 的測試文件 | 規劃時；〔實測〕**不成立**：100 MB 的 `dbaguy` bucket 放兩份約 18 MB 的文件後，讀與 SQL++ DELETE 回 TMPFAIL（12008）超過一分鐘，其中一份只能用 KV docs endpoint 刪掉 → 寫入的測試文件 ≤ 64 KiB；大文件的檢查讀 `u_big`（5 MiB）或合成的回應 |
+| A33 | 對同一個 CAS 的並發 DELETE 與 save，只有一邊成功 | 04c Task 4 審查；〔實測〕**不成立**：80 次裡 21 次兩邊都成功、文件被刪掉（server 對 DELETE 的 CAS 檢查在它自己的讀取上）→ 已知限制 C41 |
+| A34 | server 的 1080（timeout）之後，寫入沒有生效 | 04c Task 4 審查；〔實測〕**不成立**：192 次裡 45 次寫入已生效 → 寫入的 1080 回 `write_outcome_unknown`（C7） |
 
 ## 11. 執行計畫拆分
 
@@ -810,6 +831,7 @@ TLS 測試用的 CA 不入庫：測試執行時從 `GET /pools/default/trustedCA
 - **R-04-6 意見**：原先認為 120 秒合理，但 A13 實測不成立（server 在 77–86 秒自己砍停滯的請求），改為 45 秒、從第一次暫停起算；housekeeping 每 15 秒檢查，所以實際是 45–60 秒（D-04-12）。若要精確可改成每次暫停一個 Timer，但目前沒有必要。
 - **R-04-8**：CSV 裡 NULL 與 MISSING 都是空字串（`null_text` 預設也是空），兩者在 CSV 無法區分——這是 CSV 的限制，需要分辨就用 JSON 匯出。
 - 其餘裁決照單全收，沒有發現錯誤。
+- **04c 執行中追加的裁決**（C1–C34 在 plan `2026-10-19-04c-couchbase-documents.md` 的 Planning／Pre-flight rulings，之後的記在這裡）：C35 document tab 的狀態轉換放在純函式 reducer，用 Vitest 測；C36 一次只讓一個人跑完整的 backend 測試（scratch 文件 vs `app.orders` 剛好 500 份）；C37 `diff` 的 offset 存成緊湊陣列（寬物件的暫時記憶體 ≤ 約 10 倍）；C38 巢狀超過 100 層的文件拒絕存；C39 request body 的每個原文 literal 必須剛好是一個 JSON 值（避免多出頂層欄位而繞過 `readonly`）；C40 寫入前閒置超過 2 秒的連線先做一次可重送的檢查；C41 DELETE 與同一個 CAS 的並發 save 會競爭，列為已知限制（A33）；C42 寫入的 metadata 呼叫帶「已放棄」旗標，在佇列裡就逾時的寫入永遠不會執行；C43 只看文字的檢查與 diff 在 request 執行緒、metadata 呼叫只做 I/O；C44 grid 的預填用語句自己的 keyspace（`/couchbase/statement-keyspace`）；C45 寫入的回應拿不到＝結果不明、絕不重送；C46 刪除時 server 說文件已不存在＝已達成；C47 不存在的文件有未存文字時保持唯讀，出口是 Create it 或 Save as new document；C48 取消 unlock 對話框＝這次存檔結束（什麼都沒送，編輯器可編輯）。
 
 ## 13. 收尾時要更新的文件
 
