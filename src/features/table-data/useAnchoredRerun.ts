@@ -64,7 +64,6 @@ export function useAnchoredRerun(
       leading: before.leading,
     });
     if (anchor) {
-      // `clearSelection` (K14b) takes effect once DataGrid's `restore` reads it (a Task 7 file, not changed here).
       handle.restore(
         placeAnchor(anchor, { rows, keyIndexes, rowHeight: ROW_HEIGHT, leading, maxScrollTop: where.maxScrollTop }),
       );

@@ -45,8 +45,11 @@ export interface DataGridHandle {
   focus(): void;
   /** Where the grid is; null before it is laid out. */
   view(): GridView | null;
-  /** Puts the grid in place: a selection or scroll position that is null stays as it is. */
-  restore(place: { selection: GridSelection | null; scrollTop: number | null }): void;
+  /**
+   * Puts the grid in place: a selection or scroll position that is null stays as it is; `clearSelection` drops the
+   * selection (its row is gone: an active cell on another row would invite an edit of the wrong row, 05b K14b).
+   */
+  restore(place: { selection: GridSelection | null; clearSelection?: boolean; scrollTop: number | null }): void;
 }
 
 /** Where the grid is: what a re-run of the same browse needs to put it back by key (05b K14). */
@@ -278,8 +281,9 @@ export function DataGrid(props: DataGridProps) {
     };
   }, [made, rowVirtualizer]);
   const restore = useCallback(
-    (place: { selection: GridSelection | null; scrollTop: number | null }) => {
-      if (place.selection) select(place.selection);
+    (place: { selection: GridSelection | null; clearSelection?: boolean; scrollTop: number | null }) => {
+      if (place.clearSelection) select(null);
+      else if (place.selection) select(place.selection);
       if (place.scrollTop !== null) scrollRef.current?.scrollTo({ top: place.scrollTop });
     },
     [select],
