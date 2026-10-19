@@ -1,11 +1,12 @@
 import json
 import os
+from pathlib import Path
 
 import pytest
 from loguru import logger
 from pydantic import ValidationError
 
-from dbaguy_backend.domain.edits import MAX_STAGED_CHARS, MAX_VALUE_CHARS
+from dbaguy_backend.domain.edits import MAX_STAGED_CHARS, MAX_VALUE_CHARS, StagedEditsFile
 from dbaguy_backend.domain.errors import AlreadyExists, NotFound, StorageError, ValidationFailed
 from dbaguy_backend.domain.execution import QueryContext
 from dbaguy_backend.domain.metadata import PathSegment
@@ -778,3 +779,35 @@ def test_staged_keys_count_their_column_names():  # pre-flight M3
     assert len(tab(9_000).staged_edits.deletes) == 9_000  # 8,109,000 characters
     with pytest.raises(ValidationError):
         tab(10_000)  # 9,010,000: the frontend's `savedEdits` says the same
+
+
+# ---- what the model refuses beyond size (ruling K5): the frontend's `savedEdits` must write only what it takes ----
+# `fixtures/staged_edits_cases.json` is read by this test and by `savedEdits.test.ts`: the same files go through both,
+# so what one side keeps the other takes and what one side refuses the other refuses. Size is not in it (it has its own
+# boundary tests above and in `savedEdits.test.ts`); an update that sets nothing, a repeated id, a name of 0 or 1,025
+# characters, a lone surrogate (a text that is not valid Unicode) and a cell nested 255 levels are.
+STAGED_CASES = json.loads((Path(__file__).parent / "fixtures" / "staged_edits_cases.json").read_text())
+
+
+def test_the_staged_edits_cases_cover_what_they_claim():
+    assert len({case["name"] for case in STAGED_CASES}) == len(STAGED_CASES)
+    assert {case["reason"] for case in STAGED_CASES} == {None, "value", "name", "other"}
+    assert {case["accepted"] for case in STAGED_CASES} == {True, False}
+
+
+@pytest.mark.parametrize("case", STAGED_CASES, ids=lambda case: case["name"])
+def test_the_staged_edits_model_refuses_exactly_what_the_frontend_does_not_write(case):
+    if case["accepted"]:
+        assert StagedEditsFile.model_validate(case["file"]).key_columns == case["file"]["key_columns"]
+    else:
+        with pytest.raises(ValidationError):
+            StagedEditsFile.model_validate(case["file"])
+
+
+@pytest.mark.parametrize("case", STAGED_CASES, ids=lambda case: case["name"])
+def test_the_repair_drops_what_the_model_refuses_and_keeps_the_rest(case):  # the same cases through `PUT /workspace`
+    raw = {"tabs": [{"id": "q", "kind": "query", "buffer": "kept"},
+                    {"id": "t", "kind": "table", "title": "orders", "staged_edits": case["file"]}]}
+    query, table = WorkspaceState.model_validate(repaired_workspace(raw)).tabs
+    assert query.buffer == "kept" and table.title == "orders"
+    assert (table.staged_edits is not None) == case["accepted"]

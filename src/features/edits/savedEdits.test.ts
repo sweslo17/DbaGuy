@@ -1,12 +1,21 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type { StagedEditsFile } from "@/lib/api/types";
 import { rowKeyOf } from "./overlay";
-import { MAX_SAVED_CHARS, MAX_SAVED_VALUE_CHARS, restoredEdits, savedEdits } from "./savedEdits";
+import {
+  MAX_SAVED_CHARS,
+  MAX_SAVED_VALUE_CHARS,
+  restoredEdits,
+  savedEdits,
+  UNSAVEABLE_HINT,
+  type Unsaveable,
+} from "./savedEdits";
 import {
   emptyStaged,
   MAX_CHANGES,
   rowKeyFromKey,
   stage,
+  toChanges,
   type AppliedOutcome,
   type NewId,
   type StageAction,
@@ -34,8 +43,8 @@ const edit = (id: unknown, text: string, original: unknown = "a"): StageAction =
 
 describe("saving staged edits", () => {
   it("keeps nothing for nothing staged", () => {
-    expect(savedEdits(null)).toEqual({ file: null, tooLarge: false });
-    expect(savedEdits(emptyStaged(["id"]))).toEqual({ file: null, tooLarge: false });
+    expect(savedEdits(null)).toEqual({ file: null, tooLarge: false, unsaveable: null });
+    expect(savedEdits(emptyStaged(["id"]))).toEqual({ file: null, tooLarge: false, unsaveable: null });
   });
 
   it("keeps every change, the UPDATE under a DELETE included, with the key and an unknown outcome", () => {
@@ -49,6 +58,7 @@ describe("saving staged edits", () => {
     );
     expect(savedEdits(state)).toEqual({
       tooLarge: false,
+      unsaveable: null,
       file: {
         version: 1,
         key_columns: ["id"],
@@ -74,11 +84,11 @@ describe("saving staged edits", () => {
 
   it("keeps nothing, and says so, beyond one value's limit, the total, or the number of changes", () => {
     expect(savedEdits(staged(edit(1, "x".repeat(MAX_SAVED_VALUE_CHARS + 1)))).tooLarge).toBe(true);
-    expect(savedEdits(staged(edit(1, "x".repeat(MAX_SAVED_VALUE_CHARS)))).tooLarge).toBe(false);
+    expect(savedEdits(staged(edit(1, "x".repeat(MAX_SAVED_VALUE_CHARS)))).file).not.toBeNull();
     const big = Array.from({ length: Math.ceil(MAX_SAVED_CHARS / MAX_SAVED_VALUE_CHARS) + 1 }, (_, i) =>
       edit(i, "x".repeat(MAX_SAVED_VALUE_CHARS)),
     );
-    expect(savedEdits(staged(...big))).toEqual({ file: null, tooLarge: true });
+    expect(savedEdits(staged(...big))).toEqual({ file: null, tooLarge: true, unsaveable: null });
     // Entries are counted as the file holds them: a DELETE and the UPDATE under it are two.
     const many = staged(...Array.from({ length: MAX_CHANGES / 2 + 1 }, (_, i) => edit(i, "b")), {
       type: "deleteRows",
@@ -101,12 +111,12 @@ describe("saving staged edits", () => {
     expect(savedEdits(staged(...insert("i:a", MAX_SAVED_VALUE_CHARS + 1))).tooLarge).toBe(true);
     const nine = Array.from({ length: 9 }, (_, i) => insert(`i:${i}`, MAX_SAVED_VALUE_CHARS)).flat();
     expect(savedEdits(staged(...nine)).tooLarge).toBe(true); // 9 MiB in all
-    expect(savedEdits(staged(...nine.slice(0, 14))).tooLarge).toBe(false); // 7 MiB
+    expect(savedEdits(staged(...nine.slice(0, 14))).file).not.toBeNull(); // 7 MiB
   });
 
   it("keeps nothing for a staging without a key: the file needs one", () => {
     const keyless = stage(emptyStaged([]), { type: "addRow", id: "i:x" });
-    expect(savedEdits(keyless)).toEqual({ file: null, tooLarge: true });
+    expect(savedEdits(keyless)).toEqual({ file: null, tooLarge: false, unsaveable: "other" });
   });
 
   it("writes each kind in the order the changes were staged, whatever order the maps hold them in", () => {
@@ -146,7 +156,7 @@ describe("saving staged edits", () => {
       ["an object, whose names count too", BYTES, 150],
       ["an array, element by element", ["ab", 3, null, [true]], 5],
     ])("up to the character, with %s as the original", (_, original, chars) => {
-      expect(savedEdits(totalling(MAX_SAVED_CHARS, original, chars)).tooLarge).toBe(false);
+      expect(savedEdits(totalling(MAX_SAVED_CHARS, original, chars)).file).not.toBeNull();
       expect(savedEdits(totalling(MAX_SAVED_CHARS + 1, original, chars)).tooLarge).toBe(true);
     });
 
@@ -161,13 +171,13 @@ describe("saving staged edits", () => {
         return stage(emptyStaged([name]), { type: "deleteRows", rows });
       };
       expect(savedEdits(deletes(MAX_CHANGES)).tooLarge).toBe(true); // 10,000 x (900 + 1) = 9,010,000 characters
-      expect(savedEdits(deletes(9_000)).tooLarge).toBe(false); // 8,109,000
+      expect(savedEdits(deletes(9_000)).file).not.toBeNull(); // 8,109,000
     });
 
     it("counts a text's characters, not its UTF-16 units", () => {
       const emoji = "\u{1F600}";
-      expect(savedEdits(staged(edit(1, emoji.repeat(600_000)))).tooLarge).toBe(false); // 1.2 million units
-      expect(savedEdits(staged(edit(1, emoji.repeat(MAX_SAVED_VALUE_CHARS)))).tooLarge).toBe(false);
+      expect(savedEdits(staged(edit(1, emoji.repeat(600_000)))).file).not.toBeNull(); // 1.2 million units
+      expect(savedEdits(staged(edit(1, emoji.repeat(MAX_SAVED_VALUE_CHARS)))).file).not.toBeNull();
       expect(savedEdits(staged(edit(1, emoji.repeat(MAX_SAVED_VALUE_CHARS + 1)))).tooLarge).toBe(true);
     });
   });
@@ -204,7 +214,11 @@ describe("saving staged edits", () => {
 
     it("is cleared by the outcome: a commit leaves nothing to keep, a rollback keeps the changes as unsent", () => {
       const applying = stage(staged(edit(1, "b")), { type: "applying" });
-      expect(savedEdits(stage(applying, outcome("committed", ["u:1"])))).toEqual({ file: null, tooLarge: false });
+      expect(savedEdits(stage(applying, outcome("committed", ["u:1"])))).toEqual({
+        file: null,
+        tooLarge: false,
+        unsaveable: null,
+      });
       const rolledBack = savedEdits(stage(applying, outcome("rolled_back"))).file!;
       expect(rolledBack.outcome_unknown).toBe(false);
       expect(rolledBack.updates).toHaveLength(1);
@@ -292,5 +306,87 @@ describe("restoring staged edits", () => {
       outcome_unknown: true,
     };
     expect(restoredEdits(file).unknownOutcome).toBe("pending");
+  });
+});
+
+/*
+ * Ruling K5: what the backend's model refuses besides size is never written, so one bad value cannot make every save
+ * fail (B40) and the edit bar can say why nothing is kept. The staging itself is not touched.
+ */
+
+interface RefusalCase {
+  name: string;
+  accepted: boolean;
+  reason: Unsaveable | null;
+  file: StagedEditsFile;
+}
+
+// The backend's `test_local_stores.py` puts the same files through `StagedEditsFile`: what is kept here is what the
+// model takes there, and what is refused here is what it refuses.
+const CASES = JSON.parse(
+  readFileSync(new URL("../../../backend/tests/fixtures/staged_edits_cases.json", import.meta.url), "utf8"),
+) as RefusalCase[];
+
+describe("keeping exactly what the backend's model takes (ruling K5)", () => {
+  it("has cases of every kind, each named once", () => {
+    expect(new Set(CASES.map((c) => c.name)).size).toBe(CASES.length);
+    expect(new Set(CASES.map((c) => c.reason))).toEqual(new Set([null, "value", "name", "other"]));
+    expect(new Set(CASES.map((c) => c.accepted))).toEqual(new Set([true, false]));
+  });
+
+  it.each(CASES)("$name", ({ file, accepted, reason }) => {
+    const saved = savedEdits(restoredEdits(file));
+    if (accepted) {
+      expect(saved).toEqual({ file, tooLarge: false, unsaveable: null }); // written back as it is
+    } else {
+      expect(saved).toEqual({ file: null, tooLarge: false, unsaveable: reason });
+    }
+  });
+});
+
+describe("staged edits that cannot be kept (ruling K5)", () => {
+  const editColumn = (column: string, text: string): StageAction => ({
+    type: "edit",
+    cell: { row: ref(1), column, original: "a" },
+    input: { kind: "value", text },
+  });
+
+  it("says why: a character that cannot be saved, or a column name", () => {
+    expect(savedEdits(staged(edit(1, "a\ud800b")))).toMatchObject({ file: null, tooLarge: false, unsaveable: "value" });
+    expect(savedEdits(staged(editColumn("bad\udc00", "b")))).toMatchObject({ file: null, unsaveable: "name" });
+    expect(savedEdits(staged(editColumn("", "b")))).toMatchObject({ file: null, unsaveable: "name" });
+    expect(savedEdits(staged(editColumn("k".repeat(1025), "b")))).toMatchObject({ file: null, unsaveable: "name" });
+    expect(savedEdits(staged(editColumn("k".repeat(1024), "b"))).file).not.toBeNull();
+    expect(savedEdits(staged(edit("\ud800", "b")))).toMatchObject({ file: null, unsaveable: "value" }); // in the key
+    for (const reason of ["value", "name", "other"] as const) expect(UNSAVEABLE_HINT[reason]).toMatch(/^Can't keep/);
+  });
+
+  it("is not too large, and too large is not unsaveable", () => {
+    const tooLarge = savedEdits(staged(edit(1, "x".repeat(MAX_SAVED_VALUE_CHARS + 1))));
+    expect(tooLarge).toMatchObject({ file: null, tooLarge: true, unsaveable: null });
+    expect(savedEdits(staged(edit(1, "a\ud800b"))).tooLarge).toBe(false);
+  });
+
+  it("leaves the staging as it is, still committable, and keeps it again once the text is fixed", () => {
+    const state = staged(edit(1, "a\ud800b"), { type: "addRow", id: "i:x" });
+    const before = structuredClone(state);
+    expect(savedEdits(state).unsaveable).toBe("value");
+    expect(state).toEqual(before);
+    expect(toChanges(state).updates).toHaveLength(1); // a commit would send it
+    const fixed = stage(state, edit(1, "ab"));
+    expect(savedEdits(fixed).file?.updates?.[0].set).toEqual({ label: { kind: "value", text: "ab" } });
+  });
+
+  it("finds a repeated id, whatever kinds hold it", () => {
+    const state = staged(edit(1, "b"), { type: "addRow", id: "u:1" }); // the update's id is u:1
+    expect(savedEdits(state)).toMatchObject({ file: null, unsaveable: "other" });
+  });
+
+  it("finds a cell nested too deep, and takes the deepest the backend does", () => {
+    const nested = (levels: number) => Array.from({ length: levels }).reduce<unknown>((cell) => [cell], 1);
+    const deep = (levels: number) => staged(edit(1, "b", nested(levels)));
+    expect(savedEdits(deep(253)).file).not.toBeNull(); // the original is level 1, its scalar level 254
+    expect(savedEdits(deep(254)).file).not.toBeNull();
+    expect(savedEdits(deep(255))).toMatchObject({ file: null, unsaveable: "other" });
   });
 });

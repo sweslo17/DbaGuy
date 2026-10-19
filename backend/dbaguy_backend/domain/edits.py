@@ -1,7 +1,8 @@
 """Grid editing (spec ⑤ §3): how a table's rows are identified and written (EditTarget), the changes a tab stages
 (EditChanges), what a preview shows (EditPreview) and the one-time plan a session applies (EditPlan)."""
 
-from collections.abc import Sequence
+import re
+from collections.abc import Iterator, Sequence
 from typing import Annotated, Literal, Self
 from uuid import UUID
 
@@ -115,23 +116,33 @@ class RowDelete(_Input):
     key: dict[ColumnName, JsonValue]
 
 
-def _json_chars(cell: JsonValue) -> int:
-    """The text a key or original cell holds: the length of each string (an object's keys too), 1 for any other scalar.
-    Iterative, so however deep a cell nests it is measured, never a RecursionError."""
-    total = 0
+def _walk(cell: JsonValue) -> Iterator[JsonValue]:
+    """Every scalar of a key or original cell, and the name of every object in it. Iterative, so however deep a cell
+    nests it is walked, never a RecursionError."""
     pending = [cell]
     while pending:
         item = pending.pop()
-        if isinstance(item, str):
-            total += len(item)
-        elif isinstance(item, list):
+        if isinstance(item, list):
             pending.extend(item)
         elif isinstance(item, dict):
-            total += sum(len(name) for name in item)
+            yield from item
             pending.extend(item.values())
         else:
-            total += 1
-    return total
+            yield item
+
+
+def _json_chars(cell: JsonValue) -> int:
+    """The text a key or original cell holds: the length of each string (an object's names too), 1 per other scalar."""
+    return sum(len(item) if isinstance(item, str) else 1 for item in _walk(cell))
+
+
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _is_text(cell: JsonValue) -> bool:
+    """Whether every string of a key or original cell (an object's names too) can be written to a file: pydantic takes a
+    lone surrogate inside a `JsonValue`, but it cannot be encoded, and the write of `workspace.json` would fail."""
+    return not any(isinstance(item, str) and _SURROGATE.search(item) for item in _walk(cell))
 
 
 def _text_chars(updates: Sequence[RowUpdate], inserts: Sequence[RowInsert], deletes: Sequence[RowDelete]) -> int:
@@ -204,6 +215,9 @@ class StagedEditsFile(_Input):
     @model_validator(mode="after")
     def _counted_and_bounded(self) -> Self:
         _counted_ids((*self.deletes, *self.updates, *self.inserts))
+        cells = [change.key for change in (*self.updates, *self.deletes)] + [change.original for change in self.updates]
+        if not all(_is_text(cell) for cell in cells):
+            raise ValueError("a key or an original holds text that cannot be saved")
         if _text_chars(self.updates, self.inserts, self.deletes) > MAX_STAGED_CHARS:
             raise ValueError(f"at most {MAX_STAGED_CHARS // 1_048_576} MiB of staged text is kept")
         return self

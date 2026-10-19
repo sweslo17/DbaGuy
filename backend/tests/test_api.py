@@ -1,3 +1,4 @@
+import json
 import socket
 import sqlite3
 import threading
@@ -420,6 +421,32 @@ def test_a_save_with_a_bad_draft_name_or_context_keeps_the_rest(client):  # B40 
     assert any("workspace being saved" in line for line in logged) and "bad name" not in "".join(logged)
     # a tab that is wrong in any other way still refuses the whole save
     assert client.put("/workspace", json={"tabs": [{"id": "t3", "kind": "chart"}]}, headers=AUTH).status_code == 422
+
+
+@pytest.mark.parametrize("staged", [
+    # a lone surrogate in a key, in a nested name, in an original: a `JsonValue` takes it, the file cannot be written
+    {"deletes": [{"id": "d:1", "key": {"id": "\ud800"}}]},
+    {"deletes": [{"id": "d:1", "key": {"id": {"\udc00": 1}}}]},
+    {"updates": [{"id": "u:1", "key": {"id": 1}, "set": {"a": {"kind": "null"}}, "original": {"a": "x\ud800"}}]},
+    {"inserts": [{"id": "i:1", "values": {"a": {"kind": "value", "text": "\ud800"}}}]},  # and in a value
+])
+def test_a_save_with_staged_edits_that_cannot_be_written_keeps_the_rest(client, staged):  # B40 and ruling K5
+    """What a browser sends for such a text: JSON with the surrogate escaped. The staged edits are dropped (a WARNING
+    without the text), every other tab is saved, and the workspace is still readable."""
+    logged: list[str] = []
+    sink = logger.add(lambda m: logged.append(m.record["message"]), level="DEBUG")
+    tab = {"id": "t1", "kind": "table", "title": "orders",
+           "staged_edits": {"version": 1, "key_columns": ["id"], **staged}}
+    body = json.dumps({"tabs": [{"id": "q1", "kind": "query", "buffer": "SELECT 1"}, tab], "active_tab_id": "q1"})
+    try:
+        saved = client.put("/workspace", content=body.encode(), headers={**AUTH, "Content-Type": "application/json"})
+    finally:
+        logger.remove(sink)
+    assert saved.status_code == 204
+    state = client.get("/workspace", headers=AUTH).json()
+    assert [(t["id"], t["staged_edits"]) for t in state["tabs"]] == [("q1", None), ("t1", None)]
+    assert state["tabs"][0]["buffer"] == "SELECT 1" and state["tabs"][1]["title"] == "orders"
+    assert any("dropped the staged edits" in line for line in logged)
 
 
 def test_settings_and_workspace_reject_bad_input(client):
