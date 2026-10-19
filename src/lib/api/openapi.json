@@ -4913,7 +4913,7 @@
           },
           "text": {
             "type": "string",
-            "maxLength": 20971520,
+            "maxLength": 22020096,
             "title": "Text"
           },
           "confirmed": {
@@ -6061,7 +6061,7 @@
           },
           "text": {
             "type": "string",
-            "maxLength": 20971520,
+            "maxLength": 22020096,
             "title": "Text"
           },
           "confirmed": {

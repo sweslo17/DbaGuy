@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from io import StringIO
-from typing import Any, Literal, NoReturn, TextIO
+from typing import Any, Literal, TextIO
 
 from pydantic import BaseModel
 
@@ -27,7 +27,7 @@ from .dialects import (
     NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, datetime_literal, in_list, json_literal, qualified,
     quote_ident, quote_literal, zero_date_as_text,
 )
-from .jsontext import one_line
+from .jsontext import one_line, reject_constant
 
 __all__ = [
     "FormatColumn", "FormatKind", "FormatResult", "RAW_JSON_FORMATS", "RawJsonWriter", "RowFormatOptions", "RowWriter",
@@ -203,10 +203,6 @@ def _json_cell(cell: Cell) -> Any:
     return cell if cell is None or isinstance(cell, (bool, int, float, str)) else _display(cell)
 
 
-def _reject_constant(name: str) -> NoReturn:
-    raise ValueError(f"{name} is not JSON")
-
-
 def _dump_json(node: Any) -> str:
     """`json.dumps` for a tree parsed with `parse_float=Decimal`: decimals are written as they were read."""
     match node:
@@ -224,7 +220,7 @@ def _dump_json(node: Any) -> str:
 def _embedded_json(text: str) -> str | None:
     """`text` as compact JSON with its numbers kept exactly as written; None when it is not JSON."""
     try:
-        return _dump_json(json.loads(text, parse_float=Decimal, parse_constant=_reject_constant))
+        return _dump_json(json.loads(text, parse_float=Decimal, parse_constant=reject_constant))
     except (ValueError, RecursionError):
         return None
 

@@ -41,7 +41,7 @@ from typing import Any
 from loguru import logger
 
 from dbaguy_backend.adapters.sockets import enable_keepalive
-from dbaguy_backend.sql.jsontext import NotJson, value_end
+from dbaguy_backend.sql.jsontext import JSON_SPACE, NotJson, value_end
 
 READ_CHUNK = 64 * 1024
 CONNECT_TIMEOUT_S = 10.0  # connect and TLS handshake; reads afterwards block with no timeout (a cancel ends them),
@@ -82,9 +82,6 @@ class QueryRequest:
     timeout: str | None = None  # a server duration such as "30s"; only the internal metadata queries set one (R-04a-F3)
 
 
-_JSON_SPACE = re.compile(r"[ \t\n\r]*")
-
-
 class LiteralNotJson(ValueError):
     """A parameter literal that is not exactly one JSON value (ruling C39): embedded as it is, it would end its value
     early and add fields of its own to the body (`1, "readonly": false`). `label`: `$name` or `$n`, never the value."""
@@ -97,12 +94,12 @@ class LiteralNotJson(ValueError):
 def _one_value(label: str, literal: str) -> str:
     """`literal` when it is one JSON value with only JSON whitespace around it, else LiteralNotJson. Checked by the C
     decoder, which builds no tree (`jsontext.value_end`): a 20 MiB document in about 0.1 s."""
-    start = _JSON_SPACE.match(literal).end()
+    start = JSON_SPACE.match(literal).end()
     try:
         end = value_end(literal, start)
     except (json.JSONDecodeError, NotJson, RecursionError):
         raise LiteralNotJson(label) from None
-    if _JSON_SPACE.match(literal, end).end() != len(literal):
+    if JSON_SPACE.match(literal, end).end() != len(literal):
         raise LiteralNotJson(label)
     return literal
 

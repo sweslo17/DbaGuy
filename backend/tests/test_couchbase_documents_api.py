@@ -13,7 +13,7 @@ from dbaguy_backend.adapters.base import StatementError
 from dbaguy_backend.adapters.couchbase.adapter import CouchbaseConnection
 from dbaguy_backend.adapters.couchbase.documents import SqlppDocumentRules
 from dbaguy_backend.adapters.couchbase.http import NodeClient
-from dbaguy_backend.domain.couchbase import Keyspace
+from dbaguy_backend.domain.couchbase import DOCUMENT_TEXT_LIMIT, Keyspace
 from dbaguy_backend.domain.errors import ValidationFailed
 from dbaguy_backend.domain.metadata import MetadataRequest
 from dbaguy_backend.services import document_service
@@ -235,6 +235,22 @@ def test_a_text_is_checked_before_any_connection_is_used(app, cb, no_connection,
     client, _ = app
     answer = post(client, path, profile_id=cb, keyspace=ORDERS, id=NEVER, text=text, **extra)
     assert error_of(answer) == (422, code) and not no_connection
+
+
+@pytest.mark.parametrize(("path", "extra"), [("save", {"cas": "1"}), ("insert", {})])
+def test_a_text_beyond_the_limit_says_so_before_any_connection_is_used(app, cb, no_connection, path, extra):  # M5
+    client, _ = app
+
+    def send(size):
+        return post(client, path, profile_id=cb, keyspace=ORDERS, id=NEVER, text=" " * size, **extra)
+
+    assert error_of(send(DOCUMENT_TEXT_LIMIT)) == (422, "invalid_json")  # within the limit: the next check answers
+    beyond = send(DOCUMENT_TEXT_LIMIT + 1)
+    assert error_of(beyond) == (422, "validation_failed")
+    assert beyond.json()["error"]["message"] == "Documents are limited to 20 MiB"
+    # Far beyond (more than 1 MiB over), the request itself is refused: a bound on what is taken in at all.
+    assert send(DOCUMENT_TEXT_LIMIT + 1024 * 1024 + 1).json()["error"]["message"] == "Invalid request"
+    assert not no_connection
 
 
 def test_an_id_beyond_250_utf8_bytes_is_refused_before_any_connection_is_used(app, cb, no_connection):

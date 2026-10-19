@@ -1,10 +1,10 @@
 """Documents by key (spec §3.9.3, R-04-2): read, save, insert and remove through the engine's DocumentStore, on the
 profile's metadata connection (D-04-9: a document tab has no session of its own).
 
-- Every check that needs only the text runs on the request thread before any connection is used (ruling C43): text
-  UTF-8 can carry, one JSON value no deeper than MAX_DOCUMENT_DEPTH (`json_problem`; its offset is sent in UTF-16 code
-  units, as the editor counts), and the engine's rules: numbers the server would store with another value are refused,
-  also when confirmed (ruling C4).
+- Every check that needs only the text runs on the request thread before any connection is used (ruling C43): at most
+  DOCUMENT_TEXT_LIMIT characters (first: it costs nothing), text UTF-8 can carry, one JSON value no deeper than
+  MAX_DOCUMENT_DEPTH (`json_problem`; its offset is sent in UTF-16 code units, as the editor counts), and the engine's
+  rules: numbers the server would store with another value are refused, also when confirmed (ruling C4).
 - Unless confirmed, one short metadata call fetches the server's form of the text; the comparison (`diff`) runs after
   it, on the request thread, so the profile's tree, completion and sampling never wait for it. Any token difference
   comes back as a SavePreview and nothing is written; whitespace is no difference (spec §12), so such a save is written
@@ -18,7 +18,6 @@ profile's metadata connection (D-04-9: a document tab has no session of its own)
 Logs: INFO a write's keyspace and a preview's change counts by kind; DEBUG the document's ID; never a text, a path or a
 value (spec §5)."""
 
-import re
 from collections.abc import Callable
 from typing import Literal
 from uuid import UUID
@@ -29,10 +28,10 @@ from ..adapters.base import DatabaseConnection
 from ..adapters.documents import DocumentCapable, DocumentEngine, DocumentRules, DocumentStore
 from ..adapters.registry import AdapterRegistry
 from ..domain.couchbase import (
-    DOCUMENT_ID_MAX_BYTES, ChangeCounts, DocumentSaved, DocumentView, Keyspace, SavePreview,
+    DOCUMENT_ID_MAX_BYTES, DOCUMENT_TEXT_LIMIT, ChangeCounts, DocumentSaved, DocumentView, Keyspace, SavePreview,
 )
 from ..domain.errors import DocumentMissing, InvalidJson, NumberOutOfRange, ReadOnlyProfile, ValidationFailed
-from ..sql.jsontext import diff, json_problem
+from ..sql.jsontext import LONE_SURROGATE, diff, json_problem
 from ..sql.offsets import utf16_offset
 from .metadata_errors import server_errors_are_final
 from .metadata_service import MetadataService
@@ -44,9 +43,8 @@ _NO_DOCUMENTS = "This connection has no documents"
 _ID_NOT_TEXT = "The document ID holds a character that is not valid text"
 _ID_SIZE = f"A document ID is 1 to {DOCUMENT_ID_MAX_BYTES} bytes long (UTF-8)"
 _TEXT_NOT_TEXT = "The document holds a character that is not valid text"
+_TEXT_SIZE = f"Documents are limited to {DOCUMENT_TEXT_LIMIT // (1024 * 1024)} MiB"
 _TOO_DEEP_TO_CHECK = "Nested too deeply to check before saving"
-# What UTF-8 cannot encode: in a Python str, only a surrogate code point. Searched instead of encoding a 20 MiB text.
-_SURROGATE = re.compile("[\ud800-\udfff]")
 
 
 def _where(keyspace: Keyspace) -> str:
@@ -64,7 +62,10 @@ def _check_id(doc_id: str) -> None:
 
 def _check_text(text: str) -> None:
     """Spec §3.9.3 step 2, before any connection is used."""
-    if not text.isascii() and _SURROGATE.search(text):
+    if len(text) > DOCUMENT_TEXT_LIMIT:
+        raise ValidationFailed(_TEXT_SIZE)
+    # What UTF-8 cannot encode: in a Python str, only a lone surrogate. Searched instead of encoding a 20 MiB text.
+    if not text.isascii() and LONE_SURROGATE.search(text):
         raise ValidationFailed(_TEXT_NOT_TEXT)
     problem = json_problem(text)
     if problem is not None:

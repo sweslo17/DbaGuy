@@ -13,9 +13,9 @@ The warning names the parameter, never its value (spec §4, ruling B10)."""
 import json
 import math
 from decimal import Decimal, InvalidOperation
-from typing import NoReturn
 
 from ...domain.execution import MessageSeverity, ServerMessage, StatementParams
+from ...sql.jsontext import reject_constant
 
 INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
 # "-9223372036854775808" is the longest int64 text: a longer JSON integer (no leading zeros) is out of range, decided
@@ -23,10 +23,6 @@ INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
 _INT64_TEXT_MAX = 20
 _WARNING = ("Parameter {label}: the query service reads a number in it as a double, which changes its value — "
             "send it as a string to keep it exact")
-
-
-def _not_json(name: str) -> NoReturn:
-    raise ValueError(f"{name} is not JSON")
 
 
 def _number_texts(literal: str) -> tuple[list[str], list[str]] | None:
@@ -44,7 +40,7 @@ def _number_texts(literal: str) -> tuple[list[str], list[str]] | None:
         return 0.0
 
     try:
-        json.JSONDecoder(parse_int=integer, parse_float=decimal, parse_constant=_not_json).decode(literal)
+        json.JSONDecoder(parse_int=integer, parse_float=decimal, parse_constant=reject_constant).decode(literal)
     except (ValueError, RecursionError):
         return None
     return integers, decimals

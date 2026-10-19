@@ -92,33 +92,39 @@ class MetadataService:
 
     def invalidate(self, profile_id: UUID) -> None:
         with self._lock:
-            keys = [k for k in self._workers if k[0] == profile_id]
-        for key in keys:
-            self._drop(key)
+            entries = [(k, e.worker) for k, e in self._workers.items() if k[0] == profile_id]
+        for key, worker in entries:
+            self._drop(key, worker)
 
     def reap_idle(self) -> int:
         now = time.monotonic()
         with self._lock:
-            idle = [k for k, e in self._workers.items() if now - e.last_used >= self._idle_timeout]
-        for key in idle:
-            self._drop(key)
+            idle = [(k, e.worker) for k, e in self._workers.items() if now - e.last_used >= self._idle_timeout]
+        for key, worker in idle:
+            self._drop(key, worker)
         return len(idle)
 
     def close_all(self) -> None:
         with self._lock:
-            keys = list(self._workers)
-        for key in keys:
-            self._drop(key)
+            entries = [(k, e.worker) for k, e in self._workers.items()]
+        for key, worker in entries:
+            self._drop(key, worker)
 
     def with_connection(
         self, profile_id: UUID, database: str | None, fn: Callable[[DatabaseConnection], T], *, retry: bool = True
     ) -> T:
         """Run `fn` on the metadata connection of (profile, database), reconnecting once if it was lost.
 
-        `database` only selects a connection for engines that open one per database. `retry=False` is a write (D-04-9,
-        ruling C42): `fn` runs at most once. Given up on before it started (`write_timeout` passed while it was queued
-        behind another call), it never runs: QueryFailed, nothing was sent. A failure after it started that is not a
-        DomainError (the timeout, an unexpected error) is WriteOutcomeUnknown: it may have been applied.
+        `database` only selects a connection for engines that open one per database. A read whose connection was closed
+        and replaced while it waited for it (SessionBusy from a worker that is no longer the key's) uses the new one; that
+        counts as its one reconnect.
+
+        `retry=False` is a write (D-04-9, ruling C42): `fn` runs at most once, and is never resent on another connection.
+        Given up on before it started (`write_timeout` passed while it was queued behind another call), or refused by a
+        connection closed while it was queued, it never runs: QueryFailed, nothing was sent. StatementNotSent (the round
+        trip that had to go before the write failed, ruling C40) is QueryFailed, nothing was sent, and the connection is
+        dropped. Any other failure after it started that is not a DomainError (the timeout, an unexpected error) is
+        WriteOutcomeUnknown: it may have been applied.
         """
         profile = self._profiles.get(profile_id)
         adapter = self._registry.get(profile.engine)
@@ -136,10 +142,17 @@ class MetadataService:
             worker = self._worker(key, profile, database)
             try:
                 return worker.call(fn)
+            except SessionBusy:
+                # Closed while the read waited for it (invalidate, the idle reap, another call's drop): `fn` never ran,
+                # and whoever closed it removed it, so the read goes to the key's connection now. From the key's current
+                # worker, it is `fn`'s own answer.
+                if attempt == 2 or self._is_current(key, worker):
+                    raise
+                logger.info("A metadata query on {} found its connection closed; reconnecting", profile.name)
             except DomainError:
                 raise  # NotFound / ValidationFailed from introspection: the connection is fine
             except Exception as exc:
-                self._drop(key)
+                self._drop(key, worker)
                 if attempt == 2:
                     message = exc.message if isinstance(exc, StatementError) else str(exc)
                     raise QueryFailed(message) from exc
@@ -158,13 +171,13 @@ class MetadataService:
             if not call.abandon():
                 raise  # `fn`'s own answer
             # Closed while the write was queued (invalidate, the idle reap, another call's drop): whoever closed it has
-            # already removed it, and dropping the key now could close a new connection opened meanwhile.
+            # already removed it. Nothing to drop, and never resent on the connection opened meanwhile.
             logger.info("A write on {} found its metadata connection closed: not sent", profile.name)
             raise QueryFailed(_CLOSED) from exc
         except DomainError:
             raise
         except StatementNotSent as exc:  # ruling C40: the request that had to go first failed, so the write never went
-            self._drop(key)
+            self._drop(key, worker)
             logger.info("A write on {} was not sent: {} ({})", profile.name, exc.message, exc.code)
             raise QueryFailed(f"{exc.message}: nothing was sent") from exc
         except Exception as exc:
@@ -173,12 +186,12 @@ class MetadataService:
                 # Nothing was sent. A timeout here means the connection is busy with another call, not broken: it stays.
                 timed_out = isinstance(exc, TimeoutError)
                 if not timed_out:
-                    self._drop(key)
+                    self._drop(key, worker)
                 logger.info("A write on {} {}: not sent", profile.name,
                             f"waited {self._write_timeout:g} s for the metadata connection" if timed_out
                             else f"could not start ({type(exc).__name__})")
                 raise QueryFailed(_NOT_SENT if timed_out else _NOT_STARTED) from exc
-            self._drop(key)
+            self._drop(key, worker)
             # The type only: an unexpected error's text may quote what the write carried.
             logger.warning("A write on {} {} after it started ({}): its outcome is unknown", profile.name,
                            f"got no answer within {self._write_timeout:g} s" if waited_out else "failed",
@@ -212,12 +225,20 @@ class MetadataService:
                 self._workers[key] = _MetaEntry(worker=worker, last_used=time.monotonic())
             return worker
 
-    def _drop(self, key: _Key) -> None:
+    def _is_current(self, key: _Key, worker: SessionWorker) -> bool:
         with self._lock:
-            entry = self._workers.pop(key, None)
-        if entry is None:
-            return
+            entry = self._workers.get(key)
+        return entry is not None and entry.worker is worker
+
+    def _drop(self, key: _Key, worker: SessionWorker) -> None:
+        """Close `worker` if it is still the key's: a late drop (its failure answered after another call replaced it)
+        never closes the connection that replaced it."""
+        with self._lock:
+            entry = self._workers.get(key)
+            if entry is None or entry.worker is not worker:
+                return
+            del self._workers[key]
         try:
-            entry.worker.close()
+            worker.close()
         except Exception:
             logger.exception("Error while closing the metadata connection of {}", key)

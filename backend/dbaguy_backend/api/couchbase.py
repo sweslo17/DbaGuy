@@ -46,7 +46,10 @@ class SampleRequest(_Input):
 
 
 _Cas = Annotated[str, Field(pattern=CAS_PATTERN)]  # decimal text: a CAS is beyond 2^53 (the store checks its range)
-_DocumentText = Annotated[str, Field(max_length=DOCUMENT_TEXT_LIMIT)]
+# A bound on what is taken in at all, a little above the limit: the service refuses a text beyond DOCUMENT_TEXT_LIMIT
+# with its own message ("Documents are limited to 20 MiB"); beyond this, the request is invalid.
+_TEXT_ACCEPTED = DOCUMENT_TEXT_LIMIT + 1024 * 1024
+_DocumentText = Annotated[str, Field(max_length=_TEXT_ACCEPTED)]
 
 
 class DocumentRequest(_Input):

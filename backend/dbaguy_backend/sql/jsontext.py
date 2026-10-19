@@ -85,7 +85,8 @@ class JsonProblem:
     reason: str  # a fixed text: Python's decoder's own words (without their trailing "at") or ours, never a quote of it
 
 
-_SPACE = re.compile(r"[ \t\n\r]*")
+# JSON whitespace (RFC 8259): a run of it, possibly empty. Nothing else is whitespace to JSON (no NBSP, no VT).
+JSON_SPACE = re.compile(r"[ \t\n\r]*")
 _STRING = re.compile(_STRING_SRC)
 _CONSTANT = re.compile(rf"{_STRING_SRC}|(NaN|-?Infinity)")
 _TOO_DEEP = f"Nested deeper than {MAX_DOCUMENT_DEPTH} levels"
@@ -128,7 +129,7 @@ def json_problem(text: str) -> JsonProblem | None:
     """Where `text` stops being one JSON value with optional whitespace around it (or nests deeper than
     MAX_DOCUMENT_DEPTH levels, which `number_paths` and `diff` would read again at every level), or None. Checked by
     the C decoder with nothing kept (a 20 MiB text costs its text), then a few passes over its brackets."""
-    start = _SPACE.match(text).end()
+    start = JSON_SPACE.match(text).end()
     try:
         end = value_end(text, start)
     except json.JSONDecodeError as exc:
@@ -138,7 +139,7 @@ def json_problem(text: str) -> JsonProblem | None:
         return JsonProblem(found.start(1) if found else start, "NaN and Infinity are not JSON")
     except RecursionError:  # far deeper than MAX_DOCUMENT_DEPTH
         return JsonProblem(start, _TOO_DEEP)
-    end = _SPACE.match(text, end).end()
+    end = JSON_SPACE.match(text, end).end()
     if end != len(text):
         return JsonProblem(end, "Extra data after the value")
     return JsonProblem(start, _TOO_DEEP) if _nested_deeper_than(text, MAX_DOCUMENT_DEPTH) else None
@@ -150,7 +151,8 @@ def without_strings(text: str) -> str:
 
 
 _PLAIN_KEY = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
-_LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
+# A surrogate code point in a str: a decoded `\ud800`, never half of a pair (a str holds pairs as one character).
+LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
 _NUMBER_START = frozenset("-0123456789")
 _KIND_ORDER: tuple[ChangeKind, ...] = ("other", "duplicate_key", "number", "key_order")
 Steps = tuple[str | int, ...]
@@ -158,7 +160,7 @@ Steps = tuple[str | int, ...]
 
 def _shown(text: str) -> str:
     """`text` with each lone surrogate (a decoded `\\ud800`) written as its escape, so an answer encodes as UTF-8."""
-    return _LONE_SURROGATE.sub(lambda m: f"\\u{ord(m.group()):04x}", text)
+    return LONE_SURROGATE.sub(lambda m: f"\\u{ord(m.group()):04x}", text)
 
 
 def json_path(steps: Sequence[str | int]) -> str:
