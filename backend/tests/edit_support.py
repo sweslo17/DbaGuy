@@ -468,7 +468,8 @@ class Applied:
 
     @property
     def outcome(self) -> EditOutcomeEvent:
-        return next(event for event in self.events if event.type == "edit_outcome")
+        [event] = [event for event in self.events if event.type == "edit_outcome"]  # exactly one per apply (E1)
+        return event
 
     @property
     def error(self) -> ErrorEvent | None:
