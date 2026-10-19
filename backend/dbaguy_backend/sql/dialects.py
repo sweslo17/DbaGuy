@@ -1,6 +1,6 @@
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -279,26 +279,35 @@ def in_list(dialect: Dialect, literals: Iterable[str]) -> str:
     return opening + ", ".join(literals) + closing
 
 
-def quote_literal(dialect: Dialect, value: str) -> str:
+def quote_literal(
+    dialect: Dialect, value: str, *, national: bool = True, backslash_escapes: bool | None = None
+) -> str:
     """A string literal that the dialect reads back as exactly `value`: quotes are doubled, and where backslash
     escapes exist (MySQL's default sql_mode), backslashes are doubled too. T-SQL literals carry the N prefix. A NUL
     character never stays raw (`_NUL_IN_LITERAL`): an escape, or a concatenation that keeps the text one expression.
-    SQL++: the value as a JSON string (`json.dumps`), which is also how the server reads a "…" literal (D-04-15)."""
+    SQL++: the value as a JSON string (`json.dumps`), which is also how the server reads a "…" literal (D-04-15).
+
+    `national` False leaves T-SQL's N out (ASCII text for a non-Unicode column keeps its index seek, ⑤ D-05-2, A8).
+    `backslash_escapes` overrides the dialect's rule (False: a MySQL session with NO_BACKSLASH_ESCAPES, ⑤ D-05-13),
+    where MySQL's `\\0` cannot write a NUL: ValueError then."""
     if _JSON_STRINGS[dialect]:
         return json.dumps(value, ensure_ascii=False)
-    if RULES[dialect].backslash_escapes:
+    escapes = RULES[dialect].backslash_escapes if backslash_escapes is None else backslash_escapes
+    if "\x00" in value and dialect is Dialect.MYSQL and not escapes:
+        raise ValueError("A NUL character cannot be written in a MySQL literal without backslash escapes")
+    if escapes:
         value = value.replace("\\", "\\\\")
-    literal = _STRING_PREFIXES[dialect] + "'" + value.replace("'", "''") + "'"
+    literal = (_STRING_PREFIXES[dialect] if national else "") + "'" + value.replace("'", "''") + "'"
     nul = _NUL_IN_LITERAL[dialect]
     return literal if nul is None else literal.replace("\x00", nul)
 
 
-def datetime_literal(dialect: Dialect, text: str) -> str:
+def datetime_literal(dialect: Dialect, text: str, *, backslash_escapes: bool | None = None) -> str:
     """A date/time value given as the grid's text. SQL Server reads `2026-10-18 12:34:56` by the login's DATEFORMAT
     (a dmy language such as British fails with error 242) but `2026-10-18T12:34:56` the same everywhere."""
     if _ISO_DATETIME[dialect] and (found := _DATE_SPACE_TIME.match(text)):
         text = f"{found.group(1)}T{found.group(2)}{text[found.end():]}"
-    return quote_literal(dialect, text)
+    return quote_literal(dialect, text, backslash_escapes=backslash_escapes)
 
 
 def bool_literal(dialect: Dialect, value: bool) -> str:
@@ -313,11 +322,13 @@ def bytes_literal(dialect: Dialect, hex_digits: str) -> str:
     return template.format(hex_digits)
 
 
-def json_literal(dialect: Dialect, text: str) -> str:
+def json_literal(dialect: Dialect, text: str, *, national: bool = True, backslash_escapes: bool | None = None) -> str:
     """A JSON document given as its text, written so that the dialect compares it as JSON (SQL++: the text itself,
     JSON being SQL++ syntax)."""
     template = _JSON_LITERALS[dialect]
-    return text if template is None else template.format(quote_literal(dialect, text))
+    if template is None:
+        return text
+    return template.format(quote_literal(dialect, text, national=national, backslash_escapes=backslash_escapes))
 
 
 def zero_date_as_text(dialect: Dialect, column_sql: str, value: str) -> str | None:
@@ -325,3 +336,47 @@ def zero_date_as_text(dialect: Dialect, column_sql: str, value: str) -> str | No
     the plain comparison works (and keeps using the column's index)."""
     template = _ZERO_DATE_AS_TEXT[dialect]
     return template.format(column_sql) if template is not None and _ZERO_DATE.match(value) else None
+
+
+@dataclass(frozen=True)
+class TransactionFrame:
+    """The texts around a grid commit (⑤ D-05-4): sent through run() like its statements, so they are in the preview."""
+
+    begin: str
+    commit: str
+
+
+_TRANSACTION_FRAMES: dict[Dialect, TransactionFrame | None] = {
+    Dialect.POSTGRES: TransactionFrame("BEGIN", "COMMIT"),
+    Dialect.MYSQL: TransactionFrame("START TRANSACTION", "COMMIT"),
+    # NOCOUNT OFF: on a server whose `user options` turn NOCOUNT on, no statement would report its rows (A2)
+    Dialect.TSQL: TransactionFrame("SET NOCOUNT OFF;\nBEGIN TRANSACTION", "COMMIT TRANSACTION"),
+    # IMMEDIATE: the write lock first, so a database another connection is writing fails before the first statement
+    Dialect.SQLITE: TransactionFrame("BEGIN IMMEDIATE", "COMMIT"),
+    Dialect.SQLPP: None,  # no grid editing (R-05-12)
+}
+_ALL_DEFAULTS: dict[Dialect, str | None] = {  # an INSERT of a row whose every column takes its default
+    Dialect.POSTGRES: "DEFAULT VALUES", Dialect.SQLITE: "DEFAULT VALUES", Dialect.TSQL: "DEFAULT VALUES",
+    Dialect.MYSQL: "() VALUES ()", Dialect.SQLPP: None,
+}
+
+
+def transaction_frame(dialect: Dialect) -> TransactionFrame:
+    frame = _TRANSACTION_FRAMES[dialect]
+    if frame is None:
+        raise ValueError(f"{dialect} has no grid editing")
+    return frame
+
+
+def insert_defaults(dialect: Dialect, table_sql: str) -> str:
+    rest = _ALL_DEFAULTS[dialect]
+    if rest is None:
+        raise ValueError(f"{dialect} has no grid editing")
+    return f"INSERT INTO {table_sql} {rest}"
+
+
+def script_text(dialect: Dialect, statements: Sequence[str]) -> str:
+    """Statements as one text to copy or keep in History: `;` after each, or a `GO` line after each T-SQL batch."""
+    if RULES[dialect].client_command is ClientCommand.GO:
+        return "".join(f"{statement}\nGO\n" for statement in statements).rstrip("\n")
+    return "\n".join(f"{statement};" for statement in statements)

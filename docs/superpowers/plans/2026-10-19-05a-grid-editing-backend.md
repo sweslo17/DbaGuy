@@ -96,7 +96,7 @@ backend/tests/
   edit_support.py                 (new) ScratchDb per engine, scratch(), items_table(); Task 9 adds EditApp, Tab,
                                   Applied and the change builders
   sql/test_literals.py, sql/test_dml.py, test_editing_target.py, test_edit_plans.py, test_edits_api.py,
-  test_edit_apply.py, test_edit_worker.py, test_edit_flows.py,
+  test_edit_models.py, test_edit_apply.py, test_edit_worker.py, test_edit_flows.py,
   test_postgres_edits.py, test_sqlite_edits.py, test_mysql_edits.py, test_mssql_edits.py   (new)
   test_dev_env.py, test_api.py    (extended)
 src/lib/api/{openapi.json, schema.d.ts}   regenerated;  src/lib/api/types.ts   the new exports
