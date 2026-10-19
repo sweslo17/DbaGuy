@@ -1,13 +1,25 @@
 import json
+import random
+import time
 import tracemalloc
 
 import pytest
 
 from dbaguy_backend.domain.couchbase import ChangeCounts, DocumentChange
+from dbaguy_backend.sql import jsontext
 from dbaguy_backend.sql.jsontext import (
-    CHANGE_TEXT_LIMIT, CHANGES_PER_KIND, KEYS_SHOWN, DocumentDiff, NotJson, diff, json_path, json_problem, number_paths,
-    one_line, value_end, without_strings,
+    CHANGE_TEXT_LIMIT, CHANGES_LISTED, CHANGES_PER_KIND, EXCERPT_LEAD, KEYS_SHOWN, MAX_DOCUMENT_DEPTH, DocumentDiff,
+    JsonProblem, NotJson, diff, json_path, json_problem, number_paths, one_line, value_end, without_strings,
 )
+
+COMPACT_FROM = jsontext._COMPACT_FROM
+
+
+@pytest.fixture(autouse=True, params=["lists", "arrays"])
+def offset_containers(request, monkeypatch):
+    """Objects under COMPACT_FROM characters remember offsets in lists, bigger ones in arrays: run every test with each
+    kind everywhere, since a document's small objects and its big ones must give the same answer."""
+    monkeypatch.setattr(jsontext, "_COMPACT_FROM", 0 if request.param == "arrays" else 1 << 40)
 
 
 def test_value_end_finds_where_a_value_ends_without_building_it():
@@ -47,9 +59,38 @@ def test_json_problem_accepts_one_value_with_space_around_it():
     assert json_problem('  {"a": [1, 2]}  \n') is None and json_problem('"s"') is None
 
 
-def test_json_problem_names_too_deep_nesting_instead_of_raising():  # the C decoder passes it, the walkers could not
+def test_json_problem_names_too_deep_nesting_instead_of_raising():  # far past what the C decoder itself accepts
     deep = "[" * 100_000 + "]" * 100_000
-    assert json_problem(deep).reason == "Nested too deeply"
+    assert json_problem(deep) == JsonProblem(0, "Nested deeper than 100 levels")
+
+
+@pytest.mark.parametrize("text, reason", [
+    ('{"a":"x\ty"}', "Invalid control character"), ('{"a":"abc', "Unterminated string"),
+    ('["\\x"]', "Invalid \\escape"), ("[1,]", "Illegal trailing comma before end of array"),
+    ('{"a" 1}', "Expecting ':' delimiter"),
+])
+def test_json_problem_reasons_do_not_end_in_the_word_at(text, reason):  # "…: Unterminated string starting at"
+    assert json_problem(text).reason == reason
+
+
+@pytest.mark.parametrize("open_, close", [("[", "]"), ('{"a":', "}"), ('[{"a":', "}]")])
+def test_json_problem_accepts_the_deepest_allowed_nesting_and_refuses_one_level_more(open_, close):
+    per_group = open_.count("[") + open_.count("{")
+    groups = MAX_DOCUMENT_DEPTH // per_group  # 100 levels exactly for each of these shapes
+    assert groups * per_group == MAX_DOCUMENT_DEPTH
+    assert json_problem(open_ * groups + "1" + close * groups) is None
+    assert json_problem("[" + open_ * groups + "1" + close * groups + "]") == JsonProblem(
+        0, "Nested deeper than 100 levels"
+    )
+    assert json_problem("  " + "[" + open_ * groups + "1" + close * groups + "]  ") == JsonProblem(
+        2, "Nested deeper than 100 levels"
+    )
+
+
+def test_brackets_inside_strings_are_not_levels_of_nesting():
+    text = json.dumps({"a": "[" * 500 + "{" * 500, "b": ['"[[[[', "\\[[[[", "[\\\"[[["], "c" + "[" * 300: "}" * 300})
+    assert text.count("[") + text.count("{") > MAX_DOCUMENT_DEPTH
+    assert json_problem(text) is None
 
 
 def test_without_strings_keeps_numbers_and_structure():
@@ -59,7 +100,7 @@ def test_without_strings_keeps_numbers_and_structure():
 def test_json_path_is_written_like_the_value_viewer():
     assert json_path(()) == "$"
     assert json_path(("a", 0, "b c", "$x", "中", "\ud800")) == '$.a[0]["b c"].$x["中"]["\\ud800"]'
-    assert json_path(("a\n",)) == '$["a\\n"]'  # a plain key ends at the end of the key: `$` alone would let a newline pass
+    assert json_path(("a\n",)) == '$["a\\n"]'  # a plain key ends at its end: `$` alone would let a newline pass
 
 
 def test_number_paths_finds_numbers_by_their_literal():
@@ -75,9 +116,9 @@ def test_number_paths_of_a_bare_number_and_of_empty_containers():
     assert number_paths('{"a":{},"b":[],"c":[[],{}]}', lambda literal: True, 5) == ([], 0)
 
 
-def test_number_paths_and_diff_refuse_nesting_deeper_than_python_allows():  # ruling C27: valid JSON, too deep to walk
+def test_number_paths_and_diff_still_raise_for_nesting_deeper_than_python_allows():  # ruling C27: past json_problem
     deep = '{"a":' * 1100 + "12345678901234567890" + "}" * 1100
-    assert json_problem(deep) is None
+    assert json_problem(deep) == JsonProblem(0, "Nested deeper than 100 levels")
     with pytest.raises(RecursionError):
         number_paths(deep, lambda literal: True, 5)
     with pytest.raises(RecursionError):
@@ -167,7 +208,8 @@ def test_a_value_repeated_more_than_twice_is_reported_for_each_dropped_one():
 def test_arrays_of_different_lengths_are_one_change_and_the_common_part_is_still_compared():
     found = diff('[1.0,{"b":1,"a":1},3]', '[1,{"a":1,"b":1}]')
     assert [(c.path, c.kind, c.before, c.after) for c in found.changes] == [
-        ("$", "other", "3 elements", "2 elements"), ("$[0]", "number", "1.0", "1"), ("$[1]", "key_order", '"b", "a"', '"a", "b"'),
+        ("$", "other", "3 elements", "2 elements"), ("$[0]", "number", "1.0", "1"),
+        ("$[1]", "key_order", '"b", "a"', '"a", "b"'),
     ]
 
 
@@ -203,6 +245,131 @@ def test_diff_of_a_big_document_never_builds_a_tree():  # ruling C3; a tree of t
             tracemalloc.stop()
         assert found.counts.key_order == 10000
         assert peak < 6 * len(text), peak / len(text)  # measured 2.0× (compact) and 4.4× (pretty)
+
+
+def test_a_value_change_is_listed_however_many_respellings_come_first():  # review: 150 × 1.0 then a lost digit
+    edited = '{"a":[' + ",".join(["1.0"] * 150) + '],"pi":3.141592653589793238462}'
+    server = '{"a":[' + ",".join(["1"] * 150) + '],"pi":3.141592653589793}'
+    found = diff(edited, server)
+    assert found.counts == ChangeCounts(number=151)
+    assert [c.path for c in found.changes if c.value_changed] == ["$.pi"]
+    assert sum(not c.value_changed for c in found.changes) == CHANGES_PER_KIND
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_every_value_change_up_to_its_cap_is_listed_among_any_number_of_respellings(seed):
+    rng = random.Random(seed)
+    kinds = (
+        ["respelled"] * rng.randrange(0, 400) + ["lost"] * rng.randrange(0, 150) + ["reordered"] * rng.randrange(0, 150)
+    )
+    rng.shuffle(kinds)
+    edited, server = [], []
+    for kind in kinds:
+        edited.append({"respelled": "1.0", "lost": "3.141592653589793238462", "reordered": '{"b":1,"a":2}'}[kind])
+        server.append({"respelled": "1", "lost": "3.141592653589793", "reordered": '{"a":2,"b":1}'}[kind])
+    found = diff("[" + ",".join(edited) + "]", "[" + ",".join(server) + "]")
+    paths = {kind: [f"$[{i}]" for i, k in enumerate(kinds) if k == kind] for kind in ("respelled", "lost", "reordered")}
+    assert found.counts == ChangeCounts(
+        number=len(paths["respelled"]) + len(paths["lost"]), key_order=len(paths["reordered"])
+    )
+    expected = (  # value changes first, then the rest; each kind kept to CHANGES_PER_KIND; the list to CHANGES_LISTED
+        paths["lost"][:CHANGES_PER_KIND] + paths["respelled"][:CHANGES_PER_KIND] + paths["reordered"][:CHANGES_PER_KIND]
+    )[:CHANGES_LISTED]
+    assert [c.path for c in found.changes] == expected
+    assert [c.path for c in found.changes if c.value_changed] == paths["lost"][:CHANGES_PER_KIND]
+
+
+def test_a_long_string_that_differs_only_far_in_is_cut_around_the_difference():
+    edited = '{"s":"' + "a" * 1000 + "X" + "b" * 1000 + '"}'
+    server = '{"s":"' + "a" * 1000 + "Y" + "b" * 1000 + '"}'
+    (found,) = diff(edited, server).changes
+    middle = "a" * EXCERPT_LEAD + "{}" + "b" * (CHANGE_TEXT_LIMIT - EXCERPT_LEAD - 1)
+    assert found.before == "…" + middle.format("X") + "…" and found.after == "…" + middle.format("Y") + "…"
+
+
+def test_a_long_string_that_differs_after_the_first_chunk_is_still_cut_around_the_difference():
+    prefix = "é" * 100_000  # the escape spelling of the server's side differs from the start and is not the difference
+    edited = '{"s":"' + prefix + "X" + '"}'
+    server = '{"s":"' + prefix + "Y" + '"}'
+    (found,) = diff(edited.replace("é", "\\u00e9", 1), server).changes
+    assert found.before.startswith("…") and found.before.endswith("éX\"") and found.after.endswith("éY\"")
+    assert len(found.before) == len(found.after) <= CHANGE_TEXT_LIMIT + 1
+
+
+def test_a_long_string_with_a_lone_surrogate_is_cut_into_text_that_encodes():
+    (found,) = diff('{"s":"\\ud800' + "a" * 300 + '"}', '{"s":"\\ufffd' + "a" * 300 + '"}').changes
+    found.before.encode("utf-8"), found.after.encode("utf-8")
+    assert found.before.startswith('"\\ud800aaa') and found.after.startswith('"\ufffdaaa')
+
+
+def test_a_long_number_that_differs_only_far_in_is_cut_around_the_difference():
+    (found,) = diff("[" + "1" * 299 + "2]", "[" + "1" * 299 + "3]").changes
+    assert (found.before, found.after) == ("…" + "1" * EXCERPT_LEAD + "2", "…" + "1" * EXCERPT_LEAD + "3")
+    assert found.value_changed
+
+
+def test_a_changed_key_set_names_the_keys_on_one_side_only():
+    (found,) = diff('{"keep":1,"gone":2,"also gone":3}', '{"keep":1,"new":4}').changes
+    assert (found.kind, found.before, found.after) == ("other", '"gone", "also gone"', '"new"')
+    (found,) = diff('{"a":1}', '{"a":1,"b":2}').changes
+    assert (found.before, found.after) == ("(none)", '"b"')
+    (found,) = diff('{"a":1,"b":2}', '{"a":1}').changes
+    assert (found.before, found.after) == ('"b"', "(none)")
+
+
+def test_a_key_set_change_caps_each_side_and_counts_its_keys():
+    edited = "{" + ",".join(f'"k{i:02}":1' for i in range(15)) + ',"same":1}'
+    (found,) = diff(edited, '{"same":1,"new":1}').changes
+    assert found.before.endswith(", … (15 keys)") and found.before.count(", ") == KEYS_SHOWN
+    assert found.after == '"new"'
+
+
+def test_a_dropped_duplicate_key_shows_the_earlier_value_and_the_later_one_the_server_keeps():
+    (found,) = diff('{"a":"first","a":"second"}', '{"a":"second"}').changes
+    assert (found.kind, found.before, found.after) == ("duplicate_key", '"first"', '"second"')
+
+
+def test_members_are_found_by_key_not_by_position_when_the_order_differs_in_a_big_object():
+    edited = "{" + ",".join(f'"k{i}":{i}' for i in range(2000, 0, -1)) + "}"
+    server = "{" + ",".join(f'"k{i}":{i if i != 77 else "7.5"}' for i in range(1, 2001)) + "}"
+    found = diff(edited, server)
+    assert [(c.path, c.kind, c.before, c.after) for c in found.changes] == [
+        ("$.k77", "number", "77", "7.5"),
+        ("$", "key_order", ", ".join(f'"k{i}"' for i in range(2000, 1990, -1)) + ", … (2000 keys)",
+         ", ".join(f'"k{i}"' for i in range(1, 11)) + ", … (2000 keys)"),
+    ]
+
+
+def test_diff_of_a_wide_object_keeps_offsets_not_objects(monkeypatch):  # 100,000 members; review: 27× before
+    monkeypatch.setattr(jsontext, "_COMPACT_FROM", COMPACT_FROM)
+    edited = "{" + ",".join(f'"k{i}":{i}' for i in range(100_000)) + "}"  # not sorted: the server may keep this order
+    peaks = {}
+    changed = {"a value": edited.replace('"k5":5,', '"k5":6,', 1), "a key": edited.replace('"k5"', '"k5x"', 1)}
+    for label, server in changed.items():
+        tracemalloc.start()
+        try:
+            found = diff(edited, server)
+            peaks[label] = tracemalloc.get_traced_memory()[1] / len(edited)
+        finally:
+            tracemalloc.stop()
+        assert sum(found.counts.model_dump().values()) == 1
+    assert peaks["a value"] < 0.5  # members read in step, nothing kept but the one that differs
+    assert peaks["a key"] < 14, peaks  # the keys of both sides are compared by name: about 11×, and 27× as objects
+
+
+def test_a_document_nested_to_the_limit_still_diffs_quickly():  # ruling C38: depth × size is bounded
+    payload = "[" + ",".join(["1.5"] * 25_000) + "]"  # 100 KB at the 100th level
+    levels = MAX_DOCUMENT_DEPTH - 1  # the payload array is the last level
+    edited = '{"a":' * levels + payload + "}" * levels
+    server = '{"a":' * levels + payload.replace("1.5", "1.50", 1) + "}" * levels
+    assert json_problem(edited) is None
+    started = time.perf_counter()
+    found = diff(edited, server)
+    paths, count = number_paths(edited, lambda literal: literal == "1.5", 3)
+    assert time.perf_counter() - started < 10  # about 0.2 s; a loaded machine and a slow one both fit
+    where = "$" + ".a" * levels
+    assert found.counts == ChangeCounts(number=1) and not found.changes[0].value_changed
+    assert found.changes[0].path == where + "[0]" and paths[0] == where + "[0]" and count == 25_000
 
 
 def test_one_line_keeps_every_character_that_is_not_space_between_tokens():

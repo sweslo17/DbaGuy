@@ -138,8 +138,9 @@ class DocumentChange(BaseModel):
 
     path: str  # JSONPath as the value viewer writes it: $, $.address, $.items[0], $["odd key"]
     kind: ChangeKind
-    before: str  # the edited side: a literal, a key list or a dropped value (≤ 200 characters, then "…")
-    after: str  # the server's side
+    before: str  # the edited side: a literal, a key list (for a key-set change, the keys on this side only) or, for a
+    # duplicate key, the dropped value; at most 200 characters, a long text cut around its first difference with "…"
+    after: str  # the server's side; for a duplicate key, the later value (the server keeps the last one)
     value_changed: bool  # something is lost or changed; false for reordered keys and a respelled equal number
 
 

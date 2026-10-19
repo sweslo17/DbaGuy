@@ -5,16 +5,20 @@ numbers, key order and escapes stay exactly as they are. Here, not in the adapte
 `value_end` locates a JSON value without building it: the response parser finds where an object or array inside a row
 ends this way, so a big document costs a few times its text (how many depends on its shape, see `_LEAN`), never a
 decoded tree. The checks a document save needs are built on it (04c): `json_problem` says where a text stops being
-JSON, `number_paths` names the numbers the server would change, and `diff` lists what the server would store
-differently from the edited text. None of them builds a tree (ruling C3): they walk the text level by level, and `diff`
-skips every subtree whose text is the same on both sides."""
+JSON (or that it nests deeper than MAX_DOCUMENT_DEPTH levels), `number_paths` names the numbers the server would
+change, and `diff` lists what the server would store differently from the edited text. None of them builds a tree
+(ruling C3): they walk the text level by level, `diff` skips every subtree whose text is the same on both sides, and
+what a comparison remembers is offsets (arrays for a big object), never one Python object per member. Every level reads
+its children again, so their time is about the text's size times its levels, which is what the depth limit bounds."""
 
 import json
 import re
-from collections.abc import Callable, Iterator, Sequence
+from array import array
+from collections.abc import Callable, Iterable, Iterator, MutableSequence, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from itertools import zip_longest
+from functools import partial
+from itertools import islice, zip_longest
 from json.decoder import scanstring
 from typing import NoReturn
 
@@ -23,7 +27,9 @@ from ..domain.couchbase import ChangeCounts, ChangeKind, DocumentChange
 CHANGES_PER_KIND = 100  # changes kept per kind; the counts still count every one
 CHANGES_LISTED = 200  # changes listed in a preview
 CHANGE_TEXT_LIMIT = 200  # characters of a change's before / after text, then "…"
-KEYS_SHOWN = 10  # keys named in a key-order change
+KEYS_SHOWN = 10  # keys named in a key-order or key-set change
+EXCERPT_LEAD = 40  # characters kept before the first difference when a long text is cut around it
+MAX_DOCUMENT_DEPTH = 100  # levels of nesting a document may have (ruling C38): the checks below read each level again
 
 
 class NotJson(ValueError):
@@ -50,13 +56,15 @@ def reject_constant(name: str) -> NoReturn:
 _LEAN = json.JSONDecoder(object_hook=bool, parse_int=bool, parse_float=bool, parse_constant=reject_constant)
 
 
+_STRING_SRC = r'"(?:[^"\\]++|\\.)*+"'  # a JSON string, possessive: it can only be read one way
+
 # Runs of tokens with no whitespace between them: a string (kept whole), or anything else that is not whitespace (the
 # last alternative keeps a lone quote, an unterminated string, as it was). A compact text is one run and joins back as
 # the same object, where a substitution would build an object per string token (11.6× a token-dense text, measured). The
 # quantifiers are possessive: a string can only be read one way, and the plain `*` keeps a backtracking record per
 # character (a 40 MB string value took 2.3 GB and 7.7 s; this takes 130 MB and 0.4 s). JSON strings hold no raw line
 # breaks, so `.` after a backslash never needs to match one.
-_RUN = re.compile(r'(?:"(?:[^"\\]++|\\.)*+"|[^ \t\n\r"]++|")++')
+_RUN = re.compile(rf'(?:{_STRING_SRC}|[^ \t\n\r"]++|")++')
 
 
 def one_line(text: str) -> str:
@@ -74,29 +82,66 @@ def value_end(text: str, start: int) -> int:
 @dataclass(frozen=True)
 class JsonProblem:
     offset: int  # code points from the start of the text
-    reason: str  # a fixed text: Python's decoder's own words or ours, never a quote of the text
+    reason: str  # a fixed text: Python's decoder's own words (without their trailing "at") or ours, never a quote of it
 
 
 _SPACE = re.compile(r"[ \t\n\r]*")
-_STRING = re.compile(r'"(?:[^"\\]++|\\.)*+"')
-_CONSTANT = re.compile(r'"(?:[^"\\]++|\\.)*+"|(NaN|-?Infinity)')
+_STRING = re.compile(_STRING_SRC)
+_CONSTANT = re.compile(rf"{_STRING_SRC}|(NaN|-?Infinity)")
+_TOO_DEEP = f"Nested deeper than {MAX_DOCUMENT_DEPTH} levels"
+
+
+def _reason(message: str) -> str:
+    """The decoder's words without the "at" that its position followed: "Unterminated string starting at" says
+    "Unterminated string"."""
+    return message.removesuffix(" starting at").removesuffix(" at")
+
+
+_ESCAPES = ("\\\\", '\\"', "\\/", "\\b", "\\f", "\\n", "\\r", "\\t", "\\u")  # an escaped backslash first
+_NOT_STRUCTURE = bytes(set(range(256)) - set(b'"[]{}'))
+
+
+def _nested_deeper_than(text: str, limit: int) -> bool:
+    """Whether the valid JSON `text` holds containers nested more than `limit` levels deep. Escapes go first, so every
+    string is `"…"` with no quote inside; then only the brackets and quotes are kept (C-speed byte operations, no
+    object per token), empty strings go, and the text between the remaining quotes (strings that hold a bracket) is
+    dropped. Then the innermost pairs are removed one round at a time: a round takes exactly one level off the deepest
+    nesting, so anything left after `limit` rounds is deeper than `limit` (a few rounds for a real document; no work at
+    all when the text holds no more than `limit` opening brackets, strings included)."""
+    if text.count("[") + text.count("{") <= limit:
+        return False
+    if "\\" in text:
+        for escape in _ESCAPES:
+            text = text.replace(escape, "")
+    kept = text.encode("ascii", "ignore").translate(None, _NOT_STRUCTURE).replace(b'""', b"")
+    if b'"' in kept:
+        kept = b"".join(kept.split(b'"')[::2])
+    brackets = kept.replace(b"{", b"[").replace(b"}", b"]")
+    for _ in range(limit):
+        brackets = brackets.replace(b"[]", b"")
+        if not brackets:
+            return False
+    return True
 
 
 def json_problem(text: str) -> JsonProblem | None:
-    """Where `text` stops being one JSON value with optional whitespace around it, or None. Checked by the C decoder
-    with nothing kept (a 20 MiB text costs its text)."""
+    """Where `text` stops being one JSON value with optional whitespace around it (or nests deeper than
+    MAX_DOCUMENT_DEPTH levels, which `number_paths` and `diff` would read again at every level), or None. Checked by
+    the C decoder with nothing kept (a 20 MiB text costs its text), then a few passes over its brackets."""
     start = _SPACE.match(text).end()
     try:
         end = value_end(text, start)
     except json.JSONDecodeError as exc:
-        return JsonProblem(exc.pos, exc.msg)
+        return JsonProblem(exc.pos, _reason(exc.msg))
     except NotJson:
         found = next((m for m in _CONSTANT.finditer(text, start) if m.group(1)), None)
         return JsonProblem(found.start(1) if found else start, "NaN and Infinity are not JSON")
-    except RecursionError:
-        return JsonProblem(start, "Nested too deeply")
+    except RecursionError:  # far deeper than MAX_DOCUMENT_DEPTH
+        return JsonProblem(start, _TOO_DEEP)
     end = _SPACE.match(text, end).end()
-    return None if end == len(text) else JsonProblem(end, "Extra data after the value")
+    if end != len(text):
+        return JsonProblem(end, "Extra data after the value")
+    return JsonProblem(start, _TOO_DEEP) if _nested_deeper_than(text, MAX_DOCUMENT_DEPTH) else None
 
 
 def without_strings(text: str) -> str:
@@ -131,20 +176,25 @@ def json_path(steps: Sequence[str | int]) -> str:
 
 
 # The walkers below read compact text (`one_line`) that `json_problem` accepted: no whitespace between tokens, so each
-# step is a fixed offset from the last one, and each value's end comes from `value_end`.
-def _members(text: str, start: int) -> list[tuple[str, int, int]]:
-    """The members of the object at text[start]: (key, value start, value end), in order, duplicates kept."""
-    members: list[tuple[str, int, int]] = []
+# step is a fixed offset from the last one, and each value's end comes from `value_end`. Nothing per member is kept
+# as a Python object: a wide object (a million keys) is read one member at a time, and what a comparison must remember
+# is held as offsets in `array("q")`, 8 bytes each. What stays is the cost `_LEAN` describes: a member whose value is a
+# big array is located by `value_end` over the whole of it (`[[1, 2], …]` and `[[], …]` under an object member take
+# 16-21× the text while it is located; the same arrays at the top of a text are read element by element).
+def _members(text: str, start: int) -> Iterator[tuple[str, int, int, int]]:
+    """The members of the object at text[start], one at a time: (key, key start, value start, value end), in order,
+    duplicates kept."""
     i = start + 1
     if text[i] == "}":
-        return members
+        return
     while True:
+        key_start = i
         key, i = scanstring(text, i + 1)
         i += 1  # past the colon
         end = value_end(text, i)
-        members.append((key, i, end))
+        yield key, key_start, i, end
         if text[end] == "}":
-            return members
+            return
         i = end + 1  # past the comma
 
 
@@ -163,7 +213,8 @@ def _elements(text: str, start: int) -> Iterator[tuple[int, int]]:
 
 def number_paths(text: str, wanted: Callable[[str], bool], limit: int) -> tuple[list[str], int]:
     """The paths of at most `limit` numbers whose literal `wanted` accepts, in document order, and how many there are.
-    `text` is valid JSON (`json_problem` found nothing); RecursionError for nesting deeper than Python allows."""
+    `text` is valid JSON that `json_problem` accepted (nested at most MAX_DOCUMENT_DEPTH levels); RecursionError for
+    nesting deeper than Python allows."""
     text = one_line(text)
     paths: list[str] = []
     count = 0
@@ -172,7 +223,7 @@ def number_paths(text: str, wanted: Callable[[str], bool], limit: int) -> tuple[
         nonlocal count
         first = text[start]
         if first == "{":
-            for key, member_start, member_end in _members(text, start):
+            for key, _, member_start, member_end in _members(text, start):
                 walk(member_start, member_end, (*steps, key))
         elif first == "[":
             for index, (item_start, item_end) in enumerate(_elements(text, start)):
@@ -198,14 +249,55 @@ def _short(text: str, start: int, end: int) -> str:
     return shown + "…" if end - start > CHANGE_TEXT_LIMIT else shown
 
 
-def _keys(keys: Sequence[str]) -> str:
-    """A key list as a change shows it: KEYS_SHOWN keys written as JSON strings, cut at CHANGE_TEXT_LIMIT characters,
-    then `, … (N keys)` when anything was left out."""
-    names = ", ".join(json.dumps(key[:CHANGE_TEXT_LIMIT], ensure_ascii=False) for key in keys[:KEYS_SHOWN])
-    shown = _shown(names[:CHANGE_TEXT_LIMIT])
-    if len(keys) <= KEYS_SHOWN and len(names) <= CHANGE_TEXT_LIMIT:
+_CHUNK = 1 << 16
+
+
+def _first_difference(a: str, b: str) -> int:
+    """The index of the first character where `a` and `b` differ (the shorter length when one is a prefix of the other),
+    found a chunk at a time."""
+    shortest = min(len(a), len(b))
+    i = 0
+    while i < shortest and a[i : i + _CHUNK] == b[i : i + _CHUNK]:
+        i += _CHUNK
+    i = min(i, shortest)
+    while i < shortest and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def _excerpts(a: str, b: str) -> tuple[str, str]:
+    """`a` and `b` as a change shows them: whole when both fit in CHANGE_TEXT_LIMIT characters, else each cut to that
+    many from EXCERPT_LEAD characters before the first difference, with `…` on a cut side (a long text that differs
+    only far in is not shown as two copies of its start)."""
+    if max(len(a), len(b)) <= CHANGE_TEXT_LIMIT:
+        return _shown(a), _shown(b)
+    start = max(0, _first_difference(a, b) - EXCERPT_LEAD)
+    stop = start + CHANGE_TEXT_LIMIT
+
+    def cut(text: str) -> str:
+        return ("…" if start else "") + _shown(text[start:stop]) + ("…" if len(text) > stop else "")
+
+    return cut(a), cut(b)
+
+
+def _string_texts(e: str, es: int, ee: int, s: str, ss: int, se: int, edited: str, server: str) -> tuple[str, str]:
+    """The two sides of a changed string: its text as written when short; when long, the decoded values written
+    the same way, cut around the first difference (a spelling difference such as `\\u00e9` against `é` cannot be it)."""
+    if max(ee - es, se - ss) <= CHANGE_TEXT_LIMIT:
+        return _shown(e[es:ee]), _shown(s[ss:se])
+    return _excerpts(json.dumps(edited, ensure_ascii=False), json.dumps(server, ensure_ascii=False))
+
+
+def _keys(names: Iterable[str], total: int) -> str:
+    """A key list as a change shows it: at most KEYS_SHOWN of `names` written as JSON strings, cut at CHANGE_TEXT_LIMIT
+    characters, then `, … (N keys)` when any of the `total` is left out; "(none)" for no key."""
+    if total == 0:
+        return "(none)"
+    written = ", ".join(json.dumps(name[:CHANGE_TEXT_LIMIT], ensure_ascii=False) for name in islice(names, KEYS_SHOWN))
+    shown = _shown(written[:CHANGE_TEXT_LIMIT])
+    if total <= KEYS_SHOWN and len(written) <= CHANGE_TEXT_LIMIT:
         return shown
-    return f"{shown}, … ({len(keys)} key{'' if len(keys) == 1 else 's'})"
+    return f"{shown}, … ({total} key{'' if total == 1 else 's'})"
 
 
 def _count(n: int) -> str:
@@ -218,9 +310,6 @@ def _same_value(a: str, b: str) -> bool:
         return Decimal(a) == Decimal(b)
     except InvalidOperation:
         return False
-
-
-_CHUNK = 1 << 16
 
 
 def _same_text(e: str, es: int, ee: int, s: str, ss: int, se: int) -> bool:
@@ -236,22 +325,25 @@ def _same_text(e: str, es: int, ee: int, s: str, ss: int, se: int) -> bool:
     )
 
 
-Texts = Callable[[], tuple[str, str, bool]]  # a change's (before, after, value_changed), made only if it is kept
+Texts = Callable[[], tuple[str, str]]  # a change's (before, after), made only if it is kept
 
 
 class _Found:
-    """Changes as the walk meets them: counted all, kept CHANGES_PER_KIND per kind. A kept change's path and texts are
-    built when it is kept, not when it is met: a document the server re-sorts throughout meets one change per object."""
+    """Changes as the walk meets them: counted all, kept CHANGES_PER_KIND per kind and per `value_changed` (a flood of
+    respelled numbers must not use up the room of a lost digit). A kept change's path and texts are built when it is
+    kept, not when it is met: a document the server re-sorts throughout meets one change per object."""
 
     def __init__(self) -> None:
-        self.kept: dict[ChangeKind, list[DocumentChange]] = {kind: [] for kind in _KIND_ORDER}
+        self.kept: dict[tuple[ChangeKind, bool], list[DocumentChange]] = {
+            (kind, value_changed): [] for kind in _KIND_ORDER for value_changed in (True, False)
+        }
         self.counts: dict[ChangeKind, int] = dict.fromkeys(_KIND_ORDER, 0)
 
-    def add(self, steps: Steps, kind: ChangeKind, texts: Texts) -> None:
+    def add(self, steps: Steps, kind: ChangeKind, value_changed: bool, texts: Texts) -> None:
         self.counts[kind] += 1
-        kept = self.kept[kind]
+        kept = self.kept[kind, value_changed]
         if len(kept) < CHANGES_PER_KIND:
-            before, after, value_changed = texts()
+            before, after = texts()
             kept.append(
                 DocumentChange(
                     path=json_path(steps), kind=kind, before=before, after=after, value_changed=value_changed
@@ -259,58 +351,148 @@ class _Found:
             )
 
     def result(self) -> DocumentDiff:
-        ordered = [change for kind in _KIND_ORDER for change in self.kept[kind]]
-        listed = [c for c in ordered if c.value_changed] + [c for c in ordered if not c.value_changed]
+        listed = [c for flag in (True, False) for kind in _KIND_ORDER for c in self.kept[kind, flag]]
         return DocumentDiff(changes=listed[:CHANGES_LISTED], counts=ChangeCounts(**self.counts))
+
+
+_COMPACT_FROM = 1 << 16  # characters of an object from which what a comparison remembers of it goes in arrays
+
+
+def _offsets(size: int) -> Callable[..., MutableSequence[int]]:
+    """What holds the offsets a comparison remembers about an object of `size` characters: `array("q")` (8 bytes an
+    offset) for a big one, a list (faster to fill, 32-40 bytes an offset) for the many small ones."""
+    return list if size < _COMPACT_FROM else partial(array, "q")
+
+
+def _first_key(text: str, start: int) -> str | None:
+    """The first key of the object at text[start]; None for `{}`."""
+    return None if text[start + 1] == "}" else scanstring(text, start + 2)[0]
+
+
+def _aligned_differences(
+    e: str, es: int, s: str, ss: int, new: Callable[..., MutableSequence[int]]
+) -> MutableSequence[int] | None:
+    """When the objects at e[es] and s[ss] have the same keys in the same order (a document read from the server and
+    edited, which is almost every save), the members whose values differ, flat in a sequence made by `new` of
+    (edited key start, edited value start and end, server value start and end) and nothing else kept; else None. The
+    server's form repeats no key, so the same keys in the same order means the edited object repeats none either."""
+    differing = new()
+    for edited, server in zip_longest(_members(e, es), _members(s, ss)):
+        if edited is None or server is None or edited[0] != server[0]:
+            return None
+        if not _same_text(e, edited[2], edited[3], s, server[2], server[3]):
+            differing.extend((edited[1], edited[2], edited[3], server[2], server[3]))
+    return differing
+
+
+def _compare_objects(e: str, es: int, ee: int, s: str, ss: int, steps: Steps, found: _Found) -> None:
+    """Two objects that are not the same text: dropped duplicate keys, a different key set, a different key order, then
+    their members' values."""
+    new = _offsets(ee - es)
+    if _first_key(e, es) == _first_key(s, ss):
+        differing = _aligned_differences(e, es, s, ss, new)
+        if differing is not None:
+            for key_start, edited_start, edited_end, server_start, server_end in zip(*[iter(differing)] * 5):
+                key = scanstring(e, key_start + 1)[0]
+                _compare(e, edited_start, edited_end, s, server_start, server_end, (*steps, key), found)
+            return
+    rank_of: dict[str, int] = {}  # each distinct edited key, in first-occurrence order
+    edited = new()  # its value's (start, end), by rank: the last one of a repeated key
+    for key, _, start, end in _members(e, es):
+        rank = rank_of.get(key)
+        if rank is None:
+            rank_of[key] = len(edited) // 2
+            edited.extend((start, end))
+        else:  # the server keeps the last value of a repeated key; the change's `after` is that later value
+            found.add(
+                (*steps, key),
+                "duplicate_key",
+                True,
+                lambda: (_short(e, edited[2 * rank], edited[2 * rank + 1]), _short(e, start, end)),
+            )
+            edited[2 * rank] = start
+            edited[2 * rank + 1] = end
+    seen = bytearray(len(rank_of))
+    server = new()  # each server member: (edited rank, key start, value start, value end)
+    server_only: list[str] = []
+    server_only_count = 0
+    for key, key_start, start, end in _members(s, ss):
+        rank = rank_of.get(key)
+        if rank is None:
+            server_only_count += 1
+            if server_only_count <= KEYS_SHOWN:
+                server_only.append(key)
+        else:
+            seen[rank] = 1
+            server.extend((rank, key_start, start, end))
+    edited_only_count = seen.count(0)
+    if server_only_count or edited_only_count:  # said as the keys on one side only
+        found.add(
+            steps,
+            "other",
+            True,
+            lambda: (
+                _keys((key for key, rank in rank_of.items() if not seen[rank]), edited_only_count),
+                _keys(server_only, server_only_count),
+            ),
+        )
+        return
+    if server[0::4] != new(range(len(rank_of))):
+        found.add(
+            steps,
+            "key_order",
+            False,
+            lambda: (
+                _keys(rank_of, len(rank_of)),
+                _keys((scanstring(s, key_start + 1)[0] for key_start in server[1::4]), len(server) // 4),
+            ),
+        )
+    for rank, key_start, start, end in zip(*[iter(server)] * 4):
+        edited_start, edited_end = edited[2 * rank], edited[2 * rank + 1]
+        if not _same_text(e, edited_start, edited_end, s, start, end):
+            key = scanstring(s, key_start + 1)[0]
+            _compare(e, edited_start, edited_end, s, start, end, (*steps, key), found)
 
 
 def _compare(e: str, es: int, ee: int, s: str, ss: int, se: int, steps: Steps, found: _Found) -> None:
     """The edited value e[es:ee] against the server's s[ss:se], both compact and not the same text."""
     first, server_first = e[es], s[ss]
     if first == "{" and server_first == "{":
-        last: dict[str, tuple[int, int]] = {}
-        for key, start, end in _members(e, es):
-            if key in last:  # the server keeps the last value of a repeated key
-                dropped = last[key]
-                found.add(
-                    (*steps, key), "duplicate_key", lambda: (_short(e, *dropped), _short(e, start, end), True)
-                )
-            last[key] = (start, end)
-        server = _members(s, ss)
-        order, server_order = list(last), [key for key, _, _ in server]
-        if last.keys() != set(server_order):
-            found.add(steps, "other", lambda: (_keys(order), _keys(server_order), True))
-            return
-        if order != server_order:
-            found.add(steps, "key_order", lambda: (_keys(order), _keys(server_order), False))
-        for key, start, end in server:
-            edited_start, edited_end = last[key]
-            if not _same_text(e, edited_start, edited_end, s, start, end):
-                _compare(e, edited_start, edited_end, s, start, end, (*steps, key), found)
+        _compare_objects(e, es, ee, s, ss, steps, found)
     elif first == "[" and server_first == "[":
         edited_items, server_items = _elements(e, es), _elements(s, ss)
         for index, (a, b) in enumerate(zip_longest(edited_items, server_items)):
             if a is None or b is None:  # different lengths: counted to the end, said once
                 left = index + (a is not None) + sum(1 for _ in edited_items)
                 right = index + (b is not None) + sum(1 for _ in server_items)
-                found.add(steps, "other", lambda: (_count(left), _count(right), True))
+                found.add(steps, "other", True, lambda: (_count(left), _count(right)))
                 return
             if not _same_text(e, *a, s, *b):
                 _compare(e, *a, s, *b, (*steps, index), found)
     elif first == '"' and server_first == '"':
-        if scanstring(e, es + 1)[0] != scanstring(s, ss + 1)[0]:
-            found.add(steps, "other", lambda: (_short(e, es, ee), _short(s, ss, se), True))
+        edited_value, server_value = scanstring(e, es + 1)[0], scanstring(s, ss + 1)[0]
+        if edited_value != server_value:
+            found.add(
+                steps, "other", True, lambda: _string_texts(e, es, ee, s, ss, se, edited_value, server_value)
+            )
     elif first in _NUMBER_START and server_first in _NUMBER_START:
-        found.add(steps, "number", lambda: (_short(e, es, ee), _short(s, ss, se), not _same_value(e[es:ee], s[ss:se])))
+        same = _same_value(e[es:ee], s[ss:se])
+        found.add(steps, "number", not same, lambda: _excerpts(e[es:ee], s[ss:se]))
     else:
-        found.add(steps, "other", lambda: (_short(e, es, ee), _short(s, ss, se), True))
+        found.add(steps, "other", True, lambda: (_short(e, es, ee), _short(s, ss, se)))
 
 
 def diff(edited: str, server: str) -> DocumentDiff:
     """What storing `edited` would change, given `server`, the server's form of it (`SELECT RAW $doc`, A2): key order,
-    number spelling, dropped duplicate keys, anything else as `other`. Whitespace and string escape spelling are not
-    changes. Both texts are valid JSON; never builds a tree (ruling C3); RecursionError for nesting deeper than Python
-    allows."""
+    number spelling, dropped duplicate keys (a change's `before` is the dropped value, its `after` the later one: the
+    server keeps the last), a different set of keys (the keys on one side only), anything else as `other`. Whitespace
+    and string escape spelling are not changes. Both texts are valid JSON that `json_problem` accepted, and `server`
+    repeats no key (it is the server's form); never builds a tree (ruling C3); RecursionError for nesting deeper than
+    Python allows.
+
+    Memory: offsets in compact arrays, nothing per member as an object, so the walk costs a small part of the text
+    (see the note above `_members` for the shapes `value_end` itself makes costly). Time: every level reads its
+    children again, so about the text's size times the levels a change is below (hence MAX_DOCUMENT_DEPTH)."""
     found = _Found()
     edited, server = one_line(edited), one_line(server)
     if edited != server:
