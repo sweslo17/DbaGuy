@@ -7204,7 +7204,8 @@
             "enum": [
               "query",
               "table",
-              "object"
+              "object",
+              "document"
             ],
             "title": "Kind"
           },
@@ -7337,6 +7338,18 @@
               }
             ],
             "title": "Params"
+          },
+          "document_cas": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[1-9][0-9]{0,18}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Document Cas"
           }
         },
         "additionalProperties": false,

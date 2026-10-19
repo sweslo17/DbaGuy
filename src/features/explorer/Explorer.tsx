@@ -17,6 +17,7 @@ import { findEngineInfo, useDeleteProfile, useEngines, useProfiles } from "../co
 import { profileColor } from "../connections/profileColors";
 import { secretsNeeded } from "../connections/UnlockDialog";
 import { joinUnlockPrompt } from "../connections/unlockPrompts";
+import { askOpenDocument } from "../documents/openDocument";
 import { applyTreeContext } from "../query/queryContext";
 import { requestCloseTab, requestDisconnectTab } from "../workspace/closeGuards";
 import { openBrowseTab } from "./browse";
@@ -344,10 +345,24 @@ export function Explorer() {
           </div>
         );
         if (row.node.kind !== BROWSABLE_KIND) return content;
+        const opensDocuments = findEngineInfo(entries, engines, row.profileId)?.documents === true;
         return (
           <ContextMenu
             items={[
               { label: "Browse documents", onSelect: () => void openBrowseTab(row.profileId, row.node.path) },
+              ...(opensDocuments
+                ? [
+                    {
+                      label: "Open document by ID…",
+                      onSelect: () =>
+                        askOpenDocument({
+                          profileId: row.profileId,
+                          mode: "open",
+                          keyspace: keyspaceOfPath(row.node.path) ?? {},
+                        }),
+                    },
+                  ]
+                : []),
               { label: "Details", onSelect: () => openObject(row.profileId, row.node) },
               {
                 label: "Sample fields…",

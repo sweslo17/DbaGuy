@@ -1,5 +1,6 @@
 import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
+import { json } from "@codemirror/lang-json";
 import { MSSQL, MySQL, PostgreSQL, sql, SQLDialect, SQLite, StandardSQL } from "@codemirror/lang-sql";
 import { bracketMatching, indentOnInput, indentUnit } from "@codemirror/language";
 import { highlightSelectionMatches, search, searchKeymap } from "@codemirror/search";
@@ -18,6 +19,9 @@ import { vim } from "@replit/codemirror-vim";
 import type { Dialect, EditorSettings } from "@/lib/api/types";
 import { editorTheme, fontSizeTheme } from "./theme";
 
+/** What an editor holds: SQL (a query tab's text) or JSON (a Couchbase document's). */
+export type EditorLanguage = "sql" | "json";
+
 /** What the live settings and the tab's connection decide about an editor. */
 export interface EditorOptions {
   fontSize: number;
@@ -25,15 +29,22 @@ export interface EditorOptions {
   wordWrap: boolean;
   vim: boolean;
   upperCaseKeywords: boolean;
-  /** The language mode; null (no connection yet) is generic SQL. */
+  /** The SQL mode; null (no connection yet) is generic SQL. A JSON editor has none. */
   dialect: Dialect | null;
+  language: EditorLanguage;
   /** Typing is not possible (e.g. while a script's text is being read). */
   readOnly: boolean;
 }
 
-export function editorOptions(editor: EditorSettings, dialect: Dialect | null, readOnly = false): EditorOptions {
+export function editorOptions(
+  editor: EditorSettings,
+  dialect: Dialect | null,
+  readOnly = false,
+  language: EditorLanguage = "sql",
+): EditorOptions {
   return {
     readOnly,
+    language,
     fontSize: editor.font_size,
     tabSize: editor.tab_size,
     wordWrap: editor.word_wrap,
@@ -105,9 +116,16 @@ const LIVE_SLOTS: readonly LiveSlot[] = [
     (o) => String(o.readOnly),
     (o) => EditorState.readOnly.of(o.readOnly),
   ),
+  // The language and the label that names it for assistive technology.
   slot(
-    (o) => `${o.dialect}:${o.upperCaseKeywords}`,
-    (o) => sql({ dialect: o.dialect ? SQL_DIALECTS[o.dialect] : StandardSQL, upperCaseKeywords: o.upperCaseKeywords }),
+    (o) => `${o.language}:${o.dialect}:${o.upperCaseKeywords}`,
+    (o) =>
+      o.language === "json"
+        ? [json(), EditorView.contentAttributes.of({ "aria-label": "JSON editor" })]
+        : [
+            sql({ dialect: o.dialect ? SQL_DIALECTS[o.dialect] : StandardSQL, upperCaseKeywords: o.upperCaseKeywords }),
+            EditorView.contentAttributes.of({ "aria-label": "SQL editor" }),
+          ],
   ),
 ];
 
@@ -128,11 +146,10 @@ const STATIC: Extension = [
   search({ top: true }),
   // ⌘F / ⌘G / ⌘D (select next occurrence) come from searchKeymap, ⌘/ (toggle comment) from defaultKeymap.
   keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap, indentWithTab]),
-  EditorView.contentAttributes.of({ "aria-label": "SQL editor" }),
   editorTheme(),
 ];
 
-/** Every base extension of a SQL editor, with the live parts configured from `options`. */
+/** Every base extension of an editor, with the live parts configured from `options`. */
 export function baseExtensions(options: EditorOptions): Extension {
   return [LIVE_SLOTS.map((s) => s.compartment.of(s.build(options))), STATIC];
 }

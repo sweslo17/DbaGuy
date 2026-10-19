@@ -1,8 +1,15 @@
-import type { SavedTab, SavedWorkspace, TextSelection } from "@/lib/api/types";
+import type { PathSegment, SavedTab, SavedWorkspace, TextSelection } from "@/lib/api/types";
 import { PARAM_NAME } from "@/lib/paramNames";
 import { matchesFile } from "@/lib/scriptText";
 import type { EditorBuffer } from "@/stores/editorBuffers";
-import { startSelection, type QueryTabState, type Tab, type WorkspaceSnapshot } from "@/stores/workspace";
+import {
+  startSelection,
+  type DocumentTabState,
+  type QueryTabState,
+  type Tab,
+  type WorkspaceSnapshot,
+} from "@/stores/workspace";
+import { keyspaceOfPath } from "../explorer/fieldSamples";
 
 /*
  * `workspace.json` ↔ the tab store (spec §4.8). A query tab keeps its connection, script binding, editor text,
@@ -10,7 +17,9 @@ import { startSelection, type QueryTabState, type Tab, type WorkspaceSnapshot } 
  * script keeps no text while it holds just what its file does (`buffer: null`, ruling R-02c-21): it is restored from
  * the file as the file is then. A Couchbase query tab also keeps its query context: null is the profile's default,
  * "none" the user's choice of no context (ruling B14). A tab that uses SQL++ parameters keeps its panel's drafts, the
- * text as typed, so a crash or a restart loses none of them (`savedParams`).
+ * text as typed, so a crash or a restart loses none of them (`savedParams`). A Couchbase document tab keeps its
+ * connection, its path (the collection, then the document), the CAS its text is based on, and its text only while it
+ * is unsaved (a new document, or edited): a clean document is read again from the server (ruling C15).
  */
 
 const WORKSPACE_VERSION = 1;
@@ -55,6 +64,16 @@ export function savedParams(
   return count > 0 ? kept : null;
 }
 
+/**
+ * What the backend takes as `document_cas` (`CAS_PATTERN` in `domain/couchbase.py`): decimal text, 1 to 19 digits, no
+ * leading zero. `PUT /workspace` validates the whole state, so a value it refuses would fail every save and a crash
+ * would lose every tab's unsaved text (Q2, rulings B40 and C33).
+ */
+const CAS = /^[1-9][0-9]{0,18}$/;
+
+/** A document tab's CAS as `workspace.json` keeps it: null unless the backend accepts it. */
+const savedCas = (cas: string | null): string | null => (cas !== null && CAS.test(cas) ? cas : null);
+
 /** The tab's text and selection as last known: its editor's, else what it was restored with. */
 function contentOf(tab: QueryTabState, buffer: EditorBuffer | null): { text: string; selection: TextSelection | null } {
   return buffer ?? { text: tab.initialText, selection: startSelection(tab) ?? null };
@@ -71,7 +90,25 @@ function bufferToSave(tab: QueryTabState, text: string): string | null {
   return tab.savedText !== null && matchesFile(text, tab.savedText) ? null : text;
 }
 
+/**
+ * A document tab: the editor's text only when there is something to keep (a new document, or unsaved changes), with
+ * the CAS it is based on; a clean document keeps neither a text nor a buffer read (a 20 MiB one is never read here).
+ */
+function savedDocument(tab: DocumentTabState, readBuffer: (tabId: string) => EditorBuffer | null): SavedTab {
+  const keepsText = tab.isNew || tab.dirty;
+  return {
+    id: tab.id,
+    kind: "document",
+    title: tab.title,
+    profile_id: tab.profileId,
+    object_path: tab.path,
+    document_cas: savedCas(tab.cas),
+    buffer: keepsText ? (readBuffer(tab.id)?.text ?? tab.initialText ?? "") : null,
+  };
+}
+
 function savedTab(tab: Tab, readBuffer: (tabId: string) => EditorBuffer | null): SavedTab {
+  if (tab.kind === "document") return savedDocument(tab, readBuffer);
   if (tab.kind !== "query") {
     return { id: tab.id, kind: tab.kind, title: tab.title, profile_id: tab.profileId, object_path: tab.path };
   }
@@ -109,16 +146,39 @@ export function toSavedWorkspace(
 
 export interface RestoredWorkspace {
   snapshot: WorkspaceSnapshot;
-  /** Titles of the table and object tabs dropped because their connection no longer exists. */
+  /** Titles of the table, object and document tabs dropped because their connection or path no longer exists. */
   closed: string[];
   /** Titles of the query tabs reopened without a connection because theirs no longer exists. */
   detached: string[];
 }
 
 /**
+ * A document tab as saved, or null when its path does not name a document (a collection and an ID). Its text, when
+ * kept, is unsaved: with a CAS it is edits to that document, without one a new document.
+ */
+function restoredDocument(entry: SavedTab, profileId: string): DocumentTabState | null {
+  const path: PathSegment[] = entry.object_path ?? [];
+  const id = path.at(-1);
+  if (keyspaceOfPath(path) === null || id?.kind !== "document") return null;
+  const cas = entry.document_cas ?? null;
+  const text = entry.buffer ?? null;
+  return {
+    id: entry.id,
+    kind: "document",
+    profileId,
+    path,
+    title: entry.title || id.name,
+    isNew: cas === null && text !== null,
+    cas,
+    dirty: text !== null,
+    initialText: text,
+  };
+}
+
+/**
  * The saved workspace as store tabs, keeping their ids. A query tab whose profile is gone reopens without a
- * connection (nor its query context, but it keeps its parameter drafts); a table or object tab whose profile is gone
- * is dropped. A saved auto-commit of null means on: the tab's mode must be definite, or nothing could run.
+ * connection (nor its query context, but it keeps its parameter drafts); a table, object or document tab whose profile
+ * is gone is dropped. A saved auto-commit of null means on: the tab's mode must be definite, or nothing could run.
  */
 export function fromSavedWorkspace(saved: SavedWorkspace, profileExists: (id: string) => boolean): RestoredWorkspace {
   const tabs: Tab[] = [];
@@ -149,6 +209,10 @@ export function fromSavedWorkspace(saved: SavedWorkspace, profileExists: (id: st
         queryContext: connected ? (entry.query_context ?? undefined) : undefined,
         params: savedParams(entry.params) ?? undefined,
       });
+    } else if (entry.kind === "document") {
+      const document = connected ? restoredDocument(entry, profileId) : null;
+      if (document) tabs.push(document);
+      else closed.push(entry.title);
     } else if (connected && entry.object_path?.length) {
       tabs.push({ id: entry.id, kind: entry.kind, profileId, path: entry.object_path, title: entry.title });
     } else {

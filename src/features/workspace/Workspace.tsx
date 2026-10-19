@@ -12,6 +12,8 @@ import { useTabStatus } from "@/stores/tabStatus";
 import { useWorkspace, type Tab } from "@/stores/workspace";
 import { useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
+import { DocumentTab } from "../documents/DocumentTab";
+import { keyspaceLabel, keyspaceOfPath } from "../explorer/fieldSamples";
 import { ObjectDetailView } from "../explorer/ObjectDetailView";
 import { QueryTab } from "../query/QueryTab";
 import { relationOf } from "../table-data/filterValue";
@@ -23,9 +25,9 @@ import { WelcomeScreen } from "./WelcomeScreen";
 const TAB_PANEL = "data-tab-panel";
 
 /**
- * A tab's content: a query tab's editor, a relation's table data, or any other object's detail. Memoized: changing one
- * tab (a parameter typed, a context picked) replaces `tabs` but keeps every other tab's object, so only that one
- * renders again (R-02c-4).
+ * A tab's content: a query tab's editor, a relation's table data, a Couchbase document, or any other object's detail.
+ * Memoized: changing one tab (a parameter typed, a context picked) replaces `tabs` but keeps every other tab's
+ * object, so only that one renders again (R-02c-4).
  */
 const TabContent = memo(function TabContent({ tab, active }: { tab: Tab; active: boolean }) {
   switch (tab.kind) {
@@ -37,10 +39,15 @@ const TabContent = memo(function TabContent({ tab, active }: { tab: Tab; active:
     }
     case "object":
       return <ObjectDetailView tab={tab} />;
+    case "document":
+      return <DocumentTab tab={tab} active={active} />;
   }
 });
 
-/** The tab's tooltip: its title and connection, and for a query tab bound to a script, the file (and if it is gone). */
+/**
+ * The tab's tooltip: its title and connection; for a query tab bound to a script, the file (and if it is gone); for a
+ * document, its collection (and that it is not saved yet).
+ */
 function tabTooltip(tab: Tab, profile: Profile | undefined, missing: boolean): string {
   const lines = [profile ? `${tab.title} · ${profile.name}` : tab.title];
   if (tab.kind === "query" && tab.scriptPath !== null) {
@@ -48,19 +55,25 @@ function tabTooltip(tab: Tab, profile: Profile | undefined, missing: boolean): s
     const resave = tab.textFromFile ? "" : "; ⌘S saves it again";
     lines.push(missing ? `${tab.scriptPath} — file missing${resave}` : tab.scriptPath);
   }
+  if (tab.kind === "document") {
+    const keyspace = keyspaceOfPath(tab.path);
+    if (keyspace) lines.push(keyspaceLabel(keyspace));
+    if (tab.isNew) lines.push("New document — not saved yet");
+  }
   return lines.join("\n");
 }
 
 /**
  * One tab in the strip: its connection's engine icon leads it and its colour underlines it; a query tab shows a
- * spinner while it works and a dot when its script has unsaved changes. Every way of closing it goes through the close
- * guards. It scrolls itself into view when it becomes the active tab.
+ * spinner while it works, and a query tab or a document a dot when it has unsaved changes. Every way of closing it
+ * goes through the close guards. It scrolls itself into view when it becomes the active tab.
  */
 function TabLabel({ tab, active, profile }: { tab: Tab; active: boolean; profile: Profile | undefined }) {
   const activate = useWorkspace((s) => s.activate);
   const status = useTabStatus(tab.id);
   const tint = profileColor(profile?.color);
   const query = tab.kind === "query";
+  const savable = query || tab.kind === "document";
   // However it became active (opened, ⌘1–9, ⌃Tab, the palette, the restored workspace), the strip shows it.
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -85,7 +98,7 @@ function TabLabel({ tab, active, profile }: { tab: Tab; active: boolean; profile
       {profile && <EngineIcon engine={profile.engine} size={12} />}
       {query && status.busy && <Loader2 size={11} className="shrink-0 animate-spin text-muted" aria-label="Running" />}
       <span className="truncate">
-        {query && status.dirty && (
+        {savable && status.dirty && (
           <span
             className={status.missing ? "text-warning" : undefined}
             aria-label={status.missing ? "File missing" : "Unsaved changes"}

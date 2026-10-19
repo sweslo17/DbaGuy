@@ -3,6 +3,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .couchbase import CAS_PATTERN
 from .execution import PARAM_NAME, QueryContext
 from .metadata import PathSegment
 
@@ -26,18 +27,20 @@ class WorkspaceTab(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1, max_length=100)
-    kind: Literal["query", "table", "object"]
+    kind: Literal["query", "table", "object", "document"]
     title: str = ""
     profile_id: UUID | None = None
     database: str | None = None
     script_path: str | None = None  # relative to the scripts folder
-    object_path: list[PathSegment] | None = None
-    buffer: str | None = None  # the editor text, unsaved changes included
+    object_path: list[PathSegment] | None = None  # a document tab's: bucket, scope, collection, then `document` (its ID)
+    buffer: str | None = None  # the editor text, unsaved changes included; a document tab keeps it only when unsaved
     cursor: int | None = Field(default=None, ge=0)  # UTF-16 code units
     selection: TextSelection | None = None
     autocommit: bool | None = None
     query_context: TabQueryContext | None = None  # Couchbase
     params: dict[ParamName, ParamDraft] | None = Field(default=None, max_length=MAX_PARAM_DRAFTS)
+    # Couchbase document tab: the CAS its unsaved `buffer` is based on (decimal text); None for a new document
+    document_cas: str | None = Field(default=None, pattern=CAS_PATTERN)
 
 
 class WorkspaceState(BaseModel):

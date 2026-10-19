@@ -555,6 +555,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
               dialect={dialect}
               pageSize={settings.run.page_size}
               plans={plans}
+              documentsProfileId={engine?.documents && tab.profileId !== null ? tab.profileId : null}
               onExport={openExport}
               locate={locate}
               onJump={jump}

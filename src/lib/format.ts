@@ -32,3 +32,17 @@ export function formatRelativeTime(at: number, now: number): string {
   }
   return relativeTime.format(0, "second");
 }
+
+/**
+ * How long after `now` the time `at` is (ms since the epoch), in the same units as `formatRelativeTime`: "in 5 days",
+ * "in 13 yr." (years are 365 days, months 30: approximate, so the exact time belongs in a tooltip). Under a minute it
+ * counts seconds, never "now" for a time that has not come. "expired" once `at` is not after `now`.
+ */
+export function formatTimeUntil(at: number, now: number): string {
+  const remaining = at - now;
+  if (remaining <= 0) return "expired";
+  for (const [unit, size] of RELATIVE_UNITS) {
+    if (remaining >= size) return relativeTime.format(Math.floor(remaining / size), unit);
+  }
+  return relativeTime.format(Math.max(1, Math.floor(remaining / 1000)), "second");
+}

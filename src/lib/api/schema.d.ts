@@ -2499,7 +2499,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "query" | "table" | "object";
+            kind: "query" | "table" | "object" | "document";
             /**
              * Title
              * @default
@@ -2526,6 +2526,8 @@ export interface components {
             params?: {
                 [key: string]: string;
             } | null;
+            /** Document Cas */
+            document_cas?: string | null;
         };
     };
     responses: never;

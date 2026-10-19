@@ -1,9 +1,16 @@
+import { isolateHistory } from "@codemirror/commands";
 import { Compartment, EditorSelection, EditorState, Transaction, type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, type Ref } from "react";
 import type { Dialect } from "@/lib/api/types";
 import { useAppSettings } from "@/stores/settings";
-import { baseExtensions, editorOptions, reconfigureEffects, type EditorOptions } from "./extensions";
+import {
+  baseExtensions,
+  editorOptions,
+  reconfigureEffects,
+  type EditorLanguage,
+  type EditorOptions,
+} from "./extensions";
 
 export interface CodeEditorHandle {
   view: EditorView;
@@ -22,6 +29,11 @@ export interface CodeEditorHandle {
    * cursor ends after it, in view, and the editor takes the focus.
    */
   insert(text: string): void;
+  /**
+   * Replaces the whole text (a formatter's result) as one undoable change of its own, never merged with typing around
+   * it: undo brings the text back. The cursor goes to the start, in view.
+   */
+  replaceAll(text: string): void;
 }
 
 /** An editor's text and main selection. */
@@ -33,8 +45,10 @@ export interface EditorContent {
 export interface CodeEditorProps {
   initialText: string;
   initialSelection?: { anchor: number; head: number };
-  /** The language mode; null → generic SQL. */
+  /** The SQL mode; null → generic SQL. Ignored for `language="json"`. */
   dialect: Dialect | null;
+  /** What the text is: SQL (the default) or JSON (a Couchbase document). */
+  language?: EditorLanguage;
   /** No typing (the text can still be set through the handle). */
   readOnly?: boolean;
   /** The text changed. Called on every keystroke, so it carries no text: read it (`getText`) only when needed. */
@@ -60,14 +74,15 @@ const NONE: Extension[] = [];
 const clamp = (pos: number, length: number) => Math.min(Math.max(0, pos), length);
 
 /**
- * A CodeMirror 6 SQL editor. The `EditorView` is created once and lives as long as the component, so undo history,
- * selection and scroll survive while a hidden tab stays mounted. Settings and dialect changes reconfigure it through
- * compartments; it is never recreated.
+ * A CodeMirror 6 editor for SQL, or for JSON (a Couchbase document). The `EditorView` is created once and lives as
+ * long as the component, so undo history, selection and scroll survive while a hidden tab stays mounted. Settings,
+ * dialect and language changes reconfigure it through compartments; it is never recreated.
  */
 export function CodeEditor({
   initialText,
   initialSelection,
   dialect,
+  language = "sql",
   readOnly = false,
   onChange,
   onSelectionChange,
@@ -79,7 +94,10 @@ export function CodeEditor({
   const viewRef = useRef<EditorView | null>(null);
   const { settings } = useAppSettings();
   const editor = settings.editor;
-  const options = useMemo(() => editorOptions(editor, dialect, readOnly), [editor, dialect, readOnly]);
+  const options = useMemo(
+    () => editorOptions(editor, dialect, readOnly, language),
+    [editor, dialect, readOnly, language],
+  );
   // What the view is configured with now: the reconfigure effects only swap what changed since.
   const applied = useRef<{ options: EditorOptions; extensions: Extension[] }>({ options, extensions });
   const latest = useRef({ initialText, initialSelection, options, extensions, onChange, onSelectionChange, onUnmount });
@@ -177,6 +195,16 @@ export function CodeEditor({
             userEvent: "input.paste", // its own undo step, like a paste
           });
           view.focus();
+        },
+        replaceAll: (text) => {
+          const view = current();
+          view.dispatch({
+            changes: { from: 0, to: view.state.doc.length, insert: view.state.toText(text) },
+            selection: EditorSelection.cursor(0),
+            scrollIntoView: true,
+            userEvent: "format",
+            annotations: isolateHistory.of("full"), // its own undo step, never merged with typing around it
+          });
         },
       };
     },

@@ -35,7 +35,7 @@ export function clearPendingWorkspace(): void {
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
-const TAB_KINDS: ReadonlySet<unknown> = new Set(["query", "table", "object"]);
+const TAB_KINDS: ReadonlySet<unknown> = new Set(["query", "table", "object", "document"]);
 
 /** The stored copy, if it reads as a workspace; tabs without a usable id or kind are left out. */
 function asPending(value: unknown): PendingWorkspace | null {

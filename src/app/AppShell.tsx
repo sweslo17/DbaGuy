@@ -5,6 +5,7 @@ import { Group, Panel, useDefaultLayout } from "react-resizable-panels";
 import symbol from "@/assets/symbol-64.png";
 import { PanelHandle } from "@/components/ui/PanelHandle";
 import { Toaster } from "@/components/ui/Toast";
+import { OpenDocumentDialogHost } from "@/features/documents/OpenDocumentDialog";
 import { openSettings, SettingsDialogHost } from "@/features/settings/SettingsDialog";
 import { saveWorkspaceNow, useWorkspaceSaveFailing } from "@/features/workspace/workspaceSync";
 import { api, unwrap } from "@/lib/api/client";
@@ -88,6 +89,7 @@ export function AppShell({ sidebar, workspace }: { sidebar: ReactNode; workspace
       </div>
       <Toaster />
       <SettingsDialogHost />
+      <OpenDocumentDialogHost />
     </div>
   );
 }

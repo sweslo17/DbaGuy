@@ -81,6 +81,8 @@ export interface ResultsAreaProps extends Omit<RunMessagesProps, "run"> {
   pageSize: number;
   /** The connection's engine draws plans (Couchbase): a `plan` set shows the plan view, switchable to the grid. */
   plans: PlanSupport | null;
+  /** The connection when its engine opens documents by ID (Couchbase): a cell's menu offers "Open document…". */
+  documentsProfileId: string | null;
   /** Opens the tab's export dialog for a result's statement and what it was sent with; stable across renders. */
   onExport: (sql: string, request: RequestOptions) => void;
 }
@@ -101,6 +103,7 @@ export function ResultsArea({
   dialect,
   pageSize,
   plans,
+  documentsProfileId,
   onExport,
   ...messages
 }: ResultsAreaProps) {
@@ -163,6 +166,7 @@ export function ResultsArea({
               controller={controller}
               pageSize={pageSize}
               dialect={dialect}
+              documentsProfileId={documentsProfileId}
               hidden={!drawsPlan && tab.key !== selected}
             />
           );

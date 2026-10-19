@@ -196,6 +196,21 @@ def test_workspace_keeps_object_tabs(tmp_path):
     assert WorkspaceService(tmp_path / "workspace.json").get() == state
 
 
+def test_workspace_keeps_document_tabs(tmp_path):  # Review Focus 5, ruling C15
+    path = [{"kind": "bucket", "name": "dbaguy"}, {"kind": "scope", "name": "app"},
+            {"kind": "collection", "name": "users"}, {"kind": "document", "name": "u 1/😀"}]
+    state = WorkspaceState.model_validate({"tabs": [
+        {"id": "d1", "kind": "document", "title": "u 1/😀", "object_path": path, "buffer": '{"a": 1}',
+         "document_cas": "1792325990605258752"},
+        {"id": "d2", "kind": "document", "title": "u2", "object_path": path[:3] + [{"kind": "document", "name": "u2"}]},
+    ]})
+    service = WorkspaceService(tmp_path / "workspace.json")
+    service.put(state)
+    assert service.get() == state
+    with pytest.raises(ValidationError):
+        WorkspaceTab(id="d3", kind="document", document_cas="12ab")
+
+
 def test_an_invalid_tab_is_dropped_alone_with_a_warning_naming_its_fields(tmp_path, logged_warnings):
     path = tmp_path / "workspace.json"
     path.write_text(json.dumps({"tabs": [
