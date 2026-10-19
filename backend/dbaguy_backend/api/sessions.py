@@ -8,7 +8,15 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from ..container import AppContainer
 from ..domain.errors import DomainError, NotFound, SessionNotFound
-from ..domain.execution import CancelCommand, ClientCommand, ErrorEvent, ExecutionSchema, FinishedEvent
+from ..domain.execution import (
+    ApplyEditsCommand,
+    CancelCommand,
+    ClientCommand,
+    EditOutcomeEvent,
+    ErrorEvent,
+    ExecutionSchema,
+    FinishedEvent,
+)
 from ..sessions.manager import SessionCreateRequest, SessionInfo
 from .deps import get_container, require_token, websocket_token_ok
 
@@ -23,13 +31,18 @@ async def _reject(websocket: WebSocket, code: int, reason: str) -> None:
     await websocket.close(code=code, reason=reason)
 
 
-async def _fail_request(outbox: asyncio.Queue[dict[str, Any] | None], request_id: str, message: str, code: str) -> None:
-    """Answer a request the worker never ran: an error plus the `finished` every request must end with.
+async def _fail_request(
+    outbox: asyncio.Queue[dict[str, Any] | None], request_id: str, message: str, code: str, *, apply: bool = False,
+) -> None:
+    """Answer a request the worker never ran: an error plus the `finished` every request must end with — for an
+    apply, with its `edit_outcome` (rolled back: nothing was sent) right before it (ruling E1, pre-flight M1).
 
     `in_transaction` is false because the connection belongs to the worker thread and may already be gone.
     """
     await outbox.put(ErrorEvent(request_id=request_id, message=message, code=code).model_dump(mode="json"))
     if request_id:
+        if apply:
+            await outbox.put(EditOutcomeEvent(request_id=request_id, outcome="rolled_back").model_dump(mode="json"))
         finished = FinishedEvent(request_id=request_id, elapsed_ms=0, in_transaction=False, cancelled=False)
         await outbox.put(finished.model_dump(mode="json"))
 
@@ -85,7 +98,10 @@ async def session_socket(websocket: WebSocket, session_id: str) -> None:
                 command = _COMMANDS.validate_python(raw)
             except ValidationError as exc:
                 request_id = str(raw.get("request_id", "")) if isinstance(raw, dict) else ""
-                await _fail_request(outbox, request_id, f"Invalid command: {exc.errors()[0]['msg']}", "invalid_command")
+                apply = isinstance(raw, dict) and raw.get("type") == "apply_edits"
+                await _fail_request(
+                    outbox, request_id, f"Invalid command: {exc.errors()[0]['msg']}", "invalid_command", apply=apply,
+                )
                 continue
             try:
                 # submit() and cancel() can wait on the worker's state lock (a cancel holds it across a PG cancel),
@@ -95,7 +111,8 @@ async def session_socket(websocket: WebSocket, session_id: str) -> None:
                 else:
                     await asyncio.to_thread(worker.submit, command)
             except DomainError as exc:
-                await _fail_request(outbox, command.request_id, exc.message, exc.code)
+                apply = isinstance(command, ApplyEditsCommand)
+                await _fail_request(outbox, command.request_id, exc.message, exc.code, apply=apply)
     except WebSocketDisconnect:
         pass
     finally:

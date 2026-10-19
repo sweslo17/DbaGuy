@@ -833,6 +833,22 @@ export interface components {
             /** Scripts Dir */
             scripts_dir?: string | null;
         };
+        /**
+         * ApplyEditsCommand
+         * @description Apply a previewed grid-edit plan (spec ⑤ §3.5): its statements exactly as previewed, in one transaction on this
+         *     session. A Cancel stops it until its COMMIT has been sent.
+         */
+        ApplyEditsCommand: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "apply_edits";
+            /** Request Id */
+            request_id: string;
+            /** Plan Id */
+            plan_id: string;
+        };
         /** BrowseSelectRequest */
         BrowseSelectRequest: {
             /**
@@ -1243,6 +1259,38 @@ export interface components {
              */
             deletes: number;
         };
+        /**
+         * EditOutcomeEvent
+         * @description How an apply ended (spec ⑤ R-05-6): sent once, right before the request's `session_state` and `finished`.
+         */
+        EditOutcomeEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "edit_outcome";
+            /** Request Id */
+            request_id: string;
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "committed" | "rolled_back" | "partial" | "unknown";
+            /**
+             * Applied
+             * @default []
+             */
+            applied: string[];
+            /**
+             * Already Gone
+             * @default []
+             */
+            already_gone: string[];
+            /** Failed Change */
+            failed_change?: string | null;
+            /** Statement */
+            statement?: number | null;
+        };
         /** EditPreview */
         EditPreview: {
             /** Plan Id */
@@ -1462,9 +1510,9 @@ export interface components {
          */
         ExecutionSchema: {
             /** Command */
-            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["ExportCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"] | components["schemas"]["CommitCommand"] | components["schemas"]["RollbackCommand"] | components["schemas"]["SetAutocommitCommand"];
+            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["ExportCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"] | components["schemas"]["CommitCommand"] | components["schemas"]["RollbackCommand"] | components["schemas"]["SetAutocommitCommand"] | components["schemas"]["ApplyEditsCommand"];
             /** Event */
-            event: components["schemas"]["StartedEvent"] | components["schemas"]["ResultSetEvent"] | components["schemas"]["RowsEvent"] | components["schemas"]["ResultSetEndEvent"] | components["schemas"]["AffectedEvent"] | components["schemas"]["MessageEvent"] | components["schemas"]["ErrorEvent"] | components["schemas"]["ProgressEvent"] | components["schemas"]["ConfirmationRequiredEvent"] | components["schemas"]["SessionStateEvent"] | components["schemas"]["FinishedEvent"];
+            event: components["schemas"]["StartedEvent"] | components["schemas"]["ResultSetEvent"] | components["schemas"]["RowsEvent"] | components["schemas"]["ResultSetEndEvent"] | components["schemas"]["AffectedEvent"] | components["schemas"]["MessageEvent"] | components["schemas"]["ErrorEvent"] | components["schemas"]["ProgressEvent"] | components["schemas"]["ConfirmationRequiredEvent"] | components["schemas"]["SessionStateEvent"] | components["schemas"]["FinishedEvent"] | components["schemas"]["EditOutcomeEvent"];
         };
         /**
          * ExportCommand

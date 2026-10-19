@@ -268,6 +268,24 @@ def test_command_rejected_by_a_closed_session_gets_an_error_and_finished(client,
     assert finished["type"] == "finished" and finished["request_id"] == "late" and finished["cancelled"] is False
 
 
+def test_every_apply_ends_with_its_edit_outcome_even_one_the_worker_never_ran(client, sqlite_profile_id):  # E1, M1
+    sid = client.post("/sessions", json={"profile_id": sqlite_profile_id}, headers=AUTH).json()["session_id"]
+    with client.websocket_connect(f"{WS_BASE}/sessions/{sid}/ws?token={TOKEN}") as ws:
+        ws.send_json({"type": "apply_edits", "request_id": "r", "plan_id": ""})  # refused by the protocol model
+        invalid = [receive(ws) for _ in range(3)]
+        ws.send_json({"type": "apply_edits", "request_id": "gone", "plan_id": "never-previewed"})  # the worker's own
+        expired = [receive(ws) for _ in range(4)]
+        client.app.state.container.sessions.worker(sid).close()  # the socket stays attached to a dead worker
+        ws.send_json({"type": "apply_edits", "request_id": "late", "plan_id": "p"})
+        busy = [receive(ws) for _ in range(3)]
+    for events, rid, code in ((invalid, "r", "invalid_command"), (busy, "late", "session_busy")):
+        assert [(e["type"], e["request_id"]) for e in events] == [
+            ("error", rid), ("edit_outcome", rid), ("finished", rid)]
+        assert (events[0]["code"], events[1]["outcome"], events[1]["applied"]) == (code, "rolled_back", [])
+    assert [e["type"] for e in expired] == ["started", "error", "edit_outcome", "finished"]
+    assert (expired[1]["code"], expired[2]["outcome"]) == ("plan_expired", "rolled_back")
+
+
 def test_websocket_rejects_bad_token(client, sqlite_profile_id):
     sid = client.post("/sessions", json={"profile_id": sqlite_profile_id}, headers=AUTH).json()["session_id"]
     with pytest.raises(WebSocketDisconnect):

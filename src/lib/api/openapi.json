@@ -3077,6 +3077,33 @@
         "title": "AppSettings",
         "description": "The app preferences (`settings.json`). Persisted, so a newer build's extra fields are tolerated on read and\nkept on write; input from the API stays strict."
       },
+      "ApplyEditsCommand": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "apply_edits",
+            "title": "Type",
+            "default": "apply_edits"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "plan_id": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Plan Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "plan_id"
+        ],
+        "title": "ApplyEditsCommand",
+        "description": "Apply a previewed grid-edit plan (spec \u2464 \u00a73.5): its statements exactly as previewed, in one transaction on this\nsession. A Cancel stops it until its COMMIT has been sent."
+      },
       "BrowseSelectRequest": {
         "properties": {
           "profile_id": {
@@ -4079,6 +4106,75 @@
         "type": "object",
         "title": "EditCounts"
       },
+      "EditOutcomeEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "edit_outcome",
+            "title": "Type",
+            "default": "edit_outcome"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "committed",
+              "rolled_back",
+              "partial",
+              "unknown"
+            ],
+            "title": "Outcome"
+          },
+          "applied": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Applied",
+            "default": []
+          },
+          "already_gone": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Already Gone",
+            "default": []
+          },
+          "failed_change": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failed Change"
+          },
+          "statement": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Statement"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "outcome"
+        ],
+        "title": "EditOutcomeEvent",
+        "description": "How an apply ended (spec \u2464 R-05-6): sent once, right before the request's `session_state` and `finished`."
+      },
       "EditPreview": {
         "properties": {
           "plan_id": {
@@ -4668,12 +4764,16 @@
               },
               {
                 "$ref": "#/components/schemas/SetAutocommitCommand"
+              },
+              {
+                "$ref": "#/components/schemas/ApplyEditsCommand"
               }
             ],
             "title": "Command",
             "discriminator": {
               "propertyName": "type",
               "mapping": {
+                "apply_edits": "#/components/schemas/ApplyEditsCommand",
                 "cancel": "#/components/schemas/CancelCommand",
                 "commit": "#/components/schemas/CommitCommand",
                 "discard": "#/components/schemas/DiscardCommand",
@@ -4719,6 +4819,9 @@
               },
               {
                 "$ref": "#/components/schemas/FinishedEvent"
+              },
+              {
+                "$ref": "#/components/schemas/EditOutcomeEvent"
               }
             ],
             "title": "Event",
@@ -4727,6 +4830,7 @@
               "mapping": {
                 "affected": "#/components/schemas/AffectedEvent",
                 "confirmation_required": "#/components/schemas/ConfirmationRequiredEvent",
+                "edit_outcome": "#/components/schemas/EditOutcomeEvent",
                 "error": "#/components/schemas/ErrorEvent",
                 "finished": "#/components/schemas/FinishedEvent",
                 "message": "#/components/schemas/MessageEvent",

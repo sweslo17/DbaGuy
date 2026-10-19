@@ -114,6 +114,12 @@ export type EditWarning = S["EditWarning"];
 export type EditCounts = S["EditCounts"];
 /** Grid editing (spec ⑤ §3.4): the preview of a commit: its statements, problems, warnings and, when none, a one-time plan id. */
 export type EditPreview = S["EditPreview"];
+/** Grid editing (spec ⑤ §3.5): apply a previewed plan on the tab's session, its statements exactly as previewed, in one transaction. */
+export type ApplyEditsCommand = S["ApplyEditsCommand"];
+/** Grid editing (spec ⑤ R-05-6): how an apply ended, sent once right before its `session_state` and `finished`. */
+export type EditOutcomeEvent = S["EditOutcomeEvent"];
+/** "committed", "rolled_back" (nothing was applied), "partial" (a table that cannot roll back) or "unknown". */
+export type EditOutcome = EditOutcomeEvent["outcome"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");
