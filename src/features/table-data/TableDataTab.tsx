@@ -17,7 +17,7 @@ import { DataGrid } from "../grid/DataGrid";
 import { ExportDialog } from "../grid/ExportDialog";
 import type { GridSort } from "../grid/GridHeader";
 import { useHeldResult } from "../grid/useHeldResult";
-import { CONNECTION_LOST } from "../session/execution";
+import { CONNECTION_LOST, firstPageDelivered } from "../session/execution";
 import { isExporting } from "../session/SessionController";
 import { useSessionGuards } from "../session/SessionGuards";
 import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
@@ -161,8 +161,9 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   const [exportOpen, setExportOpen] = useState(false);
   const openExport = useCallback(() => setExportOpen(true), []);
   const phase = snapshot?.phase ?? "opening";
-  const current = execution?.resultSets[0] ?? null;
-  // Until a sort, filter or refresh delivers its first page, the grid keeps the previous rows (and its layout), dimmed.
+  // Until a sort, filter or refresh has its whole first page, the grid keeps the previous rows (and its layout),
+  // dimmed: it never flashes empty, and a re-run that keeps the position finds it (A12).
+  const current = firstPageDelivered(execution) ? (execution?.resultSets[0] ?? null) : null;
   const shown = useHeldResult(current, table.pending);
   const set = shown.value;
   const columns = set?.columns;
@@ -278,6 +279,7 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
             loadingMore={execution?.status === "running"}
             onLoadMore={phase === "open" ? table.loadMore : undefined}
             stale={shown.stale}
+            resetScrollOn={table.position}
             dialect={dialect}
             tableName={tableName}
             sort={gridSort}

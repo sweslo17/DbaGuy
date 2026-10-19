@@ -1,10 +1,5 @@
 import { useState } from "react";
 
-/** Arrays with the same elements, in the same order. */
-export function sameElements<T>(a: readonly T[], b: readonly T[]): boolean {
-  return a.length === b.length && a.every((item, index) => item === b[index]);
-}
-
 /**
  * What a result view shows: `current` once the latest request has delivered it; while that request is still `pending`
  * without one, the value shown before it (`stale`), so a re-run (sort, filter, refresh, the same query again) keeps

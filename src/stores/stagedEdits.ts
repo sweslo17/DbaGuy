@@ -8,7 +8,7 @@ import {
   type StageAction,
   type StagedEdits,
 } from "@/features/edits/staging";
-import { sameElements } from "@/features/grid/useHeldResult";
+import { sameElements } from "@/lib/arrays";
 
 /*
  * The table-data tabs' staged grid edits, by tab id (spec ⑤ §3.6.1). Outside React, like `editorBuffers`: the one

@@ -60,6 +60,11 @@ export interface DataGridProps {
    * delivers its first page (`useHeldResult`); nothing more is loaded for them.
    */
   stale?: boolean;
+  /**
+   * A value whose change scrolls the grid back to the top; by default the column list (every new result). A table data
+   * tab passes its browse's position, so a re-run that keeps it (Refresh, a commit) keeps the scroll (D-05-12).
+   */
+  resetScrollOn?: unknown;
   /** Dialect of the copy formats that need one (INSERT, IN list), and of the formats offered; null while unknown. */
   dialect: Dialect | null;
   /** INSERT copies target this table (table data); else a `table_name` placeholder. */
@@ -164,13 +169,17 @@ export function DataGrid(props: DataGridProps) {
   useLayoutEffect(() => {
     columnVirtualizer.measure();
   }, [columnVirtualizer, layout.widths]);
-  // Incremental loading asks once per row count (see below); a new result starts over, at the top. A result with
-  // other columns also starts at the left; the same columns (a sort, a refresh) keep the horizontal position.
+  // Incremental loading asks once per row count (see below), for each new result. A new result starts at the top unless
+  // the caller keeps the position (`resetScrollOn`), but never with other columns. A result with other columns also
+  // starts at the left; the same columns (a sort, a refresh) keep the horizontal position.
   const requestedAt = useRef(-1);
+  const scrollReset = props.resetScrollOn === undefined ? columns : props.resetScrollOn;
   useLayoutEffect(() => {
     requestedAt.current = -1;
-    scrollRef.current?.scrollTo({ top: 0 });
   }, [columns]);
+  useLayoutEffect(() => {
+    scrollRef.current?.scrollTo({ top: 0 });
+  }, [scrollReset, signature]);
   useLayoutEffect(() => {
     scrollRef.current?.scrollTo({ left: 0 });
   }, [signature]);

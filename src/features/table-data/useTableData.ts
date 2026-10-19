@@ -1,9 +1,16 @@
-import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import type { PathSegment } from "@/lib/api/types";
 import type { TableTabState } from "@/stores/workspace";
-import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
-import { isExporting, PAGE_SIZE, type SessionController, type SessionSnapshot } from "../session/SessionController";
+import { useEngineInfo } from "../connections/hooks";
+import { firstPageDelivered, INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
+import {
+  isExporting,
+  MAX_PAGE_SIZE,
+  PAGE_SIZE,
+  type SessionController,
+  type SessionSnapshot,
+} from "../session/SessionController";
 import { useSession } from "../session/useSession";
 import { clearFilterHistory, readFilterHistory, rememberFilter } from "./filterHistory";
 import { relationOf, type Relation } from "./filterValue";
@@ -34,13 +41,23 @@ export interface TableDataState {
 interface Job {
   run: number;
   sql: string;
+  /** Rows of its first page. */
+  pageSize: number;
 }
 
 /** The applied browse: what the grid shows (or is loading). */
 interface BrowseJob extends Job {
   filter: string;
   sorts: SortKey[];
+  /**
+   * Changes when the grid should start again at the top (a new filter or sort); a re-run that keeps the position
+   * (Refresh, the re-read after a commit: D-05-12) keeps it.
+   */
+  position: number;
 }
+
+/** The first page of a re-run that keeps the position: the rows loaded now (at least a page, at most MAX_PAGE_SIZE). */
+export const keptPageSize = (loaded: number) => Math.min(MAX_PAGE_SIZE, Math.max(PAGE_SIZE, loaded));
 
 /** A count asked for `filter`; `sql` is null while it is being built. */
 interface CountJob {
@@ -109,7 +126,7 @@ function useSessionJob<J extends Job>(
     const previous = sent.current?.controller === controller ? sent.current : null;
     if (previous?.run === job.run) return;
     if (previous) endRequest(controller, previous.requestId);
-    const requestId = controller.execute(job.sql, { history: false, pageSize: PAGE_SIZE });
+    const requestId = controller.execute(job.sql, { history: false, pageSize: job.pageSize });
     sent.current = { controller, run: job.run, requestId };
     setCurrent({ requestId, job });
   }, [controller, phase, exporting, job]);
@@ -160,7 +177,10 @@ export function useTableData(tab: TableTabState, active: boolean) {
   const countRuns = useRef(0);
 
   const sentBrowse = useSessionJob(data.controller, data.snapshot, browseJob);
-  const countReady = useMemo(() => (countJob?.sql ? { run: countJob.run, sql: countJob.sql } : null), [countJob]);
+  const countReady = useMemo(
+    () => (countJob?.sql ? { run: countJob.run, sql: countJob.sql, pageSize: PAGE_SIZE } : null),
+    [countJob],
+  );
   const sentCount = useSessionJob(countController, countSnapshot, countReady);
   const execution: ExecutionState | null = sentBrowse
     ? (data.snapshot?.executions[sentBrowse.requestId] ?? null)
@@ -187,7 +207,14 @@ export function useTableData(tab: TableTabState, active: boolean) {
           if (ticket !== builds.current) return;
           setBuildError(null);
           if (newFilter) setFilterError(null);
-          setBrowseJob((job) => ({ run: (job?.run ?? 0) + 1, sql, filter: nextFilter, sorts }));
+          setBrowseJob((job) => ({
+            run: (job?.run ?? 0) + 1,
+            sql,
+            filter: nextFilter,
+            sorts,
+            pageSize: PAGE_SIZE,
+            position: (job?.position ?? 0) + 1,
+          }));
         },
         (error: unknown) => {
           if (ticket !== builds.current) return;
@@ -247,13 +274,33 @@ export function useTableData(tab: TableTabState, active: boolean) {
     (column: string, descending: boolean) => browse(filter, [{ column, descending }]),
     [browse, filter],
   );
-  /** Runs the applied browse again (or builds the first one if that failed); a finished count is out of date. */
+  // D-05-12 (CR-1: only an engine whose table data can be edited): a re-run reloads as many rows as are loaded and the
+  // grid keeps its position. Read when the re-run is asked for, never as a dependency (rows arrive page by page).
+  const keepsPosition = useEngineInfo(profileId)?.row_editing === true;
+  const loaded = useRef(0);
+  useLayoutEffect(() => {
+    // The rows of a request that has its first page: one still loading it holds fewer, and a second Refresh pressed
+    // meanwhile must reload what the grid shows (the held rows), not what has arrived so far.
+    const set = execution?.resultSets[0];
+    if (set && firstPageDelivered(execution)) loaded.current = set.rows.length;
+  });
+  /**
+   * Runs the applied browse again (or builds the first one if that failed); a finished count is out of date. Where the
+   * engine can edit rows, it loads as many rows as are loaded now (up to MAX_PAGE_SIZE) and keeps the grid's position.
+   */
   const refresh = useCallback(() => {
     setBuildError(null);
     if (!countRunning) setCountJob(null);
-    if (browseJob) setBrowseJob((job) => job && { ...job, run: job.run + 1 });
-    else browse("", []);
-  }, [browse, browseJob, countRunning]);
+    if (!browseJob) {
+      browse("", []);
+      return;
+    }
+    setBrowseJob((job) =>
+      job && keepsPosition
+        ? { ...job, run: job.run + 1, pageSize: keptPageSize(loaded.current) }
+        : job && { ...job, run: job.run + 1, pageSize: PAGE_SIZE, position: job.position + 1 },
+    );
+  }, [browse, browseJob, countRunning, keepsPosition]);
   /** Stops a browse that has not delivered its first page yet. */
   const cancel = useCallback(() => {
     if (sentBrowse) data.controller?.cancel(sentBrowse.requestId);
@@ -285,6 +332,10 @@ export function useTableData(tab: TableTabState, active: boolean) {
   /** Escape (the input shows the applied filter again) or an edit: the rejected text is no longer what is shown. */
   const clearFilterError = useCallback(() => setFilterError(null), []);
 
+  // The request whose first page is shown: a commit whose outcome was unknown waits for another one (fresh rows, R-05-6),
+  // a Refresh or the same browse sent again on a new session alike.
+  const deliveredRequest = sentBrowse && firstPageDelivered(execution) ? sentBrowse.requestId : null;
+
   const state: TableDataState = {
     filter,
     sorts: browseJob?.sorts ?? [],
@@ -302,6 +353,10 @@ export function useTableData(tab: TableTabState, active: boolean) {
     state,
     execution,
     pending,
+    /** Changes only when the grid should scroll back to the top (D-05-12). */
+    position: browseJob?.position ?? 0,
+    /** The browse request whose first page is in (null while one loads). */
+    deliveredRequest,
     controller: data.controller,
     snapshot: data.snapshot,
     relation,

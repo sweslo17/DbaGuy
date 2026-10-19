@@ -1,7 +1,7 @@
 import type { ColumnCategory, ColumnMeta, EditKind } from "@/lib/api/types";
+import { sameElements } from "@/lib/arrays";
 import { describeCell } from "@/lib/cells";
 import type { CellMark, RowMark } from "../grid/marks";
-import { sameElements } from "../grid/useHeldResult";
 import { displayCell, sameCell } from "./cells";
 import {
   hasChanges,
