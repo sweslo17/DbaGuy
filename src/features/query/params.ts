@@ -1,6 +1,7 @@
 import type { EditorState, Extension } from "@codemirror/state";
 import { ViewPlugin, type EditorView, type ViewUpdate } from "@codemirror/view";
 import type { StatementParams } from "@/lib/api/types";
+import { PARAM_NAME } from "@/lib/paramNames";
 import { statementsField } from "../editor/statements";
 import { parseJson } from "../grid/json";
 
@@ -13,8 +14,6 @@ import { parseJson } from "../grid/json";
  * refuses gets no field, so a statement that uses one is sent without it and the server answers with its own error.
  */
 
-/** A parameter's name without its `$` / `@`; the backend's `PARAM_NAME` (`domain/execution.py`). */
-export const PARAM_NAME = "[A-Za-z_][A-Za-z0-9_]*";
 /** `StatementParams` takes at most this many positional values. */
 export const MAX_POSITIONAL = 200;
 

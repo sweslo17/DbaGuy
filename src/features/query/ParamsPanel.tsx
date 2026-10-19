@@ -45,6 +45,7 @@ const ParamRow = memo(function ParamRow({ name, value, htmlId, onChange, registe
         autoCorrect="off"
         autoCapitalize="off"
         autoComplete="off"
+        aria-label={`${name} value`}
         aria-invalid={invalid}
         aria-describedby={invalid ? `${htmlId}-hint` : undefined}
         onChange={(event) => {

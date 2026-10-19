@@ -46,6 +46,15 @@ const NO_FIELDS: string[] = [];
 const NO_DRAFTS: Record<string, string> = {};
 
 /**
+ * The keys that run: ⌘↵ by the `run.default` setting, ⌘⇧↵ every statement. The editor's keymap (`cm`, CodeMirror's
+ * spelling) and the parameter fields (`shift`, for `isCommandKey`) both read this, so they never differ.
+ */
+const RUN_KEYS: readonly { cm: string; shift: boolean; mode: RunMode }[] = [
+  { cm: "Mod-Enter", shift: false, mode: "default" },
+  { cm: "Shift-Mod-Enter", shift: true, mode: "all" },
+];
+
+/**
  * A query tab (spec §3.5, §4.1, §4.2): toolbar, then the editor above the results. Its session opens the first time
  * the tab is shown and closes with the tab, or reopens when the connection picker changes it; the editor lives as long
  * as the tab, so undo history survives tab switches. ⌘↵ runs the selection or (by `run.default`) the statement under
@@ -334,13 +343,14 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     rollback: { enabled: transactions !== false && canEnd, run: transaction.rollback },
   });
 
-  // ⌘↵ and ⌘⇧↵ run from a parameter's field as they do in the editor (which handles its own keys and prevents them).
+  // The run keys also work in a parameter's field (only there: not in the editor, which handles its own keys, nor in
+  // its search panel's checkboxes).
   const runFromParams = (e: KeyboardEvent<HTMLElement>) => {
     if (isImeKeyEvent(e) || e.defaultPrevented || !(e.target instanceof HTMLInputElement)) return;
-    const mode = isCommandKey(e, "enter") ? "default" : isCommandKey(e, "enter", { shift: true }) ? "all" : null;
-    if (!mode) return;
+    const key = RUN_KEYS.find(({ shift }) => isCommandKey(e, "enter", { shift }));
+    if (!key) return;
     e.preventDefault();
-    void start(mode);
+    void start(key.mode);
   };
 
   // The editor's keymap is built once: it calls the latest `start`, `format` and script commands through refs.
@@ -381,8 +391,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     // CodeMirror keymaps skip key events during IME composition, so ⌘↵ never runs half-composed text.
     Prec.highest(
       keymap.of([
-        { key: "Mod-Enter", run: () => runFromKey("default") },
-        { key: "Shift-Mod-Enter", run: () => runFromKey("all") },
+        ...RUN_KEYS.map(({ cm, mode }) => ({ key: cm, run: () => runFromKey(mode) })),
         { key: "Mod-e", run: explainFromKey },
         { key: "Mod-s", run: () => (scriptRef.current.save(), true) },
         { key: "Shift-Mod-s", run: () => (scriptRef.current.saveAs(), true) },
@@ -495,11 +504,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
         <Group orientation="vertical">
           <Panel id="editor" defaultSize="55%" minSize="15%">
             {/* The connection's colour as the editor's top border; the parameters' bar sits under the editor. */}
-            <div
-              className="flex h-full flex-col"
-              style={tint ? { borderTop: `2px solid ${tint}` } : undefined}
-              onKeyDown={runFromParams}
-            >
+            <div className="flex h-full flex-col" style={tint ? { borderTop: `2px solid ${tint}` } : undefined}>
               <div className="relative min-h-0 flex-1">
                 {script.loading && (
                   <span
@@ -526,14 +531,17 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
                 </div>
               </div>
               {takesParams && slots.named.length + slots.positional > 0 && (
-                <ParamsPanel
-                  slots={slots}
-                  drafts={drafts}
-                  open={paramsOpen}
-                  focus={focusParam}
-                  onToggle={() => setParamsOpen((open) => !open)}
-                  onChange={changeParam}
-                />
+                // `contents`: only the key handler's place in the DOM; the panel lays itself out in the column.
+                <div className="contents" onKeyDown={runFromParams}>
+                  <ParamsPanel
+                    slots={slots}
+                    drafts={drafts}
+                    open={paramsOpen}
+                    focus={focusParam}
+                    onToggle={() => setParamsOpen((open) => !open)}
+                    onChange={changeParam}
+                  />
+                </div>
               )}
             </div>
           </Panel>

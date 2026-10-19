@@ -1,8 +1,8 @@
 import type { SavedTab, SavedWorkspace, TextSelection } from "@/lib/api/types";
+import { PARAM_NAME } from "@/lib/paramNames";
 import { matchesFile } from "@/lib/scriptText";
 import type { EditorBuffer } from "@/stores/editorBuffers";
 import { startSelection, type QueryTabState, type Tab, type WorkspaceSnapshot } from "@/stores/workspace";
-import { PARAM_NAME } from "../query/params";
 
 /*
  * `workspace.json` ↔ the tab store (spec §4.8). A query tab keeps its connection, script binding, editor text,

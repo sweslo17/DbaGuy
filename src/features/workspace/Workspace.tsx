@@ -1,5 +1,5 @@
 import { Loader2, Plus, X } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { EngineIcon } from "@/components/EngineIcon";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import type { Profile } from "@/lib/api/types";
@@ -22,8 +22,12 @@ import { WelcomeScreen } from "./WelcomeScreen";
 /** The attribute that marks a tab's content with its tab id. */
 const TAB_PANEL = "data-tab-panel";
 
-/** A tab's content: a query tab's editor, a relation's table data, or any other object's detail. */
-function TabContent({ tab, active }: { tab: Tab; active: boolean }) {
+/**
+ * A tab's content: a query tab's editor, a relation's table data, or any other object's detail. Memoized: changing one
+ * tab (a parameter typed, a context picked) replaces `tabs` but keeps every other tab's object, so only that one
+ * renders again (R-02c-4).
+ */
+const TabContent = memo(function TabContent({ tab, active }: { tab: Tab; active: boolean }) {
   switch (tab.kind) {
     case "query":
       return <QueryTab tab={tab} active={active} />;
@@ -34,7 +38,7 @@ function TabContent({ tab, active }: { tab: Tab; active: boolean }) {
     case "object":
       return <ObjectDetailView tab={tab} />;
   }
-}
+});
 
 /** The tab's tooltip: its title and connection, and for a query tab bound to a script, the file (and if it is gone). */
 function tabTooltip(tab: Tab, profile: Profile | undefined, missing: boolean): string {
