@@ -224,6 +224,19 @@ def test_a_last_row_that_fills_the_budget_still_ends_the_answer(split_after_rows
     assert numbers(result, 200) == list(range(1, 100))
 
 
+def test_an_answer_already_whole_in_memory_is_never_full():  # its tail came in the read that crossed the budget
+    body = numbers_body(3000)
+    result, _, released = result_of(body[:200], body[200:], sql="SELECT n FROM ks", bare_star=False)
+    result.columns()
+    assert numbers(result, 5) == list(range(5))
+    budget = row_cost('{"n":100}') * 50  # crossed early in the second read, which holds the rest of the answer
+    step = result.read_ahead(budget)
+    while step.state is ReadAheadState.READING:
+        step = result.read_ahead(budget)
+    assert step.state is ReadAheadState.DONE and released  # a full answer the server has finished is no stall
+    assert numbers(result, 5000) == list(range(5, 3000))
+
+
 def test_received_counts_what_a_load_more_read_too():  # B44: every byte of the answer, by any path
     body = numbers_body(5000)
     result, response, _ = result_of(*chunked(body, 1024), sql="SELECT n FROM ks", bare_star=False)

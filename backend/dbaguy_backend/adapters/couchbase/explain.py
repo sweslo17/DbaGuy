@@ -65,6 +65,9 @@ _NS_PER_UNIT = {"h": 3_600_000_000_000, "m": 60_000_000_000, "s": 1_000_000_000,
 _DURATION_TERM = r"([0-9]+(?:\.[0-9]+)?)(ns|us|\u00b5s|\u03bcs|ms|h|m|s)"
 _DURATION = re.compile(rf"-?(?:{_DURATION_TERM})+")
 _DURATION_PART = re.compile(_DURATION_TERM)
+# Go's longest duration text is "-2562047h47m16.854775808s" (25 characters); a longer one is not a server's, and turning
+# a long run of digits into an int takes quadratic time (400,000 digits: seconds), from a plan cell of up to 4 MiB.
+_DURATION_TEXT_LIMIT = 64
 
 
 def analyze(text: str) -> PlanView:
@@ -105,8 +108,8 @@ def _analyze(value: Any) -> PlanView:
 
 def go_duration_ns(text: str) -> int | None:
     """Go's duration text ("34.611027ms", "1h2m3.5s", "10µs") in whole nanoseconds, truncated toward zero; None when
-    the whole text is not a duration."""
-    if not _DURATION.fullmatch(text):
+    the whole text is not a duration, or is longer than any duration Go writes (_DURATION_TEXT_LIMIT)."""
+    if len(text) > _DURATION_TEXT_LIMIT or not _DURATION.fullmatch(text):
         return None
     with localcontext() as context:
         context.prec = 80  # exact for any fraction a server writes

@@ -76,6 +76,7 @@ class EventStream:
         self._ended = False  # the response object has closed (EndEvent seen), or the stream was closed
         self.done = False  # …and the body has been read to its end: the connection may carry the next request
         self.received = 0  # body bytes read so far, by every path (a read-ahead step, fetch(), the trailer; B44)
+        self._end_parsed = False  # the parser has produced the EndEvent: the whole answer is in memory
         self.reads = 0  # reads made so far (a read-ahead step counts its own)
 
     def next(self) -> Event | None:
@@ -87,6 +88,11 @@ class EventStream:
     def queued(self) -> Event | None:
         """The next event if one is already parsed (no I/O), without taking it."""
         return self._events[0] if self._events else None
+
+    @property
+    def end_queued(self) -> bool:
+        """The whole answer is parsed and its EndEvent waits in the queue: taking the rest needs no I/O."""
+        return self._end_parsed and not self._ended
 
     def next_if_ready(self, max_reads: int) -> Event | None | NotReady:
         """As next(), but never waits (ruling B34): while no event is complete it reads one chunk at a time, only when
@@ -164,6 +170,8 @@ class EventStream:
                            exc.field)
             raise StatementError(PROTOCOL_ERROR, code="protocol_error") from exc
         self.done = self._response.done
+        if events and isinstance(events[-1], EndEvent):  # nothing is parsed after the object closes
+            self._end_parsed = True
         self._events.extend(events)
 
     def _lost(self, reason: str) -> StatementError:
@@ -429,21 +437,24 @@ class CouchbaseResult(StatementResult, RawJsonRows):
     def read_ahead(self, budget: int) -> ReadAhead:
         """One step (see the module docstring): the events the stream already holds, then reads while the response is
         ready, at most READ_AHEAD_STEP_CHUNKS of them, until the rows held take `budget` (FULL; checked after each row,
-        so a row is never split and the rows after it stay queued; the end of the rows already parsed after the last
-        row is still taken, without reading, and after it the step reads on), the answer ends (DONE: `_end()` releases
-        the connection), or nothing more is ready (WAITING when this step read nothing and took nothing, else READING:
-        a chunk inside a long row completes no event and is still progress, B34). A failure is kept for after the held
-        rows, and the step says DONE."""
+        so a row is never split and the rows after it stay queued, unless the whole answer is already parsed; the end of
+        the rows already parsed after the last row is still taken, without reading, and after it the step reads on),
+        the answer ends (DONE: `_end()` releases the connection), or nothing more is ready (WAITING when this step read
+        nothing and took nothing, else READING: a chunk inside a long row completes no event and is still progress,
+        B34). A failure is kept for after the held rows, and the step says DONE."""
         if self._ended or self._pending is not None:
             return ReadAhead(ReadAheadState.DONE, self._stream.received)
         reads, took = self._stream.reads, False
         while True:
             if self.held < budget or self._rows_done:  # after the rows only the end's small fields come: read on
                 max_reads = READ_AHEAD_STEP_CHUNKS - (self._stream.reads - reads)
-            elif isinstance(self._stream.queued(), RowEvent | None):
+            elif self._stream.end_queued or not isinstance(self._stream.queued(), RowEvent | None):
+                # full, but the whole answer (or the end of its rows) is already parsed: take it without reading. Those
+                # rows are in memory already (as text they take less), and an answer the server has finished must not
+                # look like a stall, or the idle close would drop it.
+                max_reads = 0
+            else:
                 return ReadAhead(ReadAheadState.FULL, self._stream.received)
-            else:  # full, but the end of the rows is already parsed: take it without reading (an answer in memory
-                max_reads = 0  # must not look like a stall, or the idle close would drop it)
             try:
                 event = self._stream.next_if_ready(max_reads)
             except StatementError as exc:  # a cut connection, a protocol error, a cancel

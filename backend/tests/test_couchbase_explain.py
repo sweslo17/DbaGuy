@@ -143,6 +143,17 @@ def test_go_duration_ns(text, ns):
     assert go_duration_ns(text) == ns
 
 
+def test_a_duration_longer_than_go_writes_is_not_parsed():  # int(Decimal) of a long digit run takes quadratic time
+    assert go_duration_ns("0" * 62 + "1s") == 1_000_000_000  # 64 characters: still a duration
+    assert go_duration_ns("0" * 63 + "1s") is None
+    long = "1" * 400_000 + "s"  # a plan cell may hold 4 MiB: 400,000 digits took 3.7 s before the limit
+    timings = {"#operator": "Sequence", "~children": [{"#operator": "Fetch", "#stats": {"execTime": long}},
+                                                      {"#operator": "IndexScan3", "#stats": {"execTime": "2ms"}}]}
+    view = analyze(json.dumps({"executionTimings": timings}))
+    assert go_duration_ns(long) is None and view.kind == "profile"
+    assert [f.badge for f in view.findings if f.badge == "slowest"] == ["slowest"]  # the scan, by its 2 ms
+
+
 def test_details_come_in_a_fixed_order_and_are_clipped():
     text = json.dumps({"plan": {"#operator": "Fetch", "as": "o", "bucket": "b", "scope": "s", "keyspace": "k",
                                 "namespace": "default", "index_id": "x", "limit": 5, "condition": "c" * 400,
