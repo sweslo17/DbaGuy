@@ -14,6 +14,7 @@ from dbaguy_backend.domain.profiles import ProfileSecretsInput, ProfileUpsertReq
 from dbaguy_backend.services.connection_service import ConnectionService
 from dbaguy_backend.services.metadata_service import MetadataService
 from dbaguy_backend.services.profile_service import ProfileService
+from dbaguy_backend.sessions.worker import SessionWorker
 from dbaguy_backend.storage.paths import profiles_file
 from dbaguy_backend.storage.profile_store import ProfileStore
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
@@ -121,7 +122,44 @@ def test_a_write_that_times_out_after_it_started_is_unknown_and_runs_once(quick_
         calls.append(connection)
         time.sleep(WRITE_TIMEOUT_S + 1)  # still running when its caller stops waiting
 
-    with pytest.raises(WriteOutcomeUnknown, match="may or may not have been applied"):
+    with pytest.raises(WriteOutcomeUnknown, match=f"No answer within {WRITE_TIMEOUT_S:g} s: the write may or may not"):
         service.with_connection(pid, "dbaguy", slow_write, retry=False)
     assert service.with_connection(pid, "dbaguy", lambda connection: "next") == "next"  # a new connection
     assert len(calls) == 1
+
+
+def test_a_timeout_the_write_raises_itself_is_not_reported_as_the_wait(service_and_profile):  # fix round 2
+    service, pid = service_and_profile
+
+    def own_timeout(connection):
+        raise TimeoutError("the driver's own")
+
+    with pytest.raises(WriteOutcomeUnknown, match="^The write failed after it started: ") as raised:
+        service.with_connection(pid, "dbaguy", own_timeout, retry=False)
+    assert "No answer within" not in raised.value.message
+
+
+def test_a_queued_write_whose_connection_is_closed_was_not_sent(service_and_profile, monkeypatch):  # fix round 2
+    """The connection a write is queued on is closed (invalidate, the idle reap, another call's drop): the worker
+    refuses the write (SessionBusy), which is answered as "nothing was sent", not as a busy session."""
+    service, pid = service_and_profile
+    reading, queued, closing, wrote = threading.Event(), threading.Event(), threading.Event(), []
+    put, begin_close = SessionWorker._put, SessionWorker._begin_close
+
+    def slow_read(connection):
+        reading.set()
+        closing.wait(scaled(30))  # holds the connection until it is being closed
+        return "read"
+
+    with ThreadPoolExecutor(2) as pool:
+        read = pool.submit(service.with_connection, pid, "dbaguy", slow_read)
+        assert reading.wait(scaled(30))
+        monkeypatch.setattr(SessionWorker, "_put", lambda self, task: (put(self, task), queued.set())[0])
+        monkeypatch.setattr(SessionWorker, "_begin_close", lambda self: (begin_close(self), closing.set())[0])
+        write = pool.submit(service.with_connection, pid, "dbaguy", wrote.append, retry=False)
+        assert queued.wait(scaled(30))  # the write waits behind the read
+        service.invalidate(pid)
+        with pytest.raises(QueryFailed, match="^The connection was closed before the write started: nothing was sent"):
+            write.result(scaled(30))
+        assert read.result(scaled(30)) == "read"
+    assert wrote == []

@@ -12,6 +12,7 @@ from loguru import logger
 from dbaguy_backend.adapters.base import StatementError
 from dbaguy_backend.adapters.couchbase.adapter import CouchbaseConnection
 from dbaguy_backend.adapters.couchbase.documents import SqlppDocumentRules
+from dbaguy_backend.adapters.couchbase.http import NodeClient
 from dbaguy_backend.domain.couchbase import Keyspace
 from dbaguy_backend.domain.errors import ValidationFailed
 from dbaguy_backend.domain.metadata import MetadataRequest
@@ -256,20 +257,25 @@ def test_what_utf8_cannot_carry_is_refused_by_the_service_too(app, cb, no_connec
 WRITES = {"save": "UPDATE", "insert": "INSERT", "remove": "DELETE"}
 
 
+def write_target(client, cb, scratch, write):
+    """The key and body of a `write` (save, insert or remove): a scratch document `{"a":1}` for a save or a remove, a
+    scratch key without a document for an insert; the text written is `{"a":2}`."""
+    if write == "insert":
+        key = scratch_key()
+        scratch.append(key)
+        return key, {"text": '{"a":2}'}
+    key = new_document(scratch, '{"a":1}')
+    cas = post(client, "get", profile_id=cb, keyspace=ORDERS, id=key).json()["cas"]
+    return key, {"cas": cas, "text": '{"a":2}'} if write == "save" else {"cas": cas}
+
+
 @pytest.mark.parametrize("write", list(WRITES))
 def test_a_write_that_fails_after_it_went_out_is_never_run_again(app, cb, scratch, monkeypatch, write):  # C26
     """A failure that is not a DomainError (a bug, the worker call's timeout) after the server answered the write: its
     outcome is unknown (ruling C42). Without `retry=False` the metadata call would reconnect and run the whole call
     again, write included (an insert would then report "exists", a remove "missing")."""
     client, _ = app
-    if write == "insert":
-        key = scratch_key()
-        scratch.append(key)
-        body = {"text": '{"a":2}'}
-    else:
-        key = new_document(scratch, '{"a":1}')
-        cas = post(client, "get", profile_id=cb, keyspace=ORDERS, id=key).json()["cas"]
-        body = {"cas": cas, "text": '{"a":2}'} if write == "save" else {"cas": cas}
+    key, body = write_target(client, cb, scratch, write)
     sent = []
     begin = CouchbaseConnection._begin
 
@@ -288,6 +294,36 @@ def test_a_write_that_fails_after_it_went_out_is_never_run_again(app, cb, scratc
     assert error_of(answer) == (502, "write_outcome_unknown") and len(sent) == 1
     stored = stored_document(key)
     assert stored is None if write == "remove" else stored.text == '{"a":2}'
+
+
+@pytest.mark.parametrize("write", list(WRITES))
+def test_a_write_whose_connection_check_fails_was_not_sent(app, cb, scratch, monkeypatch, write):  # C40, fix round 2
+    """A write on a channel that has not answered lately goes after a read (ruling C40). When that read fails, the write
+    never went out: `query_failed` "…: nothing was sent", not an unknown outcome (whose Reload would throw away edits
+    that were never sent), and the connection is replaced."""
+    client, _ = app
+    key, body = write_target(client, cb, scratch, write)
+    lost = "Connection to the query node was lost: the test dropped it"
+    begun = []  # (statement, connection)
+    begin = CouchbaseConnection._begin
+
+    def ping_fails(self, sql, **kwargs):
+        begun.append((sql, self))
+        if sql == "SELECT RAW 1":
+            raise StatementError(lost, code="connection_lost")
+        return begin(self, sql, **kwargs)
+
+    monkeypatch.setattr(NodeClient, "answered_within", lambda self, seconds: False)  # every write checks first
+    monkeypatch.setattr(CouchbaseConnection, "_begin", ping_fails)
+    answer = post(client, write, profile_id=cb, keyspace=ORDERS, id=key, **body)
+    assert error_of(answer) == (400, "query_failed")
+    assert answer.json()["error"]["message"] == f"{lost}: nothing was sent"
+    pinged = [connection for sql, connection in begun if sql == "SELECT RAW 1"]
+    assert len(pinged) == 1 and not [sql for sql, _ in begun if sql.startswith(WRITES[write])]  # never went out
+    post(client, "get", profile_id=cb, keyspace=ORDERS, id=key)
+    assert begun[-1][1] is not pinged[0]  # the next call has a new connection
+    stored = stored_document(key)
+    assert stored is None if write == "insert" else stored.text == '{"a":1}'
 
 
 @pytest.mark.parametrize("check", ["blocked_numbers", "diff"])

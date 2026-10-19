@@ -7,9 +7,9 @@ from uuid import UUID
 
 from loguru import logger
 
-from ..adapters.base import DatabaseConnection, StatementError
+from ..adapters.base import DatabaseConnection, StatementError, StatementNotSent
 from ..adapters.registry import AdapterRegistry
-from ..domain.errors import DomainError, QueryFailed, WriteOutcomeUnknown
+from ..domain.errors import DomainError, QueryFailed, SessionBusy, WriteOutcomeUnknown
 from ..domain.metadata import MetadataRequest, NodeKind, ObjectDetail, ObjectNode
 from ..domain.profiles import AnyProfile
 from ..sessions.worker import SessionWorker
@@ -22,7 +22,9 @@ _Key = tuple[UUID, str | None]
 WRITE_TIMEOUT_S = 120.0  # how long a write waits for its answer, time queued behind another call included (as a read)
 _NOT_SENT = "Timed out waiting for the connection: nothing was sent"
 _NOT_STARTED = "The write could not start on the connection: nothing was sent"
+_CLOSED = "The connection was closed before the write started: nothing was sent"
 _UNKNOWN = "{}: the write may or may not have been applied. Reload to see what the server holds"
+_FAILED_AFTER_START = "The write failed after it started"  # `fn` raised: an error of its own, or a timeout of its own
 
 
 class _WriteCall[R]:
@@ -32,7 +34,7 @@ class _WriteCall[R]:
     def __init__(self, fn: Callable[[DatabaseConnection], R]) -> None:
         self._fn = fn
         self._lock = threading.Lock()
-        self._state: Literal["queued", "started", "abandoned"] = "queued"
+        self._state: Literal["queued", "started", "finished", "abandoned"] = "queued"
 
     def __call__(self, connection: DatabaseConnection) -> R:
         with self._lock:
@@ -40,7 +42,11 @@ class _WriteCall[R]:
                 logger.debug("A write given up on while it was queued was not run")
                 raise QueryFailed(_NOT_SENT)  # nobody waits for it any more
             self._state = "started"
-        return self._fn(connection)
+        try:
+            return self._fn(connection)
+        finally:
+            with self._lock:
+                self._state = "finished"
 
     def abandon(self) -> bool:
         """Give up on the call: True when it had not started, and now never will."""
@@ -49,6 +55,11 @@ class _WriteCall[R]:
                 self._state = "abandoned"
                 return True
             return False
+
+    def running(self) -> bool:
+        """Started and not finished: a timeout now is the wait's, not one `fn` raised."""
+        with self._lock:
+            return self._state == "started"
 
 
 @dataclass
@@ -136,18 +147,31 @@ class MetadataService:
         raise AssertionError("unreachable")
 
     def _write_on(self, profile: AnyProfile, database: str | None, fn: Callable[[DatabaseConnection], T]) -> T:
-        """`with_connection(retry=False)`. A DomainError is the call's own answer and passes through untouched."""
+        """`with_connection(retry=False)`. A DomainError is the call's own answer and passes through untouched, except
+        the worker's own refusal to run it (SessionBusy: closed meanwhile), which means nothing was sent."""
         key = (profile.id, database)
         worker = self._worker(key, profile, database)
         call = _WriteCall(fn)
         try:
             return worker.call(call, timeout=self._write_timeout)
+        except SessionBusy as exc:
+            if not call.abandon():
+                raise  # `fn`'s own answer
+            # Closed while the write was queued (invalidate, the idle reap, another call's drop): whoever closed it has
+            # already removed it, and dropping the key now could close a new connection opened meanwhile.
+            logger.info("A write on {} found its metadata connection closed: not sent", profile.name)
+            raise QueryFailed(_CLOSED) from exc
         except DomainError:
             raise
+        except StatementNotSent as exc:  # ruling C40: the request that had to go first failed, so the write never went
+            self._drop(key)
+            logger.info("A write on {} was not sent: {} ({})", profile.name, exc.message, exc.code)
+            raise QueryFailed(f"{exc.message}: nothing was sent") from exc
         except Exception as exc:
-            timed_out = isinstance(exc, TimeoutError)
+            waited_out = isinstance(exc, TimeoutError) and call.running()
             if call.abandon():
                 # Nothing was sent. A timeout here means the connection is busy with another call, not broken: it stays.
+                timed_out = isinstance(exc, TimeoutError)
                 if not timed_out:
                     self._drop(key)
                 logger.info("A write on {} {}: not sent", profile.name,
@@ -157,8 +181,9 @@ class MetadataService:
             self._drop(key)
             # The type only: an unexpected error's text may quote what the write carried.
             logger.warning("A write on {} {} after it started ({}): its outcome is unknown", profile.name,
-                           "timed out" if timed_out else "failed", type(exc).__name__)
-            reason = f"No answer within {self._write_timeout:g} s" if timed_out else "The write failed after it started"
+                           f"got no answer within {self._write_timeout:g} s" if waited_out else "failed",
+                           type(exc).__name__)
+            reason = f"No answer within {self._write_timeout:g} s" if waited_out else _FAILED_AFTER_START
             raise WriteOutcomeUnknown(_UNKNOWN.format(reason)) from exc
 
     def _worker(self, key: _Key, profile: AnyProfile, database: str | None) -> SessionWorker:
