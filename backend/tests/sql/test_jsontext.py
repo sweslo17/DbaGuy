@@ -1,5 +1,6 @@
 import json
 import random
+import re
 import time
 import tracemalloc
 
@@ -300,6 +301,60 @@ def test_a_long_string_with_a_lone_surrogate_is_cut_into_text_that_encodes():
     (found,) = diff('{"s":"\\ud800' + "a" * 300 + '"}', '{"s":"\\ufffd' + "a" * 300 + '"}').changes
     found.before.encode("utf-8"), found.after.encode("utf-8")
     assert found.before.startswith('"\\ud800aaa') and found.after.startswith('"\ufffdaaa')
+
+
+def test_a_dropped_duplicate_that_differs_only_far_in_is_cut_around_the_difference():  # both sides showed "xxx…"
+    first, second = "x" * 300 + "X", "x" * 300 + "Y"
+    (found,) = diff('{"a":"' + first + '","a":"' + second + '"}', '{"a":"' + second + '"}').changes
+    assert found.kind == "duplicate_key"
+    assert found.before == "…" + "x" * EXCERPT_LEAD + 'X"' and found.after == "…" + "x" * EXCERPT_LEAD + 'Y"'
+
+
+def test_a_dropped_duplicate_object_that_differs_only_far_in_is_cut_around_the_difference():
+    inner = '{"k":"' + "x" * 400 + '","n":%s}'
+    (found,) = diff('{"a":' + inner % "1" + ',"a":' + inner % "2" + "}", '{"a":' + inner % "2" + "}").changes
+    assert found.before.startswith("…") and found.before.endswith('"n":1}') and found.after.endswith('"n":2}')
+    assert found.before != found.after and len(found.before) <= CHANGE_TEXT_LIMIT + 2
+
+
+def test_a_value_of_another_type_is_shown_from_its_start_and_never_copied_whole():
+    (found,) = diff('{"a":"' + "y" * 5000 + '"}', '{"a":' + "[" + ",".join(["1"] * 3000) + "]}").changes
+    assert found.kind == "other"
+    assert found.before == '"' + "y" * (CHANGE_TEXT_LIMIT - 1) + "…" and found.after == "[" + "1," * 99 + "1…"
+
+
+@pytest.mark.parametrize("shift", range(12))
+def test_a_long_string_is_never_cut_inside_an_escape(shift):
+    body = ("x" * 9 + "\\n") * 60  # a newline escape every 10 characters; the shift moves the window across them
+    edited = '{"s":"' + "q" * shift + body + "X" + body + '"}'
+    server = '{"s":"' + "q" * shift + body + "Y" + body + '"}'
+    (found,) = diff(edited, server).changes
+    for text, mark in ((found.before, "X"), (found.after, "Y")):
+        assert text.startswith("…") and text.endswith("…") and mark in text
+        json.loads('"' + text[1:-1] + '"')  # whole escapes only: half an escape is not a JSON string
+
+
+@pytest.mark.parametrize("shift", range(8))
+def test_a_cut_of_raw_json_never_falls_inside_an_escape_either(shift):
+    body = "".join(f"{i:03}\\u00e9\\\\\\n" for i in range(60))  # unique pieces: a \uXXXX, an escaped backslash, a \n
+    one = '{"k":"' + "q" * shift + body + '","n":1}'
+    two = '{"k":"' + "q" * shift + body + '","n":2}'
+    (found,) = diff('{"a":' + one + ',"a":' + two + "}", '{"a":' + two + "}").changes
+    assert found.kind == "duplicate_key" and found.before != found.after
+    for shown, source in ((found.before, one), (found.after, two)):
+        piece = shown.removeprefix("…").removesuffix("…")
+        boundaries = {m.start() for m in re.finditer(r"\\u[0-9a-fA-F]{4}|\\.|.", source, re.S)} | {len(source)}
+        at = source.index(piece)
+        assert at in boundaries and at + len(piece) in boundaries  # starts and ends between tokens, not inside one
+
+
+@pytest.mark.parametrize("text, i, expected", [
+    ("ab\\ncd", 3, 2), ("ab\\ncd", 2, 2), ("ab\\ncd", 4, 4), ("ab\\\\ncd", 3, 2), ("ab\\\\ncd", 4, 4),
+    ("a\\u00e9b", 2, 1), ("a\\u00e9b", 3, 1), ("a\\u00e9b", 5, 1), ("a\\u00e9b", 6, 1), ("a\\u00e9b", 7, 7),
+    ("a\\\\u00e9b", 2, 1), ("a\\\\u00e9b", 3, 3), ("a\\\\u00e9b", 4, 4), ("abc", 0, 0), ("abc", 3, 3),
+])
+def test_escape_start_finds_the_backslash_of_the_escape_a_cut_would_split(text, i, expected):
+    assert jsontext._escape_start(text, i) == expected
 
 
 def test_a_long_number_that_differs_only_far_in_is_cut_around_the_difference():

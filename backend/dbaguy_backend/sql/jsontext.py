@@ -243,12 +243,6 @@ class DocumentDiff:
     counts: ChangeCounts  # every change found, listed or not
 
 
-def _short(text: str, start: int, end: int) -> str:
-    """`text[start:end]` cut to CHANGE_TEXT_LIMIT characters, then `…` (a value of megabytes is never copied)."""
-    shown = _shown(text[start : min(end, start + CHANGE_TEXT_LIMIT)])
-    return shown + "…" if end - start > CHANGE_TEXT_LIMIT else shown
-
-
 _CHUNK = 1 << 16
 
 
@@ -265,27 +259,67 @@ def _first_difference(a: str, b: str) -> int:
     return i
 
 
+_HEX = frozenset("0123456789abcdefABCDEF")
+
+
+def _escape_start(text: str, i: int) -> int:
+    """`i`, or the index of the backslash when text[i] lies inside an escape (`\\n`, `\\uXXXX`) of the JSON `text`: a
+    cut there would show half an escape."""
+    if i <= 0 or i >= len(text):
+        return i
+
+    def escaped(k: int) -> bool:  # whether text[k] follows an odd number of backslashes
+        j = k - 1
+        while j >= 0 and text[j] == "\\":
+            j -= 1
+        return (k - 1 - j) % 2 == 1
+
+    if escaped(i):
+        return i - 1
+    for k in range(max(1, i - 4), i):  # text[k] == "u" with at most 3 hex digits between it and i
+        if text[k] == "u" and escaped(k) and all(c in _HEX for c in text[k + 1 : i]):
+            return k - 1
+    return i
+
+
 def _excerpts(a: str, b: str) -> tuple[str, str]:
-    """`a` and `b` as a change shows them: whole when both fit in CHANGE_TEXT_LIMIT characters, else each cut to that
-    many from EXCERPT_LEAD characters before the first difference, with `…` on a cut side (a long text that differs
-    only far in is not shown as two copies of its start)."""
+    """The JSON texts `a` and `b` as a change shows them: whole when both fit in CHANGE_TEXT_LIMIT characters, else each
+    cut to that many from EXCERPT_LEAD characters before the first difference, with `…` on a cut side (a long text that
+    differs only far in is not shown as two copies of its start); a cut never falls inside an escape."""
     if max(len(a), len(b)) <= CHANGE_TEXT_LIMIT:
         return _shown(a), _shown(b)
     start = max(0, _first_difference(a, b) - EXCERPT_LEAD)
-    stop = start + CHANGE_TEXT_LIMIT
 
     def cut(text: str) -> str:
-        return ("…" if start else "") + _shown(text[start:stop]) + ("…" if len(text) > stop else "")
+        first, stop = _escape_start(text, start), _escape_start(text, start + CHANGE_TEXT_LIMIT)
+        return ("…" if first else "") + _shown(text[first:stop]) + ("…" if len(text) > stop else "")
 
     return cut(a), cut(b)
 
 
-def _string_texts(e: str, es: int, ee: int, s: str, ss: int, se: int, edited: str, server: str) -> tuple[str, str]:
-    """The two sides of a changed string: its text as written when short; when long, the decoded values written
-    the same way, cut around the first difference (a spelling difference such as `\\u00e9` against `é` cannot be it)."""
-    if max(ee - es, se - ss) <= CHANGE_TEXT_LIMIT:
-        return _shown(e[es:ee]), _shown(s[ss:se])
-    return _excerpts(json.dumps(edited, ensure_ascii=False), json.dumps(server, ensure_ascii=False))
+def _string_excerpts(a: str, b: str) -> tuple[str, str]:
+    """Two long decoded strings as a change shows them: CHANGE_TEXT_LIMIT characters of each (the opening quote counts
+    as one) from EXCERPT_LEAD characters before the first difference. The decoded text is cut and the piece written as a
+    JSON string, so the cut is whole characters and whole escapes."""
+    start = max(0, _first_difference(a, b) - EXCERPT_LEAD)
+    stop = start + CHANGE_TEXT_LIMIT - (start == 0)
+
+    def cut(text: str) -> str:
+        piece = _shown(json.dumps(text[start:stop], ensure_ascii=False)[1:-1])
+        return ("…" if start else '"') + piece + ("…" if len(text) > stop else '"')
+
+    return cut(a), cut(b)
+
+
+def _value_texts(e: str, es: int, ee: int, s: str, ss: int, se: int) -> tuple[str, str]:
+    """The values e[es:ee] and s[ss:se] as a change shows them: whole when short, else cut around where they first
+    differ (from the start when their first characters differ, as two values of another type do, and then neither is
+    copied whole). Two long strings are compared by their decoded values: `\\u00e9` against `é` is no difference."""
+    if e[es] != s[ss]:
+        return _excerpts(e[es : min(ee, es + CHANGE_TEXT_LIMIT + 1)], s[ss : min(se, ss + CHANGE_TEXT_LIMIT + 1)])
+    if e[es] == '"' and max(ee - es, se - ss) > CHANGE_TEXT_LIMIT:
+        return _string_excerpts(scanstring(e, es + 1)[0], scanstring(s, ss + 1)[0])
+    return _excerpts(e[es:ee], s[ss:se])
 
 
 def _keys(names: Iterable[str], total: int) -> str:
@@ -408,7 +442,7 @@ def _compare_objects(e: str, es: int, ee: int, s: str, ss: int, steps: Steps, fo
                 (*steps, key),
                 "duplicate_key",
                 True,
-                lambda: (_short(e, edited[2 * rank], edited[2 * rank + 1]), _short(e, start, end)),
+                lambda: _value_texts(e, edited[2 * rank], edited[2 * rank + 1], e, start, end),
             )
             edited[2 * rank] = start
             edited[2 * rank + 1] = end
@@ -472,14 +506,12 @@ def _compare(e: str, es: int, ee: int, s: str, ss: int, se: int, steps: Steps, f
     elif first == '"' and server_first == '"':
         edited_value, server_value = scanstring(e, es + 1)[0], scanstring(s, ss + 1)[0]
         if edited_value != server_value:
-            found.add(
-                steps, "other", True, lambda: _string_texts(e, es, ee, s, ss, se, edited_value, server_value)
-            )
+            found.add(steps, "other", True, lambda: _value_texts(e, es, ee, s, ss, se))
     elif first in _NUMBER_START and server_first in _NUMBER_START:
         same = _same_value(e[es:ee], s[ss:se])
-        found.add(steps, "number", not same, lambda: _excerpts(e[es:ee], s[ss:se]))
+        found.add(steps, "number", not same, lambda: _value_texts(e, es, ee, s, ss, se))
     else:
-        found.add(steps, "other", True, lambda: (_short(e, es, ee), _short(s, ss, se)))
+        found.add(steps, "other", True, lambda: _value_texts(e, es, ee, s, ss, se))
 
 
 def diff(edited: str, server: str) -> DocumentDiff:
