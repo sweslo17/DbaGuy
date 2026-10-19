@@ -29,7 +29,7 @@
 - context `dbaguy.app` 下跑 `SELECT META(d).id, * FROM events AS d`：本機第一頁 < 100 ms，2 萬列逐頁載入；欄位依文件存放順序；文件沒有的欄位顯示灰色 `MISSING`。
 - int64 邊界文件（`u_numbers`）每個值與存放原文一致（`9007199254740993`、uint64 max、20 位數、`1.10`、長 π、`1E+3`、`1e400`）。
 - 245 秒的聚合查詢按 Cancel：1 秒內結束，server 端該請求為 `closed`，同 tab 立刻可再跑。串流中途關閉結果同樣立即釋放。
-- 暫停的結果從第一次暫停起 45–60 秒 → 自動關閉並說明原因（Load more 不重算；7.6.12 的 server 在 77–86 秒自己會砍，見 R-04-6）；已載入的列留著，狀態列顯示 `(partial)`。
+- 暫停的結果從第一次暫停起 45–60 秒 → 自動關閉並說明原因（Load more 不重算；7.6.12 的 server 在 77–86 秒自己會砍，見 R-04-6）；已載入的列留著，狀態列顯示 `(partial)`。04b：暫停時預讀（每個結果 8 MiB），放得下就讀到結尾、不關閉；放不下時 45 秒從預讀停下起算，讀 16 MiB 才重算（A23；socket 讀空不算，B42）。
 - 唯讀 profile：`INSERT` 被 DbaGuy 擋；繞過分類器的寫入（例如 `EXECUTE` 一個寫入的 prepared statement）被 server 以 1000 拒絕。
 - `BEGIN WORK` 被明確拒絕；Couchbase tab 的 toolbar 沒有 Auto-commit／Commit／Rollback／交易徽章。
 - 參數：`SELECT $n + 1 AS n1`、`$n = 9007199254740993` → `9007199254740994`；有參數沒給值時不送出並指出是哪個。
@@ -53,12 +53,12 @@ R-04-x 是 coordinator 的裁決；D-04-x 是本設計的決定。全文的引�
 | **R-04-3** 開發環境 | CE 7.6.2；**EE 7.6.12** | **EE**。CE 沒有 ADVISE、UPDATE STATISTICS、CBO 估計、`profile` 輸出，RBAC 只有 admin／ro_admin／bucket_full_access（調查 §0.7、§9.1）；公司 cluster 多半是 EE。開發／測試使用免費，repo 只引用 image tag。一次性 `couchbase-init` 依 調查 §9.2–9.3 seed，假帳密、只綁 127.0.0.1。EE 專屬功能偵測 edition，在 CE 上顯示「Community Edition 不提供」而不是失敗。 |
 | **R-04-4** 交易 | v1 支援 REST 交易（`txid`＋固定 node）；**v1 不支援** | **不支援**。〔實測〕沒有 `txid` 時 `BEGIN WORK` 開了一個沒人會加入的交易，`COMMIT`／`ROLLBACK`／`SAVEPOINT` 回 17002（調查 §0.5）。TRANSACTION 類語句明確拒絕（`transactions_unsupported`）；新能力 `transactions: bool`（Couchbase 為 False）讓前端隱藏 Auto-commit／Commit／Rollback／交易徽章。之後的 v1.x 可用 `txid`＋同一 node（調查 §10 的表）。 |
 | **R-04-5** 取消與 timeout | `DELETE FROM system:active_requests`；SDK cancel；**任一執行緒 shutdown socket** | **shutdown socket**：〔實測〕0 ms、server 立即標成 `closed`，任何使用者都能做；DELETE 需要 admin（CE）或 `query_system_catalog`（EE），一般使用者連自己的請求都看不到（調查 §3.7）。`status:"stopped"`（別人停掉的）視為取消；server 自己的 timeout（1080）原樣顯示。**不送 server `timeout`**：它在 client 暫停時照樣計時，恢復後以 1080 結束（調查 §3.4）；worker 既有的計時器（涵蓋 `run()`＋第一頁）負責 tab timeout。 |
-| **R-04-6** 暫停的結果 | 不處理；**暫停 45 秒後自動關閉（從第一次暫停起算）** | **自動關閉**。〔實測〕暫停中的請求在 server 上仍是 `running`，佔住一個 servicer（EE 7.6.12 每 node 32 個）（調查 §3.8）。**A13 不成立**：client 停止讀取的請求，7.6.12 在 77–86 秒後自己結束（1203 `service.slow_client`，狀態 `fatal`，之後的 Load more 只拿到 buffer 裡的列再被截斷），所以 120 秒的原設計會輸給 server；改成 **45 秒**（housekeeping 每 15 秒，實際 45–60 秒關閉，離 server 最早的 77 秒至少 17 秒）。時鐘從結果的**第一次**暫停起算，Load more 不重算（R-04a-T11b）：一次 500 列的 Load more 由 17–37 MB 的 buffer 供應，不會讓 server 的停滯時鐘歸零。關閉時在 Messages 說明「為釋放 query node 已關閉；要更多列請重跑」，已載入的列保留。秒數只定義一次：`adapters/couchbase/adapter.py` 的 `PAUSED_RESULT_MAX_IDLE_S = 45.0`，經能力欄位 `paused_result_max_idle_s` 傳給 worker（§3.7.4）。04b 的計畫帶「暫停時有上限的預讀」。 |
+| **R-04-6** 暫停的結果 | 不處理；**暫停 45 秒後自動關閉（從第一次暫停起算）** | **自動關閉**。〔實測〕暫停中的請求在 server 上仍是 `running`，佔住一個 servicer（EE 7.6.12 每 node 32 個）（調查 §3.8）。**A13 不成立**：client 停止讀取的請求，7.6.12 在 77–86 秒後自己結束（1203 `service.slow_client`，狀態 `fatal`，之後的 Load more 只拿到 buffer 裡的列再被截斷），所以 120 秒的原設計會輸給 server；改成 **45 秒**（housekeeping 每 15 秒，實際 45–60 秒關閉，離 server 最早的 77 秒至少 17 秒）。時鐘從結果的**第一次**暫停起算，Load more 不重算（R-04a-T11b）：一次 500 列的 Load more 由 17–37 MB 的 buffer 供應，不會讓 server 的停滯時鐘歸零。關閉時在 Messages 說明「為釋放 query node 已關閉；要更多列請重跑」，已載入的列保留。秒數只定義一次：`adapters/couchbase/adapter.py` 的 `PAUSED_RESULT_MAX_IDLE_S = 45.0`，經能力欄位 `paused_result_max_idle_s` 傳給 worker（§3.7.4）。04b：暫停時預讀（每個結果 8 MiB），放得下就讀到結尾、不關閉；放不下時 45 秒從預讀停下起算，讀 16 MiB 才重算（A23；socket 讀空不算，B42）。 |
 | **R-04-7** `*` 的欄位 | (a) 串流中途重送欄位；(b) **signature 順序＋首頁 key 聯集，之後的 key 進溢出欄** | **(b)**，評估見下方「R-04-7 評估」。另加 D-04-1 的 alias 展開。 |
 | **R-04-8** MISSING ≠ NULL | 當 NULL；**獨立的 cell 標記** | 獨立標記 `{"$type":"missing"}`，grid 顯示灰色 `MISSING`；copy 與 CSV 為空字串；從 grid 複製成 JSON／JSONL 時省略該 key；JSON／JSONL 匯出本來就是 server 原文（R-04-15）。〔實測〕列裡可以同時有缺的 key 與 `null`（調查 §3.2）。 |
 | **R-04-9** Query context | 每個 profile 一個；**每個 tab 一個**，每次請求都送 | **每個 tab**：`{bucket, scope?}` 放在 tab 狀態與 workspace，toolbar 有選擇器，`execute`／`export` 每次帶上；點樹上 bucket／scope／collection 設定目前 tab 的 context（FP §4 Must 2）。Profile 的 database 欄位＝預設 context。〔實測〕`default:bucket.scope`、`bucket.scope`、`default:bucket` 與 back-tick 名稱都可用（調查 §3.4）。 |
 | **R-04-10** 參數 | 只在文字裡代換；**有型別的具名／位置參數** | 參數面板，值以 **JSON literal** 輸入（型別＝JSON 型別），名稱 `$x`／`@x`（同一個參數）、位置 `$1`／`?`；放在 `execute`／`export` 指令上，backend 把 literal 原文拼進請求 body（數字不經 float）。協定與面板是通用的（之後 S6 給其他引擎用），④ 只有 Couchbase 開啟（能力 `parameters`）。〔實測〕int64 內的整數精確，小數與 > int64 在 server 變成 float64（調查 §3.4）→ 送出時對這種值加 WARNING。 |
-| **R-04-11** INFER 與取樣 | 連線時自動 INFER；**INFER 只由使用者手打＋樹上手動 Sample fields（client 端取樣）** | 〔實測〕7.6.2 CE 對含 binary 文件的 collection 跑 INFER 讓 query service panic 重啟；7.6.12 EE 靜默回 0 列（調查 §5.3）。Sample fields＝`SELECT RAW d FROM ks AS d LIMIT $n`，欄位路徑在 Python 推導，不可能弄垮 server。補全的欄位路徑來自取樣結果與本 session 結果裡看過的 key。 |
+| **R-04-11** INFER 與取樣 | 連線時自動 INFER；**INFER 只由使用者手打＋樹上手動 Sample fields（client 端取樣）** | 〔實測〕7.6.2 CE 對含 binary 文件的 collection 跑 INFER 讓 query service panic 重啟；7.6.12 EE 靜默回 0 列（調查 §5.3）。Sample fields＝`SELECT RAW d FROM ks AS d LIMIT $n`（04b 改成 `SELECT META(d).type AS t, d …`，A24、§3.12），欄位路徑在 Python 推導，不可能弄垮 server。補全的欄位路徑來自取樣結果與本 session 結果裡看過的 key。 |
 | **R-04-12** Formatter | **sqlpp → sql-formatter `n1ql`**＋**每個方言都加 token 守衛** | 〔實測〕`n1ql` 處理 `ANY…SATISFIES…END`、`UNNEST`、`USE KEYS`、`$param`、back-tick、`RETURNING`，但把 `'it''s'` 拆成 `'it' 's'`（調查 §8.3）。格式化後用 DbaGuy 的 lexer 重切原文與結果，非空白 token 不同就不替換（比較規則細化見 §3.3.7、§12）。 |
 | **R-04-13** EXPLAIN | **Couchbase plan tree＋反模式標記**；EE 加 ADVISE、`profile=timings` | 規則照調查 §7（PrimaryScan、`#sequentialscan`、未涵蓋的 Fetch、IntersectScan）。ADVISE 的 `index_statement` 可複製。`profile=timings` 成本低（多一個 result set，§3.10），放進 ④。 |
 | **R-04-14** 連線 | — | URL 匯入（KV port 一律換成 query port）、`nodeServices` 探索（受限使用者可用、匿名 401，調查 §10）、SSH tunnel 到單一 node 的 query port（不探索）、唯讀 → 每個請求 `readonly=true` ＋ SafetyPolicy allow-list（新的 SQL++ 分類器，調查 §8.2）、自訂 CA、Keychain。node 失效 → `connection_lost` ＋ Reconnect（重新探索，試下一個 node）。 |
@@ -73,7 +73,7 @@ R-04-x 是 coordinator 的裁決；D-04-x 是本設計的決定。全文的引�
 | **D-04-8** 存檔預覽怎麼算 | 本地模擬 server 的正規化；**問 server：`SELECT RAW $doc`** | 本地模擬要猜 Go 的 float 格式；`SELECT RAW $doc` 走 server 自己的值編碼，與 `SET d = $doc` 存下的應該相同 **〔未實測，A2〕**。04c 第一個 task 驗證；不同就退回本地模擬並標成「近似」。 |
 | **D-04-9** 文件操作的連線 | session 連線；**metadata 連線，寫入不重試** | 文件 tab 不綁 query tab 的 session；metadata 連線本來就是每個 profile 一條、閒置關閉。`MetadataService.with_connection()` 斷線會重試一次，寫入要關掉（`retry=False`）；有 CAS 的 replace／remove 就算重送也只會變成衝突，但 insert 會誤報「已存在」。 |
 | **D-04-10** Plan 分析放哪 | 前端 TS；**backend（`adapters/couchbase/explain.py`）** | 反模式規則是「容易出錯的邏輯」，backend 有 pytest；前端只畫樹。`POST /couchbase/plan` 收 plan 原文、回正規化的樹＋標記＋advice。 |
-| **D-04-11** 雙擊 collection | 表格資料 tab；detail tab；**開新的 query tab（帶 context 與瀏覽語句）** | 表格資料 tab 的 SELECT／篩選／排序是關聯式的；Couchbase 使用者本來就是寫 SQL++ 看資料。新 tab 的 context 設成該 scope，內容 ``SELECT META(d).id, * FROM `c` AS d``（兩行），不自動執行（「別耍聰明」，M5）。不加 LIMIT：分頁＋R-04-6 已保護 query node。Detail 從右鍵選單開。 |
+| **D-04-11** 雙擊 collection | 表格資料 tab；detail tab；**開新的 query tab（帶 context 與瀏覽語句）** | 表格資料 tab 的 SELECT／篩選／排序是關聯式的；Couchbase 使用者本來就是寫 SQL++ 看資料。新 tab 的 context 設成該 scope，內容 ``SELECT META(d).id, * FROM `c` AS d``（兩行），不自動執行（「別耍聰明」，M5）。不加 LIMIT：分頁＋R-04-6 已保護 query node。Detail 從右鍵選單開。04b（B18）：back-tick 只在需要時加（同 §3.3.2），例如 `FROM events AS d`。 |
 | **D-04-12** 45 秒怎麼計 | 每次暫停一個 Timer；**housekeeping（每 15 秒）** | 沿用閒置交易檢查的作法與 token 防競態（`SessionStateTracker.unchanged_since` 的模式）。從第一次暫停起算、Load more 不重算（R-04a-T11b）；實際在 45–60 秒之間關閉，夠用。 |
 | **D-04-13** 交易語句在哪拒絕 | SafetyPolicy；**Couchbase adapter 的 `run()`** | 這不是安全決策而是引擎能力；SafetyPolicy 的 BLOCK 只有「唯讀」語意。adapter 用 `classifier.is_transaction_statement(sql, Dialect.SQLPP)`（與分類器同一張 `_TRANSACTION_STARTS`，DRY）在送出前拒絕。 |
 | **D-04-14** keep-alive 重用 | 每句新連線；**閒置 < 30 秒才重用；讀取類可重送一次** | TLS 握手每句一次在遠端 cluster 上明顯變慢。重用的連線在「還沒收到任何回應」就斷，只有語句被分類為 READ 時（worker 傳 `retry_safe`）才換新連線重送一次；其他回 `connection_lost`。〔未實測，A9〕server 的 idle 關閉時間。 |
@@ -167,6 +167,7 @@ backend/dbaguy_backend/
   | `executed_plan` | False | True | 「Run with profile」（EE 才可用，見 §3.10） |
   | `plan_format` | None | `"couchbase"` | Explain 按鈕、plan 檢視 |
   | `paused_result_max_idle_s` | None | `PAUSED_RESULT_MAX_IDLE_S` | worker 的暫停閒置關閉（不進 EngineInfo） |
+| `read_ahead_bytes` | None | `READ_AHEAD_BYTES`（8 MiB） | worker 的暫停預讀（`StatementResult.read_ahead(budget)`，不可阻塞；不進 EngineInfo；04b） |
 
 - `EngineInfo` 加上前六個欄位（`info()` 照抄）。
 - `WorkerHooks` 新增 `capabilities: AdapterCapabilities`（`SessionHooksFactory` 從 registry 取），worker 的選項檢查、`retry_safe`、暫停閒置關閉都看它。
@@ -197,7 +198,7 @@ class StatementParams(BaseModel):       # extra="forbid"
 - `ServerInfo.edition: Literal["enterprise", "community"] | None = None`（其他引擎為 None）。
 - `SchemaSnapshot.keyspaces: list[SnapshotKeyspace] = []`；`SnapshotKeyspace(bucket, scope, collection, system: bool)`。關聯式引擎留空。`RelationKind` 加 `"collection"`（給 ⌘P 的 `ObjectSearchHit`）。
 - `DangerReason`／`GuardReason` 加 `SYSTEM_KEYSPACE`（寫入 `system:` keyspace：殺請求、刪 prepared statement）與 `MERGE_DELETE`（`MERGE … WHEN MATCHED THEN DELETE`）；前端 `reasons.ts` 加兩句說明。
-- `WorkspaceTab`：`kind` 加 `"document"`；新欄位 `query_context: QueryContext | None`、`params: dict[str, str] | None`（參數面板的草稿，鍵為 `$x`／`$1`，值是使用者打的文字，可以是不合法的 JSON）、`document_cas: str | None`（document tab 編輯所根據的 CAS）。Document tab 用既有的 `object_path`（最後一段 `{kind:"document", name:id}`）與 `buffer`（未存的內容）。舊的 `workspace.json` 照樣有效。
+- `WorkspaceTab`：`kind` 加 `"document"`；新欄位 `query_context: QueryContext | None`、`params: dict[str, str] | None`（參數面板的草稿，鍵為 `$x`／`$1`，值是使用者打的文字，可以是不合法的 JSON）、`document_cas: str | None`（document tab 編輯所根據的 CAS）。Document tab 用既有的 `object_path`（最後一段 `{kind:"document", name:id}`）與 `buffer`（未存的內容）。舊的 `workspace.json` 照樣有效。04b（B14）：`query_context` 是 `QueryContext | "none" | None`——None＝profile 的預設，`"none"`＝No context（一個 `null` 分不出兩者）。
 - `AppSettings.couchbase: CouchbaseSettings`（`sample_size: int = 1000`，10–10,000）。
 - History：不改 schema。Couchbase 的紀錄把該次請求的 query context 文字寫進既有的 `database` 欄位（`ExecutionRecord` 多帶 context；hooks 對 `query_context` 能力的引擎用它，否則用 session 的 database）。從 History 重開時解析回 `QueryContext`。
 
@@ -333,7 +334,7 @@ sqlglot 沒有 N1QL／SQL++ 方言（〔實測〕30.23.0 為最新）。SQLPP �
 - **大列避免 O(n²)**：一列沒解析完時，記下目前的 buffer 長度，buffer 至少長到兩倍才再試（總成本 ≤ 2 倍）。5 MB 文件被切成 80 個 64 KiB chunk 時，不會每來一個 chunk 就從頭解析一次。
 - 每列不先整列 `raw_decode`：直接在 buffer 上逐欄掃描物件的 key（`json.decoder.scanstring`）與值（`JSONDecoder.raw_decode(s, idx)`，C 實作），切出每個值的原文；碰到 buffer 結尾就等更多資料。〔實測〕每欄再 decode 一次的成本：travel-sample routes 2,700 萬位元組 8 萬列／秒（含 HTTP）。
 - 每列產出 `RawRow(text, fields)`：`text` 是整列原文（給 `fetch_raw`），`fields` 是 `(key, 原文, 解析後的值)` 的有序清單（物件列）或單一值（RAW 列）。
-- 讀取：`HTTPResponse.read1(READ_CHUNK = 64 KiB)`（處理 chunked）。
+- 讀取：Content-Length 用 `HTTPResponse.read1`；chunked 由 `http.ChunkedBody` 增量解碼（http.client 的 chunked 讀取停在 chunk 邊界會等下一個 chunk，預讀不能用，04b B33）。
 
 ### 3.5 結果塑形（`adapters/couchbase/rows.py`，純函式）
 
@@ -370,7 +371,7 @@ sqlglot 沒有 N1QL／SQL++ 方言（〔實測〕30.23.0 為最新）。SQLPP �
 
 - `warnings[]` → `ServerMessage(WARNING, f"{code}: {msg}")`，隨 `take_messages()` 送出。
 - `metrics` 到達時（最後一列之後）→ 一則 INFO：`Elapsed 12.96s · execution 12.95s · 1,000 results · 2.1 MB · 3 mutations · 1 warning`（有的欄位才列；duration 照 server 的 Go 格式原樣顯示，不解析）。
-- 參數 WARNING（送出前，Couchbase 特有）：literal 含 > int64 的整數或 float64 存不精確的小數 →「參數 $x：query service 會把 18446744073709551615 讀成 double」。
+- 參數 WARNING（送出前，Couchbase 特有）：literal 含 > int64 的整數或 float64 存不精確的小數 →「參數 $x：query service 會把 18446744073709551615 讀成 double」。04b（B10）：訊息只寫參數名稱、不顯示值（§4 的原則優先於這個例子）；規則照 server 對 int64 的取整（B11）。
 - `errors[]`（在 `run()` 或列之後的 `fetch()` 裡）→ `StatementError`：
   - `code` = `str(code)`；`message` = `msg` 原文（M10），附上 `reason` 的巢狀說明與 `reason.missing_role`（「missing role: query_system_catalog」）；其餘錯誤各一行附在後面。
   - 位置：`line`＋`column`（〔實測〕1-based、column 以 code point 計）→ 該行文字經 `sql/offsets.py` 轉成 UTF-16 → `ErrorPosition`（相對於送出的語句）。
@@ -465,6 +466,7 @@ sqlglot 沒有 N1QL／SQL++ 方言（〔實測〕30.23.0 為最新）。SQLPP �
 - `WorkerHooks.paused_result_max_idle_s` 來自 adapter 能力（`SessionHooksFactory` 從 registry 取）。
 - `SessionManager.check_paused_results()` 由 container 的 housekeeping（每 15 秒）呼叫 → 每個 worker 的 `check_paused_result()`：距結果的**第一次**暫停超過上限（45 秒，R-04-6）就 `_put(close_idle_paused(token))`；Load more 不重算時鐘（它由 server 的 buffer 供應，不會讓 server 的停滯時鐘歸零；7.6.12 在 77–86 秒自己砍掉停滯的請求，A13）。worker 執行緒上再確認 token 沒變、仍是同一個暫停的結果，才送 WARNING `Closed this result 45 s after it first paused, to free the query node — run the statement again to load more, or export it to get every row`（文字由 `paused_result_closed_text(limit_s)` 組：整分鐘寫 `N min`，其餘寫 `N s`）並 `_finish(ex)`。
 - 前端不用改：`finished` 會把暫停中的 set 標成 `partial`，已載入的列留著；之後的 Load more 拿到 `no_open_result`（已結束的 execution 本來就不會再要）。
+- 04b：有 `read_ahead_bytes` 的引擎，暫停中 worker 在指令之間預讀 server 已送出的列（`StatementResult.read_ahead()`；只讀 socket 上已有的、不等待）。「第一次暫停起算」改成由 `sessions/read_ahead.py` 的 `StallClock` 決定停滯何時開始：預讀讀滿的那一刻起算；讀到結尾（`DONE`）就沒有停滯、不關閉；停滯開始後再讀了 16 MiB（預讀上限的 2 倍，`STALL_RESET_FACTOR`；Load more 讀的也算）才重算；socket 讀空不算（B42）。沒有預讀的引擎維持第一次暫停起算。關閉訊息改成 `Closed this result 45 s after the server was left waiting for it, to free the query node — …`（B7）。
 
 #### 3.7.5 沒有交易（R-04-4）
 
@@ -560,10 +562,10 @@ CAS 以 JSON 整數 literal 送（uint64；〔實測〕目前 < 2⁶³，約到 
   | `intersect_scan` | `IntersectScan` | warning |
   | `slowest`（只 profile） | `execTime`＋`servTime` 佔全部 > 50% 的 operator | info |
 
-- **API**：`POST /couchbase/plan {text}` → `PlanView{kind, root, findings: [{badge, path, text}], advice: [{statement, keyspace_alias, rule, kind: recommended|covering|current}], statement_text}`。
+- **API**：`POST /couchbase/plan {text}` → `PlanView{kind, root, findings: [{badge, path, text}], advice: [{statement, keyspace_alias, rule, kind: recommended|covering|current}], statement_text}`。04b：findings 以 node id 定位（`path` 無法指到 `~subqueries` 底下的節點）；operator 上限 10,000（`MAX_PLAN_NODES`）、深度 200，超過 → `unknown`；findings 最多 100 則。
 - **流程**：
   - toolbar「Explain」（⌘E；plan 時以 `lib/shortcuts.ts` 確認未佔用）→ 對游標下的語句或選取送 `EXPLAIN <語句>`（`history=false`）；選取多句 → 提示「Explain 一次一句」。結果 `presentation="plan"` → 結果區直接是 plan 檢視（可切回 grid）。使用者自己打的 EXPLAIN 也一樣。
-  - plan 檢視的「Get index advice」：用 plan 裡的 `text` 送 `ADVISE <text>`（`history=false`），結果也是 plan presentation，顯示在同一面板，每個 `index_statement` 有 Copy。CE 上停用並提示「Community Edition 不提供 index advice」；萬一仍收到 3230，原文顯示。〔實測〕7.6.12 對含 binary 文件的 collection 可能回 5001 panic → 原文顯示。
+  - plan 檢視的「Get index advice」：用 plan 裡的 `text` 送 `ADVISE <text>`（`history=false`；04b B12：走 metadata 連線的 `POST /couchbase/advise`、唯讀、帶 tab 的 context，不經 session，免得結束同一次執行暫停中的結果），結果也是 plan presentation，顯示在同一面板，每個 `index_statement` 有 Copy。CE 上停用並提示「Community Edition 不提供 index advice」；萬一仍收到 3230，原文顯示。〔實測〕7.6.12 對含 binary 文件的 collection 可能回 5001 panic → 原文顯示。
   - 「Run with profile」（Explain 旁的選單，EE 才可用）：照常執行（照常過 SafetyPolicy：它真的會執行），`ExecuteCommand.profile_plan=true` → body `profile:"timings"`；回應的 `profile` 在 metrics 之後到達，result 讀完最後一列時 `next_result()` 回 True 一次，切到一個 presentation `plan` 的額外 result set（欄 `plan`、一列 `JsonText(profile 原文)`）。提早關閉結果就沒有 profile（plan 檢視說明）。〔實測〕EE `timings` 給 `executionTimings` 與每個 operator 的 `#stats`；CE 靜默不給（按鈕本來就停用）。
 
 ### 3.11 Query context 與參數（R-04-9、R-04-10）
@@ -573,7 +575,7 @@ CAS 以 JSON 整數 literal 送（uint64；〔實測〕目前 < 2⁶³，約到 
 - 型別 `QueryContext{bucket, scope?}`（D-04-5）。顯示文字：`keyspace_path`（`travel-sample.inventory`、`` `my.bucket`.app ``）。
 - Profile 的 `database` 解析：含 back-tick → 依 SQL++ 路徑解析；否則在**最後一個** `.` 切成 bucket／scope（scope 名稱不能含 `.`，bucket 可以），沒有 `.` → 只有 bucket。名稱含 `.` 且沒有 scope 的 bucket 要寫成 `` `a.b` ``（對話框 hint 說明）。
 - 前端：`QueryTabState.queryContext`；新 tab 預設＝profile 的預設 context；從樹或 ⌘P 開的瀏覽 tab＝該 scope；從 History 重開＝紀錄裡的 context。
-- toolbar 的 `ContextPicker`（`query_context` 能力才顯示）：列出 `GET /couchbase/contexts?profile_id` 回傳的 `{bucket, scope}`（來自 snapshot 的 keyspaces，含只有 bucket 的項目）＋「No context」。
+- toolbar 的 `ContextPicker`（`query_context` 能力才顯示）：列出 `GET /couchbase/contexts?profile_id` 回傳的 `{bucket, scope}`（來自 snapshot 的 keyspaces，含只有 bucket 的項目）＋「No context」。04b（B13）：端點收 tab 目前的 context，snapshot 沒有列它時（來自 History 或 profile 預設）仍列在第一個（`listed: false`）；每個顯示文字都來自 `QueryContext.text()`，前端不自己加引號。
 - 點樹上的 bucket／scope／collection／index（`Explorer.selectRow`）：目前的 tab 是同一個 profile 的 query tab 時，把它的 context 設成該節點的 bucket＋scope（bucket 節點 → 只有 bucket，即 `default:bucket`，`users` 解析成 `bucket._default.users`）。其他情況不動（選取 profile 的行為照舊）。執行中的語句不受影響（context 每次請求才送）。
 - `_default._default`：瀏覽語句用 context `(b, "_default")` ＋ ``FROM `_default` ``。
 
@@ -587,13 +589,13 @@ CAS 以 JSON 整數 literal 送（uint64；〔實測〕目前 < 2⁶³，約到 
 
 ### 3.12 欄位取樣與補全（R-04-11、SQL++ Should）
 
-- **取樣**：`POST /couchbase/fields/sample {profile_id, keyspace, size}`（size 預設 `settings.couchbase.sample_size`）→ metadata 連線送 `SELECT RAW d FROM ks AS d LIMIT $n`（`readonly=true`），最多 `SAMPLE_MAX_BYTES = 32 MiB`（超過就關閉請求，用已讀的）。在 Python 推導 `FieldPath{path: [segment…], types: {json 型別: 次數}, docs: int, percent: float}`：物件往下到 `FIELD_PATH_MAX_DEPTH = 6` 層，陣列記成 `[]` 段（元素是物件時往下），最多 `FIELD_PATHS_MAX = 2000` 條；非物件文件計成文件本身的型別。沒有 index 的 collection 會走 sequential scan（EE 受限使用者缺 `query_use_sequential_scans` 回 13014，原文顯示）。
+- **取樣**：`POST /couchbase/fields/sample {profile_id, keyspace, size}`（size 預設 `settings.couchbase.sample_size`）→ metadata 連線送 `SELECT META(d).type AS t, d FROM ks AS d LIMIT $n`（`readonly=true`；binary 文件以 `META().type` 判斷，A24），最多 `SAMPLE_MAX_BYTES = 32 MiB`（超過就關閉請求，用已讀的）。在 Python 推導 `FieldPath{path: [segment…], types: {json 型別: 次數}, docs: int, percent: float}`：物件往下到 `FIELD_PATH_MAX_DEPTH = 6` 層，陣列記成 `[]` 段（元素是物件時往下），最多 `FIELD_PATHS_MAX = 2000` 條；非物件文件計成文件本身的型別。沒有 index 的 collection 會走 sequential scan（EE 受限使用者缺 `query_use_sequential_scans` 回 13014，原文顯示）。
 - **快取**：`FieldSampleService`（記憶體，每個 profile＋keyspace 一份，直到重新取樣、profile 變更或 app 結束）；`GET /couchbase/fields?profile_id&bucket&scope&collection` 取快取（沒有回 null）。
 - **入口**：collection 右鍵「Sample fields…」（可改 size）；collection detail tab 的「Fields (sampled)」區塊（路徑、型別、% 文件、「Sample again」）。INFER 仍可以自己打（READ）。
 - **補全**（`sql/sqlpp_completion.py`；`/sql/complete` 對 SQLPP 分派過來）：
-  - `CompleteRequest` 新增 `query_context: QueryContext | None`、`seen_fields: list[str]`（最多 500 個；前端給目前 tab 最近結果的欄名，不含 `value` 與溢出欄）。
+  - `CompleteRequest` 新增 `query_context: QueryContext | None`、`seen_fields: list[str]`（最多 500 個；前端給目前 tab 最近結果的欄名，不含 `value`、溢出欄與帶 `.` 的名稱（B22：`*` 展開的衝突欄 `d.id` 若當成欄位會插入 `` `d.id` ``，是另一個 key））。
   - keyspace 位置（FROM、JOIN、UPDATE、INSERT／UPSERT INTO、DELETE FROM、MERGE INTO、NEST）：第一段＝context scope 下的 collection＋所有 bucket；`b.` 之後＝scope；`b.s.` 之後＝collection；插入文字用 `quote_ident(SQLPP)`（自動 back-tick，SQL++ Should）。
-  - 欄位位置：`alias.` → 該 alias 的 keyspace 的取樣頂層欄位；`alias.a.` → 巢狀；不帶前綴且 FROM 只有一個 keyspace → 該 keyspace 的欄位；另加 alias、`seen_fields`（detail「seen in results」，排在取樣欄位後）、關鍵字。alias 解析沿用 `sql/scope.py` 能用的部分；UNNEST 的 alias 之後再做。
+  - 欄位位置：`alias.` → 該 alias 的 keyspace 的取樣頂層欄位；`alias.a.` → 巢狀；不帶前綴且 FROM 只有一個 keyspace → 該 keyspace 的欄位；另加 alias、`seen_fields`（detail「seen in results」，排在取樣欄位後、關鍵字前）、關鍵字。alias 解析沿用 `sql/scope.py` 能用的部分；UNNEST 的 alias 之後再做。
   - 共用：`_Candidate`、過濾與排序從 `completion.py` 抽成共用 helper（DRY）。`/sql/describe` 對 SQLPP 回 None（之後）。
 - **⌘P**：`SchemaCache.search` 也搜 `snapshot.keyspaces`，命中 kind `collection`；選了就開瀏覽 tab（D-04-11）。
 
@@ -765,12 +767,16 @@ TLS 測試用的 CA 不入庫：測試執行時從 `GET /pools/default/trustedCA
 | A13 | 暫停中的請求在 120 秒內不會被 server 自己關掉 | 04a 整合；〔實測〕**不成立**：77–86 秒後 server 自己結束（1203，`fatal`）→ 上限改 45 秒（R-04-6） |
 | A14 | query service 的錯誤回應（4xx／5xx）都是 JSON | 04a 整合 |
 | A15 | EXPLAIN 的 signature 形狀（字串或物件；兩者都處理） | 04a T1 |
-| A16 | `profile` 欄位在 metrics 之後、形狀 `executionTimings` | 04b |
+| A16 | `profile` 欄位在 metrics 之後、形狀 `executionTimings` | 04b T1；〔實測〕成立（7.6.12 EE，T1 重跑相同）：頂層鍵 `requestID, signature, results, status, metrics, profile`；`profile`＝`{phaseTimes, phaseCounts, phaseOperators, cpuTime, requestTime, servicingHost, executionTimings}`；`executionTimings` 是從 `Authorize` 起的 operator 樹，帶 `#stats`（`#itemsIn`、`#itemsOut`、`#phaseSwitches`、`execTime`、`kernTime`、`servTime`，Go duration 如 `34.611027ms`、`4.792µs`）；有成本估計時 `profile` 另帶 `optimizerEstimates {cardinality, cost}` |
 | A17 | 受限使用者能呼叫 `CURRENT_USERS()` | 04a 整合（`dbaguy_reader`） |
 | A18 | `system:indexes` 也依權限過濾 | 04a 整合 |
 | A19 | IN list 用 `[…]` 陣列 | 04a 整合 |
 | A20 | image 內的 `cbc create` 能寫 binary／text 旗標 | 04a dev 環境 |
 | A21 | SQL++ `INSERT … VALUES (k, v, {"expiration": n})` | 04a dev 環境 |
+| A23 | client 讀了一個大回應後停止，7.6.12 在停止後固定時間結束請求；之後的小讀取不重新計時，大讀取會 | 04b T1；〔實測〕成立：讀 8 MiB 後停止 → 77.5 秒後消失（`fatal`，1203 `service.slow_client`）；40 秒後讀 128 KiB → 仍是第一次停止後 77.4 秒；讀 8 MiB → 第二次停止後 77.4 秒；16 × 512 KiB 在 32 秒內 → 99.6 秒（讀約 5.5 MiB 後重置）；每 2 秒讀 128 KiB 撐了 200 秒；被砍後剩下的回應讀不到。T1 重跑：三個請求同時，V1 停止後 76.7 秒、V3（40 秒後 128 KiB）77.3 秒（未重置）、V2（40 秒後 8 MiB）重置後 76.1 秒 → `STALL_RESET_FACTOR = 2`（16 MiB） |
+| A24 | 取樣時能分辨 binary 文件 | 04b T1；〔實測〕`SELECT RAW d` 給 `"<binary (9 b)>"`（和字串文件無法分辨）；`SELECT META(d).type AS t, d` 的 `t` 對 binary 是 `"base64"`、其餘 `"json"` → §3.12 用後者（B16） |
+| A25 | plan 與 advice 的形狀（plan 檢視依賴） | 04b T1；〔實測〕EXPLAIN 列 `{plan, text}`（CBO 另有 `cost`、`cardinality`、`optimizer_hints`）；`~subqueries` 在列的頂層（不在 `plan` 裡），各 `{correlated, plan, subquery}`；`IntersectScan.scans[]`；join 是 Sequence 裡平的 `Join`（`on_keys`）；每個 operator 可有 `optimizer_estimates {cardinality, cost, fr_cost, size}`；ADVISE 列 `{#operator: Advise, advice: {#operator: IndexAdvice, adviseinfo: {current_indexes[], recommended_indexes}}, query}`，`recommended_indexes` 是 `{indexes[], covering_indexes[]}` 或字串 `"No index recommendation at this time."`；有 query context 時另有 `index_statement_relative`、`query_context`；十份答案存成 `backend/tests/fixtures/couchbase/` |
+| A26 | 參數綁定 | 04b T1；〔實測〕`@n` 綁 `$n`；`?` 依 `args` 順序、`$1` 是 `args[0]`（可混用）；`$n + 1` 加 9007199254740993 → 9007199254740994 精確；`18446744073709551615` → `18446744073709552000`；`3.141592653589793238462643383279` → `3.141592653589793`；`1.10` → `1.1` |
 
 ## 11. 執行計畫拆分
 

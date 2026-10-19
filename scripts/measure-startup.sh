@@ -76,7 +76,8 @@ CHILD_EXES=$(for pid in $CHILDREN; do printf '%s %s\n' "$pid" "$(ps -p "$pid" -o
 # WebKit helper processes are XPC services of launchd, so attribute them by age: keep only those started no earlier
 # than the app itself. Other apps' web views started in the same window would inflate the total.
 app_age=$(ps -p "$APP_PID" -o etime= | tr -d ' ')
-ps -axo pid=,rss=,etime=,command= | AGE="$app_age" OURS=" $APP_PID $CHILDREN" awk '
+PIDS_FILE="$(mktemp)" # the PIDs listed below, for `footprint`
+ps -axo pid=,rss=,etime=,command= | AGE="$app_age" OURS=" $APP_PID $CHILDREN" PIDS_FILE="$PIDS_FILE" awk '
   function secs(t,   n, a, d, p) {
     d = 0; if (index(t, "-")) { split(t, a, "-"); d = a[1]; t = a[2] }
     n = split(t, p, ":")
@@ -84,9 +85,16 @@ ps -axo pid=,rss=,etime=,command= | AGE="$app_age" OURS=" $APP_PID $CHILDREN" aw
   }
   index(ENVIRON["OURS"] " ", " " $1 " ") \
     || ($0 ~ /com\.apple\.WebKit\.(WebContent|Networking|GPU)/ && secs($3) <= secs(ENVIRON["AGE"]) + 1) {
-    n = split($4, b, "/"); sum += $2; printf "%7.1f MB  %s\n", $2 / 1024, b[n]
+    n = split($4, b, "/"); sum += $2; printf "%7.1f MB  %s\n", $2 / 1024, b[n]; print $1 > (ENVIRON["PIDS_FILE"])
   }
   END { printf "total RSS: %.0f MB (RSS double-counts shared pages: an upper bound)\n", sum / 1024 }'
+# phys_footprint of the same processes: what Activity Monitor calls Memory (RSS above double-counts shared pages).
+# Before stop_app: the processes must still be running.
+if command -v footprint >/dev/null && [[ -s "$PIDS_FILE" ]]; then
+  # shellcheck disable=SC2046  # one PID per word
+  footprint --noCategories $(<"$PIDS_FILE") 2>/dev/null | grep -E 'Footprint:' | sed -E 's/^ +//' || true
+fi
+rm -f "$PIDS_FILE"
 stop_app
 trap - EXIT
 left=""
