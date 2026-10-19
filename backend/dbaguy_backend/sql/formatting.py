@@ -3,7 +3,8 @@
 - Copy (`/sql/format-rows`) formats rows the grid already holds: `source="encoded"` cells, as `encode_row` sent them.
 - Export streams `source="raw"` driver values to a file through `open_writer`, so nothing is truncated.
 
-Both go through the same normalisation step (`_NORMALISERS`) and the same writer classes.
+Both go through the same normalisation step (`_NORMALISERS`) and the same writer classes. Couchbase rows that are
+already JSON text (`RawJsonRows`) are exported by `open_raw_json_writer`, which never re-reads them.
 """
 
 import csv
@@ -14,22 +15,23 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from io import StringIO
-from typing import Any, Literal, NoReturn, TextIO
+from typing import Any, Literal, TextIO
 
 from pydantic import BaseModel
 
-from ..adapters.values import encode_value
+from ..adapters.values import MISSING, JsonText, encode_value
 from ..domain.column_category import ColumnCategory
-from ..domain.errors import ValidationFailed
+from ..domain.errors import UnsupportedFormat, ValidationFailed
 from ..domain.formats import FormatColumn, FormatKind, RowFormatOptions
 from .dialects import (
-    NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, datetime_literal, json_literal, qualified, quote_ident,
-    quote_literal, zero_date_as_text,
+    NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, datetime_literal, in_list, json_literal, qualified,
+    quote_ident, quote_literal, zero_date_as_text,
 )
+from .jsontext import one_line, reject_constant
 
 __all__ = [
-    "FormatColumn", "FormatKind", "FormatResult", "RowFormatOptions", "RowWriter", "format_rows", "open_writer",
-    "value_condition",
+    "FormatColumn", "FormatKind", "FormatResult", "RAW_JSON_FORMATS", "RawJsonWriter", "RowFormatOptions", "RowWriter",
+    "format_rows", "open_raw_json_writer", "open_writer", "unsupported_reason", "value_condition",
 ]
 
 Source = Literal["encoded", "raw"]
@@ -41,6 +43,11 @@ _JSON_NUMBER = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?")
 _HEX_BYTES = re.compile(r"(?:[0-9a-fA-F]{2})*")
 _NEWLINES = re.compile(r"\r\n|\r|\n")
 _TSV_SPECIAL = frozenset('\t\n\r"')
+_UNSUPPORTED: dict[tuple[FormatKind, Dialect], str] = {
+    # SQL++ INSERT takes a key and a document, not columns (spec §3.2.4)
+    (FormatKind.INSERT, Dialect.SQLPP): "INSERT statements are not offered for Couchbase",
+}
+RAW_JSON_FORMATS: frozenset[FormatKind] = frozenset({FormatKind.JSON, FormatKind.JSONL})
 
 
 class FormatResult(BaseModel):
@@ -64,10 +71,33 @@ class _Truncated:
     preview: str
 
 
-Cell = None | bool | int | float | str | _Binary | _Truncated
+@dataclass(frozen=True, slots=True)
+class _Json:
+    """A JSON value as its text (Couchbase objects, arrays, exact numbers): written as it is, never re-encoded."""
+
+    text: str
+
+
+class _MissingCell:
+    """SQL++ MISSING: the row has no such key. Empty in text formats, a left-out key in JSON (R-04-8)."""
+
+    __slots__ = ()
+
+
+_MISSING_CELL = _MissingCell()
+Cell = None | bool | int | float | str | _Binary | _Truncated | _Json | _MissingCell
+
+
+def unsupported_reason(kind: FormatKind, dialect: Dialect) -> str | None:
+    """Why `kind` cannot be produced for `dialect` (copy and export alike); None when it can."""
+    return _UNSUPPORTED.get((kind, dialect))
 
 
 def _normalise_raw(value: Any) -> Cell:
+    if isinstance(value, JsonText):  # before encode_value, which would cut a long document for the grid
+        return _Json(value.text)
+    if value is MISSING:
+        return _MISSING_CELL
     if isinstance(value, str):  # before encode_value, which would cut long text for the grid
         return value
     if isinstance(value, (bytes, bytearray, memoryview)):
@@ -97,16 +127,28 @@ def _encoded_text(cell: dict[str, Any]) -> str | _Truncated:
     return _Truncated(preview) if truncated else preview
 
 
+def _encoded_json(cell: dict[str, Any]) -> _Json:
+    text = cell.get("text")
+    if not isinstance(text, str):
+        raise _MalformedCell("a json cell needs its text")
+    return _Json(text)
+
+
 def _normalise_encoded(value: Any) -> Cell:
-    """Raises `_MalformedCell`: the only objects an encoded cell can be are `encode_value`'s bytes and text cells."""
+    """Raises `_MalformedCell`: the only objects an encoded cell can be are `encode_value`'s bytes, text, json and
+    missing cells."""
     if isinstance(value, dict):
         match value.get("$type"):
             case "bytes":
                 return _encoded_binary(value)
             case "text":
                 return _encoded_text(value)
+            case "json":
+                return _encoded_json(value)
+            case "missing":
+                return _MISSING_CELL
             case _:
-                raise _MalformedCell("an object cell must be a bytes or a text cell")
+                raise _MalformedCell("an object cell must be a bytes, text, json or missing cell")
     return _normalise_raw(value)
 
 
@@ -145,6 +187,10 @@ def _display(cell: Cell) -> str:
             return f"0x{cell.hex}{_ELLIPSIS if cell.truncated else ''}"
         case _Truncated():
             return cell.preview + _ELLIPSIS
+        case _Json():
+            return cell.text
+        case _MissingCell():
+            return ""
         case _:
             return str(cell)
 
@@ -155,10 +201,6 @@ def _text_cell(cell: Cell, null_text: str) -> str:
 
 def _json_cell(cell: Cell) -> Any:
     return cell if cell is None or isinstance(cell, (bool, int, float, str)) else _display(cell)
-
-
-def _reject_constant(name: str) -> NoReturn:
-    raise ValueError(f"{name} is not JSON")
 
 
 def _dump_json(node: Any) -> str:
@@ -178,14 +220,23 @@ def _dump_json(node: Any) -> str:
 def _embedded_json(text: str) -> str | None:
     """`text` as compact JSON with its numbers kept exactly as written; None when it is not JSON."""
     try:
-        return _dump_json(json.loads(text, parse_float=Decimal, parse_constant=_reject_constant))
+        return _dump_json(json.loads(text, parse_float=Decimal, parse_constant=reject_constant))
     except (ValueError, RecursionError):
         return None
 
 
+def _single_line(text: str) -> str:
+    """JSON text on one line: a line break (whitespace a document was stored with) is squeezed out between tokens,
+    anything else is exactly as it is."""
+    return one_line(text) if "\n" in text or "\r" in text else text
+
+
 def _json_text(cell: Cell, column: FormatColumn) -> str:
     """A cell as JSON. PostgreSQL loads bigint, numeric and json as text, so number and JSON columns are written as
-    what they are: a bare number with its exact digits, an embedded JSON value (a string that is not JSON stays one)."""
+    what they are: a bare number with its exact digits, an embedded JSON value (a string that is not JSON stays one).
+    A `_Json` cell is already JSON text and goes in unchanged; any other string in a mixed column is a JSON string."""
+    if isinstance(cell, _Json):
+        return cell.text
     if isinstance(cell, str):
         if column.category == ColumnCategory.NUMBER and _JSON_NUMBER.fullmatch(cell):
             return cell
@@ -211,6 +262,10 @@ class _SqlLiterals:
         match cell:
             case None:
                 return "NULL"
+            case _MissingCell():
+                return "MISSING"
+            case _Json():
+                return json_literal(self._dialect, cell.text)
             case bool():
                 return bool_literal(self._dialect, cell)
             case _Truncated() | _Binary(truncated=True):
@@ -241,8 +296,12 @@ def value_condition(dialect: Dialect, column: str, value: Any, category: ColumnC
         cell = _normalise_encoded(value)
     except _MalformedCell as malformed:
         raise ValidationFailed(f"Not a grid cell: {malformed}") from None
+    if cell is _MISSING_CELL:
+        return f"{name} IS MISSING"
     if isinstance(cell, _Truncated) or (isinstance(cell, _Binary) and cell.truncated):
         return None
+    if isinstance(cell, _Json):
+        return f"{name} = {json_literal(dialect, cell.text)}"
     if category == ColumnCategory.JSON and isinstance(cell, str):
         return f"{name} = {json_literal(dialect, cell)}"
     if category == ColumnCategory.DATETIME and isinstance(cell, str) and (text := zero_date_as_text(dialect, name, cell)):
@@ -364,11 +423,22 @@ class _ObjectWriter(RowWriter, ABC):
         self._keys = [json.dumps(key, ensure_ascii=False) for key in _unique_names(self._names)]
 
     def _object(self, cells: list[Cell]) -> str:
-        fields = (f"{key}: {_json_text(cell, column)}" for key, cell, column in zip(self._keys, cells, self._columns))
+        fields = (  # a MISSING cell has no key in the object (R-04-8)
+            f"{key}: {self._value(cell, column)}"
+            for key, cell, column in zip(self._keys, cells, self._columns)
+            if cell is not _MISSING_CELL
+        )
         return "{" + ", ".join(fields) + "}"
+
+    def _value(self, cell: Cell, column: FormatColumn) -> str:
+        return _json_text(cell, column)
 
 
 class _JsonlWriter(_ObjectWriter):
+    def _value(self, cell: Cell, column: FormatColumn) -> str:
+        text = _json_text(cell, column)
+        return _single_line(text) if isinstance(cell, _Json) else text  # a JSON Lines row is one line
+
     def _write_row(self, cells: list[Cell]) -> None:
         self._fp.write(self._object(cells) + "\n")
 
@@ -420,13 +490,47 @@ def _make_writer(
     kind: FormatKind, fp: TextIO, columns: Sequence[FormatColumn], options: RowFormatOptions, dialect: Dialect,
     source: Source,
 ) -> RowWriter:
+    if (reason := unsupported_reason(kind, dialect)) is not None:  # copy and export alike
+        raise UnsupportedFormat(reason)
     writer = _WRITERS.get(kind)
     if writer is None:
         raise ValueError(f"{kind.value} cannot be written as a stream")
     return writer(fp, columns, options, dialect, source)
 
 
+class RawJsonWriter:
+    """JSON / JSONL export of rows that are already JSON text (`RawJsonRows`): each row exactly as the server sent it
+    (R-04-15). A JSON Lines row must be one line, so a row holding a line break (whitespace a document was stored with)
+    is squeezed outside its strings, tokens unchanged; a JSON array keeps every row's bytes."""
+
+    def __init__(self, kind: FormatKind, fp: TextIO) -> None:
+        if kind not in RAW_JSON_FORMATS:
+            raise ValueError(f"{kind.value} is not a raw JSON format")
+        self._lines = kind == FormatKind.JSONL
+        self._fp = fp
+        self._first = True
+        if not self._lines:
+            fp.write("[")
+
+    def write(self, rows: Iterable[str]) -> None:
+        for text in rows:
+            if self._lines:
+                self._fp.write(_single_line(text) + "\n")
+            else:
+                self._fp.write(("\n  " if self._first else ",\n  ") + text)
+            self._first = False
+
+    def close(self) -> None:
+        if not self._lines:
+            self._fp.write("]\n" if self._first else "\n]\n")
+
+
 # --- public entry points ---------------------------------------------------------------------------------------------
+
+
+def open_raw_json_writer(kind: FormatKind, fp: TextIO) -> RawJsonWriter:
+    """Streaming JSON / JSONL writer for `RawJsonRows` text (ValueError for any other kind)."""
+    return RawJsonWriter(kind, fp)
 
 
 def open_writer(
@@ -455,4 +559,4 @@ def _in_list(columns: Sequence[FormatColumn], rows: Iterable[Sequence[Any]], dia
         raise ValidationFailed("An IN list needs exactly one column", detail={"columns": len(columns)})
     literals = _SqlLiterals(dialect)
     distinct = dict.fromkeys(literals(cells[0], columns[0]) for cells in _cells(rows, 1, _NORMALISERS[source]))
-    return FormatResult(text=f"({', '.join(distinct)})", warnings=_truncation_warnings(literals.truncated))
+    return FormatResult(text=in_list(dialect, distinct), warnings=_truncation_warnings(literals.truncated))

@@ -6,6 +6,7 @@ from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.splitter import split
 
 PG, LITE, MY = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL
+SQ = Dialect.SQLPP
 
 
 def texts(sql, dialect=PG):
@@ -403,3 +404,23 @@ def test_a_huge_go_count_does_not_crash_the_splitter():
     assert batches("SELECT 1\nGO 000000000000000000000000000003") == [("SELECT 1", 3)]  # leading zeros are no digits
     assert batches("SELECT 1\nGO 00000000000") == [("SELECT 1", 0)]
     assert batches("SELECT 1\nGO 999999999") == [("SELECT 1", 999_999_999)]
+
+
+def test_sqlpp_splits_on_every_semicolon_outside_tokens():
+    sql = (
+        "SELECT {\"a\": [1, 2]} AS o, ARRAY v FOR v IN [1] END AS x FROM `a;b` WHERE s = 'x;y' AND t = \"u;v\";"
+        " /* ; */ UPDATE ks SET a = 1 -- ;\n; INSERT INTO ks (KEY, VALUE) VALUES ('k', {\"v\": \";\"})"
+    )
+    assert [s.text for s in split(sql, SQ)] == [
+        "SELECT {\"a\": [1, 2]} AS o, ARRAY v FOR v IN [1] END AS x FROM `a;b` WHERE s = 'x;y' AND t = \"u;v\"",
+        "UPDATE ks SET a = 1",  # a span ends at its last significant token
+        "INSERT INTO ks (KEY, VALUE) VALUES ('k', {\"v\": \";\"})",
+    ]
+    assert not any(s.has_body for s in split("CREATE FUNCTION f() { 1 }; SELECT f()", SQ))  # BodyRule.NONE
+
+
+def test_sqlpp_spans_carry_their_parameters():
+    first, second = split("SELECT $a, @a, $b, $1, ?, ?, '$c' FROM ks WHERE x = @b; SELECT `$d`, $e", SQ)
+    assert first.params == ("$a", "$b", "$1", "?", "?")  # @a is $a; strings and names are not parameters
+    assert second.params == ("$e",)
+    assert split("SELECT $1", Dialect.POSTGRES)[0].params == ()  # only dialects with named or ? parameters

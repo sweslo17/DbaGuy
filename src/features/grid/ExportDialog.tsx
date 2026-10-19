@@ -1,5 +1,5 @@
 import { Loader2 } from "lucide-react";
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useEffectEvent, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useStore } from "zustand";
 import { Button } from "@/components/ui/Button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
@@ -14,9 +14,9 @@ import { canChooseFiles, chooseSavePath } from "@/lib/native";
 import { useNow } from "@/lib/useNow";
 import { useEngineInfo } from "../connections/hooks";
 import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
-import type { SessionController } from "../session/SessionController";
+import type { RequestOptions, SessionController } from "../session/SessionController";
 import { cancelAbortsTransaction, EXPORT_CANCEL_ABORTS_TRANSACTION } from "../session/transactions";
-import { COPY_FORMAT_LABELS } from "./copy";
+import { COPY_FORMAT_LABELS, copyFormatsFor } from "./copy";
 
 type TableName = { schema: string | null; name: string };
 
@@ -25,6 +25,11 @@ export interface ExportSource {
   controller: SessionController;
   /** The statement that produced the result (the browse SELECT for table data). */
   sql: string;
+  /**
+   * What the statement was sent with (Couchbase: its query context and parameters): the export runs it the same way.
+   * Absent: the session's default context, no parameters.
+   */
+  request?: RequestOptions;
   /** Default file name stem. */
   title: string;
   /** Prefills the INSERT target (table data). */
@@ -147,9 +152,15 @@ export function ExportDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const { controller, sql, title } = source;
+  const { controller, sql, request, title } = source;
   const engine = useEngineInfo(controller.profileId);
   const prefill = source.tableName ?? null;
+  // The formats of the engine's dialect: SQL++ has no INSERT by columns, and `copyFormatsFor` is where that is decided.
+  const dialect = engine?.dialect ?? null;
+  const formats = useMemo(
+    () => FORMAT_ORDER.filter((kind) => kind !== "insert" || copyFormatsFor(dialect).includes("insert")),
+    [dialect],
+  );
   const [format, setFormat] = useState<ExportFormat>("csv");
   const [header, setHeader] = useState(true);
   const [nullText, setNullText] = useState("");
@@ -191,6 +202,15 @@ export function ExportDialog({
     setFormat(next);
   };
 
+  // The engine arrives after the dialog may have been opened (or the tab's connection changed): a format it cannot
+  // write is not kept; going through `changeFormat` also remaps a file name's extension.
+  const dropUnsupportedFormat = useEffectEvent(() => {
+    if (!formats.includes(format)) changeFormat("csv");
+  });
+  useEffect(() => {
+    dropUnsupportedFormat();
+  }, [formats, format]);
+
   const choose = async () => {
     try {
       const filters = [{ name: spec.label, extensions: [spec.ext] }];
@@ -208,7 +228,7 @@ export function ExportDialog({
       null_text: spec.textTable ? nullText : "",
       ...(format === "insert" ? tableTarget(table, prefill) : {}),
     };
-    const requestId = controller.exportResult(sql, format, target, options);
+    const requestId = controller.exportResult(sql, format, target, options, request);
     setRunning({ requestId, path: target, startedAt: Date.now() });
     setCancelSent(null);
     setOutcome(null);
@@ -309,7 +329,7 @@ export function ExportDialog({
         <div className="flex flex-col gap-2">
           <FieldRow label="Format">
             <Select value={format} onChange={(e) => changeFormat(e.target.value as ExportFormat)}>
-              {FORMAT_ORDER.map((kind) => (
+              {formats.map((kind) => (
                 <option key={kind} value={kind}>
                   {FORMATS[kind].label}
                 </option>

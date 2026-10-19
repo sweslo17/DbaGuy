@@ -1,14 +1,19 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { EngineIcon } from "@/components/EngineIcon";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import { pathKey, type ObjectNode, type ObjectSearchHit, type Profile } from "@/lib/api/types";
 import { useWorkspace } from "@/stores/workspace";
+import { useEngineInfo } from "../connections/hooks";
+import { openBrowseTab } from "../explorer/browse";
 import { kindIcon } from "../explorer/kinds";
 import { objectSearchKey } from "./objectSearchKey";
 import { PaletteGroup, PaletteItem, PaletteNote, type Choose } from "./parts";
 
 /*
  * Quick open's database objects (spec §4.10, ruling R-02c-16): the tables and views of the connection being worked
- * with, found by the backend (`GET /metadata/search`, a fuzzy match over its schema snapshot) and listed in its order.
+ * with (its collections too, for Couchbase), found by the backend (`GET /metadata/search`, a fuzzy match over its
+ * schema snapshot) and listed in its order. A table or view opens as the explorer would open it; a collection opens a
+ * browse tab.
  */
 
 const OBJECT_LIMIT = 50;
@@ -52,8 +57,20 @@ export function ObjectsSection({
   choose: Choose;
 }) {
   const openObject = useWorkspace((s) => s.openObject);
+  // Only an engine with a query context (Couchbase) has collections to find; the others keep their wording.
+  const collections = !!useEngineInfo(profile?.id ?? null)?.query_context;
+  const openHit = (profileId: string, hit: ObjectSearchHit) =>
+    hit.kind === "collection" ? void openBrowseTab(profileId, hit.path) : openObject(profileId, hitNode(hit));
   const search = useObjectSearch(profile?.id ?? null, q);
-  const heading = profile ? `Database objects · ${profile.name}` : "Database objects";
+  const heading = profile ? (
+    // The engine's icon leads the connection's name.
+    <span className="flex items-center gap-1.5">
+      <EngineIcon engine={profile.engine} size={12} />
+      <span className="min-w-0">Database objects · {profile.name}</span>
+    </span>
+  ) : (
+    "Database objects"
+  );
   if (!profile) {
     return (
       <PaletteGroup heading={heading}>
@@ -64,7 +81,9 @@ export function ObjectsSection({
   if (!q) {
     return (
       <PaletteGroup heading={heading}>
-        <PaletteNote>Type to search tables and views</PaletteNote>
+        <PaletteNote>
+          {collections ? "Type to search tables, views and collections" : "Type to search tables and views"}
+        </PaletteNote>
       </PaletteGroup>
     );
   }
@@ -81,7 +100,9 @@ export function ObjectsSection({
         </div>
       )}
       {!search.isError && hits.length === 0 && !waiting && (
-        <PaletteNote>No table or view matches “{q}”</PaletteNote>
+        <PaletteNote>
+          {collections ? "No table, view or collection matches" : "No table or view matches"} “{q}”
+        </PaletteNote>
       )}
       {hits.map((hit) => {
         // The explorer path names the object uniquely: database, schema, kind and name.
@@ -91,7 +112,7 @@ export function ObjectsSection({
             key={id}
             value={`object:${id}`}
             pending={stale}
-            onSelect={() => choose(() => openObject(profile.id, hitNode(hit)))}
+            onSelect={() => choose(() => openHit(profile.id, hit))}
             icon={kindIcon(hit.kind)}
             label={hit.name}
             detail={hit.database ? `${hit.database} · ${hit.schema_name}` : hit.schema_name}

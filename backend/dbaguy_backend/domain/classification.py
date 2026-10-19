@@ -26,6 +26,8 @@ class DangerReason(StrEnum):
     DROP = "drop"
     TRUNCATE = "truncate"
     ALTER_DROP = "alter_drop"
+    SYSTEM_KEYSPACE = "system_keyspace"  # SQL++: a write to system: (kills requests, drops prepared statements)
+    MERGE_DELETE = "merge_delete"  # SQL++: MERGE … WHEN MATCHED THEN DELETE
 
 
 class GuardReason(StrEnum):
@@ -37,6 +39,8 @@ class GuardReason(StrEnum):
     DROP = DangerReason.DROP.value
     TRUNCATE = DangerReason.TRUNCATE.value
     ALTER_DROP = DangerReason.ALTER_DROP.value
+    SYSTEM_KEYSPACE = DangerReason.SYSTEM_KEYSPACE.value
+    MERGE_DELETE = DangerReason.MERGE_DELETE.value
     STRICT_WRITE = "strict_write"
     STRICT_DDL = "strict_ddl"
     STRICT_TRANSACTION = "strict_transaction"

@@ -2,6 +2,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { memo, useEffect, useRef } from "react";
 import { tabClass } from "@/components/ui/Tabs";
 import { cn } from "@/lib/cn";
+import { scrollSidewaysOnWheel } from "@/lib/stripScroll";
 
 export interface StripTab {
   value: string;
@@ -51,10 +52,8 @@ export const ResultTabStrip = memo(function ResultTabStrip({
       {/* `pb-px -mb-px`: the selected tab's underline sits on the border below, as in `Tabs`. */}
       <div
         ref={scroller}
-        className="-mb-px min-w-0 overflow-x-auto overflow-y-hidden pb-px [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-        onWheel={(e) => {
-          if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) e.currentTarget.scrollLeft += e.deltaY;
-        }}
+        className="scrollbar-none -mb-px min-w-0 overflow-x-auto overflow-y-hidden pb-px"
+        onWheel={scrollSidewaysOnWheel}
       >
         {/* The tabs in view, in the flow: the first is pushed to where the strip has it. */}
         <div className="flex" style={{ width: virtualizer.getTotalSize() }}>

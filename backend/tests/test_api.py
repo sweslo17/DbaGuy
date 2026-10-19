@@ -7,15 +7,18 @@ from uuid import UUID, uuid4
 
 import pytest
 import uvicorn
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from loguru import logger
 from starlette.websockets import WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect
 
+from dbaguy_backend.api.errors import register_error_handlers
 from dbaguy_backend.app import create_app
 from dbaguy_backend.config import Settings
 from dbaguy_backend.container import AppContainer
+from dbaguy_backend.domain.errors import QueryFailed, ValidationFailed
 from dbaguy_backend.domain.history import HistoryRecord
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
 
@@ -84,6 +87,14 @@ def test_import_url_and_validation(client):
     assert invalid.status_code == 422 and invalid.json()["error"]["code"] == "validation_failed"
 
 
+def test_a_validation_error_never_echoes_the_input(client):
+    secret = "hunter2\ud800"  # a lone surrogate could not be encoded in the answer either
+    body = '{"profile": {"engine": "postgres", "port": "' + secret.encode("unicode_escape").decode() + '"}}'
+    response = client.post("/profiles", content=body, headers={**AUTH, "Content-Type": "application/json"})
+    assert response.status_code == 422 and response.json()["error"]["code"] == "validation_failed"
+    assert "hunter2" not in response.text and all("input" not in e for e in response.json()["error"]["detail"])
+
+
 @pytest.mark.parametrize("url", [
     "postgres://h:abc/db", "postgres://h:99999999/db", "postgres://[bad/db", "sqlite://[bad/x.db",
     "mysql://h:abc/db", "jdbc:mysql://h:99999999/db", "mysql://[bad/db",
@@ -106,9 +117,39 @@ def test_import_url_never_echoes_the_password_of_a_malformed_url(client):
     assert any("rejected" in line for line in logged) and "hunter2" not in "".join(logged)
 
 
+def test_a_query_failed_keeps_the_servers_text_out_of_the_info_log():
+    """The server's text quotes the user's statement (a syntax error shows the token, a string literal included): the
+    answer carries it, INFO does not, DEBUG does. Our own errors keep their text at INFO."""
+    app = FastAPI()
+    register_error_handlers(app)
+
+    @app.get("/server")
+    def server_error():
+        raise QueryFailed('syntax error - at "SECRET_LIT_1"')
+
+    @app.get("/ours")
+    def own_error():
+        raise ValidationFailed("This is our own text")
+
+    levels: dict[str, list[str]] = {"INFO": [], "DEBUG": []}
+    sinks = [logger.add(lambda m, name=name: levels[name].append(m.record["message"]), level=name,
+                        filter=lambda r, name=name: r["level"].name == name) for name in levels]
+    try:
+        with TestClient(app, base_url=BASE_URL) as client:
+            failed, ours = client.get("/server"), client.get("/ours")
+    finally:
+        for sink in sinks:
+            logger.remove(sink)
+    assert failed.status_code == 400 and "SECRET_LIT_1" in failed.json()["error"]["message"]
+    assert any("/server" in line and "query_failed" in line for line in levels["INFO"])
+    assert "SECRET_LIT_1" not in "".join(levels["INFO"])
+    assert any("SECRET_LIT_1" in line for line in levels["DEBUG"])
+    assert ours.status_code == 422 and any("This is our own text" in line for line in levels["INFO"])
+
+
 def test_engines(client):
     engines = {e["engine"]: e for e in client.get("/system/engines", headers=AUTH).json()}
-    assert set(engines) == {"postgres", "mysql", "mssql", "sqlite"}
+    assert set(engines) == {"postgres", "mysql", "mssql", "couchbase", "sqlite"}
     assert engines["postgres"]["per_database_connection"] and engines["postgres"]["cancel_aborts_transaction"]
     assert not engines["sqlite"]["per_database_connection"] and not engines["sqlite"]["cancel_aborts_transaction"]
     assert engines["postgres"]["server_read_only"] and engines["sqlite"]["server_read_only"]
@@ -120,6 +161,16 @@ def test_engines(client):
     assert (mssql["per_database_connection"], mssql["cancel_aborts_transaction"], mssql["server_read_only"]) == (
         True, False, False,
     )
+    couchbase = engines["couchbase"]
+    assert couchbase["dialect"] == "sqlpp" and couchbase["default_port"] == 8093 and couchbase["server_read_only"]
+    assert not couchbase["transactions"] and couchbase["query_context"] and couchbase["parameters"]
+    assert couchbase["documents"] and couchbase["executed_plan"] and couchbase["plan_format"] == "couchbase"
+    assert couchbase["url_schemes"] == ["couchbase", "couchbases", "http", "https"]
+    for name, info in engines.items():
+        if name == "couchbase":
+            continue
+        assert info["transactions"] and info["plan_format"] is None
+        assert not (info["query_context"] or info["parameters"] or info["documents"] or info["executed_plan"])
 
 
 def test_metadata_and_session_over_websocket(client, sqlite_profile_id):
@@ -329,6 +380,26 @@ def test_settings_and_workspace_api(client):
     workspace["tabs"].append(object_tab)
     assert client.put("/workspace", json=workspace, headers=AUTH).status_code == 204
     assert client.get("/workspace", headers=AUTH).json()["tabs"][1]["kind"] == "object"
+
+
+def test_a_save_with_a_bad_draft_name_or_context_keeps_the_rest(client):  # B40 backstop: prune, then save
+    logged: list[str] = []
+    sink = logger.add(lambda m: logged.append(m.record["message"]), level="DEBUG")
+    tab = {"id": "t1", "kind": "query", "buffer": "SELECT $a", "query_context": "all",
+           "params": {"$a": "1", "bad name": "2"}}
+    try:
+        saved = client.put("/workspace", json={"tabs": [tab, {"id": "t2", "kind": "query"}], "active_tab_id": "t2"},
+                           headers=AUTH)
+    finally:
+        logger.remove(sink)
+    assert saved.status_code == 204
+    state = client.get("/workspace", headers=AUTH).json()
+    assert [t["id"] for t in state["tabs"]] == ["t1", "t2"] and state["active_tab_id"] == "t2"
+    assert state["tabs"][0]["buffer"] == "SELECT $a" and state["tabs"][0]["params"] == {"$a": "1"}
+    assert state["tabs"][0]["query_context"] is None
+    assert any("workspace being saved" in line for line in logged) and "bad name" not in "".join(logged)
+    # a tab that is wrong in any other way still refuses the whole save
+    assert client.put("/workspace", json={"tabs": [{"id": "t3", "kind": "chart"}]}, headers=AUTH).status_code == 422
 
 
 def test_settings_and_workspace_reject_bad_input(client):

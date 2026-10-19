@@ -1,0 +1,10 @@
+-- DbaGuy dev Couchbase (7.6.12 EE). Run by couchbase-init with cbq. Fake credentials only.
+CREATE SCOPE dbaguy.app IF NOT EXISTS;
+CREATE SCOPE dbaguy.many IF NOT EXISTS;
+CREATE COLLECTION dbaguy.app.users IF NOT EXISTS;
+CREATE COLLECTION dbaguy.app.orders IF NOT EXISTS;
+CREATE COLLECTION dbaguy.app.events IF NOT EXISTS;
+CREATE COLLECTION dbaguy.app.`odd-name` IF NOT EXISTS;
+CREATE COLLECTION dbaguy.app.`value` IF NOT EXISTS;
+CREATE COLLECTION dbaguy.app.blobs IF NOT EXISTS;
+CREATE COLLECTION dbaguy.app.noindex IF NOT EXISTS;

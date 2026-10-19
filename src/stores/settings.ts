@@ -13,6 +13,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   run: { default: "statement", continue_on_error: false, page_size: 500, statement_timeout_s: 0 },
   safety: { idle_transaction_warn_minutes: 3, idle_transaction_rollback_minutes: 0 },
   notifications: { long_query_seconds: 15 },
+  couchbase: { sample_size: 1000 },
   scripts_dir: null,
 };
 

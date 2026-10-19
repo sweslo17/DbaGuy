@@ -1,16 +1,20 @@
 import { Prec, type Extension } from "@codemirror/state";
 import { keymap, placeholder, type EditorView } from "@codemirror/view";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { Group, Panel } from "react-resizable-panels";
 import { PanelHandle } from "@/components/ui/PanelHandle";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
+import type { Dialect } from "@/lib/api/types";
+import { isImeKeyEvent } from "@/lib/ime";
+import { isCommandKey } from "@/lib/shortcuts";
 import { markEdited, readEditorBuffer, registerEditor, rememberEditorBuffer } from "@/stores/editorBuffers";
 import { useAppSettings } from "@/stores/settings";
 import { useReportTabStatus } from "@/stores/tabStatus";
 import { startSelection, useWorkspace, type QueryTabState } from "@/stores/workspace";
-import { useDialect, useProfiles } from "../connections/hooks";
+import { useEngineInfo, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
+import { RecoverableError } from "../connections/RecoverableError";
 import { CodeEditor, type CodeEditorHandle } from "../editor/CodeEditor";
 import { sqlCompletion, type CompletionTarget } from "../editor/completion";
 import { describeOnDemand } from "../editor/describe";
@@ -20,22 +24,35 @@ import { currentStatementHighlight, refreshStatements, statementsExtension } fro
 import { ExportDialog } from "../grid/ExportDialog";
 import { useLongQueryNotifications } from "../notifications/useLongQueryNotifications";
 import type { ExecutionState } from "../session/execution";
-import { busy, isExporting, type SessionPhase } from "../session/SessionController";
-import { SessionError } from "../session/SessionError";
+import { busy, isExporting, type RequestOptions, type SessionPhase } from "../session/SessionController";
 import { useSessionGuards } from "../session/SessionGuards";
 import { useSession } from "../session/useSession";
 import { useScriptBinding } from "../scripts/useScriptBinding";
 import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
 import { ConfirmRunDialog } from "./ConfirmRunDialog";
-import { QueryToolbar } from "./QueryToolbar";
-import { ResultsArea } from "./ResultsArea";
+import { NO_SLOTS, paramsWatcher, problemMessage, type ParamProblem } from "./params";
+import { ParamsPanel } from "./ParamsPanel";
+import { QueryToolbar, type PlanControl } from "./QueryToolbar";
+import { ResultsArea, type PlanSupport } from "./ResultsArea";
 import { beginRunMarks, errorLocation, flashStatement, jumpToError, markStatementError } from "./runMarks";
-import { planRun, type PlannedStatement, type RunMode } from "./runPlan";
+import { effectiveContext, seenFieldsOf } from "./queryContext";
+import { bindParams, explainStatement, planRun, type PlannedStatement, type RunMode } from "./runPlan";
 import { useQueryTabActions } from "./tabActions";
-import { useQueryRunner, type RunListener } from "./useQueryRunner";
+import { useQueryRunner, type RunListener, type StartOptions } from "./useQueryRunner";
 import { useTransactionControls } from "./useTransactionControls";
 
 const NO_EXECUTIONS: Record<string, ExecutionState> = {};
+const NO_FIELDS: string[] = [];
+const NO_DRAFTS: Record<string, string> = {};
+
+/**
+ * The keys that run: ⌘↵ by the `run.default` setting, ⌘⇧↵ every statement. The editor's keymap (`cm`, CodeMirror's
+ * spelling) and the parameter fields (`shift`, for `isCommandKey`) both read this, so they never differ.
+ */
+const RUN_KEYS: readonly { cm: string; shift: boolean; mode: RunMode }[] = [
+  { cm: "Mod-Enter", shift: false, mode: "default" },
+  { cm: "Shift-Mod-Enter", shift: true, mode: "all" },
+];
 
 /**
  * A query tab (spec §3.5, §4.1, §4.2): toolbar, then the editor above the results. Its session opens the first time
@@ -44,16 +61,55 @@ const NO_EXECUTIONS: Record<string, ExecutionState> = {};
  * the cursor; ⌘⇧↵ runs every statement; ⌘⇧F formats. ⌘S saves the tab to its script file (⌘⇧S: Save As). Closing the
  * tab or switching its connection first stops a running export and ends an open transaction, asking each time;
  * closing also asks about unsaved script changes. The tab hosts the export dialog, so it outlives the result grids. A
- * long run that ends while DbaGuy is in the background notifies.
+ * long run that ends while DbaGuy is in the background notifies. For Couchbase the tab has a query context (picked in
+ * the toolbar, or by a click on the tree, or the one a browse tab or History entry opened with), which every run, export
+ * and completion request carries; without a choice it follows the profile's default. For an engine that takes
+ * parameters (Couchbase) a bar at the bottom of the editor pane holds one field per parameter the statements use
+ * (JSON literals, kept with the tab in the workspace): a run needs a valid value for every parameter of the statements
+ * it sends, and each statement is sent with its own. An engine that draws plans (Couchbase) adds ⌘E, Explain: the plan
+ * of the one statement (the selection, or under the cursor) as `EXPLAIN <statement>`, not recorded in the History and
+ * sent without the values of parameters that have none; and Run with profile, a run that also returns the plan the
+ * statement ran with.
  */
 export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean }) {
   const { settings } = useAppSettings();
   const [shown, setShown] = useState(active);
   if (active && !shown) setShown(true);
   const { controller, snapshot, retry } = useSession(tab.profileId, tab.database, { enabled: shown });
-  const dialect = useDialect(tab.profileId);
+  const engine = useEngineInfo(tab.profileId);
+  const dialect = engine?.dialect ?? null;
+  /** Couchbase: where the tab's unqualified names resolve; undefined for engines without a query context. */
+  const takesContext = !!engine?.query_context;
+  const sessionDefault = snapshot?.info?.server.default_query_context ?? null;
+  const context = takesContext ? effectiveContext(tab.queryContext, sessionDefault) : undefined;
+  /** Couchbase: results of the `plan` presentation are drawn as plans, and Explain is offered (spec §3.10). */
+  const takesPlans = engine?.plan_format === "couchbase";
+  /** Couchbase: a run can also return the plan it ran with; Enterprise Edition only (the session reports it). */
+  const offersProfile = takesPlans && !!engine?.executed_plan;
+  /** The server's edition (Couchbase), once the session has reported it. */
+  const edition = snapshot?.info?.server.edition ?? null;
+  /** Whether the engine has transactions; undefined while the engines load. Couchbase has none (spec §3.7.5). */
+  const transactions = engine?.transactions;
   const profiles = useProfiles();
   const updateTab = useWorkspace((s) => s.updateTab);
+  // SQL++ parameters: the fields come from the editor's split (`paramsWatcher`), the values are the tab's drafts.
+  const takesParams = !!engine?.parameters;
+  const drafts = tab.params ?? NO_DRAFTS;
+  const draftsRef = useRef(drafts);
+  useLayoutEffect(() => {
+    draftsRef.current = drafts;
+  });
+  const [slots, setSlots] = useState(NO_SLOTS);
+  const [paramsOpen, setParamsOpen] = useState(true);
+  /** The field a refused run asks the panel to focus; cleared once the panel has had it (the same one may repeat). */
+  const [focusParam, setFocusParam] = useState<string | null>(null);
+  useEffect(() => {
+    if (focusParam !== null) setFocusParam(null);
+  }, [focusParam]);
+  const changeParam = useCallback(
+    (name: string, text: string) => updateTab(tab.id, "query", { params: { ...draftsRef.current, [name]: text } }),
+    [tab.id, updateTab],
+  );
   const editor = useRef<CodeEditorHandle>(null);
   const view = () => editor.current?.view ?? null;
   const withView = (fn: (v: EditorView) => void) => {
@@ -72,8 +128,21 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   const [ownTimeout, setOwnTimeout] = useState<number | null>(null);
   const timeout = ownTimeout ?? settings.run.statement_timeout_s;
   const timeoutS = timeout > 0 ? timeout : null;
-  const runner = useQueryRunner({ controller, profileId: tab.profileId, settings, timeoutS, listener });
+  const runner = useQueryRunner({
+    controller,
+    profileId: tab.profileId,
+    settings,
+    timeoutS,
+    queryContext: context,
+    listener,
+  });
   const { run } = runner;
+  // The field names of the latest run's results: SQL++ completion offers them (as "seen in results").
+  const executions = snapshot?.executions ?? NO_EXECUTIONS;
+  const seenFields = useMemo(
+    () => (takesContext ? seenFieldsOf(run, executions) : NO_FIELDS),
+    [takesContext, run, executions],
+  );
   /** The text is being split into statements for a run (a long script that was not split yet takes a moment). */
   const [splitting, setSplitting] = useState(false);
   /** Cancel was pressed while splitting: nothing is run. */
@@ -81,7 +150,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
 
   const profile = profiles.data?.find((entry) => entry.profile.id === tab.profileId)?.profile ?? null;
   const profileName = tab.profileId === null ? null : (profile?.name ?? "…");
-  useLongQueryNotifications(run, snapshot?.executions ?? NO_EXECUTIONS, profile?.name ?? null);
+  useLongQueryNotifications(run, executions, profile?.name ?? null);
   /** The tab and its connection, as dialogs and toasts name it. */
   const subject = profileName ? `${tab.title} · ${profileName}` : tab.title;
   const phase: SessionPhase = snapshot?.phase ?? "opening";
@@ -99,8 +168,8 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   const checking = splitting || runner.checking;
   const sessionBusy = busy(snapshot);
   // Nothing runs before the session has reported its state and taken the tab's auto-commit mode: a statement sent
-  // earlier would run in the wrong mode.
-  const modeApplied = !!snapshot?.state && snapshot.state.autocommit === tab.autocommit;
+  // earlier would run in the wrong mode. An engine without transactions has no mode to wait for.
+  const modeApplied = !!snapshot?.state && (transactions === false || snapshot.state.autocommit === tab.autocommit);
   const canRun = !!controller && phase === "open" && modeApplied && dialect !== null && !sessionBusy && !running;
   const runBlockedReason =
     tab.profileId === null
@@ -111,12 +180,15 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
           ? "Setting the auto-commit mode…"
           : undefined;
   const runningReason = running || sessionBusy ? "Wait for the run to finish, or cancel it" : undefined;
+  /** What disables the connection and context pickers: only a run (a statement of it may still be sent). */
+  const pickerBlockedReason = running ? "Wait for the run to finish, or cancel it" : undefined;
 
   const transaction = useTransactionControls({
     tabId: tab.id,
     controller,
     snapshot,
     autocommit: tab.autocommit,
+    transactions,
     subject,
   });
   const inTransaction = !!snapshot?.state?.inTransaction;
@@ -146,18 +218,40 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     switching.current = true;
     try {
       if (!(await guards.exportStep("switch")) || !(await guards.transactionStep("switch"))) return;
-      updateTab(tab.id, "query", { profileId, database }); // useSession closes the old session and opens the new one
+      // useSession closes the old session and opens the new one; the new profile's own default context applies.
+      updateTab(tab.id, "query", { profileId, database, queryContext: undefined });
     } finally {
       switching.current = false;
     }
   };
 
   // The export dialog of the result whose grid asked; it stays mounted (with its settings) once opened.
-  const [exportRequest, setExportRequest] = useState<{ sql: string; open: boolean } | null>(null);
-  const openExport = useCallback((sql: string) => setExportRequest({ sql, open: true }), []);
+  const [exportRequest, setExportRequest] = useState<{ sql: string; request: RequestOptions; open: boolean } | null>(
+    null,
+  );
+  const openExport = useCallback(
+    (sql: string, request: RequestOptions) => setExportRequest({ sql, request, open: true }),
+    [],
+  );
+
+  /** A run that cannot start for want of a parameter's value: says which, and opens the panel on its field. */
+  const refuseRun = (problem: ParamProblem) => {
+    toast("error", problemMessage(problem));
+    setParamsOpen(true);
+    setFocusParam(problem.name);
+  };
 
   const planning = useRef(false);
-  const start = async (mode: RunMode) => {
+  /**
+   * Plans a run and hands it to the runner: `choose` gives the statements (the text is split first, which a long script
+   * takes a moment for), `prepare` makes them ready to send, or gives null when the run is refused (it has already said
+   * why). Nothing happens while the tab cannot run or another run is being planned.
+   */
+  const beginRun = async (
+    choose: (current: EditorView, dialect: Dialect) => Promise<PlannedStatement[]>,
+    prepare: (planned: PlannedStatement[]) => PlannedStatement[] | null,
+    options: Omit<StartOptions, "unchanged"> = {},
+  ) => {
     const current = view();
     if (!canRun || !current || dialect === null || planning.current) return;
     planning.current = true;
@@ -167,18 +261,63 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
       let planned: PlannedStatement[];
       setSplitting(true);
       try {
-        planned = await planRun(current, mode, settings.run.default, dialect);
+        planned = await choose(current, dialect);
       } catch (error) {
         toast("error", `Could not split the text into statements: ${errorMessage(error)}`);
         return;
       } finally {
         setSplitting(false);
       }
-      if (planCancelled.current) return;
-      if (planned.length) await runner.start(planned, { unchanged: () => view()?.state.doc === plannedDoc });
+      if (planCancelled.current || !planned.length) return;
+      const statements = prepare(planned);
+      if (!statements) return;
+      await runner.start(statements, { ...options, unchanged: () => view()?.state.doc === plannedDoc });
     } finally {
       planning.current = false;
     }
+  };
+
+  /** Run (⌘↵), Run all (⌘⇧↵) and Run with profile: every parameter a statement uses needs a valid value first. */
+  const start = (mode: RunMode, options: Omit<StartOptions, "unchanged"> = {}) =>
+    beginRun(
+      (v, d) => planRun(v, mode, settings.run.default, d),
+      (planned) => {
+        if (!takesParams) return planned;
+        // Before anything is analysed or sent: a statement needs a valid value for each parameter it uses.
+        const bound = bindParams(planned, draftsRef.current);
+        if ("problem" in bound) {
+          refuseRun(bound);
+          return null;
+        }
+        return bound.statements;
+      },
+      options,
+    );
+
+  /**
+   * ⌘E: the plan of one statement, the selection's or the one under the cursor (whatever `run.default` says), without
+   * running it. It does not wait for parameter values (the plan does not need them) and is not recorded in the History.
+   */
+  const explain = async () => {
+    if (!takesPlans) return;
+    await beginRun(
+      (v, d) => planRun(v, "default", "statement", d),
+      (planned) => {
+        if (planned.length > 1) {
+          toast("info", "Explain one statement at a time");
+          return null;
+        }
+        return planned.map((statement) => explainStatement(statement, draftsRef.current));
+      },
+      { history: false },
+    );
+  };
+
+  /** Run with profile: why it is not possible (Community Edition gives no profile); undefined when it is. */
+  const profileBlockedReason =
+    edition === "community" ? "Community Edition does not give an execution profile" : undefined;
+  const runWithProfile = async () => {
+    if (offersProfile && !profileBlockedReason) await start("default", { profilePlan: true });
   };
 
   // ⌘⇧F: the selection, else the statement under the cursor, by the tab's dialect and the editor settings.
@@ -189,22 +328,39 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   useQueryTabActions(tab.id, {
     run: { enabled: canRun, run: () => void start("default") },
     runAll: { enabled: canRun, run: () => void start("all") },
+    explain: { enabled: canRun && takesPlans, run: () => void explain() },
+    runWithProfile: {
+      enabled: canRun && offersProfile && !profileBlockedReason,
+      run: () => void runWithProfile(),
+    },
     format: { enabled: true, run: format },
     toggleAutocommit: {
-      enabled: !autocommitBlockedReason,
+      enabled: transactions !== false && !autocommitBlockedReason,
       checked: tab.autocommit,
       run: () => transaction.setAutocommit(!tab.autocommit),
     },
-    commit: { enabled: canEnd, run: transaction.commit },
-    rollback: { enabled: canEnd, run: transaction.rollback },
+    commit: { enabled: transactions !== false && canEnd, run: transaction.commit },
+    rollback: { enabled: transactions !== false && canEnd, run: transaction.rollback },
   });
+
+  // The run keys also work in a parameter's field (only there: not in the editor, which handles its own keys, nor in
+  // its search panel's checkboxes).
+  const runFromParams = (e: KeyboardEvent<HTMLElement>) => {
+    if (isImeKeyEvent(e) || e.defaultPrevented || !(e.target instanceof HTMLInputElement)) return;
+    const key = RUN_KEYS.find(({ shift }) => isCommandKey(e, "enter", { shift }));
+    if (!key) return;
+    e.preventDefault();
+    void start(key.mode);
+  };
 
   // The editor's keymap is built once: it calls the latest `start`, `format` and script commands through refs.
   const startRef = useRef(start);
+  const explainRef = useRef(explain);
   const formatRef = useRef(format);
   const scriptRef = useRef(script);
   useLayoutEffect(() => {
     startRef.current = start;
+    explainRef.current = explain;
     formatRef.current = format;
     scriptRef.current = script;
   });
@@ -214,6 +370,8 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     database: tab.database,
     dialect,
     keywordCase: settings.editor.keyword_case,
+    queryContext: context ?? null,
+    seenFields,
   };
   const editorTarget = useRef(target);
   useLayoutEffect(() => {
@@ -224,12 +382,17 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     void startRef.current(mode);
     return true;
   };
+  // ⌘E does nothing on an engine without plans, and is still handled: it never falls through to the editor or the app.
+  const explainFromKey = () => {
+    void explainRef.current();
+    return true;
+  };
   const [extensions] = useState<Extension[]>(() => [
     // CodeMirror keymaps skip key events during IME composition, so ⌘↵ never runs half-composed text.
     Prec.highest(
       keymap.of([
-        { key: "Mod-Enter", run: () => runFromKey("default") },
-        { key: "Shift-Mod-Enter", run: () => runFromKey("all") },
+        ...RUN_KEYS.map(({ cm, mode }) => ({ key: cm, run: () => runFromKey(mode) })),
+        { key: "Mod-e", run: explainFromKey },
         { key: "Mod-s", run: () => (scriptRef.current.save(), true) },
         { key: "Shift-Mod-s", run: () => (scriptRef.current.saveAs(), true) },
         { key: "Shift-Mod-f", run: () => (formatRef.current(), true) },
@@ -241,6 +404,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     errorMarksExtension(),
     sqlCompletion(() => editorTarget.current),
     describeOnDemand(() => editorTarget.current),
+    paramsWatcher(setSlots),
   ]);
 
   // The split depends on the dialect, which is known only once the profiles have loaded (or a connection is chosen).
@@ -275,6 +439,16 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   }, []);
   const initialSelection = remembered?.selection ?? startSelection(tab);
   const tint = profileColor(profile?.color);
+  /** Explain and Run with profile in the toolbar (Couchbase only). */
+  const planControl: PlanControl | null = takesPlans
+    ? {
+        onExplain: () => void explain(),
+        profile: offersProfile
+          ? { onRun: () => void runWithProfile(), blockedReason: profileBlockedReason }
+          : null,
+      }
+    : null;
+  const plans: PlanSupport | null = takesPlans && tab.profileId !== null ? { profileId: tab.profileId, edition } : null;
 
   return (
     <div className="flex h-full flex-col">
@@ -285,8 +459,15 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
           phase,
           session: snapshot?.info ?? null,
           sessionFailed: !!snapshot?.error,
-          blockedReason: running ? "Wait for the run to finish, or cancel it" : undefined,
+          blockedReason: pickerBlockedReason,
           onChange: (profileId, database) => void changeConnection(profileId, database),
+          context: {
+            choice: tab.queryContext,
+            sessionDefault,
+            loading: !snapshot?.info,
+            blockedReason: pickerBlockedReason,
+            onChange: (next) => updateTab(tab.id, "query", { queryContext: next }),
+          },
         }}
         state={snapshot?.state ?? null}
         visible={active}
@@ -306,6 +487,8 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
         onRun={() => void start("default")}
         onRunAll={() => void start("all")}
         onCancel={cancel}
+        plan={planControl}
+        showTransactions={transactions !== false}
         autocommit={tab.autocommit}
         autocommitBlockedReason={autocommitBlockedReason}
         onAutocommitChange={transaction.setAutocommit}
@@ -315,45 +498,64 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
         onRollback={transaction.rollback}
       />
       {tab.profileId !== null && (
-        <SessionError profileId={tab.profileId} error={snapshot?.error ?? null} onRetry={retry} />
+        <RecoverableError profileId={tab.profileId} error={snapshot?.error ?? null} onRetry={retry} />
       )}
       <div className="min-h-0 flex-1">
         <Group orientation="vertical">
           <Panel id="editor" defaultSize="55%" minSize="15%">
-            {/* The connection's colour as the editor's top border. */}
-            <div className="relative h-full" style={tint ? { borderTop: `2px solid ${tint}` } : undefined}>
-              {script.loading && (
-                <span
-                  className="pointer-events-none absolute top-1 right-3 z-10 animate-delayed-show text-[11px] text-muted"
-                >
-                  Loading…
-                </span>
+            {/* The connection's colour as the editor's top border; the parameters' bar sits under the editor. */}
+            <div className="flex h-full flex-col" style={tint ? { borderTop: `2px solid ${tint}` } : undefined}>
+              <div className="relative min-h-0 flex-1">
+                {script.loading && (
+                  <span
+                    className="pointer-events-none absolute top-1 right-3 z-10 animate-delayed-show text-[11px] text-muted"
+                  >
+                    Loading…
+                  </span>
+                )}
+                <div className="absolute inset-0">
+                  <CodeEditor
+                    ref={editor}
+                    initialText={remembered?.text ?? tab.initialText}
+                    initialSelection={initialSelection}
+                    dialect={dialect}
+                    readOnly={script.loading}
+                    extensions={extensions}
+                    onChange={() => {
+                      markEdited();
+                      script.docChanged();
+                    }}
+                    onSelectionChange={markEdited}
+                    onUnmount={(content) => rememberEditorBuffer(tab.id, content)}
+                  />
+                </div>
+              </div>
+              {takesParams && slots.named.length + slots.positional > 0 && (
+                // `contents`: only the key handler's place in the DOM; the panel lays itself out in the column.
+                <div className="contents" onKeyDown={runFromParams}>
+                  <ParamsPanel
+                    slots={slots}
+                    drafts={drafts}
+                    open={paramsOpen}
+                    focus={focusParam}
+                    onToggle={() => setParamsOpen((open) => !open)}
+                    onChange={changeParam}
+                  />
+                </div>
               )}
-              <CodeEditor
-                ref={editor}
-                initialText={remembered?.text ?? tab.initialText}
-                initialSelection={initialSelection}
-                dialect={dialect}
-                readOnly={script.loading}
-                extensions={extensions}
-                onChange={() => {
-                  markEdited();
-                  script.docChanged();
-                }}
-                onSelectionChange={markEdited}
-                onUnmount={(content) => rememberEditorBuffer(tab.id, content)}
-              />
             </div>
           </Panel>
           <PanelHandle orientation="vertical" />
           <Panel id="results" minSize="15%">
             <ResultsArea
               run={run}
-              executions={snapshot?.executions ?? NO_EXECUTIONS}
+              executions={executions}
               controller={controller}
               phase={phase}
               dialect={dialect}
               pageSize={settings.run.page_size}
+              plans={plans}
+              documentsProfileId={engine?.documents && tab.profileId !== null ? tab.profileId : null}
               onExport={openExport}
               locate={locate}
               onJump={jump}
@@ -365,7 +567,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
       <ConfirmRunDialog prompt={runner.prompt} context={subject} onClosed={() => editor.current?.focus()} />
       {controller && exportRequest && (
         <ExportDialog
-          source={{ controller, sql: exportRequest.sql, title: tab.title }}
+          source={{ controller, sql: exportRequest.sql, request: exportRequest.request, title: tab.title }}
           open={exportRequest.open}
           onOpenChange={(open) => setExportRequest((current) => current && { ...current, open })}
         />

@@ -1,0 +1,7 @@
+CREATE PRIMARY INDEX IF NOT EXISTS ON dbaguy.app.users;
+CREATE PRIMARY INDEX IF NOT EXISTS ON dbaguy.app.orders;
+CREATE PRIMARY INDEX IF NOT EXISTS ON dbaguy.app.events;
+CREATE INDEX idx_orders_amount IF NOT EXISTS ON dbaguy.app.orders(amount DESC);
+-- Stays deferred: the tree shows the state and the generated DDL keeps the WITH clause.
+CREATE INDEX idx_users_deferred IF NOT EXISTS ON dbaguy.app.users(name) WITH {"defer_build": true};
+-- dbaguy.app.noindex has no index on purpose: read by a sequential scan (EE: needs query_use_sequential_scans).

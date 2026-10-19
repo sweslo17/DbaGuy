@@ -1,6 +1,6 @@
 import type { ColumnCategory } from "@/lib/api/types";
 
-export type CellKind = "null" | "empty" | "number" | "bool" | "json" | "bytes" | "truncated" | "text";
+export type CellKind = "null" | "missing" | "empty" | "number" | "bool" | "json" | "bytes" | "truncated" | "text";
 
 /** How one encoded cell is shown: `text`, then `detail` (muted) when there is one. */
 export interface CellDisplay {
@@ -19,6 +19,8 @@ export interface EncodedCell {
   $type?: string;
   preview?: string;
   size?: number;
+  /** `$type: "json"`: the value's JSON text as the server sent it (Couchbase); numbers beyond double stay exact. */
+  text?: string;
 }
 
 export const BYTES_PREVIEW = 64; // keep in sync with BYTES_PREVIEW in the backend (adapters/values.py)
@@ -26,9 +28,23 @@ export const BYTES_PREVIEW = 64; // keep in sync with BYTES_PREVIEW in the backe
 const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"];
 const JSON_WHITESPACE = new Set([" ", "\n", "\r", "\t"]);
 const LINE_BREAKS = /[\r\n\t]+/g;
+/** A JSON number literal: a `$type: "json"` cell holding one is a number, anything else is a JSON value. */
+const JSON_NUMBER = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
 /** Characters a JSON value can start / end with (string, object, array, number, true / false / null). */
 const VALUE_START = new Set('"{[-0123456789tfn');
 const VALUE_END = new Set('"}]0123456789el');
+
+/** The text of a `$type: "json"` cell, or null for any other value. */
+export function jsonCellText(value: unknown): string | null {
+  if (value === null || typeof value !== "object") return null;
+  const cell = value as EncodedCell;
+  return cell.$type === "json" && typeof cell.text === "string" ? cell.text : null;
+}
+
+/** SQL++ MISSING: the row has no such field (which is not NULL). */
+export function isMissing(value: unknown): boolean {
+  return value !== null && typeof value === "object" && (value as EncodedCell).$type === "missing";
+}
 
 /** "512 B", "1.2 KB", "3.0 MB": base 1024, one decimal. */
 export function formatBytes(size: number): string {
@@ -137,12 +153,19 @@ export function cellKind(value: unknown, category: ColumnCategory): CellKind {
   if (typeof value === "number") return "number";
   if (typeof value === "object") {
     const type = (value as EncodedCell).$type;
+    if (type === "missing") return "missing";
+    if (type === "json") {
+      const text = jsonCellText(value);
+      return text !== null && JSON_NUMBER.test(text) ? "number" : "json";
+    }
     return type === "bytes" ? "bytes" : type === "text" ? "truncated" : "json";
   }
   const text = String(value);
   if (text === "") return "empty";
   // Big integers and decimals arrive as strings so that no digit is lost.
   if (category === "number") return "number";
+  // A mixed column (Couchbase) carries its type on the cell: a string is a string, never guessed as JSON.
+  if (category === "mixed") return "text";
   if (category === "json" || ((category === "text" || category === "other") && looksLikeJson(text))) return "json";
   return "text";
 }
@@ -156,24 +179,35 @@ export function describeCell(value: unknown, category: ColumnCategory, maxLength
   switch (kind) {
     case "null":
       return { text: "NULL", kind, alignRight: false };
+    case "missing":
+      return {
+        text: "MISSING",
+        kind,
+        title: "This row has no such field (MISSING, not NULL)",
+        alignRight: false,
+      };
     case "empty":
       return { text: "", kind, title: "empty string", alignRight: false };
     case "bool":
       return { text: String(value), kind, alignRight: false };
     case "number":
-      return { text: clip(String(value), maxLength), kind, alignRight: true };
+      return { text: clip(plainValue(value), maxLength), kind, alignRight: true };
     case "bytes":
       return describeBytes(value as EncodedCell, maxLength);
     case "truncated":
       return describeTruncated(value as EncodedCell, maxLength);
     case "json": {
-      // Compacted only in a json column: a text value that merely looks like JSON ("[1] and [2]") keeps its spaces.
+      // A json cell is the server's text, compacted lexically (never re-parsed). Other text is compacted only in a
+      // json column: a text value that merely looks like JSON ("[1] and [2]") keeps its spaces.
+      const serverText = jsonCellText(value);
       const shown =
-        typeof value !== "string"
-          ? oneLine(JSON.stringify(value), maxLength)
-          : category === "json"
-            ? compactJson(value, maxLength)
-            : oneLine(value, maxLength);
+        serverText !== null
+          ? compactJson(serverText, maxLength)
+          : typeof value !== "string"
+            ? oneLine(JSON.stringify(value), maxLength)
+            : category === "json"
+              ? compactJson(value, maxLength)
+              : oneLine(value, maxLength);
       return { ...shown, kind, alignRight: false };
     }
     case "text":
@@ -183,12 +217,16 @@ export function describeCell(value: unknown, category: ColumnCategory, maxLength
 
 /**
  * A cell as plain text (ruling R-02b-7): what a single-cell copy and the value viewer's "Copy value" write. NULL is
- * empty, bytes are `0x` + the hex preview, truncated text is its preview, anything else is its text.
+ * empty, MISSING is empty, bytes are `0x` + the hex preview, truncated text is its preview, a json cell is its text,
+ * anything else is its text.
  */
 export function plainValue(value: unknown): string {
   if (value === null || value === undefined) return "";
   if (typeof value !== "object") return String(value);
   const cell = value as EncodedCell;
+  if (cell.$type === "missing") return "";
+  const json = jsonCellText(value);
+  if (json !== null) return json;
   if (cell.$type === "bytes") return `0x${cell.preview ?? ""}`;
   if (cell.$type === "text") return cell.preview ?? "";
   return JSON.stringify(value);

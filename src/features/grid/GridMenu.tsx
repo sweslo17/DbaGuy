@@ -1,7 +1,7 @@
 import { useState, type MouseEvent, type ReactNode } from "react";
 import { ContextMenu, type MenuItem } from "@/components/ui/ContextMenu";
 import type { ColumnMeta } from "@/lib/api/types";
-import { copyColumnNames, COPY_FORMAT_LABELS, COPY_FORMATS, type CopyFormat } from "./copy";
+import { copyColumnNames, COPY_FORMAT_LABELS, type CopyFormat } from "./copy";
 import type { GridHit } from "./hitTest";
 import type { CellPos, Rect } from "./selection";
 
@@ -15,6 +15,8 @@ export interface GridMenuActions {
   /** "Copy": one cell copies its plain value, more cells copy as TSV. */
   copyDefault: () => void;
   copy: (format: CopyFormat) => void;
+  /** The "Copy as" formats the connection's dialect can produce (`copyFormatsFor`). */
+  copyFormats: readonly CopyFormat[];
   pin: (count: number) => void;
   /** Absent: the item shows disabled. */
   openValue?: (pos: CellPos) => void;
@@ -69,7 +71,7 @@ function selectionItems(pos: CellPos | null, cell: boolean, a: GridMenuActions):
     { label: "Copy", shortcut: "⌘C", onSelect: a.copyDefault },
     {
       label: "Copy as",
-      children: COPY_FORMATS.map((format) => ({ label: COPY_FORMAT_LABELS[format], onSelect: () => a.copy(format) })),
+      children: a.copyFormats.map((format) => ({ label: COPY_FORMAT_LABELS[format], onSelect: () => a.copy(format) })),
     },
     ...(openExport ? [{ label: "Export…", onSelect: openExport }] : []),
     {

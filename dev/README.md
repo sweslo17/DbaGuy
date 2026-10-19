@@ -1,6 +1,6 @@
 # Dev databases
 
-PostgreSQL 17, MySQL 8.4, SQL Server 2022 and an SSH bastion, all bound to `127.0.0.1`. Fake credentials only (see `docker-compose.yml`).
+PostgreSQL 17, MySQL 8.4, SQL Server 2022, Couchbase 7.6.12 and an SSH bastion, all bound to `127.0.0.1`. Fake credentials only (see `docker-compose.yml`).
 
 ```sh
 docker compose -f dev/docker-compose.yml up -d --build --wait
@@ -47,3 +47,37 @@ containers and start them again:
 docker compose -f dev/docker-compose.yml rm -sfv mssql mssql-init
 docker compose -f dev/docker-compose.yml up -d --build --wait
 ```
+
+## Couchbase
+
+Couchbase Server Enterprise 7.6.12 (`couchbase/server:enterprise-7.6.12`, arm64; Enterprise is free for development and
+testing). One node with the data, query and index services. Ports `8091` (cluster manager and console:
+http://127.0.0.1:8091), `8093` (query service), `18091` and `18093` (the same over TLS), all on `127.0.0.1` with the
+same numbers inside and out, because node discovery (`nodeServices`) reports the server's own ports. No data (KV) port
+is published: DbaGuy talks to the query service only. Cluster admin `dbaguy` / `dbaguy`; the limited user
+`dbaguy_reader` / `dbaguy` has `query_select` and `data_reader` on `dbaguy.app.users` only. The bastion reaches the query
+service as `couchbase:8093`. The container takes about 1.2 GiB of memory.
+
+The seed runs in the one-shot `couchbase-init` container (same image): `couchbase/seed.sh` initialises the cluster,
+installs `travel-sample`, creates the `dbaguy` bucket (scopes `app` and `many`, the latter with 300 collections), runs
+`couchbase/init/*.n1ql` with `cbq`, writes the byte-exact documents through the console's docs endpoint and the binary
+and text ones with `cbc`, creates the limited user and writes `dbaguy._default._default::seed_done` last. The first run
+takes 1-2 minutes. Like `mssql-init`, it skips the seed when `seed_done` exists and then stays up idle, so repeated
+`up -d --build --wait` runs succeed; `--wait` covers the seed because the `couchbase` healthcheck looks for `seed_done`.
+Every step can run again (`IF NOT EXISTS`, `UPSERT`, existence checks), so a seed that stopped or failed half-way is
+finished by the next `up` (the error is in `docker logs dbaguy-dev-couchbase-init-1`; `cbq` prints every statement's
+result, so look at the end). As with `mssql-init`, `--wait` does not notice a failed seed: it ends only when the
+`couchbase` healthcheck gives up (about 10 minutes, "couchbase is unhealthy").
+
+The TLS certificate is the cluster's own, generated at first start; no CA is committed. Tests fetch it at run time from
+`GET /pools/default/trustedCAs` (admin).
+
+To start from an empty cluster (or to apply an edit to the seed), remove both containers and start them again:
+
+```sh
+docker compose -f dev/docker-compose.yml rm -sfv couchbase couchbase-init
+docker compose -f dev/docker-compose.yml up -d --build --wait
+```
+
+Recreating only `couchbase` leaves the idle `couchbase-init` as it is, so the new cluster is never seeded and `--wait`
+fails after about 11 minutes: remove both as above, or run `docker restart dbaguy-dev-couchbase-init-1` afterwards.

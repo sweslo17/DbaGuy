@@ -14,12 +14,15 @@ import type { Dialect } from "@/lib/api/types";
 /**
  * UTF-16 offsets into the document: [from, to) is the statement, `terminatorEnd` is after its `;` or custom
  * delimiter (or `to`). `repeat` is how many times a run sends it (T-SQL `GO n`; 1 for every other statement).
+ * `params` are the parameters it uses (SQL++ only, else empty): each named one once as `$name` (`@x` is `$x`) in
+ * first-use order, every `?`, and `$1` … as written. A mapped range keeps them until the next split.
  */
 export interface StatementRange {
   from: number;
   to: number;
   terminatorEnd: number;
   repeat: number;
+  params: string[];
 }
 
 export interface StatementsState {
@@ -47,7 +50,7 @@ function mapRanges(ranges: StatementRange[], changes: ChangeDesc): StatementRang
     const to = changes.mapPos(range.to, 1);
     if (to > from) {
       const terminatorEnd = Math.max(to, changes.mapPos(range.terminatorEnd, -1));
-      mapped.push({ from, to, terminatorEnd, repeat: range.repeat });
+      mapped.push({ from, to, terminatorEnd, repeat: range.repeat, params: range.params });
     }
   }
   return mapped;
@@ -75,7 +78,13 @@ export const statementsField = StateField.define<StatementsState>({
 export async function splitText(text: string, dialect: Dialect, signal?: AbortSignal): Promise<StatementRange[]> {
   const client = await api();
   const { statements } = unwrap(await client.POST("/sql/split", { body: { text, dialect }, signal }));
-  return statements.map((s) => ({ from: s.start, to: s.end, terminatorEnd: s.terminator_end, repeat: s.repeat }));
+  return statements.map((s) => ({
+    from: s.start,
+    to: s.end,
+    terminatorEnd: s.terminator_end,
+    repeat: s.repeat,
+    params: s.params,
+  }));
 }
 
 function applySplit(view: EditorView, version: number, ranges: StatementRange[]): void {

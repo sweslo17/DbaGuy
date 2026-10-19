@@ -1,7 +1,15 @@
 import { useLayoutEffect, useRef } from "react";
 
 /** What the command palette can do with a query tab (ruling R-02c-15). */
-export type QueryTabActionId = "run" | "runAll" | "format" | "toggleAutocommit" | "commit" | "rollback";
+export type QueryTabActionId =
+  | "run"
+  | "runAll"
+  | "explain"
+  | "runWithProfile"
+  | "format"
+  | "toggleAutocommit"
+  | "commit"
+  | "rollback";
 
 export interface QueryTabAction {
   /** Whether the tab's own control would allow it now (the toolbar button is enabled). */

@@ -6,7 +6,7 @@ import type { AppSettings } from "@/lib/api/types";
  * the authority), their validation, and the text of a refused save.
  */
 
-type Section = "editor" | "run" | "safety" | "notifications";
+type Section = "editor" | "run" | "safety" | "notifications" | "couchbase";
 type NumberKey<T> = { [K in keyof T]-?: T[K] extends number ? K : never }[keyof T];
 
 interface NumberFieldOf<S extends Section> {
@@ -68,6 +68,15 @@ export const NUMBER_FIELDS = {
     unit: "s",
     min: 0,
     hint: "Notifies when a run that took at least this long ends while DbaGuy is in the background; 0 = off",
+  },
+  sample_size: {
+    section: "couchbase",
+    key: "sample_size",
+    label: "Sample size",
+    unit: "documents",
+    min: 10,
+    max: 10_000,
+    hint: "Documents read by Sample fields; INFER is never run for you",
   },
 } as const satisfies Record<string, NumberField>;
 

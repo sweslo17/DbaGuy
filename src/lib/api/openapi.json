@@ -952,6 +952,716 @@
         }
       }
     },
+    "/couchbase/contexts": {
+      "get": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Contexts",
+        "description": "The query contexts a tab can pick. `bucket` and `scope` name the tab's current one, listed first when the\nschema snapshot does not have it.",
+        "operationId": "contexts_couchbase_contexts_get",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Profile Id"
+            }
+          },
+          {
+            "name": "bucket",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 100
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Bucket"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 251
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ContextOption"
+                  },
+                  "title": "Response Contexts Couchbase Contexts Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/couchbase/plan": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Plan",
+        "operationId": "plan_couchbase_plan_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/couchbase/advise": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Advise",
+        "operationId": "advise_couchbase_advise_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdviseRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/couchbase/statement-keyspace": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Statement Keyspace",
+        "description": "The collection the statement reads when it names exactly one (fully qualified, or resolved against the run's\ncontext as SQL++ resolves it), else null. Pure: no connection, nothing logged.",
+        "operationId": "statement_keyspace_couchbase_statement_keyspace_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StatementKeyspaceRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/Keyspace"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Statement Keyspace Couchbase Statement Keyspace Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/couchbase/fields/sample": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Sample Fields",
+        "description": "Sample a keyspace's documents (R-04-11): a manual action, whose result is kept for `GET /fields`.",
+        "operationId": "sample_fields_couchbase_fields_sample_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SampleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FieldSample"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/couchbase/fields": {
+      "get": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Cached Fields",
+        "description": "The keyspace's last sample, or null when it has none (nothing samples by itself).",
+        "operationId": "cached_fields_couchbase_fields_get",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Profile Id"
+            }
+          },
+          {
+            "name": "bucket",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100,
+              "title": "Bucket"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 251,
+              "title": "Scope"
+            }
+          },
+          {
+            "name": "collection",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 251,
+              "title": "Collection"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/FieldSample"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Cached Fields Couchbase Fields Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/couchbase/documents/get": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Get Document",
+        "description": "The document as stored: its exact text and META (spec \u00a73.9.4). 404 `document_missing` when there is none.",
+        "operationId": "get_document_couchbase_documents_get_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DocumentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DocumentView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/couchbase/documents/save": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Save Document",
+        "description": "Write the text over the document if it still has `cas`, or answer what the server would store instead\n(`needs_confirmation`) until `confirmed`.",
+        "operationId": "save_document_couchbase_documents_save_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveDocumentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/DocumentSaved"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SavePreview"
+                    }
+                  ],
+                  "discriminator": {
+                    "propertyName": "status",
+                    "mapping": {
+                      "saved": "#/components/schemas/DocumentSaved",
+                      "needs_confirmation": "#/components/schemas/SavePreview"
+                    }
+                  },
+                  "title": "Response Save Document Couchbase Documents Save Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/couchbase/documents/insert": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Insert Document",
+        "description": "Create the document, previewed like a save; 409 `document_exists` when the ID is taken.",
+        "operationId": "insert_document_couchbase_documents_insert_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InsertDocumentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/DocumentSaved"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SavePreview"
+                    }
+                  ],
+                  "discriminator": {
+                    "propertyName": "status",
+                    "mapping": {
+                      "saved": "#/components/schemas/DocumentSaved",
+                      "needs_confirmation": "#/components/schemas/SavePreview"
+                    }
+                  },
+                  "title": "Response Insert Document Couchbase Documents Insert Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/couchbase/documents/remove": {
+      "post": {
+        "tags": [
+          "couchbase"
+        ],
+        "summary": "Remove Document",
+        "description": "Delete the document if it still has `cas`.",
+        "operationId": "remove_document_couchbase_documents_remove_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemoveDocumentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/settings": {
       "get": {
         "tags": [
@@ -1926,6 +2636,66 @@
         }
       }
     },
+    "/sql/format-guard": {
+      "post": {
+        "tags": [
+          "sql"
+        ],
+        "summary": "Format Guard",
+        "description": "Whether a formatter's output may replace the original: only when its significant tokens are the same.",
+        "operationId": "format_guard_sql_format_guard_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FormatGuardRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FormatGuardResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/sql/browse-select": {
       "post": {
         "tags": [
@@ -2047,6 +2817,38 @@
   },
   "components": {
     "schemas": {
+      "AdviseRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "statement": {
+            "type": "string",
+            "maxLength": 1048576,
+            "minLength": 1,
+            "title": "Statement"
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "statement"
+        ],
+        "title": "AdviseRequest"
+      },
       "AffectedEvent": {
         "properties": {
           "type": {
@@ -2132,6 +2934,12 @@
             "$ref": "#/components/schemas/NotificationSettings",
             "default": {
               "long_query_seconds": 15
+            }
+          },
+          "couchbase": {
+            "$ref": "#/components/schemas/CouchbaseSettings",
+            "default": {
+              "sample_size": 1000
             }
           },
           "scripts_dir": {
@@ -2230,6 +3038,32 @@
         ],
         "title": "CancelCommand"
       },
+      "ChangeCounts": {
+        "properties": {
+          "key_order": {
+            "type": "integer",
+            "title": "Key Order",
+            "default": 0
+          },
+          "number": {
+            "type": "integer",
+            "title": "Number",
+            "default": 0
+          },
+          "duplicate_key": {
+            "type": "integer",
+            "title": "Duplicate Key",
+            "default": 0
+          },
+          "other": {
+            "type": "integer",
+            "title": "Other",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "ChangeCounts"
+      },
       "Classification": {
         "properties": {
           "kind": {
@@ -2259,7 +3093,8 @@
           "datetime",
           "binary",
           "json",
-          "other"
+          "other",
+          "mixed"
         ],
         "title": "ColumnCategory"
       },
@@ -2397,6 +3232,25 @@
                 "type": "null"
               }
             ]
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "seen_fields": {
+            "items": {
+              "type": "string",
+              "maxLength": 300
+            },
+            "type": "array",
+            "maxItems": 500,
+            "title": "Seen Fields"
           }
         },
         "additionalProperties": false,
@@ -2425,7 +3279,11 @@
               "column",
               "alias",
               "function",
-              "join"
+              "join",
+              "bucket",
+              "scope",
+              "collection",
+              "field"
             ],
             "title": "Kind"
           },
@@ -2601,6 +3459,55 @@
         ],
         "title": "ConnectionTestResult"
       },
+      "ContextOption": {
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "title": "Bucket"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "listed": {
+            "type": "boolean",
+            "title": "Listed",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "bucket",
+          "text"
+        ],
+        "title": "ContextOption",
+        "description": "One entry of the query-context picker. `text` is `QueryContext(bucket, scope).text()`, so the frontend never\nquotes a name (B13)."
+      },
+      "CouchbaseSettings": {
+        "properties": {
+          "sample_size": {
+            "type": "integer",
+            "maximum": 10000.0,
+            "minimum": 10.0,
+            "title": "Sample Size",
+            "default": 1000
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "CouchbaseSettings"
+      },
       "DangerReason": {
         "type": "string",
         "enum": [
@@ -2608,7 +3515,9 @@
           "delete_without_where",
           "drop",
           "truncate",
-          "alter_drop"
+          "alter_drop",
+          "system_keyspace",
+          "merge_delete"
         ],
         "title": "DangerReason",
         "description": "Why a statement is dangerous: the standard safety level asks before running it."
@@ -2700,7 +3609,8 @@
               "table",
               "view",
               "materialized_view",
-              "synonym"
+              "synonym",
+              "collection"
             ],
             "title": "Kind"
           },
@@ -2727,7 +3637,8 @@
           "postgres",
           "sqlite",
           "mysql",
-          "tsql"
+          "tsql",
+          "sqlpp"
         ],
         "title": "Dialect",
         "description": "The SQL dialect of an engine: how its statements are split, classified, completed and quoted."
@@ -2750,6 +3661,152 @@
           "request_id"
         ],
         "title": "DiscardCommand"
+      },
+      "DocumentChange": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "key_order",
+              "number",
+              "duplicate_key",
+              "other"
+            ],
+            "title": "Kind"
+          },
+          "before": {
+            "type": "string",
+            "title": "Before"
+          },
+          "after": {
+            "type": "string",
+            "title": "After"
+          },
+          "value_changed": {
+            "type": "boolean",
+            "title": "Value Changed"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "kind",
+          "before",
+          "after",
+          "value_changed"
+        ],
+        "title": "DocumentChange",
+        "description": "One thing the server would store differently from the edited text (spec \u00a73.9.3, ruling C2)."
+      },
+      "DocumentRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "keyspace": {
+            "$ref": "#/components/schemas/Keyspace"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 250,
+            "minLength": 1,
+            "title": "Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "keyspace",
+          "id"
+        ],
+        "title": "DocumentRequest"
+      },
+      "DocumentSaved": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "saved",
+            "title": "Status"
+          },
+          "cas": {
+            "type": "string",
+            "title": "Cas"
+          },
+          "expiration": {
+            "type": "integer",
+            "title": "Expiration"
+          },
+          "size": {
+            "type": "integer",
+            "title": "Size"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "cas",
+          "expiration",
+          "size"
+        ],
+        "title": "DocumentSaved",
+        "description": "A write that happened: the document's new CAS and its expiration."
+      },
+      "DocumentView": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "cas": {
+            "type": "string",
+            "title": "Cas"
+          },
+          "expiration": {
+            "type": "integer",
+            "title": "Expiration"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "json",
+              "base64"
+            ],
+            "title": "Type"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          },
+          "size": {
+            "type": "integer",
+            "title": "Size"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "cas",
+          "expiration",
+          "type",
+          "text",
+          "size"
+        ],
+        "title": "DocumentView",
+        "description": "One document as the server holds it (spec \u00a73.9.2, R-04-2)."
       },
       "EditorSettings": {
         "properties": {
@@ -2839,6 +3896,38 @@
           "server_read_only": {
             "type": "boolean",
             "title": "Server Read Only"
+          },
+          "transactions": {
+            "type": "boolean",
+            "title": "Transactions"
+          },
+          "query_context": {
+            "type": "boolean",
+            "title": "Query Context"
+          },
+          "parameters": {
+            "type": "boolean",
+            "title": "Parameters"
+          },
+          "documents": {
+            "type": "boolean",
+            "title": "Documents"
+          },
+          "executed_plan": {
+            "type": "boolean",
+            "title": "Executed Plan"
+          },
+          "plan_format": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "couchbase"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Format"
           }
         },
         "type": "object",
@@ -2849,7 +3938,13 @@
           "dialect",
           "per_database_connection",
           "cancel_aborts_transaction",
-          "server_read_only"
+          "server_read_only",
+          "transactions",
+          "query_context",
+          "parameters",
+          "documents",
+          "executed_plan",
+          "plan_format"
         ],
         "title": "EngineInfo"
       },
@@ -2961,6 +4056,31 @@
             "type": "boolean",
             "title": "History",
             "default": true
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "params": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StatementParams"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "profile_plan": {
+            "type": "boolean",
+            "title": "Profile Plan",
+            "default": false
           }
         },
         "type": "object",
@@ -3106,6 +4226,26 @@
               "header": true,
               "null_text": ""
             }
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "params": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StatementParams"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -3143,6 +4283,119 @@
           "request_id"
         ],
         "title": "FetchMoreCommand"
+      },
+      "FieldPath": {
+        "properties": {
+          "path": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Path"
+          },
+          "display": {
+            "type": "string",
+            "title": "Display"
+          },
+          "types": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Types"
+          },
+          "docs": {
+            "type": "integer",
+            "title": "Docs"
+          },
+          "percent": {
+            "type": "number",
+            "title": "Percent"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "display",
+          "types",
+          "docs",
+          "percent"
+        ],
+        "title": "FieldPath",
+        "description": "One field path of a sample: how many documents have it and with which JSON kinds."
+      },
+      "FieldSample": {
+        "properties": {
+          "keyspace": {
+            "$ref": "#/components/schemas/Keyspace"
+          },
+          "sampled_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Sampled At"
+          },
+          "requested": {
+            "type": "integer",
+            "title": "Requested"
+          },
+          "documents": {
+            "type": "integer",
+            "title": "Documents"
+          },
+          "cut_at_bytes": {
+            "type": "boolean",
+            "title": "Cut At Bytes"
+          },
+          "paths_capped": {
+            "type": "boolean",
+            "title": "Paths Capped"
+          },
+          "long_keys_skipped": {
+            "type": "boolean",
+            "title": "Long Keys Skipped"
+          },
+          "depth_capped": {
+            "type": "boolean",
+            "title": "Depth Capped"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/SampleLimits"
+          },
+          "elapsed_ms": {
+            "type": "integer",
+            "title": "Elapsed Ms"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/FieldPath"
+            },
+            "type": "array",
+            "title": "Fields"
+          }
+        },
+        "type": "object",
+        "required": [
+          "keyspace",
+          "sampled_at",
+          "requested",
+          "documents",
+          "cut_at_bytes",
+          "paths_capped",
+          "long_keys_skipped",
+          "depth_capped",
+          "limits",
+          "elapsed_ms",
+          "fields"
+        ],
+        "title": "FieldSample",
+        "description": "A manual sample of a keyspace (R-04-11): the field paths derived in Python from the documents read."
       },
       "FinishedEvent": {
         "properties": {
@@ -3209,6 +4462,54 @@
           "category"
         ],
         "title": "FormatColumn"
+      },
+      "FormatGuardRequest": {
+        "properties": {
+          "dialect": {
+            "$ref": "#/components/schemas/Dialect"
+          },
+          "original": {
+            "type": "string",
+            "title": "Original"
+          },
+          "formatted": {
+            "type": "string",
+            "title": "Formatted"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "dialect",
+          "original",
+          "formatted"
+        ],
+        "title": "FormatGuardRequest"
+      },
+      "FormatGuardResponse": {
+        "properties": {
+          "same": {
+            "type": "boolean",
+            "title": "Same"
+          },
+          "offset": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offset"
+          }
+        },
+        "type": "object",
+        "required": [
+          "same",
+          "offset"
+        ],
+        "title": "FormatGuardResponse"
       },
       "FormatKind": {
         "type": "string",
@@ -3323,6 +4624,8 @@
           "drop",
           "truncate",
           "alter_drop",
+          "system_keyspace",
+          "merge_delete",
           "strict_write",
           "strict_ddl",
           "strict_transaction",
@@ -3428,6 +4731,16 @@
           "id": {
             "type": "integer",
             "title": "Id"
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -3525,6 +4838,130 @@
           "profile"
         ],
         "title": "ImportUrlResponse"
+      },
+      "IndexAdvice": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "recommended",
+              "covering",
+              "current"
+            ],
+            "title": "Kind"
+          },
+          "statement": {
+            "type": "string",
+            "title": "Statement"
+          },
+          "keyspace_alias": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Keyspace Alias"
+          },
+          "rule": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rule"
+          },
+          "update_statistics": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Update Statistics"
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind",
+          "statement"
+        ],
+        "title": "IndexAdvice"
+      },
+      "InsertDocumentRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "keyspace": {
+            "$ref": "#/components/schemas/Keyspace"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 250,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 83886080,
+            "title": "Text"
+          },
+          "confirmed": {
+            "type": "boolean",
+            "title": "Confirmed",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "keyspace",
+          "id",
+          "text"
+        ],
+        "title": "InsertDocumentRequest"
+      },
+      "Keyspace": {
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Bucket"
+          },
+          "scope": {
+            "type": "string",
+            "maxLength": 251,
+            "minLength": 1,
+            "title": "Scope"
+          },
+          "collection": {
+            "type": "string",
+            "maxLength": 251,
+            "minLength": 1,
+            "title": "Collection"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "bucket",
+          "scope",
+          "collection"
+        ],
+        "title": "Keyspace",
+        "description": "A collection by its three names. Frozen: it is the key of the field-sample cache."
       },
       "MessageEvent": {
         "properties": {
@@ -3737,7 +5174,8 @@
               "table",
               "view",
               "materialized_view",
-              "synonym"
+              "synonym",
+              "collection"
             ],
             "title": "Kind"
           },
@@ -3776,6 +5214,356 @@
           "name"
         ],
         "title": "PathSegment"
+      },
+      "PlanDetail": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "value"
+        ],
+        "title": "PlanDetail"
+      },
+      "PlanEstimates": {
+        "properties": {
+          "cost": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost"
+          },
+          "cardinality": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cardinality"
+          }
+        },
+        "type": "object",
+        "title": "PlanEstimates"
+      },
+      "PlanFinding": {
+        "properties": {
+          "badge": {
+            "type": "string",
+            "enum": [
+              "primary_scan",
+              "sequential_scan",
+              "intersect_scan",
+              "not_covered",
+              "slowest"
+            ],
+            "title": "Badge"
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "warning",
+              "info"
+            ],
+            "title": "Severity"
+          },
+          "node_id": {
+            "type": "integer",
+            "title": "Node Id"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          }
+        },
+        "type": "object",
+        "required": [
+          "badge",
+          "severity",
+          "node_id",
+          "text"
+        ],
+        "title": "PlanFinding"
+      },
+      "PlanNode": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "operator": {
+            "type": "string",
+            "title": "Operator"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "details": {
+            "items": {
+              "$ref": "#/components/schemas/PlanDetail"
+            },
+            "type": "array",
+            "title": "Details",
+            "default": []
+          },
+          "estimates": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlanEstimates"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stats": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlanStats"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "badges": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "primary_scan",
+                "sequential_scan",
+                "intersect_scan",
+                "not_covered",
+                "slowest"
+              ]
+            },
+            "type": "array",
+            "title": "Badges",
+            "default": []
+          },
+          "children": {
+            "items": {
+              "$ref": "#/components/schemas/PlanNode"
+            },
+            "type": "array",
+            "title": "Children",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "operator",
+          "title"
+        ],
+        "title": "PlanNode"
+      },
+      "PlanRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 4194304,
+            "title": "Text"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "title": "PlanRequest"
+      },
+      "PlanStats": {
+        "properties": {
+          "items_in": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Items In"
+          },
+          "items_out": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Items Out"
+          },
+          "exec_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exec Time"
+          },
+          "serv_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Serv Time"
+          },
+          "kern_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kern Time"
+          }
+        },
+        "type": "object",
+        "title": "PlanStats"
+      },
+      "PlanSubquery": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "correlated": {
+            "type": "boolean",
+            "title": "Correlated"
+          },
+          "root": {
+            "$ref": "#/components/schemas/PlanNode"
+          }
+        },
+        "type": "object",
+        "required": [
+          "text",
+          "correlated",
+          "root"
+        ],
+        "title": "PlanSubquery"
+      },
+      "PlanView": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "plan",
+              "profile",
+              "advice",
+              "unknown"
+            ],
+            "title": "Kind"
+          },
+          "root": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlanNode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "subqueries": {
+            "items": {
+              "$ref": "#/components/schemas/PlanSubquery"
+            },
+            "type": "array",
+            "title": "Subqueries",
+            "default": []
+          },
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/PlanFinding"
+            },
+            "type": "array",
+            "title": "Findings",
+            "default": []
+          },
+          "advice": {
+            "items": {
+              "$ref": "#/components/schemas/IndexAdvice"
+            },
+            "type": "array",
+            "title": "Advice",
+            "default": []
+          },
+          "advice_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Advice Note"
+          },
+          "statement_text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Statement Text"
+          },
+          "estimates": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlanEstimates"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "phase_times": {
+            "items": {
+              "$ref": "#/components/schemas/PlanDetail"
+            },
+            "type": "array",
+            "title": "Phase Times",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "title": "PlanView"
       },
       "ProfileEntry": {
         "properties": {
@@ -3904,6 +5692,68 @@
         "title": "ProgressEvent",
         "description": "An export has written `rows` rows so far; sent after every 10,000 rows."
       },
+      "QueryContext": {
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Bucket"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 251,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "bucket"
+        ],
+        "title": "QueryContext",
+        "description": "Couchbase: the bucket (and scope) that unqualified keyspace names resolve against, sent with every request\n(D-04-5: a structure, because a bucket name may hold a dot)."
+      },
+      "RemoveDocumentRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "keyspace": {
+            "$ref": "#/components/schemas/Keyspace"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 250,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "cas": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]{0,18}$",
+            "title": "Cas"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "keyspace",
+          "id",
+          "cas"
+        ],
+        "title": "RemoveDocumentRequest"
+      },
       "ResultSetEndEvent": {
         "properties": {
           "type": {
@@ -3960,6 +5810,15 @@
             },
             "type": "array",
             "title": "Columns"
+          },
+          "presentation": {
+            "type": "string",
+            "enum": [
+              "grid",
+              "plan"
+            ],
+            "title": "Presentation",
+            "default": "grid"
           }
         },
         "type": "object",
@@ -4117,6 +5976,142 @@
         "additionalProperties": false,
         "type": "object",
         "title": "SafetySettings"
+      },
+      "SampleLimits": {
+        "properties": {
+          "max_bytes": {
+            "type": "integer",
+            "title": "Max Bytes"
+          },
+          "max_paths": {
+            "type": "integer",
+            "title": "Max Paths"
+          },
+          "max_depth": {
+            "type": "integer",
+            "title": "Max Depth"
+          },
+          "max_key_chars": {
+            "type": "integer",
+            "title": "Max Key Chars"
+          }
+        },
+        "type": "object",
+        "required": [
+          "max_bytes",
+          "max_paths",
+          "max_depth",
+          "max_key_chars"
+        ],
+        "title": "SampleLimits",
+        "description": "What bounds a sample, as the backend has it: the UI words what a sample left out with these numbers."
+      },
+      "SampleRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "keyspace": {
+            "$ref": "#/components/schemas/Keyspace"
+          },
+          "size": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 10000.0,
+                "minimum": 10.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "keyspace"
+        ],
+        "title": "SampleRequest"
+      },
+      "SaveDocumentRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "keyspace": {
+            "$ref": "#/components/schemas/Keyspace"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 250,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "cas": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]{0,18}$",
+            "title": "Cas"
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 83886080,
+            "title": "Text"
+          },
+          "confirmed": {
+            "type": "boolean",
+            "title": "Confirmed",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "keyspace",
+          "id",
+          "cas",
+          "text"
+        ],
+        "title": "SaveDocumentRequest"
+      },
+      "SavePreview": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "needs_confirmation",
+            "title": "Status"
+          },
+          "server_text": {
+            "type": "string",
+            "title": "Server Text"
+          },
+          "changes": {
+            "items": {
+              "$ref": "#/components/schemas/DocumentChange"
+            },
+            "type": "array",
+            "title": "Changes"
+          },
+          "counts": {
+            "$ref": "#/components/schemas/ChangeCounts"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "server_text",
+          "changes",
+          "counts"
+        ],
+        "title": "SavePreview",
+        "description": "What the server would store instead of the edited text: nothing is written until the user confirms."
       },
       "SchemaRefreshRequest": {
         "properties": {
@@ -4305,6 +6300,31 @@
               }
             ],
             "title": "Current User"
+          },
+          "edition": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "enterprise",
+                  "community"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Edition"
+          },
+          "default_query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -5017,6 +7037,32 @@
         ],
         "title": "StartedEvent"
       },
+      "StatementKeyspaceRequest": {
+        "properties": {
+          "sql": {
+            "type": "string",
+            "maxLength": 1048576,
+            "minLength": 1,
+            "title": "Sql"
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "sql"
+        ],
+        "title": "StatementKeyspaceRequest"
+      },
       "StatementKind": {
         "type": "string",
         "enum": [
@@ -5028,6 +7074,30 @@
           "unknown"
         ],
         "title": "StatementKind"
+      },
+      "StatementParams": {
+        "properties": {
+          "named": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "maxProperties": 200,
+            "title": "Named"
+          },
+          "positional": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "title": "Positional"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "StatementParams",
+        "description": "Typed parameters of one statement (R-10): JSON literal texts, sent unchanged. Content is checked by the worker\n(`invalid_params`), only the shape here."
       },
       "StatementRange": {
         "properties": {
@@ -5046,6 +7116,13 @@
           "repeat": {
             "type": "integer",
             "title": "Repeat"
+          },
+          "params": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Params"
           }
         },
         "type": "object",
@@ -5053,7 +7130,8 @@
           "start",
           "end",
           "terminator_end",
-          "repeat"
+          "repeat",
+          "params"
         ],
         "title": "StatementRange"
       },
@@ -5220,7 +7298,8 @@
             "enum": [
               "query",
               "table",
-              "object"
+              "object",
+              "document"
             ],
             "title": "Kind"
           },
@@ -5320,6 +7399,51 @@
               }
             ],
             "title": "Autocommit"
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "string",
+                "const": "none"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Query Context"
+          },
+          "params": {
+            "anyOf": [
+              {
+                "patternProperties": {
+                  "^\\$(?:[A-Za-z_][A-Za-z0-9_]*|[1-9][0-9]{0,2})$": {
+                    "type": "string",
+                    "maxLength": 1048576
+                  }
+                },
+                "type": "object",
+                "maxProperties": 400
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Params"
+          },
+          "document_cas": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[1-9][0-9]{0,18}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Document Cas"
           }
         },
         "additionalProperties": false,

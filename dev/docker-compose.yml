@@ -69,6 +69,31 @@ services:
     entrypoint: ["/bin/bash", "/mssql/seed.sh"]  # seeds once, then stays up idle (R-03b-P1)
     restart: "no"
 
+  couchbase:
+    image: couchbase/server:enterprise-7.6.12  # free for development and testing (spec R-04-3); arm64
+    ports:  # same numbers inside and out: nodeServices reports the server's own ports (spec §6.1); no KV port
+      - "127.0.0.1:8091:8091"
+      - "127.0.0.1:8093:8093"
+      - "127.0.0.1:18091:18091"
+      - "127.0.0.1:18093:18093"
+    healthcheck:
+      # Healthy means "seeded": `up --wait` does not wait for the one-shot couchbase-init, so this looks for the seed's
+      # last document (resultCount is 1 only when it exists). USE KEYS needs no index.
+      test: ["CMD-SHELL", "curl -s -u dbaguy:dbaguy http://127.0.0.1:8093/query/service --data-urlencode 'statement=SELECT RAW 1 FROM dbaguy._default._default USE KEYS \"seed_done\"' | grep -Eq '\"resultCount\": *1[^0-9]'"]
+      interval: 5s
+      timeout: 5s
+      retries: 120
+      start_period: 60s
+
+  couchbase-init:
+    image: couchbase/server:enterprise-7.6.12
+    depends_on:
+      - couchbase
+    volumes:
+      - ./couchbase:/couchbase:ro
+    entrypoint: ["/bin/bash", "/couchbase/seed.sh"]  # seeds once, then stays up idle (R-03b-P1)
+    restart: "no"
+
   bastion:
     build: ./bastion
     ports:
@@ -77,3 +102,4 @@ services:
       - postgres
       - mysql
       - mssql
+      - couchbase

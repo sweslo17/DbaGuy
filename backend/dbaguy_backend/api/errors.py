@@ -6,7 +6,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from loguru import logger
 
-from ..domain.errors import DomainError
+from ..domain.errors import DomainError, QueryFailed
 
 
 def error_body(code: str, message: str, detail: Any | None = None) -> dict[str, Any]:
@@ -21,15 +21,21 @@ def register_error_handlers(app: FastAPI) -> None:
     async def handle_domain_error(request: Request, exc: DomainError) -> JSONResponse:
         if exc.status >= 500:
             logger.error("{} {} failed: {} ({})", request.method, request.url.path, exc.message, exc.code)
+        elif isinstance(exc, QueryFailed):
+            # The server's or driver's own text: a syntax error quotes the statement (a string literal included), so it
+            # stays out of the INFO log, which a user may share; DEBUG already carries SQL text (spec §5).
+            logger.info("{} {} rejected ({})", request.method, request.url.path, exc.code)
+            logger.debug("{} {} rejected: {}", request.method, request.url.path, exc.message)
         else:
             logger.info("{} {} rejected: {} ({})", request.method, request.url.path, exc.message, exc.code)
         return JSONResponse(status_code=exc.status, content=error_body(exc.code, exc.message, exc.detail))
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # Where and why, never the input itself: it can be a secret, and a lone surrogate in it cannot be encoded
+        errors = [{key: value for key, value in error.items() if key != "input"} for error in exc.errors()]
         return JSONResponse(
-            status_code=422,
-            content=error_body("validation_failed", "Invalid request", jsonable_encoder(exc.errors())),
+            status_code=422, content=error_body("validation_failed", "Invalid request", jsonable_encoder(errors)),
         )
 
     @app.exception_handler(Exception)

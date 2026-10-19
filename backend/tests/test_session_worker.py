@@ -1,11 +1,14 @@
 """Worker / manager lifecycle and cancel semantics, driven by a fake connection so every race is forced, not hoped for."""
 
+import queue
 import sqlite3
 import threading
 import time
 
 import pytest
+from loguru import logger
 
+from dbaguy_backend.adapters.base import AdapterCapabilities, RawJsonRows, ReadAhead, ReadAheadState, RunOptions
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager, write_askpass_script
@@ -16,7 +19,9 @@ from dbaguy_backend.domain.execution import (
     ExportCommand,
     FetchMoreCommand,
     MessageSeverity,
+    QueryContext,
     ServerMessage,
+    StatementParams,
 )
 from dbaguy_backend.domain.formats import FormatKind
 from dbaguy_backend.domain.profiles import ProfileUpsertRequest
@@ -24,12 +29,15 @@ from dbaguy_backend.services.connection_service import ConnectionService
 from dbaguy_backend.services.profile_service import ProfileService
 from dbaguy_backend.services.safety import GuardAction, GuardDecision
 from dbaguy_backend.sessions.manager import SessionCreateRequest, SessionManager
+from dbaguy_backend.sessions.read_ahead import StallClock
 from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks
+from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.storage.paths import profiles_file
 from dbaguy_backend.storage.profile_store import ProfileStore
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
-from tests.fake_db import FakeConnection, FakeLease
+from tests.fake_db import FakeConnection, FakeLease, FakeResult
 from tests.fake_ssh import run_in_thread, wait_until
+from tests.support import scaled
 from tests.test_sessions import Recorder, finished, paused
 
 
@@ -367,10 +375,10 @@ class MessagingConnection(FakeConnection):
         self.listener = listener
         self.listeners.append(listener)
 
-    def run(self, sql):
+    def statement(self, sql, options):  # inside the driver call, as SQL Server delivers it
         if self.listener is not None:
             self.listener(ServerMessage(severity=MessageSeverity.INFO, text=f"before {sql}"))
-        return super().run(sql)
+        return super().statement(sql, options)
 
 
 @pytest.fixture
@@ -433,3 +441,691 @@ def test_an_export_routes_live_messages_to_its_own_request(messaging_worker, tmp
     texts = [e.text for e in rec.of("e", "message")]
     assert texts[0] == "before rows 4" and texts[-1].startswith("Exported 4 rows")
     assert conn.listener is None and len(conn.listeners) == 2
+
+
+# ---- 7. per-request options, presentation, idle close of paused results, raw JSON export (04a) ----
+
+CONTEXT = QueryContext(bucket="dbaguy", scope="app")
+
+
+def _policy(sql, confirmed):  # `rows …` reads; anything else writes
+    kind = StatementKind.READ if sql.startswith("rows") else StatementKind.WRITE
+    return GuardDecision(action=GuardAction.RUN, classification=Classification(kind=kind))
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def make_worker(connection=None, clock=None, recorder=None, **capabilities):
+    lease = FakeLease(connection)
+    worker = SessionWorker("fake", lambda: lease, clock=clock or Clock())
+    worker.start()
+    worker.configure(WorkerHooks(check=_policy, capabilities=AdapterCapabilities(**capabilities)))
+    recorder = recorder or Recorder()
+    worker.set_emitter(recorder)
+    return worker, lease.connection, recorder
+
+
+def test_unsupported_options_never_reach_the_connection():
+    worker, conn, rec = make_worker()
+    try:
+        worker.submit(ExecuteCommand(request_id="c", sql="rows 1", query_context=CONTEXT))
+        rec.wait_for(finished("c"))
+        assert rec.of("c", "error")[0].code == "unsupported_option" and conn.runs == []
+    finally:
+        worker.close()
+
+
+def test_options_and_retry_safety_reach_run():
+    worker, conn, rec = make_worker(query_context=True, parameters=True)
+    try:
+        params = StatementParams(named={"n": "1"})
+        worker.submit(ExecuteCommand(request_id="r", sql="rows 1", query_context=CONTEXT, params=params))
+        rec.wait_for(finished("r"))
+        worker.submit(ExecuteCommand(request_id="w", sql="begin"))
+        rec.wait_for(finished("w"))
+        assert conn.options == [RunOptions(query_context=CONTEXT, params=params, retry_safe=True), RunOptions()]
+        worker.submit(ExecuteCommand(request_id="bad", sql="rows 1", params=StatementParams(positional=["x"])))
+        rec.wait_for(finished("bad"))
+        assert rec.of("bad", "error")[0].code == "invalid_params" and len(conn.runs) == 2
+    finally:
+        worker.close()
+
+
+class PlanConnection(FakeConnection):
+    def run(self, sql, options=None):
+        result = super().run(sql, options)
+        result.presentation = lambda: "plan"
+        return result
+
+
+def test_presentation_reaches_the_result_set_event():
+    worker, _, rec = make_worker(PlanConnection())
+    try:
+        execute(worker, "x", "rows 1")
+        rec.wait_for(finished("x"))
+        assert rec.of("x", "result_set")[0].presentation == "plan"
+    finally:
+        worker.close()
+
+
+def test_the_history_record_carries_the_requests_query_context():  # P37: `_complete` fills ExecutionRecord.query_context
+    worker, _, rec = make_worker(query_context=True)
+    records = []
+    worker.configure(WorkerHooks(check=_policy, capabilities=AdapterCapabilities(query_context=True),
+                                 on_record=records.append))
+    try:
+        worker.submit(ExecuteCommand(request_id="h", sql="rows 1", query_context=CONTEXT))
+        rec.wait_for(finished("h"))
+        worker.submit(ExecuteCommand(request_id="n", sql="rows 1"))  # no context: the record says so
+        rec.wait_for(finished("n"))
+        assert [r.query_context for r in records] == [CONTEXT, None]
+    finally:
+        worker.close()
+
+
+CLOSED = ("Closed this result 2 min after the server was left waiting for it, to free the query node — run the "
+          "statement again to load more, or export it to get every row")
+
+
+def test_an_idle_paused_result_is_closed_after_the_limit():
+    clock = Clock()
+    worker, _, rec = make_worker(clock=clock, paused_result_max_idle_s=120.0)
+    try:
+        execute(worker, "p", "rows 1200")
+        rec.wait_for(paused("p", 500))
+        clock.now += 119
+        worker.check_paused_result()  # below the limit it queues nothing, so this is already settled
+        assert not rec.of("p", "finished")
+        clock.now += 2
+        worker.check_paused_result()
+        rec.wait_for(finished("p"))
+        assert rec.of("p", "message")[-1].text == CLOSED  # loaded rows stay; the client marks the set partial
+        worker.submit(FetchMoreCommand(request_id="p"))
+        rec.wait_for(lambda e: e.type == "error" and e.code == "no_open_result")
+    finally:
+        worker.close()
+
+
+def test_engines_without_a_limit_keep_paused_results():
+    clock = Clock()
+    worker, _, rec = make_worker(clock=clock)
+    try:
+        execute(worker, "p", "rows 1200")
+        rec.wait_for(paused("p", 500))
+        clock.now += 10_000
+        worker.check_paused_result()
+        worker.submit(FetchMoreCommand(request_id="p"))
+        rec.wait_for(paused("p", 1000))
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("fetch_first", [True, False])
+def test_idle_close_and_fetch_more_race_either_way(fetch_first):  # Review Focus 3
+    clock = Clock()
+    rec = HoldingRecorder(lambda e: e.type == "result_set_end" and e.has_more)
+    worker, _, _ = make_worker(clock=clock, recorder=rec, paused_result_max_idle_s=120.0)
+    try:
+        execute(worker, "p", "rows 900")
+        assert rec.holding.wait(5)  # the worker thread is inside the pause; its mark is set
+        clock.now += 121
+        if fetch_first:
+            worker.submit(FetchMoreCommand(request_id="p"))
+            worker.check_paused_result()
+        else:
+            worker.check_paused_result()
+            worker.submit(FetchMoreCommand(request_id="p"))
+        rec.proceed.set()
+        worker.call(lambda c: None)  # a barrier: both queued tasks have run
+        texts = [e.text for e in rec.of("p", "message")]
+        if fetch_first:  # the Load more won: every row arrived and the close found nothing to do
+            assert sum(len(e.rows) for e in rec.of("p", "rows")) == 900 and CLOSED not in texts
+            assert len(rec.of("p", "finished")) == 1
+        else:  # the close won: the Load more finds no open result
+            assert CLOSED in texts and rec.of("p", "error")[0].code == "no_open_result"
+    finally:
+        worker.close()
+
+
+def _barrier(worker):
+    """Wait until every task queued so far has run, without discarding the open result (as `call()` would)."""
+    done = threading.Event()
+    worker._put(done.set)
+    assert done.wait(5)
+
+
+CLOSED_45 = ("Closed this result 45 s after the server was left waiting for it, to free the query node — run the "
+             "statement again to load more, or export it to get every row")
+
+
+def test_the_idle_limit_counts_from_the_first_pause_and_a_load_more_does_not_restart_it():  # R-04a-T11b
+    clock = Clock()
+    worker, _, rec = make_worker(clock=clock, paused_result_max_idle_s=45.0)
+    try:
+        execute(worker, "p", "rows 2000")
+        rec.wait_for(paused("p", 500))  # the first pause: the clock starts here
+        clock.now += 40  # limit - 5 s
+        worker.submit(FetchMoreCommand(request_id="p"))
+        rec.wait_for(paused("p", 1000))
+        clock.now += 4  # 44 s after the first pause, 4 s after the second
+        worker.check_paused_result()
+        _barrier(worker)
+        assert not rec.of("p", "finished")
+        clock.now += 1  # 45 s after the first pause (5 s after the second): the limit, not 45 s after the Load more
+        worker.check_paused_result()
+        rec.wait_for(finished("p"))
+        assert rec.of("p", "message")[-1].text == CLOSED_45
+        assert sum(len(e.rows) for e in rec.of("p", "rows")) == 1000  # the rows loaded stay
+    finally:
+        worker.close()
+
+
+def test_a_load_more_racing_the_close_still_wins_and_the_clock_still_runs_from_the_first_pause():  # R-04a-T11b
+    clock = Clock()
+    rec = HoldingRecorder(lambda e: e.type == "result_set_end" and e.has_more)
+    worker, _, _ = make_worker(clock=clock, recorder=rec, paused_result_max_idle_s=45.0)
+    try:
+        execute(worker, "p", "rows 2000")
+        assert rec.holding.wait(5)  # paused at 500, held inside the pause
+        clock.now += 46
+        worker.submit(FetchMoreCommand(request_id="p"))
+        worker.check_paused_result()  # a close for the pause at 500, queued behind the Load more
+        rec.proceed.set()
+        rec.wait_for(paused("p", 1000))
+        _barrier(worker)
+        assert not rec.of("p", "finished")  # the Load more won: the stale close found a new mark
+        assert sum(len(e.rows) for e in rec.of("p", "rows")) == 1000
+        worker.check_paused_result()  # the pause at 1000 is already past the limit counted from the first pause
+        rec.wait_for(finished("p"))
+        assert rec.of("p", "message")[-1].text == CLOSED_45
+    finally:
+        worker.close()
+
+
+def test_a_close_queued_for_an_earlier_pause_spares_the_next_one():  # the token: same request, a later pause
+    clock = Clock()
+    rec = HoldingRecorder(lambda e: e.type == "result_set_end" and e.has_more)
+    worker, _, _ = make_worker(clock=clock, recorder=rec, paused_result_max_idle_s=120.0)
+    try:
+        execute(worker, "p", "rows 1200")
+        assert rec.holding.wait(5)  # paused at 500
+        clock.now += 121
+        worker.submit(FetchMoreCommand(request_id="p"))
+        worker.check_paused_result()  # queued behind the Load more, for the pause at 500
+        rec.proceed.set()
+        rec.wait_for(paused("p", 1000))  # the Load more paused again: a new mark, which the queued close spares
+        _barrier(worker)
+        assert not rec.of("p", "finished") and CLOSED not in [e.text for e in rec.of("p", "message")]
+        clock.now += 121
+        worker.check_paused_result()
+        rec.wait_for(finished("p"))
+        assert rec.of("p", "message")[-1].text == CLOSED
+    finally:
+        worker.close()
+
+
+def test_a_new_statement_that_came_first_ends_the_paused_result_normally():
+    clock = Clock()
+    rec = HoldingRecorder(lambda e: e.type == "result_set_end" and e.has_more)
+    worker, _, _ = make_worker(clock=clock, recorder=rec, paused_result_max_idle_s=120.0)
+    try:
+        execute(worker, "p", "rows 900")
+        assert rec.holding.wait(5)
+        clock.now += 121
+        execute(worker, "q", "rows 1")
+        worker.check_paused_result()
+        rec.proceed.set()
+        rec.wait_for(finished("q"))
+        _barrier(worker)
+        assert len(rec.of("p", "finished")) == 1 and CLOSED not in [e.text for e in rec.of("p", "message")]
+        assert not rec.of("q", "message")  # the close does not land on the next request either
+    finally:
+        worker.close()
+
+
+def test_the_pause_mark_lives_only_while_the_result_waits():  # resumed or ended: nothing for the idle check to see
+    rec = HoldingRecorder(lambda e: e.type == "result_set_end" and not e.has_more)
+    worker, _, _ = make_worker(recorder=rec, paused_result_max_idle_s=120.0)
+    try:
+        execute(worker, "p", "rows 700")
+        rec.wait_for(paused("p", 500))
+        assert worker._paused is not None and worker._paused.request_id == "p"
+        worker.submit(FetchMoreCommand(request_id="p"))
+        assert rec.holding.wait(5)  # loading the rest: not idle
+        assert worker._paused is None
+        rec.proceed.set()
+        rec.wait_for(finished("p"))
+        execute(worker, "c", "rows 700")
+        rec.wait_for(paused("c", 500))
+        worker.cancel("c")  # a discarded result
+        rec.wait_for(finished("c"))
+        assert worker._paused is None
+    finally:
+        worker.close()
+
+
+class RawResult(FakeResult, RawJsonRows):
+    def fetch_raw(self, n):
+        taken, self._rows = self._rows[:n], self._rows[n:]
+        return [f'{{"n": {value},\n "s": "a b"}}' for value in taken]
+
+
+class RawConnection(FakeConnection):
+    def run(self, sql, options=None):
+        self.runs.append(sql)
+        self.options.append(options)
+        return RawResult(int(sql.split()[1]))
+
+
+def test_a_raw_json_export_writes_the_server_text(tmp_path):
+    worker, conn, rec = make_worker(RawConnection())
+    try:
+        target = tmp_path / "out.jsonl"
+        worker.submit(ExportCommand(request_id="j", sql="rows 3", format="jsonl", path=str(target)))
+        rec.wait_for(finished("j"))
+        assert target.read_text().splitlines() == ['{"n":0,"s":"a b"}', '{"n":1,"s":"a b"}', '{"n":2,"s":"a b"}']
+        assert conn.options[-1].retry_safe  # an export is a read
+        csv = tmp_path / "out.csv"
+        worker.submit(ExportCommand(request_id="c", sql="rows 2", format="csv", path=str(csv)))
+        rec.wait_for(finished("c"))
+        assert csv.read_text() == "n\n0\n1\n"  # other formats go by the columns
+    finally:
+        worker.close()
+
+
+def test_an_export_format_the_dialect_cannot_write_is_refused(tmp_path):
+    worker, conn, rec = make_worker()
+    worker.configure(WorkerHooks(dialect=Dialect.SQLPP, check=_policy))
+    try:
+        worker.submit(ExportCommand(request_id="i", sql="rows 1", format="insert", path=str(tmp_path / "x.sql")))
+        rec.wait_for(finished("i"))
+        assert rec.of("i", "error")[0].code == "unsupported_format" and conn.runs == []
+    finally:
+        worker.close()
+
+
+# ---- 8. read-ahead of paused results (04b, R-04a-T11a) ----
+
+MIB = 1024 * 1024
+CLOSED_AFTER_45 = ("Closed this result 45 s after the server was left waiting for it, to free the query node — run the "
+                   "statement again to load more, or export it to get every row")
+
+
+class ScriptedResult(FakeResult):
+    """Rows like FakeResult. Its read-ahead answers from `script` (the test feeds steps or exceptions); with nothing fed
+    within 50 ms it says READING again, as a result still reading would."""
+
+    def __init__(self, rows: int, script: queue.Queue) -> None:
+        super().__init__(rows)
+        self.script = script
+        self.received = 0
+        self.calls = 0
+
+    def read_ahead(self, budget: int) -> ReadAhead:
+        self.calls += 1
+        try:
+            step = self.script.get(timeout=0.05)
+        except queue.Empty:
+            return ReadAhead(ReadAheadState.READING, self.received)
+        if isinstance(step, BaseException):
+            raise step
+        self.received = step.received
+        return step
+
+
+class ReadAheadConnection(FakeConnection):
+    """`rows N` returns a ScriptedResult (or `result_type`) sharing the connection's `script`."""
+
+    result_type = ScriptedResult
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.script: queue.Queue = queue.Queue()
+        self.results: list[ScriptedResult] = []
+
+    def statement(self, sql, options):
+        result = super().statement(sql, options)
+        if not sql.startswith("rows "):
+            return result
+        scripted = self.result_type(int(sql.split()[1]), self.script)
+        self.results.append(scripted)
+        return scripted
+
+
+def read_ahead_worker(clock, **capabilities):
+    connection = ReadAheadConnection()
+    worker, _, rec = make_worker(connection, clock=clock, **{"paused_result_max_idle_s": 45.0,
+                                                             "read_ahead_bytes": 1 * MIB, **capabilities})
+    return worker, connection, rec
+
+
+def test_a_result_read_to_its_end_is_never_closed():
+    clock = Clock()
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        execute(worker, "p", "rows 1200")
+        rec.wait_for(paused("p", 500))
+        conn.script.put(ReadAhead(ReadAheadState.DONE, 300_000))
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.DONE)
+        clock.now += 10_000
+        worker.check_paused_result()
+        _barrier(worker)
+        assert not rec.of("p", "finished")
+        worker.submit(FetchMoreCommand(request_id="p", count=1000))
+        rec.wait_for(finished("p"))
+        assert sum(len(e.rows) for e in rec.of("p", "rows")) == 1200 and not rec.of("p", "error")
+    finally:
+        worker.close()
+
+
+def test_the_idle_limit_counts_from_where_the_read_ahead_stopped():  # Review Focus 3
+    clock = Clock()  # 1000.0 at the pause
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        execute(worker, "p", "rows 2000")
+        rec.wait_for(paused("p", 500))
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.READING)
+        clock.now = 1030.0  # still reading 30 s later: the server is not held back, nothing may close
+        worker.check_paused_result()
+        _barrier(worker)
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB))
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1074.0  # 44 s after the stop, 74 s after the pause
+        worker.check_paused_result()
+        _barrier(worker)
+        assert not rec.of("p", "finished")
+        clock.now = 1075.0
+        worker.check_paused_result()
+        rec.wait_for(finished("p"))
+        assert rec.of("p", "message")[-1].text == CLOSED_AFTER_45
+    finally:
+        worker.close()
+
+
+def test_an_empty_socket_after_a_load_more_does_not_restart_the_clock():  # B42 (B3 withdrawn)
+    clock = Clock()
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        execute(worker, "p", "rows 2000")
+        rec.wait_for(paused("p", 500))
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB))  # stopped at 1000.0
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        worker.submit(FetchMoreCommand(request_id="p", count=500))
+        rec.wait_for(paused("p", 1000))
+        clock.now = 1040.0
+        conn.script.put(ReadAhead(ReadAheadState.WAITING, 1 * MIB))  # the refill drained the socket
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.WAITING)
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB + 4096))  # 4 KiB more: far from 2 × the budget
+        wait_until(lambda: conn.script.empty() and worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1044.0  # 44 s after the first stop
+        worker.check_paused_result()
+        _barrier(worker)
+        assert not rec.of("p", "finished")
+        clock.now = 1045.0  # 45 s after the FIRST stop, 5 s after the empty socket
+        worker.check_paused_result()
+        rec.wait_for(finished("p"))
+        assert rec.of("p", "message")[-1].text == CLOSED_AFTER_45
+    finally:
+        worker.close()
+
+
+def test_draining_twice_the_budget_restarts_the_clock():  # STALL_RESET_FACTOR = 2, budget 1 MiB here
+    clock = Clock()
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        execute(worker, "p", "rows 5000")
+        rec.wait_for(paused("p", 500))
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB))  # stopped at 1000.0
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1040.0
+        conn.script.put(ReadAhead(ReadAheadState.READING, 2 * MIB))  # 1 MiB since the stop: not enough
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 2 * MIB))
+        worker.submit(FetchMoreCommand(request_id="p", count=2000))
+        rec.wait_for(paused("p", 2500))
+        wait_until(lambda: conn.script.empty() and worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1045.0  # 45 s after the first stop: closes
+        worker.check_paused_result()
+        rec.wait_for(finished("p"))
+    finally:
+        worker.close()
+    clock = Clock()
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        execute(worker, "q", "rows 5000")
+        rec.wait_for(paused("q", 500))
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB))  # stopped at 1000.0
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1040.0
+        conn.script.put(ReadAhead(ReadAheadState.READING, 3 * MIB))  # 2 MiB since the stop: unblocked
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 3 * MIB))  # stopped again at 1040.0
+        worker.submit(FetchMoreCommand(request_id="q", count=2000))
+        rec.wait_for(paused("q", 2500))
+        wait_until(lambda: conn.script.empty() and worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1084.0
+        worker.check_paused_result()
+        _barrier(worker)
+        assert not rec.of("q", "finished")
+        clock.now = 1085.0
+        worker.check_paused_result()
+        rec.wait_for(finished("q"))
+    finally:
+        worker.close()
+
+
+def test_read_ahead_never_holds_up_a_command():  # Review Focus 1: every step here takes 50 ms and finds more
+    clock = Clock()
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        execute(worker, "p", "rows 2000")
+        rec.wait_for(paused("p", 500))
+        wait_until(lambda: conn.results[0].calls >= 3)  # stepping
+        started = time.monotonic()
+        worker.cancel("p")  # paused: a discard
+        rec.wait_for(finished("p"))
+        assert time.monotonic() - started < scaled(1.0)
+        execute(worker, "n", "rows 1")
+        rec.wait_for(finished("n"))
+        assert conn.results[0].closed
+    finally:
+        worker.close()
+
+
+def test_a_failing_read_ahead_falls_back_to_the_first_pause_clock():
+    clock = Clock()
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        conn.script.put(RuntimeError("bug in an adapter"))
+        execute(worker, "p", "rows 2000")
+        rec.wait_for(paused("p", 500))
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now += 45
+        worker.check_paused_result()
+        rec.wait_for(finished("p"))
+        assert sum(len(e.rows) for e in rec.of("p", "rows")) == 500  # the rows loaded stay
+    finally:
+        worker.close()
+
+
+def test_engines_without_read_ahead_never_read_ahead():
+    clock = Clock()
+    connection = ReadAheadConnection()
+    worker, _, rec = make_worker(connection, clock=clock, paused_result_max_idle_s=45.0)
+    try:
+        execute(worker, "p", "rows 1200")
+        rec.wait_for(paused("p", 500))
+        _barrier(worker)
+        assert connection.results[0].calls == 0 and worker.paused_read_ahead() is None
+    finally:
+        worker.close()
+
+
+def test_a_load_more_that_drains_twice_the_budget_ends_the_stall_even_on_an_empty_socket():  # B44
+    clock = Clock()
+    worker, conn, rec = read_ahead_worker(clock)
+    try:
+        execute(worker, "p", "rows 5000")
+        rec.wait_for(paused("p", 500))
+        conn.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB))  # stopped at 1000.0
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1040.0
+        for _ in range(40):  # the Load more's fetch() drains 2 MiB (2 × the budget); the socket stays empty after it
+            conn.script.put(ReadAhead(ReadAheadState.WAITING, 3 * MIB))
+        worker.submit(FetchMoreCommand(request_id="p", count=2000))
+        rec.wait_for(paused("p", 2500))
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.WAITING)
+        clock.now = 1045.0  # 45 s after the stall began, but the server has been unblocked since
+        worker.check_paused_result()
+        _barrier(worker)
+        clock.now = 1100.0
+        worker.check_paused_result()
+        _barrier(worker)
+        assert not rec.of("p", "finished")
+        worker.submit(FetchMoreCommand(request_id="p", count=500))
+        rec.wait_for(paused("p", 3000))
+    finally:
+        worker.close()
+
+
+def test_a_failing_read_ahead_step_never_ends_the_worker(monkeypatch):  # B32: the step runs inside the loop's try
+    real_update, failed = StallClock.update, threading.Event()
+
+    def update_failing_once(self, step, now):
+        if not failed.is_set():
+            failed.set()
+            raise RuntimeError("bug in the worker's own step")
+        real_update(self, step, now)
+
+    monkeypatch.setattr(StallClock, "update", update_failing_once)
+    logged = []
+    sink = logger.add(lambda m: logged.append(m.record), level="ERROR")
+    worker, conn, rec = read_ahead_worker(Clock())
+    try:
+        execute(worker, "p", "rows 2000")
+        rec.wait_for(paused("p", 500))
+        assert failed.wait(5)
+        _barrier(worker)  # the loop went on after the failure
+        assert worker._thread.is_alive()
+        assert [r for r in logged if r["message"] == "Session task failed on fake" and r["exception"] is not None]
+        calls = conn.results[0].calls
+        time.sleep(0.3)  # a step that failed is not repeated until the next pause (it would spin, failing each time)
+        assert conn.results[0].calls <= calls + 1 and worker.paused_read_ahead() is ReadAheadState.FULL
+        assert worker._paused.since == 1000.0  # it stopped reading: the server is held back from there (as FULL)
+        worker.submit(FetchMoreCommand(request_id="p", count=500))
+        rec.wait_for(paused("p", 1000))
+        wait_until(lambda: conn.results[0].calls > calls + 1)  # the next pause reads on
+        worker.cancel("p")  # paused: a discard
+        rec.wait_for(finished("p"))
+        assert conn.results[0].closed
+        execute(worker, "n", "rows 1")
+        rec.wait_for(finished("n"))
+        assert worker._thread.is_alive()
+    finally:
+        worker.close()
+        logger.remove(sink)
+
+
+class GatedResult(ScriptedResult):
+    """A ScriptedResult whose next read-ahead step, once `gate_next` is set, sets `entered` and waits inside
+    read_ahead() for the step the test puts in `release`."""
+
+    def __init__(self, rows: int, script: queue.Queue) -> None:
+        super().__init__(rows, script)
+        self.gate_next = threading.Event()
+        self.entered = threading.Event()
+        self.release: queue.Queue = queue.Queue()
+
+    def read_ahead(self, budget: int) -> ReadAhead:
+        if not self.gate_next.is_set():
+            return super().read_ahead(budget)
+        self.gate_next.clear()
+        self.entered.set()
+        self.calls += 1
+        step = self.release.get(timeout=10)
+        self.received = step.received
+        return step
+
+
+def test_a_close_decided_on_the_old_stall_loses_to_a_step_that_ends_it():  # the mark is compared by value (E1)
+    clock = Clock()
+    connection = ReadAheadConnection()
+    connection.result_type = GatedResult
+    worker, _, rec = make_worker(connection, clock=clock, paused_result_max_idle_s=45.0, read_ahead_bytes=1 * MIB)
+    try:
+        execute(worker, "p", "rows 5000")
+        rec.wait_for(paused("p", 500))
+        connection.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB))  # stopped at 1000.0
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        worker.submit(FetchMoreCommand(request_id="p", count=500))
+        rec.wait_for(paused("p", 1000))
+        wait_until(lambda: worker._paused.since == 1000.0)  # the first step after the pause brought the stall back
+        result = connection.results[0]
+        result.gate_next.set()
+        assert result.entered.wait(5)  # a step is inside read_ahead()
+        clock.now = 1050.0
+        worker.check_paused_result()  # decided on the stall that began at 1000.0: a close is queued behind the step
+        result.release.put(ReadAhead(ReadAheadState.READING, 3 * MIB))  # 2 MiB since the stall: the server is unblocked
+        _barrier(worker)
+        assert not rec.of("p", "finished") and worker._paused.since is None
+    finally:
+        worker.close()
+
+
+def test_a_close_checked_before_the_first_step_after_a_load_more_cannot_use_the_old_stall():  # E2 (B44)
+    clock = Clock()
+    rec = HoldingRecorder(lambda e: e.type == "result_set_end" and e.has_more and e.row_count == 2500)
+    connection = ReadAheadConnection()
+    worker, _, _ = make_worker(connection, clock=clock, recorder=rec, paused_result_max_idle_s=45.0,
+                               read_ahead_bytes=1 * MIB)
+    try:
+        execute(worker, "p", "rows 5000")
+        rec.wait_for(paused("p", 500))
+        connection.script.put(ReadAhead(ReadAheadState.FULL, 1 * MIB))  # stopped at 1000.0
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.FULL)
+        clock.now = 1050.0
+        for _ in range(40):  # the Load more's fetch() drains 2 MiB (2 × the budget); the socket stays empty after it
+            connection.script.put(ReadAhead(ReadAheadState.WAITING, 3 * MIB))
+        worker.submit(FetchMoreCommand(request_id="p", count=2000))
+        assert rec.holding.wait(5)  # inside the pause at 2500: its mark is published, no step has run yet
+        worker.check_paused_result()  # 50 s after the stall began
+        rec.proceed.set()
+        _barrier(worker)  # a close queued by the check would run before any step
+        assert not rec.of("p", "finished")
+        wait_until(lambda: worker.paused_read_ahead() is ReadAheadState.WAITING)
+        worker.check_paused_result()
+        _barrier(worker)
+        assert not rec.of("p", "finished") and worker._paused.since is None
+    finally:
+        worker.close()
+
+
+class InstantResult(ScriptedResult):
+    """Answers every read-ahead step at once with `state` (no wait in the fake): only the worker paces the steps."""
+
+    state = ReadAheadState.FULL
+
+    def read_ahead(self, budget: int) -> ReadAhead:
+        self.calls += 1
+        return ReadAhead(self.state, 0)
+
+
+@pytest.mark.parametrize("state, most", [
+    (ReadAheadState.FULL, 1), (ReadAheadState.DONE, 1), (ReadAheadState.WAITING, 4),
+])
+def test_steps_stop_after_full_or_done_and_poll_after_waiting(state, most):  # E7: 0.25 s polls, never a busy loop
+    connection = ReadAheadConnection()
+    connection.result_type = type("Instant", (InstantResult,), {"state": state})
+    worker, _, rec = make_worker(connection, clock=Clock(), paused_result_max_idle_s=45.0, read_ahead_bytes=1 * MIB)
+    try:
+        execute(worker, "p", "rows 5000")
+        rec.wait_for(paused("p", 500))
+        wait_until(lambda: connection.results[0].calls >= 1)  # the step at the pause
+        time.sleep(0.6)
+        assert connection.results[0].calls <= most
+    finally:
+        worker.close()

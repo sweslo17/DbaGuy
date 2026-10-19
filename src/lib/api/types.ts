@@ -22,6 +22,8 @@ export type ObjectDetail = S["ObjectDetail"];
 export type ObjectSearchHit = S["ObjectSearchHit"];
 export type ColumnInfo = S["ColumnInfo"];
 export type SessionInfo = S["SessionInfo"];
+/** Couchbase: the bucket (and scope) that unqualified keyspace names resolve against, sent with execute and export. */
+export type QueryContext = S["QueryContext"];
 export type ColumnMeta = S["ColumnMeta"];
 export type ColumnCategory = S["ColumnCategory"];
 export type ServerEvent = S["ExecutionSchema"]["event"];
@@ -53,6 +55,39 @@ export type ScriptFile = S["ScriptFile"];
 export type HistoryEntry = S["HistoryEntry"];
 export type HistoryPage = S["HistoryPage"];
 export type HistoryStatus = HistoryEntry["status"];
+/** Couchbase (spec §3.11.1): one entry of the query-context picker. `text` is the backend's display text for it. */
+export type ContextOption = S["ContextOption"];
+/** Couchbase (spec §3.10): an EXPLAIN, ADVISE or profile result as an operator tree with flags, advice and timings. */
+export type PlanView = S["PlanView"];
+export type PlanNode = S["PlanNode"];
+export type PlanFinding = S["PlanFinding"];
+export type PlanDetail = S["PlanDetail"];
+export type PlanSubquery = S["PlanSubquery"];
+export type IndexAdvice = S["IndexAdvice"];
+/** Couchbase (spec §3.11.2): the typed parameters of one statement, JSON literal texts by name or position. */
+export type StatementParams = S["StatementParams"];
+/** Couchbase: a collection by its three names (the key of a field sample). */
+export type Keyspace = S["Keyspace"];
+/**
+ * Couchbase (R-04-11): one field path of a manual sample. `path` runs from the document's root: a key, `null` for the
+ * elements of an array, `[]` for the document itself; `types` counts the documents by JSON kind ("binary" included).
+ * `display` is the path as the backend writes it for the user (SQL++ quoting): show it, never build one from `path`.
+ */
+export type FieldPath = S["FieldPath"];
+/** Couchbase (R-04-11): the field paths of a keyspace's sampled documents, as `POST /couchbase/fields/sample` answers. */
+export type FieldSample = S["FieldSample"];
+/** Couchbase (spec §3.9.2): a document as stored, its exact text (null when binary) and META; `cas` in decimal. */
+export type DocumentView = S["DocumentView"];
+/** Couchbase (spec §3.9.3): a write that happened, with the document's new CAS and its expiration. */
+export type DocumentSaved = S["DocumentSaved"];
+/** Couchbase (spec §3.9.3): what the server would store instead of the edited text, written only once confirmed. */
+export type SavePreview = S["SavePreview"];
+/** Couchbase (ruling C2): one token change of a preview; value changes come first. */
+export type DocumentChange = S["DocumentChange"];
+/** Couchbase (ruling C2): every change of a preview by kind, listed or not. */
+export type ChangeCounts = S["ChangeCounts"];
+/** Couchbase: what `POST /couchbase/documents/save` and `/insert` answer, told apart by `status`. */
+export type SaveAnswer = DocumentSaved | SavePreview;
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

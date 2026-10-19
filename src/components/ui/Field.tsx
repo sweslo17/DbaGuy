@@ -53,22 +53,29 @@ export function Label({ className, ...props }: LabelHTMLAttributes<HTMLLabelElem
   return <label className={cn("text-[12px] text-muted", className)} {...props} />;
 }
 
-/** A labelled control; `error` (a value the form cannot take) shows in place of the hint. */
+/**
+ * A labelled control; `error` (a value the form cannot take) shows in place of the hint. `htmlFor` (the control's id)
+ * ties the label to it, so a click on the label focuses the control.
+ */
 export function FieldRow({
   label,
+  htmlFor,
   hint,
   error,
   children,
 }: {
   label: string;
-  hint?: string;
+  htmlFor?: string;
+  hint?: ReactNode;
   error?: string | null;
   children: ReactNode;
 }) {
   const note = error || hint;
   return (
     <div role="group" aria-label={label || undefined} className="grid grid-cols-[120px_1fr] items-center gap-x-3 gap-y-1">
-      <Label className="text-right">{label}</Label>
+      <Label htmlFor={htmlFor} className="text-right">
+        {label}
+      </Label>
       <div>{children}</div>
       {note && (
         <span className={cn("col-start-2 text-[11px] [overflow-wrap:anywhere]", error ? "text-danger" : "text-muted")}>

@@ -35,6 +35,16 @@ class NotificationSettings(BaseModel):
     long_query_seconds: int = Field(default=15, ge=0)
 
 
+SAMPLE_SIZE_MIN, SAMPLE_SIZE_MAX = 10, 10_000  # also what a single Sample fields request may ask for
+
+
+class CouchbaseSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # documents a manual Sample fields reads (R-04-11)
+    sample_size: int = Field(default=1000, ge=SAMPLE_SIZE_MIN, le=SAMPLE_SIZE_MAX)
+
+
 class AppSettings(BaseModel):
     """The app preferences (`settings.json`). Persisted, so a newer build's extra fields are tolerated on read and
     kept on write; input from the API stays strict."""
@@ -45,4 +55,5 @@ class AppSettings(BaseModel):
     run: RunSettings = RunSettings()
     safety: SafetySettings = SafetySettings()
     notifications: NotificationSettings = NotificationSettings()
+    couchbase: CouchbaseSettings = CouchbaseSettings()
     scripts_dir: str | None = None  # None = the default folder inside the data dir

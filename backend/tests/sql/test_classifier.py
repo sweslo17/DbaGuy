@@ -14,8 +14,8 @@ from sqlglot.dialects.dialect import Dialect as SqlglotDialect
 from dbaguy_backend.domain.classification import Classification, DangerReason
 from dbaguy_backend.sql import classifier
 from dbaguy_backend.sql.classifier import StatementKind as K
-from dbaguy_backend.sql.classifier import classify, warm_up
-from dbaguy_backend.sql.dialects import Dialect
+from dbaguy_backend.sql.classifier import _from_sqlglot, classify, is_transaction_statement, warm_up
+from dbaguy_backend.sql.dialects import KEYWORD_ONLY_DIALECTS, Dialect
 from dbaguy_backend.sql.splitter import StatementSpan
 
 PG, LITE, MY = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL
@@ -362,7 +362,7 @@ def _warnings_while(action):
     return result, messages
 
 
-@pytest.mark.parametrize("dialect", list(Dialect))
+@pytest.mark.parametrize("dialect", [d for d in Dialect if d not in KEYWORD_ONLY_DIALECTS])
 def test_every_dialect_parses_through_sqlglot_resolved_by_import(dialect, monkeypatch):
     calls = []
     real = sqlglot.parse
@@ -391,15 +391,22 @@ def test_dialects_survive_a_bundle_without_sqlglots_by_name_lookups():
             return real(name, package)
         importlib.import_module = bundled_only
         from dbaguy_backend.sql.classifier import _from_sqlglot
-        from dbaguy_backend.sql.dialects import Dialect
+        from dbaguy_backend.sql.dialects import KEYWORD_ONLY_DIALECTS, Dialect
         # sqlglot's own answer (None when it could not run: a TypeError here); the keyword rules give the same reason
         sql = "ALTER TABLE t DROP COLUMN a"
-        print(json.dumps([[c.dangerous_reasons for c in _from_sqlglot(sql, d)] for d in Dialect]))
+        dialects = [d for d in Dialect if d not in KEYWORD_ONLY_DIALECTS]
+        print(json.dumps([[c.dangerous_reasons for c in _from_sqlglot(sql, d)] for d in dialects]))
     """)
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
                             cwd=Path(__file__).parents[2])
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == [[["alter_drop"]]] * len(Dialect)  # parsed, not the keyword fallback
+    assert json.loads(result.stdout) == [[["alter_drop"]]] * (len(Dialect) - len(KEYWORD_ONLY_DIALECTS))  # parsed, not the keyword fallback
+
+
+def test_keyword_only_dialects_never_reach_sqlglot(monkeypatch):
+    monkeypatch.setattr(sqlglot, "parse", lambda *a, **k: pytest.fail("sqlglot was asked about SQL++"))
+    result, warnings = _warnings_while(lambda: _from_sqlglot("SELECT 1", Dialect.SQLPP))
+    assert result is None and warnings == []
 
 
 def test_an_unexpected_sqlglot_failure_is_a_warning_naming_only_the_exception(monkeypatch):
@@ -433,7 +440,7 @@ def test_warm_up_parses_once_per_dialect_and_logs_its_duration(monkeypatch):
         warm_up()
     finally:
         logger.remove(sink)
-    assert len(calls) == len(Dialect)
+    assert len(calls) == len(Dialect) - len(KEYWORD_ONLY_DIALECTS)  # warm_up() skips the keyword-only dialects
     assert any("warmed up" in m and " ms" in m for m in messages)
 
 
@@ -634,3 +641,233 @@ def test_the_tsql_keyword_overrides_do_not_leak_into_the_other_dialects():
     assert classify("PRAGMA table_info(t)", LITE).kind == K.READ
     assert classify("PRAGMA journal_mode = WAL", LITE).kind == K.SESSION
     assert classify("DESCRIBE t", MY).kind == K.READ
+
+
+# --- SQL++ (Couchbase): keyword rules only, nothing from sqlglot ---------------------------------------------------
+
+SQ = Dialect.SQLPP
+D = DangerReason
+
+
+@pytest.mark.parametrize("sql, kind, reasons", [
+    ("SELECT * FROM users", K.READ, []),
+    ("select raw d.name from ks as d use keys ['a']", K.READ, []),
+    ("WITH a AS (SELECT 1 AS x) SELECT a", K.READ, []),
+    ("(SELECT 1) UNION (SELECT 2)", K.READ, []),
+    ("EXPLAIN DELETE FROM users", K.READ, []),
+    ("EXPLAIN FUNCTION f", K.READ, []),
+    ("ADVISE SELECT * FROM users WHERE name = 'x'", K.READ, []),
+    ('INFER users WITH {"sample_size": 10}', K.READ, []),
+    ("PREPARE p FROM DELETE FROM users", K.READ, []),
+    ("SELECT NEXT VALUE FOR s1", K.WRITE, []),
+    ("SELECT nextval for s1", K.WRITE, []),
+    ("SELECT PREV VALUE FOR s1", K.READ, []),
+    ("SELECT 1 DELETE FROM users", K.WRITE, []),  # invalid for the server; still never a read
+    ("INSERT INTO users (KEY, VALUE) VALUES ('k', {})", K.WRITE, []),
+    ("UPSERT INTO users (KEY, VALUE) VALUES ('k', {})", K.WRITE, []),
+    ("UPDATE users SET a = 1", K.WRITE, [D.UPDATE_WITHOUT_WHERE]),
+    ("UPDATE users USE KEYS 'k' SET a = 1", K.WRITE, []),
+    ("UPDATE users SET a = 1 WHERE b = 2", K.WRITE, []),
+    ("UPDATE users SET a = (SELECT RAW 1 FROM t WHERE x = 1)", K.WRITE, [D.UPDATE_WITHOUT_WHERE]),
+    ("DELETE FROM users", K.WRITE, [D.DELETE_WITHOUT_WHERE]),
+    ("DELETE FROM users d USE KEYS ['a', 'b']", K.WRITE, []),
+    ("DELETE FROM users d WHERE d.k IN (SELECT RAW o.k FROM orders o WHERE o.x = 1)", K.WRITE, []),
+    ("MERGE INTO users u USING orders o ON KEY o.u WHEN MATCHED THEN DELETE", K.WRITE, [D.MERGE_DELETE]),
+    ("MERGE INTO users u USING orders o ON KEY o.u WHEN MATCHED THEN UPDATE SET u.n = 1", K.WRITE, []),
+    ("DELETE FROM system:active_requests WHERE clientContextID = 'x'", K.WRITE, [D.SYSTEM_KEYSPACE]),
+    ("DELETE FROM system:prepareds", K.WRITE, [D.DELETE_WITHOUT_WHERE, D.SYSTEM_KEYSPACE]),
+    ("SELECT * FROM system:active_requests", K.READ, []),
+    ("UPDATE STATISTICS FOR users(name)", K.WRITE, []),
+    ("ANALYZE KEYSPACE users", K.WRITE, []),
+    ("CREATE INDEX i ON users(name)", K.DDL, []),
+    ("CREATE PRIMARY INDEX ON users", K.DDL, []),
+    ("BUILD INDEX ON users(i)", K.DDL, []),
+    ('ALTER INDEX i ON users WITH {"action": "move"}', K.DDL, []),
+    ("DROP INDEX i ON users", K.DDL, [D.DROP]),
+    ("DROP COLLECTION dbaguy.app.users", K.DDL, [D.DROP]),
+    ("DROP SCOPE dbaguy.app", K.DDL, [D.DROP]),
+    ("CREATE FUNCTION f() { 1 }", K.DDL, []),
+    ("CREATE SEQUENCE s1", K.DDL, []),
+    ("GRANT query_select ON users TO bob", K.DDL, []),
+    ("BEGIN WORK", K.TRANSACTION, []),
+    ("begin transaction", K.TRANSACTION, []),
+    ("START TRANSACTION", K.TRANSACTION, []),
+    ("COMMIT", K.TRANSACTION, []),
+    ("ROLLBACK TO SAVEPOINT s", K.TRANSACTION, []),
+    ("SAVEPOINT s", K.TRANSACTION, []),
+    ("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", K.TRANSACTION, []),
+    ("BEGIN", K.UNKNOWN, []),
+    ("EXECUTE p", K.UNKNOWN, []),
+    ("EXECUTE FUNCTION f()", K.UNKNOWN, []),
+    ("SET x = 1", K.UNKNOWN, []),
+    ("`users`", K.UNKNOWN, []),
+    ("FOO BAR", K.UNKNOWN, []),
+])
+def test_sqlpp(sql, kind, reasons):
+    result = classify(sql, SQ)
+    assert (result.kind, result.dangerous_reasons) == (kind, reasons)
+
+
+@pytest.mark.parametrize("sql, kind, reasons", [
+    # FLUSH COLLECTION empties a collection (probed on 7.6.12): confirmed like TRUNCATE, never run unasked
+    ("FLUSH COLLECTION dbaguy.app.users", K.DDL, [D.TRUNCATE]),
+    ("flush collection `users`", K.DDL, [D.TRUNCATE]),
+    # a bare expression starts no recognised statement: UNKNOWN, so read-only blocks it
+    ("NEXT VALUE FOR s1", K.UNKNOWN, []),
+    ("(NEXTVAL FOR s1)", K.UNKNOWN, []),
+    ("1 + 1", K.UNKNOWN, []),
+    ("$x", K.UNKNOWN, []),
+    ("'DELETE FROM users'", K.UNKNOWN, []),
+    ("", K.UNKNOWN, []),
+    ("/* SELECT 1 */", K.UNKNOWN, []),
+    # a leading parenthesis never hides the statement word, and a DML word wins over the READ word outside it
+    ("(DELETE FROM users)", K.WRITE, [D.DELETE_WITHOUT_WHERE]),
+    ("((SELECT NEXT VALUE FOR s1))", K.WRITE, []),
+    ("(SELECT 1) UNION (SELECT 2) -- ;DELETE FROM users", K.READ, []),
+    # nesting: a sequence or DML word anywhere in a SELECT, a subquery's WHERE or USE KEYS filters nothing
+    ("SELECT (SELECT NEXT VALUE FOR s1) AS n", K.WRITE, []),
+    ("SELECT 1 FROM t WHERE x IN (DELETE FROM u USE KEYS 'k')", K.WRITE, []),
+    ("WITH a AS (SELECT NEXTVAL FOR s1 AS n) SELECT a.n", K.WRITE, []),
+    ("SELECT * FROM (SELECT 1 AS a) AS t WHERE t.a IN (SELECT RAW 1 FROM s WHERE s.x = 1)", K.READ, []),
+    ("UPDATE users SET a = (SELECT RAW 1 FROM x USE KEYS ['k'])", K.WRITE, [D.UPDATE_WITHOUT_WHERE]),
+    ("DELETE FROM users LIMIT 1", K.WRITE, [D.DELETE_WITHOUT_WHERE]),
+    # R-04a-T3a: a keys filter whose expression holds a subquery may name every document, so it filters nothing; a
+    # subquery after the expression (SET, UNSET, LIMIT, RETURNING, WHERE) is something else
+    ("DELETE FROM users USE KEYS (SELECT RAW META(x).id FROM users x)", K.WRITE, [D.DELETE_WITHOUT_WHERE]),
+    ("DELETE FROM users USE KEYS ARRAY k FOR k IN (SELECT RAW META(x).id FROM users x) END", K.WRITE,
+     [D.DELETE_WITHOUT_WHERE]),
+    ("DELETE FROM users USE KEYS ['a'] || (SELECT RAW META(x).id FROM users x)", K.WRITE, [D.DELETE_WITHOUT_WHERE]),
+    ("DELETE FROM users d USE KEYS ((SELECT RAW 1)) RETURNING d.a", K.WRITE, [D.DELETE_WITHOUT_WHERE]),
+    ("UPDATE users USE KEYS (SELECT RAW META(x).id FROM users x) SET a = 1", K.WRITE, [D.UPDATE_WITHOUT_WHERE]),
+    ("UPDATE users USE KEYS (SELECT RAW META(x).id FROM users x) UNSET a", K.WRITE, [D.UPDATE_WITHOUT_WHERE]),
+    ("DELETE FROM users USE KEYS (SELECT RAW META(x).id FROM users x) WHERE x = 1", K.WRITE, []),
+    ("DELETE FROM users USE KEYS ['a'] || (SELECT RAW 1) USE KEYS 'k'", K.WRITE, []),
+    ("UPDATE users USE KEYS 'k' SET a = (SELECT RAW 1 FROM t)", K.WRITE, []),
+    ("UPDATE users USE KEYS 'k' UNSET a RETURNING (SELECT RAW 1)", K.WRITE, []),
+    ("DELETE FROM users USE KEYS ['a'] LIMIT (SELECT RAW 1)", K.WRITE, []),
+    ("DELETE FROM users USE KEYS ['a', 'b'] RETURNING (SELECT RAW 1)", K.WRITE, []),
+    ("DELETE FROM users USE KEYS $keys", K.WRITE, []),
+    ("DELETE FROM users USE KEYS (`SELECT`)", K.WRITE, []),  # a field named select is no subquery
+    ("DELETE FROM users WHERE true", K.WRITE, []),  # out of reach: a filter that filters nothing
+    # FROM-first selects (R-04a-T3b, probed): READ like SELECT, scanned for sequences and DML words the same way
+    ("FROM ks SELECT a", K.READ, []),
+    ("from ks as k let x = 1 where k.a = x group by k.b having count(*) > 1 select k.b", K.READ, []),
+    ("FROM ks USE KEYS ['a'] SELECT a", K.READ, []),
+    ("FROM ks SELECT a UNION ALL FROM ks2 SELECT b", K.READ, []),
+    ("(FROM ks SELECT a) UNION (SELECT 1)", K.READ, []),
+    ("FROM ks SELECT PREV VALUE FOR s", K.READ, []),
+    ("FROM ks SELECT NEXT VALUE FOR s", K.WRITE, []),
+    ("FROM ks SELECT NEXTVAL FOR s", K.WRITE, []),
+    ("FROM ks DELETE", K.WRITE, []),
+    ("FROM ks SELECT a UNION ALL SELECT NEXT VALUE FOR s", K.WRITE, []),
+    ("FROM ks WHERE a IN (UPDATE t SET x = 1) SELECT a", K.WRITE, []),
+    ("FROM `DELETE` SELECT a", K.READ, []),
+    ("FROM", K.READ, []),
+    ("DELETE FROM users d USE (KEYS) x", K.WRITE, [D.DELETE_WITHOUT_WHERE]),  # the phrase's words are neighbours
+    ("DELETE FROM users -- WHERE x\n", K.WRITE, [D.DELETE_WITHOUT_WHERE]),
+    ("DELETE FROM users /* USE KEYS 'k' */ RETURNING 'WHERE', `where`", K.WRITE, [D.DELETE_WITHOUT_WHERE]),
+    ("DELETE FROM users USE /* c */ KEYS 'k'", K.WRITE, []),
+    # system: written the other ways the server reads it (probed): back-ticked, with escapes, spaced, commented
+    ("DELETE FROM system : prepareds WHERE name = 'p'", K.WRITE, [D.SYSTEM_KEYSPACE]),
+    ("DELETE FROM system/* c */:/* c */prepareds WHERE name = 'p'", K.WRITE, [D.SYSTEM_KEYSPACE]),
+    ("DELETE FROM `system`:prepareds WHERE name = 'p'", K.WRITE, [D.SYSTEM_KEYSPACE]),
+    ("DELETE FROM `\\u0073ystem`:prepareds WHERE name = 'p'", K.WRITE, [D.SYSTEM_KEYSPACE]),
+    ("DELETE FROM `sys\\u0074em`:prepareds WHERE name = 'p'", K.WRITE, [D.SYSTEM_KEYSPACE]),
+    ("DELETE FROM SYSTEM:prepareds WHERE name = 'p'", K.WRITE, [D.SYSTEM_KEYSPACE]),
+    ("DELETE FROM default:users WHERE a = 1", K.WRITE, []),
+    ("DELETE FROM users WHERE a = 'system:x'", K.WRITE, []),
+    ("DELETE FROM `system` WHERE a = 1", K.WRITE, []),  # a keyspace named system, no colon
+    ("UPDATE system:prepareds SET a = 1 WHERE b = 2", K.WRITE, [D.SYSTEM_KEYSPACE]),
+    ("INSERT INTO system:prepareds (KEY, VALUE) VALUES ('k', {})", K.WRITE, [D.SYSTEM_KEYSPACE]),
+    ("EXPLAIN DELETE FROM system:prepareds", K.READ, []),
+    # MERGE … DELETE however it is spelt
+    ("merge into users u using orders o on key o.u when matched then /* c */ delete where u.n = 1", K.WRITE,
+     [D.MERGE_DELETE]),
+    ("MERGE INTO users u USING (SELECT * FROM orders) o ON KEY o.u WHEN NOT MATCHED THEN INSERT (o.x)", K.WRITE, []),
+    # a transaction word is not one inside something else, nor with a back-ticked word
+    ("SELECT 1 /* BEGIN WORK */", K.READ, []),
+    ("`BEGIN` WORK", K.UNKNOWN, []),
+    ("BEGIN /* c */ WORK", K.TRANSACTION, []),
+    ("BEGIN\tTRAN", K.TRANSACTION, []),
+    ("START WORK", K.TRANSACTION, []),
+    ("COMMIT TRANSACTION", K.TRANSACTION, []),
+    ("START", K.UNKNOWN, []),
+    ("END", K.UNKNOWN, []),
+    ("RELEASE SAVEPOINT s", K.UNKNOWN, []),
+    ("SET TRANSACTION", K.TRANSACTION, []),
+    ("SET `TRANSACTION` ISOLATION LEVEL READ COMMITTED", K.UNKNOWN, []),
+    ("EXECUTE", K.UNKNOWN, []),
+    ("execute /* c */ function f()", K.UNKNOWN, []),
+])
+def test_sqlpp_bypass_attempts_and_edges(sql, kind, reasons):
+    result = classify(sql, SQ)
+    assert (result.kind, result.dangerous_reasons) == (kind, reasons)
+
+
+@pytest.mark.parametrize("statement", [
+    "DELETE FROM users", "UPSERT INTO users (KEY, VALUE) VALUES ('k', {})", "SELECT NEXT VALUE FOR s1",
+    "SELECT NEXTVAL FOR s1", "MERGE INTO users u USING orders o ON KEY o.u WHEN MATCHED THEN DELETE",
+    "EXECUTE p", "EXECUTE FUNCTION f()", "CREATE INDEX i ON users(name)", "BEGIN WORK",
+    "UPDATE users SET a = 1 WHERE b = 2",
+])
+@pytest.mark.parametrize(
+    "gap", [" ", "  ", "\t", "\n", "\r\n", " /* c */ ", "/**/", "-- c\n", " -- c\r", "/* ; DELETE */"]
+)
+def test_sqlpp_the_kind_survives_comments_and_whitespace_between_the_words(statement, gap):
+    plain = classify(statement, SQ)
+    spread = classify(gap.join(statement.split(" ")), SQ)
+    assert plain.kind != K.READ
+    assert (spread.kind, spread.dangerous_reasons) == (plain.kind, plain.dangerous_reasons)
+
+
+def test_sqlpp_comments_strings_and_names_are_not_words():
+    assert classify("/* DELETE */ SELECT 'DELETE', `delete` FROM ks", SQ).kind == K.READ
+    assert classify("SELECT 1 -- ;DELETE\n", SQ).kind == K.READ
+    assert classify("SELECT 1; DELETE FROM users", SQ).dangerous_reasons == [D.DELETE_WITHOUT_WHERE]  # a script
+    assert classify("SELECT 'NEXT VALUE FOR s', `NEXT VALUE FOR` FROM ks", SQ).kind == K.READ
+    assert classify("SELECT \"x\" AS `update`, 'it''s ; DELETE FROM users' FROM ks", SQ).kind == K.READ
+
+
+def test_sqlpp_a_script_is_judged_statement_by_statement():
+    assert classify("SELECT 1; EXECUTE p", SQ).kind == K.UNKNOWN
+    assert classify("SELECT 1; SELECT NEXT VALUE FOR s1", SQ).kind == K.WRITE
+    assert classify("SELECT 1; DELETE FROM users USE KEYS 'k'; BEGIN WORK", SQ).kind == K.WRITE
+    assert classify("BEGIN WORK; SELECT 1", SQ).kind == K.TRANSACTION
+    assert classify("SELECT 1;; SELECT 2;", SQ).kind == K.READ
+    assert classify("SELECT 1; DROP INDEX i ON users", SQ).dangerous_reasons == [D.DROP]
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT 'unterminated", "SELECT `unterminated", "SELECT /* unterminated", "DELETE FROM `x\\", "UPDATE `\\u00", "`",
+    "(" * 5000 + "SELECT 1", "DELETE FROM users WHERE " + "(" * 2000,
+])
+def test_sqlpp_never_raises_on_broken_text(sql):
+    assert classify(sql, SQ).kind in set(K)
+
+
+def test_is_transaction_statement():
+    assert is_transaction_statement("  begin work", SQ)
+    assert is_transaction_statement("/* x */ COMMIT", SQ)
+    assert not is_transaction_statement("SELECT 1", SQ)
+    assert not is_transaction_statement("BEGIN", SQ)
+    assert is_transaction_statement("BEGIN", Dialect.POSTGRES)  # a dialect without a table: the classifier decides
+
+
+@pytest.mark.parametrize("sql", [
+    "BEGIN WORK", "begin tran", "BEGIN TRANSACTION", "START TRANSACTION", "START WORK", "COMMIT", "COMMIT WORK",
+    "ROLLBACK", "ROLLBACK TO SAVEPOINT s", "SAVEPOINT s", "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    "BEGIN /* c */ WORK", "(BEGIN WORK)",
+])
+def test_is_transaction_statement_agrees_with_the_classifier_for_sqlpp(sql):
+    assert is_transaction_statement(sql, SQ)
+    assert classify(sql, SQ).kind == K.TRANSACTION
+
+
+def test_tsql_unfiltered_dml_is_unchanged():  # the helper was generalised for SQL++
+    assert classify("DELETE FROM t", Dialect.TSQL).dangerous_reasons == [D.DELETE_WITHOUT_WHERE]
+    assert classify("DELETE FROM t WHERE id IN (SELECT id FROM u)", Dialect.TSQL).dangerous_reasons == []
+    assert classify("WITH c AS (SELECT 1 AS id) DELETE FROM t", Dialect.TSQL).dangerous_reasons == [D.DELETE_WITHOUT_WHERE]
+    assert classify("UPDATE t SET a = 1 WHERE id = 1", Dialect.TSQL).dangerous_reasons == []
+    # a CTE named like a SQL++ statement word is still a CTE, and USE KEYS is no T-SQL filter
+    for sql in ("WITH upsert AS (SELECT 1 AS id) DELETE FROM t", "DELETE FROM t OUTPUT deleted.* USE KEYS"):
+        assert classify(sql, Dialect.TSQL).dangerous_reasons == [D.DELETE_WITHOUT_WHERE]

@@ -40,6 +40,12 @@ class UnsupportedEngine(ValidationFailed):
     code = "unsupported_engine"
 
 
+class UnsupportedFormat(ValidationFailed):
+    """The export or copy format cannot be produced for this engine's dialect."""
+
+    code = "unsupported_format"
+
+
 class ConnectionFailed(DomainError):
     code = "connection_failed"
     status = 502
@@ -88,3 +94,80 @@ class PasswordRequired(ConnectionFailed):
 
     code = "password_required"
     status = 428
+
+
+class DocumentMissing(NotFound):
+    code = "document_missing"
+
+    def __init__(self) -> None:
+        super().__init__("The document does not exist (it may have been deleted)")
+
+
+class DocumentConflict(DomainError):
+    """A CAS-checked write met a newer version of the document; `detail.cas` is the CAS it holds now."""
+
+    code = "document_conflict"
+    status = 409
+
+    def __init__(self, current_cas: str) -> None:
+        super().__init__("The document was changed after it was opened", detail={"cas": current_cas})
+
+
+class DocumentExists(DomainError):
+    code = "document_exists"
+    status = 409
+
+    def __init__(self) -> None:
+        super().__init__("A document with this ID already exists")
+
+
+class BinaryDocument(ValidationFailed):
+    code = "binary_document"
+
+    def __init__(self) -> None:
+        super().__init__("This is a binary document: DbaGuy shows it but never changes it")
+
+
+class WriteOutcomeUnknown(DomainError):
+    """A write whose answer never came (D-04-9): it may have been applied, so it is never sent again. The message says
+    why: by default the store's (the connection was lost), or the metadata call's (a timeout, ruling C42)."""
+
+    code = "write_outcome_unknown"
+    status = 502
+    LOST = ("The connection to the query node was lost during the write: the document may or may not have changed. "
+            "Reload it to see what the server holds")
+
+    def __init__(self, message: str = LOST) -> None:
+        super().__init__(message)
+
+
+class InvalidJson(ValidationFailed):
+    """A document text that is not one JSON value (or nests too deeply to check): `detail.offset` is where, in UTF-16
+    code units as the editor counts; `detail.reason` a fixed text, never a quote of the document."""
+
+    code = "invalid_json"
+
+    def __init__(self, offset: int, reason: str) -> None:
+        super().__init__(f"Not valid JSON: {reason}", detail={"offset": offset, "reason": reason})
+
+
+class NumberOutOfRange(ValidationFailed):
+    """Numbers the server would store with another value (ruling C4). Their paths travel in `detail`, never in the
+    message, so they never reach the INFO log."""
+
+    code = "number_out_of_range"
+
+    def __init__(self, paths: list[str]) -> None:
+        super().__init__(
+            "Couchbase would change these numbers (integers beyond 64 bits or numbers beyond a double's range): write "
+            "them as strings to save",
+            detail={"paths": paths},
+        )
+
+
+class ReadOnlyProfile(DomainError):
+    code = "read_only"
+    status = 403
+
+    def __init__(self) -> None:
+        super().__init__("This connection is read-only")

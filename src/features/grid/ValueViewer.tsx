@@ -12,6 +12,7 @@ import { JsonTree } from "./JsonTree";
 /** What the viewer shows for one cell; computed once per value (the JSON parse included). */
 type ValueView =
   | { kind: "null" }
+  | { kind: "missing" }
   | { kind: "scalar"; text: string; type: "boolean" | "number" }
   | { kind: "text"; text: string; chars: number }
   | { kind: "truncated"; text: string; chars: number; size: number }
@@ -32,6 +33,8 @@ function viewOf(value: unknown, column: ColumnMeta): ValueView {
   switch (kind) {
     case "null":
       return { kind: "null" };
+    case "missing":
+      return { kind: "missing" };
     case "bool":
       return { kind: "scalar", text: plainValue(value), type: "boolean" };
     case "number":
@@ -45,7 +48,7 @@ function viewOf(value: unknown, column: ColumnMeta): ValueView {
       return { kind: "truncated", text, chars: charCount(text), size: (value as EncodedCell).size ?? 0 };
     }
     case "json": {
-      const text = plainValue(value);
+      const text = plainValue(value); // a json cell is the server's text, parsed by the lossless parser
       const json = parseJson(text);
       return json ? { kind: "json", json, chars: charCount(text) } : textView(text);
     }
@@ -86,6 +89,8 @@ function ValueBody({ view, onCopyPath }: { view: ValueView; onCopyPath: (path: s
   switch (view.kind) {
     case "null":
       return <p className="p-3 font-mono text-[12px] text-muted italic">NULL</p>;
+    case "missing":
+      return <p className="p-3 font-mono text-[12px] text-muted italic">MISSING — this row has no such field</p>;
     case "scalar":
     case "text":
       return (
@@ -131,6 +136,8 @@ function describeSize(view: ValueView, column: ColumnMeta): string {
   switch (view.kind) {
     case "null":
       return `NULL · ${column.type_name}`;
+    case "missing":
+      return `MISSING · ${column.type_name}`;
     case "scalar":
       return `${view.type} · ${column.type_name}`;
     case "text":

@@ -1,12 +1,14 @@
 import sqlite3
 import time
+from datetime import UTC, datetime
 
 import pytest
 
+from dbaguy_backend.adapters.base import AdapterCapabilities
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager, write_askpass_script
-from dbaguy_backend.domain.execution import ExportCommand
+from dbaguy_backend.domain.execution import ExecuteCommand, ExportCommand, QueryContext
 from dbaguy_backend.domain.formats import FormatKind, RowFormatOptions
 from dbaguy_backend.domain.profiles import ProfileUpsertRequest
 from dbaguy_backend.services.connection_service import ConnectionService
@@ -15,6 +17,7 @@ from dbaguy_backend.services.profile_service import ProfileService
 from dbaguy_backend.services.safety import SafetyPolicy
 from dbaguy_backend.sessions.hooks import SessionHooksFactory
 from dbaguy_backend.sessions.manager import SessionCreateRequest, SessionManager
+from dbaguy_backend.sessions.worker import ExecutionRecord
 from dbaguy_backend.storage.paths import profiles_file
 from dbaguy_backend.storage.profile_store import ProfileStore
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
@@ -118,3 +121,47 @@ def test_export_uses_the_classification_and_dialect_of_the_profile(env, tmp_path
                                 options=RowFormatOptions(table_name="t")))
     rec.wait_for(lambda e: e.type == "finished" and e.request_id == "x")
     assert not rec.of("x", "error") and "INSERT INTO" in target.read_text()
+
+
+class ContextSqlite(SqliteAdapter):  # an engine with a per-request query context, as Couchbase
+    capabilities = AdapterCapabilities(query_context=True)
+
+
+@pytest.mark.parametrize("context, shown", [(QueryContext(bucket="travel-sample", scope="inventory"), "travel-sample.inventory"),
+                                            (None, None)])
+def test_the_history_keeps_the_request_query_context(env, context, shown):
+    _, _, pid, history, cache, manager = env
+    hooks = SessionHooksFactory(AdapterRegistry([ContextSqlite()]), manager._profiles, SafetyPolicy(), history, cache)
+    record = ExecutionRecord(request_id="r", sql="SELECT 1", started_at=datetime.now(UTC), elapsed_ms=1, rows=1,
+                             status="ok", query_context=context)
+    hooks.build(pid, "the session's database").on_record(record)
+    assert history.search().items[0].database == shown
+
+
+def test_other_engines_keep_the_session_database(env):
+    _, _, pid, history, cache, manager = env
+    hooks = SessionHooksFactory(AdapterRegistry([SqliteAdapter()]), manager._profiles, SafetyPolicy(), history, cache)
+    record = ExecutionRecord(request_id="r", sql="SELECT 1", started_at=datetime.now(UTC), elapsed_ms=1, rows=1,
+                             status="ok", query_context=QueryContext(bucket="ignored"))
+    hooks.build(pid, "main").on_record(record)
+    assert history.search().items[0].database == "main"
+
+
+def test_a_requests_query_context_reaches_the_history_through_a_session(env, tmp_path):  # P37, the whole path
+    _, _, pid, history, cache, manager = env
+    registry = AdapterRegistry([ContextSqlite()])
+    connections = ConnectionService(registry, manager._profiles, SshTunnelManager(write_askpass_script(tmp_path)))
+    hooks = SessionHooksFactory(registry, manager._profiles, SafetyPolicy(), history, cache)
+    sessions = SessionManager(connections, manager._profiles, hooks)
+    try:
+        info = sessions.create(SessionCreateRequest(profile_id=pid))
+        rec = Recorder()
+        worker = sessions.attach(info.session_id, rec)
+        context = QueryContext(bucket="travel-sample", scope="inventory")
+        run(worker, rec, "a", "SELECT 1", query_context=context)
+        run(worker, rec, "b", "SELECT 2")
+        assert [(e.sql, e.database) for e in history.search().items] == [
+            ("SELECT 2", None), ("SELECT 1", "travel-sample.inventory"),
+        ]
+    finally:
+        sessions.close_all()

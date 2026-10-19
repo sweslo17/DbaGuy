@@ -250,6 +250,203 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/couchbase/contexts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Contexts
+         * @description The query contexts a tab can pick. `bucket` and `scope` name the tab's current one, listed first when the
+         *     schema snapshot does not have it.
+         */
+        get: operations["contexts_couchbase_contexts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/couchbase/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Plan */
+        post: operations["plan_couchbase_plan_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/couchbase/advise": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Advise */
+        post: operations["advise_couchbase_advise_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/couchbase/statement-keyspace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Statement Keyspace
+         * @description The collection the statement reads when it names exactly one (fully qualified, or resolved against the run's
+         *     context as SQL++ resolves it), else null. Pure: no connection, nothing logged.
+         */
+        post: operations["statement_keyspace_couchbase_statement_keyspace_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/couchbase/fields/sample": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Sample Fields
+         * @description Sample a keyspace's documents (R-04-11): a manual action, whose result is kept for `GET /fields`.
+         */
+        post: operations["sample_fields_couchbase_fields_sample_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/couchbase/fields": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Cached Fields
+         * @description The keyspace's last sample, or null when it has none (nothing samples by itself).
+         */
+        get: operations["cached_fields_couchbase_fields_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/couchbase/documents/get": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Get Document
+         * @description The document as stored: its exact text and META (spec §3.9.4). 404 `document_missing` when there is none.
+         */
+        post: operations["get_document_couchbase_documents_get_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/couchbase/documents/save": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Save Document
+         * @description Write the text over the document if it still has `cas`, or answer what the server would store instead
+         *     (`needs_confirmation`) until `confirmed`.
+         */
+        post: operations["save_document_couchbase_documents_save_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/couchbase/documents/insert": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Insert Document
+         * @description Create the document, previewed like a save; 409 `document_exists` when the ID is taken.
+         */
+        post: operations["insert_document_couchbase_documents_insert_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/couchbase/documents/remove": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Remove Document
+         * @description Delete the document if it still has `cas`.
+         */
+        post: operations["remove_document_couchbase_documents_remove_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/settings": {
         parameters: {
             query?: never;
@@ -462,6 +659,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sql/format-guard": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Format Guard
+         * @description Whether a formatter's output may replace the original: only when its significant tokens are the same.
+         */
+        post: operations["format_guard_sql_format_guard_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sql/browse-select": {
         parameters: {
             query?: never;
@@ -500,6 +717,17 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AdviseRequest */
+        AdviseRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Statement */
+            statement: string;
+            query_context?: components["schemas"]["QueryContext"] | null;
+        };
         /** AffectedEvent */
         AffectedEvent: {
             /**
@@ -562,6 +790,12 @@ export interface components {
              *     }
              */
             notifications: components["schemas"]["NotificationSettings"];
+            /**
+             * @default {
+             *       "sample_size": 1000
+             *     }
+             */
+            couchbase: components["schemas"]["CouchbaseSettings"];
             /** Scripts Dir */
             scripts_dir?: string | null;
         };
@@ -602,6 +836,29 @@ export interface components {
             /** Request Id */
             request_id: string;
         };
+        /** ChangeCounts */
+        ChangeCounts: {
+            /**
+             * Key Order
+             * @default 0
+             */
+            key_order: number;
+            /**
+             * Number
+             * @default 0
+             */
+            number: number;
+            /**
+             * Duplicate Key
+             * @default 0
+             */
+            duplicate_key: number;
+            /**
+             * Other
+             * @default 0
+             */
+            other: number;
+        };
         /** Classification */
         Classification: {
             kind: components["schemas"]["StatementKind"];
@@ -615,7 +872,7 @@ export interface components {
          * ColumnCategory
          * @enum {string}
          */
-        ColumnCategory: "number" | "text" | "bool" | "datetime" | "binary" | "json" | "other";
+        ColumnCategory: "number" | "text" | "bool" | "datetime" | "binary" | "json" | "other" | "mixed";
         /** ColumnInfo */
         ColumnInfo: {
             /** Name */
@@ -663,6 +920,9 @@ export interface components {
             /** Profile Id */
             profile_id?: string | null;
             dialect?: components["schemas"]["Dialect"] | null;
+            query_context?: components["schemas"]["QueryContext"] | null;
+            /** Seen Fields */
+            seen_fields?: string[];
         };
         /** CompletionItem */
         CompletionItem: {
@@ -672,7 +932,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "keyword" | "schema" | "table" | "view" | "materialized_view" | "synonym" | "column" | "alias" | "function" | "join";
+            kind: "keyword" | "schema" | "table" | "view" | "materialized_view" | "synonym" | "column" | "alias" | "function" | "join" | "bucket" | "scope" | "collection" | "field";
             /** Detail */
             detail?: string | null;
             /** Apply */
@@ -728,11 +988,37 @@ export interface components {
             elapsed_ms: number;
         };
         /**
+         * ContextOption
+         * @description One entry of the query-context picker. `text` is `QueryContext(bucket, scope).text()`, so the frontend never
+         *     quotes a name (B13).
+         */
+        ContextOption: {
+            /** Bucket */
+            bucket: string;
+            /** Scope */
+            scope?: string | null;
+            /** Text */
+            text: string;
+            /**
+             * Listed
+             * @default true
+             */
+            listed: boolean;
+        };
+        /** CouchbaseSettings */
+        CouchbaseSettings: {
+            /**
+             * Sample Size
+             * @default 1000
+             */
+            sample_size: number;
+        };
+        /**
          * DangerReason
          * @description Why a statement is dangerous: the standard safety level asks before running it.
          * @enum {string}
          */
-        DangerReason: "update_without_where" | "delete_without_where" | "drop" | "truncate" | "alter_drop";
+        DangerReason: "update_without_where" | "delete_without_where" | "drop" | "truncate" | "alter_drop" | "system_keyspace" | "merge_delete";
         /** DescribeColumn */
         DescribeColumn: {
             /** Name */
@@ -768,7 +1054,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "table" | "view" | "materialized_view" | "synonym";
+            kind: "table" | "view" | "materialized_view" | "synonym" | "collection";
             /** Columns */
             columns: components["schemas"]["DescribeColumn"][];
         };
@@ -777,7 +1063,7 @@ export interface components {
          * @description The SQL dialect of an engine: how its statements are split, classified, completed and quoted.
          * @enum {string}
          */
-        Dialect: "postgres" | "sqlite" | "mysql" | "tsql";
+        Dialect: "postgres" | "sqlite" | "mysql" | "tsql" | "sqlpp";
         /** DiscardCommand */
         DiscardCommand: {
             /**
@@ -787,6 +1073,74 @@ export interface components {
             type: "discard";
             /** Request Id */
             request_id: string;
+        };
+        /**
+         * DocumentChange
+         * @description One thing the server would store differently from the edited text (spec §3.9.3, ruling C2).
+         */
+        DocumentChange: {
+            /** Path */
+            path: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "key_order" | "number" | "duplicate_key" | "other";
+            /** Before */
+            before: string;
+            /** After */
+            after: string;
+            /** Value Changed */
+            value_changed: boolean;
+        };
+        /** DocumentRequest */
+        DocumentRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            keyspace: components["schemas"]["Keyspace"];
+            /** Id */
+            id: string;
+        };
+        /**
+         * DocumentSaved
+         * @description A write that happened: the document's new CAS and its expiration.
+         */
+        DocumentSaved: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "saved";
+            /** Cas */
+            cas: string;
+            /** Expiration */
+            expiration: number;
+            /** Size */
+            size: number;
+        };
+        /**
+         * DocumentView
+         * @description One document as the server holds it (spec §3.9.2, R-04-2).
+         */
+        DocumentView: {
+            /** Id */
+            id: string;
+            /** Cas */
+            cas: string;
+            /** Expiration */
+            expiration: number;
+            /**
+             * Type
+             * @enum {string}
+             */
+            type: "json" | "base64";
+            /** Text */
+            text: string | null;
+            /** Size */
+            size: number;
         };
         /** EditorSettings */
         EditorSettings: {
@@ -836,6 +1190,18 @@ export interface components {
             cancel_aborts_transaction: boolean;
             /** Server Read Only */
             server_read_only: boolean;
+            /** Transactions */
+            transactions: boolean;
+            /** Query Context */
+            query_context: boolean;
+            /** Parameters */
+            parameters: boolean;
+            /** Documents */
+            documents: boolean;
+            /** Executed Plan */
+            executed_plan: boolean;
+            /** Plan Format */
+            plan_format: "couchbase" | null;
         };
         /** ErrorEvent */
         ErrorEvent: {
@@ -887,6 +1253,13 @@ export interface components {
              * @default true
              */
             history: boolean;
+            query_context?: components["schemas"]["QueryContext"] | null;
+            params?: components["schemas"]["StatementParams"] | null;
+            /**
+             * Profile Plan
+             * @default false
+             */
+            profile_plan: boolean;
         };
         /**
          * ExecutionSchema
@@ -922,6 +1295,8 @@ export interface components {
              *     }
              */
             options: components["schemas"]["RowFormatOptions"];
+            query_context?: components["schemas"]["QueryContext"] | null;
+            params?: components["schemas"]["StatementParams"] | null;
         };
         /** FetchMoreCommand */
         FetchMoreCommand: {
@@ -937,6 +1312,53 @@ export interface components {
              * @default 500
              */
             count: number;
+        };
+        /**
+         * FieldPath
+         * @description One field path of a sample: how many documents have it and with which JSON kinds.
+         */
+        FieldPath: {
+            /** Path */
+            path: (string | null)[];
+            /** Display */
+            display: string;
+            /** Types */
+            types: {
+                [key: string]: number;
+            };
+            /** Docs */
+            docs: number;
+            /** Percent */
+            percent: number;
+        };
+        /**
+         * FieldSample
+         * @description A manual sample of a keyspace (R-04-11): the field paths derived in Python from the documents read.
+         */
+        FieldSample: {
+            keyspace: components["schemas"]["Keyspace"];
+            /**
+             * Sampled At
+             * Format: date-time
+             */
+            sampled_at: string;
+            /** Requested */
+            requested: number;
+            /** Documents */
+            documents: number;
+            /** Cut At Bytes */
+            cut_at_bytes: boolean;
+            /** Paths Capped */
+            paths_capped: boolean;
+            /** Long Keys Skipped */
+            long_keys_skipped: boolean;
+            /** Depth Capped */
+            depth_capped: boolean;
+            limits: components["schemas"]["SampleLimits"];
+            /** Elapsed Ms */
+            elapsed_ms: number;
+            /** Fields */
+            fields: components["schemas"]["FieldPath"][];
         };
         /** FinishedEvent */
         FinishedEvent: {
@@ -977,6 +1399,21 @@ export interface components {
             /** Name */
             name: string;
             category: components["schemas"]["ColumnCategory"];
+        };
+        /** FormatGuardRequest */
+        FormatGuardRequest: {
+            dialect: components["schemas"]["Dialect"];
+            /** Original */
+            original: string;
+            /** Formatted */
+            formatted: string;
+        };
+        /** FormatGuardResponse */
+        FormatGuardResponse: {
+            /** Same */
+            same: boolean;
+            /** Offset */
+            offset: number | null;
         };
         /**
          * FormatKind
@@ -1024,7 +1461,7 @@ export interface components {
          *     a statement (a read-only connection). Every `DangerReason` is one, with the same value.
          * @enum {string}
          */
-        GuardReason: "update_without_where" | "delete_without_where" | "drop" | "truncate" | "alter_drop" | "strict_write" | "strict_ddl" | "strict_transaction" | "strict_session" | "strict_unknown" | "read_only";
+        GuardReason: "update_without_where" | "delete_without_where" | "drop" | "truncate" | "alter_drop" | "system_keyspace" | "merge_delete" | "strict_write" | "strict_ddl" | "strict_transaction" | "strict_session" | "strict_unknown" | "read_only";
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -1071,6 +1508,7 @@ export interface components {
             error?: string | null;
             /** Id */
             id: number;
+            query_context?: components["schemas"]["QueryContext"] | null;
         };
         /** HistoryPage */
         HistoryPage: {
@@ -1090,6 +1528,52 @@ export interface components {
             profile: components["schemas"]["ServerProfileDraft"] | components["schemas"]["SqliteProfileDraft"];
             /** Password */
             password?: string | null;
+        };
+        /** IndexAdvice */
+        IndexAdvice: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "recommended" | "covering" | "current";
+            /** Statement */
+            statement: string;
+            /** Keyspace Alias */
+            keyspace_alias?: string | null;
+            /** Rule */
+            rule?: string | null;
+            /** Update Statistics */
+            update_statistics?: string | null;
+        };
+        /** InsertDocumentRequest */
+        InsertDocumentRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            keyspace: components["schemas"]["Keyspace"];
+            /** Id */
+            id: string;
+            /** Text */
+            text: string;
+            /**
+             * Confirmed
+             * @default false
+             */
+            confirmed: boolean;
+        };
+        /**
+         * Keyspace
+         * @description A collection by its three names. Frozen: it is the key of the field-sample cache.
+         */
+        Keyspace: {
+            /** Bucket */
+            bucket: string;
+            /** Scope */
+            scope: string;
+            /** Collection */
+            collection: string;
         };
         /** MessageEvent */
         MessageEvent: {
@@ -1177,7 +1661,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "table" | "view" | "materialized_view" | "synonym";
+            kind: "table" | "view" | "materialized_view" | "synonym" | "collection";
             /** Path */
             path: components["schemas"]["PathSegment"][];
         };
@@ -1187,6 +1671,123 @@ export interface components {
             kind: string;
             /** Name */
             name: string;
+        };
+        /** PlanDetail */
+        PlanDetail: {
+            /** Label */
+            label: string;
+            /** Value */
+            value: string;
+        };
+        /** PlanEstimates */
+        PlanEstimates: {
+            /** Cost */
+            cost?: number | null;
+            /** Cardinality */
+            cardinality?: number | null;
+        };
+        /** PlanFinding */
+        PlanFinding: {
+            /**
+             * Badge
+             * @enum {string}
+             */
+            badge: "primary_scan" | "sequential_scan" | "intersect_scan" | "not_covered" | "slowest";
+            /**
+             * Severity
+             * @enum {string}
+             */
+            severity: "warning" | "info";
+            /** Node Id */
+            node_id: number;
+            /** Text */
+            text: string;
+        };
+        /** PlanNode */
+        PlanNode: {
+            /** Id */
+            id: number;
+            /** Operator */
+            operator: string;
+            /** Title */
+            title: string;
+            /**
+             * Details
+             * @default []
+             */
+            details: components["schemas"]["PlanDetail"][];
+            estimates?: components["schemas"]["PlanEstimates"] | null;
+            stats?: components["schemas"]["PlanStats"] | null;
+            /**
+             * Badges
+             * @default []
+             */
+            badges: ("primary_scan" | "sequential_scan" | "intersect_scan" | "not_covered" | "slowest")[];
+            /**
+             * Children
+             * @default []
+             */
+            children: components["schemas"]["PlanNode"][];
+        };
+        /** PlanRequest */
+        PlanRequest: {
+            /** Text */
+            text: string;
+        };
+        /** PlanStats */
+        PlanStats: {
+            /** Items In */
+            items_in?: number | null;
+            /** Items Out */
+            items_out?: number | null;
+            /** Exec Time */
+            exec_time?: string | null;
+            /** Serv Time */
+            serv_time?: string | null;
+            /** Kern Time */
+            kern_time?: string | null;
+        };
+        /** PlanSubquery */
+        PlanSubquery: {
+            /** Text */
+            text: string;
+            /** Correlated */
+            correlated: boolean;
+            root: components["schemas"]["PlanNode"];
+        };
+        /** PlanView */
+        PlanView: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "plan" | "profile" | "advice" | "unknown";
+            root?: components["schemas"]["PlanNode"] | null;
+            /**
+             * Subqueries
+             * @default []
+             */
+            subqueries: components["schemas"]["PlanSubquery"][];
+            /**
+             * Findings
+             * @default []
+             */
+            findings: components["schemas"]["PlanFinding"][];
+            /**
+             * Advice
+             * @default []
+             */
+            advice: components["schemas"]["IndexAdvice"][];
+            /** Advice Note */
+            advice_note?: string | null;
+            /** Statement Text */
+            statement_text?: string | null;
+            estimates?: components["schemas"]["PlanEstimates"] | null;
+            /**
+             * Phase Times
+             * @default []
+             */
+            phase_times: components["schemas"]["PlanDetail"][];
         };
         /** ProfileEntry */
         ProfileEntry: {
@@ -1228,6 +1829,30 @@ export interface components {
             /** Rows */
             rows: number;
         };
+        /**
+         * QueryContext
+         * @description Couchbase: the bucket (and scope) that unqualified keyspace names resolve against, sent with every request
+         *     (D-04-5: a structure, because a bucket name may hold a dot).
+         */
+        QueryContext: {
+            /** Bucket */
+            bucket: string;
+            /** Scope */
+            scope?: string | null;
+        };
+        /** RemoveDocumentRequest */
+        RemoveDocumentRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            keyspace: components["schemas"]["Keyspace"];
+            /** Id */
+            id: string;
+            /** Cas */
+            cas: string;
+        };
         /** ResultSetEndEvent */
         ResultSetEndEvent: {
             /**
@@ -1257,6 +1882,12 @@ export interface components {
             index: number;
             /** Columns */
             columns: components["schemas"]["ColumnMeta"][];
+            /**
+             * Presentation
+             * @default grid
+             * @enum {string}
+             */
+            presentation: "grid" | "plan";
         };
         /** RollbackCommand */
         RollbackCommand: {
@@ -1339,6 +1970,67 @@ export interface components {
              */
             idle_transaction_rollback_minutes: number;
         };
+        /**
+         * SampleLimits
+         * @description What bounds a sample, as the backend has it: the UI words what a sample left out with these numbers.
+         */
+        SampleLimits: {
+            /** Max Bytes */
+            max_bytes: number;
+            /** Max Paths */
+            max_paths: number;
+            /** Max Depth */
+            max_depth: number;
+            /** Max Key Chars */
+            max_key_chars: number;
+        };
+        /** SampleRequest */
+        SampleRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            keyspace: components["schemas"]["Keyspace"];
+            /** Size */
+            size?: number | null;
+        };
+        /** SaveDocumentRequest */
+        SaveDocumentRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            keyspace: components["schemas"]["Keyspace"];
+            /** Id */
+            id: string;
+            /** Cas */
+            cas: string;
+            /** Text */
+            text: string;
+            /**
+             * Confirmed
+             * @default false
+             */
+            confirmed: boolean;
+        };
+        /**
+         * SavePreview
+         * @description What the server would store instead of the edited text: nothing is written until the user confirms.
+         */
+        SavePreview: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "needs_confirmation";
+            /** Server Text */
+            server_text: string;
+            /** Changes */
+            changes: components["schemas"]["DocumentChange"][];
+            counts: components["schemas"]["ChangeCounts"];
+        };
         /** SchemaRefreshRequest */
         SchemaRefreshRequest: {
             /**
@@ -1413,6 +2105,9 @@ export interface components {
             current_database?: string | null;
             /** Current User */
             current_user?: string | null;
+            /** Edition */
+            edition?: ("enterprise" | "community") | null;
+            default_query_context?: components["schemas"]["QueryContext"] | null;
         };
         /** ServerProfile */
         ServerProfile: {
@@ -1732,11 +2427,30 @@ export interface components {
             /** Request Id */
             request_id: string;
         };
+        /** StatementKeyspaceRequest */
+        StatementKeyspaceRequest: {
+            /** Sql */
+            sql: string;
+            query_context?: components["schemas"]["QueryContext"] | null;
+        };
         /**
          * StatementKind
          * @enum {string}
          */
         StatementKind: "read" | "write" | "ddl" | "transaction" | "session" | "unknown";
+        /**
+         * StatementParams
+         * @description Typed parameters of one statement (R-10): JSON literal texts, sent unchanged. Content is checked by the worker
+         *     (`invalid_params`), only the shape here.
+         */
+        StatementParams: {
+            /** Named */
+            named?: {
+                [key: string]: string;
+            };
+            /** Positional */
+            positional?: string[];
+        };
         /** StatementRange */
         StatementRange: {
             /** Start */
@@ -1747,6 +2461,8 @@ export interface components {
             terminator_end: number;
             /** Repeat */
             repeat: number;
+            /** Params */
+            params: string[];
         };
         /** TextSelection */
         TextSelection: {
@@ -1810,7 +2526,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "query" | "table" | "object";
+            kind: "query" | "table" | "object" | "document";
             /**
              * Title
              * @default
@@ -1831,6 +2547,14 @@ export interface components {
             selection?: components["schemas"]["TextSelection"] | null;
             /** Autocommit */
             autocommit?: boolean | null;
+            /** Query Context */
+            query_context?: components["schemas"]["QueryContext"] | "none" | null;
+            /** Params */
+            params?: {
+                [key: string]: string;
+            } | null;
+            /** Document Cas */
+            document_cas?: string | null;
         };
     };
     responses: never;
@@ -2366,6 +3090,355 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ExecutionSchema"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    contexts_couchbase_contexts_get: {
+        parameters: {
+            query: {
+                profile_id: string;
+                bucket?: string | null;
+                scope?: string | null;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContextOption"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    plan_couchbase_plan_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlanView"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    advise_couchbase_advise_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdviseRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlanView"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    statement_keyspace_couchbase_statement_keyspace_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StatementKeyspaceRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Keyspace"] | null;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    sample_fields_couchbase_fields_sample_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SampleRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FieldSample"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cached_fields_couchbase_fields_get: {
+        parameters: {
+            query: {
+                profile_id: string;
+                bucket: string;
+                scope: string;
+                collection: string;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FieldSample"] | null;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_document_couchbase_documents_get_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocumentRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentView"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    save_document_couchbase_documents_save_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveDocumentRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentSaved"] | components["schemas"]["SavePreview"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    insert_document_couchbase_documents_insert_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InsertDocumentRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentSaved"] | components["schemas"]["SavePreview"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    remove_document_couchbase_documents_remove_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemoveDocumentRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {
@@ -2931,6 +4004,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["FormatResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    format_guard_sql_format_guard_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FormatGuardRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FormatGuardResponse"];
                 };
             };
             /** @description Validation Error */

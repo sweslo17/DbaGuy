@@ -5,7 +5,7 @@ These run on every keystroke (completion) or on every selection change, so they 
 SQL text above it.
 """
 
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
@@ -14,16 +14,20 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..container import AppContainer
 from ..domain.column_category import ColumnCategory
+from ..domain.couchbase import FieldPath, Keyspace
 from ..domain.errors import ValidationFailed
+from ..domain.execution import QueryContext
 from ..domain.formats import FormatColumn, FormatKind, RowFormatOptions
 from ..domain.metadata import PathSegment
 from ..services.safety import GuardDecision
 from ..sql.completion import CompletionItem, DescribeResult, SnapshotIndex, complete, describe_at
 from ..sql.dialects import Dialect
+from ..sql.format_guard import first_difference
 from ..sql.formatting import FormatResult, format_rows, value_condition
 from ..sql.offsets import Utf16Index
 from ..sql.select_builder import SortKey, build_browse_select
 from ..sql.splitter import split
+from ..sql.sqlpp_completion import FieldLookup, complete_sqlpp
 from .deps import get_container, require_token
 
 
@@ -48,6 +52,7 @@ class StatementRange(BaseModel):
     end: int  # UTF-16, without the terminator
     terminator_end: int  # UTF-16, after the `;`, the custom delimiter or the `GO` line (or `end` when there is none)
     repeat: int  # times the statement runs: T-SQL "GO n" (0 for GO 0); 1 otherwise
+    params: list[str]  # the statement's parameters (SQL++): $name, $1, and each ?
 
 
 class SplitResponse(BaseModel):
@@ -68,6 +73,9 @@ class _TextAtCursor(_Input):
 class CompleteRequest(_TextAtCursor):
     profile_id: UUID | None = None  # without one only keywords are suggested, and `dialect` is required
     dialect: Dialect | None = None  # ignored when `profile_id` is given
+    # SQL++ only (other engines ignore them): the tab's query context, and the field names of the tab's recent results
+    query_context: QueryContext | None = None
+    seen_fields: list[Annotated[str, Field(max_length=300)]] = Field(default_factory=list, max_length=500)
 
 
 class DescribeRequest(_TextAtCursor):
@@ -97,6 +105,17 @@ class ValueConditionRequest(_Input):
 
 class ValueConditionResponse(BaseModel):
     condition: str | None  # None: the cell is only a preview, so no condition matches it exactly
+
+
+class FormatGuardRequest(_Input):
+    dialect: Dialect
+    original: str
+    formatted: str
+
+
+class FormatGuardResponse(BaseModel):
+    same: bool
+    offset: int | None  # UTF-16 in `original`: the first token the formatter changed
 
 
 class BrowseSelectRequest(_Input):
@@ -140,12 +159,22 @@ def _snapshot_index(
         return None
 
 
+def _sampled_fields(container: AppContainer, profile_id: UUID | None) -> FieldLookup:
+    """The fields of a keyspace as the profile's last sample left them: completion only reads the cache, a sample is
+    made by the user (R-04-11)."""
+    def lookup(keyspace: Keyspace) -> list[FieldPath] | None:
+        sample = container.field_samples.cached(profile_id, keyspace) if profile_id is not None else None
+        return sample.fields if sample is not None else None
+
+    return lookup
+
+
 @router.post("/split", response_model=SplitResponse)
 def split_statements(body: SplitRequest) -> SplitResponse:
     index = Utf16Index(body.text)
     return SplitResponse(statements=[
         StatementRange(start=index.to_utf16(s.start), end=index.to_utf16(s.end),
-                       terminator_end=index.to_utf16(s.terminator_end), repeat=s.repeat)
+                       terminator_end=index.to_utf16(s.terminator_end), repeat=s.repeat, params=list(s.params))
         for s in split(body.text, body.dialect)
     ])
 
@@ -165,7 +194,12 @@ def complete_at(body: CompleteRequest, container: AppContainer = Depends(get_con
     if body.profile_id is not None:
         snapshot_index = _snapshot_index(container, body.profile_id, body.database, wait=False)
     index = Utf16Index(body.text)
-    result = complete(body.text, index.from_utf16(body.cursor), dialect, snapshot_index)
+    cursor = index.from_utf16(body.cursor)
+    if dialect is Dialect.SQLPP:
+        fields = _sampled_fields(container, body.profile_id)
+        result = complete_sqlpp(body.text, cursor, snapshot_index, body.query_context, fields, body.seen_fields)
+    else:
+        result = complete(body.text, cursor, dialect, snapshot_index)
     logger.debug("Completion at {}: {} items{}", body.cursor, len(result.items),
                  "" if snapshot_index is not None else " (keywords only)")
     return CompletionResponse(start=index.to_utf16(result.start), end=index.to_utf16(result.end), items=result.items)
@@ -174,6 +208,8 @@ def complete_at(body: CompleteRequest, container: AppContainer = Depends(get_con
 @router.post("/describe", response_model=DescribeResult | None)
 def describe(body: DescribeRequest, container: AppContainer = Depends(get_container)) -> DescribeResult | None:
     dialect = _profile_dialect(container, body.profile_id)
+    if dialect is Dialect.SQLPP:  # spec §3.12: a SQL++ name is a keyspace or a document path, not a column to describe
+        return None
     # An explicit user action, not a keystroke: worth waiting for a snapshot that is being built.
     snapshot_index = _snapshot_index(container, body.profile_id, body.database, wait=True)
     return describe_at(body.text, Utf16Index(body.text).from_utf16(body.cursor), dialect, snapshot_index)
@@ -182,6 +218,16 @@ def describe(body: DescribeRequest, container: AppContainer = Depends(get_contai
 @router.post("/format-rows", response_model=FormatResult)
 def format_rows_for_copy(body: FormatRowsRequest) -> FormatResult:
     return format_rows(body.kind, body.columns, body.rows, body.options, body.dialect, "encoded")
+
+
+@router.post("/format-guard", response_model=FormatGuardResponse)
+def format_guard(body: FormatGuardRequest) -> FormatGuardResponse:
+    """Whether a formatter's output may replace the original: only when its significant tokens are the same."""
+    offset = first_difference(body.dialect, body.original, body.formatted)
+    if offset is None:
+        return FormatGuardResponse(same=True, offset=None)
+    logger.debug("Format guard ({}): the formatter changed a token at offset {}", body.dialect, offset)
+    return FormatGuardResponse(same=False, offset=Utf16Index(body.original).to_utf16(offset))
 
 
 @router.post("/browse-select", response_model=BrowseSelectResponse)

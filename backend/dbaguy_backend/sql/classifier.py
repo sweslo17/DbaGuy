@@ -1,3 +1,4 @@
+import re
 import threading
 import time
 from collections.abc import Iterator
@@ -7,14 +8,14 @@ from loguru import logger
 
 # The models live in the domain (the execution protocol carries them); re-exported here for the sql/ callers.
 from ..domain.classification import Classification, DangerReason, StatementKind
-from .dialects import Dialect
+from .dialects import KEYWORD_ONLY_DIALECTS, Dialect
 from .lexer import (
     HINT_COMMENT_START, INSIGNIFICANT, VERSION_COMMENT_STARTS, Token, TokenKind, tokenize, with_ascii_spaces,
 )
 from .splitter import split
 from .tsql import statements
 
-__all__ = ["Classification", "DangerReason", "StatementKind", "classify", "warm_up"]
+__all__ = ["Classification", "DangerReason", "StatementKind", "classify", "is_transaction_statement", "warm_up"]
 
 _KEYWORD_KIND: dict[str, StatementKind] = {
     **dict.fromkeys(
@@ -67,6 +68,11 @@ _TRANSACTION_STARTS: dict[Dialect, tuple[tuple[str, ...], ...]] = {
     Dialect.TSQL: (
         ("BEGIN", "TRAN"), ("BEGIN", "TRANSACTION"), ("BEGIN", "DISTRIBUTED"), ("COMMIT",), ("ROLLBACK",), ("SAVE",),
     ),
+    # A bare BEGIN is a syntax error for the server (probed), so it is not a start: UNKNOWN.
+    Dialect.SQLPP: (
+        ("BEGIN", "WORK"), ("BEGIN", "TRANSACTION"), ("BEGIN", "TRAN"), ("START", "TRANSACTION"), ("START", "WORK"),
+        ("COMMIT",), ("ROLLBACK",), ("SAVEPOINT",), ("SET", "TRANSACTION"),
+    ),
 }
 # The keywords that open an EXPLAIN. In MySQL DESCRIBE and DESC are synonyms: `DESCRIBE ANALYZE DELETE …` runs the
 # DELETE, while `DESC t` and `DESCRIBE t` only list the columns (no ANALYZE follows).
@@ -75,6 +81,7 @@ _EXPLAIN_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.SQLITE: ("EXPLAIN",),
     Dialect.MYSQL: ("EXPLAIN", "DESCRIBE", "DESC"),
     Dialect.TSQL: (),  # T-SQL has no EXPLAIN: plans come from SET SHOWPLAN_* / SET STATISTICS (SESSION statements)
+    Dialect.SQLPP: (),  # SQL++ EXPLAIN never executes; the executed plan is profile=timings (04b)
 }
 # Least to most cautious: when a script mixes kinds, the strictest one decides (unknown is the most cautious).
 _SEVERITY = (
@@ -130,6 +137,31 @@ _TSQL_FLOOR_PHRASES: dict[tuple[str, ...], StatementKind] = dict.fromkeys(
 # allows); LEVEL alone is not enough, since an index may be named level (WITH (INDEX = level SERIALIZABLE)).
 _TSQL_FLOOR_NOT_BEFORE: dict[str, frozenset[str]] = {"MERGE": frozenset({"JOIN", "UNION"})}
 _TSQL_FLOOR_NOT_AFTER: dict[str, tuple[str, ...]] = {"SERIALIZABLE": ("ISOLATION", "LEVEL")}
+# SQL++ (spec §3.3.4): keyword rules only, sqlglot has no dialect for it. EXPLAIN, ADVISE, PREPARE and INFER never
+# execute what they hold. UNKNOWN (fail closed): EXECUTE (a prepared statement or a JavaScript function, either may
+# write), any other SET, bare expressions and every other word. FROM starts a select too (`FROM ks SELECT a`, probed): a
+# READ word, scanned like SELECT and WITH. FLUSH COLLECTION empties a collection (probed on 7.6): DDL, confirmed like
+# TRUNCATE.
+_SQLPP_KIND: dict[str, StatementKind] = {
+    **dict.fromkeys(("SELECT", "WITH", "FROM", "EXPLAIN", "ADVISE", "INFER", "PREPARE"), StatementKind.READ),
+    **dict.fromkeys(("INSERT", "UPSERT", "UPDATE", "DELETE", "MERGE"), StatementKind.WRITE),
+    **dict.fromkeys(("CREATE", "DROP", "ALTER", "BUILD", "GRANT", "REVOKE", "FLUSH"), StatementKind.DDL),
+}
+_SELECT_FAMILY = ("SELECT", "WITH")
+_SQLPP_SELECT_FIRST = (*_SELECT_FAMILY, "FROM")  # the words a SQL++ select starts with (T-SQL has no FROM-first)
+_DML_WORDS = frozenset({"INSERT", "UPDATE", "DELETE", "MERGE"})  # the statements that write rows, in every dialect
+_SQLPP_DML = _DML_WORDS | {"UPSERT"}
+_SQLPP_SEQUENCE_ADVANCE = (("NEXT", "VALUE", "FOR"), ("NEXTVAL", "FOR"))  # PREV VALUE FOR only reads
+_SQLPP_FILTERS = (("WHERE",), ("USE", "KEYS"), ("ON", "KEYS"))  # a statement given its documents is targeted
+# A keys filter targets only what its expression names: with a subquery inside, which may name every document, it
+# filters nothing. The expression runs to the next of these words at depth 0 (R-04a-T3a).
+_SQLPP_KEYS_FILTERS = frozenset({("USE", "KEYS"), ("ON", "KEYS")})
+_SQLPP_KEYS_END = frozenset({"WHERE", "SET", "UNSET", "LIMIT", "RETURNING"})
+_TSQL_FILTERS = (("WHERE",),)
+# Where the statement `_unfiltered_dml` judges starts: the first of these words at depth 0 (after T-SQL's CTEs).
+_DML_STARTS = _DML_WORDS | {"SELECT"}
+_SQLPP_ESCAPE = re.compile(r"\\u([0-9A-Fa-f]{4})|\\(.)|``", re.DOTALL)  # \u0073, \n, \`, and a doubled back-tick
+_SQLPP_ESCAPED = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}  # any other `\x` is x
 
 
 def _has_version_comment(tokens: list[Token]) -> bool:
@@ -192,7 +224,7 @@ def _lexical(sql: str, dialect: Dialect) -> Classification:
     kind = overrides.get(first) or _KEYWORD_KIND.get(first, StatementKind.UNKNOWN)
     if kind == StatementKind.READ and first in ("SELECT", "WITH"):
         # Data-modifying CTEs, locking reads and file writes are writes even when sqlglot could not parse them.
-        has_dml = any(w in ("INSERT", "UPDATE", "DELETE", "MERGE") for w in words[1:])
+        has_dml = any(w in _DML_WORDS for w in words[1:])
         if has_dml or _takes_row_locks(words) or _writes_server_file(words):
             kind = StatementKind.WRITE
     elif kind == StatementKind.SESSION and first == "SET" and _takes_row_locks(words):
@@ -260,6 +292,8 @@ def _from_sqlglot(sql: str, dialect: Dialect) -> list[Classification | None] | N
 
     Logs the exception type only: sqlglot's messages quote the statement.
     """
+    if dialect in KEYWORD_ONLY_DIALECTS:
+        return None  # no sqlglot dialect exists: the keyword rules decide, and that is not worth a log line
     try:
         rules = _sqlglot_rules()
     except Exception as exc:  # e.g. an app bundle without sqlglot: a packaging bug, not a statement problem
@@ -293,29 +327,108 @@ def _tsql_rule(words: list[str]) -> Classification | None:
     return None
 
 
-def _tsql_unfiltered_dml(tokens: list[Token]) -> list[DangerReason]:
-    """The danger reason of a T-SQL UPDATE or DELETE, also one after a CTE (WITH … DELETE), that has no WHERE at
-    parenthesis depth 0: a WHERE inside a subquery or a CTE filters nothing. Decided on the words, whatever sqlglot
-    makes of the rest: it cannot parse `OPTION (USE HINT …)`, nor `OPTION (MAXDOP 1)` after a CTE (self-check)."""
-    depth, dml = 0, ""
+def _has_phrase(words: list[str], phrases: tuple[tuple[str, ...], ...]) -> bool:
+    return any(tuple(words[k:k + len(p)]) == p for p in phrases for k in range(len(words)))
+
+
+def _has_filter(top: list[str], inner: list[str], dml: int, filters: tuple[tuple[str, ...], ...]) -> bool:
+    """Whether a filter phrase follows the DML word at `top[dml]`. A keys filter (USE KEYS, ON KEYS) holds only if no
+    SELECT is in its expression, at any depth (`inner`), up to the next depth-0 word in `_SQLPP_KEYS_END`: a SELECT
+    after that (`USE KEYS 'k' SET a = (SELECT …)`) belongs to something else."""
+    for k in range(dml + 1, len(top)):
+        for phrase in filters:
+            if tuple(top[k:k + len(phrase)]) != phrase:
+                continue
+            if phrase not in _SQLPP_KEYS_FILTERS:
+                return True
+            first = k + len(phrase)
+            end = next((j for j in range(first, len(top)) if top[j] in _SQLPP_KEYS_END), len(top))
+            if "SELECT" not in inner[first:end]:
+                return True
+    return False
+
+
+def _unfiltered_dml(tokens: list[Token], filters: tuple[tuple[str, ...], ...]) -> list[DangerReason]:
+    """The danger reason of an UPDATE or DELETE (T-SQL: also one after a CTE, WITH … DELETE) with none of `filters` at
+    parenthesis depth 0 after it: a filter inside a subquery or a CTE filters nothing. T-SQL filters with WHERE, SQL++
+    also with USE KEYS and ON KEYS (the phrase's words must be neighbours, and its expression holds no subquery).
+    Decided on the words, whatever a parser makes of the rest: sqlglot cannot parse `OPTION (USE HINT …)`, nor
+    `OPTION (MAXDOP 1)` after a CTE (self-check), and has no SQL++ dialect at all."""
+    depth = 0
+    top: list[str] = []  # one entry per token: its upper-cased word at depth 0, "" for any other token
+    inner: list[str] = []  # the same at any depth
     for k, token in enumerate(t for t in tokens if t.kind not in INSIGNIFICANT):
-        word = token.upper if token.kind == TokenKind.WORD else ""
         depth = max(depth + (token.kind == TokenKind.LPAREN) - (token.kind == TokenKind.RPAREN), 0)
-        if depth or not word:
-            continue
-        if k == 0 and word not in ("UPDATE", "DELETE", "WITH"):
+        word = token.upper if token.kind == TokenKind.WORD else ""
+        if k == 0 and word and not depth and word not in ("UPDATE", "DELETE", "WITH"):
             return []
-        if not dml and word in ("SELECT", "INSERT", "UPDATE", "DELETE", "MERGE"):
-            if word not in ("UPDATE", "DELETE"):
-                return []
-            dml = word
-        elif dml and word == "WHERE":
-            return []
-    reasons = {"UPDATE": DangerReason.UPDATE_WITHOUT_WHERE, "DELETE": DangerReason.DELETE_WITHOUT_WHERE}
-    return [reasons[dml]] if dml else []
+        top.append("" if depth else word)
+        inner.append(word)
+    dml = next((i for i, w in enumerate(top) if w in _DML_STARTS), None)
+    if dml is None or top[dml] not in ("UPDATE", "DELETE") or _has_filter(top, inner, dml, filters):
+        return []
+    return [DangerReason.UPDATE_WITHOUT_WHERE if top[dml] == "UPDATE" else DangerReason.DELETE_WITHOUT_WHERE]
 
 
-_SELECT_FAMILY = ("SELECT", "WITH")
+def _sqlpp_name(token: Token) -> str:
+    """The name a word or a back-ticked identifier spells, as the server reads it: a back-ticked name takes the escapes
+    of a string (`\\u0073ystem` is `system`, probed) and a doubled back-tick is one."""
+    if token.kind == TokenKind.WORD:
+        return token.text
+
+    def unescape(match: re.Match[str]) -> str:
+        if match[1]:
+            return chr(int(match[1], 16))
+        return _SQLPP_ESCAPED.get(match[2], match[2]) if match[2] else "`"
+
+    return _SQLPP_ESCAPE.sub(unescape, token.text[1:-1] if token.terminated else token.text[1:])
+
+
+def _names_system_keyspace(tokens: list[Token]) -> bool:
+    """`system:` named in the statement (`DELETE FROM system:active_requests …`; `tokens`: its significant tokens): the
+    lexer reads `system`, `:`. The server also accepts the namespace back-ticked (also spelt with escapes) and spaces
+    or comments around the colon, all probed. A back-ticked key before a colon in an object constructor counts too:
+    only a write is asked about, so a false alarm costs one confirmation."""
+    return any(
+        a.kind in (TokenKind.WORD, TokenKind.QUOTED) and _sqlpp_name(a).lower() == "system"
+        and b.kind == TokenKind.OTHER and b.text == ":"
+        for a, b in zip(tokens, tokens[1:])
+    )
+
+
+def _classify_sqlpp(tokens: list[Token]) -> Classification:
+    """One SQL++ statement by its words (spec §3.3.4). Everything it does not recognise is UNKNOWN, which a read-only
+    connection blocks: only the READ words pass, and a select (SELECT, WITH or FROM first) holding a DML word or
+    `NEXT VALUE FOR` is a WRITE (SQL++ rejects DML inside a SELECT; this is a net under that, and the server's
+    `readonly` another)."""
+    significant = [t for t in tokens if t.kind not in INSIGNIFICANT]
+    opened = next((i for i, t in enumerate(significant) if t.kind != TokenKind.LPAREN), len(significant))
+    significant = significant[opened:]  # (SELECT …) UNION (SELECT …)
+    if not significant or significant[0].kind != TokenKind.WORD:
+        return Classification(kind=StatementKind.UNKNOWN)
+    words = _words(significant)
+    if _begins_a_transaction_statement(words, Dialect.SQLPP):
+        return Classification(kind=StatementKind.TRANSACTION)
+    first = words[0]
+    if words[:2] == ["UPDATE", "STATISTICS"] or first == "ANALYZE":
+        return Classification(kind=StatementKind.WRITE)  # maintenance (EE); no WHERE to miss
+    kind = _SQLPP_KIND.get(first, StatementKind.UNKNOWN)
+    if first in _SQLPP_SELECT_FIRST and (
+        any(w in _SQLPP_DML for w in words[1:]) or _has_phrase(words, _SQLPP_SEQUENCE_ADVANCE)
+    ):
+        kind = StatementKind.WRITE  # NEXT VALUE FOR advances a sequence; a DML word: the safety net
+    reasons: list[DangerReason] = []
+    if first == "DROP":
+        reasons.append(DangerReason.DROP)
+    elif first == "FLUSH":
+        reasons.append(DangerReason.TRUNCATE)
+    if first in ("UPDATE", "DELETE"):
+        reasons.extend(_unfiltered_dml(significant, _SQLPP_FILTERS))
+    if first == "MERGE" and "DELETE" in words[1:]:
+        reasons.append(DangerReason.MERGE_DELETE)
+    if kind == StatementKind.WRITE and _names_system_keyspace(significant):
+        reasons.append(DangerReason.SYSTEM_KEYSPACE)
+    return Classification(kind=kind, dangerous_reasons=reasons)
 
 
 def _tsql_selects_into_a_table(tokens: list[Token]) -> bool:
@@ -384,6 +497,8 @@ def _classify_statement(sql: str, dialect: Dialect, has_body: bool = False) -> C
 def _classify_single(sql: str, dialect: Dialect, has_body: bool = False) -> Classification:
     """One statement; `has_body`: it holds a routine or trigger body."""
     tokens = tokenize(sql, dialect)
+    if dialect is Dialect.SQLPP:
+        return _classify_sqlpp(tokens)  # keyword rules only: no version comments, no sqlglot, no EXPLAIN ANALYZE
     if _has_version_comment(tokens):
         return Classification(kind=StatementKind.UNKNOWN)
     words = _words(tokens)
@@ -397,7 +512,7 @@ def _classify_single(sql: str, dialect: Dialect, has_body: bool = False) -> Clas
     # R-03a-F1: the words decide after whichever rules did. sqlglot 30.23 cannot parse `ALTER TABLE t DROP PARTITION p`
     # and reads `TRUNCATE PARTITION` as a Command, so both reach the keyword rules, which judge only the first word.
     # The same holds for T-SQL's unfiltered UPDATE/DELETE.
-    implied = [*_alter_reasons(words), *(_tsql_unfiltered_dml(tokens) if tsql else [])]
+    implied = [*_alter_reasons(words), *(_unfiltered_dml(tokens, _TSQL_FILTERS) if tsql else [])]
     if missing := [r for r in implied if r not in result.dangerous_reasons]:
         result = Classification(kind=result.kind, dangerous_reasons=[*result.dangerous_reasons, *missing])
     # R-03a-P7: decided after sqlglot too, as a floor. sqlglot 30.23 cannot parse INTO OUTFILE (so _lexical sees it
@@ -453,9 +568,19 @@ def classify(sql: str, dialect: Dialect) -> Classification:
     return results[0] if len(results) == 1 else _combine(results)
 
 
+def is_transaction_statement(sql: str, dialect: Dialect) -> bool:
+    """Whether `sql` (one statement) is transaction control by the same table the classifier uses (DRY): the Couchbase
+    adapter refuses these itself, since v1 has no SQL++ transactions (D-04-13). Dialects without a table ask the
+    classifier."""
+    starts = _TRANSACTION_STARTS.get(dialect)
+    if starts is None:
+        return classify(sql, dialect).kind == StatementKind.TRANSACTION
+    return _begins_a_transaction_statement(_words(tokenize(sql, dialect)), dialect)
+
+
 def warm_up() -> None:
     """Import sqlglot and parse one statement per dialect, so the first real classification does not pay for it."""
     started = time.perf_counter()
-    for dialect in Dialect:
+    for dialect in (d for d in Dialect if d not in KEYWORD_ONLY_DIALECTS):
         _from_sqlglot("SELECT 1", dialect)
     logger.debug("SQL classifier warmed up in {:.0f} ms", (time.perf_counter() - started) * 1000)

@@ -1,8 +1,9 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
-import type { AppSettings } from "@/lib/api/types";
+import type { AppSettings, EngineInfo, ProfileEntry } from "@/lib/api/types";
 import { openNewQuery, useWorkspace, type Tab } from "@/stores/workspace";
+import { enginesKey, findEngineInfo, profilesKey } from "../connections/hooks";
 import { refreshSchema } from "../explorer/refreshSchema";
 import { HISTORY_VIEW } from "../history/useHistory";
 import { readQueryTabActions, type QueryTabActionId, type QueryTabActions } from "../query/tabActions";
@@ -10,12 +11,13 @@ import { openSettings } from "../settings/SettingsDialog";
 import { requestCloseTab } from "../workspace/closeGuards";
 
 /**
- * The shortcut labels the palette shows, in one place. The bindings: ⌘↵, ⌘⇧↵ and ⌘⇧F are the query tab's editor
+ * The shortcut labels the palette shows, in one place. The bindings: ⌘↵, ⌘⇧↵, ⌘E and ⌘⇧F are the query tab's editor
  * keymap, ⌘W the workspace, ⌘, the settings dialog, ⌘P and ⌘⇧P the app. A command without a binding has none.
  */
 export const SHORTCUTS = {
   run: "⌘↵",
   runAll: "⌘⇧↵",
+  explain: "⌘E",
   format: "⌘⇧F",
   closeTab: "⌘W",
   settings: "⌘,",
@@ -44,6 +46,8 @@ export interface PaletteCommand {
   shortcut?: string;
   /** Disabled commands are shown greyed. */
   enabled: (ctx: CommandContext) => boolean;
+  /** A command that only some engines have is left out of the list for the others (default: always listed). */
+  visible?: (ctx: CommandContext) => boolean;
   /** For a toggle: whether it is on now. */
   checked?: (ctx: CommandContext) => boolean | undefined;
   run: (ctx: CommandContext) => void;
@@ -55,11 +59,17 @@ const always = () => true;
  * A command the active query tab carries out with its own handler (ruling R-02c-15), the one its toolbar button or
  * keymap calls. Asked again when it runs: the tab may have changed while the palette was open.
  */
-function tabCommand(id: QueryTabActionId, label: string, shortcut?: string): PaletteCommand {
+function tabCommand(
+  id: QueryTabActionId,
+  label: string,
+  shortcut?: string,
+  visible?: PaletteCommand["visible"],
+): PaletteCommand {
   return {
     id,
     label,
     shortcut,
+    visible,
     enabled: (ctx) => ctx.tabActions?.[id].enabled ?? false,
     checked: (ctx) => ctx.tabActions?.[id].checked,
     run: (ctx) => {
@@ -69,6 +79,20 @@ function tabCommand(id: QueryTabActionId, label: string, shortcut?: string): Pal
     },
   };
 }
+
+/** What the active tab's connection is and can do, from the profiles and engines already loaded; null if unknown. */
+function activeEngine(ctx: CommandContext): EngineInfo | null {
+  return findEngineInfo(
+    ctx.queryClient.getQueryData<ProfileEntry[]>(profilesKey),
+    ctx.queryClient.getQueryData<EngineInfo[]>(enginesKey),
+    ctx.activeTab?.profileId ?? null,
+  );
+}
+
+/** Couchbase: its plans (Explain). */
+const takesPlans = (ctx: CommandContext) => activeEngine(ctx)?.plan_format === "couchbase";
+/** Couchbase: the plan a statement ran with (Run with profile). */
+const takesProfile = (ctx: CommandContext) => takesPlans(ctx) && !!activeEngine(ctx)?.executed_plan;
 
 async function toggleVim({ current, save }: CommandContext["settings"]): Promise<void> {
   const vim = !current.editor.vim;
@@ -101,6 +125,8 @@ export const COMMANDS: readonly PaletteCommand[] = [
   },
   tabCommand("run", "Run", SHORTCUTS.run),
   tabCommand("runAll", "Run all", SHORTCUTS.runAll),
+  tabCommand("explain", "Explain", SHORTCUTS.explain, takesPlans),
+  tabCommand("runWithProfile", "Run with profile", undefined, takesProfile),
   tabCommand("format", "Format", SHORTCUTS.format),
   {
     id: "toggleVim",

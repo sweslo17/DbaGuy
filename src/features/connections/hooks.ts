@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, unwrap } from "@/lib/api/client";
-import type { Dialect, EngineInfo, ProfileDraft, ProfileSecretsInput } from "@/lib/api/types";
-import { invalidateExplorer } from "../explorer/explorerCache";
+import type { Dialect, EngineInfo, ProfileDraft, ProfileEntry, ProfileSecretsInput } from "@/lib/api/types";
+import { invalidateExplorer, retryFailedExplorer } from "../explorer/explorerCache";
 
 export const profilesKey = ["profiles"] as const;
 
@@ -13,12 +13,34 @@ export function useProfiles() {
   return useQuery({ queryKey: profilesKey, queryFn: fetchProfiles });
 }
 
+/** Whether profile `profileId` is read-only; false for an unknown profile and while the list is missing. */
+export function isReadOnlyProfile(entries: readonly ProfileEntry[] | undefined, profileId: string | null): boolean {
+  return entries?.find((entry) => entry.profile.id === profileId)?.profile.read_only === true;
+}
+
+/** Whether profile `profileId` is read-only (a document tab then neither saves nor deletes). */
+export function useReadOnlyProfile(profileId: string | null): boolean {
+  return isReadOnlyProfile(useProfiles().data, profileId);
+}
+
+export const enginesKey = ["engines"] as const;
+
 export function useEngines() {
   return useQuery({
-    queryKey: ["engines"],
+    queryKey: enginesKey,
     queryFn: async () => unwrap(await (await api()).GET("/system/engines")),
     staleTime: Infinity,
   });
+}
+
+/** What the engine of profile `profileId` is and can do; null for an unknown profile or while either list is missing. */
+export function findEngineInfo(
+  profiles: readonly ProfileEntry[] | undefined,
+  engines: readonly EngineInfo[] | undefined,
+  profileId: string | null,
+): EngineInfo | null {
+  const engine = profiles?.find((entry) => entry.profile.id === profileId)?.profile.engine;
+  return engines?.find((info) => info.engine === engine) ?? null;
 }
 
 /**
@@ -26,10 +48,7 @@ export function useEngines() {
  * are loaded. It wraps queries, so call it unconditionally at the top of a component and derive booleans afterwards.
  */
 export function useEngineInfo(profileId: string | null): EngineInfo | null {
-  const profiles = useProfiles();
-  const engines = useEngines();
-  const engine = profiles.data?.find((entry) => entry.profile.id === profileId)?.profile.engine;
-  return engines.data?.find((info) => info.engine === engine) ?? null;
+  return findEngineInfo(useProfiles().data, useEngines().data, profileId);
 }
 
 /** SQL dialect of a profile's engine; null without a profile and until profiles and engines are loaded. */
@@ -80,7 +99,13 @@ export function useImportUrl() {
   });
 }
 
+/**
+ * Gives a profile the secrets it was missing (kept in memory). Wherever the dialog was opened (the tree, a query tab, a
+ * detail tab), whatever of the profile's explorer had failed is read again; the dialog's own `onUnlocked` is for the
+ * caller's own retry.
+ */
 export function useUnlockProfile() {
+  const qc = useQueryClient();
   return useMutation({
     mutationFn: async (input: { id: string; secrets: ProfileSecretsInput }) =>
       unwrap(
@@ -89,5 +114,7 @@ export function useUnlockProfile() {
           body: input.secrets,
         }),
       ),
+    // Not returned: the dialog closes now, the reads finish when they finish.
+    onSuccess: (_, { id }) => void retryFailedExplorer(qc, id),
   });
 }

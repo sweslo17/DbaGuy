@@ -37,7 +37,7 @@ def labels(response):
 
 def test_split_uses_utf16_offsets(client):
     statements = client.post("/sql/split", json={"text": EMOJI_SQL, "dialect": "sqlite"}, headers=AUTH).json()["statements"]
-    assert statements[0] == {"start": 0, "end": 11, "terminator_end": 12, "repeat": 1}  # '😀' is two UTF-16 units
+    assert statements[0] == {"start": 0, "end": 11, "terminator_end": 12, "repeat": 1, "params": []}  # '😀' is two UTF-16 units
     assert statements[1]["start"] == 13 and statements[1]["end"] == utf16_len(EMOJI_SQL)
 
 
@@ -45,9 +45,23 @@ def test_split_returns_go_repeats(client):
     body = {"text": "SELECT '😀'\nGO 3\nSELECT '中'", "dialect": "tsql"}  # '😀' is two UTF-16 units, '中' one
     statements = client.post("/sql/split", json=body, headers=AUTH).json()["statements"]
     assert statements == [
-        {"start": 0, "end": 11, "terminator_end": 16, "repeat": 3},
-        {"start": 17, "end": 27, "terminator_end": 27, "repeat": 1},
+        {"start": 0, "end": 11, "terminator_end": 16, "repeat": 3, "params": []},
+        {"start": 17, "end": 27, "terminator_end": 27, "repeat": 1, "params": []},
     ]
+
+
+def test_split_returns_sqlpp_parameters(client):
+    body = {"text": "SELECT $a, ? FROM ks; SELECT @a", "dialect": "sqlpp"}
+    statements = client.post("/sql/split", json=body, headers=AUTH).json()["statements"]
+    assert [s["params"] for s in statements] == [["$a", "?"], ["$a"]]
+
+
+def test_format_guard_offsets_are_utf16(client):
+    original = "SELECT '😀', 'it''s'"
+    body = {"dialect": "sqlpp", "original": original, "formatted": "SELECT '😀', 'it' 's'"}
+    assert client.post("/sql/format-guard", json=body, headers=AUTH).json() == {"same": False, "offset": 13}
+    body["formatted"] = "SELECT\n  '😀',\n  'it''s'"
+    assert client.post("/sql/format-guard", json=body, headers=AUTH).json() == {"same": True, "offset": None}
 
 
 def test_complete_after_an_astral_character(client, sqlite_profile_id):
@@ -245,3 +259,47 @@ def test_value_condition_endpoint(client):
     preview = {**body, "value": {"$type": "text", "preview": "x", "size": 70000, "truncated": True}}
     assert client.post("/sql/value-condition", json=preview, headers=AUTH).json() == {"condition": None}
     assert client.post("/sql/value-condition", json={**body, "extra": 1}, headers=AUTH).status_code == 422
+
+
+def test_sqlpp_copy_json_missing_and_the_insert_refusal(client, log_records):
+    columns = [{"name": "doc", "category": "mixed"}, {"name": "n", "category": "number"}]
+    rows = [[{"$type": "json", "text": '{"b": 1.10, "a": 9007199254740993}'}, 5], [{"$type": "missing"}, 6]]
+    body = {"dialect": "sqlpp", "kind": "jsonl", "columns": columns, "rows": rows}
+    assert client.post("/sql/format-rows", json=body, headers=AUTH).json()["text"].splitlines() == [
+        '{"doc": {"b": 1.10, "a": 9007199254740993}, "n": 5}', '{"n": 6}',
+    ]
+    insert = client.post("/sql/format-rows", json={**body, "kind": "insert"}, headers=AUTH)
+    assert insert.status_code == 422
+    error = insert.json()["error"]
+    assert error["code"] == "unsupported_format" and error["message"] == "INSERT statements are not offered for Couchbase"
+    missing = {"dialect": "sqlpp", "column": "doc", "value": {"$type": "missing"}, "category": "mixed"}
+    assert client.post("/sql/value-condition", json=missing, headers=AUTH).json() == {"condition": "doc IS MISSING"}
+    assert not [r for r in log_records if r["level"].no >= ERROR]
+
+
+def test_sqlpp_completion_takes_a_context_and_seen_fields_and_keeps_utf16_offsets(client):
+    text = "SELECT '😀', na FROM users AS u"  # '😀' is two UTF-16 units
+    cursor = utf16_len("SELECT '😀', na")
+    body = {"dialect": "sqlpp", "text": text, "cursor": cursor, "query_context": {"bucket": "b", "scope": "s"},
+            "seen_fields": ["name", "nation"]}
+    result = client.post("/sql/complete", json=body, headers=AUTH).json()
+    assert [i["label"] for i in result["items"]][:2] == ["name", "nation"]  # no sample: only what the results showed
+    assert (result["start"], result["end"]) == (cursor - 2, cursor)
+
+
+@pytest.mark.parametrize("extra", [
+    {"seen_fields": ["x"] * 501}, {"seen_fields": ["x" * 301]}, {"query_context": {"bucket": ""}},
+    {"query_context": {"bucket": "b", "other": 1}},
+])
+def test_sqlpp_completion_bounds_its_inputs(client, extra):
+    body = {"dialect": "sqlpp", "text": "SELECT 1", "cursor": 0, **extra}
+    assert client.post("/sql/complete", json=body, headers=AUTH).status_code == 422
+
+
+def test_sqlpp_completion_inside_back_ticks_replaces_the_whole_name_in_utf16(client):
+    text = "SELECT '😀', `` FROM ks AS u"  # '😀' is two UTF-16 units
+    cursor = utf16_len("SELECT '😀', `")
+    body = {"dialect": "sqlpp", "text": text, "cursor": cursor}
+    result = client.post("/sql/complete", json=body, headers=AUTH).json()
+    assert [i["label"] for i in result["items"]] == ["u"]  # no keyword inside a name
+    assert (result["start"], result["end"]) == (cursor - 1, cursor + 1)

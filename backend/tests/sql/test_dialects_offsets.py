@@ -1,14 +1,14 @@
 import pytest
 
 from dbaguy_backend.sql.dialects import (
-    Dialect, bool_literal, bytes_literal, datetime_literal, force_quote_ident, json_literal, needs_quote, qualified,
-    quote_ident, quote_literal, zero_date_as_text,
+    Dialect, bool_literal, bytes_literal, datetime_literal, force_quote_ident, in_list, is_reserved, json_literal,
+    keyspace_path, needs_quote, qualified, quote_ident, quote_literal, zero_date_as_text,
 )
 from dbaguy_backend.sql.lexer import INSIGNIFICANT, TokenKind, tokenize
-from dbaguy_backend.sql.offsets import Utf16Index
+from dbaguy_backend.sql.offsets import Utf16Index, utf16_offset
 from dbaguy_backend.sql.sqlglot_rules import parse
 
-PG, LITE, MY, TS = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL
+PG, LITE, MY, TS, SQ = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL, Dialect.SQLPP
 
 
 @pytest.mark.parametrize(
@@ -42,6 +42,16 @@ PG, LITE, MY, TS = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL
         (TS, "中文", "[中文]"),
         (TS, "go", "[go]"),  # not reserved by the server, but alone on a line it is the batch separator
         (TS, "GO", "[GO]"),
+        (SQ, "users", "`users`"),  # USERS is reserved
+        (SQ, "orders", "orders"),
+        (SQ, "travel-sample", "`travel-sample`"),
+        (SQ, "value", "`value`"),
+        (SQ, "Name", "Name"),  # SQL++ names keep their case
+        (SQ, "a$b", "`a$b`"),
+        (SQ, "中文", "`中文`"),
+        (SQ, "_index_key", "`_index_key`"),
+        (SQ, "a`b", "`a``b`"),
+        (SQ, "a\\b", "`a\\\\b`"),
     ],
 )
 def test_quote_ident(dialect, name, expected):
@@ -132,12 +142,17 @@ def test_every_dialect_has_an_entry_in_every_dialect_table(dialect):  # tripwire
         "dialects._STRING_PREFIXES": dialects._STRING_PREFIXES,
         "dialects._ISO_DATETIME": dialects._ISO_DATETIME,
         "dialects._NUL_IN_LITERAL": dialects._NUL_IN_LITERAL,
+        "dialects._JSON_STRINGS": dialects._JSON_STRINGS,
+        "dialects._IN_LIST_BRACKETS": dialects._IN_LIST_BRACKETS,
         "classifier._EXPLAIN_KEYWORDS": classifier._EXPLAIN_KEYWORDS,
         "sqlglot_rules.SQLGLOT_DIALECT": sqlglot_rules.SQLGLOT_DIALECT,
         "completion.STATEMENT_KEYWORDS": completion.STATEMENT_KEYWORDS,
         "completion.CLAUSE_KEYWORDS": completion.CLAUSE_KEYWORDS,
     }
-    missing = [name for name, table in tables.items() if dialect not in table]
+    missing = [
+        name for name, table in tables.items()
+        if dialect not in table and not (name == "sqlglot_rules.SQLGLOT_DIALECT" and dialect in dialects.KEYWORD_ONLY_DIALECTS)
+    ]
     assert not missing, f"{dialect} has no entry in: {missing}"
 
 
@@ -149,3 +164,24 @@ def test_utf16_round_trip_with_astral_characters():
         assert index.from_utf16(index.to_utf16(cp)) == cp
     assert index.from_utf16(2) == 1  # middle of a surrogate pair clamps to the character start
     assert index.from_utf16(99) == len(text)
+
+
+def test_sqlpp_literals_and_paths():
+    assert quote_literal(SQ, "it's \"中文\"\n\\") == '"it\'s \\"中文\\"\\n\\\\"'  # a JSON string (D-04-15)
+    assert quote_literal(SQ, "\x00") == '"\\u0000"'
+    assert [bool_literal(SQ, True), bool_literal(SQ, False)] == ["TRUE", "FALSE"]
+    assert json_literal(SQ, '{"a": [1, 1e400]}') == '{"a": [1, 1e400]}'  # JSON is SQL++ syntax
+    with pytest.raises(ValueError):
+        bytes_literal(SQ, "dead")
+    assert force_quote_ident(SQ, "a\\b`c") == "`a\\\\b``c`"
+    assert keyspace_path("travel-sample", "inventory", "airline") == "`travel-sample`.inventory.airline"
+    assert keyspace_path("dbaguy", "app") == "dbaguy.app"
+    assert keyspace_path("my.bucket") == "`my.bucket`"
+    assert in_list(SQ, ["1", '"a"']) == '[1, "a"]'
+    assert in_list(Dialect.POSTGRES, ["1", "'a'"]) == "(1, 'a')"
+    assert is_reserved(SQ, "Users") and not is_reserved(SQ, "name")
+
+
+def test_utf16_offset_counts_astral_characters():
+    text = 'a😀b中\U0001F600'
+    assert [utf16_offset(text, cp) for cp in range(-1, 7)] == [0, 0, 1, 3, 4, 5, 7, 7]

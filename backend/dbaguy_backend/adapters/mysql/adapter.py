@@ -3,7 +3,6 @@ conversion (`types`), KILL QUERY from a side connection for cancel and for closi
 from the protocol's status flags, and READ ONLY sessions for read-only profiles."""
 
 import re
-import socket
 import threading
 import time
 from contextlib import suppress
@@ -27,12 +26,15 @@ from ..base import (
     DatabaseConnection,
     Endpoint,
     ParsedUrl,
+    RunOptions,
     StatementCancelled,
     StatementError,
     StatementResult,
     invalid_text_error,
     transaction_open_error,
 )
+from ..cancel_window import CancelWindow
+from ..sockets import enable_keepalive
 from . import catalog, introspection
 from . import schema as mysql_schema
 from .settings import URL_SCHEMES, connect_params, kill_params, parse_mysql_url, requires_tls, session_settings
@@ -166,6 +168,8 @@ class MysqlConnection(DatabaseConnection):
         self._autocommit = True  # connections open in auto-commit mode (settings fix it)
         self._autocommit_stale = False  # a statement may have switched it: re-read once nothing is unread
         self._killed = threading.Event()  # KILL QUERY was sent for the current statement (R-03a-P4)
+        # A cancel before run() has sent anything is kept here: KILL QUERY does nothing to an idle thread (Task 6b)
+        self._window = CancelWindow("MySQL")
         self._lost = False  # the connection is gone (or was dropped): it has no transaction any more
 
     # ---- statements ----
@@ -186,7 +190,15 @@ class MysqlConnection(DatabaseConnection):
         logger.info("MySQL {}: KILL QUERY {} in {:.0f} ms", why, self._thread_id, (time.monotonic() - started) * 1000)
         return True
 
+    def arm_cancel(self) -> None:
+        self._window.arm()
+
+    def disarm_cancel(self) -> None:
+        self._window.disarm()
+
     def cancel(self) -> None:
+        if self._window.keep():
+            return  # run() has not sent the statement yet: it will not, and no KILL is needed (nor the KILL flag)
         self._killed.set()  # first: SLEEP() may return its 1 before the KILL's own reply reaches us
         if not self.kill_query("cancel"):
             self._killed.clear()  # nothing was interrupted: report what the statement really does
@@ -351,10 +363,13 @@ class MysqlConnection(DatabaseConnection):
             position=ErrorPosition(line=int(line.group(1)), column=1) if line else None,
         )
 
-    def run(self, sql: str) -> StatementResult:
+    def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
         self._killed.clear()
         if _MENTIONS_AUTOCOMMIT.search(sql) or first_keyword(sql, Dialect.MYSQL) in _MAY_SET_AUTOCOMMIT:
             self._autocommit_stale = True
+        # Right before the first send, after the clear: a cancel kept while armed means nothing is sent; from here
+        # one sets the KILL flag and KILLs.
+        self._window.take_over()
         cursor = _VerbatimCursor(self._conn)  # not conn.cursor(): that sends a PING first, one round trip per statement
         try:
             cursor.execute_verbatim(sql)
@@ -466,19 +481,12 @@ def _may_change_status(exc: mysql.connector.Error) -> bool:
 
 
 def _enable_keepalive(conn: MySQLConnection) -> None:
-    """TCP keepalive (30 s idle, 10 s interval, 3 probes) as for PostgreSQL; the driver has no option for it, so it is
-    set on its socket, best effort."""
+    """TCP keepalive as for PostgreSQL; the driver has no option for it, so it is set on its socket, best effort."""
     sock = getattr(getattr(conn, "_socket", None), "sock", None)
     if sock is None:
         logger.debug("MySQL socket not reachable; TCP keepalive not set")
         return
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        for name, value in (("TCP_KEEPALIVE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
-            if (option := getattr(socket, name, None)) is not None:
-                sock.setsockopt(socket.IPPROTO_TCP, option, value)
-    except OSError as exc:
-        logger.debug("MySQL TCP keepalive not set: {}", exc)
+    enable_keepalive(sock)
 
 
 def _login_failed(exc: mysql.connector.Error) -> bool:

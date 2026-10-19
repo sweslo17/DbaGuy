@@ -8,7 +8,7 @@ from loguru import logger
 from ..adapters.base import DatabaseAdapter, DatabaseConnection, Endpoint, StatementError
 from ..adapters.registry import AdapterRegistry
 from ..connectivity.ssh_tunnel import SshTunnelManager
-from ..domain.errors import DomainError, ValidationFailed
+from ..domain.errors import DomainError
 from ..domain.profiles import AnyProfile, ConnectionTestRequest, ConnectionTestResult, ServerProfile, profile_from_draft
 from .profile_service import ProfileService, ResolvedSecrets
 
@@ -63,14 +63,10 @@ class ConnectionService:
     ) -> tuple[Endpoint | None, Callable[[], None]]:
         if not isinstance(profile, ServerProfile):
             return None, _noop
-        port = profile.port or adapter.default_port
-        if port is None:
-            raise ValidationFailed("A port is required")
+        host, port = adapter.endpoint_target(profile)
         if not profile.ssh.enabled:
-            return Endpoint(profile.host, port), _noop
-        tunnel = self._tunnels.lease(
-            profile.id, profile.ssh, profile.host, port, secrets.ssh_password, shared=share_tunnel
-        )
+            return Endpoint(host, port), _noop
+        tunnel = self._tunnels.lease(profile.id, profile.ssh, host, port, secrets.ssh_password, shared=share_tunnel)
         return tunnel.endpoint, tunnel.release  # bound to this very tunnel, so a stale release cannot hit a replacement
 
     def test(self, request: ConnectionTestRequest) -> ConnectionTestResult:

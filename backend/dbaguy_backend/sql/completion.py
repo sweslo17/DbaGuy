@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from ..domain.schema import RelationKind, SchemaSnapshot, SnapshotRelation, SnapshotSchema
 from .dialects import Dialect, qualified, quote_ident
+from .keyspaces import KeyspaceTree
 from .lexer import INSIGNIFICANT, Token, TokenKind, tokenize
 from .scope import (
     BEFORE_NAME, IDENT, Scope, ScopeRelation, enclosing_group, find_ctes, introduces_relation, scope_at, unquote,
@@ -21,17 +22,18 @@ from .scope import (
 from .splitter import split
 
 CompletionKind = Literal[
-    "keyword", "schema", "table", "view", "materialized_view", "synonym", "column", "alias", "function", "join"
+    "keyword", "schema", "table", "view", "materialized_view", "synonym", "column", "alias", "function", "join",
+    "bucket", "scope", "collection", "field",  # Couchbase (sql/sqlpp_completion.py)
 ]
-_Context = Literal["start", "clause", "relations", "columns", "join"]
+ClauseContext = Literal["start", "clause", "relations", "columns", "join"]
 MAX_ITEMS = 300
 _JOIN_BOOST = 3
-_SYSTEM_BOOST = -1
+SYSTEM_BOOST = -1
 _PREFIX_BOOST, _SUBSTRING_BOOST = 2, 1
 # Tie-break after the boost. Relation kinds share a rank so a short view is not buried under every table.
 _KIND_ORDER: dict[str, int] = {
-    "join": 0, "alias": 1, "column": 2, "table": 3, "view": 3, "materialized_view": 3, "synonym": 3, "schema": 4,
-    "function": 5, "keyword": 6,
+    "join": 0, "alias": 1, "column": 2, "field": 2, "table": 3, "view": 3, "materialized_view": 3, "synonym": 3,
+    "collection": 3, "schema": 4, "bucket": 4, "scope": 4, "function": 5, "keyword": 6,
 }
 
 
@@ -78,6 +80,10 @@ STATEMENT_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.SQLITE: (*_STARTERS, "PRAGMA"),
     Dialect.MYSQL: (*_STARTERS, "SHOW", "USE", "REPLACE", "CALL"),
     Dialect.TSQL: (*(word for word in _STARTERS if word != "EXPLAIN"), "EXEC", "DECLARE", "PRINT", "USE", "MERGE", "SET"),
+    Dialect.SQLPP: (
+        "SELECT", "INSERT", "UPSERT", "UPDATE", "DELETE", "MERGE", "WITH", "CREATE", "DROP", "ALTER", "BUILD",
+        "EXPLAIN", "ADVISE", "INFER", "PREPARE", "EXECUTE", "GRANT", "REVOKE",
+    ),
 }
 CLAUSE_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.POSTGRES: (*_CLAUSES, "ILIKE"),
@@ -88,6 +94,13 @@ CLAUSE_KEYWORDS: dict[Dialect, tuple[str, ...]] = {
     Dialect.TSQL: (  # no LIMIT and no RETURNING: TOP, OFFSET … FETCH and OUTPUT instead
         *(word for word in _CLAUSES if word not in ("LIMIT", "RETURNING")), "TOP", "OUTPUT", "CROSS APPLY",
         "OUTER APPLY", "FETCH NEXT", "ROWS ONLY", "WITH (NOLOCK)",
+    ),
+    Dialect.SQLPP: (  # spec §3.3.6; no FULL / RIGHT JOIN
+        "SELECT", "RAW", "DISTINCT", "FROM", "USE KEYS", "USE INDEX", "ON KEYS", "JOIN", "LEFT JOIN", "INNER JOIN",
+        "NEST", "UNNEST", "LET", "LETTING", "WHERE", "GROUP BY", "HAVING", "ORDER BY", "LIMIT", "OFFSET", "RETURNING",
+        "SET", "UNSET", "VALUES", "ANY", "EVERY", "SATISFIES", "IN", "WITHIN", "END", "IS MISSING", "IS NOT MISSING",
+        "IS VALUED", "IS NULL", "IS NOT NULL", "AND", "OR", "NOT", "LIKE", "BETWEEN", "CASE", "WHEN", "THEN", "ELSE",
+        "ARRAY", "FOR", "EXISTS", "UNION", "INTERSECT", "EXCEPT", "ALL", "AS", "ASC", "DESC", "MISSING", "NULL",
     ),
 }
 
@@ -102,7 +115,7 @@ _NO_ITEMS_INSIDE = (TokenKind.STRING, TokenKind.COMMENT, TokenKind.QUOTED, Token
 
 
 @dataclass(frozen=True, slots=True)
-class _Candidate:
+class Candidate:
     """A completion item before filtering; `lower` is precomputed because every keystroke filters on it."""
 
     label: str
@@ -114,14 +127,14 @@ class _Candidate:
 
     @classmethod
     def of(cls, label: str, kind: CompletionKind, detail: str | None = None, apply: str | None = None,
-           boost: int = 0) -> "_Candidate":
+           boost: int = 0) -> "Candidate":
         return cls(label, kind, detail, None if apply == label else apply, boost, label.lower())
 
     def item(self, boost: int) -> CompletionItem:
         return CompletionItem(label=self.label, kind=self.kind, detail=self.detail, apply=self.apply, boost=boost)
 
 
-def _by_length(candidates: Iterable[_Candidate]) -> list[_Candidate]:
+def by_length(candidates: Iterable[Candidate]) -> list[Candidate]:
     """Shorter, then alphabetical: the natural order that filtering keeps within one boost and kind."""
     return sorted(candidates, key=lambda c: (len(c.label), c.label))
 
@@ -137,17 +150,17 @@ def _relation_detail(schema: SnapshotSchema, relation: SnapshotRelation) -> str:
     return "CTE" if schema is _CTE_SCHEMA else f"{_kind_word(relation.kind)} in {schema.name}"
 
 
-def _column_candidates(dialect: Dialect, relation: SnapshotRelation) -> list[_Candidate]:
+def _column_candidates(dialect: Dialect, relation: SnapshotRelation) -> list[Candidate]:
     """In table order, which is what people expect to scan."""
     return [
-        _Candidate.of(c.name, "column", f"{relation.name} · {c.type_name}" if c.type_name else relation.name,
-                      quote_ident(dialect, c.name))
+        Candidate.of(c.name, "column", f"{relation.name} · {c.type_name}" if c.type_name else relation.name,
+                     quote_ident(dialect, c.name))
         for c in relation.columns
     ]
 
 
-_KEYWORD_CANDIDATES: dict[tuple[Dialect, str], list[_Candidate]] = {
-    (dialect, group): _by_length(_Candidate.of(word, "keyword") for word in dict.fromkeys(words))
+_KEYWORD_CANDIDATES: dict[tuple[Dialect, str], list[Candidate]] = {
+    (dialect, group): by_length(Candidate.of(word, "keyword") for word in dict.fromkeys(words))
     for group, table in (("start", STATEMENT_KEYWORDS), ("clause", CLAUSE_KEYWORDS))
     for dialect, words in table.items()
 }
@@ -168,6 +181,7 @@ class SnapshotIndex:
     def __init__(self, snapshot: SchemaSnapshot, dialect: Dialect) -> None:
         self.snapshot = snapshot
         self.dialect = dialect
+        self.keyspaces = KeyspaceTree.of(snapshot.keyspaces)  # Couchbase; empty for a relational snapshot
         self.search_path_lower = [name.lower() for name in snapshot.search_path]
         self._path_rank = {name: rank for rank, name in reversed(list(enumerate(self.search_path_lower)))}
         self.schemas_by_lower: dict[str, list[SnapshotSchema]] = {}
@@ -177,19 +191,19 @@ class SnapshotIndex:
             for relation in schema.relations:
                 self.relations_by_lower_name.setdefault(relation.name.lower(), []).append((schema, relation))
         self.functions = sorted({name for schema in snapshot.schemas for name in schema.functions})
-        self.relation_candidates = _by_length(
+        self.relation_candidates = by_length(
             self._relation_candidate(schema, relation) for schema in snapshot.schemas for relation in schema.relations
         )
-        self.schema_candidates = _by_length(
-            _Candidate.of(s.name, "schema", "schema", quote_ident(dialect, s.name), _SYSTEM_BOOST if s.system else 0)
+        self.schema_candidates = by_length(
+            Candidate.of(s.name, "schema", "schema", quote_ident(dialect, s.name), SYSTEM_BOOST if s.system else 0)
             for s in snapshot.schemas
         )
-        self.function_candidates = _by_length(
-            _Candidate.of(name, "function", "function", quote_ident(dialect, name)) for name in self.functions
+        self.function_candidates = by_length(
+            Candidate.of(name, "function", "function", quote_ident(dialect, name)) for name in self.functions
         )
         self._relations_of_schema = {
-            schema.name: _by_length(
-                _Candidate.of(r.name, r.kind, _kind_word(r.kind), quote_ident(dialect, r.name))
+            schema.name: by_length(
+                Candidate.of(r.name, r.kind, _kind_word(r.kind), quote_ident(dialect, r.name))
                 for r in schema.relations
             )
             for schema in snapshot.schemas
@@ -211,7 +225,7 @@ class SnapshotIndex:
             return _prefer_exact([p for p in found if p[0] is target], name, lambda p: p[1].name)
         return min(found, key=lambda pair: self._unqualified_rank(pair, name), default=None)
 
-    def relations_of(self, schema: SnapshotSchema) -> list[_Candidate]:
+    def relations_of(self, schema: SnapshotSchema) -> list[Candidate]:
         return self._relations_of_schema.get(schema.name, [])
 
     def _unqualified_rank(self, pair: _Resolved, name: str) -> tuple[bool, bool, int]:
@@ -220,20 +234,20 @@ class SnapshotIndex:
         outside = rank is None
         return outside, relation.name != name, int(schema.system) if outside else rank
 
-    def _relation_candidate(self, schema: SnapshotSchema, relation: SnapshotRelation) -> _Candidate:
+    def _relation_candidate(self, schema: SnapshotSchema, relation: SnapshotRelation) -> Candidate:
         """Bare name when an unqualified reference reaches this relation; `schema.name` otherwise."""
         resolved = self.resolve(None, relation.name) if self.in_search_path(schema.name) else None
         bare = resolved is not None and resolved[1] is relation
         label = relation.name if bare else f"{schema.name}.{relation.name}"
         apply = qualified(self.dialect, None if bare else schema.name, relation.name)
-        return _Candidate.of(label, relation.kind, _relation_detail(schema, relation), apply,
-                             _SYSTEM_BOOST if schema.system else 0)
+        return Candidate.of(label, relation.kind, _relation_detail(schema, relation), apply,
+                            SYSTEM_BOOST if schema.system else 0)
 
 
 # --- statement and tokens ----------------------------------------------------------------------------------------
 
 
-def _statement_bounds(text: str, cursor: int, dialect: Dialect) -> tuple[int, int]:
+def statement_bounds(text: str, cursor: int, dialect: Dialect) -> tuple[int, int]:
     """The statement around the cursor, or the gap (whitespace, comments, stray `;`) between two statements.
 
     An unterminated last statement owns everything after it, so `SELECT * FROM t |` is still that statement.
@@ -251,11 +265,11 @@ def _statement_bounds(text: str, cursor: int, dialect: Dialect) -> tuple[int, in
     return gap_start, len(text)
 
 
-def _significant(tokens: Iterable[Token]) -> list[Token]:
+def significant(tokens: Iterable[Token]) -> list[Token]:
     return [token for token in tokens if token.kind not in INSIGNIFICANT]
 
 
-def _token_before(tokens: list[Token], offset: int) -> Token | None:
+def token_before(tokens: list[Token], offset: int) -> Token | None:
     """The token that contains `offset` or ends exactly at it (the character just typed belongs to it)."""
     return next((token for token in tokens if token.start < offset <= token.end), None)
 
@@ -265,7 +279,7 @@ def _is_closed(token: Token, dialect: Dialect) -> bool:
     return tokenize(token.text + "\n", dialect)[0].end == len(token.text)
 
 
-def _inside_literal(token: Token | None, offset: int, dialect: Dialect) -> bool:
+def inside_literal(token: Token | None, offset: int, dialect: Dialect) -> bool:
     if token is None or token.kind not in _NO_ITEMS_INSIDE:
         return False
     if offset < token.end or token.text.startswith(("--", "#")):  # a line comment runs up to (not over) the newline
@@ -276,7 +290,7 @@ def _inside_literal(token: Token | None, offset: int, dialect: Dialect) -> bool:
 # --- context -----------------------------------------------------------------------------------------------------
 
 
-def _context(before: list[Token]) -> tuple[_Context, str]:
+def clause_context(before: list[Token]) -> tuple[ClauseContext, str]:
     """Clause the cursor is in, and its keyword, from the last clause keyword at the cursor's parenthesis depth
     (AND/OR/NOT and other words are passed over): "relations", "clause" (a relation was just named), "join" (right
     after ON), "columns" (also inside an unclosed parenthesis) or "start" (no clause yet)."""
@@ -303,7 +317,7 @@ def _context(before: list[Token]) -> tuple[_Context, str]:
     return "start", ""
 
 
-def _qualifier(before: list[Token]) -> list[str]:
+def qualifier(before: list[Token]) -> list[str]:
     """`a.b.` right before the partial word → ["a", "b"]; [] when the word is not qualified."""
     parts: list[str] = []
     j = len(before) - 1
@@ -331,7 +345,7 @@ def _reference_name(dialect: Dialect, ref: ScopeRelation) -> str:
 # --- candidate sources -------------------------------------------------------------------------------------------
 
 
-def _qualified_candidates(parts: list[str], scope: Scope, index: SnapshotIndex) -> list[_Candidate]:
+def _qualified_candidates(parts: list[str], scope: Scope, index: SnapshotIndex) -> list[Candidate]:
     """`x.`: an alias, relation or CTE in scope → its columns; a schema → its relations; any relation → its
     columns."""
     if len(parts) == 1:
@@ -349,25 +363,25 @@ def _qualified_candidates(parts: list[str], scope: Scope, index: SnapshotIndex) 
     return _column_candidates(index.dialect, resolved[1]) if resolved else []
 
 
-def _cte_candidates(dialect: Dialect, tokens: list[Token]) -> list[_Candidate]:
+def _cte_candidates(dialect: Dialect, tokens: list[Token]) -> list[Candidate]:
     names = {cte.relation.name.lower(): cte.relation.name for cte in find_ctes(tokens)}
-    return _by_length(_Candidate.of(name, "table", "CTE", quote_ident(dialect, name)) for name in names.values())
+    return by_length(Candidate.of(name, "table", "CTE", quote_ident(dialect, name)) for name in names.values())
 
 
-def _scope_candidates(scope: Scope, index: SnapshotIndex) -> list[_Candidate]:
+def _scope_candidates(scope: Scope, index: SnapshotIndex) -> list[Candidate]:
     """Aliases (and unaliased relation names) of the statement, then the columns of every relation, once each."""
-    names: dict[str, _Candidate] = {}
-    columns: list[_Candidate] = []
+    names: dict[str, Candidate] = {}
+    columns: list[Candidate] = []
     seen: set[int] = set()
     for ref in scope.relations:
         resolved = _resolve_ref(index, scope, ref)
         if ref.alias is not None:
             detail = resolved[1].name if resolved else ref.name or "subquery"
-            names.setdefault(ref.alias.lower(), _Candidate.of(ref.alias, "alias", detail,
-                                                              quote_ident(index.dialect, ref.alias)))
+            names.setdefault(ref.alias.lower(), Candidate.of(ref.alias, "alias", detail,
+                                                             quote_ident(index.dialect, ref.alias)))
         elif resolved is not None:
             relation = resolved[1]
-            names.setdefault(relation.name.lower(), _Candidate.of(
+            names.setdefault(relation.name.lower(), Candidate.of(
                 relation.name, relation.kind, _relation_detail(*resolved), quote_ident(index.dialect, relation.name)))
         if resolved is not None and id(resolved[1]) not in seen:
             seen.add(id(resolved[1]))
@@ -386,13 +400,13 @@ def _fk_pairs(dialect: Dialect, src: _Resolved, src_ref: str, dst: _Resolved,
             ]
 
 
-def _join_candidate(name: str, pairs: Iterable[tuple[str, str]]) -> _Candidate:
+def _join_candidate(name: str, pairs: Iterable[tuple[str, str]]) -> Candidate:
     condition = " AND ".join(f"{left} = {right}" for left, right in pairs)
-    return _Candidate(condition, "join", name, condition, _JOIN_BOOST, condition.lower())
+    return Candidate(condition, "join", name, condition, _JOIN_BOOST, condition.lower())
 
 
 def _join_conditions(target: ScopeRelation, other: ScopeRelation, scope: Scope,
-                     index: SnapshotIndex) -> Iterator[_Candidate]:
+                     index: SnapshotIndex) -> Iterator[Candidate]:
     """FKs between the relation being joined and one already in the statement, either direction; the joined
     relation's side is written first."""
     joined, existing = _resolve_ref(index, scope, target), _resolve_ref(index, scope, other)
@@ -405,7 +419,7 @@ def _join_conditions(target: ScopeRelation, other: ScopeRelation, scope: Scope,
         yield _join_candidate(name, ((mine, theirs) for theirs, mine in pairs))
 
 
-def _join_candidates(scope: Scope, before: list[Token], index: SnapshotIndex) -> list[_Candidate]:
+def _join_candidates(scope: Scope, before: list[Token], index: SnapshotIndex) -> list[Candidate]:
     """FK join conditions for the relation just before the cursor's ON, against the relations before it in the same
     FROM (relations inside subqueries are not visible there)."""
     offset, group = before[-1].start, enclosing_group(before)
@@ -414,41 +428,41 @@ def _join_candidates(scope: Scope, before: list[Token], index: SnapshotIndex) ->
     if not earlier:
         return []
     target = earlier[-1]
-    found: dict[str, _Candidate] = {}
+    found: dict[str, Candidate] = {}
     for other in earlier[:-1]:
         for candidate in _join_conditions(target, other, scope, index):
             found.setdefault(candidate.label, candidate)
     return list(found.values())
 
 
-def _keywords(dialect: Dialect, group: Literal["start", "clause"]) -> list[_Candidate]:
+def keywords(dialect: Dialect, group: Literal["start", "clause"]) -> list[Candidate]:
     return _KEYWORD_CANDIDATES[(dialect, group)]
 
 
 def _candidates(before: list[Token], statement: list[Token], offset: int, dialect: Dialect,
-                index: SnapshotIndex | None) -> Iterable[_Candidate]:
+                index: SnapshotIndex | None) -> Iterable[Candidate]:
     """Everything that fits at `offset`, unfiltered. `before` are the significant tokens before the partial word,
     `statement` all significant tokens of the statement."""
-    parts = _qualifier(before)
+    parts = qualifier(before)
     if parts:
         return _qualified_candidates(parts, scope_at(statement, offset), index) if index is not None else []
-    context, keyword = _context(before)
+    context, keyword = clause_context(before)
     if context == "start" or context == "clause":
-        return _keywords(dialect, context)
+        return keywords(dialect, context)
     if index is None:
-        return _keywords(dialect, "clause") if context != "relations" else []
+        return keywords(dialect, "clause") if context != "relations" else []
     if context == "relations":  # CTEs first: they win ties against schema relations
         ctes = _cte_candidates(dialect, statement) if keyword in _CTE_KEYWORDS else []
         return chain(ctes, index.relation_candidates, index.schema_candidates)
     scope = scope_at(statement, offset)
     joins = _join_candidates(scope, before, index) if context == "join" else []
-    return chain(joins, _scope_candidates(scope, index), index.function_candidates, _keywords(dialect, "clause"))
+    return chain(joins, _scope_candidates(scope, index), index.function_candidates, keywords(dialect, "clause"))
 
 
-def _filter(candidates: Iterable[_Candidate], prefix: str) -> list[CompletionItem]:
+def filter_candidates(candidates: Iterable[Candidate], prefix: str) -> list[CompletionItem]:
     """Prefix matches (+2) before substring matches (+1); then kind, then each source's own order. At most 300."""
     needle = prefix.lower()
-    matched: list[tuple[int, _Candidate]] = []
+    matched: list[tuple[int, Candidate]] = []
     for candidate in candidates:
         if candidate.lower.startswith(needle):
             matched.append((candidate.boost + _PREFIX_BOOST, candidate))
@@ -461,7 +475,7 @@ def _filter(candidates: Iterable[_Candidate], prefix: str) -> list[CompletionIte
 # --- entry points ------------------------------------------------------------------------------------------------
 
 
-def _guarded[T](operation: str, cursor: int, default: T, run: Callable[[], T]) -> T:
+def guarded[T](operation: str, cursor: int, default: T, run: Callable[[], T]) -> T:
     """Runs on every keystroke: a bug must degrade to "no suggestions", never fail the request."""
     try:
         return run()
@@ -478,21 +492,54 @@ def complete(text: str, cursor: int, dialect: Dialect, index: SnapshotIndex | No
     """Completions at `cursor`; without an index only keywords. Never raises."""
     cursor = min(max(cursor, 0), len(text))
     empty = CompletionResult(start=cursor, end=cursor, items=[])
-    return _guarded("Completion", cursor, empty, lambda: _complete(text, cursor, dialect, index))
+    return guarded("Completion", cursor, empty, lambda: _complete(text, cursor, dialect, index))
+
+
+@dataclass(frozen=True, slots=True)
+class WordAtCursor:
+    """What is being typed at the cursor: the statement around it and the partial word before the cursor."""
+
+    start: int  # offset of the partial word in the text (the cursor, when none is being typed)
+    word_start: int  # the same offset in the statement: the offsets of its tokens
+    statement: list[Token]  # the statement's significant tokens
+    before: list[Token]  # those that end before the partial word
+    prefix: str
+    end: int  # where the text the items replace ends: the cursor, or the end of a quoted name
+    quoted: bool = False  # the partial word is inside a quoted name (`quoted_names`): the items replace all of it
+
+
+def _inside_quoted_name(token: Token, offset: int) -> bool:
+    """The cursor is after the opening quote of a quoted name and before its closing one (or the name never closes)."""
+    return token.kind == TokenKind.QUOTED and (offset < token.end or not token.terminated)
+
+
+def word_at_cursor(text: str, cursor: int, dialect: Dialect, quoted_names: bool = False) -> WordAtCursor | None:
+    """None inside a string, a comment or a quoted name, where nothing is suggested. With `quoted_names`, a quoted name
+    under the cursor is the partial word instead: what is typed after its opening quote is the prefix, and the items
+    replace the whole name, both quotes included."""
+    base, end = statement_bounds(text, cursor, dialect)
+    tokens = tokenize(text[base:end], dialect)
+    offset = cursor - base
+    at = token_before(tokens, offset)
+    statement = significant(tokens)
+    if quoted_names and at is not None and _inside_quoted_name(at, offset):
+        before = [token for token in statement if token.end <= at.start]
+        name_end = at.end if at.terminated else offset
+        return WordAtCursor(base + at.start, at.start, statement, before, text[base + at.start + 1:cursor],
+                            base + name_end, quoted=True)
+    if inside_literal(at, offset, dialect):
+        return None
+    word_start = at.start if at is not None and at.kind == TokenKind.WORD else offset
+    before = [token for token in statement if token.end <= word_start]
+    return WordAtCursor(base + word_start, word_start, statement, before, text[base + word_start:cursor], cursor)
 
 
 def _complete(text: str, cursor: int, dialect: Dialect, index: SnapshotIndex | None) -> CompletionResult:
-    base, end = _statement_bounds(text, cursor, dialect)
-    tokens = tokenize(text[base:end], dialect)
-    offset = cursor - base
-    at = _token_before(tokens, offset)
-    if _inside_literal(at, offset, dialect):
+    word = word_at_cursor(text, cursor, dialect)
+    if word is None:
         return CompletionResult(start=cursor, end=cursor, items=[])
-    word_start = at.start if at is not None and at.kind == TokenKind.WORD else offset
-    significant = _significant(tokens)
-    before = [token for token in significant if token.end <= word_start]
-    items = _filter(_candidates(before, significant, word_start, dialect, index), text[base + word_start:cursor])
-    return CompletionResult(start=base + word_start, end=cursor, items=items)
+    candidates = _candidates(word.before, word.statement, word.word_start, dialect, index)
+    return CompletionResult(start=word.start, end=word.end, items=filter_candidates(candidates, word.prefix))
 
 
 def describe_at(text: str, cursor: int, dialect: Dialect, index: SnapshotIndex | None) -> DescribeResult | None:
@@ -500,7 +547,7 @@ def describe_at(text: str, cursor: int, dialect: Dialect, index: SnapshotIndex |
     if index is None:
         return None
     cursor = min(max(cursor, 0), len(text))
-    return _guarded("Describe", cursor, None, lambda: _describe(text, cursor, dialect, index))
+    return guarded("Describe", cursor, None, lambda: _describe(text, cursor, dialect, index))
 
 
 def _identifier_at(tokens: list[Token], offset: int) -> int | None:
@@ -512,8 +559,8 @@ def _identifier_at(tokens: list[Token], offset: int) -> int | None:
 
 
 def _describe(text: str, cursor: int, dialect: Dialect, index: SnapshotIndex) -> DescribeResult | None:
-    base, end = _statement_bounds(text, cursor, dialect)
-    tokens = _significant(tokenize(text[base:end], dialect))
+    base, end = statement_bounds(text, cursor, dialect)
+    tokens = significant(tokenize(text[base:end], dialect))
     offset = cursor - base
     j = _identifier_at(tokens, offset)
     if j is None:

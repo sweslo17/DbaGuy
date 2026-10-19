@@ -9,9 +9,16 @@ export interface MenuItem {
   onSelect?: () => void;
   danger?: boolean;
   disabled?: boolean;
+  /** A tooltip: what the item does, or why it is disabled. */
+  title?: string;
   separatorBefore?: boolean;
   /** Shown muted at the right edge, e.g. "⌘C". */
   shortcut?: string;
+  /**
+   * Shown before the label. Its `svg`s are drawn in the row's text colour while the row is highlighted, so a coloured
+   * icon is never lost on the highlight.
+   */
+  icon?: ReactNode;
   /** A choice in a list: true shows a check mark (false keeps the mark's space, so the labels line up). */
   checked?: boolean;
   /** A submenu. */
@@ -45,9 +52,17 @@ function MenuItems({ items, parts: P }: { items: MenuItem[]; parts: MenuParts })
           </P.Portal>
         </P.Sub>
       ) : (
-        <P.Item onSelect={item.onSelect} disabled={item.disabled} className={cn(ITEM, item.danger && "text-danger")}>
+        <P.Item
+          onSelect={item.onSelect}
+          disabled={item.disabled}
+          title={item.title}
+          className={cn(ITEM, item.danger && "text-danger")}
+        >
           {item.checked !== undefined && (
             <Check size={12} className={cn("mr-1.5 -ml-0.5 shrink-0", !item.checked && "invisible")} />
+          )}
+          {item.icon && (
+            <span className="mr-1.5 flex shrink-0 in-data-[highlighted]:[&_svg]:text-accent-fg">{item.icon}</span>
           )}
           <span className="min-w-0 truncate">{item.label}</span>
           {item.shortcut && <span className="ml-auto pl-6 text-[12px] opacity-60">{item.shortcut}</span>}

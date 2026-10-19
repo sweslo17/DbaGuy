@@ -54,3 +54,12 @@ def test_askpass_script_is_written_lazily_for_password_auth(tmp_path):
     with pytest.raises(TunnelFailed):
         tunnels.acquire(uuid4(), bastion(), "postgres", 5432, "dev")
     assert askpass.exists() and askpass.stat().st_mode & 0o700 == 0o700
+
+
+def test_an_ipv6_target_is_bracketed_in_the_forward_spec():
+    from dbaguy_backend.connectivity.ssh_tunnel import forward_spec
+
+    assert forward_spec(5000, "db.internal", 5432) == "127.0.0.1:5000:db.internal:5432"
+    assert forward_spec(5000, "10.0.0.5", 5432) == "127.0.0.1:5000:10.0.0.5:5432"
+    assert forward_spec(5000, "fd00::5", 8093) == "127.0.0.1:5000:[fd00::5]:8093"
+    assert forward_spec(5000, "[fd00::5]", 8093) == "127.0.0.1:5000:[fd00::5]:8093"

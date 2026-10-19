@@ -1,15 +1,19 @@
 import { Loader2, Plus, X } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { EngineIcon } from "@/components/EngineIcon";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import type { Profile } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { isDialogOpen } from "@/lib/dialogs";
 import { isImeKeyEvent } from "@/lib/ime";
 import { isCommandKey } from "@/lib/shortcuts";
+import { revealInStrip, scrollSidewaysOnWheel } from "@/lib/stripScroll";
 import { useTabStatus } from "@/stores/tabStatus";
 import { useWorkspace, type Tab } from "@/stores/workspace";
 import { useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
+import { DocumentTab } from "../documents/DocumentTab";
+import { keyspaceLabel, keyspaceOfPath } from "../explorer/fieldSamples";
 import { ObjectDetailView } from "../explorer/ObjectDetailView";
 import { QueryTab } from "../query/QueryTab";
 import { relationOf } from "../table-data/filterValue";
@@ -20,8 +24,12 @@ import { WelcomeScreen } from "./WelcomeScreen";
 /** The attribute that marks a tab's content with its tab id. */
 const TAB_PANEL = "data-tab-panel";
 
-/** A tab's content: a query tab's editor, a relation's table data, or any other object's detail. */
-function TabContent({ tab, active }: { tab: Tab; active: boolean }) {
+/**
+ * A tab's content: a query tab's editor, a relation's table data, a Couchbase document, or any other object's detail.
+ * Memoized: changing one tab (a parameter typed, a context picked) replaces `tabs` but keeps every other tab's
+ * object, so only that one renders again (R-02c-4).
+ */
+const TabContent = memo(function TabContent({ tab, active }: { tab: Tab; active: boolean }) {
   switch (tab.kind) {
     case "query":
       return <QueryTab tab={tab} active={active} />;
@@ -31,10 +39,15 @@ function TabContent({ tab, active }: { tab: Tab; active: boolean }) {
     }
     case "object":
       return <ObjectDetailView tab={tab} />;
+    case "document":
+      return <DocumentTab tab={tab} active={active} />;
   }
-}
+});
 
-/** The tab's tooltip: its title and connection, and for a query tab bound to a script, the file (and if it is gone). */
+/**
+ * The tab's tooltip: its title and connection; for a query tab bound to a script, the file (and if it is gone); for a
+ * document, its collection (and that it is not saved yet).
+ */
 function tabTooltip(tab: Tab, profile: Profile | undefined, missing: boolean): string {
   const lines = [profile ? `${tab.title} · ${profile.name}` : tab.title];
   if (tab.kind === "query" && tab.scriptPath !== null) {
@@ -42,20 +55,33 @@ function tabTooltip(tab: Tab, profile: Profile | undefined, missing: boolean): s
     const resave = tab.textFromFile ? "" : "; ⌘S saves it again";
     lines.push(missing ? `${tab.scriptPath} — file missing${resave}` : tab.scriptPath);
   }
+  if (tab.kind === "document") {
+    const keyspace = keyspaceOfPath(tab.path);
+    if (keyspace) lines.push(keyspaceLabel(keyspace));
+    if (tab.isNew) lines.push("New document — not saved yet");
+  }
   return lines.join("\n");
 }
 
 /**
- * One tab in the strip: its connection's colour underlines it; a query tab shows a spinner while it works and a dot
- * when its script has unsaved changes. Every way of closing it goes through the close guards.
+ * One tab in the strip: its connection's engine icon leads it and its colour underlines it; a query tab shows a
+ * spinner while it works, and a query tab or a document a dot when it has unsaved changes. Every way of closing it
+ * goes through the close guards. It scrolls itself into view when it becomes the active tab.
  */
 function TabLabel({ tab, active, profile }: { tab: Tab; active: boolean; profile: Profile | undefined }) {
   const activate = useWorkspace((s) => s.activate);
   const status = useTabStatus(tab.id);
   const tint = profileColor(profile?.color);
   const query = tab.kind === "query";
+  const savable = query || tab.kind === "document";
+  // However it became active (opened, ⌘1–9, ⌃Tab, the palette, the restored workspace), the strip shows it.
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (active && ref.current) revealInStrip(ref.current);
+  }, [active]);
   return (
     <div
+      ref={ref}
       role="tab"
       aria-selected={active}
       onClick={() => activate(tab.id)}
@@ -69,9 +95,10 @@ function TabLabel({ tab, active, profile }: { tab: Tab; active: boolean; profile
       style={tint ? { boxShadow: `inset 0 -2px 0 ${tint}` } : undefined}
       title={tabTooltip(tab, profile, status.missing)}
     >
+      {profile && <EngineIcon engine={profile.engine} size={12} />}
       {query && status.busy && <Loader2 size={11} className="shrink-0 animate-spin text-muted" aria-label="Running" />}
       <span className="truncate">
-        {query && status.dirty && (
+        {savable && status.dirty && (
           <span
             className={status.missing ? "text-warning" : undefined}
             aria-label={status.missing ? "File missing" : "Unsaved changes"}
@@ -134,19 +161,27 @@ export function Workspace() {
 
   return (
     <div className="flex h-full flex-col">
-      <div role="tablist" className="flex h-8 shrink-0 items-end gap-px overflow-x-auto border-b border-border bg-panel px-1">
-        {tabs.map((tab) => (
-          <TabLabel
-            key={tab.id}
-            tab={tab}
-            active={tab.id === activeTabId}
-            profile={tab.profileId === null ? undefined : profilesById.get(tab.profileId)}
-          />
-        ))}
+      <div className="flex h-8 shrink-0 items-end border-b border-border bg-panel">
+        {/* No scrollbar of its own, whatever the system setting: one would sit inside the strip and cut off the tabs. The
+            strip scrolls by wheel, swipe, and by showing the active tab; the New query button stays outside it, in view. */}
+        <div
+          role="tablist"
+          className="scrollbar-none flex h-full min-w-0 flex-1 items-end gap-px overflow-x-auto overflow-y-hidden px-1"
+          onWheel={scrollSidewaysOnWheel}
+        >
+          {tabs.map((tab) => (
+            <TabLabel
+              key={tab.id}
+              tab={tab}
+              active={tab.id === activeTabId}
+              profile={tab.profileId === null ? undefined : profilesById.get(tab.profileId)}
+            />
+          ))}
+        </div>
         <button
           title="New query on the connection selected in the sidebar"
           aria-label="New query"
-          className="mb-1 ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted hover:bg-hover hover:text-fg"
+          className="mb-1 mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted hover:bg-hover hover:text-fg"
           onClick={newQuery}
         >
           <Plus size={14} />

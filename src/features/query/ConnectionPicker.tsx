@@ -1,16 +1,19 @@
 import { useQuery } from "@tanstack/react-query";
-import { ChevronDown, Database } from "lucide-react";
-import { useState, type ComponentProps } from "react";
+import { Database } from "lucide-react";
+import { useState } from "react";
+import { EngineIcon } from "@/components/EngineIcon";
 import { DropdownMenu, type MenuItem } from "@/components/ui/ContextMenu";
 import { errorMessage } from "@/lib/api/client";
 import type { ProfileEntry, SessionInfo } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
-import { ENGINE_LABELS } from "../connections/ConnectionDialog";
+import { ENGINE_LABELS } from "@/lib/engines";
 import { buildFolderTree, type FolderNode } from "../connections/folders";
 import { useEngineInfo, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
 import { childrenQuery } from "../explorer/useTreeRows";
 import type { SessionPhase } from "../session/SessionController";
+import { ContextPicker, type ContextPickerProps } from "./ContextPicker";
+import { PickerTrigger } from "./PickerTrigger";
 
 const PHASE_DOT: Record<SessionPhase, string> = {
   opening: "bg-warning",
@@ -32,6 +35,8 @@ export interface ConnectionPickerProps {
   blockedReason?: string;
   /** A new profile (database null: its default) or another database of the same profile. */
   onChange: (profileId: string, database: string | null) => void;
+  /** The query context picker, shown for engines that take one (Couchbase), after the profile. */
+  context?: ContextPickerProps;
 }
 
 /** The connections as menu items: folders become submenus, like the explorer's tree. */
@@ -40,28 +45,13 @@ function profileItems(folder: FolderNode, current: string | null, pick: (id: str
     ...folder.folders.map((sub) => ({ label: sub.name, children: profileItems(sub, current, pick) })),
     ...folder.profiles.map(({ profile }) => ({
       label: profile.name,
+      // The engine's name is the row's shortcut text.
+      icon: <EngineIcon engine={profile.engine} decorative />,
       shortcut: ENGINE_LABELS[profile.engine],
       checked: profile.id === current,
       onSelect: () => pick(profile.id),
     })),
   ];
-}
-
-/** A menu's button, shrinking to a truncated name when crowded; Radix passes its trigger props (and ref) through. */
-function Trigger({ children, className, ...props }: ComponentProps<"button">) {
-  return (
-    <button
-      type="button"
-      className={cn(
-        "flex h-6 min-w-12 items-center gap-1 rounded-md px-1.5 text-[12px] outline-none focus-visible:ring-2 focus-visible:ring-accent/50 disabled:opacity-50",
-        className,
-      )}
-      {...props}
-    >
-      {children}
-      <ChevronDown size={12} className="shrink-0 opacity-70" />
-    </button>
-  );
 }
 
 /**
@@ -96,25 +86,26 @@ function DatabasePicker({
   }
   return (
     <DropdownMenu items={items} onOpenChange={setOpen} className="max-h-[60vh] max-w-[320px] overflow-y-auto">
-      <Trigger
+      <PickerTrigger
         disabled={!!blockedReason}
         title={blockedReason ?? `Database: ${current ?? "the connection's default"}`}
         className="max-w-[160px] enabled:hover:bg-hover"
       >
         <Database size={12} className="shrink-0 text-muted" />
         <span className="truncate">{current ?? "Default database"}</span>
-      </Trigger>
+      </PickerTrigger>
     </DropdownMenu>
   );
 }
 
 /**
  * The tab's connection (spec §4.2): the profile (grouped by folder) and, for engines with one connection per database,
- * the database, with the session's phase as a dot and its server version. A red profile's name sits on a red chip.
- * Changing either reopens the tab's session (the tab asks first if that would lose an export or a transaction).
+ * the database, or, for engines with a query context (Couchbase), the context picker, with the session's phase as a dot
+ * and its server version. A red profile's name sits on a red chip. Changing the profile or the database reopens the
+ * tab's session (the tab asks first if that would lose an export or a transaction); the context does not.
  */
 export function ConnectionPicker(props: ConnectionPickerProps) {
-  const { profileId, database, phase, session, sessionFailed, blockedReason, onChange } = props;
+  const { profileId, database, phase, session, sessionFailed, blockedReason, onChange, context } = props;
   const engine = useEngineInfo(profileId);
   const profiles = useProfiles();
   const entries: ProfileEntry[] = profiles.data ?? [];
@@ -139,20 +130,24 @@ export function ConnectionPicker(props: ConnectionPickerProps) {
         <span className={cn("h-2 w-2 shrink-0 rounded-full", PHASE_DOT[phase])} title={`Session ${phase}`} />
       )}
       <DropdownMenu items={items} align="end" className="max-h-[60vh] max-w-[360px] overflow-y-auto">
-        <Trigger
+        <PickerTrigger
           disabled={!!blockedReason}
           title={blockedReason ?? (profile ? `Connection: ${profile.name}` : "Connection")}
           className={cn(
             "max-w-[180px]",
             // A red profile keeps its red chip, also while disabled.
-            red ? "bg-danger font-medium text-accent-fg enabled:hover:brightness-110" : "enabled:hover:bg-hover",
+            red
+              ? // The icons take the chip's text colour: the engine's own red would vanish on it.
+                "bg-danger font-medium text-accent-fg enabled:hover:brightness-110 [&_svg]:text-accent-fg"
+              : "enabled:hover:bg-hover",
           )}
         >
+          {profile && <EngineIcon engine={profile.engine} size={12} />}
           {!red && tint && <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: tint }} />}
           <span className={cn("truncate", profile ? "font-medium" : "text-muted")}>
             {profile?.name ?? (profileId ? "…" : "Choose a connection")}
           </span>
-        </Trigger>
+        </PickerTrigger>
       </DropdownMenu>
       {profileId !== null && engine?.per_database_connection && (
         <DatabasePicker
@@ -162,6 +157,7 @@ export function ConnectionPicker(props: ConnectionPickerProps) {
           onPick={(name) => name !== currentDatabase && onChange(profileId, name)}
         />
       )}
+      {profileId !== null && engine?.query_context && context && <ContextPicker profileId={profileId} {...context} />}
       {/* Basis 0: it only takes the room left over (up to its own width); in a narrow toolbar it is not shown at all. */}
       {detail && (
         <span className="max-w-max min-w-0 grow basis-0 truncate text-[11px] text-muted @max-[50rem]:hidden">

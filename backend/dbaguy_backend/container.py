@@ -4,6 +4,7 @@ from pathlib import Path
 
 from loguru import logger
 
+from .adapters.couchbase.adapter import CouchbaseAdapter
 from .adapters.mssql import freetds
 from .adapters.mssql.adapter import MssqlAdapter
 from .adapters.mysql.adapter import MysqlAdapter
@@ -13,6 +14,9 @@ from .adapters.sqlite.adapter import SqliteAdapter
 from .config import Settings, default_data_dir
 from .connectivity.ssh_tunnel import SshTunnelManager
 from .services.connection_service import ConnectionService
+from .services.couchbase_service import CouchbaseService
+from .services.document_service import DocumentService
+from .services.field_sample_service import FieldSampleService
 from .services.history_service import HistoryService
 from .services.metadata_service import MetadataService
 from .services.profile_service import ProfileService
@@ -28,7 +32,8 @@ from .storage.paths import default_scripts_dir, history_file, profiles_file, set
 from .storage.profile_store import ProfileStore
 from .storage.secret_store import APP_KEYCHAIN_SERVICE, DEV_KEYCHAIN_SERVICE, KeyringSecretStore, SecretStore
 
-_HOUSEKEEPING_INTERVAL_S = 15  # also the resolution of the idle-transaction warning and rollback
+# also the resolution of the idle-transaction warning and rollback, and of closing idle paused results
+_HOUSEKEEPING_INTERVAL_S = 15
 
 
 def default_registry(freetds_conf: Path | None = None) -> AdapterRegistry:
@@ -36,7 +41,7 @@ def default_registry(freetds_conf: Path | None = None) -> AdapterRegistry:
     written by the first SQL Server connect, so building the app never writes into the data dir (R-03b-P9)."""
     if freetds_conf is not None:
         freetds.use(freetds_conf)
-    return AdapterRegistry([PostgresAdapter(), MysqlAdapter(), MssqlAdapter(), SqliteAdapter()])
+    return AdapterRegistry([PostgresAdapter(), MysqlAdapter(), MssqlAdapter(), CouchbaseAdapter(), SqliteAdapter()])
 
 
 def keychain_service(data_dir: Path) -> str:
@@ -71,6 +76,9 @@ class AppContainer:
         self.connections = ConnectionService(self.registry, self.profiles, self.tunnels)
         self.metadata = MetadataService(self.registry, self.connections, self.profiles)
         self.schema_cache = SchemaCache(self.metadata, self.registry, self.profiles)
+        self.couchbase = CouchbaseService(self.registry, self.profiles, self.schema_cache, self.metadata)
+        self.documents = DocumentService(self.metadata, self.profiles, self.registry)
+        self.field_samples = FieldSampleService(self.metadata, self.app_settings)
         self.history = HistoryService(history_file(data_dir))
         self.policy = SafetyPolicy()
         hooks = SessionHooksFactory(self.registry, self.profiles, self.policy, self.history, self.schema_cache)
@@ -96,6 +104,7 @@ class AppContainer:
         self._guarded("Session reaping", self.sessions.reap_idle)
         self._guarded("Metadata reaping", self.metadata.reap_idle)
         self._guarded("Idle-transaction check", self._check_idle_transactions)
+        self._guarded("Paused-result check", self.sessions.check_paused_results)
 
     def _check_idle_transactions(self) -> None:
         safety = self.app_settings.get().safety  # read on every pass: a changed setting applies without a restart

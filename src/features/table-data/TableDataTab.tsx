@@ -10,6 +10,7 @@ import { cn } from "@/lib/cn";
 import { plural } from "@/lib/format";
 import { useWorkspace, type TableTabState } from "@/stores/workspace";
 import { useDialect, useProfiles } from "../connections/hooks";
+import { RecoverableError } from "../connections/RecoverableError";
 import { ColumnsView, DdlView } from "../explorer/ObjectDetailView";
 import { kindLabel } from "../explorer/kinds";
 import { DataGrid } from "../grid/DataGrid";
@@ -18,7 +19,6 @@ import type { GridSort } from "../grid/GridHeader";
 import { useHeldResult } from "../grid/useHeldResult";
 import { CONNECTION_LOST } from "../session/execution";
 import { isExporting } from "../session/SessionController";
-import { SessionError } from "../session/SessionError";
 import { useSessionGuards } from "../session/SessionGuards";
 import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
 import { FilterBar } from "./FilterBar";
@@ -255,7 +255,7 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
           onCancel={table.cancelCount}
         />
       </div>
-      <SessionError profileId={tab.profileId} error={snapshot?.error ?? null} onRetry={table.retry} />
+      <RecoverableError profileId={tab.profileId} error={snapshot?.error ?? null} onRetry={table.retry} />
       {state.error && (
         <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-1.5 text-[12px] text-danger">
           <span className="min-w-0 flex-1 whitespace-pre-wrap" data-selectable>

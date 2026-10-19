@@ -5,7 +5,8 @@ from pydantic import BaseModel
 
 from .metadata import PathSegment
 
-RelationKind = Literal["table", "view", "materialized_view", "synonym"]  # synonym: SQL Server, no columns
+# synonym: SQL Server, no columns; collection: Couchbase, found by ⌘P (not a relation of the snapshot's schemas)
+RelationKind = Literal["table", "view", "materialized_view", "synonym", "collection"]
 
 
 class SnapshotColumn(BaseModel):
@@ -36,12 +37,22 @@ class SnapshotSchema(BaseModel):
     functions: list[str] = []
 
 
+class SnapshotKeyspace(BaseModel):
+    """A Couchbase collection; the bucket-level (default) keyspace is `_default._default` of its bucket."""
+
+    bucket: str
+    scope: str
+    collection: str
+    system: bool = False
+
+
 class SchemaSnapshot(BaseModel):
     database: str | None
     default_schema: str | None
     search_path: list[str]
     schemas: list[SnapshotSchema]
     built_at: datetime
+    keyspaces: list[SnapshotKeyspace] = []  # Couchbase keyspaces; relational engines leave it empty
 
 
 class ObjectSearchHit(BaseModel):

@@ -13,12 +13,13 @@ export type CloseGuard = (intent: CloseIntent) => Promise<boolean> | boolean;
  * The order a tab's guards are asked in, lowest first (ruling R-02c-8): the unsaved script first, while nothing has
  * been done yet (its Cancel must never follow a side effect), then a running export, then the run (no further
  * statement is sent), then an open transaction. A disconnect asks only the session's guards (the tab, and so its
- * script, stays).
+ * script, stays). A document tab's unsaved text (`document`, ruling C20) is asked first too: a tab has a script or a
+ * document, never both, and a document tab has no session.
  */
-export const CLOSE_GUARD_ORDER = { script: 5, export: 10, run: 15, transaction: 20 } as const;
+export const CLOSE_GUARD_ORDER = { script: 5, document: 5, export: 10, run: 15, transaction: 20 } as const;
 
 /** The guards that only closing asks: losing the connection keeps the tab and its text. */
-const CLOSE_ONLY: ReadonlySet<number> = new Set([CLOSE_GUARD_ORDER.script]);
+const CLOSE_ONLY: ReadonlySet<number> = new Set([CLOSE_GUARD_ORDER.script, CLOSE_GUARD_ORDER.document]);
 
 interface Entry {
   order: number;

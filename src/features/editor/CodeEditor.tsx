@@ -1,17 +1,27 @@
-import { Compartment, EditorSelection, EditorState, Transaction, type Extension } from "@codemirror/state";
+import { isolateHistory } from "@codemirror/commands";
+import { Compartment, EditorSelection, EditorState, type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, type Ref } from "react";
 import type { Dialect } from "@/lib/api/types";
+import { clamp } from "@/lib/math";
 import { useAppSettings } from "@/stores/settings";
-import { baseExtensions, editorOptions, reconfigureEffects, type EditorOptions } from "./extensions";
+import {
+  baseExtensions,
+  editorOptions,
+  reconfigureEffects,
+  type EditorLanguage,
+  type EditorOptions,
+} from "./extensions";
+import { startingPoint } from "./startingPoint";
 
 export interface CodeEditorHandle {
   view: EditorView;
   getText(): string;
   /**
-   * Replaces the whole text outside the undo history, as the editor's starting content (e.g. a script read for its
-   * restored tab): undo never goes back to the text it replaced. The selection is placed as given (clamped), else at
-   * the start, and scrolled into view.
+   * Replaces the whole text as the editor's starting content (a script read for its restored tab, a document loaded or
+   * reloaded): it is not an undo step, and the undo and redo history is emptied, since CodeMirror would map the old
+   * events through the replacement and Undo would put pieces of the old text into the new one. The selection is placed
+   * as given (clamped), else at the start, and scrolled into view.
    */
   setText(text: string, selection?: { anchor: number; head: number }): void;
   focus(): void;
@@ -22,6 +32,11 @@ export interface CodeEditorHandle {
    * cursor ends after it, in view, and the editor takes the focus.
    */
   insert(text: string): void;
+  /**
+   * Replaces the whole text (a formatter's result) as one undoable change of its own, never merged with typing around
+   * it: undo brings the text back. The cursor goes to the start, in view.
+   */
+  replaceAll(text: string): void;
 }
 
 /** An editor's text and main selection. */
@@ -33,8 +48,10 @@ export interface EditorContent {
 export interface CodeEditorProps {
   initialText: string;
   initialSelection?: { anchor: number; head: number };
-  /** The language mode; null → generic SQL. */
+  /** The SQL mode; null → generic SQL. Ignored for `language="json"`. */
   dialect: Dialect | null;
+  /** What the text is: SQL (the default) or JSON (a Couchbase document). */
+  language?: EditorLanguage;
   /** No typing (the text can still be set through the handle). */
   readOnly?: boolean;
   /** The text changed. Called on every keystroke, so it carries no text: read it (`getText`) only when needed. */
@@ -57,17 +74,16 @@ export interface CodeEditorProps {
 const callerExtensions = new Compartment();
 const NONE: Extension[] = [];
 
-const clamp = (pos: number, length: number) => Math.min(Math.max(0, pos), length);
-
 /**
- * A CodeMirror 6 SQL editor. The `EditorView` is created once and lives as long as the component, so undo history,
- * selection and scroll survive while a hidden tab stays mounted. Settings and dialect changes reconfigure it through
- * compartments; it is never recreated.
+ * A CodeMirror 6 editor for SQL, or for JSON (a Couchbase document). The `EditorView` is created once and lives as
+ * long as the component, so undo history, selection and scroll survive while a hidden tab stays mounted. Settings,
+ * dialect and language changes reconfigure it through compartments; it is never recreated.
  */
 export function CodeEditor({
   initialText,
   initialSelection,
   dialect,
+  language = "sql",
   readOnly = false,
   onChange,
   onSelectionChange,
@@ -79,7 +95,10 @@ export function CodeEditor({
   const viewRef = useRef<EditorView | null>(null);
   const { settings } = useAppSettings();
   const editor = settings.editor;
-  const options = useMemo(() => editorOptions(editor, dialect, readOnly), [editor, dialect, readOnly]);
+  const options = useMemo(
+    () => editorOptions(editor, dialect, readOnly, language),
+    [editor, dialect, readOnly, language],
+  );
   // What the view is configured with now: the reconfigure effects only swap what changed since.
   const applied = useRef<{ options: EditorOptions; extensions: Extension[] }>({ options, extensions });
   const latest = useRef({ initialText, initialSelection, options, extensions, onChange, onSelectionChange, onUnmount });
@@ -92,7 +111,10 @@ export function CodeEditor({
     const init = latest.current;
     const length = init.initialText.length;
     const selection = init.initialSelection
-      ? EditorSelection.single(clamp(init.initialSelection.anchor, length), clamp(init.initialSelection.head, length))
+      ? EditorSelection.single(
+          clamp(init.initialSelection.anchor, 0, length),
+          clamp(init.initialSelection.head, 0, length),
+        )
       : undefined;
     const listener = EditorView.updateListener.of((update) => {
       const { onChange: changed, onSelectionChange: selected } = latest.current;
@@ -149,22 +171,16 @@ export function CodeEditor({
         getText: () => current().state.doc.toString(),
         setText: (text, selection) => {
           const view = current();
-          const insert = view.state.toText(text); // its length as the editor counts it (line breaks normalised)
-          view.dispatch({
-            changes: { from: 0, to: view.state.doc.length, insert },
-            selection: EditorSelection.single(
-              clamp(selection?.anchor ?? 0, insert.length),
-              clamp(selection?.head ?? 0, insert.length),
-            ),
-            scrollIntoView: true,
-            annotations: Transaction.addToHistory.of(false),
-          });
+          for (const spec of startingPoint(view.state, text, selection)) view.dispatch(spec);
         },
         focus: () => current().focus(),
         selectRange: (from, to) => {
           const view = current();
           const length = view.state.doc.length;
-          view.dispatch({ selection: EditorSelection.single(clamp(from, length), clamp(to, length)), scrollIntoView: true });
+          view.dispatch({
+            selection: EditorSelection.single(clamp(from, 0, length), clamp(to, 0, length)),
+            scrollIntoView: true,
+          });
         },
         insert: (text) => {
           const view = current();
@@ -177,6 +193,16 @@ export function CodeEditor({
             userEvent: "input.paste", // its own undo step, like a paste
           });
           view.focus();
+        },
+        replaceAll: (text) => {
+          const view = current();
+          view.dispatch({
+            changes: { from: 0, to: view.state.doc.length, insert: view.state.toText(text) },
+            selection: EditorSelection.cursor(0),
+            scrollIntoView: true,
+            userEvent: "format",
+            annotations: isolateHistory.of("full"), // its own undo step, never merged with typing around it
+          });
         },
       };
     },

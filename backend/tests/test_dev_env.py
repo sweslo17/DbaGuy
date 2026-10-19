@@ -1,18 +1,35 @@
+import http.client
+import json
+
 import mysql.connector
 import psycopg
 import pytest
 from pymssql import _mssql
 
+from tests.fake_ssh import wait_until
 from tests.support import (
+    COUCHBASE_HOST,
+    COUCHBASE_PORT,
+    COUCHBASE_READER,
     PG_HOST,
     PG_PASSWORD,
     PG_PORT,
     PG_USER,
+    _basic,
+    couchbase_query,
+    couchbase_query_text,
     mssql_connect,
     mysql_driver_kwargs,
+    plan_fixture,
+    put_raw_document,
+    request_active,
+    requires_couchbase,
     requires_mssql,
     requires_mysql,
     requires_pg,
+    scratch_documents,
+    scratch_key,
+    stored_document,
 )
 
 
@@ -111,3 +128,73 @@ def test_dev_mssql_is_seeded():
         assert one("SELECT CAST(v AS int) FROM dbo.variant_cases WHERE id = 2") == 42
     finally:
         conn.close()
+
+
+U_NUMBERS = (
+    '{"big":9007199254740993,"i64max":9223372036854775807,"i64min":-9223372036854775808,'
+    '"u64max":18446744073709551615,"beyond":12345678901234567890,"dec":1.10,'
+    '"pi":3.141592653589793238462643383279,"sci":1E+3,"tiny":1e-400,"huge":1e400,"half":0.5}'
+)
+
+
+@requires_couchbase
+def test_dev_couchbase_is_seeded():
+    def one(statement, **kw):
+        return couchbase_query(statement, **kw)["results"][0]
+
+    assert one("SELECT RAW COUNT(*) FROM dbaguy.app.events") == 20_000
+    assert one('SELECT RAW COUNT(*) FROM system:keyspaces AS k WHERE k.`bucket` = "dbaguy" AND k.`scope` = "many"') == 300
+    assert one('SELECT RAW i.state FROM system:indexes AS i WHERE i.name = "idx_users_deferred"') == "deferred"
+    assert one('SELECT RAW d FROM dbaguy.app.events AS d USE KEYS "e101000"')["late"]
+    # Stored byte for byte, and passed through unchanged by SELECT RAW (survey §4)
+    assert U_NUMBERS in couchbase_query_text('SELECT RAW d FROM dbaguy.app.users AS d USE KEYS "u_numbers"')
+    types = couchbase_query('SELECT RAW META(d).type FROM dbaguy.app.blobs AS d USE KEYS ["bin1", "txt1", "j1"]')
+    assert sorted(types["results"]) == ["base64", "base64", "json"]  # A20
+    assert one('SELECT RAW META(d).expiration FROM dbaguy.app.users AS d USE KEYS "u_ttl"') == 4102444800  # A21
+    assert one('SELECT RAW LENGTH(d.blob) FROM dbaguy.app.users AS d USE KEYS "u_big"') == 5 * 1024 * 1024
+    # No `namespace` predicate (P35): every keyspace is in the one namespace `default` (the 7.6.12 rows carry both
+    # `namespace` and `namespace_id`, A22).
+    reader = couchbase_query("SELECT RAW k.name FROM system:keyspaces AS k", user=COUCHBASE_READER)
+    assert reader["results"] == ["users"]  # the limited user sees only its own keyspace (survey §5.1)
+
+
+@requires_couchbase
+def test_request_active_follows_a_request():
+    ident = "dbaguy-t1-active"
+    conn = http.client.HTTPConnection(COUCHBASE_HOST, COUCHBASE_PORT, timeout=30)
+    body = json.dumps({"statement": "SELECT RAW a * 1000 + b FROM ARRAY_RANGE(0, 100000) AS a "
+                                    "UNNEST ARRAY_RANGE(0, 1000) AS b", "client_context_id": ident})
+    conn.request("POST", "/query/service", body=body,
+                 headers={"Authorization": _basic("dbaguy", "dbaguy"), "Content-Type": "application/json"})
+    response = conn.getresponse()
+    response.read1(1024)  # the request runs: rows are streaming, the client stops reading
+    try:
+        assert request_active(ident)
+    finally:
+        conn.close()  # the server stops the request once the connection goes
+    wait_until(lambda: not request_active(ident), 10)
+
+
+@pytest.mark.parametrize("name, key", [
+    ("explain_covered", "plan"), ("explain_fetch", "plan"), ("explain_primary", "plan"),
+    ("explain_sequential", "plan"), ("explain_intersect", "plan"), ("explain_join", "plan"),
+    ("explain_subquery", "~subqueries"), ("advise_indexes", "advice"), ("advise_covering", "advice"),
+    ("advise_none", "advice"), ("profile_timings", "executionTimings"), ("profile_join", "executionTimings"),
+])
+def test_plan_fixtures_hold_the_server_shapes(name, key):  # files only: no cluster needed
+    assert key in json.loads(plan_fixture(name))
+
+
+@requires_couchbase
+def test_scratch_documents_are_stored_as_sent_and_removed():
+    with scratch_documents() as keys:
+        text, binary, expiring = scratch_key("t"), scratch_key("b"), scratch_key("x")
+        keys += [text, binary, expiring]
+        put_raw_document(text, '{"b": 1,\n "a": 1.10}')
+        put_raw_document(binary, "not json")
+        put_raw_document(expiring, '{"a":1}', expiry=2_000_000_000)
+        assert stored_document(text).text == '{"b": 1,\n "a": 1.10}'
+        assert stored_document(text).cas.isdigit() and stored_document(text).type == "json"
+        assert stored_document(binary).type == "base64"
+        assert stored_document(expiring).expiration == 2_000_000_000
+    assert [stored_document(key) for key in (text, binary, expiring)] == [None, None, None]

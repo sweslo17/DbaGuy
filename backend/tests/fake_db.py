@@ -5,6 +5,7 @@ from typing import Any
 
 from dbaguy_backend.adapters.base import (
     DatabaseConnection,
+    RunOptions,
     StatementCancelled,
     StatementError,
     StatementResult,
@@ -44,12 +45,17 @@ class FakeResult(StatementResult):
 class FakeConnection(DatabaseConnection):
     """`run()` words: `rows N` returns N rows; `block` waits until cancel() (then raises StatementCancelled); `hold`
     waits for a forced cancel or an abort (a statement a plain cancel cannot stop);
-    `fail MSG` raises StatementError (and aborts an open transaction, like PostgreSQL); `begin` opens a transaction;
-    anything else returns an empty result. In manual-commit mode (`auto` False) every statement opens a transaction
-    first, like the real adapters."""
+    `fail MSG` raises StatementError (and aborts an open transaction, like PostgreSQL); `crash` raises RuntimeError (a
+    driver bug); `begin` opens a transaction; anything else returns an empty result. In manual-commit mode (`auto`
+    False) every statement opens a transaction first, like the real adapters.
+
+    Cancels behave like a real server's: one reaches only the statement inside run(), one with nothing running is
+    ignored, and one while armed (`arm_cancel`, Task 6b) is kept, so run() raises StatementCancelled before the
+    statement starts (it is then not in `runs`). `calls` spies on the window: "arm", "keep", "run", "disarm"."""
 
     def __init__(self) -> None:
         self.runs: list[str] = []
+        self.options: list[RunOptions | None] = []  # what each run() received, in order
         self.cancel_calls = 0
         self.interruptions: list[str] = []  # "cancel", "force", "abort", in order
         self._forced = threading.Event()
@@ -61,6 +67,11 @@ class FakeConnection(DatabaseConnection):
         self.commits = 0
         self.rollbacks = 0
         self.failed = False  # the open transaction is aborted (set by `fail` inside a transaction)
+        self.calls: list[str] = []
+        self._window = threading.Lock()  # guards the three flags below
+        self.armed = False
+        self._kept = False  # a cancel reached the armed window
+        self._running = False  # inside run(): a cancel reaches the statement
 
     def server_info(self) -> ServerInfo:
         return ServerInfo(engine=Engine.SQLITE, version="fake")
@@ -77,23 +88,49 @@ class FakeConnection(DatabaseConnection):
     def schema_snapshot(self) -> SchemaSnapshot:
         raise NotImplementedError
 
-    def run(self, sql: str) -> StatementResult:
-        """`rows N` → N rows; `block` → waits for cancel(); `fail MSG` → StatementError; `begin` opens a
-        transaction; anything else → an empty result."""
+    def arm_cancel(self) -> None:
+        with self._window:
+            self.calls.append("arm")
+            self.armed, self._kept = True, False
+
+    def disarm_cancel(self) -> None:
+        with self._window:
+            self.calls.append("disarm")
+            self.armed = self._kept = False
+
+    def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
+        with self._window:
+            self.calls.append("run")
+            kept, self.armed, self._kept = self._kept, False, False
+            if kept:
+                raise StatementCancelled()  # nothing started
+            self._running = True
+        try:
+            return self.statement(sql, options)
+        finally:
+            with self._window:  # a cancel of this statement ends with it
+                self._running = False
+                self._unblock.clear()
+                self._forced.clear()
+
+    def statement(self, sql: str, options: RunOptions | None) -> StatementResult:
+        """What the statement does once it runs: `rows N` → N rows; `block` → waits for cancel(); `fail MSG` →
+        StatementError; `begin` opens a transaction; anything else → an empty result."""
         self.runs.append(sql)
+        self.options.append(options)
         if not self.auto:
             self.tx = True  # manual mode: the adapters BEGIN before the statement, even a SELECT that then pauses
         word, _, arg = sql.partition(" ")
         if word == "hold":
             self.blocked.set()
             assert self._forced.wait(10), "hold was never forced"
-            self._forced.clear()
             raise StatementError("Connection to the server was lost", code="connection_lost")
         if word == "block":
             self.blocked.set()
             assert self._unblock.wait(10), "block was never cancelled"
-            self._unblock.clear()  # one fake connection can serve several `block` statements in a test
             raise StatementCancelled()
+        if word == "crash":
+            raise RuntimeError("crash")
         if word == "fail":
             self.failed = self.tx
             raise StatementError(arg or "boom", code="42000")
@@ -131,11 +168,16 @@ class FakeConnection(DatabaseConnection):
             self.failed = False
 
     def _interrupt(self, kind: str) -> None:
-        self.cancel_calls += 1
-        self.interruptions.append(kind)
-        self._unblock.set()
-        if kind != "cancel":
-            self._forced.set()
+        with self._window:
+            self.cancel_calls += 1
+            self.interruptions.append(kind)
+            if self.armed:
+                self.calls.append("keep")
+                self._kept = True
+            elif self._running:
+                self._unblock.set()
+                if kind != "cancel":
+                    self._forced.set()
 
     def cancel(self) -> None:
         self._interrupt("cancel")

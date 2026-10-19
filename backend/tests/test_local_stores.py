@@ -3,14 +3,17 @@ import os
 
 import pytest
 from loguru import logger
+from pydantic import ValidationError
 
 from dbaguy_backend.domain.errors import AlreadyExists, NotFound, StorageError, ValidationFailed
+from dbaguy_backend.domain.execution import QueryContext
+from dbaguy_backend.domain.metadata import PathSegment
 from dbaguy_backend.domain.settings import AppSettings
-from dbaguy_backend.domain.workspace import WorkspaceState
+from dbaguy_backend.domain.workspace import WorkspaceState, WorkspaceTab
 from dbaguy_backend.services import scripts_service
 from dbaguy_backend.services.scripts_service import ScriptsService
 from dbaguy_backend.services.settings_service import SettingsService
-from dbaguy_backend.services.workspace_service import WorkspaceService
+from dbaguy_backend.services.workspace_service import WorkspaceService, repaired_workspace
 from dbaguy_backend.storage.atomic_file import atomic_text_file
 from dbaguy_backend.storage.json_files import JsonDocument, write_text_atomic
 
@@ -97,12 +100,14 @@ def test_settings_defaults_and_unknown_fields_survive(tmp_path):
     service = SettingsService(path, tmp_path / "scripts")
     current = service.get()
     assert current.editor.font_size == 15 and current.run.page_size == 500
+    assert current.couchbase.sample_size == 1000  # a settings.json from before 04b has no couchbase section
     service.update(current.model_copy(update={"run": current.run.model_copy(update={"page_size": 1000})}))
     saved = json.loads(path.read_text())
     assert saved["run"]["page_size"] == 1000 and saved["future_section"] == {"x": 2} and saved["editor"]["future"] == 1
 
 
-@pytest.mark.parametrize("content", ["{not json", '{"editor": {"font_size": 999}}', "[]"])
+@pytest.mark.parametrize("content", ["{not json", '{"editor": {"font_size": 999}}', '{"couchbase": {"sample_size": 9}}',
+                                     "[]"])
 def test_unreadable_settings_are_moved_aside(tmp_path, content):
     path = tmp_path / "settings.json"
     path.write_text(content)
@@ -192,6 +197,21 @@ def test_workspace_keeps_object_tabs(tmp_path):
     assert WorkspaceService(tmp_path / "workspace.json").get() == state
 
 
+def test_workspace_keeps_document_tabs(tmp_path):  # Review Focus 5, ruling C15
+    path = [{"kind": "bucket", "name": "dbaguy"}, {"kind": "scope", "name": "app"},
+            {"kind": "collection", "name": "users"}, {"kind": "document", "name": "u 1/😀"}]
+    state = WorkspaceState.model_validate({"tabs": [
+        {"id": "d1", "kind": "document", "title": "u 1/😀", "object_path": path, "buffer": '{"a": 1}',
+         "document_cas": "1792325990605258752"},
+        {"id": "d2", "kind": "document", "title": "u2", "object_path": path[:3] + [{"kind": "document", "name": "u2"}]},
+    ]})
+    service = WorkspaceService(tmp_path / "workspace.json")
+    service.put(state)
+    assert service.get() == state
+    with pytest.raises(ValidationError):
+        WorkspaceTab(id="d3", kind="document", document_cas="12ab")
+
+
 def test_an_invalid_tab_is_dropped_alone_with_a_warning_naming_its_fields(tmp_path, logged_warnings):
     path = tmp_path / "workspace.json"
     path.write_text(json.dumps({"tabs": [
@@ -205,6 +225,72 @@ def test_an_invalid_tab_is_dropped_alone_with_a_warning_naming_its_fields(tmp_pa
     assert len(logged_warnings) == 1
     assert "1" in logged_warnings[0] and "kind" in logged_warnings[0] and "cursor" in logged_warnings[0]
     assert "secret-buffer" not in logged_warnings[0] and "chart" not in logged_warnings[0]
+
+
+def test_a_tab_with_bad_drafts_or_context_keeps_its_buffer_and_loses_only_those(tmp_path, logged_warnings):
+    path = tmp_path / "workspace.json"
+    bad_names = {"$1000": "1", "$x y": "1", "$0": "1", "$1abc": "1", "$\u00e9": "1", "$line\nbreak": "1"}
+    path.write_text(json.dumps({"tabs": [
+        {"id": "t1", "kind": "query", "buffer": "SELECT $x", "query_context": "all",
+         "params": {"$ok": "1", **bad_names, "$big": "x" * (1 << 20) + "y"}},
+        {"id": "t2", "kind": "query", "buffer": "kept", "params": {"$a": "1"},
+         "query_context": {"bucket": "b", "scope": "s"}},
+        {"id": "t3", "kind": "query", "buffer": "b3", "params": ["not", "a", "dict"]},
+        {"id": "t4", "kind": "query", "buffer": "b4", "params": {f"$p{i}": "1" for i in range(450)},
+         "query_context": {"bucket": ""}},
+        {"id": "t5", "kind": "chart", "buffer": "dropped as before"},
+    ]}))
+    state = WorkspaceService(path).get()
+    t1, t2, t3, t4 = state.tabs
+    assert [t.id for t in state.tabs] == ["t1", "t2", "t3", "t4"]
+    assert (t1.buffer, t1.params, t1.query_context) == ("SELECT $x", {"$ok": "1"}, None)
+    assert (t2.params, t2.query_context.bucket) == ({"$a": "1"}, "b")  # a good tab is untouched
+    assert (t3.buffer, t3.params) == ("b3", None)
+    assert (t4.buffer, len(t4.params), list(t4.params)[0], t4.query_context) == ("b4", 400, "$p0", None)
+    assert list(tmp_path.glob("workspace.json.corrupt-*")) == []
+    repaired = [line for line in logged_warnings if line.startswith("Repaired")]
+    assert repaired == [
+        "Repaired tab 0 of the saved workspace: removed 7 parameter draft(s) and reset the query context",
+        "Repaired tab 2 of the saved workspace: removed 1 parameter draft(s)",
+        "Repaired tab 3 of the saved workspace: removed 50 parameter draft(s) and reset the query context",
+    ]
+    everything = "".join(logged_warnings)  # counts and indexes only: no name, no draft, no context value
+    for secret in ("$x y", "$1000", "line", "break", "$ok", "all", "xxxx"):
+        assert secret not in everything
+    WorkspaceService(path).put(state)  # the next save writes what was kept
+    assert [t["id"] for t in json.loads(path.read_text())["tabs"]] == ["t1", "t2", "t3", "t4"]
+
+
+@pytest.mark.parametrize("cas", ["12ab", "0", "012", "", " 5", "-5", "1" * 20, 5, 1.5, True, ["1"]])
+def test_a_document_tab_with_a_bad_cas_keeps_its_buffer_and_loses_only_the_cas(tmp_path, logged_warnings, cas):
+    path = tmp_path / "workspace.json"
+    document = [{"kind": "bucket", "name": "b"}, {"kind": "scope", "name": "s"}, {"kind": "collection", "name": "c"},
+                {"kind": "document", "name": "secret-id"}]
+    path.write_text(json.dumps({"tabs": [
+        {"id": "d1", "kind": "document", "title": "secret-id", "object_path": document, "buffer": '{"edited": 1}',
+         "document_cas": cas},
+        {"id": "d2", "kind": "document", "title": "ok", "object_path": document, "buffer": "kept",
+         "document_cas": "1792325990605258752"},
+    ]}))
+    d1, d2 = WorkspaceService(path).get().tabs
+    assert (d1.id, d1.buffer, d1.document_cas, d1.object_path) == ("d1", '{"edited": 1}', None, [
+        PathSegment(**segment) for segment in document])  # the tab and its unsaved text stay
+    assert (d2.buffer, d2.document_cas) == ("kept", "1792325990605258752")  # a good CAS is untouched
+    assert list(tmp_path.glob("workspace.json.corrupt-*")) == []
+    assert [line for line in logged_warnings if line.startswith("Repaired")] == [
+        "Repaired tab 0 of the saved workspace: reset the document CAS"]
+    assert "secret-id" not in "".join(logged_warnings) and "edited" not in "".join(logged_warnings)
+
+
+def test_a_workspace_being_saved_with_a_bad_cas_is_repaired_not_refused(logged_warnings):
+    raw = {"tabs": [{"id": "d1", "kind": "document", "buffer": "text", "document_cas": "12ab"},
+                    {"id": "d2", "kind": "document", "document_cas": "7"}]}
+    state = WorkspaceState.model_validate(repaired_workspace(raw))  # what `PUT /workspace` validates
+    assert [(t.buffer, t.document_cas) for t in state.tabs] == [("text", None), (None, "7")]
+    assert [line for line in logged_warnings if line.startswith("Repaired")] == [
+        "Repaired tab 0 of the workspace being saved: reset the document CAS"]
+    with pytest.raises(ValidationError):  # unrepaired, the model still refuses it
+        WorkspaceState.model_validate(raw)
 
 
 @pytest.mark.parametrize("content", ["{not json", "[]", '{"tabs": "nope"}', '{"version": "two", "tabs": []}'])
@@ -568,3 +654,19 @@ def test_an_unreadable_scripts_folder_is_a_storage_error(tmp_path):
     service = ScriptsService(lambda: tmp_path / "no-such-folder")
     with pytest.raises(StorageError):
         service.tree()
+
+
+def test_workspace_keeps_the_tab_context_and_params(tmp_path):  # Review Focus 5
+    service = WorkspaceService(tmp_path / "workspace.json")
+    state = WorkspaceState(tabs=[
+        WorkspaceTab(id="a", kind="query", query_context=QueryContext(bucket="my.bucket", scope="app"),
+                     params={"$n": "9007199254740993", "$1": '"x"', "$x": "not json yet"}),
+        WorkspaceTab(id="b", kind="query", query_context="none"),
+        WorkspaceTab(id="c", kind="query"),
+    ])
+    service.put(state)
+    assert service.get() == state
+    with pytest.raises(ValidationError):
+        WorkspaceTab(id="d", kind="query", params={"n": "1"})  # a draft is keyed by `$name` or `$n`
+    with pytest.raises(ValidationError):
+        WorkspaceTab(id="d", kind="query", query_context="all")

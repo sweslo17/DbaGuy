@@ -109,8 +109,9 @@ def test_one_failing_housekeeping_task_does_not_stop_the_others(container):
     container.sessions.reap_idle = failing_reaper
     container.metadata.reap_idle = lambda: calls.append("metadata")
     container.sessions.check_idle_transactions = lambda warn, rollback: calls.append("idle transactions")
+    container.sessions.check_paused_results = lambda: calls.append("paused results")
     container._housekeep_once()
-    assert calls == ["sessions", "metadata", "idle transactions"]
+    assert calls == ["sessions", "metadata", "idle transactions", "paused results"]
 
 
 def test_start_and_close_housekeeping_thread(container):

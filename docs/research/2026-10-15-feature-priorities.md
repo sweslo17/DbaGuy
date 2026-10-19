@@ -233,6 +233,8 @@ HN 上約 25 人主動抱怨「macOS DB 工具功能膨脹」，並表示 99% �
 - 欄位型別名稱從 `sys.dm_exec_describe_first_result_set` 查。sql_variant 會回傳 raw bytes，以 hex 顯示並提供 CAST。
 
 ### Couchbase
+> 2026-10-18：已由 ④ 的設計取代（不用 Python SDK，改用 Query Service REST；見 docs/superpowers/specs/2026-10-18-04-couchbase-design.md）。
+
 - 建議用 Python SDK（4.x）：KV 的 get/replace 含 CAS、`preserve_expiry`、Capella CA、DNS SRV 都內建。
 - 查詢一律帶 `QueryOptions(timeout=…, client_context_id=…)`。SDK 預設 75 秒 timeout，伺服器端另有自己的 timeout，兩者都要在 UI 上顯示。取消用 `client_context_id` 從 `system:active_requests` 刪除。
 - 沒有 primary index 就無法列出文件，開文件改用 `USE KEYS`。

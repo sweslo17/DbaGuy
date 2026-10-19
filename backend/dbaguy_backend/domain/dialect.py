@@ -8,3 +8,4 @@ class Dialect(StrEnum):
     SQLITE = "sqlite"
     MYSQL = "mysql"
     TSQL = "tsql"
+    SQLPP = "sqlpp"  # Couchbase SQL++ (N1QL)

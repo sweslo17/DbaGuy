@@ -9,7 +9,7 @@ import {
 import type { Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { api } from "@/lib/api/client";
-import type { CompletionItem, Dialect, EditorSettings } from "@/lib/api/types";
+import type { CompletionItem, Dialect, EditorSettings, QueryContext } from "@/lib/api/types";
 import { kindLabel } from "../explorer/kinds";
 import { statementWindow } from "./statements";
 
@@ -30,6 +30,10 @@ export interface CompletionTarget {
   dialect: Dialect | null;
   /** `editor.keyword_case`: "upper" inserts keywords in upper case, "preserve" follows the typed prefix. */
   keywordCase: KeywordCase;
+  /** Couchbase: where the tab's unqualified names resolve; null for no context (and for engines without one). */
+  queryContext: QueryContext | null;
+  /** Couchbase: the field names of the tab's latest results, offered as fields "seen in results"; empty otherwise. */
+  seenFields: string[];
 }
 
 const DEBOUNCE_MS = 30;
@@ -40,6 +44,8 @@ const BACKEND_ITEM_CAP = 300;
 const WORD = /^[\p{L}\p{N}_]*$/u;
 /** Asked for while typing only after a word character, after `x.`, or after `ON ` (join conditions). */
 const TRIGGER = /(?:[\p{L}\p{N}_.]|(?:^|[^\p{L}\p{N}_])on\s+)$/iu;
+/** SQL++ back-ticks its names, and completes inside them: typing the back-tick (or what follows it) asks too. */
+const SQLPP_TRIGGER = /(?:[\p{L}\p{N}_.`]|(?:^|[^\p{L}\p{N}_])on\s+)$/iu;
 
 /** CodeMirror's completion type (it picks the icon) of each backend kind. */
 const TYPES: Record<CompletionItem["kind"], string> = {
@@ -53,6 +59,10 @@ const TYPES: Record<CompletionItem["kind"], string> = {
   schema: "namespace",
   alias: "variable",
   join: "text",
+  bucket: "namespace",
+  scope: "namespace",
+  collection: "class",
+  field: "property",
 };
 
 /** "preserve": the typed prefix decides, all lower case → lower case, anything else (or nothing typed) → upper case. */
@@ -104,7 +114,8 @@ function completionSource(target: () => CompletionTarget) {
   let previous: AbortController | null = null;
 
   return async (context: CompletionContext): Promise<CompletionResult | null> => {
-    if (!context.explicit && !context.matchBefore(TRIGGER)) return null;
+    const sqlpp = target().dialect === "sqlpp";
+    if (!context.explicit && !context.matchBefore(sqlpp ? SQLPP_TRIGGER : TRIGGER)) return null;
     previous?.abort();
     const request = new AbortController();
     previous = request;
@@ -113,7 +124,7 @@ function completionSource(target: () => CompletionTarget) {
     const timeout = window.setTimeout(() => request.abort(), TIMEOUT_MS);
     try {
       if (!context.explicit && !(await settle(DEBOUNCE_MS, request.signal))) return null;
-      const { profileId, database, dialect, keywordCase } = target();
+      const { profileId, database, dialect, keywordCase, queryContext, seenFields } = target();
       const { state, pos } = context;
       const bounds = statementWindow(state, pos);
       const client = await api();
@@ -123,16 +134,25 @@ function completionSource(target: () => CompletionTarget) {
           cursor: pos - bounds.from,
           database,
           ...(profileId ? { profile_id: profileId } : { dialect: dialect ?? "postgres" }),
+          ...(queryContext ? { query_context: queryContext } : {}),
+          ...(seenFields.length ? { seen_fields: seenFields } : {}),
         },
         signal: request.signal,
       });
       const view = context.view;
       const moved = !!view && (view.state.doc !== state.doc || view.state.selection.main.head !== pos);
       if (!data?.items.length || request.signal.aborted || context.aborted || moved) return null;
+      const from = bounds.from + data.start;
+      const options = data.items.map((item, index) => toCompletion(item, index, keywordCase));
+      // Inside a back-ticked name (SQL++) the typed text starts with the back-tick and the items replace the whole name:
+      // CodeMirror's own matching would find nothing in it, so the backend's list (already filtered) is shown as it is.
+      if (sqlpp && from < pos && state.sliceDoc(from, from + 1) === "`") {
+        return { from, to: bounds.from + data.end, options, filter: false };
+      }
       return {
-        from: bounds.from + data.start,
+        from,
         to: bounds.from + data.end,
-        options: data.items.map((item, index) => toCompletion(item, index, keywordCase)),
+        options,
         // A capped list is filtered by the backend again on every keystroke: it may be missing what the next one matches.
         validFor: data.items.length < BACKEND_ITEM_CAP ? WORD : undefined,
       };
@@ -168,7 +188,8 @@ const completionTheme = EditorView.theme({
 
 /**
  * Completion from `POST /sql/complete` as the only source (lang-sql's keyword list is replaced). `target` is read at
- * each request: the tab's connection, database, dialect and keyword case.
+ * each request: the tab's connection, database, dialect and keyword case, and for Couchbase its query context and the
+ * field names of its results.
  */
 export function sqlCompletion(target: () => CompletionTarget): Extension {
   return [

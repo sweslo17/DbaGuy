@@ -11,6 +11,7 @@ from .lexer import INSIGNIFICANT, TokenKind, tokenize
 from .tsql import statements
 
 _RELATION_KINDS = frozenset({NodeKind.TABLE, NodeKind.VIEW, NodeKind.MATERIALIZED_VIEW, NodeKind.PARTITION})
+_COLLECTIONS = frozenset({NodeKind.COLLECTION})
 _TRAILING = INSIGNIFICANT | {TokenKind.SEMI}
 
 
@@ -19,11 +20,17 @@ class SortKey(BaseModel):
     descending: bool = False
 
 
-def relation_from_path(path: Sequence[PathSegment]) -> tuple[str | None, str]:
-    """(schema, name) of the table-like node a tree path points at (also from one of its columns or indexes)."""
-    name = next((segment.name for segment in reversed(path) if segment.kind in _RELATION_KINDS), None)
+def _last_named(path: Sequence[PathSegment], kinds: frozenset[NodeKind]) -> str:
+    """The name of the innermost segment of one of `kinds` (a table's column or index sits below it)."""
+    name = next((segment.name for segment in reversed(path) if segment.kind in kinds), None)
     if name is None:
         raise ValidationFailed("This object has no data to browse", detail={"path": [s.model_dump() for s in path]})
+    return name
+
+
+def relation_from_path(path: Sequence[PathSegment]) -> tuple[str | None, str]:
+    """(schema, name) of the table-like node a tree path points at (also from one of its columns or indexes)."""
+    name = _last_named(path, _RELATION_KINDS)
     schema = next((segment.name for segment in reversed(path) if segment.kind == NodeKind.SCHEMA), None)
     return schema, name
 
@@ -55,9 +62,23 @@ def _single_expression(where: str | None, dialect: Dialect) -> str | None:
     return "".join(" " if token.kind == TokenKind.COMMENT else token.text for token in tokens).strip() or None
 
 
+def _sqlpp_browse_select(
+    path: Sequence[PathSegment], where: str | None, order_by: Sequence[SortKey], count: bool
+) -> str:
+    """D-04-11: a collection is read in a query tab whose context is its scope, so the name is not qualified, and each
+    document comes with its key (B18: quoted only where SQL++ needs it). No filter, sort or count here: that is SQL++
+    the user writes in the tab."""
+    collection = _last_named(path, _COLLECTIONS)
+    if count or order_by or (where or "").strip():
+        raise ValidationFailed("Filtering and sorting a collection is done in SQL++ in a query tab")
+    return f"SELECT META(d).id, *\nFROM {quote_ident(Dialect.SQLPP, collection)} AS d"
+
+
 def build_browse_select(
     dialect: Dialect, path: Sequence[PathSegment], where: str | None, order_by: Sequence[SortKey], count: bool = False
 ) -> str:
+    if dialect is Dialect.SQLPP:
+        return _sqlpp_browse_select(path, where, order_by, count)
     schema, name = relation_from_path(path)
     sql = f"SELECT {'count(*)' if count else '*'} FROM {qualified(dialect, schema, name)}"
     if condition := _single_expression(where, dialect):

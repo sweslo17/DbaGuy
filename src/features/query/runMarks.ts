@@ -10,8 +10,15 @@ import { positionToOffset, type PlannedStatement } from "./runPlan";
  * Messages jumps to its place. Positions come from the run's tracked ranges, so edits made since still land right.
  */
 
-/** A run starts: track its statements and clear the previous run's marks. */
+/**
+ * The length of each statement's `prefix` in the latest run of each editor. The database counts positions in the text it
+ * was sent, which starts with the prefix (Explain's `EXPLAIN `); the editor's text does not have it.
+ */
+const prefixLengths = new WeakMap<EditorView, readonly number[]>();
+
+/** A run starts: track its statements (and the prefixes they are sent with) and clear the previous run's marks. */
 export function beginRunMarks(view: EditorView, planned: readonly PlannedStatement[]): void {
+  prefixLengths.set(view, planned.map(({ prefix }) => prefix?.length ?? 0));
   startTracking(
     view,
     planned.map(({ from, to }) => ({ from, to })),
@@ -24,12 +31,18 @@ export function flashStatement(view: EditorView, index: number): void {
   if (span) flashRange(view, span.from, span.to);
 }
 
-/** Where the error of statement `index` is: its token when the database gave a position, else the whole statement. */
+/**
+ * Where the error of statement `index` is: its token when the database gave a position, else the whole statement. The
+ * position is read in the text that was sent (`execution.sql`) and moved back by the statement's prefix, never to before
+ * the statement's start: an error in the prefix itself is at the start (M10).
+ */
 function errorSpan(view: EditorView, index: number, execution: ExecutionState): Span | null {
   const span = trackedSpan(view.state, index);
   const position = execution.error?.position;
   if (!span || !position) return span;
-  const at = Math.min(positionToOffset(execution.sql, span.from, position.line, position.column), span.to);
+  const prefix = prefixLengths.get(view)?.[index] ?? 0;
+  const sent = positionToOffset(execution.sql, span.from, position.line, position.column);
+  const at = Math.min(Math.max(sent - prefix, span.from), span.to);
   return { from: at, to: tokenEnd(view.state, at, span.to) };
 }
 

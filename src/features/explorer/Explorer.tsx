@@ -1,27 +1,42 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ChevronRight, Plus, RefreshCw, Server } from "lucide-react";
+import { ChevronRight, Plus, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { EngineIcon } from "@/components/EngineIcon";
 import { Button } from "@/components/ui/Button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ContextMenu } from "@/components/ui/ContextMenu";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
-import type { Profile, ProfileEntry } from "@/lib/api/types";
+import type { ObjectNode, ProfileEntry } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
+import { ENGINE_LABELS } from "@/lib/engines";
 import { useWorkspace } from "@/stores/workspace";
-import { ConnectionDialog, ENGINE_LABELS } from "../connections/ConnectionDialog";
-import { useDeleteProfile, useProfiles } from "../connections/hooks";
+import { ConnectionDialog } from "../connections/ConnectionDialog";
+import { findEngineInfo, isReadOnlyProfile, useDeleteProfile, useEngines, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
-import { secretsNeeded, UnlockDialog, type SecretsNeeded } from "../connections/UnlockDialog";
+import { secretsNeeded } from "../connections/UnlockDialog";
+import { joinUnlockPrompt } from "../connections/unlockPrompts";
+import { askOpenDocument } from "../documents/openDocument";
+import { applyTreeContext } from "../query/queryContext";
 import { requestCloseTab, requestDisconnectTab } from "../workspace/closeGuards";
+import { openBrowseTab } from "./browse";
 import { forgetExplorer } from "./explorerCache";
+import { keyspaceOfPath } from "./fieldSamples";
 import { folderLabel, kindIcon } from "./kinds";
+import { SampleFieldsDialog } from "./SampleFieldsDialog";
 import { nodeKeyPrefix, profileKey, useTreeRows, type Expansion, type TreeRow } from "./useTreeRows";
 
 const ROW_HEIGHT = 22;
 /** Nodes that group other nodes: double-click expands them instead of opening a detail tab. */
-const CONTAINER_KINDS = new Set(["folder", "database", "schema"]);
+const CONTAINER_KINDS = new Set(["folder", "database", "schema", "bucket", "scope"]);
+/** A Couchbase collection holds documents: double-click browses them (ruling B19); its detail is in its menu. */
+const BROWSABLE_KIND = "collection";
+/**
+ * A click on a node sets the active tab's context only this long after it, the double-click interval: a double-click
+ * on a collection opens a browse tab and must not retarget the tab that was open.
+ */
+const CONTEXT_CLICK_DELAY_MS = 250;
 
 type ErrorRow = Extract<TreeRow, { type: "error" }>;
 
@@ -54,6 +69,7 @@ function Chevron({ show, open, onToggle }: { show: boolean; open: boolean; onTog
 export function Explorer() {
   const qc = useQueryClient();
   const profiles = useProfiles();
+  const engines = useEngines().data;
   const deleteProfile = useDeleteProfile();
   const openObject = useWorkspace((s) => s.openObject);
   const openQuery = useWorkspace((s) => s.openQuery);
@@ -64,9 +80,10 @@ export function Explorer() {
   const [selected, setSelected] = useState<string | null>(null);
   const [dialog, setDialog] = useState<{ open: boolean; entry?: ProfileEntry }>({ open: false });
   const [toDelete, setToDelete] = useState<ProfileEntry | null>(null);
+  const [sampling, setSampling] = useState<{ profileId: string; node: ObjectNode } | null>(null);
   const [releasing, setReleasing] = useState(false);
-  const [unlock, setUnlock] = useState<{ profile: Profile; needs: SecretsNeeded } | null>(null);
-  const promptedErrors = useRef(new Set<string>());
+  // The failed rows that have asked for their profile's password (`joinUnlockPrompt`) and how to stop asking.
+  const asking = useRef(new Map<string, () => void>());
   const entries = profiles.data ?? [];
   const rows = useTreeRows(entries, expanded, expansions);
   const parentRef = useRef<HTMLDivElement>(null);
@@ -82,6 +99,35 @@ export function Explorer() {
     setSelected(row.key);
     const profileId = rowProfileId(row);
     if (profileId) selectProfile(profileId);
+  };
+
+  // The one context change a click is waiting to make (see `clickNode`); gone with the Explorer.
+  const pendingContext = useRef<number | null>(null);
+  const cancelPendingContext = useCallback(() => {
+    if (pendingContext.current !== null) window.clearTimeout(pendingContext.current);
+    pendingContext.current = null;
+  }, []);
+  useEffect(() => cancelPendingContext, [cancelPendingContext]);
+
+  /** `selectRow` for a pointer click: a click that follows another one takes the place of its pending context change. */
+  const selectByClick = (row: TreeRow) => {
+    cancelPendingContext();
+    selectRow(row);
+  };
+
+  /**
+   * A pointer click on a node: selects it and, for a connection whose engine has a query context (Couchbase), sets the
+   * context of the active query tab on it (spec §3.11.1, ruling B48), `CONTEXT_CLICK_DELAY_MS` later: a double-click
+   * (`activate` on a collection) cancels it, and so does the next click. Only a click does: walking the tree with the
+   * keyboard (`selectRow` alone) never retargets the open tab.
+   */
+  const clickNode = (row: Extract<TreeRow, { type: "node" }>) => {
+    selectByClick(row);
+    if (!findEngineInfo(entries, engines, row.profileId)?.query_context) return;
+    pendingContext.current = window.setTimeout(() => {
+      pendingContext.current = null;
+      applyTreeContext(row.profileId, row.node.path);
+    }, CONTEXT_CLICK_DELAY_MS);
   };
 
   const toggle = useCallback(
@@ -100,26 +146,41 @@ export function Explorer() {
   );
 
   const activate = (row: TreeRow) => {
-    if (row.type === "node" && !CONTAINER_KINDS.has(row.node.kind)) {
+    if (row.type === "node" && row.node.kind === BROWSABLE_KIND) {
+      cancelPendingContext(); // the browse tab has its own context: the open tab keeps its
+      void openBrowseTab(row.profileId, row.node.path);
+    } else if (row.type === "node" && !CONTAINER_KINDS.has(row.node.kind)) {
       openObject(row.profileId, row.node);
     } else if (isExpandable(row)) {
       toggle(row);
     }
   };
 
-  // A children request failed with password_required: ask once per failure, then retry what failed.
+  // A children request failed with password_required: ask once per failure, in the profile's one unlock dialog. What
+  // failed is read again when the password is given (`useUnlockProfile`); a cancelled dialog leaves the row's Retry.
   useEffect(() => {
     const failing = rows.filter((r): r is ErrorRow => r.type === "error" && r.code === "password_required");
     const failingKeys = new Set(failing.map((r) => r.key));
-    for (const key of promptedErrors.current) if (!failingKeys.has(key)) promptedErrors.current.delete(key);
-    if (unlock) return;
-    const next = failing.find((r) => !promptedErrors.current.has(r.key));
-    const entry = next && entries.find((e) => e.profile.id === next.profileId);
-    if (next && entry) {
-      promptedErrors.current.add(next.key);
-      setUnlock({ profile: entry.profile, needs: secretsNeeded(next.detail) });
+    for (const [key, stopAsking] of asking.current) {
+      if (failingKeys.has(key)) continue;
+      stopAsking();
+      asking.current.delete(key);
     }
-  }, [rows, entries, unlock]);
+    for (const row of failing) {
+      const entry = entries.find((e) => e.profile.id === row.profileId);
+      if (!entry || asking.current.has(row.key)) continue;
+      const request = { profile: entry.profile, needs: secretsNeeded(row.detail) };
+      asking.current.set(row.key, joinUnlockPrompt(request, {}));
+    }
+  }, [rows, entries]);
+  // Rows that go with the tree stop asking.
+  useEffect(() => {
+    const own = asking.current;
+    return () => {
+      for (const stopAsking of own.values()) stopAsking();
+      own.clear();
+    };
+  }, []);
 
   /** Drops everything the tree and the workspace hold for a deleted profile. */
   const forgetProfile = (profileId: string) => {
@@ -135,7 +196,7 @@ export function Explorer() {
     // connection.
     const { tabs, closeTab, updateTab } = useWorkspace.getState();
     for (const tab of tabs.filter((t) => t.profileId === profileId)) {
-      if (tab.kind === "query") updateTab(tab.id, "query", { profileId: null, database: null });
+      if (tab.kind === "query") updateTab(tab.id, "query", { profileId: null, database: null, queryContext: undefined });
       else closeTab(tab.id);
     }
   };
@@ -226,7 +287,7 @@ export function Explorer() {
       case "folder": {
         const Icon = kindIcon("folder");
         return (
-          <div {...aria} className={base} style={pad} onClick={() => selectRow(row)} onDoubleClick={() => toggle(row)}>
+          <div {...aria} className={base} style={pad} onClick={() => selectByClick(row)} onDoubleClick={() => toggle(row)}>
             {chevron}
             <Icon size={14} className="shrink-0 text-muted" />
             <span className="truncate">{row.name}</span>
@@ -240,15 +301,16 @@ export function Explorer() {
             {...aria}
             className={base}
             style={pad}
-            onClick={() => selectRow(row)}
-            onContextMenu={() => selectRow(row)}
+            onClick={() => selectByClick(row)}
+            onContextMenu={() => selectByClick(row)}
             onDoubleClick={() => toggle(row)}
           >
             {chevron}
-            <Server size={14} className="shrink-0 text-muted" />
+            {/* Its name is written at the right edge, and gives way first in a narrow sidebar: the icon already says it. */}
+            <EngineIcon engine={p.engine} decorative />
             <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: profileColor(p.color) ?? "transparent" }} />
             <span className="truncate font-medium">{p.name}</span>
-            <span className="ml-auto shrink-0 text-[11px] text-muted">{ENGINE_LABELS[p.engine]}</span>
+            <span className="ml-auto min-w-0 shrink-[100] truncate pl-2 text-[11px] text-muted">{ENGINE_LABELS[p.engine]}</span>
           </div>
         );
         return (
@@ -267,13 +329,13 @@ export function Explorer() {
       case "node": {
         const Icon = kindIcon(row.node.kind, row.node.name);
         const label = row.node.kind === "folder" ? folderLabel(row.node.name) : row.node.name;
-        return (
+        const content = (
           <div
             {...aria}
             className={cn(base, row.node.system && "opacity-60")}
             style={pad}
             title={row.node.detail ? `${label} — ${row.node.detail}` : label}
-            onClick={() => selectRow(row)}
+            onClick={() => clickNode(row)}
             onDoubleClick={() => activate(row)}
           >
             {chevron}
@@ -282,12 +344,44 @@ export function Explorer() {
             {row.node.detail && <span className="ml-auto shrink-[100] truncate pl-2 text-[11px] text-muted">{row.node.detail}</span>}
           </div>
         );
+        if (row.node.kind !== BROWSABLE_KIND) return content;
+        const opensDocuments = findEngineInfo(entries, engines, row.profileId)?.documents === true;
+        // The dialog asks for the document's ID in this collection: to open it, or to create it (never on a read-only one).
+        const askDocument = (mode: "open" | "new") =>
+          askOpenDocument({ profileId: row.profileId, mode, keyspace: keyspaceOfPath(row.node.path) ?? {} });
+        return (
+          <ContextMenu
+            items={[
+              { label: "Browse documents", onSelect: () => void openBrowseTab(row.profileId, row.node.path) },
+              ...(opensDocuments ? [{ label: "Open document by ID…", onSelect: () => askDocument("open") }] : []),
+              ...(opensDocuments && !isReadOnlyProfile(entries, row.profileId)
+                ? [{ label: "New document…", onSelect: () => askDocument("new") }]
+                : []),
+              { label: "Details", onSelect: () => openObject(row.profileId, row.node) },
+              {
+                label: "Sample fields…",
+                title: "Read some of its documents and list their fields (completion offers them)",
+                disabled: keyspaceOfPath(row.node.path) === null,
+                onSelect: () => setSampling({ profileId: row.profileId, node: row.node }),
+              },
+            ]}
+          >
+            {content}
+          </ContextMenu>
+        );
       }
       case "loading":
         return (
           <div className={base} style={pad}>
             <span className="w-4 shrink-0" />
             <span className="text-muted">Loading…</span>
+          </div>
+        );
+      case "hint":
+        return (
+          <div className={base} style={pad} title={row.title}>
+            <span className="w-4 shrink-0" />
+            <span className="truncate text-[12px] text-muted italic">{row.text}</span>
           </div>
         );
       case "error":
@@ -340,6 +434,14 @@ export function Explorer() {
         </div>
       </div>
       <ConnectionDialog open={dialog.open} entry={dialog.entry} onOpenChange={(open) => setDialog((d) => ({ ...d, open }))} />
+      {sampling && (
+        <SampleFieldsDialog
+          open
+          profileId={sampling.profileId}
+          node={sampling.node}
+          onOpenChange={(open) => !open && setSampling(null)}
+        />
+      )}
       {toDelete && (
         <ConfirmDialog
           open
@@ -353,21 +455,6 @@ export function Explorer() {
             setToDelete(null);
           }}
           onConfirm={() => void deleteEntry(toDelete)}
-        />
-      )}
-      {unlock && (
-        <UnlockDialog
-          open
-          profile={unlock.profile}
-          needs={unlock.needs}
-          onOpenChange={(open) => !open && setUnlock(null)}
-          onUnlocked={() => {
-            void qc.refetchQueries({
-              queryKey: ["children", unlock.profile.id],
-              predicate: (query) => query.state.status === "error",
-            });
-            setUnlock(null);
-          }}
         />
       )}
     </div>

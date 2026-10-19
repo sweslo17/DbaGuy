@@ -13,6 +13,8 @@ export interface TransactionControlsArgs {
   snapshot: SessionSnapshot | null;
   /** The tab's desired auto-commit mode. */
   autocommit: boolean;
+  /** The engine has transactions (`EngineInfo.transactions`); undefined while the engines load. */
+  transactions: boolean | undefined;
   /** The tab and its connection, e.g. "Query 1 · dev pg": prefixes toasts, which can show while another tab is open. */
   subject: string;
 }
@@ -21,11 +23,19 @@ export interface TransactionControlsArgs {
  * The query tab's transaction controls (spec §4.2):
  * - the tab's desired auto-commit mode is applied to its session: once the session is open and has reported its
  *   state, and again whenever the toggle changes it (sent once per session and value until it fails; a failure
- *   reverts the toggle to the session's real mode, so it never loops and choosing the mode again retries it);
+ *   reverts the toggle to the session's real mode, so it never loops and choosing the mode again retries it); never
+ *   for an engine without transactions (Couchbase), nor before the engine is known;
  * - Commit / Rollback, whose warnings and errors become toasts;
  * - session messages (idle warnings, idle rollbacks) become toasts, each once, and pulse the badge for 3 s.
  */
-export function useTransactionControls({ tabId, controller, snapshot, autocommit, subject }: TransactionControlsArgs) {
+export function useTransactionControls({
+  tabId,
+  controller,
+  snapshot,
+  autocommit,
+  transactions,
+  subject,
+}: TransactionControlsArgs) {
   const updateTab = useWorkspace((s) => s.updateTab);
   const phase = snapshot?.phase ?? null;
   const state = snapshot?.state ?? null;
@@ -40,6 +50,7 @@ export function useTransactionControls({ tabId, controller, snapshot, autocommit
   // Bumped when a request ended without an answer, so the effect asks again even if nothing else changed.
   const [askAgain, setAskAgain] = useState(0);
   useEffect(() => {
+    if (transactions !== true) return; // no transactions (or not known yet): there is no mode to apply
     if (!controller || phase !== "open" || !idle || !state || state.inTransaction) return;
     if (state.autocommit === autocommit) return;
     if (asked.current?.controller === controller && asked.current.value === autocommit) return;
@@ -70,7 +81,7 @@ export function useTransactionControls({ tabId, controller, snapshot, autocommit
       },
       retryable, // forgotten meanwhile: the next state change asks again if the modes still differ
     );
-  }, [controller, phase, idle, state, autocommit, tabId, updateTab, askAgain]);
+  }, [controller, phase, idle, state, autocommit, transactions, tabId, updateTab, askAgain]);
 
   const [pulseUntil, setPulseUntil] = useState(0);
   const seen = useRef<{ controller: SessionController | null; id: number }>({ controller: null, id: 0 });

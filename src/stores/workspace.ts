@@ -1,6 +1,8 @@
 import { create } from "zustand";
-import { pathKey, type ObjectNode, type PathSegment } from "@/lib/api/types";
+import { pathKey, type Keyspace, type ObjectNode, type PathSegment, type QueryContext } from "@/lib/api/types";
 import { baseName, isWithin, movedPath } from "@/lib/scriptPaths";
+import { documentPath } from "@/features/documents/documentApi";
+import { NEW_DOCUMENT_TEXT } from "@/features/documents/documentState";
 import { relationOf } from "@/features/table-data/filterValue";
 
 /** A SQL editor tab with its own session. */
@@ -29,6 +31,17 @@ export interface QueryTabState {
   initialSelection?: { anchor: number; head: number };
   /** The desired auto-commit mode, applied when the session opens. */
   autocommit: boolean;
+  /**
+   * Couchbase: where unqualified names resolve (spec §3.11.1). Undefined follows the profile's default context (the
+   * session's); "none" is the user's choice of no context (ruling B14). The tab keeps `database = null` (ruling B15).
+   */
+  queryContext?: QueryContext | "none";
+  /**
+   * Couchbase: the parameter panel's drafts, keyed `$name` / `$n`, each the text as typed (valid JSON or not yet).
+   * Kept for names the statements no longer use, so a name that comes back finds its value; undefined: none.
+   * `workspace.json` keeps them through `savedParams` (ruling B40).
+   */
+  params?: Record<string, string>;
 }
 
 /** A relation (table, view, materialized view, partition): its data, columns and DDL. */
@@ -49,7 +62,26 @@ export interface ObjectTabState {
   title: string;
 }
 
-export type Tab = QueryTabState | TableTabState | ObjectTabState;
+/** A Couchbase document (spec §3.13): its stored text in a JSON editor, with its META. */
+export interface DocumentTabState {
+  id: string;
+  kind: "document";
+  profileId: string;
+  /** bucket › scope › collection › document: the keyspace (`keyspaceOfPath`) and, last, the ID. */
+  path: PathSegment[];
+  /** The document's ID. */
+  title: string;
+  /** Not in the database yet: the first ⌘S inserts it. */
+  isNew: boolean;
+  /** The CAS the editor's text was loaded with or last saved as; null for a new document or until loaded. */
+  cas: string | null;
+  /** The editor holds changes not saved yet: `workspace.json` then keeps the text and `cas`. */
+  dirty: boolean;
+  /** What the editor starts with (restored unsaved text, or a new document's); null loads it from the server. */
+  initialText: string | null;
+}
+
+export type Tab = QueryTabState | TableTabState | ObjectTabState | DocumentTabState;
 export type TabKind = Tab["kind"];
 export type TabOf<K extends TabKind> = Extract<Tab, { kind: K }>;
 
@@ -76,6 +108,8 @@ export interface OpenQueryOptions {
   /** Binds the tab to a script file; its `text` is then the saved content. */
   scriptPath?: string;
   title?: string;
+  /** Couchbase: the tab's query context (see `QueryTabState.queryContext`). */
+  queryContext?: QueryContext | "none";
 }
 
 interface WorkspaceState extends WorkspaceSnapshot {
@@ -83,6 +117,11 @@ interface WorkspaceState extends WorkspaceSnapshot {
   selectedProfileId: string | null;
   /** Opens (or activates) a relation as a table tab, any other object as an object tab. */
   openObject: (profileId: string, node: ObjectNode) => void;
+  /**
+   * Opens a Couchbase document, or activates the tab that has it open (same connection and path), and returns the
+   * tab's id. `isNew`: a document to create, starting as `{}`.
+   */
+  openDocument: (profileId: string, keyspace: Keyspace, id: string, options?: { isNew?: boolean }) => string;
   /** Opens a new query tab and returns its id. */
   openQuery: (profileId: string | null, database: string | null, options?: OpenQueryOptions) => string;
   closeTab: (id: string) => void;
@@ -169,6 +208,28 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
     const tab: TableTabState | ObjectTabState = { id, kind, profileId, path: node.path, title: node.name };
     set((s) => ({ tabs: [...s.tabs, tab], activeTabId: id }));
   },
+  openDocument: (profileId, keyspace, id, { isNew = false } = {}) => {
+    const path = documentPath(keyspace, id);
+    const key = pathKey(path);
+    const open = get().tabs.find((t) => t.kind === "document" && t.profileId === profileId && pathKey(t.path) === key);
+    if (open) {
+      set({ activeTabId: open.id });
+      return open.id;
+    }
+    const tab: DocumentTabState = {
+      id: `document:${crypto.randomUUID()}`, // a short random id: `workspace.json` limits ids to 100 characters
+      kind: "document",
+      profileId,
+      path,
+      title: id,
+      isNew,
+      cas: null,
+      dirty: false,
+      initialText: isNew ? NEW_DOCUMENT_TEXT : null,
+    };
+    set((s) => ({ tabs: [...s.tabs, tab], activeTabId: tab.id }));
+    return tab.id;
+  },
   openQuery: (profileId, database, options = {}) => {
     queryCounter += 1;
     const id = `query:${crypto.randomUUID()}`;
@@ -184,6 +245,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
       textFromFile: false,
       initialText: text,
       autocommit: true,
+      queryContext: options.queryContext,
     };
     set((s) => ({ tabs: [...s.tabs, tab], activeTabId: id }));
     return id;

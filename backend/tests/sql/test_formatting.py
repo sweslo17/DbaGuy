@@ -2,15 +2,19 @@ import io
 import json
 from datetime import date
 from decimal import Decimal
+from io import StringIO
 
 import pytest
 
-from dbaguy_backend.domain.errors import ValidationFailed
+from dbaguy_backend.adapters.values import MISSING, JsonText as J
+from dbaguy_backend.domain.errors import UnsupportedFormat, ValidationFailed
 from dbaguy_backend.domain.execution import ColumnCategory as C
 from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.formatting import (
-    FormatColumn, FormatKind as F, RowFormatOptions, format_rows, open_writer, value_condition,
+    FormatColumn, FormatKind as F, RowFormatOptions, format_rows, open_raw_json_writer, open_writer,
+    unsupported_reason, value_condition,
 )
+from dbaguy_backend.sql.jsontext import one_line
 
 PG, LITE, MY, TS = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL
 COLS = [FormatColumn(name="id", category=C.NUMBER), FormatColumn(name="note", category=C.TEXT),
@@ -284,3 +288,158 @@ def test_raw_values_are_not_checked_for_the_encoded_shape():
     # a driver dict that happens to look like an encoded cell is just a JSON value, written as text
     rows = [[{"$type": "bytes"}]]
     assert fmt(F.JSONL, rows=rows, cols=ONE_TEXT_COLUMN, source="raw").text == '{"v": "{\\"$type\\": \\"bytes\\"}"}'
+
+
+SQ = Dialect.SQLPP
+MIX = C.MIXED
+DOC_COLUMNS = [FormatColumn(name="doc", category=MIX), FormatColumn(name="n", category=C.NUMBER),
+               FormatColumn(name="s", category=MIX)]
+RAW_ROWS = [[J('{"z":1,"a":[1e400, 1.10]}'), J("9007199254740993"), "[1] stays a string"], [MISSING, 5, None]]
+ENCODED_ROWS = [[{"$type": "json", "text": '{"z":1,"a":[1e400, 1.10]}'}, {"$type": "json", "text": "9007199254740993"},
+                 "[1] stays a string"], [{"$type": "missing"}, 5, None]]
+
+
+@pytest.mark.parametrize("source, rows", [("raw", RAW_ROWS), ("encoded", ENCODED_ROWS)])
+def test_json_cells_in_every_writer(source, rows):  # Review Focus 1
+    def run(kind, **options):
+        return format_rows(kind, DOC_COLUMNS, rows, RowFormatOptions(**options), SQ, source).text
+
+    assert run(F.CSV, null_text="NULL") == (
+        'doc,n,s\n"{""z"":1,""a"":[1e400, 1.10]}",9007199254740993,[1] stays a string\n,5,NULL\n'
+    )  # MISSING is empty even when NULL has a text
+    assert run(F.JSONL).splitlines() == [
+        '{"doc": {"z":1,"a":[1e400, 1.10]}, "n": 9007199254740993, "s": "[1] stays a string"}',
+        '{"n": 5, "s": null}',  # the missing key is left out
+    ]
+    assert run(F.TSV).splitlines()[2] == "\t5\t"
+    assert run(F.MARKDOWN).splitlines()[3] == "|  | 5 |  |"
+
+
+@pytest.mark.parametrize("source, rows", [("raw", RAW_ROWS), ("encoded", ENCODED_ROWS)])
+def test_json_array_and_text_formats_keep_the_cell_text(source, rows):
+    def run(kind, **options):
+        return format_rows(kind, DOC_COLUMNS, rows, RowFormatOptions(**options), SQ, source).text
+
+    assert run(F.JSON) == (
+        '[\n  {"doc": {"z":1,"a":[1e400, 1.10]}, "n": 9007199254740993, "s": "[1] stays a string"},\n'
+        '  {"n": 5, "s": null}\n]'
+    )
+    assert run(F.TSV).splitlines()[1] == '"{""z"":1,""a"":[1e400, 1.10]}"\t9007199254740993\t[1] stays a string'
+    assert run(F.MARKDOWN).splitlines()[2] == '| {"z":1,"a":[1e400, 1.10]} | 9007199254740993 | [1] stays a string |'
+    assert run(F.TSV, null_text="NULL").splitlines()[2] == "\t5\tNULL"
+
+
+def test_a_mixed_columns_string_is_never_read_as_json():
+    column = [FormatColumn(name="v", category=MIX)]
+    rows = [["[1, 2]"], ['{"a": 1}'], ["123"], [J("123")], [J('{"a": 1}')], ["true"]]
+    assert format_rows(F.JSONL, column, rows, RowFormatOptions(), SQ, "raw").text.splitlines() == [
+        '{"v": "[1, 2]"}', '{"v": "{\\"a\\": 1}"}', '{"v": "123"}', '{"v": 123}', '{"v": {"a": 1}}', '{"v": "true"}',
+    ]
+
+
+def test_a_json_cell_with_a_line_break_stays_on_one_jsonl_line_and_keeps_its_bytes_in_a_json_array():
+    stored = '{"z" :\n 1, "a": [1e400,\r\n 1.10], "s": "a  b"}'
+    column = [FormatColumn(name="v", category=MIX)]
+    jsonl = format_rows(F.JSONL, column, [[J(stored)], [J('{"z" : 1}')]], RowFormatOptions(), SQ, "raw").text
+    assert jsonl.splitlines() == ['{"v": {"z":1,"a":[1e400,1.10],"s":"a  b"}}', '{"v": {"z" : 1}}']
+    array = format_rows(F.JSON, column, [[J(stored)]], RowFormatOptions(), SQ, "raw").text
+    assert array == "[\n  {\"v\": " + stored + "}\n]"
+
+
+def test_sqlpp_in_list_and_no_insert():
+    column = [FormatColumn(name="v", category=MIX)]
+    rows = [[1], ["a"], [True], [None], [MISSING], [J('{"k":1}')], [1]]
+    assert format_rows(F.IN_LIST, column, rows, RowFormatOptions(), SQ, "raw").text == '[1, "a", TRUE, NULL, MISSING, {"k":1}]'
+    assert unsupported_reason(F.INSERT, SQ) == "INSERT statements are not offered for Couchbase"
+    assert unsupported_reason(F.INSERT, PG) is None and unsupported_reason(F.CSV, SQ) is None
+    with pytest.raises(UnsupportedFormat):
+        format_rows(F.INSERT, column, rows, RowFormatOptions(), SQ, "raw")
+    with pytest.raises(UnsupportedFormat):  # export goes through open_writer
+        open_writer(F.INSERT, StringIO(), column, RowFormatOptions(), SQ)
+
+
+def test_other_dialects_keep_their_in_list_and_insert():
+    column = [FormatColumn(name="v", category=C.TEXT)]
+    assert fmt(F.IN_LIST, rows=[["a"], ["b"]], cols=column, dialect=MY).text == "('a', 'b')"
+    assert fmt(F.INSERT, rows=[["a"]], cols=column, dialect=PG, table_name="t").text == "INSERT INTO t (v) VALUES ('a');"
+
+
+@pytest.mark.parametrize("value, category, expected", [
+    ({"$type": "missing"}, MIX, "amount IS MISSING"),
+    ({"$type": "json", "text": '{"a": 1}'}, MIX, 'amount = {"a": 1}'),
+    ("x", MIX, 'amount = "x"'),
+    (5, C.NUMBER, "amount = 5"),
+    (None, MIX, "amount IS NULL"),
+])
+def test_sqlpp_value_condition(value, category, expected):
+    assert value_condition(SQ, "amount", value, category) == expected
+
+
+def test_a_truncated_json_cell_has_no_condition_and_no_insert_value():
+    cut = {"$type": "text", "preview": '{"k":', "size": 70000, "truncated": True}
+    assert value_condition(SQ, "doc", cut, MIX) is None
+    result = format_rows(F.IN_LIST, [FormatColumn(name="v", category=MIX)], [[cut]], RowFormatOptions(), SQ, "encoded")
+    assert result.text == "[NULL]" and result.warnings
+
+
+@pytest.mark.parametrize("cell", [{"$type": "json"}, {"$type": "json", "text": 5}, {"$type": "json", "text": None}])
+def test_a_malformed_json_cell_is_refused(cell):
+    with pytest.raises(ValidationFailed, match="json"):
+        format_rows(F.CSV, [FormatColumn(name="d", category=MIX)], [[cell]], RowFormatOptions(), SQ, "encoded")
+
+
+def test_a_raw_json_cell_dict_is_not_a_cell():
+    # a driver value that looks like an encoded cell is a JSON value: only the encoded source reads cells
+    rows = [[{"$type": "missing"}]]
+    out = format_rows(F.JSONL, [FormatColumn(name="v", category=MIX)], rows, RowFormatOptions(), SQ, "raw").text
+    assert out == '{"v": "{\\"$type\\": \\"missing\\"}"}'
+
+
+def test_raw_json_writer_keeps_row_text():  # Review Focus 1
+    stored = '{"zeta": 1,\n "alpha": {"z": 1, "a": 2}, "ws" :  [ 1 , 2 ], "mid": "a b"}'
+    rows = [stored, "1e400", '"x\\ny"', '{"a": 1, "b": "c d"}']
+    out = StringIO()
+    writer = open_raw_json_writer(F.JSONL, out)
+    writer.write(rows)
+    writer.close()
+    assert out.getvalue().splitlines() == [
+        '{"zeta":1,"alpha":{"z":1,"a":2},"ws":[1,2],"mid":"a b"}',  # had a line break: squeezed outside strings
+        "1e400", '"x\\ny"', '{"a": 1, "b": "c d"}',  # one line already: exactly as sent
+    ]
+    out = StringIO()
+    writer = open_raw_json_writer(F.JSON, out)
+    writer.write(rows[:2])
+    writer.close()
+    assert out.getvalue() == "[\n  " + stored + ",\n  1e400\n]\n"  # a JSON array keeps every byte
+    out = StringIO()
+    open_raw_json_writer(F.JSON, out).close()
+    assert out.getvalue() == "[]\n"
+    out = StringIO()
+    open_raw_json_writer(F.JSONL, out).close()
+    assert out.getvalue() == ""
+    with pytest.raises(ValueError):
+        open_raw_json_writer(F.CSV, StringIO())
+
+
+def test_raw_json_writer_writes_in_several_calls_and_survives_big_numbers():
+    rows = ['{"n": 9007199254740993, "d": 1.10, "e": 1e400, "k": {"b": 1, "a": 2}}']
+    out = StringIO()
+    writer = open_raw_json_writer(F.JSON, out)
+    writer.write(rows)
+    writer.write([])
+    writer.write(rows)
+    writer.close()
+    assert out.getvalue() == "[\n  " + rows[0] + ",\n  " + rows[0] + "\n]\n"
+    assert json.loads(out.getvalue(), parse_float=Decimal)[1]["d"] == Decimal("1.10")
+
+
+@pytest.mark.parametrize("text, expected", [
+    ('{ "a" : [ 1 , 2 ] ,\n\t"b" :\r\n 1e400 }', '{"a":[1,2],"b":1e400}'),
+    ('{"s": "a  b\\"  c\\\\", "t": " x "}', '{"s":"a  b\\"  c\\\\","t":" x "}'),  # spaces and escapes inside strings stay
+    ('"\\u00e9 \\n"', '"\\u00e9 \\n"'),
+    ("  1.10  ", "1.10"),
+    ('{"中 文": "日 本"}', '{"中 文":"日 本"}'),
+    ("", ""),
+])
+def test_one_line_squeezes_only_the_space_between_tokens(text, expected):
+    assert one_line(text) == expected

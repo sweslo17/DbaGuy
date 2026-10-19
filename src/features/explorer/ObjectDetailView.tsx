@@ -1,54 +1,38 @@
 import { useQuery } from "@tanstack/react-query";
-import { Check, Copy } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Button } from "@/components/ui/Button";
-import { api, errorMessage, unwrap } from "@/lib/api/client";
+import type { ReactNode } from "react";
+import { CopyButton } from "@/components/ui/CopyButton";
+import { api, unwrap } from "@/lib/api/client";
 import { pathKey, type ColumnInfo, type ObjectDetail } from "@/lib/api/types";
-import { writeClipboard } from "@/lib/native";
 import type { ObjectTabState } from "@/stores/workspace";
+import { RecoverableError } from "../connections/RecoverableError";
+import { isPasswordRequired } from "../connections/UnlockDialog";
+import { keyspaceOfPath } from "./fieldSamples";
 import { kindLabel } from "./kinds";
+import { SampledFields } from "./SampledFields";
 
 /** The object a detail view shows: an object tab, or the table tab's Columns and DDL views. */
 type ObjectRef = Pick<ObjectTabState, "profileId" | "path">;
 
-const FEEDBACK_MS = 1500;
+/** The app's one automatic retry of a failed read, except a missing password: that is asked for, not retried. */
+const retryOnce = (failures: number, error: Error) => failures < 1 && !isPasswordRequired(error);
 
-function CopyDdlButton({ ddl }: { ddl: string }) {
-  const [result, setResult] = useState<"copied" | "failed" | null>(null);
-  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
-  useEffect(() => () => clearTimeout(timer.current), []);
-  const copy = async () => {
-    try {
-      await writeClipboard(ddl);
-      setResult("copied");
-    } catch {
-      setResult("failed"); // e.g. the webview denied clipboard access
-    }
-    clearTimeout(timer.current);
-    timer.current = setTimeout(() => setResult(null), FEEDBACK_MS);
-  };
-  return (
-    <Button size="sm" onClick={() => void copy()}>
-      {result === "copied" ? <Check size={12} /> : <Copy size={12} />}{" "}
-      {result === "copied" ? "Copied" : result === "failed" ? "Copy failed" : "Copy DDL"}
-    </Button>
-  );
-}
-
-/** Loads an object's detail (`/metadata/detail`) and renders it with `children`; shows loading and errors itself. */
+/**
+ * Loads an object's detail (`/metadata/detail`) and renders it with `children`; shows loading and errors itself. A
+ * failure offers Retry, and a missing password (the backend forgets it on restart) asks for it: the profile unlocked
+ * anywhere reads this detail again (`useUnlockProfile`).
+ */
 function WithDetail({ tab, children }: { tab: ObjectRef; children: (detail: ObjectDetail) => ReactNode }) {
   const detail = useQuery({
     queryKey: ["detail", tab.profileId, pathKey(tab.path)],
     queryFn: async () =>
       unwrap(await (await api()).POST("/metadata/detail", { body: { profile_id: tab.profileId, path: tab.path } })),
+    retry: retryOnce,
   });
   if (detail.isPending) return <p className="p-4 text-muted">Loading…</p>;
   if (detail.isError) {
-    return (
-      <p className="whitespace-pre-wrap p-4 text-danger" data-selectable>
-        {errorMessage(detail.error)}
-      </p>
-    );
+    // `cancelRefetch: false`: an unlock has started this read already, and asking again must not restart it.
+    const retry = () => void detail.refetch({ cancelRefetch: false });
+    return <RecoverableError profileId={tab.profileId} error={detail.error} onRetry={retry} />;
   }
   return children(detail.data);
 }
@@ -137,7 +121,7 @@ export function DdlView({ tab }: { tab: ObjectRef }) {
             <div className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-2">
               <DdlBadge detail={d} />
               <div className="flex-1" />
-              <CopyDdlButton ddl={d.ddl} />
+              <CopyButton text={d.ddl} label="Copy DDL" />
             </div>
             <div className="min-h-0 flex-1 overflow-auto">
               <DdlText ddl={d.ddl} />
@@ -151,7 +135,16 @@ export function DdlView({ tab }: { tab: ObjectRef }) {
   );
 }
 
-/** Detail tab of an object without rows (function, sequence, index, …): its comment, columns and DDL on one page. */
+/** The sampled fields of a Couchbase collection's detail page; nothing for any other object. */
+function CollectionFields({ tab, kind }: { tab: ObjectRef; kind: string }) {
+  const keyspace = kind === "collection" ? keyspaceOfPath(tab.path) : null;
+  return keyspace && <SampledFields profileId={tab.profileId} keyspace={keyspace} />;
+}
+
+/**
+ * Detail tab of an object without rows (function, sequence, index, …): its comment, columns and DDL on one page. A
+ * Couchbase collection adds its sampled fields under the DDL.
+ */
 export function ObjectDetailView({ tab }: { tab: ObjectRef }) {
   return (
     <WithDetail tab={tab}>
@@ -164,11 +157,12 @@ export function ObjectDetailView({ tab }: { tab: ObjectRef }) {
             </span>
             <DdlBadge detail={d} />
             <div className="flex-1" />
-            {d.ddl && <CopyDdlButton ddl={d.ddl} />}
+            {d.ddl && <CopyButton text={d.ddl} label="Copy DDL" />}
           </div>
           {d.comment && <Comment text={d.comment} />}
           {d.columns && <ColumnsTable columns={d.columns} />}
           {d.ddl && <DdlText ddl={d.ddl} />}
+          <CollectionFields tab={tab} kind={d.kind} />
         </div>
       )}
     </WithDetail>

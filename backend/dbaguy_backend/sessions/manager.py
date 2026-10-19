@@ -1,5 +1,6 @@
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
@@ -123,14 +124,22 @@ class SessionManager:
             self._pop_and_close(sid)
 
     def check_idle_transactions(self, warn_after_s: float, rollback_after_s: float) -> None:
-        """Warn about idle transactions and roll them back in time; one failing session does not stop the rest."""
+        """Warn about idle transactions and roll them back in time."""
+        self._check_each("Idle-transaction check", lambda w: w.check_idle_transaction(warn_after_s, rollback_after_s))
+
+    def check_paused_results(self) -> None:
+        """Close paused results that waited too long for Load more (engines that set a limit)."""
+        self._check_each("Paused-result check", SessionWorker.check_paused_result)
+
+    def _check_each(self, what: str, check: Callable[[SessionWorker], None]) -> None:
+        """Run a housekeeping check on every session's worker; one failing session does not stop the rest."""
         with self._lock:
             entries = list(self._sessions.items())
         for session_id, entry in entries:
             try:
-                entry.worker.check_idle_transaction(warn_after_s, rollback_after_s)
+                check(entry.worker)
             except Exception:
-                logger.exception("Idle-transaction check failed for session {}", session_id)
+                logger.exception("{} failed for session {}", what, session_id)
 
     def _is_idle(self, entry: _Entry) -> bool:
         return entry.attached == 0 and time.monotonic() - entry.detached_at >= self._idle_timeout
