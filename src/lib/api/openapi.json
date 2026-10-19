@@ -4376,6 +4376,20 @@
             "type": "boolean",
             "title": "Backslash Escapes",
             "default": true
+          },
+          "stable_order": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stable Order"
           }
         },
         "type": "object",
@@ -4574,6 +4588,10 @@
           "row_editing": {
             "type": "boolean",
             "title": "Row Editing"
+          },
+          "orders_browse_by_key": {
+            "type": "boolean",
+            "title": "Orders Browse By Key"
           }
         },
         "type": "object",
@@ -4591,7 +4609,8 @@
           "documents",
           "executed_plan",
           "plan_format",
-          "row_editing"
+          "row_editing",
+          "orders_browse_by_key"
         ],
         "title": "EngineInfo"
       },

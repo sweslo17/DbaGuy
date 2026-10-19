@@ -33,21 +33,20 @@ import {
 
 /**
  * The selection of one column signature (`columnSignature`): a result with other columns starts without one; a
- * re-run with the same columns and more rows only clamp it.
+ * re-run with the same columns and more rows only clamp it. `made` is the selection as it was made, over the rows it
+ * was made on (unclamped): where a re-run's new rows put it back by key (05b K14).
  */
 export function useSelectionState(signature: string, columnCount: number, rowCount: number) {
   const [stored, setStored] = useState<{ signature: string; selection: GridSelection } | null>(null);
   const dims = useMemo<Dims>(() => ({ rows: rowCount, cols: columnCount }), [rowCount, columnCount]);
-  const selection = useMemo(
-    () => (stored?.signature === signature ? clampSelection(stored.selection, dims) : null),
-    [stored, signature, dims],
-  );
+  const made = stored?.signature === signature ? stored.selection : null;
+  const selection = useMemo(() => (made ? clampSelection(made, dims) : null), [made, dims]);
   const rect = useMemo(() => (selection ? rectOf(selection, dims) : null), [selection, dims]);
   const select = useCallback(
     (next: GridSelection | null) => setStored(next ? { signature, selection: next } : null),
     [signature],
   );
-  return { dims, selection, rect, select };
+  return { dims, made, selection, rect, select };
 }
 
 /** The selection a press on `hit` makes; `from` is the selection a shift-press extends, `active` the active cell. */

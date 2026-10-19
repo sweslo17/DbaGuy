@@ -1,5 +1,8 @@
 """PostgreSQL grid editing (spec ⑤): the edit target read from the catalog. Scratch objects only (zz_05a_*)."""
 
+import time
+from concurrent.futures import ThreadPoolExecutor, wait
+
 import pytest
 
 from dbaguy_backend.adapters.editing import NO_KEY, VIEWS
@@ -134,6 +137,76 @@ def test_a_domain_is_read_through_every_level_to_its_base_type(pg):  # ruling E2
     assert described(target) == {"k": ("number", "none", True), "n": ("number", "as_text", True)}
     assert not target.editable and target.reason == (
         f"The key column k ({outer}) cannot be matched exactly: a row cannot be identified")
+
+
+def test_a_table_read_in_key_order_without_a_big_sort_has_a_stable_order(pg):  # 05b K13
+    db, connection = pg
+    with scratch(db) as make:
+        correlated = make("TABLE", "CREATE TABLE {t} (id int PRIMARY KEY, v text)")
+        pair = make("TABLE", "CREATE TABLE {t} (a int, b text, v text, PRIMARY KEY (a, b))")
+        tiny = make("TABLE", "CREATE TABLE {t} (id int PRIMARY KEY, v text)")  # the planner sorts it: a few rows
+        scattered = make("TABLE", "CREATE TABLE {t} (id uuid PRIMARY KEY, v text)")  # random keys
+        loose = make("TABLE", "CREATE TABLE {t} (a int, b text)")
+        db.execute(
+            f"INSERT INTO {db.table(correlated)} SELECT g, 'row ' || g FROM generate_series(1, 5000) g",
+            f"INSERT INTO {db.table(pair)} SELECT g / 10, 'k' || (g % 10), 'v' FROM generate_series(1, 5000) g",
+            f"INSERT INTO {db.table(tiny)} VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            f"INSERT INTO {db.table(scattered)} SELECT gen_random_uuid(), repeat('x', 200) "
+            "FROM generate_series(1, 20000) g",
+            *(f"ANALYZE {db.table(name)}" for name in (correlated, pair, tiny, scattered)),
+        )
+        ordered = [connection.edit_target(db.path(name)).stable_order for name in (correlated, pair, tiny, scattered)]
+        # As if the table were larger than the cache: Seq Scan + Sort of 20,000 rows, the first row waits for all
+        connection.run("SET effective_cache_size = '8kB'").close()
+        sorted_ = connection.edit_target(db.path(scattered))
+        connection.run("RESET effective_cache_size").close()
+        keyless = connection.edit_target(db.path(loose))
+    assert ordered == [["id"], ["a", "b"], ["id"], ["id"]]
+    assert (sorted_.editable, sorted_.key, sorted_.stable_order) == (True, ["id"], None)
+    assert (keyless.editable, keyless.stable_order) == (False, None)
+
+
+def test_a_locked_table_gives_no_stable_order_in_time_and_the_session_is_as_it_was(pg):  # 05b K13
+    db, connection = pg
+    with scratch(db) as make:
+        table = make("TABLE", "CREATE TABLE {t} (id int PRIMARY KEY, v text)")
+        db.execute(f"INSERT INTO {db.table(table)} SELECT g, 'v' FROM generate_series(1, 2000) g",
+                   f"ANALYZE {db.table(table)}")
+        with ThreadPoolExecutor(1) as pool:
+            # An uncommitted ALTER elsewhere. The target is read on another thread, so that a planning without its
+            # time limit fails the test (the lock is let go after 5 s) instead of waiting for the lock forever.
+            with db.holding(f"LOCK TABLE {db.table(table)} IN ACCESS EXCLUSIVE MODE"):
+                started = time.monotonic()
+                reading = pool.submit(connection.edit_target, db.path(table))
+                wait([reading], timeout=5)
+                waited = time.monotonic() - started
+            locked = reading.result()
+        # Asked again and again (Refresh, previews): the plan is never a prepared statement, so it keeps working
+        again = [connection.edit_target(db.path(table)).stable_order for _ in range(7)]
+        shown = connection.run("SHOW statement_timeout")
+        timeout = shown.fetch(1)
+        shown.close()
+    assert (locked.editable, locked.key, locked.stable_order) == (True, ["id"], None)
+    assert 0.9 < waited < 3, waited
+    assert again == [["id"]] * 7
+    assert timeout == [["0"]]  # SET LOCAL ended with the EXPLAIN's own implicit transaction
+
+
+def test_inside_a_transaction_the_order_is_not_planned(pg):  # 05b K13: a failed EXPLAIN would abort the transaction
+    db, connection = pg
+    with scratch(db) as make:
+        table = make("TABLE", "CREATE TABLE {t} (id int PRIMARY KEY, v text)")
+        connection.set_autocommit(False)
+        try:
+            connection.run(f"SELECT * FROM {db.table(table)}").close()
+            inside = connection.edit_target(db.path(table))
+            still = (connection.in_transaction(), connection.transaction_failed())
+        finally:
+            connection.rollback()
+            connection.set_autocommit(True)
+        outside = connection.edit_target(db.path(table))
+    assert (inside.key, inside.stable_order, still) == (["id"], None, (True, False))
+    assert outside.stable_order == ["id"]
 
 
 # --- live applies (Task 9) ------------------------------------------------------------------------------------------

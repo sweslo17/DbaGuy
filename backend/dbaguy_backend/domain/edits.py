@@ -74,6 +74,10 @@ class EditTarget(BaseModel):
     columns: list[EditColumn] = Field(default_factory=list)
     transactional: bool = True  # MySQL: the table's engine supports transactions
     backslash_escapes: bool = True  # MySQL: the session's sql_mode has no NO_BACKSLASH_ESCAPES
+    # PostgreSQL (capability orders_browse_by_key): the key, when browsing the table ordered by it reads the first page
+    # at once (the plan has no Sort, or only a small one), so the table-data tab browses in that order; an UPDATE moves
+    # a row in PostgreSQL's unsorted (heap) order (05b K13). None: browse unsorted
+    stable_order: list[str] | None = None
 
 
 class _Input(BaseModel):

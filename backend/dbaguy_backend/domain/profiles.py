@@ -145,3 +145,5 @@ class EngineInfo(BaseModel):
     executed_plan: bool  # a statement can also return the plan it ran with (04b)
     plan_format: Literal["couchbase"] | None  # how EXPLAIN / profile results are laid out; None: no plan view
     row_editing: bool  # a table-data grid can be edited (spec ⑤)
+    # A table-data tab's first browse waits for the edit target and sorts by its stable_order (PostgreSQL, 05b K13)
+    orders_browse_by_key: bool

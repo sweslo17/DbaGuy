@@ -38,6 +38,21 @@ export interface DataGridHandle {
    */
   scrollToCell(row: number, col: number): void;
   focus(): void;
+  /** Where the grid is; null before it is laid out. */
+  view(): GridView | null;
+  /** Puts the grid in place: a selection or scroll position that is null stays as it is. */
+  restore(place: { selection: GridSelection | null; scrollTop: number | null }): void;
+}
+
+/** Where the grid is: what a re-run of the same browse needs to put it back by key (05b K14). */
+export interface GridView {
+  /** The selection as made, over the rows it was made on (not clamped to the rows shown now). */
+  selection: GridSelection | null;
+  /** The rows' scroll position as last scrolled, and the height of their viewport below the header (px). */
+  scrollTop: number;
+  viewportHeight: number;
+  /** The largest scroll position the rows shown now allow. */
+  maxScrollTop: number;
 }
 
 /** The current selection: the active cell is `selection.focus`; `rect` is what copy and the aggregates cover. */
@@ -142,7 +157,7 @@ export function DataGrid(props: DataGridProps) {
   const signature = useMemo(() => columnSignature(columns), [columns]);
   const layout = useColumnLayout(columns, signature, rows, !!onHeaderClick);
   const geometry = useGridGeometry(layout, rows.length, columns.length);
-  const { dims, selection, rect, select } = useSelectionState(signature, columns.length, rows.length);
+  const { dims, made, selection, rect, select } = useSelectionState(signature, columns.length, rows.length);
   const [drawer, setDrawer] = useState<GridDrawer>(null);
   const [drawerWidth, setDrawerWidth] = useState(DRAWER_WIDTH);
   /** The drawer's width while it is open; kept for the next opening when it closes. */
@@ -221,7 +236,30 @@ export function DataGrid(props: DataGridProps) {
     [rowVirtualizer, columnVirtualizer, layout.pinnedCount, layout.fixedWidth],
   );
   const focusGrid = useCallback(() => rootRef.current?.focus({ preventScroll: true }), []);
-  useImperativeHandle(ref, () => ({ scrollToCell, focus: focusGrid }), [scrollToCell, focusGrid]);
+  const view = useCallback((): GridView | null => {
+    const el = scrollRef.current;
+    if (!el) return null;
+    return {
+      selection: made,
+      // As last scrolled: once the rows are replaced, the browser may have clamped the element's own to fewer rows.
+      scrollTop: rowVirtualizer.scrollOffset ?? el.scrollTop,
+      viewportHeight: Math.max(0, el.clientHeight - HEADER_HEIGHT),
+      maxScrollTop: Math.max(0, rowVirtualizer.getTotalSize() - el.clientHeight),
+    };
+  }, [made, rowVirtualizer]);
+  const restore = useCallback(
+    (place: { selection: GridSelection | null; scrollTop: number | null }) => {
+      if (place.selection) select(place.selection);
+      if (place.scrollTop !== null) scrollRef.current?.scrollTo({ top: place.scrollTop });
+    },
+    [select],
+  );
+  useImperativeHandle(ref, () => ({ scrollToCell, focus: focusGrid, view, restore }), [
+    scrollToCell,
+    focusGrid,
+    view,
+    restore,
+  ]);
 
   const pointer = usePointerSelection({ scrollRef, columns, geometry, selection, rect, select, focusGrid });
   /** What a copy covers: the selection over the rows loaded now, whatever its mode. */

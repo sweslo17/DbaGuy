@@ -174,6 +174,8 @@ def test_engines(client):
         assert not (info["query_context"] or info["parameters"] or info["documents"] or info["executed_plan"])
     assert {name: info["row_editing"] for name, info in engines.items()} == {
         "postgres": True, "mysql": True, "mssql": True, "sqlite": True, "couchbase": False}
+    # Only PostgreSQL's unsorted order moves an UPDATEd row: its table tabs browse in the key's order (05b K13)
+    assert [name for name, info in engines.items() if info["orders_browse_by_key"]] == ["postgres"]
 
 
 def test_metadata_and_session_over_websocket(client, sqlite_profile_id):

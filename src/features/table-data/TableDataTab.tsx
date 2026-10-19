@@ -11,9 +11,10 @@ import { plural } from "@/lib/format";
 import { useWorkspace, type TableTabState } from "@/stores/workspace";
 import { useDialect, useProfiles } from "../connections/hooks";
 import { RecoverableError } from "../connections/RecoverableError";
+import { resultColumns } from "../edits/overlay";
 import { ColumnsView, DdlView } from "../explorer/ObjectDetailView";
 import { kindLabel } from "../explorer/kinds";
-import { DataGrid } from "../grid/DataGrid";
+import { DataGrid, type DataGridHandle } from "../grid/DataGrid";
 import { ExportDialog } from "../grid/ExportDialog";
 import type { GridSort } from "../grid/GridHeader";
 import { useHeldResult } from "../grid/useHeldResult";
@@ -24,6 +25,7 @@ import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
 import { browseView, keptNotice } from "./browseView";
 import { FilterBar } from "./FilterBar";
 import { addCondition, valueCondition, type Relation } from "./filterValue";
+import { useAnchoredRerun } from "./useAnchoredRerun";
 import { useTableData, type TableDataState } from "./useTableData";
 
 type View = "data" | "columns" | "ddl";
@@ -177,6 +179,19 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   const filterByValue = useFilterByValue(state.filter, applyFilter);
   // An export runs on this session: filter, sort and refresh would only wait behind it.
   const exporting = isExporting(snapshot);
+  const gridRef = useRef<DataGridHandle>(null);
+  const tableKey = table.target?.key;
+  const keyIndexes = useMemo(
+    () => (columns && tableKey ? resultColumns(columns, tableKey).keyIndexes : null),
+    [columns, tableKey],
+  );
+  useAnchoredRerun(
+    gridRef,
+    { request: state.requestId, position: table.position, view },
+    columns,
+    rows,
+    keyIndexes,
+  );
 
   const gridSort = useMemo<GridSort[]>(
     () =>
@@ -279,6 +294,7 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
       <div className="min-h-0 flex-1">
         {set ? (
           <DataGrid
+            ref={gridRef}
             columns={set.columns}
             rows={set.rows}
             hasMore={set.hasMore && !kept}

@@ -1358,6 +1358,8 @@ export interface components {
              * @default true
              */
             backslash_escapes: boolean;
+            /** Stable Order */
+            stable_order?: string[] | null;
         };
         /** EditTargetRequest */
         EditTargetRequest: {
@@ -1445,6 +1447,8 @@ export interface components {
             plan_format: "couchbase" | null;
             /** Row Editing */
             row_editing: boolean;
+            /** Orders Browse By Key */
+            orders_browse_by_key: boolean;
         };
         /** ErrorEvent */
         ErrorEvent: {

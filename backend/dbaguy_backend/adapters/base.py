@@ -44,6 +44,8 @@ class AdapterCapabilities:
     # EngineInfo)
     read_ahead_bytes: int | None = None
     row_editing: bool = False  # a table-data grid can be edited (spec ⑤): the connection is RowEditing
+    # A table-data tab's first browse waits for the edit target and sorts by its `stable_order` (PostgreSQL, 05b K13)
+    orders_browse_by_key: bool = False
 
 
 @dataclass(frozen=True)
@@ -360,7 +362,7 @@ class DatabaseAdapter(ABC):
             cancel_aborts_transaction=caps.cancel_aborts_transaction, server_read_only=caps.server_read_only,
             transactions=caps.transactions, query_context=caps.query_context, parameters=caps.parameters,
             documents=caps.documents, executed_plan=caps.executed_plan, plan_format=caps.plan_format,
-            row_editing=caps.row_editing,
+            row_editing=caps.row_editing, orders_browse_by_key=caps.orders_browse_by_key,
         )
 
     def relation_path(self, database: str | None, schema: str, name: str, kind: RelationKind) -> list[PathSegment]:
