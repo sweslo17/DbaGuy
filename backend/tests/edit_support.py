@@ -5,13 +5,15 @@ when its `scratch()` block ends, whatever the test did. Seeded tables are never 
 each engine's seed is left exactly as it was. SQLite works on a file in the test's tmp_path. Set-up and checks go
 through each engine's own driver, never through the code under test."""
 
+import itertools
 import sqlite3
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import mysql.connector
 import psycopg
@@ -23,15 +25,26 @@ from dbaguy_backend.adapters.mssql.adapter import MssqlAdapter
 from dbaguy_backend.adapters.mysql.adapter import MysqlAdapter
 from dbaguy_backend.adapters.postgres.adapter import PostgresAdapter
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
+from dbaguy_backend.config import Settings
+from dbaguy_backend.container import AppContainer
 from dbaguy_backend.domain.dialect import Dialect
+from dbaguy_backend.domain.edits import EditChanges, EditPreview, EditTarget
+from dbaguy_backend.domain.execution import (
+    ApplyEditsCommand, EditOutcomeEvent, ErrorEvent, ExecuteCommand, FinishedEvent,
+)
+from dbaguy_backend.domain.history import HistoryEntry
 from dbaguy_backend.domain.metadata import PathSegment
-from dbaguy_backend.domain.profiles import SqliteProfile
+from dbaguy_backend.domain.profiles import ProfileUpsertRequest, SqliteProfile
+from dbaguy_backend.sessions.manager import SessionCreateRequest
+from dbaguy_backend.sessions.worker import SessionWorker
 from dbaguy_backend.sql.dialects import force_quote_ident
+from dbaguy_backend.storage.secret_store import InMemorySecretStore
 from tests.support import (
     MSSQL_HOST, MSSQL_PASSWORD, MSSQL_PORT, MSSQL_SA_PASSWORD, MSSQL_USER, MYSQL_HOST, MYSQL_PASSWORD, MYSQL_PORT,
     MYSQL_USER, PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, make_mssql_profile, make_mysql_profile, make_pg_profile,
     mssql_connect, mysql_driver_kwargs, requires_mssql, requires_mysql, requires_pg, unique_name,
 )
+from tests.test_sessions import Recorder, paused, request_events
 
 SCRATCH_PREFIX = "zz_05a_"
 ITEM_ROWS: tuple[tuple[Any, ...], ...] = ((1, "a", 1, None), (2, "b", 2, "x"), (3, "c", 3, "y"))
@@ -418,3 +431,151 @@ def items_table(db: ScratchDb, make: Callable[[str, str], str], rows: Sequence[t
         values = ", ".join("(" + ", ".join(db.literal(v) for v in row) + ")" for row in rows[start:start + _CHUNK])
         db.execute(f"INSERT INTO {db.table(name)} (id, label, {db.q('order')}, note) VALUES {values}")
     return name
+
+
+# --- the app in-process (Task 9) -------------------------------------------------------------------------------------
+
+
+def val(text: str) -> dict:
+    return {"kind": "value", "text": text}
+
+
+NULL = {"kind": "null"}
+DEFAULT = {"kind": "default"}
+
+
+def update(change_id: str, key: dict, set_: dict, original: dict) -> dict:
+    return {"id": change_id, "key": key, "set": set_, "original": original}
+
+
+def insert(change_id: str, values: dict) -> dict:
+    return {"id": change_id, "values": values}
+
+
+def delete(change_id: str, key: dict) -> dict:
+    return {"id": change_id, "key": key}
+
+
+@dataclass
+class Applied:
+    """One request's events, from its `started` to its `finished`."""
+
+    events: list
+
+    @property
+    def types(self) -> list[str]:
+        return [event.type for event in self.events]
+
+    @property
+    def outcome(self) -> EditOutcomeEvent:
+        return next(event for event in self.events if event.type == "edit_outcome")
+
+    @property
+    def error(self) -> ErrorEvent | None:
+        return next((event for event in self.events if event.type == "error"), None)
+
+    @property
+    def affected(self) -> list[tuple[int, int]]:
+        return [(event.index, event.rows) for event in self.events if event.type == "affected"]
+
+    @property
+    def messages(self) -> list[str]:
+        return [event.text for event in self.events if event.type == "message"]
+
+    @property
+    def finished(self) -> FinishedEvent:
+        return self.events[-1]
+
+
+class Tab:
+    """A table-data tab's session: its worker, with the events it sent."""
+
+    def __init__(self, worker: SessionWorker, recorder: Recorder, database: str | None) -> None:
+        self.worker = worker
+        self.recorder = recorder
+        self.database = database
+        self._ids = itertools.count(1)
+
+    def _rid(self, what: str) -> str:
+        return f"{what}{next(self._ids)}"
+
+    def run(self, sql: str) -> Applied:
+        """A statement of the test's own (a session setting), run to its end without an error."""
+        rid = self._rid("run")
+        self.worker.submit(ExecuteCommand(request_id=rid, sql=sql, history=False, page_size=10_000))
+        done = self.wait(rid)
+        assert done.error is None, done.error.message
+        return done
+
+    def rows(self, sql: str) -> list[list]:
+        """The cells of a SELECT exactly as the grid gets them (encode_row)."""
+        done = self.run(sql)
+        return [row for event in done.events if event.type == "rows" for row in event.rows]
+
+    def browse(self, sql: str, page_size: int = 500) -> str:
+        """A SELECT left paused after its first page, as the table-data grid leaves it."""
+        rid = self._rid("browse")
+        self.worker.submit(ExecuteCommand(request_id=rid, sql=sql, history=False, page_size=page_size))
+        self.recorder.wait_for(paused(rid, page_size), timeout=30)
+        return rid
+
+    def submit_apply(self, plan_id: str | None) -> str:
+        rid = self._rid("apply")
+        self.worker.submit(ApplyEditsCommand(request_id=rid, plan_id=plan_id or "none"))
+        return rid
+
+    def apply(self, plan_id: str | None, timeout: float = 60.0) -> Applied:
+        return self.wait(self.submit_apply(plan_id), timeout)
+
+    def wait(self, rid: str, timeout: float = 60.0) -> Applied:
+        return Applied(request_events(self.recorder, rid, timeout))  # the slice Task 8's tests use too (L18)
+
+
+class EditApp:
+    """The backend in-process — an AppContainer over a temporary data dir with secrets in memory — so a test previews
+    through EditService and applies through a session's worker with its real hooks and adapter (ruling E21)."""
+
+    def __init__(self, directory: Path) -> None:
+        settings = Settings(token="edits", data_dir=directory / "data", log_to_file=False)
+        self.container = AppContainer(settings, secret_store=InMemorySecretStore())
+
+    def add_profile(self, body: dict) -> UUID:
+        return self.container.profiles.create(ProfileUpsertRequest.model_validate(body)).profile.id
+
+    def update_profile(self, profile_id: UUID, body: dict) -> None:
+        self.container.profiles.update(profile_id, ProfileUpsertRequest.model_validate(body))
+
+    def target(self, profile_id: UUID, path: list[PathSegment]) -> EditTarget:
+        return self.container.edits.target(profile_id, path)
+
+    def preview(self, profile_id: UUID, path: list[PathSegment], *, updates=(), inserts=(), deletes=()) -> EditPreview:
+        changes = EditChanges.model_validate({"updates": list(updates), "inserts": list(inserts),
+                                              "deletes": list(deletes)})
+        return self.container.edits.preview(profile_id, path, changes)
+
+    def tab(self, profile_id: UUID, database: str | None) -> Tab:
+        info = self.container.sessions.create(SessionCreateRequest(profile_id=profile_id, database=database))
+        recorder = Recorder()
+        return Tab(self.container.sessions.attach(info.session_id, recorder), recorder, info.database)
+
+    def history(self) -> list[HistoryEntry]:
+        return self.container.history.search().items
+
+    def close_tabs(self) -> None:
+        """Every session closed: nothing holds a lock a scratch DROP would wait for."""
+        self.container.sessions.close_all()
+
+    def close(self) -> None:
+        self.container.close()
+
+
+@contextmanager
+def edit_env(engine: str, directory: Path) -> Iterator[tuple[ScratchDb, EditApp, UUID]]:
+    """A scratch database, the app, and a profile for it (password saved in memory)."""
+    db = scratch_db(engine, directory)
+    app = EditApp(directory)
+    try:
+        yield db, app, app.add_profile(db.profile())
+    finally:
+        app.close()
+        db.close()

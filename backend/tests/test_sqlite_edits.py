@@ -3,7 +3,8 @@
 import pytest
 
 from dbaguy_backend.adapters.editing import NO_KEY, VIEWS
-from tests.edit_support import SqliteScratch, scratch
+from tests.edit_support import SqliteScratch, edit_env, insert, items_table, scratch, update, val
+from tests.support import scaled
 
 
 @pytest.fixture
@@ -101,3 +102,67 @@ def test_a_virtual_tables_internal_tables_are_read_only_and_names_match_in_any_c
         **dict.fromkeys(shadows, (False, "Internal table of a virtual table: read-only here")),
     }
     assert (upper.editable, upper.key) == (True, ["id"])
+
+
+# --- live applies (Task 9) ------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def lite_env(tmp_path):
+    with edit_env("sqlite", tmp_path) as made:
+        yield made
+
+
+def test_a_commit_blocked_by_another_sessions_reader_rolls_back(lite_env):  # A14, ruling E10
+    db, app, pid = lite_env
+    with scratch(db, app.close_tabs) as make:
+        table = items_table(db, make)
+        db.fill(db.table(table), 3000, 100)
+        app.tab(pid, None).browse(f"SELECT * FROM {db.table(table)}")  # paused: its read lock stays
+        preview = app.preview(pid, db.path(table), updates=[update("u:1", {"id": 1}, {"label": val("x")},
+                                                                   {"label": "a"})])
+        done = app.tab(pid, None).apply(preview.plan_id, timeout=scaled(30))  # the 5 s busy timeout, then the error
+        assert (done.outcome.outcome, done.outcome.statement, done.error.code) == ("rolled_back", None, "SQLITE_BUSY")
+        assert done.error.message == "database is locked\nThe transaction was rolled back: nothing was applied"
+        assert not done.finished.in_transaction
+        assert db.rows(f"SELECT label FROM {db.table(table)} WHERE id = 1") == [("a",)]
+
+
+def test_a_big_integer_in_a_column_without_a_type_is_found(lite_env):  # ruling E7, Review Focus 3
+    db, app, pid = lite_env
+    with scratch(db, app.close_tabs) as make:
+        table = make("TABLE", "CREATE TABLE {t} (id PRIMARY KEY, label TEXT)")
+        db.execute(f"INSERT INTO {db.table(table)} VALUES (9007199254740993, 'big'), ('9007199254740993x', 'text')")
+        tab = app.tab(pid, None)
+        [[cell]] = tab.rows(f"SELECT id FROM {db.table(table)} WHERE label = 'big'")
+        assert cell == "9007199254740993"  # what the grid holds: encode_value made the integer a string
+        preview = app.preview(pid, db.path(table), updates=[update("u:1", {"id": cell}, {"label": val("bigger")},
+                                                                   {"label": "big"})])
+        assert "WHERE id IN (9007199254740993, '9007199254740993')" in preview.statements[0].sql
+        assert tab.apply(preview.plan_id).outcome.outcome == "committed"
+        assert db.rows(f"SELECT typeof(id), label FROM {db.table(table)} ORDER BY label") == [
+            ("integer", "bigger"), ("text", "text")]
+
+
+def test_declared_types_shape_values_defaults_and_checks(lite_env):  # ruling E6
+    db, app, pid = lite_env
+    with scratch(db, app.close_tabs) as make:
+        table = make("TABLE", "CREATE TABLE {t} (id INTEGER PRIMARY KEY, made DATETIME DEFAULT CURRENT_TIMESTAMP, "
+                              "ok BOOLEAN NOT NULL DEFAULT 0, price REAL, twice INT GENERATED ALWAYS AS (id * 2) VIRTUAL)")
+        preview = app.preview(pid, db.path(table), inserts=[
+            insert("i:1", {"made": val("2026-10-19 12:00:00"), "ok": val("yes"), "price": val("1.5")}),
+            insert("i:2", {})])
+        assert [s.sql for s in preview.statements] == [
+            f"INSERT INTO main.{table} (made, ok, price) VALUES ('2026-10-19 12:00:00', 1, 1.5)",
+            f"INSERT INTO main.{table} DEFAULT VALUES"]
+        tab = app.tab(pid, None)
+        assert tab.apply(preview.plan_id).outcome.outcome == "committed"
+        assert db.rows(f"SELECT id, made, ok, price, twice FROM {db.table(table)} WHERE id = 1") == [
+            (1, "2026-10-19 12:00:00", 1, 1.5, 2)]
+        update_price = app.preview(pid, db.path(table), updates=[
+            update("u:1", {"id": 1}, {"price": val("2")}, {"price": 1.5})])
+        assert [(u.column, u.reason) for u in update_price.statements[0].unchecked] == [
+            ("price", "REAL values cannot be compared exactly")]
+        refused = app.preview(pid, db.path(table), updates=[update("u:1", {"id": 1}, {"twice": val("9")},
+                                                                   {"twice": 2})])
+        assert [(p.column, p.code) for p in refused.problems] == [("twice", "read_only_column")]
