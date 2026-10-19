@@ -5,7 +5,7 @@ from dbaguy_backend.sql.dialects import (
     keyspace_path, needs_quote, qualified, quote_ident, quote_literal, zero_date_as_text,
 )
 from dbaguy_backend.sql.lexer import INSIGNIFICANT, TokenKind, tokenize
-from dbaguy_backend.sql.offsets import Utf16Index
+from dbaguy_backend.sql.offsets import Utf16Index, utf16_offset
 from dbaguy_backend.sql.sqlglot_rules import parse
 
 PG, LITE, MY, TS, SQ = Dialect.POSTGRES, Dialect.SQLITE, Dialect.MYSQL, Dialect.TSQL, Dialect.SQLPP
@@ -180,3 +180,8 @@ def test_sqlpp_literals_and_paths():
     assert in_list(SQ, ["1", '"a"']) == '[1, "a"]'
     assert in_list(Dialect.POSTGRES, ["1", "'a'"]) == "(1, 'a')"
     assert is_reserved(SQ, "Users") and not is_reserved(SQ, "name")
+
+
+def test_utf16_offset_counts_astral_characters():
+    text = 'a😀b中\U0001F600'
+    assert [utf16_offset(text, cp) for cp in range(-1, 7)] == [0, 0, 1, 3, 4, 5, 7, 7]

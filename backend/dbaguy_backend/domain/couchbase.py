@@ -1,6 +1,6 @@
 """API models of the Couchbase features: the plan view (EXPLAIN, ADVISE and the profile of a statement as an operator
 tree with flags, index advice and timings, spec §3.10), the query contexts a tab can pick (§3.11.1) and the field paths
-of a keyspace's sampled documents (R-04-11)."""
+of a keyspace's sampled documents (R-04-11), and what saving a document would change (§3.9.3)."""
 
 from datetime import datetime
 from typing import Literal
@@ -127,3 +127,23 @@ class FieldSample(BaseModel):
     limits: SampleLimits
     elapsed_ms: int
     fields: list[FieldPath]
+
+
+ChangeKind = Literal["key_order", "number", "duplicate_key", "other"]
+
+
+class DocumentChange(BaseModel):
+    """One thing the server would store differently from the edited text (spec §3.9.3, ruling C2)."""
+
+    path: str  # JSONPath as the value viewer writes it: $, $.address, $.items[0], $["odd key"]
+    kind: ChangeKind
+    before: str  # the edited side: a literal, a key list or a dropped value (≤ 200 characters, then "…")
+    after: str  # the server's side
+    value_changed: bool  # something is lost or changed; false for reordered keys and a respelled equal number
+
+
+class ChangeCounts(BaseModel):
+    key_order: int = 0
+    number: int = 0
+    duplicate_key: int = 0
+    other: int = 0

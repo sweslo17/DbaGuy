@@ -34,3 +34,10 @@ def utf16_column(text: str, line: int, column: int) -> int:
     content = lines[line - 1]
     within = min(column - 1, len(content))
     return Utf16Index(content).to_utf16(within) + (column - 1 - within) + 1
+
+
+def utf16_offset(text: str, cp: int) -> int:
+    """The UTF-16 offset of code-point offset `cp` of `text` (clamped to the text), counted at C speed: no Python loop
+    over the text, as `Utf16Index` would make over a 20 MiB document."""
+    cp = max(0, min(cp, len(text)))
+    return len(text[:cp].encode("utf-16-le", "surrogatepass")) // 2
