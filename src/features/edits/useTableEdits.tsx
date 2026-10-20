@@ -178,8 +178,11 @@ export interface TableEdits {
   discardAll: () => void;
   undo: () => void;
   redo: () => void;
-  /** Ends an open editor now, staging what was typed (Task 11: a tab closing asks about it too, L8). */
-  flushEditor: () => void;
+  /**
+   * Ends an open editor now, staging what was typed (Task 11: a tab closing asks about it too, L8); whether one was
+   * open (its input had the focus, which is then on the page).
+   */
+  flushEditor: () => boolean;
 }
 
 /** A row's or cell's React key in the grid: an editor is never reused for another cell (K18). */
@@ -432,8 +435,10 @@ export function useTableEdits(input: TableEditsInput): TableEdits {
     return true;
   };
   const flushEditor = () => {
+    if (!editingNow.current) return false;
     // The editor unmounts at once, and stages what was typed as it does (its effects run before flushSync returns).
-    if (editingNow.current) flushSync(() => setEditing(null));
+    flushSync(() => setEditing(null));
+    return true;
   };
 
   const setNullIn = (rect: Rect | null) => {

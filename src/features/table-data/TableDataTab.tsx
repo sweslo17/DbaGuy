@@ -22,7 +22,13 @@ import { tableEditActions, useTableEditActions } from "../edits/editActions";
 import { EditBar } from "../edits/EditBar";
 import { resultColumns } from "../edits/overlay";
 import { changeCount } from "../edits/staging";
-import { asksBeforeDiscard, closeQuestion, discardQuestion } from "../edits/tableEditing";
+import {
+  asksBeforeDiscard,
+  CLOSE_WHILE_COMMITTING,
+  closeQuestion,
+  discardQuestion,
+  NOT_IN_EXPORT,
+} from "../edits/tableEditing";
 import { useCommit, useCommitState } from "../edits/useCommit";
 import { useTableEdits } from "../edits/useTableEdits";
 import { kindLabel } from "../explorer/kinds";
@@ -43,9 +49,6 @@ import { useTableData, type TableDataState } from "./useTableData";
 
 type View = "data" | "columns" | "ddl";
 const FILTER_BY_VALUE = "Filter by this value";
-/** Closing is refused while a commit runs (R-05-11): its dialog is modal, so only a profile deletion gets this far. */
-const CLOSE_WHILE_COMMITTING = "A commit is running: wait for it to end, or cancel it in its dialog";
-const NOT_IN_EXPORT = "Staged changes are not committed and are not in the export";
 const CUT_VALUE_MESSAGE = "This value cannot be matched exactly: the grid holds only its beginning";
 const VIEWS: { value: View; label: string }[] = [
   { value: "data", label: "Data" },
@@ -275,12 +278,25 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   // refused while a commit runs. Registered for every table tab, shown or not: a restored tab's staging is in the store
   // (C28). An open editor's text is staged first, so it is counted and asked about (L8; never during render or an
   // effect: flushSync). Losing the connection does not ask (close-only), nor does quitting (the staging is saved).
+  /** The question ended the shown tab's open editor: its input had the focus, so Cancel gives it to the grid. */
+  const refocusOnKeep = useRef(false);
   const closing = useDiscardQuestion(tab.id, CLOSE_GUARD_ORDER.edits, () => {
     if (committing.read()?.step === "applying") return { refuse: CLOSE_WHILE_COMMITTING };
-    edits.flushEditor();
+    refocusOnKeep.current = edits.flushEditor() && active;
     const staged = readStagedEdits(tab.id);
     return staged !== null && changeCount(staged) > 0;
   });
+  const keepTab = () => {
+    closing.answer(false);
+    if (!refocusOnKeep.current) return;
+    refocusOnKeep.current = false;
+    // Once the dialog has closed: it gives the focus back to what had it when it opened, and that was the page. Never
+    // over a focus something else took meanwhile.
+    requestAnimationFrame(() => {
+      const lost = !document.activeElement || document.activeElement === document.body;
+      if (lost && !isDialogOpen()) gridRef.current?.focus();
+    });
+  };
   // The tab strip's dot: staged changes are unsaved work.
   useReportTabStatus(tab.id, { dirty: edits.changes > 0 });
   // ⌘⇧P's edit commands (spec ⑤ §3.6.4), through the same handlers as the grid's keys and the edit bar (H11).
@@ -289,6 +305,7 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
     tableEditActions(
       {
         editable: edits.editable,
+        shown: active,
         changes: edits.changes,
         commitBlocked: commit.disabledReason,
         applying: commit.applying,
@@ -497,7 +514,7 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
       />
       <ConfirmDialog
         open={closing.asking}
-        onOpenChange={(open) => !open && closing.answer(false)}
+        onOpenChange={(open) => !open && keepTab()}
         title="Close tab"
         message={closeQuestion(edits.changes, relation?.name ?? tab.title)}
         confirmLabel="Discard"

@@ -45,6 +45,10 @@ export const KEEP_MINE_TITLE = "Check the staged values against the server's val
 
 /** The palette's Delete selected rows and Set NULL with nothing selected in the grid. */
 export const NOTHING_SELECTED = "Select cells in the grid first";
+/** Closing the tab is refused while a commit runs (R-05-11): its dialog is modal, so only a profile deletion gets here. */
+export const CLOSE_WHILE_COMMITTING = "A commit is running: wait for it to end, or cancel it in its dialog";
+/** The export dialog's line while changes are staged (spec ⑤ §3.6.6): it writes what the server holds. */
+export const NOT_IN_EXPORT = "Staged changes are not committed and are not in the export";
 
 export const COPY_TEXT = "Copy text";
 export const COPY_FAILED = "Could not copy the text";

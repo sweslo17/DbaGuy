@@ -46,7 +46,15 @@ const handlers = () => {
   for (const id of IDS) run[id] = vi.fn();
   return run;
 };
-const editable = { editable: true, changes: 2, commitBlocked: null, applying: false, undoable: true, redoable: false };
+const editable = {
+  editable: true,
+  shown: true,
+  changes: 2,
+  commitBlocked: null,
+  applying: false,
+  undoable: true,
+  redoable: false,
+};
 
 function context(activeTab: Tab | null, editActions: CommandContext["editActions"], rowEditing = true): CommandContext {
   return {

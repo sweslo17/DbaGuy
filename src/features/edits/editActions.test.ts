@@ -12,6 +12,7 @@ const handlers = () => {
 };
 const facts = (overrides: Partial<TableEditFacts> = {}): TableEditFacts => ({
   editable: true,
+  shown: true,
   changes: 2,
   commitBlocked: null,
   applying: false,
@@ -38,6 +39,18 @@ describe("the palette's table-edit actions", () => {
 
   it("stage nothing new while the rows cannot be edited, but still undo, redo, discard and commit", () => {
     expect(enabled(facts({ editable: false }))).toEqual({
+      addRow: false,
+      deleteRows: false,
+      setNull: false,
+      commit: true,
+      discardAll: true,
+      undo: true,
+      redo: true,
+    });
+  });
+
+  it("act on the grid only while it is on screen, and on the staging from Columns or DDL too", () => {
+    expect(enabled(facts({ shown: false }))).toEqual({
       addRow: false,
       deleteRows: false,
       setNull: false,

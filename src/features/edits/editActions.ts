@@ -8,6 +8,8 @@ export type TableEditActions = Record<TableEditActionId, TabAction>;
 export interface TableEditFacts {
   /** Rows can be edited now (the edits' `editable`: not while the rows are held, a commit runs or the key changed). */
   editable: boolean;
+  /** The grid is on screen: the tab is active and its Data view shown (not Columns or DDL). */
+  shown: boolean;
   /** The changes staged. */
   changes: number;
   /** Why Commit… cannot start now (the commit's `disabledReason`), or null. */
@@ -22,16 +24,18 @@ export interface TableEditFacts {
 /**
  * The palette's table-edit actions: each enabled as its own control is, and run through the tab's own handler (H11:
  * the palette is the way to undo when WKWebView keeps ⌘Z for its Edit menu, A10). Add row, Delete selected rows and
- * Set NULL as the grid's keys and + Row; Commit changes… as the edit bar's Commit…; Discard all changes as its
- * Discard… (shown with changes, asking first when more than one would go); Undo and Redo as ⌘Z / ⇧⌘Z, which also take
- * changes back while the rows cannot be edited (L5), but never during a commit.
+ * Set NULL as the grid's keys and + Row, so only while the grid is on screen (they act on its selection or open an
+ * editor in it); Commit changes… as the edit bar's Commit…; Discard all changes as its Discard… (shown with changes,
+ * asking first when more than one would go); Undo and Redo as ⌘Z / ⇧⌘Z, which also take changes back while the rows
+ * cannot be edited (L5), but never during a commit. Those four act on the staging, so also from Columns or DDL.
  */
 export function tableEditActions(facts: TableEditFacts, run: Record<TableEditActionId, () => void>): TableEditActions {
-  const { editable, changes, applying } = facts;
+  const { changes, applying } = facts;
+  const onGrid = facts.editable && facts.shown;
   return {
-    addRow: { enabled: editable, run: run.addRow },
-    deleteRows: { enabled: editable, run: run.deleteRows },
-    setNull: { enabled: editable, run: run.setNull },
+    addRow: { enabled: onGrid, run: run.addRow },
+    deleteRows: { enabled: onGrid, run: run.deleteRows },
+    setNull: { enabled: onGrid, run: run.setNull },
     commit: { enabled: changes > 0 && facts.commitBlocked === null, run: run.commit },
     discardAll: { enabled: changes > 0 && !applying, run: run.discardAll },
     undo: { enabled: facts.undoable && !applying, run: run.undo },
