@@ -5,7 +5,7 @@
 > 技術依據：本設計在 dev 資料庫上的探測（2026-10-19；PostgreSQL 17.11／psycopg 3.3.6、MySQL 8.4.11／mysql-connector-python 26.7.0 pure、SQL Server 2022 CU27／pymssql 2.4.4、SQLite 3.53.4），標 **〔實測〕**；標 **〔未實測〕** 的是假設，§10 彙整並指定由哪個 plan task 先驗證。探測只建 `zz_spec05_*` scratch 表（SQLite 用 scratch 目錄裡的檔案），結束時以完整名稱 DROP；紀錄在附錄 A。本文的 A 編號自成一組（⑤ A1…）。
 > 建立在 ①–④ 之上：表格資料 tab（[② spec](2026-10-16-02-query-workflow-design.md) §4.5）、grid（§4.3）、`SessionWorker` 與 WS 協定（`domain/execution.py`）、`SafetyPolicy`、`sql/dialects.py` 的引號與 literal、`sql/formatting.py` 的 `value_condition`（Filter by this value）、④ 的 cell 編碼（[④ spec](2026-10-18-04-couchbase-design.md) §3.2.4），以及 04c 存檔流程的教訓（[04c notes](../notes/2026-10-19-04c-couchbase-documents-followups.md) C7、C12、C20、C28、C42、C45、C46、C48，B40）
 > **05a（backend）完成（2026-10-19）**：實作時的細化與實測結果記在被它們修訂的文字旁邊，以「〔05a〕」開頭（§2 的 R-／D- 列、§3.2.2、§3.3.2、§3.3.3、§3.4、§3.5、§4–§9、§11–§13）與 §10 的結果欄；前文不改，衝突時以〔05a〕為準。編號 E 是 [05a plan](../plans/2026-10-19-05a-grid-editing-backend.md) 的規劃決定（E1–E25），F／G／L 是 plan 審查與 task review 的決定（內容寫在條目裡）；I／M 是 05a 最終審查（final review）的項目，最後的修正波（ruling G16）做了 I1、M1–M3、M5、M10 與 M4、M6、M8、M9 的文件，M7（被取代的預覽的 plan 仍可用 15 分鐘）留給 05b：05b 只套用畫面上那個對話框的 plan。05b（frontend）還沒開始。
-> **〔05b〕前端完成（2026-10-20）**：[05b plan](../plans/2026-10-20-05b-grid-editing-frontend.md) 的規劃決定 H1–H26 與 plan 時找到的 spec 問題 S1–S10、實作與審查時的決定 K1–K21、pre-flight 審查的項目（H1、H2、M1–M7、L1–L24）記在被它們細化的文字旁，以「〔05b〕」開頭（§2 的 R-05-10、D-05-12，§3.1、§3.6.1–§3.6.6、§3.7、§7、§8、§10、§11、§13）；前文不改，衝突時以〔05b〕為準。Task 6b 是實作時加的（K13：PG 依 key 排序瀏覽；K14：重讀依 key 找回位置）。
+> **〔05b〕前端完成（2026-10-20）**：[05b plan](../plans/2026-10-20-05b-grid-editing-frontend.md) 的規劃決定 H1–H26 與 plan 時找到的 spec 問題 S1–S10、實作與審查時的決定 K1–K22（含 K3b、K14b）、pre-flight 審查的項目（H1、H2、M1–M7、L1–L24）記在被它們細化的文字旁，以「〔05b〕」開頭（§2 的 R-05-10、D-05-12，§3.1、§3.6.1–§3.6.6、§3.7、§7、§8、§10、§11、§13）；前文不改，衝突時以〔05b〕為準。Task 6b 是實作時加的（K13：PG 依 key 排序瀏覽；K14：重讀依 key 找回位置）。
 
 ## 1. 目標
 
@@ -408,7 +408,7 @@ interface StagedEdits {
 - 前端 `savedEdits()`（同 `savedParams`）只寫 backend 會收的內容；超過上限就整個不寫，編輯列提示「Too large to keep across a restart」。
 - 還原：放進 `stores/stagedEdits.ts`；Data 檢視載入後依 key 綁回；欄位已不存在的修改在下次預覽變成 `unknown_column`，使用者還原它即可。
 
-〔05b〕backend 的修復把模型不收的 `staged_edits`（或不是 table tab 的）丟掉、留下 tab，WARNING 只記「dropped the staged edits」（H14）；檔案保留標刪列下面隱藏的 UPDATE，也算進上限（K3）；undo 歷史與問題不保存（H22）；檔案多了 `outcome_unknown`（S1，見 §3.6.1 的〔05b〕）。兩邊用同一套規則（`fixtures/staged_edits_cases.json` 的同一批檔案）：大小以 Python `len` 的字元數算，key 與原始值連欄名一起算（pre-flight M3：以 UTF-16 算會把 backend 收得下的 emoji 文字當成太大）；`savedEdits` 不寫模型會拒的（孤立 surrogate、空的或超過 1,024 字元的欄名、不合法或重複的 id、沒有 `original` 的欄，K5：編輯列說原因 `unsaveable`；暫存仍在記憶體、照樣可以 commit）；key 與原始值的巢狀最多 64 層（`MAX_CELL_LEVELS`，兩邊都有：254 層的檔案 `PUT` 得進去，`GET` 卻讀不回來，下次存檔就蓋掉每個 tab）。tab 的文字（buffer、title 等）與 workspace 本身的欄位裡的孤立 surrogate 存成 U+FFFD：前端 `workspaceJson` 一直如此，backend 的修復兜底（K7：否則 `PUT` 500，每次存檔都失敗）；`staged_edits` 不替換（那會改到 commit 寫的值），由模型拒絕。local copy 裡讀不出來的暫存只讓那個 tab 失去暫存（`readableEdits`）。backend 連不上時的 local copy 受 localStorage 配額限制（約 2.5M 字元以上可能沒有，L19）。
+〔05b〕backend 的修復把模型不收的 `staged_edits`（或不是 table tab 的）丟掉、留下 tab，WARNING 只記「dropped the staged edits」（H14）；檔案保留標刪列下面隱藏的 UPDATE，也算進上限（K3）；超過上限時改存沒有那些隱藏 UPDATE 的檔案（commit 只送 DELETE，失去的只是重開後 Restore 那些值，編輯列說明；還是放不下才不存，K3b，最終審查）；undo 歷史與問題不保存（H22）；檔案多了 `outcome_unknown`（S1，見 §3.6.1 的〔05b〕）。兩邊用同一套規則（`fixtures/staged_edits_cases.json` 的同一批檔案）：大小以 Python `len` 的字元數算，key 與原始值連欄名一起算（pre-flight M3：以 UTF-16 算會把 backend 收得下的 emoji 文字當成太大）；`savedEdits` 不寫模型會拒的（孤立 surrogate、空的或超過 1,024 字元的欄名、不合法或重複的 id、沒有 `original` 的欄，K5：編輯列說原因 `unsaveable`；暫存仍在記憶體、照樣可以 commit）；key 與原始值的巢狀最多 64 層（`MAX_CELL_LEVELS`，兩邊都有：254 層的檔案 `PUT` 得進去，`GET` 卻讀不回來，下次存檔就蓋掉每個 tab）。tab 的文字（buffer、title 等）與 workspace 本身的欄位裡的孤立 surrogate 存成 U+FFFD：前端 `workspaceJson` 一直如此，backend 的修復兜底（K7：否則 `PUT` 500，每次存檔都失敗）；`staged_edits` 不替換（那會改到 commit 寫的值），由模型拒絕。local copy 裡讀不出來的暫存只讓那個 tab 失去暫存（`readableEdits`）。backend 連不上時的 local copy 受 localStorage 配額限制（約 2.5M 字元以上可能沒有，L19）。
 
 ## 4. 錯誤處理
 
@@ -489,7 +489,7 @@ interface StagedEdits {
 - **Q1**（§1、§7「只有被改的列重畫」）：dev 瀏覽器（Chromium、StrictMode）以 `window.__gridRowRenders` 量，暫存一格只重畫那一列；一欄第一次暫存若欄寬重新估算，畫面內的列各重畫一次；jsdom 的 100,000 × 30：暫存一格 1 個新的列物件，閒置的重畫 0.2 ms。
 - **10,000 個變更的 commit**（D-05-11 的上限，PG `zz_05b_wide`，in-process）：預覽 0.14–0.17 秒、套用 6.37–6.54 秒，committed；前端的主執行緒 0.38 秒（jsdom，`useSession` 的 snapshot 修正之前 3.77 秒）。
 - **A7 重新量 1,000 個 UPDATE**（in-process，load average 2.5–4.4）：PG 0.67–0.70 秒、MySQL 0.51–0.59 秒、SQL Server 1.52–1.60 秒、SQLite 0.33 秒；預覽 13–40 ms。
-- **undo 歷史**（D-05-14，Node／V8）：10,000 個 UPDATE 加 99 次單格編輯約 37 MB；每一步都動到 10,000 列時，單欄 100 步約 145 MB、換著 29 欄約 1.2 GB（Revert cell 讓 V8 的物件變成 dictionary mode）。上限是步數，不是位元組（已知限制）。
+- **undo 歷史**（D-05-14，Node／V8）：10,000 個 UPDATE 加 99 次單格編輯約 37 MB；每一步都動到 10,000 列時，單欄 100 步約 145 MB、換著 29 欄約 1.2 GB（Revert cell 讓 V8 的物件變成 dictionary mode）。上限是步數，不是位元組（已知限制）。〔05b 修正〕最終審查的修正波（K22）：上限改為 100 步加上約 2,000,000 個 cell（`UNDO_CELLS`，每一步依複製與新建的 entry 計重，超過就丟最舊的，最後一步一定保留），`withoutAll` 改成重建物件（不用 `delete`）：29 欄的 100 步 1,194 → 34 MB、單欄 Revert 一步 32.7 → 6.8 MB、全選 Revert 1.73 秒 → 33–37 ms；一般用法（10,000 個暫存）不變，約 37 MB、100 步都留著；最壞（單欄 10,000 列 ⌥⌘N 與 Revert 交替 100 步）約 145 MB。大量編輯之後只能復原最後幾步大量的步驟。
 - **workspace 的存檔**（§3.7，8 MiB 的暫存，ASCII 與中文）：前端每次序列化 7–27 ms（暫存變了再加 `savedEdits` 0.1–14 ms）；backend `PUT /workspace` 42–115 ms（8 個大的值）到 321–380 ms（10,000 個小變更，模型驗證兩次各 72–78 ms）。
 - **K13**：PG 第一次瀏覽等 target 的代價，第一頁 warm 8.9 → 9.0 ms、cold 9.3 → 12.9 ms，EXPLAIN 約 0.3 ms。
 
@@ -509,7 +509,7 @@ interface StagedEdits {
 | M10 錯誤 | server 原文、標出是哪一句、哪一格 | — |
 
 〔05b〕前端完成時的對照（數字見 §7 的〔05b 實測〕）：
-- **Q1**：暫存一格只重畫那一列（dev 瀏覽器實測，H17 的計數器）、apply 進行中 Data view 不每句重畫（`useSession` 沿用 snapshot）；踩到的是 undo 歷史的記憶體：每一步都動到 10,000 列、跨很多欄時 100 步可達約 1.2 GB（V8 量，L2；一般用法約 37 MB），還有 8 MiB 暫存的每次存檔（backend 每次 0.04–0.4 秒，L18）。
+- **Q1**：暫存一格只重畫那一列（dev 瀏覽器實測，H17 的計數器）、apply 進行中 Data view 不每句重畫（`useSession` 沿用 snapshot）；踩到的是 undo 歷史的記憶體：每一步都動到 10,000 列、跨很多欄時 100 步可達約 1.2 GB（V8 量，L2；一般用法約 37 MB），還有 8 MiB 暫存的每次存檔（backend 每次 0.04–0.4 秒，L18）。〔05b 修正〕修正波：undo 改以 cell 計的上限（K22，見 §7），存檔的模型只驗證一次（wrap validator：10,000 個小變更 305–314 → 229–241 ms，其餘是 parse、`model_dump`、寫檔）。
 - **Q2**：apply 送出前就以 "applying" 存檔（當機不會重送新列）、打到一半的文字在關 tab、⌘S、重跑、編輯器被換掉時都會先暫存、被拒時可以複製（K20）、存不下的暫存說原因（K5）、一個壞掉的暫存或孤立 surrogate 不會讓整份 workspace 存不了（K7、B40）。踩到的：當掉的 tab 沒有 close guard；local copy 有配額（L19）。
 - **Q3**：Commit 只送畫面上的預覽、不明的結果不重送也不當成沒套用（K10、K11、K21）、PG 依 key 排序瀏覽與重讀依 key 找回位置（K13、K14），改錯列的風險（Q3 的重點）都擋在 key 上：key 不見或重複就清掉選取（K14b）、同 key 的列不能編輯（K6）。
 - **Q4**：沒有加範圍外的功能；Add row 的快捷鍵、貼上、打字即編輯仍在 §12。
