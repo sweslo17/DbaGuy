@@ -26,7 +26,9 @@ from dbaguy_backend.domain.profiles import ProfileUpsertRequest
 from dbaguy_backend.services.connection_service import ConnectionService
 from dbaguy_backend.services.profile_service import ProfileService
 from dbaguy_backend.sessions.hooks import _Recent
-from dbaguy_backend.sessions.jobs.context import Job, JobContext, JobHooks, JobReport, history_status
+from dbaguy_backend.sessions.jobs.context import (
+    JOB_ROLLBACK_FAILED, Job, JobContext, JobHooks, JobReport, history_status,
+)
 from dbaguy_backend.sessions.jobs.registry import SESSION_CLOSED_FIRST, JobRegistry
 from dbaguy_backend.sessions.manager import SessionCreateRequest, SessionManager
 from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks
@@ -37,7 +39,7 @@ from tests.fake_db import FakeConnection, FakeLease
 from tests.test_sessions import Recorder, request_events
 
 
-# `hold <name>`: (reached, go) — the job sets `reached` and waits for `go`, with no Cancel reaching it any more
+# `hold <name>` and `wait <name>`: (reached, go) — the job sets `reached` and waits for `go`
 HOLDS: dict[str, tuple[threading.Event, threading.Event]] = {}
 
 
@@ -47,17 +49,20 @@ class Scripted(JobCommand):
     job_kind = "run_file"
     type: str = "scripted"
     steps: list[str]
+    broke: Literal["default", "fails", "plain"] = "default"  # how ScriptedJob.broke answers
 
 
 class ScriptedJob(Job):
     """Steps: `sql <text>` runs a statement and drains it (StatementCancelled → stopped, cancelled), `tick` and
     `tick!` progress, `msg <text>`, `msgs <n>`, `crash`, `fail <code>` (an error report), `record`, `hold <name>`
-    (stop_cancels(), then wait as a COMMIT would: HOLDS)."""
+    (stop_cancels(), then wait as a COMMIT would: HOLDS), `wait <name>` (wait, a Cancel still lands), `check`
+    (raise_if_cancelled(), let through). Its broke() is the framework's, fails too, or a plain unknown."""
 
     kind = "run_file"
 
     def __init__(self, command: Scripted) -> None:
         self._steps = command.steps
+        self._broke = command.broke
 
     @property
     def title(self) -> str:
@@ -88,12 +93,22 @@ class ScriptedJob(Job):
                 return JobReport(ctx.outcome("stopped", statements=done), StatementError("it failed", code=arg))
             elif word == "record":
                 ctx.begin_record("-- scripted")
-            elif word == "hold":
-                ctx.stop_cancels()
+            elif word in ("hold", "wait"):
+                if word == "hold":
+                    ctx.stop_cancels()
                 reached, go = HOLDS[arg]
                 reached.set()
                 assert go.wait(5)
+            elif word == "check":
+                ctx.raise_if_cancelled()
         return JobReport(ctx.outcome("completed", statements=done), schema_changed=done > 0)
+
+    def broke(self, ctx: JobContext, exc: Exception) -> JobReport:
+        if self._broke == "fails":
+            raise RuntimeError("broke() broke too")
+        if self._broke == "plain":
+            return JobReport(ctx.outcome("unknown"), StatementError("plain"))
+        return super().broke(ctx, exc)
 
 
 class Env:
@@ -124,11 +139,11 @@ class Env:
             raise StatementError("not a test job", code="not_supported")
         return ScriptedJob(command)
 
-    def submit(self, *steps: str, rid: str = "j") -> None:
-        self.worker.submit(Scripted(request_id=rid, steps=list(steps)))
+    def submit(self, *steps: str, rid: str = "j", **fields) -> None:
+        self.worker.submit(Scripted(request_id=rid, steps=list(steps), **fields))
 
-    def run(self, *steps: str, rid: str = "j") -> list:
-        self.submit(*steps, rid=rid)
+    def run(self, *steps: str, rid: str = "j", **fields) -> list:
+        self.submit(*steps, rid=rid, **fields)
         return request_events(self.recorder, rid)
 
 
@@ -312,8 +327,8 @@ def test_the_job_list_keeps_running_jobs_and_forgets_finished_ones():
     assert registry.clear_finished() == 1 and [info.request_id for info in registry.list()] == ["d", "c"]
 
 
-@pytest.fixture
-def manager(tmp_path):
+def sqlite_sessions(tmp_path, **fields) -> tuple[SessionManager, object]:
+    """A SessionManager (no hooks) over a SQLite file, and its profile's id."""
     db = tmp_path / "s.db"
     sqlite3.connect(db).close()
     profiles = ProfileService(ProfileStore(profiles_file(tmp_path)), InMemorySecretStore())
@@ -321,8 +336,13 @@ def manager(tmp_path):
                                                                              "path": str(db)}}))
     connections = ConnectionService(AdapterRegistry([SqliteAdapter()]), profiles,
                                     SshTunnelManager(write_askpass_script(tmp_path)))
-    made = SessionManager(connections, profiles, idle_timeout=0)
-    yield made, entry.profile.id
+    return SessionManager(connections, profiles, **fields), entry.profile.id
+
+
+@pytest.fixture
+def manager(tmp_path):
+    made, profile_id = sqlite_sessions(tmp_path, idle_timeout=0)
+    yield made, profile_id
     made.close_all()
 
 
@@ -480,6 +500,83 @@ def test_a_job_command_refused_by_the_websocket_still_gets_its_outcome(api, monk
         container.sessions.worker(session_id).close()  # the socket stays attached to a dead worker
         ws.send_json({"type": "dump", "request_id": "late"})
         busy = _receive(ws, 3)
-    for events, rid, code, job in ((invalid, "r", "invalid_command", "run_file"), (busy, "late", "session_busy", "dump")):
-        assert [(e["type"], e["request_id"]) for e in events] == [("error", rid), ("job_outcome", rid), ("finished", rid)]
+    cases = ((invalid, "r", "invalid_command", "run_file"), (busy, "late", "session_busy", "dump"))
+    for events, rid, code, job in cases:
+        assert [(e["type"], e["request_id"]) for e in events] == [
+            ("error", rid), ("job_outcome", rid), ("finished", rid)]
         assert (events[0]["code"], events[1]["job"], events[1]["outcome"]) == (code, job, "not_started")
+
+
+def test_a_cancel_a_job_lets_through_is_its_outcomes_flag(env):  # fix round 1: not_started, or unknown once sent
+    for steps, expected in ((("wait w", "check"), "not_started"), (("sql x", "wait w", "check"), "unknown")):
+        e = env()
+        reached, go = HOLDS["w"] = (threading.Event(), threading.Event())
+        e.submit(*steps)
+        assert reached.wait(5)
+        e.worker.cancel("j")  # nothing in the driver to interrupt: the flag waits for the job's own check
+        go.set()
+        events = request_events(e.recorder, "j")
+        assert (outcome(events).outcome, outcome(events).cancelled, events[-1].cancelled) == (expected, True, True)
+
+
+def test_a_broke_override_that_fails_too_still_ends_with_one_outcome(env):  # fix round 1
+    events = env().run("sql x", "crash", broke="fails")
+    assert types(events)[-4:] == ["error", "job_outcome", "session_state", "finished"]
+    assert (outcome(events).outcome, next(ev for ev in events if ev.type == "error").message) == (
+        "unknown", "Internal error: bug")
+
+
+def test_a_broke_override_keeps_the_cancel_flag(env):  # fix round 1: the framework sets it whatever broke() says
+    e = env()
+    reached, go = HOLDS["w2"] = (threading.Event(), threading.Event())
+    e.submit("sql x", "wait w2", "check", broke="plain")
+    assert reached.wait(5)
+    e.worker.cancel("j")
+    go.set()
+    done = outcome(request_events(e.recorder, "j"))
+    assert (done.outcome, done.cancelled) == ("unknown", True)
+
+
+class StuckConnection(FakeConnection):
+    """A ROLLBACK that fails and leaves the transaction open."""
+
+    def rollback(self) -> None:
+        raise StatementError("rollback refused", code="08006")
+
+
+def test_a_broken_jobs_rollback_that_fails_says_so_in_a_jobs_words(env):  # fix round 1 (L2's text)
+    events = env(conn=StuckConnection()).run("sql begin", "crash")
+    assert [ev.text for ev in events if ev.type == "message"] == [JOB_ROLLBACK_FAILED]
+    assert outcome(events).outcome == "unknown" and events[-1].in_transaction
+
+
+def test_idle_time_counts_from_the_last_finished_not_from_the_detach(tmp_path):  # D-06-10, fix round 1
+    now = [1000.0]
+    sessions, profile_id = sqlite_sessions(tmp_path, idle_timeout=600, clock=lambda: now[0])
+    try:
+        info = sessions.create(SessionCreateRequest(profile_id=profile_id))
+        recorder = Recorder()
+        worker = sessions.attach(info.session_id, recorder)
+        sessions.detach(info.session_id, recorder)  # at 1000
+        worker.set_emitter(recorder)
+        now[0] = 1300.0
+        worker.submit(ExecuteCommand(request_id="q", sql="SELECT 1"))
+        request_events(recorder, "q")  # finished at 1300
+        now[0] = 1700.0  # 700 s after the detach, 400 s after the request ended
+        assert sessions.reap_idle() == 0
+        now[0] = 1900.0
+        assert sessions.reap_idle() == 1
+    finally:
+        sessions.close_all()
+
+
+@pytest.mark.parametrize("kind", [["run_file"], {"a": 1}, 7, None])
+def test_a_command_whose_type_is_not_a_string_is_refused_and_the_socket_lives(api, kind):  # fix round 1
+    client, _, session_id = api
+    with client.websocket_connect(f"ws://127.0.0.1/sessions/{session_id}/ws?token=t") as ws:
+        ws.send_json({"type": kind, "request_id": "r"})
+        refused = _receive(ws, 2)
+        assert [(e["type"], e["request_id"]) for e in refused] == [("error", "r"), ("finished", "r")]
+        assert refused[0]["code"] == "invalid_command"
+        ws.send_json({"type": "execute", "request_id": "q", "sql": "SELECT 1"})
+        assert _receive(ws, 1)[0]["type"] == "started"

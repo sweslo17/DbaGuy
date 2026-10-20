@@ -13,7 +13,9 @@ from typing import Any, ClassVar
 from loguru import logger
 from pydantic import BaseModel
 
-from ...adapters.base import AdapterCapabilities, DatabaseConnection, RunOptions, StatementError, StatementResult
+from ...adapters.base import (
+    AdapterCapabilities, DatabaseConnection, RunOptions, StatementCancelled, StatementError, StatementResult,
+)
 from ...domain.classification import Classification, StatementKind
 from ...domain.data_jobs import (
     MAX_JOB_MESSAGES, PROGRESS_INTERVAL_S, JobCommand, JobKind, JobOutcomeEvent, JobOutcomeKind, JobProgressEvent,
@@ -25,6 +27,9 @@ from ...services.safety import GuardAction, GuardDecision
 from ...sql.dialects import Dialect
 
 NO_DESCRIBE = RunOptions(describe=False)  # a job shows no result set: SQL Server skips the describe (⑤ M1)
+# A broken job's transaction that would not roll back (pre-flight L2): a job's dialog has no Rollback, and the server
+# rolls it back when the job's session closes (its dialog closes it, or the reaper once it is idle)
+JOB_ROLLBACK_FAILED = "The transaction could not be rolled back: it ends when the job's session closes"
 _DRAIN_CHUNK = 1000  # rows read and dropped at a time
 
 
@@ -208,7 +213,8 @@ class Job(ABC):
         """An exception `run` did not classify (a bug, or an error it let through): nothing is known to have been
         applied when nothing was sent; otherwise the outcome is unknown."""
         error = exc if isinstance(exc, StatementError) else StatementError(f"Internal error: {exc}")
-        return JobReport(ctx.outcome("unknown" if ctx.sent else "not_started"), error, schema_changed=ctx.sent)
+        outcome = ctx.outcome("unknown" if ctx.sent else "not_started", cancelled=isinstance(exc, StatementCancelled))
+        return JobReport(outcome, error, schema_changed=ctx.sent)
 
 
 def history_status(outcome: JobOutcomeEvent, error: StatementError | None) -> tuple[HistoryStatus, str | None]:

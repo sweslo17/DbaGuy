@@ -106,7 +106,9 @@ async def session_socket(websocket: WebSocket, session_id: str) -> None:
             except ValidationError as exc:
                 request_id = str(raw.get("request_id", "")) if isinstance(raw, dict) else ""
                 apply = isinstance(raw, dict) and raw.get("type") == "apply_edits"
-                job = raw["type"] if isinstance(raw, dict) and raw.get("type") in _JOB_TYPES else None
+                # A `type` may be any JSON value: only a string can be looked up (a list is unhashable)
+                kind = raw.get("type") if isinstance(raw, dict) else None
+                job = kind if isinstance(kind, str) and kind in _JOB_TYPES else None
                 await _fail_request(
                     outbox, request_id, f"Invalid command: {exc.errors()[0]['msg']}", "invalid_command", apply=apply,
                     job=job,

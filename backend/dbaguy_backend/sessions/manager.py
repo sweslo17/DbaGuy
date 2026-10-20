@@ -43,12 +43,13 @@ class SessionManager:
 
     def __init__(
         self, connections: ConnectionService, profiles: ProfileService, hooks: SessionHooksFactory | None = None,
-        idle_timeout: float = 600.0, jobs: JobRegistry | None = None,
+        idle_timeout: float = 600.0, jobs: JobRegistry | None = None, clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._connections = connections
         self._profiles = profiles
         self._hooks = hooks  # None: workers keep their defaults (everything runs, nothing is recorded)
         self._idle_timeout = idle_timeout
+        self._clock = clock  # idle time, here and in each worker (its `finished_at`)
         self.jobs = jobs if jobs is not None else JobRegistry()
         self._sessions: dict[str, _Entry] = {}
         self._lock = threading.Lock()
@@ -60,6 +61,7 @@ class SessionManager:
         worker = SessionWorker(
             f"{profile.name}:{session_id[:8]}",
             lambda: self._connections.open(profile, request.database, secrets),
+            clock=self._clock,
         )
         try:
             worker.start()
@@ -74,7 +76,7 @@ class SessionManager:
             raise
         info = SessionInfo(session_id=session_id, profile_id=profile.id, database=server.current_database, server=server)
         with self._lock:
-            self._sessions[session_id] = _Entry(worker=worker, info=info, detached_at=time.monotonic())
+            self._sessions[session_id] = _Entry(worker=worker, info=info, detached_at=self._clock())
         logger.info("Opened session {} for '{}'", session_id, profile.name)
         return info
 
@@ -104,7 +106,7 @@ class SessionManager:
                 return
             entry.attached = max(0, entry.attached - 1)
             if entry.attached == 0:
-                entry.detached_at = time.monotonic()
+                entry.detached_at = self._clock()
         entry.worker.clear_emitter(emit)
 
     def close(self, session_id: str) -> None:
@@ -152,7 +154,7 @@ class SessionManager:
     def _is_quiet(self, entry: _Entry) -> bool:
         """No WebSocket, and no attach and no request ending for `idle_timeout`. The caller holds the lock."""
         return not entry.attached and (
-            time.monotonic() - max(entry.detached_at, entry.worker.finished_at) >= self._idle_timeout)
+            self._clock() - max(entry.detached_at, entry.worker.finished_at) >= self._idle_timeout)
 
     def _idle_ids(self) -> list[str]:
         """Quiet sessions with nothing running or queued: a job outlives its dialog and the window (D-06-10).
