@@ -128,6 +128,17 @@ def test_mysql_executable_comments_are_code():
     assert K.EXEC_COMMENT not in INSIGNIFICANT
 
 
+def test_a_strings_end_of_comment_inside_an_executable_comment_ends_nothing():  # 06a Task 6 review T8
+    # SHOW CREATE TABLE writes a partition clause as /*!50500 … */: its values and comments are strings
+    text = "/*!50500 PARTITION p1 VALUES IN ('a*/b') COMMENT 'x */ ; y' */;"
+    assert kinds(text, MY) == [(K.EXEC_COMMENT, text[:-1]), (K.SEMI, ";")]
+    assert kinds('/*!40000 "q*/q" `n*/n` */ x', MY)[0] == (K.EXEC_COMMENT, '/*!40000 "q*/q" `n*/n` */')
+    assert kinds("/*+ SET_VAR(sql_mode = 'a*/') */ 1", MY)[0] == (K.EXEC_COMMENT, "/*+ SET_VAR(sql_mode = 'a*/') */")
+    assert kinds("/*!50500 'open */", MY) == [(K.EXEC_COMMENT, "/*!50500 'open */")]  # unterminated: to the end
+    assert not tokenize("/*!50500 'open */", Dialect.MYSQL)[0].terminated  # a statement stream holds it back
+    assert kinds("/* plain 'a*/ x', b */", MY)[0] == (K.COMMENT, "/* plain 'a*/")  # an ordinary comment is text
+
+
 def test_mariadb_executable_comments_are_code_too():  # M4: MariaDB runs `/*M! … */`
     assert kinds("/*M!DELETE FROM t WHERE*/ (SELECT 1)", MY)[0] == (K.EXEC_COMMENT, "/*M!DELETE FROM t WHERE*/")
     assert kinds("SELECT /*M!100100 1, */ 2", MY)[1] == (K.EXEC_COMMENT, "/*M!100100 1, */")

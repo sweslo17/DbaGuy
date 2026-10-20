@@ -11,10 +11,15 @@ from ..columns import GENERATED, TableColumn, TypeFamily, not_copied
 from . import catalog
 from .types import SPATIAL_TYPES, category_for_data_type
 
-_COLUMNS = """
-SELECT COLUMN_NAME, COLUMN_TYPE, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, NUMERIC_PRECISION, NUMERIC_SCALE,
-       CHARACTER_MAXIMUM_LENGTH, DATETIME_PRECISION
+_FIELDS = """COLUMN_NAME, COLUMN_TYPE, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, NUMERIC_PRECISION, NUMERIC_SCALE,
+       CHARACTER_MAXIMUM_LENGTH, DATETIME_PRECISION"""  # column()'s arguments
+_COLUMNS = f"""
+SELECT {_FIELDS}
 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s ORDER BY ORDINAL_POSITION
+"""
+_SCHEMA_COLUMNS = f"""
+SELECT TABLE_NAME, {_FIELDS}
+FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = %s ORDER BY TABLE_NAME, ORDINAL_POSITION
 """
 _GENERATED = ("VIRTUAL GENERATED", "STORED GENERATED")  # not DEFAULT_GENERATED: an expression default (ruling E15)
 _NOT_EXACT = frozenset({"float", "double", "real", "vector", *SPATIAL_TYPES})
@@ -82,6 +87,14 @@ def column(
 
 def read_columns(conn: MySQLConnection, schema: str, name: str) -> list[TableColumn]:
     return [column(*row) for row in catalog.query(conn, _COLUMNS, (schema, name))]
+
+
+def schema_columns(conn: MySQLConnection, schema: str) -> dict[str, list[TableColumn]]:
+    """Every relation's columns in `schema`, in one query (a dump's catalog: never one query per table)."""
+    found: dict[str, list[TableColumn]] = {}
+    for table, *row in catalog.query(conn, _SCHEMA_COLUMNS, (schema,)):
+        found.setdefault(table, []).append(column(*row))
+    return found
 
 
 def table_columns(conn: MySQLConnection, path: list[PathSegment]) -> list[TableColumn]:

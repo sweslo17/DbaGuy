@@ -98,7 +98,9 @@ class _Admin:
         assert name.startswith(SCRATCH_PREFIX), f"{name!r} is not a scratch database: never dropped here"
         self._run(*{
             "postgres": [f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'],
-            "mysql": [f"DROP DATABASE IF EXISTS `{name}`"],
+            # the grant create() gave goes with it (a grant outlives its database)
+            "mysql": [f"DROP DATABASE IF EXISTS `{name}`",
+                      f"REVOKE IF EXISTS ALL ON `{name}`.* FROM 'dbaguy'@'%'"],
             "mssql": [f"IF DB_ID(N'{name}') IS NOT NULL ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE",
                       f"DROP DATABASE IF EXISTS [{name}]"],
         }[self.engine])

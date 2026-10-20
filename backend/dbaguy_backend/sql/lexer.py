@@ -102,6 +102,24 @@ def _scan_string(text: str, i: int, quote: str, backslash: bool) -> tuple[int, b
     return n, False
 
 
+def _scan_quoted(text: str, i: int, close: str, rules: LexRules) -> tuple[int, bool]:
+    """i points at an identifier's opening quote; returns (index after its closing quote or len(text), whether it
+    closed). A doubled closing quote stands for one: "" `` and ]] alike (SQLite cannot escape ] at all)."""
+    n = len(text)
+    i += 1
+    while i < n:
+        if rules.identifier_backslash_escapes and text[i] == "\\":
+            i = min(i + 2, n)  # SQL++: \` and \\ inside back-ticks (a last backslash escapes nothing)
+            continue
+        if text[i] == close:
+            if i + 1 < n and text[i + 1] == close:
+                i += 2
+                continue
+            return i + 1, True
+        i += 1
+    return n, False
+
+
 def _starts_line_comment(text: str, i: int, rules: LexRules) -> bool:
     if text[i] == "#":
         return rules.hash_comments
@@ -152,7 +170,11 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
             executable = rules.executable_comments and text.startswith(_EXECUTABLE_COMMENT_STARTS, i)
             depth, i = 1, i + 2
             while i < n and depth:
-                if text.startswith("*/", i):
+                if executable and text[i] in rules.string_quotes:  # code: a `*/` inside its strings ends nothing
+                    i, _ = _scan_string(text, i, text[i], rules.backslash_escapes)
+                elif executable and text[i] in quotes:
+                    i, _ = _scan_quoted(text, i, quotes[text[i]], rules)
+                elif text.startswith("*/", i):
                     depth, i = depth - 1, i + 2
                 elif rules.nested_block_comments and text.startswith("/*", i):
                     depth, i = depth + 1, i + 2
@@ -164,21 +186,7 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
             i, terminated = _scan_string(text, i, ch, rules.backslash_escapes)
             kind = TokenKind.STRING
         elif ch in quotes:
-            close = quotes[ch]
-            i += 1
-            terminated = False
-            while i < n:
-                if rules.identifier_backslash_escapes and text[i] == "\\":
-                    i = min(i + 2, n)  # SQL++: \` and \\ inside back-ticks (a last backslash escapes nothing)
-                    continue
-                if text[i] == close:
-                    if i + 1 < n and text[i + 1] == close:  # a doubled closing quote stands for one: "" `` and ]] alike
-                        i += 2  # (SQLite cannot escape ] at all)
-                        continue
-                    i += 1
-                    terminated = True
-                    break
-                i += 1
+            i, terminated = _scan_quoted(text, i, quotes[ch], rules)
             kind = TokenKind.QUOTED
         elif ch in rules.named_param_prefixes and i + 1 < n and _param_char(text[i + 1]):
             i += 1  # SQL++ $name, @name, $1

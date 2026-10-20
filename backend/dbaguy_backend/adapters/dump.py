@@ -14,6 +14,14 @@ Section = Literal["schema", "data"]
 OWNERS_AND_PRIVILEGES = "owners and privileges"  # never dumped (R-06-2)
 
 
+SHOWN_NAMES = 10  # the names a warning lists before "…"
+
+
+def shown_names(names: list[str]) -> str:
+    """Names for a warning: the first SHOWN_NAMES, then "…"."""
+    return ", ".join(names[:SHOWN_NAMES]) + (" …" if len(names) > SHOWN_NAMES else "")
+
+
 def kept_foreign_key(table: str, target: str, key: str | None = None) -> str:
     """The warning for a foreign key its table's DDL keeps (MySQL, SQLite: the checks are off while the file runs)
     although the table it references is not in the dump."""

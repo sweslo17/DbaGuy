@@ -12,7 +12,10 @@ import sqlite3
 from ...domain.data_jobs import DumpObjectKinds, DumpScope
 from ...domain.errors import NotFound, ValidationFailed
 from ...sql.dialects import Dialect, quote_ident, quote_literal
-from ..dump import OWNERS_AND_PRIVILEGES, DumpCatalog, DumpObject, DumpSession, DumpTable, kept_foreign_key
+from ...sql.scope import names_used
+from ..dump import (
+    OWNERS_AND_PRIVILEGES, DumpCatalog, DumpObject, DumpSession, DumpTable, kept_foreign_key, shown_names,
+)
 from .columns import columns_of, read_relation
 
 SESSION = DumpSession(setup=("BEGIN",), teardown=("ROLLBACK",), consistency="snapshot")
@@ -60,15 +63,36 @@ class _Reader:
             raise NotFound(f"Not found: {', '.join(sorted(missing))}")
         in_scope = [row for row in master if not self.named or row[0] not in ("table", "view") or row[1] in self.wanted]
         tables = [name for kind, name, _, _ in in_scope if kind == "table" and self._dumped_table(name, kind_of)]
-        views = [name for kind, name, _, _ in in_scope if kind == "view"]
+        # What no dump writes (in any scope): what names it cannot work where the file is run (review T1)
+        left = {_folded(name) for kind, name, _, _ in master
+                if kind == "table" and (kind_of.get(name) in ("virtual", "shadow") or name.startswith(_STATISTICS))}
+        all_views = {name: sql for kind, name, _, sql in in_scope if kind == "view"}
+        views = list(all_views)
         if not (self.kinds.views or self.named):
             self.leave_out("views (not chosen)", len(views))
             views = []
+        needing = self._needing(views, all_views, left)
+        views = [name for name in views if name not in needing]
         written, on = set(tables), set(tables) | set(views)
-        triggers = [row for row in in_scope if row[0] == "trigger" and row[2] in on]
+        triggers = [row for row in in_scope if row[0] == "trigger" and (row[2] in on or row[2] in all_views)]
         if not self.kinds.triggers:
             self.leave_out("triggers (not chosen)", len(triggers))
             triggers = []
+        kept = []
+        for row in triggers:
+            if row[2] not in on and row[2] not in needing:
+                self.leave_out("triggers on views not chosen")
+            elif {_folded(name) for name in names_used(row[3], Dialect.SQLITE)} & left:  # its ON view's name too
+                needing[row[1]] = "trigger"
+            else:
+                kept.append(row)
+        triggers = kept
+        not_written = [f"{kind} {name}" for name, kind in needing.items()]
+        self.leave_out("views and triggers that use a virtual table, SQLite's statistics or a view the dump leaves "
+                       "out", len(not_written))
+        if not_written:
+            self.warnings.append("Not written, they use a virtual table (or its internal tables), SQLite's statistics "
+                                 f"or a view the dump leaves out: {shown_names(not_written)}")
         pre = [DumpObject("table", name, self._ddl(sql), f"DROP TABLE IF EXISTS {_q(name)}")
                for kind, name, _, sql in in_scope if kind == "table" and name in written]
         post = [*self._counters(written),
@@ -81,6 +105,21 @@ class _Reader:
             post += self._settings()
         dumped = {_folded(name): name for name in tables}
         return pre, [self._data(name, dumped) for name in tables], post
+
+    @staticmethod
+    def _needing(views: list[str], sql: dict[str, str], left: set[str]) -> dict[str, str]:
+        """The views that use what no dump writes, or such a view (any order: SQLite does not check a view's names
+        when it is made); `left` (folded names) grows with them."""
+        needing: dict[str, str] = {}
+        changed = True
+        while changed:
+            changed = False
+            for name in views:
+                if name not in needing and {_folded(used) for used in names_used(sql[name], Dialect.SQLITE)} & left:
+                    needing[name] = "view"
+                    left.add(_folded(name))
+                    changed = True
+        return needing
 
     def _dumped_table(self, name: str, kind_of: dict[str, str]) -> bool:
         """Whether a table of the scope is written; what is not is counted."""
