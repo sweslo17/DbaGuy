@@ -11,7 +11,7 @@ from loguru import logger
 
 from ..adapters.base import DatabaseAdapter
 from ..adapters.registry import AdapterRegistry
-from ..domain.data_jobs import ENGINE_NAMES, RUN_SQL_FILES, DumpHeader, FileInspection, cannot
+from ..domain.data_jobs import ENGINE_NAMES, RUN_SQL_FILES, DumpHeader, FileInspection, cannot, cannot_read
 from ..domain.errors import FileNotFound, NotSupported, ReadOnlyProfile, StorageError
 from ..domain.profiles import AnyProfile, Engine
 from ..sql.dump_header import CUT_SHORT, END_BYTES, cut_short, parse_header
@@ -60,7 +60,7 @@ class DataService:
                 else:
                     end = head[-END_BYTES:]
         except OSError as exc:
-            raise StorageError(f"Cannot read {path}: {exc.strerror or exc}") from None
+            raise StorageError(cannot_read(path, exc)) from None
         utf16 = starts_with_utf16_bom(head)
         text, bad_line = (head.decode("utf-16", "replace"), None) if utf16 else _decoded(head)
         lines = text.splitlines(keepends=True)

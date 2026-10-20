@@ -410,8 +410,9 @@ class MysqlConnection(DatabaseConnection, RowEditing):
         self._ok_status = cursor.ok_status
         result = MysqlResult(self, cursor, update=keyword == "UPDATE")
         if self._killed.is_set():  # it ended normally after KILL QUERY (SLEEP() returns 1): still a cancel
+            completed = not self._conn.have_next_result  # a CALL with more result sets to come is not over
             result.close()  # finish() clears the flag
-            raise StatementCancelled()
+            raise StatementCancelled(completed=completed)
         return result
 
     # ---- transactions ----

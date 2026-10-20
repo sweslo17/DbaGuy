@@ -4,8 +4,10 @@ tools wrote (A8: pg_dump --inserts and its COPY form, mysqldump with and without
 script). Scratch objects are `zz_06_*`, dropped by exact name; Couchbase writes only `zz_06_run_*` keys."""
 
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
+import mysql.connector
 import pytest
 
 from dbaguy_backend.domain.errors import ReadOnlyProfile
@@ -13,8 +15,8 @@ from dbaguy_backend.domain.execution import QueryContext, RunFileCommand
 from dbaguy_backend.sql.dialects import Dialect, script_text
 from tests.data_support import DataApp, dropping, scratch_name
 from tests.edit_support import ENGINES, ScratchDb, scratch_db
-from tests.support import COUCHBASE_PASSWORD, couchbase_query, make_couchbase_profile, requires_couchbase, \
-    requires_mssql, requires_mysql, requires_pg, unique_name, wait_until
+from tests.support import COUCHBASE_PASSWORD, couchbase_query, make_couchbase_profile, mysql_driver_kwargs, \
+    requires_couchbase, requires_mssql, requires_mysql, requires_pg, unique_name, wait_until
 
 FIXTURES = Path(__file__).parent / "fixtures" / "run_file"
 TOOL_TABLE = "zz_06_tool_tbl"  # the table name the tool fixtures were written with
@@ -123,7 +125,11 @@ def test_a_cancel_rolls_back_or_stops_where_it_reached(env, tmp_path, mode):
         tab.worker.cancel(rid)
         ran = tab.wait(rid)
         expected = "rolled_back" if mode == "all_or_nothing" else "stopped"
-        assert (ran.outcome.outcome, ran.outcome.cancelled, ran.outcome.stopped_at.statement) == (expected, True, 2)
+        # MySQL: the KILL ends the SLEEP(), which returns 1, and the SELECT completes: applied, so the run stops
+        # before the next statement (R8)
+        at = 3 if db.engine == "mysql" else 2
+        assert (ran.outcome.outcome, ran.outcome.cancelled, ran.outcome.stopped_at.statement) == (expected, True, at)
+        assert ran.outcome.statements == at - 1
         assert ids(db, table) == ([] if mode == "all_or_nothing" else [1])
 
 
@@ -189,10 +195,41 @@ def test_mysql_ddl_inside_the_files_own_transaction_commits_it_before_failing(to
         assert ids(db, table) == [1]
 
 
+def cancel_when(db: ScratchDb, tab, rid: str, sql: str, condition: str) -> None:
+    """Cancel the job once MySQL shows `sql` (a LIKE pattern) running with `condition`."""
+    query = ("SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID() "
+             f"AND INFO LIKE '{sql}' AND {condition}")
+    assert wait_until(lambda: db.rows(query) == [(1,)], 20)
+    tab.worker.cancel(rid)
+
+
 @requires_mysql
 def test_a_cancelled_mysql_ddl_inside_the_files_transaction_had_committed_it(tool_env, tmp_path):  # H2 × M8
     """A cancel is not a server error: the adapter does not read MySQL's flags again (R-03a-T9b), and they still say
-    the transaction is open. MySQL committed it before the CREATE began."""
+    the transaction is open. MySQL committed it before the CREATE began; the KILL stopped the CREATE itself."""
+    db, app, profile = tool_env("mysql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        other = scratch_name("ctas")
+        made.append(("TABLE", other))
+        path = write(tmp_path, db, ["START TRANSACTION", *inserts(db, table, 1),
+                                    "SET SESSION cte_max_recursion_depth = 1000000000",
+                                    f"CREATE TABLE {db.table(other)} AS WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL "
+                                    "SELECT i + 1 FROM n WHERE i < 1000000000) SELECT COUNT(*) AS c FROM n", "COMMIT"])
+        tab = app.job_session(profile)
+        rid = tab.submit(command(path, "statements"))
+        cancel_when(db, tab, rid, f"CREATE TABLE %{other}%", "TIME >= 1")
+        ran = tab.wait(rid)
+        assert (ran.outcome.outcome, ran.outcome.cancelled, ran.outcome.statements) == ("stopped", True, 3)
+        assert ran.outcome.warnings == ["Line 4 committed the file's transaction from line 1 before it failed "
+                                        "(MySQL commits around DDL)"]
+        assert ids(db, table) == [1] and not db.exists(other)
+
+
+@requires_mysql
+def test_a_ddl_that_finished_before_its_cancel_counts_as_applied(tool_env, tmp_path):  # R8
+    """KILL QUERY interrupts a SLEEP(), which returns 1, and the CREATE … SELECT goes on to its end: the adapter
+    reports the cancel as having come after the statement completed, and the run counts it as applied."""
     db, app, profile = tool_env("mysql")
     with dropping(db, app.close_sessions) as made:
         table = make_table(db, made)
@@ -202,15 +239,11 @@ def test_a_cancelled_mysql_ddl_inside_the_files_transaction_had_committed_it(too
                                     f"CREATE TABLE {db.table(other)} AS SELECT SLEEP(30) AS s", "COMMIT"])
         tab = app.job_session(profile)
         rid = tab.submit(command(path, "statements"))
-        running = ("SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID() "
-                   f"AND INFO LIKE 'CREATE TABLE %{other}%'")
-        assert wait_until(lambda: db.rows(running) == [(1,)], 20)  # the CREATE … SELECT SLEEP has started
-        tab.worker.cancel(rid)
+        cancel_when(db, tab, rid, f"CREATE TABLE %{other}%", "STATE = 'User sleep'")
         ran = tab.wait(rid)
-        assert (ran.outcome.outcome, ran.outcome.cancelled, ran.outcome.statements) == ("stopped", True, 2)
-        assert ran.outcome.warnings == ["Line 3 committed the file's transaction from line 1 before it failed "
-                                        "(MySQL commits around DDL)"]
-        assert ids(db, table) == [1]
+        assert (ran.outcome.outcome, ran.outcome.cancelled, ran.outcome.statements,
+                ran.outcome.stopped_at.statement, ran.outcome.warnings) == ("stopped", True, 3, 4, [])
+        assert ids(db, table) == [1] and db.exists(other)
 
 
 @requires_mysql
@@ -413,3 +446,231 @@ def test_couchbase_runs_a_file_statement_by_statement_only(tmp_path):
     assert couchbase_query(f'SELECT RAW META().id FROM dbaguy.app.orders USE KEYS "{key}"')["results"] == []
     # the collection's count follows a delete a moment later
     assert wait_until(lambda: couchbase_query("SELECT RAW COUNT(*) FROM dbaguy.app.orders")["results"] == [500], 10)
+
+
+# ---- fix round 1 (rulings R1–R9): each outcome against what the server holds ------------------------------------
+
+
+@requires_mysql
+@pytest.mark.parametrize(("statement", "code"), [
+    ("START REPLICA", "implicit_commit"), ("STOP SLAVE", "implicit_commit"),
+    ("SET PASSWORD FOR 'zz_06_nobody'@'%' = 'x'", "implicit_commit"), ("SET autocommit = 1", "implicit_commit"),
+    ("CALL zz_06_no_such_procedure()", "procedure_call"),
+])
+def test_mysql_all_or_nothing_never_sends_what_may_commit(tool_env, tmp_path, statement, code):  # R1, R7
+    db, app, profile = tool_env("mysql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        path = write(tmp_path, db, [*inserts(db, table, 1), statement, *inserts(db, table, 3)])
+        ran = app.job_session(profile).run(command(path, "all_or_nothing"))
+        assert (ran.outcome.outcome, ran.error.code, ran.outcome.stopped_at.statement) == ("rolled_back", code, 2)
+        assert ids(db, table) == []
+
+
+@requires_mysql
+def test_mysql_start_replica_inside_the_files_transaction_committed_it(tool_env, tmp_path):  # R1, statement mode
+    db, app, profile = tool_env("mysql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        path = write(tmp_path, db, ["START TRANSACTION", *inserts(db, table, 1), "START REPLICA",
+                                    *inserts(db, table, 3), "COMMIT"])
+        ran = app.job_session(profile).run(command(path, "statements"))  # 1227 after committing the INSERT
+        assert (ran.outcome.outcome, ran.error.code, ran.outcome.statements) == ("stopped", "1227", 2)
+        assert ran.outcome.warnings == ["Line 3 committed the file's transaction from line 1 before it failed "
+                                        "(MySQL commits around DDL)"]
+        assert ids(db, table) == [1]
+
+
+@requires_mysql
+def test_a_mysql_deadlock_victim_holds_nothing_and_says_rolled_back(tool_env, tmp_path):  # R1's exception: 1213
+    db, app, profile = tool_env("mysql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        heavy = scratch_name("heavy")
+        made.append(("TABLE", heavy))
+        db.execute(*inserts(db, table, 1, 2), f"CREATE TABLE {db.table(heavy)} (id INT PRIMARY KEY)")
+        path = write(tmp_path, db, [f"UPDATE {db.table(table)} SET label = 'run' WHERE id = 1",
+                                    f"UPDATE {db.table(table)} SET label = 'run' WHERE id = 2"])
+        other = mysql.connector.connect(**mysql_driver_kwargs())
+        try:
+            cursor = other.cursor()
+            cursor.execute("START TRANSACTION")  # heavier than the run's: InnoDB rolls the run back as the victim
+            cursor.execute(f"INSERT INTO {db.table(heavy)} WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 "
+                           "FROM n WHERE i < 200) SELECT i FROM n")
+            cursor.execute(f"UPDATE {db.table(table)} SET label = 'other' WHERE id = 2")
+            tab = app.job_session(profile)
+            rid = tab.submit(command(path, "all_or_nothing"))
+            assert wait_until(lambda: db.waiting(table), 20)  # the run's second UPDATE waits for row 2
+            cursor.execute(f"UPDATE {db.table(table)} SET label = 'other' WHERE id = 1")  # the deadlock
+            ran = tab.wait(rid)
+            other.rollback()
+        finally:
+            other.close()
+        assert (ran.outcome.outcome, ran.error.code) == ("rolled_back", "1213")
+        assert db.rows(f"SELECT id, label FROM {db.table(table)} ORDER BY id") == [(1, "row 1"), (2, "row 2")]
+
+
+@requires_mssql
+def test_a_trigger_that_commits_is_unknown_and_its_rows_stand(tool_env, tmp_path):  # R2 (3609)
+    db, app, profile = tool_env("mssql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        trigger = scratch_name("trg")  # dropped with its table
+        db.execute(f"CREATE TRIGGER {db.table(trigger)} ON {db.table(table)} AFTER INSERT AS "
+                   "IF EXISTS (SELECT 1 FROM inserted WHERE id = 99) COMMIT TRANSACTION")
+        path = write(tmp_path, db, [*inserts(db, table, 1, 99, 3)])
+        ran = app.job_session(profile).run(command(path, "all_or_nothing"))
+        assert (ran.outcome.outcome, ran.error.code, ran.outcome.stopped_at.statement) == ("unknown", "3609", 2)
+        assert ids(db, table) == [1, 99]
+        db.execute(f"DELETE FROM {db.table(table)}")
+        path = write(tmp_path, db, ["BEGIN TRANSACTION", *inserts(db, table, 1, 99, 3), "COMMIT TRANSACTION"],
+                     name="own.sql")
+        ran = app.job_session(profile).run(command(path, "statements"))
+        assert (ran.outcome.outcome, ran.outcome.statements) == ("unknown", 2)  # not "not applied"
+        assert ran.outcome.warnings[0].startswith("Line 5 may have committed or rolled back the file's transaction")
+        assert ids(db, table) == [1, 99]
+
+
+@requires_mysql
+@pytest.mark.parametrize("mode", ["all_or_nothing", "statements"])
+def test_a_myisam_write_that_a_rollback_cannot_undo_is_unknown(tool_env, tmp_path, mode):  # R3
+    db, app, profile = tool_env("mysql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        myisam = scratch_name("myisam")
+        made.append(("TABLE", myisam))
+        db.execute(*inserts(db, table, 1), f"CREATE TABLE {db.table(myisam)} (id INT PRIMARY KEY, label VARCHAR(50)) "
+                                           "ENGINE=MyISAM")
+        statements = [*inserts(db, myisam, 5), *inserts(db, table, 1)]  # the second is a duplicate key
+        path = write(tmp_path, db, statements if mode == "all_or_nothing" else ["START TRANSACTION", *statements])
+        ran = app.job_session(profile).run(command(path, mode))
+        assert ran.outcome.outcome == "unknown"
+        assert ran.outcome.warnings[-1] == "Some tables cannot roll back (non-transactional): their changes stayed"
+        assert ids(db, myisam) == [5] and ids(db, table) == [1]
+
+
+@requires_pg
+def test_a_pg_run_from_statement_n_keeps_the_files_search_path(tool_env, tmp_path):  # R4
+    db, app, profile = tool_env("postgres")
+    schema = scratch_name("s")
+    with dropping(db, app.close_sessions) as made:
+        table = scratch_name("rs")
+        made.append(("TABLE", table))  # public's
+        db.execute(f"CREATE TABLE {db.table(table)} (id INT PRIMARY KEY, label VARCHAR(50))", f'CREATE SCHEMA "{schema}"',
+                   f'CREATE TABLE "{schema}"."{table}" (id INT PRIMARY KEY, label VARCHAR(50))')
+        try:
+            path = write(tmp_path, db, [f'SET search_path TO "{schema}"', *[f"INSERT INTO {table} VALUES ({i}, 'x')"
+                                                                           for i in (1, 1, 3)]])
+            ran = app.job_session(profile).run(command(path, "statements", from_statement=4))
+            assert (ran.outcome.outcome, ran.outcome.statements) == ("completed", 1)
+            assert ran.outcome.warnings == ["1 session settings before statement 4 were run again (SET, USE, PRAGMA); "
+                                            "the other statements before it were skipped"]
+            assert db.rows(f'SELECT id FROM "{schema}"."{table}"') == [(3,)] and ids(db, table) == []
+        finally:
+            db.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+@requires_mysql
+def test_a_mysql_run_from_statement_n_keeps_the_files_time_zone(tool_env, tmp_path):  # R4
+    db, app, profile = tool_env("mysql")
+    with dropping(db, app.close_sessions) as made:
+        table = scratch_name("tz")
+        made.append(("TABLE", table))
+        db.execute(f"CREATE TABLE {db.table(table)} (id INT PRIMARY KEY, at TIMESTAMP NULL)")
+        path = write(tmp_path, db, ["/*!40103 SET TIME_ZONE='+05:00' */", "DO 0",
+                                    f"INSERT INTO {db.table(table)} VALUES (1, '2026-10-20 12:00:00')"])
+        ran = app.job_session(profile).run(command(path, "statements", from_statement=3))
+        assert (ran.outcome.outcome, ran.outcome.statements) == ("completed", 1)
+        [(epoch,)] = db.rows(f"SELECT UNIX_TIMESTAMP(at) FROM {db.table(table)}")
+        assert int(epoch) == int(datetime(2026, 10, 20, 7, tzinfo=UTC).timestamp())  # 12:00 at +05:00
+
+
+@requires_mssql
+def test_a_sql_server_run_from_statement_n_keeps_identity_insert(tool_env, tmp_path):  # R4
+    db, app, profile = tool_env("mssql")
+    with dropping(db, app.close_sessions) as made:
+        table = scratch_name("ident")
+        made.append(("TABLE", table))
+        db.execute(f"CREATE TABLE {db.table(table)} (id INT IDENTITY(1,1) PRIMARY KEY, label NVARCHAR(50))")
+        path = write(tmp_path, db, [f"SET IDENTITY_INSERT {db.table(table)} ON",
+                                    *[f"INSERT INTO {db.table(table)} (id, label) VALUES ({i}, N'x')" for i in (7, 8)]])
+        ran = app.job_session(profile).run(command(path, "statements", from_statement=3))
+        assert (ran.outcome.outcome, ran.error, ids(db, table)) == ("completed", None, [8])
+
+
+def test_a_sqlite_run_from_statement_n_keeps_foreign_keys_off(tool_env, tmp_path):  # R4
+    db, app, profile = tool_env("sqlite")
+    with dropping(db, app.close_sessions) as made:
+        parent, child = scratch_name("par"), scratch_name("chi")
+        made += [("TABLE", parent), ("TABLE", child)]
+        db.execute(f'CREATE TABLE "{parent}" (id INTEGER PRIMARY KEY)',
+                   f'CREATE TABLE "{child}" (id INTEGER PRIMARY KEY, p INTEGER REFERENCES "{parent}")')
+        path = write(tmp_path, db, ["PRAGMA foreign_keys=OFF", "SELECT 1", f'INSERT INTO "{child}" VALUES (1, 99)'])
+        ran = app.job_session(profile).run(command(path, "statements", from_statement=3))
+        assert (ran.outcome.outcome, ran.error) == ("completed", None)  # the adapter turns them on at connect
+        assert db.rows(f'SELECT id, p FROM "{child}"') == [(1, 99)]
+
+
+@pytest.mark.parametrize("engine", [pytest.param("postgres", marks=requires_pg),
+                                    pytest.param("mysql", marks=requires_mysql)])
+def test_a_commit_that_chains_restarts_the_files_transaction_there(tool_env, tmp_path, engine):  # R5
+    db, app, profile = tool_env(engine)
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        begin = ["SET SESSION completion_type = CHAIN", "START TRANSACTION"] if engine == "mysql" else ["BEGIN"]
+        chain = "COMMIT" if engine == "mysql" else "COMMIT AND CHAIN"
+        path = write(tmp_path, db, [*begin, *inserts(db, table, 1), chain, *inserts(db, table, 2, 1)])
+        ran = app.job_session(profile).run(command(path, "statements"))
+        commit_at = len(begin) + 2
+        assert (ran.outcome.outcome, ran.outcome.statements) == ("stopped", commit_at)
+        assert ran.outcome.warnings[0].startswith(f"The file's transaction from line {commit_at} (statement "
+                                                  f"{commit_at}) was still open")
+        assert ids(db, table) == [1]
+
+
+@requires_pg
+def test_a_do_block_that_commits_then_fails_says_part_may_be_applied(tool_env, tmp_path):  # R6
+    db, app, profile = tool_env("postgres")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        q = db.table(table)
+        block = (f"DO $$ BEGIN INSERT INTO {q} VALUES (1, 'a'); INSERT INTO {q} VALUES (2, 'b'); COMMIT; "
+                 f"INSERT INTO {q} VALUES (1, 'dup'); END $$")
+        ran = app.job_session(profile).run(command(write(tmp_path, db, [block]), "statements"))
+        assert ran.outcome.outcome == "stopped" and ran.outcome.warnings[0].startswith("Line 1 runs several statements")
+        assert ids(db, table) == [1, 2]
+
+
+@requires_mssql
+def test_a_procedure_that_commits_and_begins_again_is_unknown(tool_env, tmp_path):  # R7, SQL Server
+    db, app, profile = tool_env("mssql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        proc = scratch_name("reopen")
+        made.append(("PROCEDURE", proc))
+        db.execute(f"CREATE PROCEDURE {db.table(proc)} AS BEGIN COMMIT TRANSACTION; BEGIN TRANSACTION; END")
+        path = write(tmp_path, db, [*inserts(db, table, 1), f"EXEC {db.table(proc)}", *inserts(db, table, 1)])
+        ran = app.job_session(profile).run(command(path, "all_or_nothing"))
+        # it used to say rolled_back here: the procedure's COMMIT stood
+        assert (ran.outcome.outcome, ran.error.code, ran.outcome.stopped_at.statement) == (
+            "unknown", "transaction_ended", 2)
+        assert ids(db, table) == [1]
+
+
+@requires_mysql
+def test_a_stopped_mysql_run_leaves_no_table_locked(tool_env, tmp_path):  # R9
+    db, app, profile = tool_env("mysql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        path = write(tmp_path, db, [f"LOCK TABLES {db.table(table)} WRITE", *inserts(db, table, 1, 1)])
+        tab = app.job_session(profile)  # kept open: its locks would last as long as it
+        ran = tab.run(command(path, "statements"))
+        assert (ran.outcome.outcome, ran.outcome.statements) == ("stopped", 2)
+        other = mysql.connector.connect(**mysql_driver_kwargs(autocommit=True))
+        try:
+            cursor = other.cursor()
+            cursor.execute("SET SESSION lock_wait_timeout = 3")
+            cursor.execute(f"INSERT INTO {db.table(table)} VALUES (5, 'other')")  # 1205 while the lock is held
+        finally:
+            other.close()
+        assert ids(db, table) == [1, 5]

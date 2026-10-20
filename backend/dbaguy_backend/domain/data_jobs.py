@@ -28,6 +28,11 @@ ENGINE_NAMES: dict[Engine, str] = {  # what messages call an engine (the UI's EN
 RUN_SQL_FILES = "run SQL files"  # what a connection without `run_file` cannot do (spec §4)
 
 
+def cannot_read(path: str, exc: OSError) -> str:
+    """Why a file a data tool reads cannot be read (Run SQL file's run and inspection)."""
+    return f"Cannot read {path}: {exc.strerror or exc}"
+
+
 def cannot(engine: Engine | str, action: str) -> str:
     """§4's refusal of a data tool the engine lacks (D-06-13): `Couchbase connections cannot be dumped`. The one text
     of both the REST routes (422 `not_supported`) and a job command on the WebSocket (pre-flight L4)."""

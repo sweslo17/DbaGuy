@@ -19,7 +19,7 @@ _DELIMITER_ARGUMENT = re.compile(r"[ \t]+(\S+)[^\n]*")  # after the word DELIMIT
 _GO_REST = re.compile(r"(?:[ \t]+(\d+))?[ \t]*(?:--[^\r\n]*)?\r?(?=\n|\Z)")  # after GO: [count] [-- comment], line end
 _MODULES = frozenset({"PROC", "PROCEDURE", "FUNCTION", "TRIGGER", "VIEW"})
 _MAX_COUNT_DIGITS = 9  # `GO n` counts longer than this are read as 10**9
-_MODULE_HEAD = 4  # CREATE OR ALTER PROCEDURE: the significant tokens that tell whether a T-SQL batch defines a module
+MODULE_HEAD = 4  # CREATE OR ALTER PROCEDURE: the significant tokens that tell whether a T-SQL batch defines a module
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,7 +225,7 @@ class _Accumulator:
         if self.start is None:
             self.start = token.start
         self.end = token.end
-        if len(self.head) < _MODULE_HEAD:
+        if len(self.head) < MODULE_HEAD:
             self.head.append(token)
         if self._with_params and token.kind == TokenKind.PARAM:
             if token.text == "?":  # each `?` takes the next positional argument
@@ -289,10 +289,10 @@ def _go_count(digits: str | None) -> int:
     return int(significant or "0") if len(significant) <= _MAX_COUNT_DIGITS else 10**_MAX_COUNT_DIGITS
 
 
-def _defines_module(significant: list[Token]) -> bool:
+def defines_module(significant: list[Token]) -> bool:
     """CREATE [OR ALTER] | ALTER  PROC|PROCEDURE|FUNCTION|TRIGGER|VIEW. T-SQL requires such a statement to be the only
     one in its batch, so everything after it, up to the GO line, is the module's body and runs later, not now."""
-    words = [t.upper if t.kind == TokenKind.WORD else "" for t in significant[:_MODULE_HEAD]]
+    words = [t.upper if t.kind == TokenKind.WORD else "" for t in significant[:MODULE_HEAD]]
     if words[:3] == ["CREATE", "OR", "ALTER"]:
         return words[3:4] != [] and words[3] in _MODULES
     return words[:1] in (["CREATE"], ["ALTER"]) and len(words) > 1 and words[1] in _MODULES
@@ -321,10 +321,10 @@ def _iter_batches(text: str, dialect: Dialect, state: SplitState, final: bool) -
             if token.kind not in INSIGNIFICANT:
                 acc.add(token)
         if line is None:
-            if final and (span := acc.span(text, None, _defines_module(acc.head))) is not None:
+            if final and (span := acc.span(text, None, defines_module(acc.head))) is not None:
                 yield span
             return
-        if (span := acc.span(text, line.end(), _defines_module(acc.head), _go_count(line.group(1)))) is not None:
+        if (span := acc.span(text, line.end(), defines_module(acc.head), _go_count(line.group(1)))) is not None:
             yield span
         start = state.resume = line.end()
 

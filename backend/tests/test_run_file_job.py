@@ -30,27 +30,56 @@ FRAME = {Dialect.SQLITE: ("BEGIN IMMEDIATE", "COMMIT"), Dialect.POSTGRES: ("BEGI
                                                                         "COMMIT TRANSACTION")}
 
 
+class RowsResult(FakeResult):
+    """A result with the given rows (CURRENT_TRANSACTION_ID(), SHOW WARNINGS)."""
+
+    def __init__(self, rows: list[list]) -> None:
+        super().__init__(0)
+        self._rows = rows
+
+    def fetch(self, n: int) -> list[list]:
+        taken, self._rows = self._rows[:n], self._rows[n:]
+        return taken
+
+
 class RunFake(FakeConnection):
     """The frame's BEGIN opens a transaction and its COMMIT ends it (or raises `commit_error`; `commit_keeps` leaves it
     open). Statement words: `rows N`, `block` (waits for a cancel), `fail MSG`, `lost` (the link dies), `endtx` (ends
-    the transaction, as MySQL DDL does), `failend` (fails and ends the transaction: a deadlock, XACT_ABORT, or a
-    procedure's COMMIT before its error), `again` (fails from its second run on), `copy` (the adapter's COPY refusal),
-    `tx` (opens one), anything else: done. `acts` gives a whole text one of those words' behaviour (`CALL p()`)."""
+    the transaction, as MySQL DDL does), `failend` (fails and ends the transaction: XACT_ABORT, MySQL's commit before
+    an error), `deadlock` (MySQL's 1213: ends it), `trig` (SQL Server's 3609: a trigger ended it), `again` (fails from
+    its second run on), `reopen` (commits and begins another: a new CURRENT_TRANSACTION_ID()), `slept` (waits for a
+    cancel, then finishes anyway: MySQL's SLEEP() that swallowed the KILL), `copy` (the adapter's COPY refusal), `tx`
+    (opens one), anything else: done. `acts` gives a whole text one of those words' behaviour (`CALL p()`). `kept`: a
+    ROLLBACK leaves MySQL's warning 1196 (a MyISAM table)."""
 
     def __init__(self, dialect: Dialect = Dialect.SQLITE, commit_error: StatementError | None = None,
-                 commit_keeps: bool = False, acts: dict[str, str] | None = None) -> None:
+                 commit_keeps: bool = False, acts: dict[str, str] | None = None, kept: bool = False) -> None:
         super().__init__()
         self.begin, self.end = FRAME[dialect]
         self.commit_error = commit_error
         self.commit_keeps = commit_keeps
         self.acts = acts or {}
+        self.kept = kept
         self.seen: dict[str, int] = {}
+        self.txid = 100
+        self.rolled_back_kept = False  # the last ROLLBACK left 1196 for SHOW WARNINGS
+
+    def rollback(self) -> None:
+        self.rolled_back_kept = self.kept and self.tx
+        super().rollback()
 
     def statement(self, sql, options):
         self.seen[sql] = self.seen.get(sql, 0) + 1
+        if sql == "SELECT CURRENT_TRANSACTION_ID()":
+            return RowsResult([[self.txid]])
+        if sql == "SHOW WARNINGS":
+            self.runs.append(sql)
+            kept = [["Warning", 1196, "Some non-transactional changed tables couldn't be rolled back"]]
+            return RowsResult(kept if self.rolled_back_kept else [])
         if sql == self.begin:
             self.runs.append(sql)
             self.tx = True
+            self.txid += 1
             return FakeResult(0)
         if sql == self.end:
             self.runs.append(sql)
@@ -64,16 +93,25 @@ class RunFake(FakeConnection):
             return FakeResult(0)
         acted = self.acts.get(sql, sql)
         word = acted.split()[0] if acted.split() else ""
-        if word in ("lost", "endtx", "failend", "tx") or (word == "again" and self.seen[sql] > 1):
+        if word in ("lost", "endtx", "failend", "deadlock", "trig", "tx", "reopen", "slept") or (
+                word == "again" and self.seen[sql] > 1):
             self.runs.append(sql)
         if word == "lost":
             raise LOST
         if word == "endtx":
             self.tx = False
             return FakeResult(0)
-        if word == "failend":
+        if word in ("failend", "deadlock", "trig"):
             self.tx = False
-            raise StatementError("deadlock", code="40001")
+            code = {"failend": "40001", "deadlock": "1213", "trig": "3609"}[word]
+            raise StatementError("the transaction ended", code=code)
+        if word == "reopen":
+            self.txid += 1
+            return FakeResult(0)
+        if word == "slept":
+            self.blocked.set()
+            assert self._unblock.wait(10), "slept was never cancelled"
+            raise StatementCancelled(completed=True)
         if word == "again" and self.seen[sql] > 1:
             raise StatementError("duplicate", code="23505")
         if word == "copy":
@@ -81,6 +119,7 @@ class RunFake(FakeConnection):
                                  code="unsupported_copy")
         if word == "tx":
             self.tx = True
+            self.txid += 1
             return FakeResult(0)
         return super().statement(acted, options)  # an acted text is recorded as its word's (`fail` …)
 
@@ -119,8 +158,8 @@ def env():
     made: list[Env] = []
 
     def make(conn: RunFake | None = None, **fields) -> Env:
-        made.append(Env(conn or RunFake(fields.get("dialect", Dialect.SQLITE), acts=fields.pop("acts", None)),
-                        **fields))
+        made.append(Env(conn or RunFake(fields.get("dialect", Dialect.SQLITE), acts=fields.pop("acts", None),
+                                        kept=fields.pop("kept", False)), **fields))
         return made[-1]
 
     yield make
@@ -187,7 +226,7 @@ def test_a_transaction_the_file_ends_stops_an_all_or_nothing_run_as_partial(env,
     done = outcome(events)
     assert (done.outcome, done.stopped_at.line, done.statements) == ("partial", 2, 2)
     assert error(events).code == "transaction_ended" and "MySQL commits around DDL" in error(events).message
-    assert e.conn.runs == ["START TRANSACTION", "rows 1", "endtx"]
+    assert e.conn.runs == ["START TRANSACTION", "rows 1", "endtx", "SHOW WARNINGS"]  # the rollback's warnings (R3)
 
 
 @pytest.mark.parametrize("statement", ["COMMIT", "BEGIN TRANSACTION", "END", "ROLLBACK", "SAVEPOINT a"])
@@ -345,33 +384,45 @@ def test_the_history_summary():
 # ---- pre-flight findings (06a ruling J1) ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("statement", "sent"), [
-    ("CREATE TABLE u (a int)", False), ("DROP TABLE IF EXISTS u", False), ("LOCK TABLES u WRITE", False),
-    ("/*!40000 ALTER TABLE u DISABLE KEYS */", False), ("CREATE TEMPORARY TABLE u (a int)", True),
+@pytest.mark.parametrize(("statement", "code", "says"), [
+    ("CREATE TABLE u (a int)", "implicit_commit", "Line 2 (CREATE) commits MySQL's transaction"),
+    ("DROP TABLE IF EXISTS u", "implicit_commit", "Line 2 (DROP) commits"),
+    ("LOCK TABLES u WRITE", "implicit_commit", "Line 2 (LOCK) commits"),
+    ("/*!40000 ALTER TABLE u DISABLE KEYS */", "implicit_commit", "Line 2 (ALTER) commits"),
+    ("START REPLICA", "implicit_commit", "Line 2 (START REPLICA) commits"),  # R1: 1227 after committing
+    ("STOP SLAVE", "implicit_commit", "Line 2 (STOP SLAVE) commits"),
+    ("SET PASSWORD FOR 'x'@'%' = 'y'", "implicit_commit", "Line 2 (SET PASSWORD) commits"),  # R1: 1044
+    ("SET autocommit = 1", "implicit_commit", "Line 2 sets autocommit, and turning it on commits"),  # nit
+    ("CALL p()", "procedure_call", "Line 2 calls a procedure or a prepared statement"),  # R7
+    ("EXECUTE s", "procedure_call", "Line 2 calls a procedure or a prepared statement"),
+    ("CREATE TEMPORARY TABLE u (a int)", None, None),
 ])
-def test_mysql_all_or_nothing_refuses_what_commits_before_sending_it(env, sql_file, statement, sent):  # H1
+def test_mysql_all_or_nothing_refuses_what_commits_before_sending_it(env, sql_file, statement, code, says):  # H1
     e = env(dialect=Dialect.MYSQL)
     events = e.run(sql_file(f"rows 1;\n{statement};\nrows 3;"))
-    if sent:
+    if code is None:
         assert outcome(events).outcome == "completed" and statement in e.conn.runs
         return
     done = outcome(events)
-    assert (done.outcome, done.stopped_at.line, error(events).code) == ("rolled_back", 2, "implicit_commit")
-    assert error(events).message.startswith("Line 2 (") and "commits MySQL's transaction" in error(events).message
-    assert e.conn.runs == ["START TRANSACTION", "rows 1"] and e.conn.rollbacks == 1
+    assert (done.outcome, done.stopped_at.line, error(events).code) == ("rolled_back", 2, code)
+    assert error(events).message.startswith(says) and error(events).message.endswith("run it statement by statement")
+    assert e.conn.runs == ["START TRANSACTION", "rows 1", "SHOW WARNINGS"] and e.conn.rollbacks == 1
 
 
 @pytest.mark.parametrize(("statement", "dialect", "expected"), [
-    ("failend", Dialect.SQLITE, "rolled_back"),  # the server rolled it all back (a deadlock, XACT_ABORT)
+    ("failend", Dialect.SQLITE, "rolled_back"),  # the server rolled it all back (XACT_ABORT, a trigger's RAISE)
     ("failend COMMIT", Dialect.POSTGRES, "unknown"),  # it holds COMMIT: what ran before may be committed
-    ("CALL p()", Dialect.MYSQL, "unknown"),  # a procedure: MySQL's error packet cannot say
+    ("failend", Dialect.MYSQL, "unknown"),  # R1: MySQL commits before START REPLICA, SET PASSWORD … then fails
+    ("deadlock", Dialect.MYSQL, "rolled_back"),  # R1: 1213 rolled back the whole transaction
     ("fail boom", Dialect.MYSQL, "rolled_back"),
+    ("trig", Dialect.TSQL, "unknown"),  # R2: 3609, a trigger committed inside the statement
 ])
 def test_a_failure_that_may_have_committed_is_unknown_all_or_nothing(env, sql_file, statement, dialect, expected):  # H1
-    e = env(dialect=dialect, acts={"CALL p()": "failend"})
-    events = e.run(sql_file(f"rows 1;\n{statement};\nrows 3;"))
+    e = env(dialect=dialect)
+    text = f"rows 1\nGO\n{statement}\nGO\nrows 3\nGO\n" if dialect is Dialect.TSQL else f"rows 1;\n{statement};\nrows 3;"
+    events = e.run(sql_file(text))
     done = outcome(events)
-    assert (done.outcome, done.stopped_at.line) == (expected, 2)
+    assert (done.outcome, done.stopped_at.statement) == (expected, 2)
     assert ("what ran before it may be applied" in error(events).message) == (expected == "unknown")
     assert not e.conn.tx and "rows 3" not in e.conn.runs
 
@@ -385,11 +436,10 @@ def test_a_lost_link_on_a_statement_that_may_commit_is_unknown_all_or_nothing(en
 @pytest.mark.parametrize(("dialect", "statement", "expected"), [
     (Dialect.TSQL, "endtx", "unknown"),  # H3: a T-SQL batch may have rolled it back
     (Dialect.POSTGRES, "endtx", "unknown"),
-    (Dialect.MYSQL, "CALL p()", "unknown"),  # a procedure may have committed or rolled back
     (Dialect.MYSQL, "endtx", "partial"),  # only MySQL's commit around a statement is known to be a commit
 ])
 def test_a_transaction_that_ends_outside_mysqls_commit_is_unknown(env, sql_file, dialect, statement, expected):
-    e = env(dialect=dialect, acts={"CALL p()": "endtx"})
+    e = env(dialect=dialect)
     text = f"rows 1\nGO\n{statement}\nGO\nrows 3\nGO\n" if dialect is Dialect.TSQL else f"rows 1;\n{statement};\nrows 3;"
     events = e.run(sql_file(text))
     done = outcome(events)
@@ -545,3 +595,107 @@ def test_a_connection_without_the_tool_is_refused_in_sections_words():  # L4
     with pytest.raises(StatementError) as refused:
         factory.build_job(RunFileCommand(request_id="r", path="/x.sql", mode="statements"), profile, None)
     assert (refused.value.code, refused.value.message) == ("not_supported", "SQLite connections cannot run SQL files")
+
+
+# ---- fix round 1 (rulings R1–R9) ------------------------------------------------------------------------------
+
+
+def test_a_trigger_that_commits_statement_by_statement_is_unknown_and_inside_the_files_transaction_said(env, sql_file):
+    alone = env(dialect=Dialect.TSQL)  # R2: 3609 outside any transaction: the statement's own work may stand
+    events = alone.run(sql_file("rows 1\nGO\ntrig\nGO\nrows 3\nGO\n"), mode="statements")
+    assert (outcome(events).outcome, outcome(events).stopped_at.statement) == ("unknown", 2)
+    assert error(events).message.endswith("A trigger ended the transaction inside line 3: what it did may be applied")
+    inside = env(dialect=Dialect.TSQL)
+    done = outcome(inside.run(sql_file("tx\nGO\nrows 2\nGO\ntrig\nGO\n"), mode="statements"))
+    assert (done.outcome, done.statements) == ("unknown", 2)  # not counted out: it may have been committed
+    assert done.warnings == ["Line 5 may have committed or rolled back the file's transaction from line 1 (statement "
+                             "1): the statements from there on may or may not be applied"]
+
+
+@pytest.mark.parametrize("mode", ["all_or_nothing", "statements"])
+def test_a_rollback_that_left_a_tables_changes_is_unknown(env, sql_file, mode):  # R3 (MyISAM)
+    e = env(dialect=Dialect.MYSQL, kept=True)
+    text = "rows 1;\nfail boom;" if mode == "all_or_nothing" else "START TRANSACTION;\nrows 2;\nfail boom;"
+    done = outcome(e.run(sql_file(text), mode=mode))
+    assert done.outcome == "unknown" and done.warnings[-1] == (
+        "Some tables cannot roll back (non-transactional): their changes stayed")
+    assert e.conn.runs[-1] == ("SHOW WARNINGS" if mode == "all_or_nothing" else "UNLOCK TABLES")
+
+
+def test_a_rollback_that_kept_nothing_stays_rolled_back(env, sql_file):  # R3: no 1196, no change
+    e = env(dialect=Dialect.MYSQL)
+    assert outcome(e.run(sql_file("rows 1;\nfail boom;"))).outcome == "rolled_back"
+
+
+@pytest.mark.parametrize(("dialect", "text", "sent", "from_statement"), [
+    (Dialect.POSTGRES, "SET search_path TO s;\nrows 1;\nSELECT pg_catalog.set_config('search_path', '', false);\n"
+     "SET LOCAL lock_timeout = 0;\nrows 5;", ["SET search_path TO s",
+                                              "SELECT pg_catalog.set_config('search_path', '', false)", "rows 5"], 5),
+    (Dialect.MYSQL, "/*!40103 SET TIME_ZONE='+00:00' */;\nSET GLOBAL x = 1;\nUSE d;\nrows 4;\nrows 5;",
+     ["/*!40103 SET TIME_ZONE='+00:00' */", "USE d", "rows 5"], 5),
+    (Dialect.TSQL, "SET ANSI_NULLS ON\nGO\nSET NOCOUNT ON\nrows 2\nGO\nrows 3\nGO\n",
+     ["SET IMPLICIT_TRANSACTIONS OFF", "SET ANSI_NULLS ON", "rows 3"], 3),
+    (Dialect.SQLITE, "PRAGMA foreign_keys=OFF;\nPRAGMA journal_mode=WAL;\nrows 3;",
+     ["PRAGMA foreign_keys=OFF", "rows 3"], 3),
+])
+def test_a_run_from_statement_n_still_sends_the_session_settings_before_it(env, sql_file, dialect, text, sent,
+                                                                           from_statement):  # R4
+    e = env(dialect=dialect)
+    done = outcome(e.run(sql_file(text), mode="statements", from_statement=from_statement))
+    assert (done.outcome, done.statements, e.conn.runs) == ("completed", 1, sent)
+    settings = len(sent) - 1 - (dialect is Dialect.TSQL)
+    assert done.warnings == [f"{settings} session settings before statement {from_statement} were run again (SET, "
+                             "USE, PRAGMA); the other statements before it were skipped"]
+
+
+def test_a_resent_setting_all_or_nothing_is_refused_like_the_file(env, sql_file):  # R4 with the nit's SET autocommit
+    e = env(dialect=Dialect.MYSQL)
+    events = e.run(sql_file("SET autocommit = 1;\nrows 2;"), from_statement=2)
+    assert (outcome(events).outcome, error(events).code, e.conn.runs) == (
+        "not_started", "implicit_commit", ["START TRANSACTION", "SHOW WARNINGS"])
+
+
+@pytest.mark.parametrize(("dialect", "chain"), [(Dialect.POSTGRES, "COMMIT AND CHAIN"), (Dialect.MYSQL, "COMMIT")])
+def test_a_commit_that_leaves_a_transaction_open_restarts_it_there(env, sql_file, dialect, chain):  # R5
+    # MySQL: a COMMIT under completion_type=CHAIN leaves one open too (`commit_keeps`)
+    e = env(RunFake(dialect, commit_keeps=dialect is Dialect.MYSQL), dialect=dialect)
+    done = outcome(e.run(sql_file(f"tx;\nrows 2;\n{chain};\nrows 4;\nfail boom;"), mode="statements"))
+    assert (done.outcome, done.statements, done.stopped_at.statement) == ("stopped", 3, 5)
+    assert done.warnings == ["The file's transaction from line 3 (statement 3) was still open: it was rolled back, so "
+                             "the statements from there on are not applied; run again from statement 3"]
+
+
+def test_a_do_block_that_fails_may_have_applied_part_of_its_work(env, sql_file):  # R6
+    e = env(dialect=Dialect.POSTGRES, acts={"DO $$ BEGIN rows; COMMIT; END $$": "fail"})
+    done = outcome(e.run(sql_file("DO $$ BEGIN rows; COMMIT; END $$;\n"), mode="statements"))
+    assert done.outcome == "stopped" and done.warnings[0].startswith("Line 1 runs several statements")
+
+
+def test_a_tsql_batch_that_commits_and_begins_another_is_unknown(env, sql_file):  # R7, SQL Server
+    acts = {"EXEC p": "reopen"}
+    whole = env(dialect=Dialect.TSQL, acts=acts)
+    events = whole.run(sql_file("rows 1\nGO\nEXEC p\nGO\nrows 3\nGO\n"))
+    assert (outcome(events).outcome, error(events).code) == ("unknown", "transaction_ended")
+    assert error(events).message.startswith("The transaction ended and another began inside line 3")
+    each = env(dialect=Dialect.TSQL, acts=acts)
+    done = outcome(each.run(sql_file("tx\nGO\nrows 2\nGO\nEXEC p\nGO\nrows 4\nGO\nfail boom\nGO\n"),
+                            mode="statements"))
+    assert (done.outcome, done.statements) == ("stopped", 3)  # the restart at EXEC: from there on rolled back
+    assert done.warnings[0].startswith("Line 5 may have committed or rolled back the file's transaction from line 1")
+    assert done.warnings[1].startswith("The file's transaction from line 5 (statement 3) was still open")
+
+
+def test_a_statement_that_finished_before_its_cancel_counts_as_applied(env, sql_file):  # R8
+    e = env()
+    e.submit(sql_file("rows 1;\nslept;\nrows 3;"), mode="statements")
+    assert e.conn.blocked.wait(5)
+    e.worker.cancel("r")
+    done = outcome(request_events(e.recorder, "r"))
+    assert (done.outcome, done.cancelled, done.statements, done.stopped_at.statement) == ("stopped", True, 2, 3)
+    assert "rows 3" not in e.conn.runs
+
+
+def test_a_stopped_mysql_run_unlocks_its_tables_after_the_rollback(env, sql_file):  # R9
+    e = env(dialect=Dialect.MYSQL)
+    e.run(sql_file("START TRANSACTION;\nrows 2;\nfail boom;"), mode="statements")
+    assert e.conn.runs[-2:] == ["SHOW WARNINGS", "UNLOCK TABLES"] and e.conn.rollbacks == 1

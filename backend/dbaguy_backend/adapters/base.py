@@ -109,8 +109,13 @@ def invalid_text_error(sql: str, index: int) -> StatementError:
 
 
 class StatementCancelled(StatementError):
-    def __init__(self, message: str = "Query cancelled") -> None:
+    """`completed`: the server finished the statement before the cancel could stop it (MySQL: a SLEEP() inside it
+    returned early on the KILL QUERY and the statement went on to its end); a query tab still reports it cancelled, a
+    run counts it as applied (06a ruling R8)."""
+
+    def __init__(self, message: str = "Query cancelled", *, completed: bool = False) -> None:
         super().__init__(message, code="cancelled")
+        self.completed = completed
 
 
 class StatementNotSent(StatementError):
