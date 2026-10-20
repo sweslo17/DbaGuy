@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { EditPreview, EditWarning, PlannedStatement, ServerEvent } from "@/lib/api/types";
-import { applyEvent, newExecution, type ExecutionState } from "../session/execution";
+import { applyEvent, EXPORT_RUNNING, newExecution, type ExecutionState } from "../session/execution";
 import {
   afterglowHolds,
   afterglowNow,
@@ -13,7 +13,6 @@ import {
   commitBlocked,
   commitStep,
   countParts,
-  EXPORT_RUNNING,
   failedPlace,
   LIST_MAX,
   moreText,
@@ -23,9 +22,9 @@ import {
   previewed,
   previewFailed,
   previewing,
+  lastWarning,
   previewLists,
   refreshBy,
-  REREAD_FIRST,
   resultStep,
   rowLabel,
   statementLayout,
@@ -45,7 +44,7 @@ import {
   type EndedCommit,
 } from "./commitFlow";
 import { emptyStaged, rowKeyFromKey, stage, stagingOf, type StagedEdits } from "./staging";
-import { ROWS_LOADING } from "./tableEditing";
+import { REREAD_FIRST, ROWS_LOADING } from "./tableEditing";
 
 /*
  * The commit dialog's decisions (spec ⑤ §3.6.5; pre-flight H2, H8, M1, M2, M5, L10, L15; 05a M7): which preview's plan
@@ -550,6 +549,21 @@ describe("the dialog's lists (pre-flight H2)", () => {
     expect(rowLabel(preview, stagingOf(staged), "i:2")).toBe("New row");
     expect(rowLabel(preview, stagingOf(staged), "u:5")).toBe("Row id = 5");
     expect(rowLabel(preview, stagingOf(staged), "u:404")).toBe("A change");
+  });
+});
+
+describe("the apply's last warning under its progress", () => {
+  it("is the newest warning, or nothing", () => {
+    expect(lastWarning([])).toBeNull();
+    expect(lastWarning([{ severity: "info", text: "NOTICE" }])).toBeNull();
+    const escalation = "This batch is waiting inside a result … Press Cancel again to drop the connection";
+    expect(
+      lastWarning([
+        { severity: "warning", text: "older" },
+        { severity: "warning", text: escalation },
+        { severity: "info", text: "NOTICE after it" },
+      ]),
+    ).toBe(escalation);
   });
 });
 

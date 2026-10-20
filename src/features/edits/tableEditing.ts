@@ -31,6 +31,11 @@ export const KEY_CHANGED = "The table's key changed since these changes were sta
 export const TOO_MANY_ROWS = `Select at most ${MAX_CHANGES.toLocaleString()} rows`;
 /** The rows shown are held while a re-run loads them again, or not there yet: nothing new is staged on them (K19). */
 export const ROWS_LOADING = "Wait for the rows to load";
+/**
+ * The grid draws the staging from before the last commit (its afterglow) and that commit's re-read was cut short (K17):
+ * nothing loads by itself, and nothing new is staged until a Refresh reads the rows again (Task 10).
+ */
+export const REREAD_FIRST = "Refresh first: the rows shown are from before the last commit";
 /** The edit target has not been read yet. */
 export const CHECKING = "Checking whether this table's rows can be edited";
 /** A target that is not editable and gives no reason. */

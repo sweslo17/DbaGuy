@@ -354,6 +354,9 @@ export class SessionController {
    */
   private onOpen(): void {
     const { executions, state } = this.store.getState();
+    // An orphan may be a grid-edit apply (`edits`): its outcome is unknown from here on (it ended without one, R-05-6),
+    // and the cancel below may still stop it before its COMMIT and roll it back. It still reads as unknown, which is
+    // honest: whether the cancel reached it in time cannot be told, and nothing is ever sent again.
     const orphans = Object.values(executions).filter(unfinished);
     this.store.setState({ phase: "open", executions: orphans.length ? interruptAll(executions) : executions });
     const cancelKeepsTransaction = !state?.inTransaction || !this.cancelAbortsTransaction();

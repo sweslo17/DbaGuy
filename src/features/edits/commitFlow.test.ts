@@ -30,6 +30,7 @@ import {
   SQL_MODE_NOTE,
   SQLITE_BUSY_NOTE,
   stagedOutcome,
+  STOPPED_WAITING_TEXT,
   TRANSACTION_OPEN_NOTE,
   UNKNOWN_NOTE,
   type EndedCommit,
@@ -581,6 +582,35 @@ describe("when the outcome does not come (pre-flight M2)", () => {
       error: { message: "Not connected", code: "not_connected" },
     };
     expect(abandonedCommit(never)).toEqual({ kind: "not_sent" });
+  });
+
+  it("says the user stopped waiting, not that the connection was lost, after Close — outcome unknown (ruling K21)", () => {
+    const waiting = apply([{ type: "started" }, { type: "affected", index: 0, rows: 1 }]);
+    const stopped = abandonedCommit(waiting, true) as EndedCommit;
+    expect(stopped).toMatchObject({ kind: "ended", outcome: "unknown", event: null, stoppedWaiting: true });
+    expect(commitReport(stopped, { total: 3, sqlModeRefusals: 0 })).toMatchObject({
+      title: "Outcome unknown",
+      detail: STOPPED_WAITING_TEXT,
+      notes: [UNKNOWN_NOTE],
+      actions: ["refresh"],
+    });
+    expect((abandonedCommit(null, true) as EndedCommit).stoppedWaiting).toBe(true);
+    // A vanished execution, or a lost socket, still says the connection was lost.
+    expect(commitReport(abandonedCommit(waiting) as EndedCommit, { total: 3, sqlModeRefusals: 0 }).detail).toBe(LOST_TEXT);
+    expect(commitReport(abandonedCommit(null) as EndedCommit, { total: 3, sqlModeRefusals: 0 }).detail).toBe(LOST_TEXT);
+    // An outcome that arrived, or a command that never left, is what it is.
+    const answered = apply([{ type: "started" }, outcome("committed", { applied: ["u:1"] })]);
+    expect(abandonedCommit(answered, true)).not.toHaveProperty("stoppedWaiting");
+    const unknownSent = apply([
+      { type: "started" },
+      { type: "error", message: "lost during COMMIT", code: "outcome_unknown" },
+      outcome("unknown"),
+    ]);
+    const kept = abandonedCommit(unknownSent, true) as EndedCommit;
+    expect(kept.stoppedWaiting).toBeUndefined();
+    expect(commitReport(kept, { total: 1, sqlModeRefusals: 0 }).detail).toBe("lost during COMMIT");
+    const never = { ...newExecution(R, "edits", ""), status: "done" as const, error: { message: "Not connected", code: "not_connected" } };
+    expect(abandonedCommit(never, true)).toEqual({ kind: "not_sent" });
   });
 
   it("offers to close it unknown once the session is not open, or once COMMIT has gone unanswered too long", () => {

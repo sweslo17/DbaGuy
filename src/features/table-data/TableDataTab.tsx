@@ -15,7 +15,7 @@ import { isCommandKey } from "@/lib/shortcuts";
 import { useWorkspace, type TableTabState } from "@/stores/workspace";
 import { useEngineInfo, useProfiles } from "../connections/hooks";
 import { RecoverableError } from "../connections/RecoverableError";
-import { COMMIT_RUNNING, EXPORT_RUNNING } from "../edits/commitDialog";
+import { COMMIT_RUNNING } from "../edits/commitDialog";
 import { EditBar } from "../edits/EditBar";
 import { resultColumns } from "../edits/overlay";
 import { asksBeforeDiscard, discardQuestion } from "../edits/tableEditing";
@@ -27,7 +27,7 @@ import { DataGrid, type DataGridHandle } from "../grid/DataGrid";
 import { ExportDialog } from "../grid/ExportDialog";
 import type { GridSort } from "../grid/GridHeader";
 import { useHeldResult } from "../grid/useHeldResult";
-import { CONNECTION_LOST } from "../session/execution";
+import { CONNECTION_LOST, EXPORT_RUNNING } from "../session/execution";
 import { isExporting } from "../session/SessionController";
 import { useSessionGuards } from "../session/SessionGuards";
 import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
@@ -216,6 +216,9 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   // The commit's dialog and afterglow are held here, above the edits: a running commit locks the staging, and until
   // the re-read is in the grid draws the staging as it was before the commit (pre-flight M5), in the same render.
   const committing = useCommitState({ deliveredRequest: table.deliveredRequest, position: table.position });
+  // A commit's re-read has been asked for and not delivered yet: its rows count as loading from the moment it is asked
+  // (before it is sent, the rows shown are not stale yet), so nothing says "Refresh first" meanwhile.
+  const rereading = table.pending && committing.afterglow !== null;
   const openAfterEdit = useRef<() => void>(() => undefined);
   const edits = useTableEdits({
     tab,
@@ -223,7 +226,7 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
     rows,
     rowEditing: engine?.row_editing === true,
     sessionOpen: phase === "open",
-    stale: shown.stale,
+    stale: shown.stale || rereading,
     locked: committing.applying ? COMMIT_RUNNING : null,
     gridRef,
     onRequestCommit: () => openAfterEdit.current(),
@@ -246,7 +249,7 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
     browse: {
       execution,
       // The rows are being read: held while a re-run loads them, or the first ones not there yet.
-      pending: shown.stale || (table.pending && !set),
+      pending: shown.stale || rereading || (table.pending && !set),
       deliveredRequest: table.deliveredRequest,
       position: table.position,
       reread: table.refresh,

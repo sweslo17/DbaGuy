@@ -22,6 +22,8 @@ import {
   countParts,
   failedPlace,
   hasPreview,
+  lastWarning,
+  LIST_MAX,
   moreText,
   NON_TRANSACTIONAL_NOTE,
   PROBLEMS_INTRO,
@@ -124,7 +126,10 @@ function More({ more }: { more: number }) {
   return text ? <li className="px-2 py-1 text-muted">{text}</li> : null;
 }
 
-/** The apply's progress line: it alone follows each statement's count (`affected`), not the dialog. */
+/**
+ * The apply's progress line, and under it the apply's last warning (SQL Server's "Press Cancel again to drop the
+ * connection…"): it alone follows each statement's count (`affected`), not the dialog.
+ */
 function ApplyProgress({
   store,
   requestId,
@@ -135,19 +140,45 @@ function ApplyProgress({
   statements: number;
 }) {
   const counted = useStore(store, (s) => s.executions[requestId]?.affected.length ?? 0);
+  const warning = useStore(store, (s) => lastWarning(s.executions[requestId]?.messages ?? []));
   const { progress } = applyingView({ phase: "open", counted, statements, quietMs: 0, sinceCancelMs: null });
   return (
-    <p className="flex items-center gap-2" aria-live="polite">
-      <Loader2 size={12} className="animate-spin" />
-      {progress}
-    </p>
+    <div className="flex flex-col gap-1" aria-live="polite">
+      <p className="flex items-center gap-2">
+        <Loader2 size={12} className="animate-spin" />
+        {progress}
+      </p>
+      {warning && (
+        <p className="whitespace-pre-wrap text-warning" data-selectable>
+          {warning}
+        </p>
+      )}
+    </div>
   );
+}
+
+/**
+ * When each state of an apply's execution was first drawn (each event folds into a new object): when the apply last had
+ * an event, for how long it has been quiet (K11). Kept outside React state: a state update per event, from an effect,
+ * would be one more render per statement, and a burst of events made React give up (#185).
+ */
+const SEEN = new WeakMap<object, number>();
+function eventSeenAt(execution: object | undefined): number {
+  if (!execution) return Date.now();
+  let at = SEEN.get(execution);
+  if (at === undefined) {
+    at = Date.now();
+    SEEN.set(execution, at);
+  }
+  return at;
 }
 
 /**
  * The applying dialog's footer (pre-flight M1, M2, ruling K11): Cancel on the left while a statement can still be
  * cancelled, a disabled "Committing…" where Commit was (the second click of a double click never lands on Cancel), and
- * "Close — outcome unknown" once the outcome may never come.
+ * "Close — outcome unknown" once the outcome may never come. Cancel stays enabled after a click: SQL Server may ask to
+ * press it again to drop the connection (its escalation, `adapters/mssql/cancel.py`), and the backend tells a double
+ * click from that second Cancel. The first click is when the cancel was sent (`sinceCancelMs`).
  */
 function ApplyingFooter({
   store,
@@ -167,9 +198,7 @@ function ApplyingFooter({
   const execution = useStore(store, (s) => s.executions[requestId]);
   const phase = useStore(store, (s) => s.phase);
   const [cancelAt, setCancelAt] = useState<number | null>(null);
-  const [lastEventAt, setLastEventAt] = useState(() => Date.now());
-  // Each event folds into a new execution object: the time since the last one is how long the apply has been quiet.
-  useEffect(() => setLastEventAt(Date.now()), [execution]);
+  const lastEventAt = eventSeenAt(execution);
   const now = useNow(WAIT_TICK_MS);
   const view = applyingView({
     phase,
@@ -184,12 +213,12 @@ function ApplyingFooter({
         <Button
           variant="ghost"
           onClick={() => {
-            setCancelAt(Date.now());
+            if (cancelAt === null) setCancelAt(Date.now());
             onCancel();
           }}
-          disabled={!view.canCancel || cancelAt !== null}
+          disabled={!view.canCancel}
         >
-          {cancelAt === null ? "Cancel" : "Cancelling…"}
+          Cancel
         </Button>
         {view.closeUnknown && <Button onClick={onCloseUnknown}>{CLOSE_UNKNOWN_LABEL}</Button>}
       </div>
@@ -408,11 +437,12 @@ function PreviewDialogView(props: PreviewDialogProps) {
             ))}
             {state.messages.length > 0 && (
               <ul className={cn(LIST, "font-mono")}>
-                {state.messages.map((message, i) => (
+                {state.messages.slice(0, LIST_MAX).map((message, i) => (
                   <li key={i} className={cn("px-2 py-0.5", message.severity === "warning" && "text-warning")}>
                     {message.text}
                   </li>
                 ))}
+                <More more={state.messages.length - Math.min(state.messages.length, LIST_MAX)} />
               </ul>
             )}
           </div>

@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useStore } from "zustand";
-import { createStore } from "zustand/vanilla";
+import { createStore, type StoreApi } from "zustand/vanilla";
 import { useEngineInfo } from "../connections/hooks";
 import { emptySnapshot, SessionController, type SessionSnapshot } from "./SessionController";
+import { shownSnapshot } from "./sessionSnapshots";
 import { cancelAbortsTransaction } from "./transactions";
 
 /** Read while there is no controller: hooks cannot be called conditionally. */
@@ -41,7 +42,15 @@ export function useSession(
     };
   }, [profileId, database, enabled, attempt]);
 
-  const snapshot = useStore(controller?.store ?? NO_SESSION);
+  // An apply's progress alone (one `affected` per statement) does not render the tab: the commit dialog follows it from
+  // the store itself (`onlyApplyProgress`). Its outcome, its `finished` and every other change do.
+  const store = controller?.store ?? NO_SESSION;
+  const kept = useRef<{ store: StoreApi<SessionSnapshot>; snapshot: SessionSnapshot } | null>(null);
+  const snapshot = useStore(store, (next) => {
+    const shown = shownSnapshot(kept.current?.store === store ? kept.current.snapshot : null, next);
+    kept.current = { store, snapshot: shown };
+    return shown;
+  });
   const retry = useCallback(() => setAttempt((a) => a + 1), []);
   return { controller, snapshot: controller ? snapshot : null, retry };
 }

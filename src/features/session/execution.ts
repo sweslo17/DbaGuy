@@ -71,6 +71,8 @@ export interface ExecutionState {
 }
 
 export const INTERRUPTED_MESSAGE = "Connection interrupted — results may be incomplete";
+/** Why a statement is not sent now: an export runs on the session, and it would only wait behind it. */
+export const EXPORT_RUNNING = "An export is running on this session";
 /** Error code of a statement whose database connection dropped: the session must be reopened (retried). */
 export const CONNECTION_LOST = "connection_lost";
 /**

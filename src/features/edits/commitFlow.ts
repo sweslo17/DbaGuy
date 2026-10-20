@@ -32,6 +32,11 @@ export interface EndedCommit {
    * failed, or the transaction was open before it (`transaction_open`).
    */
   readonly inTransaction: boolean;
+  /**
+   * The user stopped waiting ("Close — outcome unknown", ruling K21) before an outcome came: the connection may be fine,
+   * the outcome simply did not arrive. Only on an unknown outcome without an event; absent otherwise.
+   */
+  readonly stoppedWaiting?: boolean;
 }
 
 /** The command never left: the session was not connected (`not_connected`), so nothing happened. */
@@ -79,21 +84,25 @@ export function commitState(execution: ExecutionState): CommitState {
 }
 
 /**
- * The apply as it stands when the dialog stops waiting for it, or when its execution is gone from the session (`null`:
- * a closed or replaced session). An outcome that arrived stands; a command that never left was not sent; anything else
- * is unknown, and nothing is sent again (pre-flight M2).
+ * The apply as it stands when the dialog stops waiting for it (`stoppedWaiting`), or when its execution is gone from
+ * the session (`null`: a closed or replaced session). An outcome that arrived stands; a command that never left was not
+ * sent; anything else is unknown, and nothing is sent again (pre-flight M2). An unknown outcome the user stopped waiting
+ * for says so (ruling K21): the connection may well be up.
  */
-export function abandonedCommit(execution: ExecutionState | null): SettledCommit {
-  if (execution) return settled(execution);
-  return {
-    kind: "ended",
-    outcome: "unknown",
-    event: null,
-    error: null,
-    messages: [],
-    cancelled: false,
-    inTransaction: false,
-  };
+export function abandonedCommit(execution: ExecutionState | null, stoppedWaiting = false): SettledCommit {
+  const commit: SettledCommit = execution
+    ? settled(execution)
+    : {
+        kind: "ended",
+        outcome: "unknown",
+        event: null,
+        error: null,
+        messages: [],
+        cancelled: false,
+        inTransaction: false,
+      };
+  if (!stoppedWaiting || commit.kind !== "ended" || commit.outcome !== "unknown" || commit.event) return commit;
+  return { ...commit, stoppedWaiting: true };
 }
 
 /** How long the apply may go without an event before the dialog offers to close it unknown (pre-flight M2). */
@@ -180,6 +189,9 @@ export interface CommitReport {
 export const UNKNOWN_NOTE =
   "The changes may or may not have been applied. Refresh to see the table as it is now: Commit is off until then, and nothing is sent again by itself.";
 export const LOST_TEXT = "The connection was lost while committing: the changes may or may not have been applied.";
+/** The unknown outcome's text after "Close — outcome unknown" (ruling K21). */
+export const STOPPED_WAITING_TEXT =
+  "Stopped waiting for the outcome: the changes may have been applied. Refresh to see what the table holds.";
 export const TRANSACTION_OPEN_NOTE =
   "This tab's session has a transaction open (for example from SQL Server's IMPLICIT_TRANSACTIONS login option): roll it back or reconnect, then preview again.";
 export const SQL_MODE_NOTE =
@@ -293,7 +305,7 @@ export function commitReport(commit: EndedCommit, context: { total: number; sqlM
         ...base,
         tone: "warning",
         title: "Outcome unknown",
-        detail: commit.event ? base.detail : LOST_TEXT,
+        detail: commit.event ? base.detail : commit.stoppedWaiting ? STOPPED_WAITING_TEXT : LOST_TEXT,
         notes: [UNKNOWN_NOTE],
         actions: needsReconnect(commit) ? ["refresh", "reconnect"] : ["refresh"],
       };

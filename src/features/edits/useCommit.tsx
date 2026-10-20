@@ -364,11 +364,15 @@ export function useCommit(input: CommitInput): Commit {
     }
   };
 
-  /** K11: the outcome may never come; it is unknown, nothing is sent again, Commit stays off until fresh rows. */
+  /**
+   * K11: the outcome may never come; it is unknown, nothing is sent again, Commit stays off until fresh rows. The result
+   * says the user stopped waiting (K21), not that the connection was lost.
+   */
   const closeUnknown = () => {
     const current = holder.read();
     if (current?.step !== "applying") return;
-    settle(current, abandonedCommit(applyController.current?.store.getState().executions[current.requestId] ?? null));
+    const execution = applyController.current?.store.getState().executions[current.requestId] ?? null;
+    settle(current, abandonedCommit(execution, true));
   };
 
   const cancelApply = () => {

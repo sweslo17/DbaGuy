@@ -1,7 +1,7 @@
 import type { EditCounts, EditOutcome, EditPreview, PlannedStatement } from "@/lib/api/types";
 import { plural } from "@/lib/format";
 import { positionToOffset } from "../query/runPlan";
-import type { ExecutionState } from "../session/execution";
+import { EXPORT_RUNNING, type ExecutionState } from "../session/execution";
 import type { SessionPhase } from "../session/SessionController";
 import {
   commitReport,
@@ -19,7 +19,7 @@ import {
   type SettledCommit,
 } from "./commitFlow";
 import { hasChanges, type StagedEdits, type Staging } from "./staging";
-import { ROWS_LOADING } from "./tableEditing";
+import { REREAD_FIRST, ROWS_LOADING } from "./tableEditing";
 
 /*
  * The commit dialog's decisions (spec ⑤ §3.6.5, R-05-6, R-05-7, 05a M7; pre-flight H2, H8, M1, M2, M5, L10, L15), as
@@ -127,9 +127,7 @@ export const browseWasPaused = (execution: ExecutionState | null): boolean =>
 
 export const COMMIT_RUNNING = "A commit is running: wait for it to end";
 export const NOT_CONNECTED_TEXT = "Not connected";
-export const EXPORT_RUNNING = "An export is running on this session";
 export const UNKNOWN_REFRESH_FIRST = "The last commit's outcome is unknown: Refresh first";
-export const REREAD_FIRST = "Refresh first: the rows shown are from before the last commit";
 export const NO_CHANGES = "No changes to commit";
 
 export interface CommitFacts {
@@ -405,6 +403,15 @@ export const NON_TRANSACTIONAL_NOTE =
 export const PROBLEMS_INTRO = "Nothing can be committed until these are fixed in the grid:";
 export const NOT_SHOWN = "That row is not among the rows shown (filtered out or not loaded)";
 export const BUILDING = "Building the statements…";
+
+/**
+ * The apply's last warning, shown under the progress line while it runs (SQL Server's "Press Cancel again to drop the
+ * connection…" after a Cancel that cannot reach the statement), or null.
+ */
+export function lastWarning(messages: Messages): string | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) if (messages[i].severity === "warning") return messages[i].text;
+  return null;
+}
 
 /** The applying dialog's progress line and controls (pre-flight M1, M2, ruling K11). */
 export interface ApplyingView {

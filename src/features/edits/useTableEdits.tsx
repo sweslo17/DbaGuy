@@ -64,6 +64,7 @@ import {
   pickCells,
   pickRows,
   placeAfterTop,
+  REREAD_FIRST,
   rowHasConflict,
   ROWS_LOADING,
   rowStateOf,
@@ -261,7 +262,9 @@ export function useTableEdits(input: TableEditsInput): TableEdits {
   const readOnlyReason = target && !target.editable ? (target.reason ?? NOT_EDITABLE) : null;
   const gate: EditGate = {
     locked,
-    waiting: stale || !input.columns || input.afterglow ? ROWS_LOADING : null,
+    // The afterglow is drawn until the commit's re-read is in: while it loads, the rows are `stale`; once it was cut
+    // short (K17), nothing loads by itself and a Refresh is the way on.
+    waiting: stale || !input.columns ? ROWS_LOADING : input.afterglow ? REREAD_FIRST : null,
     readOnly: target
       ? (readOnlyReason ?? (keyChanged ? KEY_CHANGED : null))
       : (targetError ?? (view === "none" ? NOT_EDITABLE : CHECKING)),
