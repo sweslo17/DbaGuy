@@ -18,6 +18,7 @@ that quietly differs from the real object.
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Context, Decimal
 
 from loguru import logger
 
@@ -25,10 +26,12 @@ from ...domain.errors import NotFound, ValidationFailed
 from ...domain.metadata import ColumnInfo, Folder, NodeKind, ObjectDetail, ObjectNode, PathSegment, make_node
 from . import driver
 from .catalog import (
-    SYSTEM_DATABASES, batch, first_row, is_system_schema, literal, name_literal, object_id_sql, q, result_sets, rows,
-    type_sql)
+    SYSTEM_DATABASES, PerObject, batch, by_object, first_row, id_sources, is_system_schema, literal, name_literal,
+    object_id_sql, q, result_sets, rows, type_sql)
 
 HIDDEN = "?"  # what the tree shows for a name the account may not see
+# Sequence and identity values go up to decimal(38, 0): their sums are exact (the default context keeps 28 digits)
+EXACT = Context(prec=80)
 # Their objects are system objects: listed from sys.all_views / sys.all_objects, not from the user-object views.
 _CATALOG_SCHEMAS = frozenset({"sys", "INFORMATION_SCHEMA"})
 
@@ -76,6 +79,13 @@ FROM sys.types t LEFT JOIN sys.types bt ON bt.user_type_id = t.system_type_id
 WHERE t.is_user_defined = 1 AND """
 _TYPES = _TYPE_COLUMNS + "t.schema_id = SCHEMA_ID({s}) ORDER BY t.name"
 _TYPE = _TYPE_COLUMNS + "t.user_type_id = TYPE_ID({ref})"
+_TYPES_OF = """
+SELECT t.user_type_id, t.name, t.is_table_type, bt.name, t.max_length, t.precision, t.scale, t.is_nullable
+FROM sys.types t LEFT JOIN sys.types bt ON bt.user_type_id = t.system_type_id
+WHERE t.is_user_defined = 1 AND t.user_type_id IN ({ids})
+"""
+_TABLE_TYPE_OBJECTS = "SELECT type_table_object_id FROM sys.table_types WHERE user_type_id IN ({ids})"
+_TABLE_TYPE_OF = "SELECT type_table_object_id, user_type_id FROM sys.table_types WHERE user_type_id IN ({ids})"
 _TABLE_FOLDER_COUNTS = """
 SELECT 'indexes', COUNT(*) FROM sys.indexes WHERE object_id = {o} AND type IN (1, 2)
 UNION ALL SELECT 'foreign_keys', COUNT(*) FROM sys.foreign_keys WHERE parent_object_id = {o}
@@ -84,8 +94,8 @@ UNION ALL SELECT 'exists', COUNT(*) FROM sys.all_objects WHERE object_id = {o} A
 """
 # sys.all_columns: a system view (`sys.objects`) has columns too. A user type the account may not see has no row in
 # sys.types: the column falls back to its base type (system_type_id), and `type_hidden` says so.
-_COLUMNS = """
-SELECT c.name, COALESCE(t.name, st.name, N'?'), c.max_length, c.precision, c.scale, c.is_nullable, c.is_identity,
+_COLUMNS = PerObject("""
+SELECT {key}c.name, COALESCE(t.name, st.name, N'?'), c.max_length, c.precision, c.scale, c.is_nullable, c.is_identity,
        CAST(ic.seed_value AS nvarchar(40)), CAST(ic.increment_value AS nvarchar(40)), cc.definition, cc.is_persisted,
        dc.name, dc.definition, CASE WHEN t.is_user_defined = 1 THEN SCHEMA_NAME(t.schema_id) END, c.collation_name,
        CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation')),
@@ -95,7 +105,7 @@ SELECT c.name, COALESCE(t.name, st.name, N'?'), c.max_length, c.precision, c.sca
             THEN 1 ELSE 0 END,
        CAST(ep.value AS nvarchar(4000)),
        c.is_computed, CASE WHEN c.default_object_id <> 0 THEN 1 ELSE 0 END, CASE WHEN t.name IS NULL THEN 1 ELSE 0 END,
-       dc.is_system_named
+       dc.is_system_named, c.is_sparse, c.is_column_set, c.is_rowguidcol, mc.masking_function, ic.is_not_for_replication
 FROM sys.all_columns c LEFT JOIN sys.types t ON t.user_type_id = c.user_type_id
 LEFT JOIN sys.types st ON st.user_type_id = c.system_type_id
 LEFT JOIN sys.identity_columns ic ON ic.object_id = c.object_id AND ic.column_id = c.column_id
@@ -103,31 +113,42 @@ LEFT JOIN sys.computed_columns cc ON cc.object_id = c.object_id AND cc.column_id
 LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
 LEFT JOIN sys.extended_properties ep
        ON ep.class = 1 AND ep.major_id = c.object_id AND ep.minor_id = c.column_id AND ep.name = N'MS_Description'
-WHERE c.object_id = {o} ORDER BY c.column_id
-"""
-_KEYS = """
-SELECT i.name, i.is_primary_key, i.type_desc, COL_NAME(k.object_id, k.column_id), k.is_descending_key, kc.is_system_named
+LEFT JOIN sys.masked_columns mc ON mc.object_id = c.object_id AND mc.column_id = c.column_id
+WHERE {where} ORDER BY {order}c.column_id
+""", "c.object_id")
+# A constraint's index has the constraint's name: sys.key_constraints is joined through sys.objects by it, a seek, where
+# joining it by (parent_object_id, unique_index_id) costs ~1.3 ms per table (a dump of 1,000 tables: 1.3 s, twice)
+_KEYS = PerObject("""
+SELECT {key}i.name, i.is_primary_key, i.type_desc, COL_NAME(k.object_id, k.column_id), k.is_descending_key,
+       kc.is_system_named
 FROM sys.indexes i JOIN sys.index_columns k ON k.object_id = i.object_id AND k.index_id = i.index_id
-LEFT JOIN sys.key_constraints kc ON kc.parent_object_id = i.object_id AND kc.unique_index_id = i.index_id
-WHERE i.object_id = {o} AND (i.is_primary_key = 1 OR i.is_unique_constraint = 1)
-ORDER BY i.is_primary_key DESC, i.name, k.key_ordinal
-"""
-_CHECKS = "SELECT name, definition, is_system_named FROM sys.check_constraints WHERE parent_object_id = {o} ORDER BY name"
-_FOREIGN_KEYS = """
-SELECT f.name, COL_NAME(fc.parent_object_id, fc.parent_column_id), OBJECT_SCHEMA_NAME(f.referenced_object_id),
+LEFT JOIN sys.objects ko ON ko.parent_object_id = i.object_id AND ko.name = i.name AND ko.type IN ('PK', 'UQ')
+LEFT JOIN sys.key_constraints kc ON kc.object_id = ko.object_id
+WHERE {where} AND (i.is_primary_key = 1 OR i.is_unique_constraint = 1)
+ORDER BY {order}i.is_primary_key DESC, i.name, k.key_ordinal
+""", "i.object_id")
+_CHECKS = PerObject("""
+SELECT {key}name, definition, is_system_named, is_disabled, is_not_trusted, is_not_for_replication
+FROM sys.check_constraints WHERE {where} ORDER BY {order}name
+""", "parent_object_id")
+_FOREIGN_KEYS = PerObject("""
+SELECT {key}f.name, COL_NAME(fc.parent_object_id, fc.parent_column_id), OBJECT_SCHEMA_NAME(f.referenced_object_id),
        OBJECT_NAME(f.referenced_object_id), COL_NAME(fc.referenced_object_id, fc.referenced_column_id),
-       f.delete_referential_action_desc, f.update_referential_action_desc, f.is_system_named
+       f.delete_referential_action_desc, f.update_referential_action_desc, f.is_system_named, f.is_disabled,
+       f.is_not_trusted, f.is_not_for_replication
 FROM sys.foreign_keys f JOIN sys.foreign_key_columns fc ON fc.constraint_object_id = f.object_id
-WHERE f.parent_object_id = {o} ORDER BY f.name, fc.constraint_column_id
-"""
-_INDEXES = """
-SELECT i.name, i.is_unique, i.type_desc, i.filter_definition, COL_NAME(k.object_id, k.column_id), k.is_descending_key,
-       k.is_included_column, i.is_primary_key, i.is_unique_constraint, kc.is_system_named, i.has_filter
+WHERE {where} ORDER BY {order}f.name, fc.constraint_column_id
+""", "f.parent_object_id")
+_INDEXES = PerObject("""
+SELECT {key}i.name, i.is_unique, i.type_desc, i.filter_definition, COL_NAME(k.object_id, k.column_id),
+       k.is_descending_key, k.is_included_column, i.is_primary_key, i.is_unique_constraint, kc.is_system_named,
+       i.has_filter
 FROM sys.indexes i JOIN sys.index_columns k ON k.object_id = i.object_id AND k.index_id = i.index_id
-LEFT JOIN sys.key_constraints kc ON kc.parent_object_id = i.object_id AND kc.unique_index_id = i.index_id
-WHERE i.object_id = {o} AND i.type IN (1, 2)
-ORDER BY i.is_primary_key DESC, i.name, k.is_included_column, k.key_ordinal, k.index_column_id
-"""
+LEFT JOIN sys.objects ko ON ko.parent_object_id = i.object_id AND ko.name = i.name AND ko.type IN ('PK', 'UQ')
+LEFT JOIN sys.key_constraints kc ON kc.object_id = ko.object_id
+WHERE {where} AND i.type IN (1, 2)
+ORDER BY {order}i.is_primary_key DESC, i.name, k.is_included_column, k.key_ordinal, k.index_column_id
+""", "i.object_id")
 _INDEX_NODES = (
     "SELECT name, is_primary_key, is_unique FROM sys.indexes WHERE object_id = {o} AND type IN (1, 2) "
     "ORDER BY is_primary_key DESC, name"
@@ -136,13 +157,12 @@ _TRIGGERS = """
 SELECT t.name, t.is_instead_of_trigger, LOWER(e.type_desc) FROM sys.triggers t
 JOIN sys.trigger_events e ON e.object_id = t.object_id WHERE t.parent_id = {o} ORDER BY t.name, e.type
 """
-_SEQUENCE = """
-SELECT TYPE_NAME(user_type_id), CAST(start_value AS nvarchar(40)), CAST(increment AS nvarchar(40)),
+_SEQUENCE_FIELDS = """TYPE_NAME(user_type_id), CAST(start_value AS nvarchar(40)), CAST(increment AS nvarchar(40)),
        CAST(minimum_value AS nvarchar(40)), CAST(maximum_value AS nvarchar(40)), is_cycling, is_cached, cache_size,
-       precision, scale
-FROM sys.sequences WHERE object_id = {o}
-"""
+       precision, scale"""
+_SEQUENCE = f"SELECT {_SEQUENCE_FIELDS} FROM sys.sequences WHERE object_id = {{o}}"
 _SYNONYM = "SELECT base_object_name FROM sys.synonyms WHERE object_id = {o}"
+_SYNONYMS_OF = "SELECT object_id, base_object_name FROM sys.synonyms WHERE object_id IN ({ids})"
 _DEFINITION = "SELECT OBJECT_ID({ref}), OBJECT_DEFINITION(OBJECT_ID({ref}))"
 _TABLE_COMMENT = ("SELECT CAST(value AS nvarchar(4000)) FROM sys.extended_properties "
                   "WHERE class = 1 AND major_id = {o} AND minor_id = 0 AND name = N'MS_Description'")
@@ -216,6 +236,11 @@ class _Column:
     has_default: bool
     type_hidden: bool  # a user-defined type that sys.types does not show to this account
     default_system_named: bool | None
+    sparse: bool = False
+    column_set: bool = False  # `xml COLUMN_SET FOR ALL_SPARSE_COLUMNS`: the table's sparse columns as one XML value
+    rowguidcol: bool = False
+    masking: str | None = None  # dynamic data masking's function, `partial(1, "X", 0)`
+    identity_not_for_replication: bool | None = None
 
     def info(self) -> ColumnInfo:
         """An alias type keeps its name; a built-in type is written as T-SQL writes it."""
@@ -364,7 +389,7 @@ def _table_folders(conn: driver.Connection, path: list[PathSegment], schema: str
 
 
 def _columns(conn: driver.Connection, object_sql: str) -> list[_Column]:
-    return [_Column(*row) for row in rows(conn, _COLUMNS.format(o=object_sql))]
+    return [_Column(*row) for row in rows(conn, _COLUMNS.one(object_sql))]
 
 
 def _column_nodes(conn: driver.Connection, path: list[PathSegment], o: str) -> list[ObjectNode]:
@@ -383,7 +408,7 @@ def _index_nodes(conn: driver.Connection, path: list[PathSegment], o: str) -> li
 def _foreign_key_nodes(conn: driver.Connection, path: list[PathSegment], o: str) -> list[ObjectNode]:
     """A key to a table the account may not see shows `?` for what it cannot name."""
     nodes = []
-    for name, parts in _grouped(rows(conn, _FOREIGN_KEYS.format(o=o))).items():
+    for name, parts in _grouped(rows(conn, _FOREIGN_KEYS.one(o))).items():
         columns = ", ".join(p[1] or HIDDEN for p in parts)
         ref_columns = ", ".join(p[4] or HIDDEN for p in parts)
         detail = f"({columns}) → {parts[0][2] or HIDDEN}.{parts[0][3] or HIDDEN} ({ref_columns})"
@@ -435,27 +460,39 @@ def _column_line(c: _Column, named: bool) -> str:
         return line
     if c.type_hidden:
         raise _Withheld(f"the type of column {c.name}")
+    if c.column_set:
+        return f"{q(c.name)} xml COLUMN_SET FOR ALL_SPARSE_COLUMNS"
     type_text = f"{q(c.user_schema)}.{q(c.type_name)}" if c.user_schema else type_sql(c.type_name, c.max_length, c.precision, c.scale)
     parts = [q(c.name), type_text]
     if c.collation and c.collation != c.database_collation:
         parts.append(f"COLLATE {c.collation}")
+    if c.sparse:
+        parts.append("SPARSE")
+    if c.masking:
+        parts.append(f"MASKED WITH (FUNCTION = {literal(c.masking)})")
     if c.identity:
-        parts.append(f"IDENTITY({_need(c.seed, 'an identity seed')}, {_need(c.increment, 'an identity increment')})")
+        parts.append(f"IDENTITY({_need(c.seed, 'an identity seed')}, {_need(c.increment, 'an identity increment')})"
+                     + (" NOT FOR REPLICATION" if c.identity_not_for_replication else ""))
     parts.append("NULL" if c.nullable else "NOT NULL")
+    if c.rowguidcol:
+        parts.append("ROWGUIDCOL")
     if c.has_default:
         default = _need(c.default, "a default definition")
         parts.append(f"{_constraint(c.default_name, c.default_system_named, named)}DEFAULT {default}")
     return " ".join(parts)
 
 
-def _foreign_key_clause(name: str, parts: list[tuple]) -> str:
-    """parts: _FOREIGN_KEYS rows of one key, in key order."""
-    _, _, ref_schema, ref_table, _, on_delete, on_update, system_named = parts[0]
+def _foreign_key_clause(name: str, parts: list[tuple], *, keep_name: bool = False) -> str:
+    """parts: _FOREIGN_KEYS rows of one key, in key order. `keep_name`: also a name the server made up (a dump: its
+    `drop_first` DROP names the key, pre-flight H7)."""
+    _, _, ref_schema, ref_table, _, on_delete, on_update, system_named, _, _, not_for_replication = parts[0]
     columns = ", ".join(_quote(p[1]) for p in parts)
     ref_columns = ", ".join(_quote(p[4]) for p in parts)
-    return (f"{_constraint(name, system_named, True)}FOREIGN KEY ({columns}) "
+    named = f"CONSTRAINT {q(name)} " if keep_name else _constraint(name, system_named, True)
+    return (f"{named}FOREIGN KEY ({columns}) "
             f"REFERENCES {_quote(ref_schema)}.{_quote(ref_table)} ({ref_columns}) "
-            f"ON DELETE {_ACTIONS[_need(on_delete, 'an action')]} ON UPDATE {_ACTIONS[_need(on_update, 'an action')]}")
+            f"ON DELETE {_ACTIONS[_need(on_delete, 'an action')]} ON UPDATE {_ACTIONS[_need(on_update, 'an action')]}"
+            + (" NOT FOR REPLICATION" if not_for_replication else ""))
 
 
 def _index_statement(schema: str, table: str, name: str, parts: list[tuple]) -> str:
@@ -483,9 +520,13 @@ def _body_lines(columns: list[_Column], keys: list[tuple], checks: list[tuple], 
         kind = "PRIMARY KEY" if parts[0][1] else "UNIQUE"
         key_columns = ", ".join(_quote(p[3]) + (" DESC" if p[4] else "") for p in parts)
         lines.append(f"{_constraint(name, parts[0][5], named)}{kind} {parts[0][2]} ({key_columns})")
-    for name, definition, system_named in checks:
-        lines.append(f"{_constraint(name, system_named, named)}CHECK {_need(definition, 'a check definition')}")
+    for name, definition, system_named, _, _, not_for_replication in checks:
+        lines.append(f"{_constraint(name, system_named, named)}{_check(definition, not_for_replication)}")
     return lines
+
+
+def _check(definition: str | None, not_for_replication: bool) -> str:
+    return f"CHECK {'NOT FOR REPLICATION ' if not_for_replication else ''}{_need(definition, 'a check definition')}"
 
 
 def _table_ddl(schema: str, table: str, columns: list[_Column], keys: list[tuple], checks: list[tuple],
@@ -499,33 +540,176 @@ def _table_ddl(schema: str, table: str, columns: list[_Column], keys: list[tuple
     return "\n".join(statements)
 
 
-def _sequence_ddl(conn: driver.Connection, schema: str, name: str) -> str:
+@dataclass(frozen=True, slots=True)
+class AddedConstraint:
+    """A constraint a dump adds with ALTER TABLE after the data: a foreign key, or a CHECK the server does not enforce
+    or does not trust (created with its table it would check the rows the dump writes, which need not pass: 547).
+    Its name is always kept, so that NOCHECK and a `drop_first` DROP can name it (pre-flight H7, L13)."""
+
+    name: str
+    statements: tuple[str, ...]  # ADD …, then NOCHECK CONSTRAINT for one the server does not enforce
+    references: tuple[str | None, str | None] | None = None  # a foreign key's table: (schema, name)
+
+
+@dataclass(frozen=True, slots=True)
+class TableStatements:
+    """A table's DDL as a dump writes it (spec ⑥ §3.3.3): CREATE TABLE without its foreign keys and without the CHECKs
+    it does not enforce, then — after the data — its other indexes and the constraints it adds. No `;` at the ends."""
+
+    create: str | None  # None: a definition it needs is hidden from the account (VIEW DEFINITION)
+    indexes: list[str]
+    foreign_keys: list[AddedConstraint]
+    checks: list[AddedConstraint]
+    hidden: int  # indexes, foreign keys and checks not written: their definition is hidden from the account
+
+
+def table_statements_of(conn: driver.Connection, tables: dict[int, tuple[str, str]],
+                        within: str | None = None) -> dict[int, TableStatements]:
+    """Many tables' DDL (`tables`: object id → (schema, name)), one batch per ID_CHUNK of them or one over `within`
+    (catalog.id_sources) — the five queries the table's detail reads (Q1). A table that is gone has no entry."""
+    found: dict[int, TableStatements] = {}
+    for source in id_sources(tables, within):
+        column_rows, keys, checks, foreign_keys, indexes = (by_object(part) for part in result_sets(conn, batch(
+            _COLUMNS.many(source), _KEYS.many(source), _CHECKS.many(source), _FOREIGN_KEYS.many(source),
+            _INDEXES.many(source))))
+        for object_id, columns in column_rows.items():
+            if object_id not in tables:
+                continue
+            schema, name = tables[object_id]
+            found[object_id] = _table_statements(
+                schema, name, [_Column(*row) for row in columns], keys.get(object_id, []), checks.get(object_id, []),
+                foreign_keys.get(object_id, []), indexes.get(object_id, []))
+    return found
+
+
+def _table_statements(schema: str, name: str, columns: list[_Column], keys: list[tuple], checks: list[tuple],
+                      foreign_keys: list[tuple], indexes: list[tuple]) -> TableStatements:
+    target = f"{q(schema)}.{q(name)}"
+    enforced = [check for check in checks if not (check[3] or check[4])]  # neither disabled nor untrusted
+    hidden = 0
+
+    def written(build: Callable[[], str]) -> str | None:
+        nonlocal hidden
+        text = _written(NodeKind.TABLE, schema, name, build)
+        hidden += text is None
+        return text
+
+    def added(constraint: str, clause: str, trusted: bool, enabled: bool) -> tuple[str, ...]:
+        statements = (f"ALTER TABLE {target}{'' if trusted else ' WITH NOCHECK'} ADD {clause}",)
+        return statements + (() if enabled else (f"ALTER TABLE {target} NOCHECK CONSTRAINT {q(constraint)}",))
+
+    create = _written(NodeKind.TABLE, schema, name, lambda: "CREATE TABLE {} (\n    {}\n)".format(
+        target, ",\n    ".join(_body_lines(columns, keys, enforced, named=True))))
+    index_statements = []
+    for index, parts in _grouped(indexes).items():
+        if parts[0][7] or parts[0][8]:  # constraint indexes are in the body
+            continue
+        if (statement := written(lambda p=parts, i=index: _index_statement(schema, name, i, p))) is not None:
+            index_statements.append(statement.rstrip(";"))
+    keys_out = []
+    for key, parts in _grouped(foreign_keys).items():
+        clause = written(lambda p=parts, k=key: _foreign_key_clause(k, p, keep_name=True))
+        if clause is not None:
+            keys_out.append(AddedConstraint(key, added(key, clause, not parts[0][9], not parts[0][8]),
+                                            (parts[0][2], parts[0][3])))
+    checks_out = []
+    for check, definition, _, disabled, untrusted, not_for_replication in checks:
+        if not (disabled or untrusted):
+            continue
+        clause = written(lambda c=check, d=definition, r=not_for_replication: f"CONSTRAINT {q(c)} {_check(d, r)}")
+        if clause is not None:
+            checks_out.append(AddedConstraint(check, added(check, clause, not untrusted, not disabled)))
+    return TableStatements(create, index_statements, keys_out, checks_out, hidden)
+
+
+def _sequence_statement(schema: str, name: str, row: tuple, start: str | None = None) -> str:
+    """One _SEQUENCE_FIELDS row as CREATE SEQUENCE (no `;`), starting at `start` when given."""
+    type_name, first, increment, minimum, maximum, is_cycling, is_cached, cache_size, precision, scale = row
+    cache = f"CACHE {cache_size}" if is_cached and cache_size is not None else "CACHE" if is_cached else "NO CACHE"
+    return (f"CREATE SEQUENCE {q(schema)}.{q(name)} AS {type_sql(type_name, 0, precision, scale)} START WITH "
+            f"{start if start is not None else first} INCREMENT BY {increment} MINVALUE {minimum} MAXVALUE {maximum} "
+            f"{'CYCLE' if is_cycling else 'NO CYCLE'} {cache}")
+
+
+def sequence_ddl(conn: driver.Connection, schema: str, name: str) -> str:
     row = first_row(conn, _SEQUENCE.format(o=object_id_sql(schema, name)))
     if row is None:
         raise _not_found(NodeKind.SEQUENCE, schema, name)
-    type_name, start, increment, minimum, maximum, is_cycling, is_cached, cache_size, precision, scale = row
-    cache = f"CACHE {cache_size}" if is_cached and cache_size is not None else "CACHE" if is_cached else "NO CACHE"
-    return (f"CREATE SEQUENCE {q(schema)}.{q(name)} AS {type_sql(type_name, 0, precision, scale)} START WITH {start} "
-            f"INCREMENT BY {increment} MINVALUE {minimum} MAXVALUE {maximum} {'CYCLE' if is_cycling else 'NO CYCLE'} {cache};")
+    return _sequence_statement(schema, name, row) + ";"
 
 
-def _synonym_ddl(conn: driver.Connection, schema: str, name: str) -> str:
+@dataclass(frozen=True, slots=True)
+class SequenceAtNext:
+    statement: str  # CREATE SEQUENCE … START WITH the value it gives next (no `;`)
+    exhausted: bool  # NO CYCLE, and its last value given: the one written gives that value once more
+
+
+def _sequences_of(ids: str) -> str:
+    """_SEQUENCE_FIELDS, the current value and whether one was ever given, of many sequences. last_used_value is
+    SQL Server 2017's: read through dynamic SQL, 2016 answers "given", which at worst skips the start value."""
+    return ("DECLARE @q nvarchar(max) = N'SELECT object_id, " + _SEQUENCE_FIELDS
+            + ", CAST(current_value AS nvarchar(40)), ' + CASE WHEN COL_LENGTH(N'sys.sequences', N'last_used_value') "
+            "IS NULL THEN N'1' ELSE N'CASE WHEN last_used_value IS NULL THEN 0 ELSE 1 END' END "
+            f"+ N' FROM sys.sequences WHERE object_id IN ({ids})';\nEXEC (@q)")
+
+
+def _next_value(first: str, increment: str, minimum: str, maximum: str, cycling: bool, current: str,
+                used: bool) -> tuple[str, bool]:
+    """(the value a sequence gives next, whether it has none left): its start value until one was given (appendix A
+    S11), then the current value plus the increment — past MAXVALUE (MINVALUE going down) a CYCLE sequence starts
+    over at MINVALUE (MAXVALUE), and a NO CYCLE one has no value left."""
+    if not used:
+        return first, False
+    step = Decimal(increment)
+    following = EXACT.add(Decimal(current), step)
+    if Decimal(minimum) <= following <= Decimal(maximum):
+        return str(following), False
+    if cycling:
+        return (minimum if step > 0 else maximum), False
+    return current, True
+
+
+def sequences_at_next_value(conn: driver.Connection, sequences: dict[int, tuple[str, str]],
+                            within: str | None = None) -> dict[int, SequenceAtNext]:
+    """A dump's sequences (object id → (schema, name)), each starting at the value it gives next: one query per
+    ID_CHUNK of them, or one over `within` (catalog.id_sources; no quote in it: it goes into dynamic SQL)."""
+    found: dict[int, SequenceAtNext] = {}
+    for source in id_sources(sequences, within):
+        for object_id, *fields, current, used in rows(conn, _sequences_of(source)):
+            if object_id not in sequences:
+                continue
+            schema, name = sequences[object_id]
+            start, exhausted = _next_value(fields[1], fields[2], fields[3], fields[4], bool(fields[5]), current,
+                                           bool(used))
+            found[object_id] = SequenceAtNext(_sequence_statement(schema, name, tuple(fields), start), exhausted)
+    return found
+
+
+def _synonym_statement(schema: str, name: str, base: str) -> str:
+    return f"CREATE SYNONYM {q(schema)}.{q(name)} FOR {base}"
+
+
+def synonym_ddl(conn: driver.Connection, schema: str, name: str) -> str:
     row = first_row(conn, _SYNONYM.format(o=object_id_sql(schema, name)))
     if row is None:
         raise _not_found(NodeKind.SYNONYM, schema, name)
-    return f"CREATE SYNONYM {q(schema)}.{q(name)} FOR {row[0]};"
+    return _synonym_statement(schema, name, row[0]) + ";"
 
 
-def _type_ddl(conn: driver.Connection, schema: str, name: str) -> str | None:
-    """One batch: the type, and what a table type's body needs (empty for an alias type). None for a CLR type: its
-    assembly is not something a catalog query can write back."""
-    ref = name_literal(schema, name)
-    body = _TABLE_TYPE_OBJECT.format(ref=ref)
-    type_rows, column_rows, key_rows, check_rows = result_sets(conn, batch(
-        _TYPE.format(ref=ref), _COLUMNS.format(o=body), _KEYS.format(o=body), _CHECKS.format(o=body)))
-    if not type_rows:
-        raise _not_found(NodeKind.TYPE, schema, name)
-    _, is_table_type, base, max_length, precision, scale, nullable = type_rows[0]
+def synonyms_of(conn: driver.Connection, synonyms: dict[int, tuple[str, str]],
+                within: str | None = None) -> dict[int, str]:
+    """CREATE SYNONYM (no `;`) of many synonyms (object id → (schema, name)): one query per ID_CHUNK of them, or one
+    over `within` (catalog.id_sources)."""
+    return {object_id: _synonym_statement(*synonyms[object_id], base)
+            for source in id_sources(synonyms, within) for object_id, base in rows(conn, _SYNONYMS_OF.format(ids=source))
+            if object_id in synonyms}
+
+
+def _type_statement(schema: str, name: str, type_row: tuple, column_rows: list[tuple], key_rows: list[tuple],
+                    check_rows: list[tuple]) -> str | None:
+    """`type_row`: (is_table_type, base, max_length, precision, scale, nullable). None for a CLR type: its assembly is
+    not something a catalog query can write back."""
+    is_table_type, base, max_length, precision, scale, nullable = type_row
     target = f"{q(schema)}.{q(name)}"
     if is_table_type:
         lines = _body_lines([_Column(*row) for row in column_rows], key_rows, check_rows, named=False)
@@ -534,6 +718,41 @@ def _type_ddl(conn: driver.Connection, schema: str, name: str) -> str | None:
         logger.debug("SQL Server type {}.{} has no base type (a CLR type): no DDL", schema, name)
         return None
     return f"CREATE TYPE {target} FROM {type_sql(base, max_length, precision, scale)} {'NULL' if nullable else 'NOT NULL'};"
+
+
+def type_ddl(conn: driver.Connection, schema: str, name: str) -> str | None:
+    """One batch: the type, and what a table type's body needs (empty for an alias type). None for a CLR type."""
+    ref = name_literal(schema, name)
+    body = _TABLE_TYPE_OBJECT.format(ref=ref)
+    type_rows, column_rows, key_rows, check_rows = result_sets(conn, batch(
+        _TYPE.format(ref=ref), _COLUMNS.one(body), _KEYS.one(body), _CHECKS.one(body)))
+    if not type_rows:
+        raise _not_found(NodeKind.TYPE, schema, name)
+    return _type_statement(schema, name, type_rows[0][1:], column_rows, key_rows, check_rows)
+
+
+def types_of(conn: driver.Connection, types: dict[int, tuple[str, str]],
+             within: str | None = None) -> dict[int, str | None]:
+    """The DDL of many types (user_type_id → (schema, name); with `;`, as type_ddl), one batch per ID_CHUNK of them or
+    one over `within` (catalog.id_sources); None for a CLR type. A table type's body is read with the queries a
+    table's are, by its type_table_object_id."""
+    found: dict[int, str | None] = {}
+    for source in id_sources(types, within):
+        bodies = _TABLE_TYPE_OBJECTS.format(ids=source)
+        type_rows, table_objects, column_rows, keys, checks = result_sets(conn, batch(
+            _TYPES_OF.format(ids=source), _TABLE_TYPE_OF.format(ids=source), _COLUMNS.many(bodies),
+            _KEYS.many(bodies), _CHECKS.many(bodies)))
+        body_of = {int(type_id): int(object_id) for object_id, type_id in table_objects}
+        column_rows, keys, checks = by_object(column_rows), by_object(keys), by_object(checks)
+        for type_id, _, *type_row in type_rows:
+            if int(type_id) not in types:
+                continue
+            body = body_of.get(int(type_id))
+            schema, name = types[int(type_id)]
+            found[int(type_id)] = _written(NodeKind.TYPE, schema, name, lambda b=body, r=type_row, s=schema, n=name:
+                                           _type_statement(s, n, tuple(r), column_rows.get(b, []), keys.get(b, []),
+                                                           checks.get(b, [])))
+    return found
 
 
 # ---- details -------------------------------------------------------------------------------------------------------
@@ -573,7 +792,7 @@ def _table_detail(conn: driver.Connection, path: list[PathSegment], schema: str)
     name = path[-1].name
     o = object_id_sql(schema, name)
     column_rows, keys, checks, foreign_keys, indexes, comment = result_sets(conn, batch(
-        _COLUMNS.format(o=o), _KEYS.format(o=o), _CHECKS.format(o=o), _FOREIGN_KEYS.format(o=o), _INDEXES.format(o=o),
+        _COLUMNS.one(o), _KEYS.one(o), _CHECKS.one(o), _FOREIGN_KEYS.one(o), _INDEXES.one(o),
         _TABLE_COMMENT.format(o=o)))
     if not column_rows:  # a table always has a column
         raise _not_found(path[-1].kind, schema, name)
@@ -586,7 +805,7 @@ def _view_detail(conn: driver.Connection, path: list[PathSegment], schema: str) 
     """One batch: the definition and the columns."""
     name = path[-1].name
     definition_rows, column_rows = result_sets(conn, batch(
-        _DEFINITION.format(ref=name_literal(schema, name)), _COLUMNS.format(o=object_id_sql(schema, name))))
+        _DEFINITION.format(ref=name_literal(schema, name)), _COLUMNS.one(object_id_sql(schema, name))))
     ddl = _definition_row(path[-1].kind, schema, name, definition_rows[0])
     return _Found(ddl, False, [_Column(*row).info() for row in column_rows])
 
@@ -616,7 +835,7 @@ def _table_leaf(path: list[PathSegment]) -> tuple[str, str]:
 def _index_detail(conn: driver.Connection, path: list[PathSegment], _schema: str) -> _Found:
     schema, table = _table_leaf(path)
     name = path[-1].name
-    parts = _grouped(rows(conn, _INDEXES.format(o=object_id_sql(schema, table)))).get(name)
+    parts = _grouped(rows(conn, _INDEXES.one(object_id_sql(schema, table)))).get(name)
     if parts is None:
         raise _not_found(path[-1].kind, schema, name)
     ddl = _written(path[-1].kind, schema, name, lambda: _index_statement(schema, table, name, parts))
@@ -626,7 +845,7 @@ def _index_detail(conn: driver.Connection, path: list[PathSegment], _schema: str
 def _foreign_key_detail(conn: driver.Connection, path: list[PathSegment], _schema: str) -> _Found:
     schema, table = _table_leaf(path)
     name = path[-1].name
-    parts = _grouped(rows(conn, _FOREIGN_KEYS.format(o=object_id_sql(schema, table)))).get(name)
+    parts = _grouped(rows(conn, _FOREIGN_KEYS.one(object_id_sql(schema, table)))).get(name)
     if parts is None:
         raise _not_found(path[-1].kind, schema, name)
     ddl = _written(path[-1].kind, schema, name,
@@ -648,9 +867,9 @@ _DETAILS: dict[NodeKind, _Detail] = {
     NodeKind.PROCEDURE: _module_detail,
     NodeKind.FUNCTION: _module_detail,
     NodeKind.TRIGGER: _module_detail,  # a trigger's schema is its table's: path[1]
-    NodeKind.SEQUENCE: _generated_detail(_sequence_ddl),
-    NodeKind.SYNONYM: _generated_detail(_synonym_ddl),
-    NodeKind.TYPE: _generated_detail(_type_ddl),
+    NodeKind.SEQUENCE: _generated_detail(sequence_ddl),
+    NodeKind.SYNONYM: _generated_detail(synonym_ddl),
+    NodeKind.TYPE: _generated_detail(type_ddl),
     NodeKind.INDEX: _index_detail,
     NodeKind.FOREIGN_KEY: _foreign_key_detail,
     NodeKind.COLUMN: _column_leaf_detail,

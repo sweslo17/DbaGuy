@@ -27,6 +27,7 @@ from typing import Any
 from loguru import logger
 
 from ...domain.column_category import ColumnCategory
+from ...domain.data_jobs import DumpObjectKinds, DumpScope
 from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, QueryFailed, ValidationFailed
 from ...domain.execution import ColumnMeta, ErrorPosition, MessageSeverity, ServerMessage
@@ -40,6 +41,7 @@ from ..base import (
     DatabaseAdapter,
     DatabaseConnection,
     DataTools,
+    Dumping,
     Endpoint,
     MessageListener,
     ParsedUrl,
@@ -52,7 +54,8 @@ from ..base import (
     transaction_open_error,
 )
 from ..columns import TableColumn
-from . import catalog, columns, driver, editing, freetds, introspection
+from ..dump import DumpCatalog, DumpSession
+from . import catalog, columns, driver, dump, editing, freetds, introspection
 from . import schema as mssql_schema
 from .cancel import Call, CallKind, CancelControl, CancelledWhileWaiting, CancelPending
 from .settings import CONNECT_TIMEOUT_S, URL_SCHEMES, connect_params, parse_mssql_url
@@ -243,7 +246,7 @@ class MssqlResult(StatementResult):
         self._owner.finish_result(self, complete=self._exhausted)
 
 
-class MssqlConnection(DatabaseConnection, RowEditing, DataTools):
+class MssqlConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
     def __init__(
         self, conn: driver.Connection, *, spid: int, database: str | None, read_only: bool,
         state: tuple[int, int, bool],  # (@@TRANCOUNT, XACT_STATE(), IMPLICIT_TRANSACTIONS) read at open
@@ -701,6 +704,16 @@ class MssqlConnection(DatabaseConnection, RowEditing, DataTools):
         UNCOMMITTED would make a dump's reads dirty)."""
         self._check_database(path)
         return self._catalog_call(lambda: columns.table_columns(self._conn, path))
+
+    def dump_session(self, scope: DumpScope) -> DumpSession:
+        return self._catalog_call(lambda: dump.session(self._conn))
+
+    def dump_catalog(self, scope: DumpScope, kinds: DumpObjectKinds, *, ddl: bool = True) -> DumpCatalog:
+        """The catalog call, never the metadata session's: READ UNCOMMITTED would make the dump's reads dirty. A plan
+        (`ddl` False) runs on the metadata connection, where that does not matter."""
+        server = self.server_info().version
+        return self._catalog_call(lambda: dump.dump_catalog(self._conn, scope, kinds, server, self._database or "",
+                                                            ddl=ddl))
 
     def schema_snapshot(self) -> SchemaSnapshot:
         return self._metadata_call(lambda: mssql_schema.build_snapshot(self._conn))

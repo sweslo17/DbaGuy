@@ -79,6 +79,21 @@ def test_column_lines():
     assert alias.info().type_name == "email_address"
 
 
+def test_column_lines_keep_sparse_columns_column_sets_masks_rowguidcol_and_replication():  # 06a Task 7
+    assert _column_line(column(name="a", sparse=True), True) == "[a] int SPARSE NULL"
+    assert _column_line(column(name="cs", type_name="xml", max_length=-1, column_set=True), True) == (
+        "[cs] xml COLUMN_SET FOR ALL_SPARSE_COLUMNS")
+    masked = column(name="m", type_name="nvarchar", max_length=40, masking='partial(1, "X", 0)')
+    assert _column_line(masked, True) == """[m] nvarchar(20) MASKED WITH (FUNCTION = N'partial(1, "X", 0)') NULL"""
+    guid = column(name="g", type_name="uniqueidentifier", max_length=16, nullable=False, rowguidcol=True)
+    assert _column_line(guid, True) == "[g] uniqueidentifier NOT NULL ROWGUIDCOL"
+    identity = column(name="id", nullable=False, identity=True, seed="1", increment="1",
+                      identity_not_for_replication=True)
+    assert _column_line(identity, True) == "[id] int IDENTITY(1, 1) NOT FOR REPLICATION NOT NULL"
+    assert _body_lines([column(name="a")], [], [("chk", "([a]>(0))", False, False, True, True)], True) == [
+        "[a] int NULL", "CONSTRAINT [chk] CHECK NOT FOR REPLICATION ([a]>(0))"]
+
+
 @pytest.mark.parametrize("hidden", [
     dict(is_computed=True, computed=None, persisted=False),  # a computed column whose expression the account cannot read
     dict(has_default=True, default=None, default_name="df", default_system_named=False),
@@ -96,15 +111,16 @@ def test_a_hidden_column_still_has_its_base_type_for_the_tree():
 
 def test_a_hidden_check_definition_is_withheld():
     keys = [("pk", 1, "CLUSTERED", "a", 0, False)]
-    assert _body_lines([column(name="a")], keys, [("chk", "([a]>(0))", False)], True) == [
+    # (name, definition, is_system_named, is_disabled, is_not_trusted, is_not_for_replication)
+    assert _body_lines([column(name="a")], keys, [("chk", "([a]>(0))", False, False, False, False)], True) == [
         "[a] int NULL", "CONSTRAINT [pk] PRIMARY KEY CLUSTERED ([a])", "CONSTRAINT [chk] CHECK ([a]>(0))"]
     with pytest.raises(_Withheld):
-        _body_lines([column(name="a")], keys, [("chk", None, False)], True)
+        _body_lines([column(name="a")], keys, [("chk", None, False, False, False, False)], True)
 
 
 def test_system_made_constraint_names_are_left_out_of_the_body():
     keys = [("PK__t__3213E83F", 1, "CLUSTERED", "a", 0, True), ("uq", 0, "NONCLUSTERED", "b", 0, False)]
-    checks = [("CK__t__a__403A8C7D", "([a]>(0))", True)]
+    checks = [("CK__t__a__403A8C7D", "([a]>(0))", True, False, False, False)]
     assert _body_lines([column(name="a")], keys, checks, True) == [
         "[a] int NULL", "PRIMARY KEY CLUSTERED ([a])", "CONSTRAINT [uq] UNIQUE NONCLUSTERED ([b])", "CHECK ([a]>(0))"]
     assert _body_lines([column(name="a")], keys, checks, False) == [  # a table type names nothing
@@ -112,7 +128,8 @@ def test_system_made_constraint_names_are_left_out_of_the_body():
 
 
 def test_a_table_with_a_hidden_foreign_key_has_no_ddl():
-    hidden_key = [("fk", "a", None, None, None, "NO_ACTION", "NO_ACTION", False)]  # OBJECT_NAME is NULL: not visible
+    # OBJECT_NAME is NULL: not visible. (…, is_system_named, is_disabled, is_not_trusted, is_not_for_replication)
+    hidden_key = [("fk", "a", None, None, None, "NO_ACTION", "NO_ACTION", False, False, False, False)]
     with pytest.raises(_Withheld):
         _table_ddl("dbo", "t", [column(name="a")], [], [], hidden_key, [])
     with pytest.raises(_Withheld):
@@ -120,13 +137,15 @@ def test_a_table_with_a_hidden_foreign_key_has_no_ddl():
 
 
 def test_foreign_key_clause_keeps_key_order_and_actions():
-    parts = [("fk", "a", "dbo", "parent", "x", "SET_NULL", "SET_DEFAULT", False),
-             ("fk", "b", "dbo", "parent", "y", "SET_NULL", "SET_DEFAULT", False)]
+    parts = [("fk", "a", "dbo", "parent", "x", "SET_NULL", "SET_DEFAULT", False, False, False, False),
+             ("fk", "b", "dbo", "parent", "y", "SET_NULL", "SET_DEFAULT", False, False, False, False)]
     assert _foreign_key_clause("fk", parts) == (
         "CONSTRAINT [fk] FOREIGN KEY ([a], [b]) REFERENCES [dbo].[parent] ([x], [y]) ON DELETE SET NULL ON UPDATE SET DEFAULT")
-    made_up = [("FK__t__a__412EB0B6", "a", "dbo", "parent", "x", "NO_ACTION", "NO_ACTION", True)]
+    made_up = [("FK__t__a__412EB0B6", "a", "dbo", "parent", "x", "NO_ACTION", "NO_ACTION", True, False, False, True)]
     assert _foreign_key_clause("FK__t__a__412EB0B6", made_up) == (
-        "FOREIGN KEY ([a]) REFERENCES [dbo].[parent] ([x]) ON DELETE NO ACTION ON UPDATE NO ACTION")
+        "FOREIGN KEY ([a]) REFERENCES [dbo].[parent] ([x]) ON DELETE NO ACTION ON UPDATE NO ACTION NOT FOR REPLICATION")
+    assert _foreign_key_clause("FK__t__a__412EB0B6", made_up, keep_name=True).startswith(  # a dump's (H7)
+        "CONSTRAINT [FK__t__a__412EB0B6] FOREIGN KEY ([a])")
 
 
 def test_index_statements():
