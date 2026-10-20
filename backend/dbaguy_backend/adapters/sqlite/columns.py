@@ -18,7 +18,8 @@ _COLUMNS = 'SELECT name, type, "notnull", dflt_value, pk, hidden FROM pragma_tab
 _INDEXES = 'SELECT name, "unique", origin, partial FROM pragma_index_list(?, ?)'
 _GENERATED = frozenset({2, 3})  # pragma_table_xinfo.hidden: a VIRTUAL or STORED generated column
 _HIDDEN = 1  # pragma_table_xinfo.hidden: a virtual table's hidden column
-_SIZES = re.compile(r"\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)")
+# At most 9 digits: SQLite takes any declared size, and int() refuses a text of 4,300 digits or more (no size then)
+_SIZES = re.compile(r"\(\s*(\d{1,9})\s*(?:,\s*(\d{1,9})\s*)?\)")
 
 
 @dataclass(frozen=True)

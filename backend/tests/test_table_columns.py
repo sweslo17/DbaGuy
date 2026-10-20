@@ -219,3 +219,19 @@ def test_sqlite_a_view_over_a_dropped_table_is_still_a_read_only_target(tmp_path
                 conn.table_columns(db.path(view, "view"))
         finally:
             conn.close()
+
+
+def test_sqlite_a_declared_size_too_long_for_a_number_is_no_size(tmp_path):
+    """SQLite keeps any declared type; a size of thousands of digits is no size, and the table stays editable (⑤)."""
+    db = scratch_db("sqlite", tmp_path)
+    with dropping(db) as made:
+        table = scratch_name("cols_huge")
+        made.append(("TABLE", table))
+        db.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, label VARCHAR({'9' * 5000}))")
+        columns = read(db, table)
+        assert columns["label"].length is None
+        conn = db.open()
+        try:
+            assert conn.edit_target(db.path(table)).editable
+        finally:
+            conn.close()
