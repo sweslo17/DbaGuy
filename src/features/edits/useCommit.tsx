@@ -65,7 +65,9 @@ async function savedBeforeSending(): Promise<void> {
     timer = window.setTimeout(() => resolve("timeout"), APPLYING_SAVE_WAIT_MS);
   });
   try {
-    const saved = await Promise.race([saveWorkspaceNow("A grid commit is being sent"), waited]);
+    // `saveWorkspaceNow` answers false on a failed save, but a throw before its own guard must not hold the commit
+    const saving = saveWorkspaceNow("A grid commit is being sent").catch(() => false as const);
+    const saved = await Promise.race([saving, waited]);
     if (saved !== true) {
       const why = saved === "timeout" ? `took over ${APPLYING_SAVE_WAIT_MS} ms` : "failed";
       console.warn(`Grid edits: saving the workspace before the commit ${why}; sending the commit anyway`);

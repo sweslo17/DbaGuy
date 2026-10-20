@@ -407,22 +407,22 @@ describe("the undo history's weight (ruling K22)", () => {
 
   it("weighs each step: the map entries the action copied, and each change it made with its entries", () => {
     const state = run(
-      { type: "edit", cell: { row: row(1), column: "a", original: 1 }, input: value("2") }, // 0 + (1 + 1 + 1)
-      { type: "edit", cell: { row: row(1), column: "b", original: 1 }, input: value("2") }, // 1 + (1 + 2 + 2)
-      { type: "deleteRows", rows: [row(2)] }, // 1 + 1
-      { type: "addRow", id: "i:x" }, // 2 + (1 + 0)
+      { type: "edit", cell: { row: row(1), column: "a", original: 1 }, input: value("2") }, // 0 + (8 + 1 + 1)
+      { type: "edit", cell: { row: row(1), column: "b", original: 1 }, input: value("2") }, // 1 + (8 + 2 + 2)
+      { type: "deleteRows", rows: [row(2)] }, // 1 + 8
+      { type: "addRow", id: "i:x" }, // 2 + (8 + 0)
       { type: "revertCells", cells: [{ row: row(1), column: "a" }, { row: row(1), column: "b" }] }, // 3 + 0
       { type: "discardAll" }, // makes nothing
     );
-    expect(state.pastCells).toEqual([3, 6, 2, 3, 3, 0]);
+    expect(state.pastCells).toEqual([10, 13, 9, 10, 3, 0]); // CHANGE_CELLS = 8 a change
     expect(state.past).toHaveLength(6);
     // The weight goes with its step: to the redo list and back.
     const back = stage(stage(state, { type: "undo" }), { type: "undo" });
-    expect(back).toMatchObject({ pastCells: [3, 6, 2, 3], futureCells: [3, 0] });
+    expect(back).toMatchObject({ pastCells: [10, 13, 9, 10], futureCells: [3, 0] });
     const again = stage(back, { type: "redo" });
-    expect(again).toMatchObject({ pastCells: [3, 6, 2, 3, 3], futureCells: [0] });
+    expect(again).toMatchObject({ pastCells: [10, 13, 9, 10, 3], futureCells: [0] });
     const edited = stage(again, { type: "edit", cell: { row: row(9), column: "a", original: 1 }, input: value("2") });
-    expect(edited).toMatchObject({ pastCells: [3, 6, 2, 3, 3, 5], futureCells: [], future: [] }); // 2 + (1 + 1 + 1)
+    expect(edited).toMatchObject({ pastCells: [10, 13, 9, 10, 3, 12], futureCells: [], future: [] }); // 2 + (8 + 1 + 1)
   });
 
   it(`keeps all ${UNDO_LIMIT} steps of editing cells one by one at 10,000 staged changes of 29 columns`, () => {
@@ -443,8 +443,8 @@ describe("the undo history's weight (ruling K22)", () => {
 
   it("after actions over 10,000 rows keeps only the last few, and undoes and redoes those", () => {
     const state = mass();
-    // ⌥⌘N on the k-th column: 10,000 entries copied (none for the first) + 10,000 × (1 + k + k)
-    expect(state.pastCells).toEqual([560_000, 580_000, 600_000]);
+    // ⌥⌘N on the k-th column: 10,000 entries copied (none for the first) + 10,000 × (8 + k + k)
+    expect(state.pastCells).toEqual([630_000, 650_000, 670_000]);
     let back = state;
     for (let i = 0; i < 3; i += 1) back = stage(back, { type: "undo" });
     expect(stage(back, { type: "undo" })).toBe(back);
@@ -455,20 +455,23 @@ describe("the undo history's weight (ruling K22)", () => {
     expect(forward.pastCells).toEqual(state.pastCells);
   });
 
-  it("keeps steps that weigh exactly as much as the history may: ⌥⌘N and Revert on one column, 50 times each", () => {
-    // ⌥⌘N: no entry copied (Revert left none) + 10,000 × (1 + 1 + 1); Revert: 10,000 copied, nothing made
+  it("keeps as many of the newest steps as the history's weight holds: ⌥⌘N and Revert on one column, 50 times each", () => {
+    // ⌥⌘N: no entry copied (Revert left none) + 10,000 × (8 + 1 + 1); Revert: 10,000 copied, nothing made
     const newId = counter();
     let state = emptyStaged(["id"]);
     for (let i = 0; i < UNDO_LIMIT; i += 1) {
       const cells = columnCells("c1");
       state = stage(state, i % 2 === 0 ? { type: "setNull", cells } : { type: "revertCells", cells }, newId);
     }
-    expect(sum(state.pastCells)).toBe(UNDO_CELLS);
-    expect(state.past).toHaveLength(UNDO_LIMIT);
+    // The newest 37 steps are kept: 19 Reverts (10,000 each) and 18 ⌥⌘N (100,000 each) = 1,990,000 cells; one more ⌥⌘N
+    // (100,000) would pass UNDO_CELLS. This is the worst case the budget bounds: about 55 MB in V8 (final review)
+    expect(sum(state.pastCells)).toBe(1_990_000);
+    expect(sum(state.pastCells) + 100_000).toBeGreaterThan(UNDO_CELLS);
+    expect(state.past).toHaveLength(37);
   });
 
   it("keeps the last step even when it alone weighs more than the whole history may", () => {
-    // 10,000 UPDATEs of 100 columns each, then ⌥⌘N on a 101st: 10,000 + 10,000 × (1 + 101 + 101) cells
+    // 10,000 UPDATEs of 100 columns each, then ⌥⌘N on a 101st: 10,000 + 10,000 × (8 + 101 + 101) cells (+1: the new row)
     const columns = Array.from({ length: 100 }, (_, i) => `w${i}`);
     const updates = Object.fromEntries(
       ROWS.map((r, i) => [
@@ -485,7 +488,7 @@ describe("the undo history's weight (ruling K22)", () => {
     const wide: StagedEdits = { ...emptyStaged(["id"]), updates, nextSeq: ROWS.length };
     const edited = stage(wide, { type: "addRow", id: "i:x" });
     const state = stage(edited, { type: "setNull", cells: columnCells("w100") });
-    expect(state.pastCells).toEqual([2_040_001]);
+    expect(state.pastCells).toEqual([2_110_001]);
     expect(state.past).toHaveLength(1); // the step before it went
     expect(stage(state, { type: "undo" }).inserts).toBe(edited.inserts);
   });
@@ -496,7 +499,7 @@ describe("the undo history's weight (ruling K22)", () => {
       { type: "deleteRows", rows: [row(2)] },
       { type: "undo" },
     );
-    expect(state).toMatchObject({ pastCells: [3], futureCells: [2] });
+    expect(state).toMatchObject({ pastCells: [10], futureCells: [9] });
     const outcome: AppliedOutcome = { outcome: "committed", applied: [], failedChange: null, message: null };
     expect(stage(state, { type: "applyOutcome", outcome })).toMatchObject({ pastCells: [], futureCells: [] });
   });

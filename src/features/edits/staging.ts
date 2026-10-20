@@ -28,6 +28,11 @@ export const UNDO_LIMIT = 100;
  * cell costs 10–14 bytes in wide rows and about 70 in one-column changes: at most about 145 MB in all.
  */
 export const UNDO_CELLS = 2_000_000;
+/**
+ * What one change (an UPDATE, a new row, a DELETE) weighs beyond its entries: its objects cost several cells' worth of
+ * memory each, so a step of many one-column changes is bounded as tightly as one of wide rows (final review, ~55 MB worst).
+ */
+export const CHANGE_CELLS = 8;
 
 /** A loaded row's key cells, as loaded, as JSON in key order. */
 export type RowKey = string;
@@ -323,11 +328,11 @@ function stepCells(state: StagedEdits, work: Work): number {
   let cells = work.cells;
   for (const rowKey of work.touched) {
     const update = work.updates[rowKey]; // made by this action (a row it touched has a new UPDATE, or none)
-    if (update) cells += 1 + entryCount(update.set) + entryCount(update.original);
+    if (update) cells += CHANGE_CELLS + entryCount(update.set) + entryCount(update.original);
   }
   if (work.insertsTouched) {
     const kept = new Set(state.inserts);
-    for (const insert of work.inserts) if (!kept.has(insert)) cells += 1 + entryCount(insert.values);
+    for (const insert of work.inserts) if (!kept.has(insert)) cells += CHANGE_CELLS + entryCount(insert.values);
   }
   return cells;
 }
@@ -477,7 +482,7 @@ function deleteRows(work: Work, rows: readonly RowRef[]): void {
       if (hidden) work.edited.add(hidden.id); // not sent while the row is marked: the last preview's problems go
       work.deletes[row.rowKey] = { id: work.newId("d"), key: row.key, seq: work.seq++ };
       work.changed = true;
-      work.cells += 1;
+      work.cells += CHANGE_CELLS;
     }
   }
 }
