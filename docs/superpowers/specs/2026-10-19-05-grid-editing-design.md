@@ -5,6 +5,7 @@
 > 技術依據：本設計在 dev 資料庫上的探測（2026-10-19；PostgreSQL 17.11／psycopg 3.3.6、MySQL 8.4.11／mysql-connector-python 26.7.0 pure、SQL Server 2022 CU27／pymssql 2.4.4、SQLite 3.53.4），標 **〔實測〕**；標 **〔未實測〕** 的是假設，§10 彙整並指定由哪個 plan task 先驗證。探測只建 `zz_spec05_*` scratch 表（SQLite 用 scratch 目錄裡的檔案），結束時以完整名稱 DROP；紀錄在附錄 A。本文的 A 編號自成一組（⑤ A1…）。
 > 建立在 ①–④ 之上：表格資料 tab（[② spec](2026-10-16-02-query-workflow-design.md) §4.5）、grid（§4.3）、`SessionWorker` 與 WS 協定（`domain/execution.py`）、`SafetyPolicy`、`sql/dialects.py` 的引號與 literal、`sql/formatting.py` 的 `value_condition`（Filter by this value）、④ 的 cell 編碼（[④ spec](2026-10-18-04-couchbase-design.md) §3.2.4），以及 04c 存檔流程的教訓（[04c notes](../notes/2026-10-19-04c-couchbase-documents-followups.md) C7、C12、C20、C28、C42、C45、C46、C48，B40）
 > **05a（backend）完成（2026-10-19）**：實作時的細化與實測結果記在被它們修訂的文字旁邊，以「〔05a〕」開頭（§2 的 R-／D- 列、§3.2.2、§3.3.2、§3.3.3、§3.4、§3.5、§4–§9、§11–§13）與 §10 的結果欄；前文不改，衝突時以〔05a〕為準。編號 E 是 [05a plan](../plans/2026-10-19-05a-grid-editing-backend.md) 的規劃決定（E1–E25），F／G／L 是 plan 審查與 task review 的決定（內容寫在條目裡）；I／M 是 05a 最終審查（final review）的項目，最後的修正波（ruling G16）做了 I1、M1–M3、M5、M10 與 M4、M6、M8、M9 的文件，M7（被取代的預覽的 plan 仍可用 15 分鐘）留給 05b：05b 只套用畫面上那個對話框的 plan。05b（frontend）還沒開始。
+> **〔05b〕前端完成（2026-10-20）**：[05b plan](../plans/2026-10-20-05b-grid-editing-frontend.md) 的規劃決定 H1–H26 與 plan 時找到的 spec 問題 S1–S10、實作與審查時的決定 K1–K21、pre-flight 審查的項目（H1、H2、M1–M7、L1–L24）記在被它們細化的文字旁，以「〔05b〕」開頭（§2 的 R-05-10、D-05-12，§3.1、§3.6.1–§3.6.6、§3.7、§7、§8、§10、§11、§13）；前文不改，衝突時以〔05b〕為準。Task 6b 是實作時加的（K13：PG 依 key 排序瀏覽；K14：重讀依 key 找回位置）。
 
 ## 1. 目標
 
@@ -113,6 +114,8 @@ src/
 ```
 
 不變的部分：`SessionWorker` 的分頁、暫停、取消與事件順序；`MetadataService` 與 metadata 連線；表格資料 tab 的 Count rows session；`SafetyPolicy` 的規則；cell 編碼；Couchbase 的一切。
+
+〔05b〕實作的前端模組（S10：純函式的規則各自成模組，才能用 Vitest 測，H1）：`features/edits/` 的 `cells.ts`（`CellInput`、依 kind 的比較與顯示）、`staging.ts`、`overlay.ts`、`savedEdits.ts`、`editsApi.ts`、`commitFlow.ts`（execution → 結果）、`commitDialog.ts`（對話框的狀態與清單）、`editKeys.ts`、`editing.ts`、`tableEditing.ts`（grid 的模式、拒絕的理由、選單）、`editActions.ts`（⌘⇧P 的指令）是純函式，`useTableEdits.tsx`、`useCommit.tsx`、`CellEditor.tsx`、`ValueEditor.tsx`、`EditBar.tsx`、`PreviewDialog.tsx` 是 React；`grid/marks.ts`、`grid/EditorSlot.tsx`、`grid/renderCount.ts`；`table-data/{browseView, stableOrder, anchor}.ts` 與 `useAnchoredRerun.ts`（K13、K14、K17）；`session/sessionSnapshots.ts`；`lib/{tabActions, unicodeText, arrays}.ts`；`workspace/closeGuards.ts` 的 `useDiscardQuestion`（DocumentTab 共用）。backend 多了 `domain/well_formed.py`、`EditTarget.stable_order` 與能力 `orders_browse_by_key`（K13），以及 `scripts/scratch_tables.py`（H16）。
 
 ### 3.2 可編輯的判斷：`EditTarget`
 
@@ -336,6 +339,8 @@ interface StagedEdits {
 
 操作：`edit`（輸入等於原始值時移除該欄的修改：沒有 no-op 的 UPDATE）、`setNull`（對選取的多格）、`useDefault`（新列）、`revertCell`、`revertRow`、`deleteRows`（新列直接移除；已全部標刪的選取再按一次 → 還原）、`restoreRows`、`addRow`、`discardAll`、`keepMine`（把原始值換成 server 現在的值；換完若與新值相同就變成 no-op 而移除）、`applyOutcome`（移除 `applied`、記 problems、unknown）、`refreshed`（清 unknown）、`undo`、`redo`。標刪的列保留它的 UPDATE（隱藏），還原時回來；plan 只送 DELETE。
 
+〔05b〕`outcomeUnknown` 是兩段（H6，S1）："pending"（Commit 停用，直到另一個瀏覽請求的列到了：Refresh，或重連後同一個瀏覽在新 session 上讀到，H26）→ "refreshed"（之後的預覽頂端提醒新列會再新增一次）→ 下一次 committed 才清掉（K10，見下）；§3.7 的檔案因此多了 `outcome_unknown`。前面另有 "applying"（pre-flight H1）：送出 apply 之前設定、立刻存進 workspace（存成 unknown，還原是 "pending"），所以 apply 途中當機或重開不會把暫存當成沒送過而再送一次新列；它記住自己取代的值（只在記憶體），committed 清掉、unknown 變 "pending"、rolled_back（含沒送出的）與 partial 放回原值（K10：沒套用新列的 apply 解決不了先前的不明）。有變更被套用（partial、unknown 的 `applied`）或 commit 後 undo／redo 清空（H7）；DELETE commit 後它下面隱藏的 UPDATE 一起移除；隱藏的 UPDATE 也存進 workspace、算進上限（K3）。新列的 Revert row 是把它移除（H20）。欄名一律當 own property 讀（`constructor`、`__proto__` 也對，K2）。表的 key 改了（DDL）之後不再在舊 key 上暫存新的變更（`key_changed`），Revert、undo、Discard、commit 照常（H13）；`dispatchStaged` 擋超過 10,000 個變更（H15）。輸入與原始值依 kind 比，見 §3.6.3 的〔05b〕。
+
 `stores/stagedEdits.ts`：依 tab id 存放（同 `editorBuffers` 的理由：workspace writer 與 close guard 不必等元件掛上就能讀）；變更時通知 workspace writer。
 
 #### 3.6.2 overlay 與標記（`features/edits/overlay.ts`，純函式，Vitest）
@@ -345,6 +350,8 @@ interface StagedEdits {
 - 標記（顏色 token，深淺主題都有）：改過的 cell → `warning` 淡底，tooltip「Was: <原始值>」；新列 → `success` 淡底，列號顯示 `+`；標刪的列 → `danger` 淡底加刪除線，列號 `−`；DEFAULT → 灰色斜體 `DEFAULT`；預覽或 apply 指出的問題 → `danger` 外框；衝突（目前的值 ≠ 暫存的原始值，Refresh 後才看得到）→ `danger` 角標，tooltip「Changed on the server: now <值>」，選單「Keep mine」；key 欄的表頭有鑰匙圖示，不能寫的欄表頭有說明 tooltip。
 - 編輯列（`EditBar`）的計數包含不在目前結果裡的暫存（「5 changes · 2 in rows not shown」）。
 
+〔05b〕綁定不是只在有暫存時算：結果有 key 欄就綁（K8，每個 100,000 列的新結果 17–21 ms），因為兩列同一個 key 時（不唯一的 key、SQL Server 讀到移動中的列兩次）那兩列是 `repeated_key`：muted 底色、不能編輯、不綁任何變更（K6），第一次編輯就要擋。overlay 的快取在來源列、變更、問題之外也看欄位、kind 與結果是不是同一個（kind 在還原的暫存畫出來之後才到，同一個 bool 的 `yes` 要換成 `true` 畫）；一個 change 的問題落在它的 cell 上（key 欄的 `key_incomplete` 在 DELETE 上也看得到）。key 欄的表頭寬度估計與 autofit 都留了鑰匙圖示的位置。標記的亮色對比：muted 斜體在淡底色上 4.1–4.4:1，低於 AA（已知限制）。
+
 #### 3.6.3 編輯器
 
 - **inline**（`CellEditor`）：真正的 `<input>`，蓋在 cell 上，寬度不小於 cell、最多 480 px；number、text（單行且 ≤ 1,000 字元）、datetime、bool、binary（hex）、other。開始時是目前顯示的文字（NULL 為空並以 placeholder `NULL` 提示，DEFAULT 同）。
@@ -352,6 +359,8 @@ interface StagedEdits {
 - 讀不出完整值的 cell（截斷的文字）：Return 提示「This value is too large to edit here (N characters); Set NULL or use SQL」。不能寫的欄：Return 提示原因。
 - 失焦（點別處）時，有改就暫存（同 Numbers）；Esc 是唯一的取消。
 - 新列：Add row 之後焦點在第一個可寫的欄並開啟編輯器。
+
+〔05b〕編輯器沒打字就什麼都不暫存（H4：在 NULL 或 DEFAULT 上按 Return 再按 Return 不會變成空字串；打了再刪才是空字串）；grid 只有預覽的 bytes（超過 64 bytes）以空白開始，提示「Hex to replace all N bytes」（H5）；drawer 的純文字編輯器（"text" language）打什麼就是什麼：不自動補括號、Return 只插 `\n`（不帶縮排）、Tab 插 `\t`、Backspace 刪一個字元、⇧Tab 不動作；JSON 照語言的縮排與補括號（H10）；inline 的寬度是 `max(cell, min(480, 文字))`（不比 cell 窄）。編輯中的列離開目前的結果（重跑、sort）時，打過的字照樣暫存（H12）；編輯器裡的 ⌘S 先暫存再開預覽（H19）。每個編輯器以 cell 為 key、只暫存進自己的 cell（K18：WebKit 點 + Row 不會先讓 input blur，若照「最新的編輯」暫存會寫進新列）；編輯器自己被移除造成的 blur 不算結束（StrictMode 的 dev 重掛載）。NOT NULL 欄的 Set NULL 被拒時編輯器與打的字留著（K16）；結束編輯時暫存被拒（第 10,001 個變更、key 已改、commit 進行中）toast「<原因>. What you typed was not staged.」並給 Copy text（K20，toast 顯示時才能按）。輸入跟原始值只差寫法也不算改：bool 的 `yes`／`t`／`1` 對 true、hex 的大小寫與 `0x`；數字照文字比（`1.0` 對 `1` 是改了）。Esc 仍是唯一的取消（vim 開著時 drawer 裡是 Cancel 按鈕，K15）。
 
 #### 3.6.4 按鍵（可編輯的表格資料 grid；唯讀 grid 與 query 結果不變）
 
@@ -370,6 +379,8 @@ interface StagedEdits {
 
 所有 Return／Tab／Esc／⌘S 處理先過 `isImeKeyEvent`：組字中的 Enter、WebKit 晚到的 keyCode 229 Enter 都不暫存、不開預覽。右鍵選單：Edit value（↵）、Set NULL（⌥⌘N）、Use default（新列）、Revert cell、Revert row、Delete rows（⌘⌫）／Restore rows、Keep mine（衝突）、Add row；View value 留在選單（不再綁 ↵）。⌘⇧P 指令：Add row、Delete selected rows、Set NULL、Commit changes…、Discard all changes。Add row 沒有預設快捷鍵：編輯列的按鈕與 ⌘⇧P 已涵蓋（M3「每個指令都能用鍵盤」），快捷鍵留到 §12。
 
+〔05b〕⌥⌘N 看實體鍵（`code` KeyN）：macOS 的 ⌥N 是 dead key（S8）；drawer 裡也是同一條規則（CodeMirror 的 keymap 對 "Dead" 不會退回基本鍵，所以是 DOM 的 keydown）。⌘⇧P 另有 Undo／Redo staged change（H11，A10 的備援）；沒有 `row_editing` 的 engine 不列出這些指令，Add row、Delete selected rows、Set NULL 只在 grid 顯示時可用（在 Columns、DDL 檢視時灰著），沒有選取時 Delete／Set NULL 提示「Select cells in the grid first」。選取超過 10,000 列的 ⌥⌘N／⌘⌫ 直接提示，不建任何東西（H15）。按住的 Return、⌘⌫、⌥⌘N 只動作一次（undo／redo 可以重複，L7）；grid 本身在呼叫 `edits.onKey` 之前也先過 `isImeKeyEvent`。vim 開著時 drawer 編輯器裡的 Escape 屬於 vim（離開 insert mode，從不取消），取消用 Cancel 按鈕（K15）。右鍵選單裡做不到的項目停用，tooltip 寫原因；列還在重讀或 afterglow 時只剩 Revert 類項目與 ⌘Z，commit 進行中選單是空的（L5、K19）。
+
 #### 3.6.5 編輯列與預覽對話框
 
 - 編輯列放在 Data 檢視的工具列右側：可編輯時有「+ Row」；有暫存時加上「N changes」（`warning`）、「Commit… ⌘S」、「Discard…」（超過一個變更時先確認，⌘Z 可復原）。不可編輯時是灰色的「Read-only · <原因>」（tooltip 為完整原因）。正在匯出、瀏覽中（stale）、session 不是 open：Commit 停用並說明。
@@ -377,6 +388,8 @@ interface StagedEdits {
 - 按下 Commit：對話框變成進度（「Committing… statement 3 of 12」，來自 `affected`）與 Cancel（COMMIT 送出後隱藏）。
 - 結果：committed → 關閉對話框、toast「Committed 4 changes to orders」（含 DELETE 0 列的「1 row was already gone」、新列可能不在已載入範圍的說明），重跑瀏覽（D-05-12）；rolled_back → 對話框顯示 server 錯誤原文與失敗的那一句（標紅）、「Nothing was applied」，按鈕 Show in grid（那一列不在目前結果裡時 toast 說明）、Close；partial → 說明哪些已生效；unknown → 「The connection was lost while committing: the changes may or may not have been applied. Refresh to see the table as it is now」，按鈕 Refresh、Close。trigger 的訊息列在下方。
 - 重跑時機：committed、partial 一定重跑；rolled_back 只在瀏覽結果原本是暫停的（被 apply 結束）時重跑，暫存依 key 綁回；unknown 等使用者按 Refresh（重跑完成後才清掉 `outcomeUnknown`）。
+
+〔05b〕前端沒有「COMMIT 已送出」的事件（S2）：每句的 `affected` 都到了就停用 Cancel（之後的 Cancel 只到得了 COMMIT 前的檢查）。在那之前 Cancel 一直可按、放在左邊（每次都送 cancel：SQL Server 讀到一半被擋住時要再按一次才斷線，apply 最後一則警告顯示在進度下面），Commit 的位置是停用的「Committing…」，雙擊 Commit 不會落在 Cancel 上（pre-flight M1）。最後一句的 `affected` 之後 30 秒沒有事件、或送了 Cancel 之後 30 秒沒有回應（session 不在了就立刻）出現「Close — outcome unknown」，結果是 unknown，文字是「Stopped waiting for the outcome: the changes may have been applied. Refresh to see what the table holds.」（K11、K21；斷線才是 §3.6.5 的「The connection was lost…」）。commit 進行中暫存鎖住；預覽後暫存變了（以各部分的 identity 比），Commit 改成重新預覽；晚到的預覽回應丟掉（H8、05a M7）。送出前先 dispatch "applying" 並立刻存 workspace（pre-flight H1）。⌘S 先 `flushEditor()`。警告逐句列（最多 200 則，「… and N more」）。committed／partial 之後套用前的暫存繼續畫到重讀的第一頁到了（M5 afterglow：值不閃回，新列留在頂端，這段時間不能暫存）；apply 進行中只有 `affected` 變時 `useSession` 沿用舊的 snapshot，Data view 不每句重畫（10,000 句的主執行緒 3.77 → 0.38 秒，jsdom）。有 trigger 訊息的 committed 留在結果畫面列出它們；COMMIT 的警告是第二個 toast（L10）。
 
 #### 3.6.6 跟既有行為的差異
 
@@ -387,11 +400,15 @@ interface StagedEdits {
 - 匯出對話框在有暫存時多一行「Staged changes are not committed and are not in the export」。
 - Filter by this value 用在改過的 cell 上時，用原始（server）的值；新列沒有這個項目。
 
+〔05b〕Filter by this value 用載入的 cell（重讀之後就是 server 現在的值，可能已不是暫存的原始值，S4）。close guard 的問法是 `closeGuards.ts` 共用的 `useDiscardQuestion`（04c 的 DocumentTab 改用同一個，M6）：先 `flushEditor()` 把打到一半的文字暫存並算進數量（L8），commit 進行中拒絕關閉（toast），guard 自己不丟暫存、tab 關掉後由 workspace writer 忘掉（H25）。重跑（Refresh、commit 的重讀）在第一頁完整之前被取消、出錯或中斷時保留舊的列（取消時說「Refresh cancelled: showing the rows from before」），Load more 停用到下一次 Refresh；sort／filter 被切斷時顯示片段並標「(partial)」（K17）。Refresh 位置出現的 Cancel 前 400 ms 不接受點擊（K12：雙擊 Refresh 不會取消它）。
+
 ### 3.7 Workspace（05b）
 
 - `WorkspaceTab.staged_edits: StagedEditsFile | None`（只給 kind "table"）：`{version: 1, key_columns, updates[{id, key, set, original}], inserts[{id, values}], deletes[{id, key}]}`，`extra="forbid"`，上限同 D-05-11；cell 是任意 JSON 值（有大小上限）。
 - 前端 `savedEdits()`（同 `savedParams`）只寫 backend 會收的內容；超過上限就整個不寫，編輯列提示「Too large to keep across a restart」。
 - 還原：放進 `stores/stagedEdits.ts`；Data 檢視載入後依 key 綁回；欄位已不存在的修改在下次預覽變成 `unknown_column`，使用者還原它即可。
+
+〔05b〕backend 的修復把模型不收的 `staged_edits`（或不是 table tab 的）丟掉、留下 tab，WARNING 只記「dropped the staged edits」（H14）；檔案保留標刪列下面隱藏的 UPDATE，也算進上限（K3）；undo 歷史與問題不保存（H22）；檔案多了 `outcome_unknown`（S1，見 §3.6.1 的〔05b〕）。兩邊用同一套規則（`fixtures/staged_edits_cases.json` 的同一批檔案）：大小以 Python `len` 的字元數算，key 與原始值連欄名一起算（pre-flight M3：以 UTF-16 算會把 backend 收得下的 emoji 文字當成太大）；`savedEdits` 不寫模型會拒的（孤立 surrogate、空的或超過 1,024 字元的欄名、不合法或重複的 id、沒有 `original` 的欄，K5：編輯列說原因 `unsaveable`；暫存仍在記憶體、照樣可以 commit）；key 與原始值的巢狀最多 64 層（`MAX_CELL_LEVELS`，兩邊都有：254 層的檔案 `PUT` 得進去，`GET` 卻讀不回來，下次存檔就蓋掉每個 tab）。tab 的文字（buffer、title 等）與 workspace 本身的欄位裡的孤立 surrogate 存成 U+FFFD：前端 `workspaceJson` 一直如此，backend 的修復兜底（K7：否則 `PUT` 500，每次存檔都失敗）；`staged_edits` 不替換（那會改到 commit 寫的值），由模型拒絕。local copy 裡讀不出來的暫存只讓那個 tab 失去暫存（`readableEdits`）。backend 連不上時的 local copy 受 localStorage 配額限制（約 2.5M 字元以上可能沒有，L19）。
 
 ## 4. 錯誤處理
 
@@ -467,6 +484,15 @@ interface StagedEdits {
 - **〔05a 最終修正〕A7 SQL Server，plan 的語句不做 describe**（M1，2026-10-20，in-process：EditService 預覽、tab 的 worker 套用，load average 6–8）：1,000 個 UPDATE 1.54–2.62 秒（6 次）；同一時間、同一種量法還做 describe 時 3.20–5.99 秒（3 次）。審查量的是 6.92 → 2.83 秒。沒有重新量打包版。
 - **A6 結束暫停中的 100 萬列瀏覽結果後再套用**：PG 0.02 秒、MySQL 0.38–0.56 秒（KILL 與 drain；非凍結 0.27 秒）、SQL Server 0.22–0.24 秒（attention）、SQLite 0.00–0.02 秒。
 
+〔05b 實測〕（2026-10-20；量法與完整數字在 CLAUDE.md 的「05b 時量」）：
+- **打包**：沒有新的 Python 或前端相依；sidecar 49,224 → 49,236 KB；JS 主 chunk 1,366.34 → 1,444.43 kB（gzip 441.38 → 467.80 kB；規劃時估 1,416.8 kB）；冷啟動 0.97–1.25 秒（第一次 2.92 秒），`footprint` 加總 164–196 MB，backend 76–77 MB，和 05a 沒有差別（WebKit 程序每次跑都有差）。
+- **Q1**（§1、§7「只有被改的列重畫」）：dev 瀏覽器（Chromium、StrictMode）以 `window.__gridRowRenders` 量，暫存一格只重畫那一列；一欄第一次暫存若欄寬重新估算，畫面內的列各重畫一次；jsdom 的 100,000 × 30：暫存一格 1 個新的列物件，閒置的重畫 0.2 ms。
+- **10,000 個變更的 commit**（D-05-11 的上限，PG `zz_05b_wide`，in-process）：預覽 0.14–0.17 秒、套用 6.37–6.54 秒，committed；前端的主執行緒 0.38 秒（jsdom，`useSession` 的 snapshot 修正之前 3.77 秒）。
+- **A7 重新量 1,000 個 UPDATE**（in-process，load average 2.5–4.4）：PG 0.67–0.70 秒、MySQL 0.51–0.59 秒、SQL Server 1.52–1.60 秒、SQLite 0.33 秒；預覽 13–40 ms。
+- **undo 歷史**（D-05-14，Node／V8）：10,000 個 UPDATE 加 99 次單格編輯約 37 MB；每一步都動到 10,000 列時，單欄 100 步約 145 MB、換著 29 欄約 1.2 GB（Revert cell 讓 V8 的物件變成 dictionary mode）。上限是步數，不是位元組（已知限制）。
+- **workspace 的存檔**（§3.7，8 MiB 的暫存，ASCII 與中文）：前端每次序列化 7–27 ms（暫存變了再加 `savedEdits` 0.1–14 ms）；backend `PUT /workspace` 42–115 ms（8 個大的值）到 321–380 ms（10,000 個小變更，模型驗證兩次各 72–78 ms）。
+- **K13**：PG 第一次瀏覽等 target 的代價，第一頁 warm 8.9 → 9.0 ms、cold 9.3 → 12.9 ms，EXPLAIN 約 0.3 ms。
+
 ## 8. 痛點對照
 
 | 需求 | 這個子專案怎麼解 | 踩到／退步 |
@@ -481,6 +507,14 @@ interface StagedEdits {
 | M7 值的正確 | NULL ≠ 空字串、數字以文字、大整數／decimal／日期／UUID／JSON 原樣、binary hex、DEFAULT | 超過 64 KiB 的值不能編輯 |
 | M11 安全與交易 | 一個交易、唯讀雙層、production 顏色進對話框、刪除排在預覽第一 | SQL Server 唯讀只在應用層（既有） |
 | M10 錯誤 | server 原文、標出是哪一句、哪一格 | — |
+
+〔05b〕前端完成時的對照（數字見 §7 的〔05b 實測〕）：
+- **Q1**：暫存一格只重畫那一列（dev 瀏覽器實測，H17 的計數器）、apply 進行中 Data view 不每句重畫（`useSession` 沿用 snapshot）；踩到的是 undo 歷史的記憶體：每一步都動到 10,000 列、跨很多欄時 100 步可達約 1.2 GB（V8 量，L2；一般用法約 37 MB），還有 8 MiB 暫存的每次存檔（backend 每次 0.04–0.4 秒，L18）。
+- **Q2**：apply 送出前就以 "applying" 存檔（當機不會重送新列）、打到一半的文字在關 tab、⌘S、重跑、編輯器被換掉時都會先暫存、被拒時可以複製（K20）、存不下的暫存說原因（K5）、一個壞掉的暫存或孤立 surrogate 不會讓整份 workspace 存不了（K7、B40）。踩到的：當掉的 tab 沒有 close guard；local copy 有配額（L19）。
+- **Q3**：Commit 只送畫面上的預覽、不明的結果不重送也不當成沒套用（K10、K11、K21）、PG 依 key 排序瀏覽與重讀依 key 找回位置（K13、K14），改錯列的風險（Q3 的重點）都擋在 key 上：key 不見或重複就清掉選取（K14b）、同 key 的列不能編輯（K6）。
+- **Q4**：沒有加範圍外的功能；Add row 的快捷鍵、貼上、打字即編輯仍在 §12。
+- **Q5**：四個關聯式 engine 用同一套前端；只有 K13 的排序是 PG 的（能力 `orders_browse_by_key`：其他 engine 的自然順序在 UPDATE 下不變），引擎圖示改成單色、SQL Server 用中性的圖示（H2）。
+- **Q6**：Return／F2／雙擊、Esc、⌘S、⌘⌫、⌥⌘N、⌘Z 都做了；WKWebView 是否把它們交給頁面（A10）與注音（A11）在使用者的清單。
 
 ## 9. 風險
 
@@ -515,9 +549,9 @@ interface StagedEdits {
 | A7 | 本機 1,000 句 UPDATE 的時間（§7 的預算） | 05a 量 | 〔實測〕（05a T11，凍結的 sidecar）PG 0.79–1.14 秒、MySQL 0.73–0.99 秒、SQL Server 7.22–9.56 秒、SQLite 0.41–0.43 秒；預覽 24–96 ms；都在預算內，SQL Server 餘裕 4–28%，見 §7。〔05a 最終修正〕plan 的語句不做 describe 之後，SQL Server in-process 1.54–2.62 秒（M1，見 §7）。 |
 | A8 | SQL Server SQL collation 下 varchar key 用 `'…'`（不加 N）是 seek（〔實測〕`N'…'` 是 scan；plain 的 SHOWPLAN_TEXT 只有一個 Clustered Index Update 運算子，沒看到 Scan） | 05a T1 以 SHOWPLAN_XML 確認 | 〔實測〕（05a T1，SHOWPLAN_XML，`SQL_Latin1_General_CP1_CI_AS`）成立：`'k42'` 是 Clustered Index Seek，`N'k42'` 是 Clustered Index Scan。 |
 | A9 | `NO_BACKSLASH_ESCAPES` 下不加倍反斜線的 literal 存回原值 | 05a 整合（session 設 sql_mode 的 scratch 測試） | 〔實測〕（05a T10）成立：`C:\tmp\new\` 在預設模式（`SET label = 'C:\\tmp\\new\\'`）與 `NO_BACKSLASH_ESCAPES`（`'C:\tmp\new\'`）下都存回原值。`test_backslashes_are_stored_as_typed_in_both_sql_modes`。 |
-| A10 | 打包版 WKWebView 在預設的 Edit 選單下，grid 有焦點時 ⌘Z、⇧⌘Z、⌘⌫、⌥⌘N、F2 會到頁面 | 05b 打包版檢查（給使用者的清單） | 05b |
-| A11 | inline `<input>` 在 WKWebView 的注音：選字的 Enter 帶 `isComposing` 或 keyCode 229（R-02c-9 的規則涵蓋） | 05b 手動（使用者清單） | 05b |
-| A12 | 以「已載入列數」重跑並保留捲動位置時畫面不閃、選取保留 | 05b | 05b |
+| A10 | 打包版 WKWebView 在預設的 Edit 選單下，grid 有焦點時 ⌘Z、⇧⌘Z、⌘⌫、⌥⌘N、F2 會到頁面 | 05b 打包版檢查（給使用者的清單） | 05b：使用者的最終測試清單（打包版、注音）；05b 沒有自動化驗證。另一個只在 WebKit 才知道的：⌥⌘N 會不會以 keyCode 229 到（會的話被 `isImeKeyEvent` 當成組字吞掉，要改 `editKeys.ts` 那一個鍵的檢查順序）。⌘Z 到不了時的備援：右鍵的 Revert、⌘⇧P 的 Undo／Redo staged change（H11）。 |
+| A11 | inline `<input>` 在 WKWebView 的注音：選字的 Enter 帶 `isComposing` 或 keyCode 229（R-02c-9 的規則涵蓋） | 05b 手動（使用者清單） | 05b：使用者的最終測試清單（打包版、注音）；05b 沒有自動化驗證。inline 與 drawer 編輯器、grid 本身的每個按鍵處理都先過 `isImeKeyEvent`（drawer 的 Escape 也是，pre-flight M4），reviewer 在 jsdom 裡以合成的組字事件驗過，WebKit 的實際事件順序沒驗。 |
+| A12 | 以「已載入列數」重跑並保留捲動位置時畫面不閃、選取保留 | 05b | 〔實測〕（05b Task 6、Task 6b、Task 9，內建 Chromium，coordinator）：重跑以「已載入列數」為第一頁，第一頁完整之前保留舊的列（最少 49 個 DOM 列，沒有空白），捲動位置與選取不變（1,200 列捲到第 900 列、12,000 列捲到第 9,000 列都是）；原本 `useHeldResult` 在第一個 `result_set` 事件就換成 0 列的新結果，捲動被瀏覽器夾到 0（H9）。位置依 key 找回（K14）：上方刪 3 列後 scrollTop 少 66 px、選取跟著那一列，PG heap 順序下改過的列換位置時 grid 跳到它的新位置。WKWebView 在使用者的清單。 |
 | A13 | PG serialization／deadlock 在 COMMIT 回錯誤後是 rolled back（deferred FK〔實測〕23503 後狀態 IDLE） | 05a 整合 | 〔實測〕（05a T9）成立：deferred constraint trigger 在 COMMIT 回 40001／40P01 → `rolled_back`、`statement` 為 null、不在交易中、沒有套用；deferred FK 的 23503 同。`test_a_serialization_failure_or_a_deadlock_at_commit_rolls_back`。 |
 | A14 | SQLite `BEGIN IMMEDIATE` 遇到 Count rows session 正在讀：busy timeout 內等到或失敗為 rolled_back | 05a 整合 | 〔實測〕（05a T9）成立：另一個 session 暫停的 SELECT 持有讀鎖時，BEGIN IMMEDIATE 與 UPDATE 都過，COMMIT 在 5 秒 busy timeout 後回 `database is locked`（SQLITE_BUSY），worker rollback（否則交易會留著，E10）→ `rolled_back`。`test_a_commit_blocked_by_another_sessions_reader_rolls_back`。 |
 | A15 | SQL Server 讓交易結束的錯誤（〔實測〕8114 後 `@@TRANCOUNT` 0）之後 adapter 的 `rollback()` 不出錯、outcome 為 rolled_back | 05a 整合 | 〔實測〕（05a T10）成立：`CONVERT(int, 'x')` 回 245、日期錯誤回 241（dev 的 server 沒有回 8114，效果相同）：`in_transaction()` 為假、`rollback()` 不出錯、`rolled_back`、沒有套用。`test_a_transaction_ending_error_rolls_back`。 |
@@ -541,6 +575,7 @@ interface StagedEdits {
    - 編輯列、唯讀原因、⌘⇧P 指令；PreviewDialog、apply、結果與 Show in grid；重跑保留位置與列數。
    - workspace 的 `staged_edits`（backend model 與 `savedEdits`）、還原綁定、close guard、匯出對話框的提示。
    - 手動檢查（每個 engine）、給使用者的最終測試清單（含注音、打包版 A10）。
+   - 〔05b 完成，2026-10-20〕以上全部做完（12 個 task 加上 Task 6b〔PG 依 key 排序瀏覽、重讀依 key 找回位置，K13、K14〕，沒有 05c），注音與打包版的按鍵在使用者的清單。
 
 **為什麼兩份**：backend 的風險是各 engine 的 SQL 與交易語意，全部能用整合測試驗，不需要 UI，先定下 API 讓前端在穩定的契約上做（同 04a／04b 的順序）；前端的風險是 grid 的互動與 IME，需要手動檢查。05b 預估 10–12 個 task（與 04c 相當）；若 plan 時超過 12 個，把「workspace、還原、close guard、undo／redo」拆成 05c。
 
@@ -573,6 +608,7 @@ interface StagedEdits {
 
 - `CLAUDE.md`：Repo 結構加 `features/edits/`、`stores/stagedEdits.ts`、`sql/dml.py`、`sql/literals.py`、`adapters/*/editing.py`、`services/edit_service.py`、`api/edits.py`；架構重點加「Grid 內編輯」一段（表格資料 tab、key、overlay、plan、tab 自己的 session 與明確交易、exactly-1、結果四分類、PG `::text`、MySQL 符合列數、SQL Server 外框與 ASCII literal、重跑保留位置、workspace 暫存與 close guard）；已知限制（浮點等不檢查、collation、唯一值互換、MyISAM partial、64 KiB、不做 query 結果）；進度表 ⑤。
 - 〔05a 已做：CLAUDE.md 的 Repo 結構（backend 的新模組）、架構重點的「Grid 內編輯」（backend 部分）、已知限制、打包版量測與進度表；`features/edits/`、`stores/stagedEdits.ts` 與前端的行為由 05b 補。〕
+- 〔05b 已做（2026-10-20）：CLAUDE.md 的 Repo 結構（`features/edits/`、`grid/{marks, EditorSlot, renderCount}`、`table-data/` 的新模組、`stores/stagedEdits.ts`、`lib/{tabActions, unicodeText, arrays}`、`scripts/scratch_tables.py`）、架構重點「Grid 內編輯」的前端部分（與 05a 的 backend 並列）、引擎圖示改成單色、已知限制（05b 一組）、打包版量測（05b 時量）與進度表 ⑤（完成）；05b 的 followups note 由 coordinator 在最終審查後寫，含給使用者的測試清單。〕
 - 每份 plan 的 followups note（`docs/superpowers/notes/`），含給使用者的最終測試清單：四個 engine 的改、增、刪與 commit；衝突與 Keep mine；Refresh 保留位置；唯讀與沒有 key 的表；重開 app 後暫存還在；注音；打包版的 ⌘Z／⌘⌫／⌥⌘N；公司資料庫的 sql_mode、collation、trigger、MyISAM。
 
 ## 附錄 A：探測紀錄（2026-10-19，dev 資料庫）
