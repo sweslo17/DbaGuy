@@ -1,6 +1,6 @@
 # 子專案 ⑥：資料工具（SQL dump、執行 SQL 檔、跨連線複製資料）— 設計
 
-> 日期：2026-10-20 ｜ 狀態：coordinator 審核通過（2026-10-20，見 §12 的 CR-1…CR-6），進入 06a 規劃
+> 日期：2026-10-20 ｜ 狀態：coordinator 審核通過（2026-10-20，見 §12 的 CR-1…CR-6）；06a（backend）已實作（2026-10-21，〔06a〕註記在 §7、§10、§11 與 §12 的 CR-6 之後），06b、06c 未開始
 > 範圍依據：[feature-priorities.md](../../research/2026-10-15-feature-priorities.md) §2（Q1–Q6）、§3（M9 完整結果匯出、M11 安全、M7 值的呈現；Won't 清單：「備份、還原、dump：直接用 pg_dump 等 CLI；DBeaver 依賴外部 binary 的問題反而是抱怨大戶（約 310 👍）」、schema compare／sync、data compare、fake data）、§7（串流、型別、MSSQL）、§8（「實際常用的進階功能：**SQL dump**、**跨 DB 傳輸或複製資料**」升為 v1）。§8 推翻了 Won't 清單的「dump」一列，但沒有推翻它的理由：使用者不要的是**包外部程式**，所以 ⑥ 全部原生（D-06-1），不呼叫 `pg_dump`、`mysqldump`、`sqlcmd`、`bcp`，也不帶它們的 binary。
 > 技術依據：本設計在 dev 資料庫上的探測（2026-10-20；PostgreSQL 17.11／psycopg 3.3.6、MySQL 8.4.11／mysql-connector-python 26.7.0 pure、SQL Server 2022 CU27（16.0.4305.5）／pymssql 2.4.4、SQLite 3.53.4、sqlglot 30.23.0、Python 3.13.5；dev 容器裡的 `pg_dump` 17.11），標 **〔實測〕**；標 **〔未實測〕** 的是假設，§10 彙整並指定由哪個 plan task 先驗證。探測只建 `zz_06_*` scratch 物件（SQLite 用 scratch 目錄裡的檔案），以完整名稱 DROP；Couchbase 沒有寫入。紀錄在附錄 A。本文的 A 編號自成一組（⑥ A1…）。
 > 建立在 ①–⑤ 之上：`SessionWorker` 與 WS 協定（`domain/execution.py`；匯出的串流、取消、`ProgressEvent`、`atomic_text_file`）、⑤ 的 `sql/literals.py`（`CellLiterals`、`LiteralStyle`）、`sql/dialects.py`（引號、literal、`transaction_frame`、`script_text`）、各 engine 的 DDL 產生（`adapters/postgres/ddl.py`、MySQL `SHOW CREATE`、`adapters/mssql/introspection.py`、SQLite `sqlite_master`）、⑤ 的 `RowEditing.edit_target`（欄位能不能寫、literal 的寫法）與 `EditPlanStore`、`SafetyPolicy`、匯出對話框（`src/features/grid/ExportDialog.tsx`）的進度與取消模式，以及 ⑤ 的教訓：每個請求恰好一個結果事件（E1）、不明就說不明、絕不重送（R-05-6、C45）。
@@ -406,13 +406,14 @@ class TargetSpec(BaseModel):
 
 - Run 受切句限制（約 2–3 MB/s，R-06-6）：100 萬列的 dump 約 150 MB，切句約 60 秒，再加 server 的時間。
 - SQL Server 的載入是瓶頸（每句 100 列 21,847 列／秒；同一批次放多句可到 26,931，§12）。
+- 〔06a 實測〕凍結的 sidecar、100 萬列、每列約 230 bytes 的 6 欄表（dump 是 231–233 MB，比估計的 150 MB 大），load average 4–9：dump PG 9.8–12.2 秒、MySQL 14.9–16.0 秒、SQL Server 17.7–19.1 秒、SQLite 9.1–10.1 秒；run PG 56.2–59.0 秒、MySQL 68.8–69.5 秒（逐句）、SQL Server 97.5–108.5 秒（10,003 句）、SQLite 46.5–50.3 秒，2.1–5.0 MB/s（比估計的 2–3 MB/s 快）：時間都在預算內（最慢的 SQL Server run 是 41–45%），還原後的聚合與來源相同。記憶體：dump 的尖峰 54–97 MB、從被 macOS 收回的基準線（44–89 MB）起算 +4–47 MB，重複跑不累積；run 的尖峰 SQLite 87–94、MySQL 79–80、SQL Server 69–76 MB（+9–31 MB），PG 101–146 MB（+34–86 MB，**超過預算**，`MallocLargeCache=0` 與非凍結的 sidecar 一樣，原因未查，CLAUDE.md 的已知限制），同一個 sidecar 的第二次不比第一次高。sidecar +300 KB（下一行估 < 200 KB：審查的修正波讓 06a 的 backend 變成約 8,700 行），沒有新相依、不需要 hidden import；打包後的檢查是 dump 兩次與 run（每個 engine）、Couchbase run 一次（probe 逐項 assert），copy 的一列 → 06c。
 - 打包：沒有新的 Python 或前端相依（stdlib 與既有 driver），不需要 hidden import；sidecar 預估增加 < 200 KB（新的純 Python 模組）。打包後的檢查：凍結的 sidecar 對四個 engine 各 dump 一次、run 一次、copy 一次（probe 逐項 assert），Couchbase run 一次。
 
 ## 8. 痛點對照
 
 | 需求 | 這個子專案怎麼解 | 踩到／退步 |
 |---|---|---|
-| Q1 輕快低記憶體 | 每條路徑串流、固定上限的塊與管線；切句不留 token；0 新相依；順手修掉 sqlglot 在大 INSERT 上 113 倍的記憶體（D-06-4） | Run 的速度受 Python 切句限制（2–3 MB/s）；SQL Server 的載入慢（約 2 萬列／秒） |
+| Q1 輕快低記憶體 | 每條路徑串流、固定上限的塊與管線；切句不留 token；0 新相依；順手修掉 sqlglot 在大 INSERT 上 113 倍的記憶體（D-06-4） | Run 的速度受 Python 切句限制（2–3 MB/s；〔06a 實測〕2.1–5.0 MB/s）；SQL Server 的載入慢（約 2 萬列／秒；〔06a 實測〕100 萬列 97.5–108.5 秒）；〔06a〕PG 的 run 的 RSS 尖峰超過 30 MB 的預算（§7） |
 | Q2 穩定不丟工作 | dump 原子寫入；run 與 copy 的結果分類、不重送；History 開始就寫、當機後是 Interrupted；job 在背景、重新載入視窗後仍找得到；關視窗與 ⌘Q 先問 | 當機留下隱藏的 `.part`；MySQL 的建表失敗後留下空表（不自動刪） |
 | Q3 可信任 | literal 共用 ⑤ 的規則；SQL Server 第 7 位小數保住；跨 engine 的每一種轉換執行前列出；預覽即確認、執行的就是 plan；唯讀雙層 | `sql_variant` 不寫；MySQL 非嚴格模式下的截斷只能警告；SQL Server 唯讀只在應用層（既有） |
 | Q4 聚焦 | 只做搬與重建；不做同步、比對、upsert、排程、壓縮、外部程式 | 要一模一樣的跨 engine 表結構做不到（只建欄位、NOT NULL、PK） |
@@ -439,28 +440,28 @@ class TargetSpec(BaseModel):
 
 | # | 假設 | 驗證 |
 |---|---|---|
-| A1 | MySQL GEOMETRY 與 VECTOR 的 bytes 以 `X'…'` 寫回不變（mysqldump `--hex-blob` 的做法）；SQL Server hierarchyid 同 geography（〔實測〕geography 的 `0x…` 可以） | 06a T1 |
-| A2 | PG 在 REPEATABLE READ READ ONLY 交易裡：DDL 輔助函式（`pg_get_*`）與 server-side cursor 交錯使用沒有問題，100 萬列的串流記憶體平穩 | 06a T1 |
-| A3 | MySQL CONSISTENT SNAPSHOT 交易裡：unbuffered 串流讀完再 `SHOW CREATE` 下一張表（〔實測〕交易裡 `SHOW CREATE TABLE` 可以） | 06a T1 |
-| A4 | SQL Server 開了 `ALLOW_SNAPSHOT_ISOLATION` 的 database 用 SNAPSHOT 讀，DDL 讀取不受影響 | 06a T1（scratch database 裡打開） |
-| A5 | SQLite rollback journal 模式下，dump 的讀取交易擋住其他連線的寫入（`database is locked`），WAL 不擋 | 06a T1 |
-| A6 | `iter_spans` 與既有 `split()` 在全部語料上相同；`StatementStream` 在每個切塊位置相同 | 06a T2 |
-| A7 | 四個 engine 的 seed schema 能 dump 並在 `zz_06_restore` 裡重建，逐表 checksum 相同 | 06a T9 |
-| A8 | dev 容器裡的 `mysqldump`、`pg_dump --inserts`、`sqlite3 .dump` 的輸出與 SSMS 風格的 GO 腳本能跑（逐句） | 06a T4 |
-| A9 | Copy 的 4×4 矩陣上，`zz_06_types` 的每個值依 §3.5.3 相同 | 06a T11 |
-| A10 | §7 的預算 | 06a T12 |
-| A11 | MySQL 來源在管線滿超過 `net_write_timeout` 時的行為與訊息 | 06a T11 |
+| A1 | MySQL GEOMETRY 與 VECTOR 的 bytes 以 `X'…'` 寫回不變（mysqldump `--hex-blob` 的做法）；SQL Server hierarchyid 同 geography（〔實測〕geography 的 `0x…` 可以） | 06a T1 → 〔06a Task 4，實測〕MySQL 8.4.11 的 GEOMETRY 以 `X'…'` 寫回相同（SRID 4326 保留）；SQL Server hierarchyid（`/1/2/3/`、`/1/2.5/3/`）、geography、geometry 以 `CAST(… AS varbinary(max))` 讀、`0x…` 寫回相同；VECTOR 不在 MySQL 8.4，沒有測（公司是 9.x 時再驗） |
+| A2 | PG 在 REPEATABLE READ READ ONLY 交易裡：DDL 輔助函式（`pg_get_*`）與 server-side cursor 交錯使用沒有問題，100 萬列的串流記憶體平穩 | 06a T1 → 〔06a Task 5，實測〕REPEATABLE READ READ ONLY 交易裡 server-side cursor 讀 100 萬列、FETCH 之間穿插 20 次 `pg_get_*`：都正常，交易仍是 repeatable read、read only，client RSS 68 → 70 MB；凍結的 sidecar dump 100 萬列時 RSS 尖峰 61–66 MB，第二次不高於第一次（Task 10，§7） |
+| A3 | MySQL CONSISTENT SNAPSHOT 交易裡：unbuffered 串流讀完再 `SHOW CREATE` 下一張表（〔實測〕交易裡 `SHOW CREATE TABLE` 可以） | 06a T1 → 〔06a Task 6，實測〕CONSISTENT SNAPSHOT 交易裡讀整份 catalog 之後，別的連線新增的列看不到（snapshot 的 `COUNT(*)` 仍是 2）；`SHOW CREATE TABLE` 的 AUTO_INCREMENT 是讀到那一刻的值，不在 snapshot 裡（S10）；catalog 讀的是 data dictionary，同時有 DDL 時讀列會遇到 1412（dump 說那張表被改了，請重新 dump） |
+| A4 | SQL Server 開了 `ALLOW_SNAPSHOT_ISOLATION` 的 database 用 SNAPSHOT 讀，DDL 讀取不受影響 | 06a T1（scratch database 裡打開） → 〔06a Task 7，實測〕scratch database 開了 `ALLOW_SNAPSHOT_ISOLATION`：SNAPSHOT 交易裡 catalog 與 DDL 的讀取正常；`BEGIN TRANSACTION` 之後、第一次讀取之前別的連線新增的列看得到，catalog 讀過之後新增的看不到：SNAPSHOT 從第一次讀取開始（S13）；catalog view 不分版本，snapshot 之後才建的表讀列時是 3961。沒開時（dev 的 database）dump 逐表讀（per_table），檔頭與預覽說明 |
+| A5 | SQLite rollback journal 模式下，dump 的讀取交易擋住其他連線的寫入（`database is locked`），WAL 不擋 | 06a T1 → 〔06a Task 6，實測〕rollback journal（`delete`）時 dump 的讀取交易讓別的連線寫入 `database is locked`；WAL 時寫得進去；預覽在不是 WAL 時警告 |
+| A6 | `iter_spans` 與既有 `split()` 在全部語料上相同；`StatementStream` 在每個切塊位置相同 | 06a T2 → 〔06a Task 1，實測〕`split()` 改成 `list(iter_spans())`：五個 dialect 18,000 段隨機 SQL 與舊的 `split()` 逐欄相同（0 差異；審查另跑約 30,000 段），既有的切句測試全過，舊 `split()` 的 span 寫成測試裡的 literal；`StatementStream` 在隨機切點、1–200 與 1 MiB 的塊大小都和一次讀完相同 |
+| A7 | 四個 engine 的 seed schema 能 dump 並在 `zz_06_restore` 裡重建，逐表 checksum 相同 | 06a T9 → 〔06a Task 9，實測〕PG、MySQL、SQL Server 的 `dbaguy` 與 `analytics` seed，與一個 SQLite 的 shapes 檔（AUTOINCREMENT、untyped 的 `'007'`／`1.10`、±9e999、−0.0、blob、STRICT、WITHOUT ROWID、CJK 的表名），以 `drop_first` dump、在 `zz_06_restore_*` 還原兩次：獨立的 inventory（不經 dump 自己的 reader）與逐列的 hash 相同，序列、identity、AUTO_INCREMENT、`sqlite_sequence`、view、routine、trigger、event 都在；MySQL 逐句（全有或全無在第 5 句被拒，S6、S22）；SQL Server 的 `sql_variant` 欄是 NULL（不寫，檔頭列出）；沒有可寫欄的表還原同樣的列數 |
+| A8 | dev 容器裡的 `mysqldump`、`pg_dump --inserts`、`sqlite3 .dump` 的輸出與 SSMS 風格的 GO 腳本能跑（逐句） | 06a T4 → 〔06a Task 3，實測〕dev 容器的 `pg_dump --inserts`（`\restrict` 跳過並說明）跑完、COPY 形式在第一個 COPY 停（`unsupported_copy` 加提示）；`mysqldump --hex-blob` 逐句跑完、全有或全無在它的 `DROP TABLE` 前就被拒（S22，表不動）；沒有 `--hex-blob` 時二進位欄是原始 bytes，前面 17 句照送、在那一行以 `file_not_utf8` 停並提示 `--hex-blob`（S11）；`sqlite3 .dump` 逐句跑完、全有或全無在它的 `BEGIN TRANSACTION` 停；SSMS 風格的 CRLF、`GO` 腳本跑完 |
+| A9 | Copy 的 4×4 矩陣上，`zz_06_types` 的每個值依 §3.5.3 相同 | 06a T11 → 06c（S1） |
+| A10 | §7 的預算 | 06a T12 → 〔06a Task 10，實測〕見 §7 的〔06a 實測〕 |
+| A11 | MySQL 來源在管線滿超過 `net_write_timeout` 時的行為與訊息 | 06a T11 → 06c（S1） |
 | A12 | Tauri 2 的 `onCloseRequested` 在 WKWebView 可用；predefined Quit 換成自訂項目後 ⌘Q 仍是系統的鍵、確認後能正常結束 | 06b 第一個 task |
-| A13 | PG 的 `money` 以 `::numeric` 讀（〔實測〕P10）對 `money[]` 與 domain over money 也適用；做不到的寫進已知限制 | 06a T6 |
-| A14 | MySQL 的 `DEFINER=` 移除對各種帳號寫法都正確（`user@host`、`'u'@'h'`、`` `u`@`h` ``、`CURRENT_USER`） | 06a T7 |
-| A15 | SQL Server 的 `CAST(… AS varchar)` 對 datetime2(7)、datetimeoffset(7)、time(7) 在 British 與 us_english 都寫回相同（〔實測〕us_english 可以） | 06a T8 |
-| A16 | `INSERT` 符合列數的讀法（⑤ 的 `matched_rows()`）對多列 INSERT 正確：MySQL 多列 INSERT 的 OK 封包是 `Records: n`（〔實測〕⑤ A1），`affected_rows` 即列數 | 06a T11 |
+| A13 | PG 的 `money` 以 `::numeric` 讀（〔實測〕P10）對 `money[]` 與 domain over money 也適用；做不到的寫進已知限制 | 06a T6 → 〔06a Task 4，實測〕`money`、`money[]` 與 domain over money 經 `numeric`／`numeric[]` 讀出、寫回都相同（`-1234567.89`、`{1.50,-2.00,NULL}`、`7.25`；±2^63 也精確） |
+| A14 | MySQL 的 `DEFINER=` 移除對各種帳號寫法都正確（`user@host`、`'u'@'h'`、`` `u`@`h` ``、`CURRENT_USER`） | 06a T7 → 〔06a Task 6，實測〕`user@host`、`'u'@'%'`、`` `u`@`%` ``、`"u"@"h"`（ANSI_QUOTES 下建立的 program）、名稱裡雙寫的 back-tick、`CURRENT_USER`、`CURRENT_USER()`、`@` 兩邊有空白：八種寫法都拿掉 DEFINER、其餘原文不變；本體裡的 `definer = …` 不動 |
+| A15 | SQL Server 的 `CAST(… AS varchar)` 對 datetime2(7)、datetimeoffset(7)、time(7) 在 British 與 us_english 都寫回相同（〔實測〕us_english 可以） | 06a T8 → 〔06a Task 4，實測〕CAST 的文字在 datetimeoffset 的位移前有空格（`… 12:34:56.1234567 +08:00`），接上 `T` 之後 us_english 與 British 都拒絕（241）；改用 `CONVERT(…, 126)`（`2026-10-05T12:34:56.1234567+08:00`），兩種語系、六種 language／DATEFORMAT 設定都寫回相同（S4） |
+| A16 | `INSERT` 符合列數的讀法（⑤ 的 `matched_rows()`）對多列 INSERT 正確：MySQL 多列 INSERT 的 OK 封包是 `Records: n`（〔實測〕⑤ A1），`affected_rows` 即列數 | 06a T11 → 06c（S1） |
 
 ## 11. 執行計畫拆分
 
 一個 branch `feat/06-data-tools`，兩份 plan 依序執行、各自可合併驗收：
 
-1. **06a：backend（約 12 個 task）**
+1. **06a：backend（約 12 個 task）**〔06a：規劃成 10 個 task，Copy（下面的 T10–T11）連同 CopyDataDialog 拆成 06c（D-06-14、CR-6；S1）。T1 的 probe 分到用到它們的 task：A1、A13、A15 → Task 4，A2 → Task 5，A3、A5、A14 → Task 6，A4 → Task 7；A6 → Task 1、A8 → Task 3、A7 → Task 9、A10 → Task 10；plan 見 `docs/superpowers/plans/2026-10-20-06a-data-tools-backend.md`，06b、06c 之後另寫 plan〕
    - T1 probe：A1–A5。
    - T2 `iter_spans`、`StatementStream`、classifier 的 64 KiB 上限（純函式，A6）。
    - T3 job 框架：指令與事件、`JobContext`、`_run_job`、`JobRegistry`、忙碌的 session 不 reap、History 的 `begin`／`finish`、`gate_confirmed`、能力欄位；`npm run gen:api`。
@@ -497,6 +498,39 @@ Coordinator 審核（2026-10-20；使用者授權自主決定，以下裁決不�
 - **CR-4**：Dump 寫檔遇到磁碟滿（ENOSPC）或其他寫入錯誤：`.part` 刪除、原本的同名檔不變，結果寫「Disk full: nothing was written」（或 OS 的原文）並指出寫到哪裡；開始前以 `shutil.disk_usage` 檢查目的地的可用空間，少於估計大小（列數 × 平均列長的上限）或 1 GiB 時在預覽警告（不擋）。使用者的 Mac 磁碟曾經被寫滿、讓 OrbStack 出 I/O error（Q2）。
 - **CR-5**：job 進行中的 ⌘Q／關視窗守衛（R-06-15）只涵蓋 ⑥ 的 job；把 quit 守衛擴大到所有 close guard 仍是 02c 的 carry（下面的「之後」）。Tauri 端以 `RunEvent::ExitRequested` 的 `prevent_exit()` 實作，Rust 只負責轉給前端問，決定在前端（CLAUDE.md：Rust 只負責視窗、選單與 sidecar）。
 - **CR-6**：06a 依 §11 的 12 個 task 規劃；planner 超過 13 個就照 D-06-14 拆出 06c（Copy），不要擠。
+
+〔06a〕規劃時的裁決（S1–S21；理由與出處在 06a plan 的「Spec issues found while planning」，數字是規劃時量的；執行時改過的在各條的〔06a 執行〕）：
+- S1：Copy 的 backend（§11 的 06a T10–T11、A9、A11、A16、`copy_data`、`OneTimePlanStore`）連同 CopyDataDialog 拆成 06c；06a 交給 06c 的是 `TableColumn`／`TypeFamily`（含 `read_as`）、job 框架與清單、`InsertBatcher`（`backslash_escapes`、`max_rows`）與 `build_copy_select`。
+- S2：dump 的結果是 `completed` 或 `failed`（什麼都沒寫），加上 `not_started`；取消是 `failed` 帶 `cancelled=true`。〔06a 執行〕第一句設定送出之前的取消是 `not_started`；`failed` 的 `rows` 是 0（什麼都沒寫，進度事件說到了哪裡）。
+- S3：PG 的非有限 float 照既有的 literal 寫成 `'inf'`／`'nan'`（P4：PG 讀得回）；MySQL、SQL Server 的 float 沒有非有限值；只有 SQLite 需要 `9e999`（L3）。〔06a 執行〕NaN 在 SQLite 寫 NULL；−0.0 保住正負號：PG `'-0.0'`、MySQL `-0.0e0`（Task 8 的 fuzz 抓到 PG 300 列裡 2 次、MySQL 4 次的遺失）；float 的規則只在 `float_literal`。
+- S4：A15 的 CAST 文字寫不回 datetimeoffset：改用 `CONVERT(…, 126)`；`datetime_literal` 也把位移前的空格拿掉（⑤ 的 grid 編輯輸入 `… +08:00` 時一樣受惠）。〔06a 執行〕style 126 寫 `+00:00`（不是 `Z`）、不寫全為 0 的小數，`0001-01-01T00:00:00-14:00`、`9999-12-31T23:59:59.9999999+14:00` 在 us_english 與 British 都寫回相同。
+- S5：`STREAM_CHUNK` 是 512 KiB（不是 1 MiB）：切 231 MB、1,000 句的 dump，1 MiB 一塊時切句本身的 RSS 尖峰 +91 MB，512 KiB 時 +28 MB（38.7 對 42.7 秒）；sqlite3 的連線 `cached_statements=0`（dump 的大 INSERT 每句不同，預設 128 句的快取在 200 句 1,000 列的 INSERT 後讓 RSS 多 111 MB，關掉後 4 MB）。
+- S6：§1 成功標準的「全有或全無」對 MySQL 做不到（DDL 隱含 commit）：MySQL 的往返以逐句還原。〔06a 執行〕全有或全無不再「在第一個 CREATE TABLE 之後停（partial）」：見 S22，DbaGuy 的 MySQL dump 全有或全無在第 5 句（第一個 DDL）送出前就被拒（rolled_back／`implicit_commit`），往返測試兩種都測。
+- S7：SQL Server 的 function 與 view、synonym 一起在資料之後依 `sql_expression_dependencies` 排序（inline／table-valued 與 schema-bound 的 function 建立時就要表在）；只有表的預設值、check、computed 欄用到的 function 在表之前。〔06a 執行〕那些 function 讀 view 時，綁定它們的 view 跟著移到表之前；預設值或 check 的 function 讀表、view 或 synonym 時，那個預設值／check 在 view 之後才以 `ALTER TABLE` 加上（Task 7 審查）。
+- S8：SQL Server 的 IDENTITY_INSERT 讓 identity 接在寫入的最大 id 之後（附錄 A S2），來源的值更大（刪過列）時資料之後補 `DBCC CHECKIDENT (…, RESEED, n)`，不會重複給號。〔06a 執行〕清空過的表要 `RESEED` 到 `n + increment`（`last_value` 是 NULL 時，pre-flight M8），只往前不往後（逐表讀時讀到的列可能超過先讀的計數），已 reseed 而空的表以 `IDENT_CURRENT` 帶過去；數值以 80 位的精確 decimal 算（decimal(38,0) 的計數）。
+- S9：SQL Server 的 system-versioned、graph、ledger 表不寫（照抄成一般表就不是同一種表），檔頭列出。〔06a 執行〕有 period 的表、ledger 表的 view 也是；需要它們的物件一起略過並點名。
+- S10：MySQL 的 `AUTO_INCREMENT=n` 照 `SHOW CREATE TABLE` 寫：它不在 snapshot 裡，可能比 dump 的列大，不會重複給號。
+- S11：沒有 `--hex-blob` 的 mysqldump 檔（二進位欄是原始 bytes）不是 UTF-8：照 §1 的範圍不支援，在那一行停並提示 `--hex-blob`，檢查時也警告。〔06a 執行〕那一行之前的語句照樣送（pre-flight M3：同一個 512 KiB 塊裡、壞行之前的語句以前會被丟掉），`stopped_at` 是讀到的最後一句的下一句、行號是壞的那一行。
+- S12：加 `POST /data/jobs/clear`（Jobs 的 Clear finished，§3.6）。
+- S13：SQL Server 的 SNAPSHOT 從第一次讀取開始（不是 BEGIN）：dump 的第一次讀取就是 catalog。〔06a 執行〕catalog view 不分版本：snapshot 開始後才建的表或加的欄 catalog 看得到，讀它的列時是 3961（dump 說那張表在 dump 中被改了，請重新 dump）。
+- S14：逐句的 run 讀完檔案時若交易還開著，rollback 並在結果說明（不替檔案 commit）。〔06a 執行〕不只檔案結束時：檔案自己開的交易被追蹤（pre-flight H2），在交易裡停下也 rollback，並把那段的語句從「已套用」的計數拿掉；PG 跳過錯誤時，abort 的交易讓 run 停下。
+- S15：檔頭與 `-- Data:` 等註解裡的名稱把換行寫成 `\n`（`comment_safe`）：否則名稱的其餘部分會被當成 SQL 執行。〔06a 執行〕`str.splitlines` 會斷行的每個字元與 NUL 都寫成跳脫（U+2028 會讓 `parse_header` 讀短檔頭）。
+- S16：`transaction_ended` 的括號依 dialect：MySQL 是「MySQL commits around DDL」，其他是「a statement in the file ended it」。〔06a 執行〕其他 dialect 的結果是 unknown（不是 partial），文字是「(a statement in the file committed or rolled it back): what ran before it may or may not be applied」（pre-flight H3：T-SQL 的 TRY/CATCH ROLLBACK 讓「之前的已套用」不成立）；全有或全無時 T-SQL 批次裡的 COMMIT／ROLLBACK／BEGIN TRAN／SAVE TRAN 在送出前就拒絕。
+- S17：`DumpObjectKinds` 沒有另外的勾選：MySQL 的 event 跟著 routines，SQL Server 的 synonym 跟著 views。
+- S18：MySQL 的 database 就是 schema 節點：範圍 `database` 回 422（「dump its schema node」）。
+- S19：PG 繼承（`INHERITS`）的子表 dump 成獨立的表（`table_ddl` 不寫 INHERITS），列各自讀（`FROM ONLY`）。〔06a 執行〕檔頭的 Not included 寫「inheritance (N child tables come back as tables of their own)」（L6）；typed table 的 `OF` 同樣不寫、同樣註明。
+- S20：MySQL 的 stored program 照它建立時的 sql_mode 寫（`SET SESSION sql_mode = …` 夾在 DELIMITER 裡），之後恢復檔頭的模式。〔06a 執行〕表與 view 也在還原時的模式下讀（dump 的 session 先 `SET SESSION sql_mode` 成檔頭的，pre-flight M5：`ANSI_QUOTES` 的 server 原本寫出 `"m"`）；program 與 view 另帶自己的 `character_set_client`／`collation_connection`，event 帶自己的 `time_zone`（Task 6 審查）。
+- S21：SQL Server 的檔頭不寫 `SET NOCOUNT ON`：在它之下 INSERT 不回報列數，還原的結果會說 0 列（其他兩句照 §3.3.3）。
+- S22（pre-flight H1，06a 執行時加）：MySQL 全有或全無的 run 在送出前就拒絕 MySQL 會先隱含 commit 的語句（DDL、LOCK／UNLOCK TABLES、GRANT 等、START／STOP REPLICA、SET PASSWORD、`SET autocommit`；CREATE／DROP TEMPORARY 除外，`implicit_commit`）與 CALL／EXECUTE（`procedure_call`）：送出之後失敗的 DDL 也已 commit 了前面的語句，以前回報 rolled_back，mysqldump 的 `DROP TABLE` 也會在「全有或全無」下刪掉表。結果 rolled_back，什麼都沒套用。
+
+〔06a〕執行時的其他決定（細節在各 task 的 report 與 CLAUDE.md「資料工具」）：
+- Job 框架：plan 的 `replay_job`（F2）換成 `SessionWorker.attach_emitter(emit)`：在 job-send lock 下先把 job 最後的 `job_progress` 與 `job_outcome` 送給新的 client，再換 emitter，所以重送的事件不會重複、也不會被即時事件超前（pre-flight M2）；job 結束後才接上的 client 只拿到 `job_outcome`、沒有 `finished`。WS 層就被拒絕的 job 指令也有 `job_outcome(not_started)`（M1）；session 在 job 的最後一個事件之前都算忙碌（L1）；壞掉的 job 留著的交易 rollback（L2）；session 先關、job 還沒結果時清單標 unknown（L3）。
+- `RunOptions(describe=False)` 也表示不預讀列（SQLite 200 列、SQL Server 100 列的型別 peek，PG cursor 的 200 列預讀），dump 依列的大小讀才算數；grid 與匯出不變。`fetch()` 只有 `[]` 是結束：SQL Server 在列之後的錯誤以前只在 `next_result()` 丟出，dump 與 CSV 匯出會把被截斷的表當成完整（Task 9 審查 H1），現在下一次 fetch 就丟出。
+- Run SQL file 的結果（R-06-12 的表，每一列都以 server 上的實際狀態驗過）：MySQL 失敗後交易已不在時是 unknown（1213 的 deadlock 除外，R1）；SQL Server trigger 自己 COMMIT 的 3609 是 unknown（R2）；MySQL rollback 之後的警告 1196（MyISAM 等不能 rollback 的表）讓結果變 unknown（R3、N5）；從第 N 句開始時，前面 allow-list 上的 session 設定照送（R4，`sql/session_settings.py`）；`COMMIT AND CHAIN`／`completion_type=CHAIN` 從那裡重算檔案的交易（R5）；PG 的 `DO` 和 CALL 一樣算「可能 commit、會跑好幾句」（R6）；SQL Server 以 `CURRENT_TRANSACTION_ID()`（BEGIN 之後、失敗時、COMMIT 前）分辨交易被 commit 又重開（R10、N4），MySQL 的 CALL 在檔案的交易裡跑過時之後的 rollback 是 unknown（N1）；MySQL 的 cancel 剛好在語句完成時到，那句算已套用（R8）；MySQL 停下時在 rollback 之後送 `UNLOCK TABLES`（R9）。殘留的已知限制：trigger 先 commit 又重開，之後 XACT_ABORT 的錯誤或 deadlock 把重開的交易 rollback 時，回報 rolled_back 而 trigger commit 的列留著。
+- Dump 的讀取（pre-flight M12、Task 9 審查 M1）：`FIRST_FETCH` = 1，之後每次 `FETCH_CHARS`（32 MiB）÷ 目前最大的一列、最多 `FETCH_ROWS` = 1,000；磁碟每寫 `DISK_CHECK_CHARS`（16 Mi 字元）看一次、少於 `DISK_FLOOR_BYTES`（256 MiB）就停（M14）；`atomic_text_file` 在換名前 `fsync`（L9，所有使用者）；不能寫進 SQLite 資料庫檔（M13）；沒有可寫欄的表以預設值的列還原同樣的列數（Task 7 審查）；只有資料的 dump 父表先寫、PG 與 SQL Server 警告 FK 循環與參照自己的表（M9、M4），PG 另 `REFRESH` materialized view（L3）；dump 中途表被改（1412、3961）有自己的訊息。
+- 篩選（dump 與表格資料 tab，Task 9 審查 M2）：只能是一個條件：`check_filter` 的單一運算式、dialect lexer 下 depth 0 的子句字（每個 dialect 只列它的 server 在 WHERE 條件之後讀成子句的字）與沒開過的 `)` 都拒絕，組出來的 SELECT 與 COUNT 都要是唯讀 allow-list 的 READ 並過 session 的閘門，否則什麼都不送（`invalid_filter`）。PG 的 plan 在 `SET LOCAL lock_timeout = 5000` 下讀 catalog（M3）。
+- T-SQL 的數字照 SQL Server 2022 的讀法切（`LexRules.number`，splitter、classifier、`select_builder` 共用；Task 9 fix round 3）：`0x` 加任意長度的 hex 是一個 binary literal，指數記號不論有沒有正負號與數字都跟著數字，`$1.5` 是 money，`$action` 等是一個名稱。以前 `0x1TRUNCATE` 被切成 `0` + `x1TRUNCATE`（server 讀成 `0x1` + `TRUNCATE`），唯讀的 query tab、表格瀏覽與 dump 的篩選都能藉此送出寫入；這修的是 ③ 就有的 lexer。其他 dialect 不變（它們的 server 拒絕黏在一起的寫法）。
+- 各 engine 的 catalog 超出 §3.3.3 的部分（PG 的 range、collation、aggregate 會寫，operator 與 text search 只計數並點名用到它們的物件；MySQL 的 NO_BACKSLASH_ESCAPES program、invalid view、用到讀不到的 routine 的物件略過並點名；SQLite 用到 virtual table 的 view 與 trigger 略過並點名；SQL Server 依 `dump_graph` 帶走需要被略過物件的物件）：各 task 的 report，摘要在 CLAUDE.md。
 
 之後（不在 ⑥）：
 - Couchbase query 結果 → 關聯式表的 copy（R-06-14；值與欄位走匯出的路徑，`MISSING` → NULL、物件與陣列 → JSON 文字）。
