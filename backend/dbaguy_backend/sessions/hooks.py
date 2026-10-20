@@ -1,14 +1,45 @@
+import threading
+import time
+from collections.abc import Callable
+from datetime import datetime
 from uuid import UUID
 
+from ..adapters.base import StatementError
 from ..adapters.registry import AdapterRegistry
+from ..domain.data_jobs import JobCommand
 from ..domain.edits import PLAN_EXPIRED, PLAN_EXPIRED_MESSAGE, EditPlan, PlanUnavailable
-from ..domain.history import HistoryRecord
+from ..domain.history import HistoryRecord, HistoryStatus
+from ..domain.profiles import AnyProfile
 from ..services.edit_plans import EditPlanStore
 from ..services.history_service import HistoryService
 from ..services.profile_service import ProfileService
 from ..services.safety import GuardDecision, SafetyPolicy
 from ..services.schema_cache import SchemaCache
+from .jobs.context import Job, JobHooks
 from .worker import ExecutionRecord, WorkerHooks
+
+READ_ONLY_RECHECK_S = 1.0  # a job's statement gate re-reads the profile at most this often (R-06-6)
+
+
+class _Recent:
+    """`read()`, re-read at most every `every_s`: ProfileStore.get reads profiles.json each time, and a run of a
+    million statements gates each one (R-06-6). Any thread."""
+
+    def __init__(self, read: Callable[[], bool], every_s: float = READ_ONLY_RECHECK_S,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._read = read
+        self._every_s = every_s
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._value = False
+        self._read_at: float | None = None
+
+    def __call__(self) -> bool:
+        with self._lock:
+            now = self._clock()
+            if self._read_at is None or now - self._read_at >= self._every_s:
+                self._value, self._read_at = self._read(), now
+            return self._value
 
 
 class SessionHooksFactory:
@@ -58,5 +89,32 @@ class SessionHooksFactory:
         return WorkerHooks(
             dialect=dialect, check=check, on_record=on_record, capabilities=capabilities,
             on_schema_change=lambda: self._schema_cache.invalidate(profile_id),  # every database of the profile
-            take_edit_plan=take_edit_plan,
+            take_edit_plan=take_edit_plan, jobs=self._job_hooks(profile, database),
         )
+
+    def _job_hooks(self, profile: AnyProfile, database: str | None) -> JobHooks:
+        """A job's statement gate (gate_confirmed, the profile re-read at most once a second) and its History record."""
+        profile_id = profile.id
+        dialect = self._registry.get(profile.engine).dialect
+        read_only = _Recent(lambda: self._profiles.get(profile_id).read_only)
+
+        def build(command: JobCommand) -> Job:
+            return self.build_job(command, profile, database)
+
+        def begin_record(sql: str, started_at: datetime) -> int | None:
+            return self._history.begin(HistoryRecord(
+                profile_id=profile_id, profile_name=profile.name, database=database, sql=sql, started_at=started_at,
+                elapsed_ms=0, rows=0, status="running",
+            ))
+
+        def finish_record(record_id: int, status: HistoryStatus, elapsed_ms: int, rows: int, error: str | None) -> None:
+            self._history.finish(record_id, status, elapsed_ms, rows, error)
+
+        return JobHooks(
+            build=build, gate=lambda sql: self._policy.gate_confirmed(sql, dialect, read_only()), read_only=read_only,
+            begin_record=begin_record, finish_record=finish_record,
+        )
+
+    def build_job(self, command: JobCommand, profile: AnyProfile, database: str | None) -> Job:
+        """The job object for a job command on a session of `profile` (the composition root of data tools' jobs)."""
+        raise StatementError(f"{type(command).__name__} is not a job this backend runs", code="not_supported")

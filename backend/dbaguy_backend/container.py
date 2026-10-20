@@ -27,6 +27,7 @@ from .services.scripts_service import ScriptsService
 from .services.settings_service import SettingsService
 from .services.workspace_service import WorkspaceService
 from .sessions.hooks import SessionHooksFactory
+from .sessions.jobs.registry import JobRegistry
 from .sessions.manager import SessionManager
 from .sql.classifier import warm_up
 from .storage.paths import default_scripts_dir, history_file, profiles_file, settings_file, workspace_file
@@ -86,7 +87,7 @@ class AppContainer:
         hooks = SessionHooksFactory(
             self.registry, self.profiles, self.policy, self.history, self.schema_cache, self.edits.plans,
         )
-        self.sessions = SessionManager(self.connections, self.profiles, hooks)
+        self.sessions = SessionManager(self.connections, self.profiles, hooks, jobs=JobRegistry())
         self._stop = threading.Event()
         self._housekeeper: threading.Thread | None = None
 

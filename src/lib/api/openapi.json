@@ -1780,6 +1780,156 @@
         }
       }
     },
+    "/data/jobs": {
+      "get": {
+        "tags": [
+          "data"
+        ],
+        "summary": "List Jobs",
+        "description": "Newest first: running and finished, until cleared (D-06-10).",
+        "operationId": "list_jobs_data_jobs_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/JobInfo"
+                  },
+                  "title": "Response List Jobs Data Jobs Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/data/jobs/cancel": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Cancel Job",
+        "description": "The WebSocket's `cancel`, for a job whose dialog is gone: a job that has ended is left as it is.",
+        "operationId": "cancel_job_data_jobs_cancel_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobCancelRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/data/jobs/clear": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Clear Jobs",
+        "description": "Forget the jobs that have ended (the Jobs list's Clear finished).",
+        "operationId": "clear_jobs_data_jobs_clear_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/settings": {
       "get": {
         "tags": [
@@ -4841,6 +4991,12 @@
               },
               {
                 "$ref": "#/components/schemas/EditOutcomeEvent"
+              },
+              {
+                "$ref": "#/components/schemas/JobProgressEvent"
+              },
+              {
+                "$ref": "#/components/schemas/JobOutcomeEvent"
               }
             ],
             "title": "Event",
@@ -4852,6 +5008,8 @@
                 "edit_outcome": "#/components/schemas/EditOutcomeEvent",
                 "error": "#/components/schemas/ErrorEvent",
                 "finished": "#/components/schemas/FinishedEvent",
+                "job_outcome": "#/components/schemas/JobOutcomeEvent",
+                "job_progress": "#/components/schemas/JobProgressEvent",
                 "message": "#/components/schemas/MessageEvent",
                 "progress": "#/components/schemas/ProgressEvent",
                 "result_set": "#/components/schemas/ResultSetEvent",
@@ -5387,7 +5545,9 @@
               "ok",
               "error",
               "cancelled",
-              "timeout"
+              "timeout",
+              "running",
+              "interrupted"
             ],
             "title": "Status"
           },
@@ -5605,6 +5765,360 @@
           "text"
         ],
         "title": "InsertDocumentRequest"
+      },
+      "JobCancelRequest": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "session_id",
+          "request_id"
+        ],
+        "title": "JobCancelRequest"
+      },
+      "JobError": {
+        "properties": {
+          "line": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line"
+          },
+          "statement": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Statement"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "title": "JobError",
+        "description": "One statement that failed: where, the server's code and its own text (shown, never logged above DEBUG)."
+      },
+      "JobInfo": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "job": {
+            "type": "string",
+            "enum": [
+              "dump",
+              "run_file"
+            ],
+            "title": "Job"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Started At"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobProgressEvent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobOutcomeEvent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "session_id",
+          "request_id",
+          "job",
+          "title",
+          "profile_id",
+          "started_at"
+        ],
+        "title": "JobInfo",
+        "description": "A job of this backend run, as the Jobs list shows it (GET /data/jobs)."
+      },
+      "JobObject": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "rows": {
+            "type": "integer",
+            "title": "Rows",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind",
+          "name"
+        ],
+        "title": "JobObject",
+        "description": "One object of a dump, with the rows written for it."
+      },
+      "JobOutcomeEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "job_outcome",
+            "title": "Type",
+            "default": "job_outcome"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "job": {
+            "type": "string",
+            "enum": [
+              "dump",
+              "run_file"
+            ],
+            "title": "Job"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "failed",
+              "rolled_back",
+              "partial",
+              "stopped",
+              "unknown",
+              "not_started"
+            ],
+            "title": "Outcome"
+          },
+          "cancelled": {
+            "type": "boolean",
+            "title": "Cancelled",
+            "default": false
+          },
+          "rows": {
+            "type": "integer",
+            "title": "Rows",
+            "default": 0
+          },
+          "bytes": {
+            "type": "integer",
+            "title": "Bytes",
+            "default": 0
+          },
+          "statements": {
+            "type": "integer",
+            "title": "Statements",
+            "default": 0
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/JobObject"
+            },
+            "type": "array",
+            "title": "Objects",
+            "default": []
+          },
+          "errors": {
+            "items": {
+              "$ref": "#/components/schemas/JobError"
+            },
+            "type": "array",
+            "title": "Errors",
+            "default": []
+          },
+          "error_count": {
+            "type": "integer",
+            "title": "Error Count",
+            "default": 0
+          },
+          "stopped_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StoppedAt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "job",
+          "outcome"
+        ],
+        "title": "JobOutcomeEvent",
+        "description": "How a job ended (R-06-12): sent once, right before the request's `session_state` and `finished`."
+      },
+      "JobProgressEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "job_progress",
+            "title": "Type",
+            "default": "job_progress"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "stage": {
+            "type": "string",
+            "enum": [
+              "starting",
+              "schema",
+              "data",
+              "post_data",
+              "statements",
+              "commit"
+            ],
+            "title": "Stage",
+            "default": "starting"
+          },
+          "object": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Object"
+          },
+          "rows": {
+            "type": "integer",
+            "title": "Rows",
+            "default": 0
+          },
+          "bytes": {
+            "type": "integer",
+            "title": "Bytes",
+            "default": 0
+          },
+          "total_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Bytes"
+          },
+          "statements": {
+            "type": "integer",
+            "title": "Statements",
+            "default": 0
+          },
+          "errors": {
+            "type": "integer",
+            "title": "Errors",
+            "default": 0
+          },
+          "line": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id"
+        ],
+        "title": "JobProgressEvent",
+        "description": "How far a job is (D-06-11): at most every 250 ms, and as each object starts and ends. Cumulative counts."
       },
       "JsonValue": {},
       "Keyspace": {
@@ -8128,6 +8642,25 @@
           "params"
         ],
         "title": "StatementRange"
+      },
+      "StoppedAt": {
+        "properties": {
+          "line": {
+            "type": "integer",
+            "title": "Line"
+          },
+          "statement": {
+            "type": "integer",
+            "title": "Statement"
+          }
+        },
+        "type": "object",
+        "required": [
+          "line",
+          "statement"
+        ],
+        "title": "StoppedAt",
+        "description": "Where a run stopped: the statement that failed, was cancelled or was not sent."
       },
       "TextSelection": {
         "properties": {

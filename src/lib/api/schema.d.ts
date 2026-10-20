@@ -481,6 +481,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/data/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Jobs
+         * @description Newest first: running and finished, until cleared (D-06-10).
+         */
+        get: operations["list_jobs_data_jobs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/data/jobs/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel Job
+         * @description The WebSocket's `cancel`, for a job whose dialog is gone: a job that has ended is left as it is.
+         */
+        post: operations["cancel_job_data_jobs_cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/data/jobs/clear": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Clear Jobs
+         * @description Forget the jobs that have ended (the Jobs list's Clear finished).
+         */
+        post: operations["clear_jobs_data_jobs_clear_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/settings": {
         parameters: {
             query?: never;
@@ -1516,7 +1576,7 @@ export interface components {
             /** Command */
             command: components["schemas"]["ExecuteCommand"] | components["schemas"]["ExportCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"] | components["schemas"]["CommitCommand"] | components["schemas"]["RollbackCommand"] | components["schemas"]["SetAutocommitCommand"] | components["schemas"]["ApplyEditsCommand"];
             /** Event */
-            event: components["schemas"]["StartedEvent"] | components["schemas"]["ResultSetEvent"] | components["schemas"]["RowsEvent"] | components["schemas"]["ResultSetEndEvent"] | components["schemas"]["AffectedEvent"] | components["schemas"]["MessageEvent"] | components["schemas"]["ErrorEvent"] | components["schemas"]["ProgressEvent"] | components["schemas"]["ConfirmationRequiredEvent"] | components["schemas"]["SessionStateEvent"] | components["schemas"]["FinishedEvent"] | components["schemas"]["EditOutcomeEvent"];
+            event: components["schemas"]["StartedEvent"] | components["schemas"]["ResultSetEvent"] | components["schemas"]["RowsEvent"] | components["schemas"]["ResultSetEndEvent"] | components["schemas"]["AffectedEvent"] | components["schemas"]["MessageEvent"] | components["schemas"]["ErrorEvent"] | components["schemas"]["ProgressEvent"] | components["schemas"]["ConfirmationRequiredEvent"] | components["schemas"]["SessionStateEvent"] | components["schemas"]["FinishedEvent"] | components["schemas"]["EditOutcomeEvent"] | components["schemas"]["JobProgressEvent"] | components["schemas"]["JobOutcomeEvent"];
         };
         /**
          * ExportCommand
@@ -1750,7 +1810,7 @@ export interface components {
              * Status
              * @enum {string}
              */
-            status: "ok" | "error" | "cancelled" | "timeout";
+            status: "ok" | "error" | "cancelled" | "timeout" | "running" | "interrupted";
             /** Error */
             error?: string | null;
             /** Id */
@@ -1809,6 +1869,182 @@ export interface components {
              * @default false
              */
             confirmed: boolean;
+        };
+        /** JobCancelRequest */
+        JobCancelRequest: {
+            /** Session Id */
+            session_id: string;
+            /** Request Id */
+            request_id: string;
+        };
+        /**
+         * JobError
+         * @description One statement that failed: where, the server's code and its own text (shown, never logged above DEBUG).
+         */
+        JobError: {
+            /** Line */
+            line?: number | null;
+            /** Statement */
+            statement?: number | null;
+            /** Code */
+            code?: string | null;
+            /** Message */
+            message: string;
+        };
+        /**
+         * JobInfo
+         * @description A job of this backend run, as the Jobs list shows it (GET /data/jobs).
+         */
+        JobInfo: {
+            /** Session Id */
+            session_id: string;
+            /** Request Id */
+            request_id: string;
+            /**
+             * Job
+             * @enum {string}
+             */
+            job: "dump" | "run_file";
+            /** Title */
+            title: string;
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            progress?: components["schemas"]["JobProgressEvent"] | null;
+            outcome?: components["schemas"]["JobOutcomeEvent"] | null;
+        };
+        /**
+         * JobObject
+         * @description One object of a dump, with the rows written for it.
+         */
+        JobObject: {
+            /** Kind */
+            kind: string;
+            /** Name */
+            name: string;
+            /**
+             * Rows
+             * @default 0
+             */
+            rows: number;
+        };
+        /**
+         * JobOutcomeEvent
+         * @description How a job ended (R-06-12): sent once, right before the request's `session_state` and `finished`.
+         */
+        JobOutcomeEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "job_outcome";
+            /** Request Id */
+            request_id: string;
+            /**
+             * Job
+             * @enum {string}
+             */
+            job: "dump" | "run_file";
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "completed" | "failed" | "rolled_back" | "partial" | "stopped" | "unknown" | "not_started";
+            /**
+             * Cancelled
+             * @default false
+             */
+            cancelled: boolean;
+            /**
+             * Rows
+             * @default 0
+             */
+            rows: number;
+            /**
+             * Bytes
+             * @default 0
+             */
+            bytes: number;
+            /**
+             * Statements
+             * @default 0
+             */
+            statements: number;
+            /** Path */
+            path?: string | null;
+            /**
+             * Objects
+             * @default []
+             */
+            objects: components["schemas"]["JobObject"][];
+            /**
+             * Errors
+             * @default []
+             */
+            errors: components["schemas"]["JobError"][];
+            /**
+             * Error Count
+             * @default 0
+             */
+            error_count: number;
+            stopped_at?: components["schemas"]["StoppedAt"] | null;
+            /**
+             * Warnings
+             * @default []
+             */
+            warnings: string[];
+        };
+        /**
+         * JobProgressEvent
+         * @description How far a job is (D-06-11): at most every 250 ms, and as each object starts and ends. Cumulative counts.
+         */
+        JobProgressEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "job_progress";
+            /** Request Id */
+            request_id: string;
+            /**
+             * Stage
+             * @default starting
+             * @enum {string}
+             */
+            stage: "starting" | "schema" | "data" | "post_data" | "statements" | "commit";
+            /** Object */
+            object?: string | null;
+            /**
+             * Rows
+             * @default 0
+             */
+            rows: number;
+            /**
+             * Bytes
+             * @default 0
+             */
+            bytes: number;
+            /** Total Bytes */
+            total_bytes?: number | null;
+            /**
+             * Statements
+             * @default 0
+             */
+            statements: number;
+            /**
+             * Errors
+             * @default 0
+             */
+            errors: number;
+            /** Line */
+            line?: number | null;
         };
         JsonValue: unknown;
         /**
@@ -2829,6 +3065,16 @@ export interface components {
             repeat: number;
             /** Params */
             params: string[];
+        };
+        /**
+         * StoppedAt
+         * @description Where a run stopped: the statement that failed, was cancelled or was not sent.
+         */
+        StoppedAt: {
+            /** Line */
+            line: number;
+            /** Statement */
+            statement: number;
         };
         /** TextSelection */
         TextSelection: {
@@ -3883,6 +4129,99 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["EditPreview"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_jobs_data_jobs_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobInfo"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_job_data_jobs_cancel_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["JobCancelRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    clear_jobs_data_jobs_clear_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

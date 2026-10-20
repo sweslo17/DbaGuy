@@ -128,6 +128,16 @@ export type EditOutcomeEvent = S["EditOutcomeEvent"];
 export type EditOutcome = EditOutcomeEvent["outcome"];
 /** Grid editing (spec ⑤ §3.7): a table tab's staged edits as `workspace.json` keeps them. */
 export type StagedEditsFile = S["StagedEditsFile"];
+/** Data tools (spec ⑥ D-06-11): how far a job is, at most every 250 ms (cumulative counts). */
+export type JobProgressEvent = S["JobProgressEvent"];
+/** Data tools (spec ⑥ R-06-12): how a job ended, sent once right before its `session_state` and `finished`. */
+export type JobOutcomeEvent = S["JobOutcomeEvent"];
+/** "completed", "failed", "rolled_back", "partial", "stopped", "unknown" or "not_started"; a cancel is `cancelled`. */
+export type JobOutcomeKind = JobOutcomeEvent["outcome"];
+/** Data tools: a statement that failed (line, statement number, the server's code and text). */
+export type JobError = S["JobError"];
+/** Data tools (spec ⑥ D-06-10): a job of this backend run, as `GET /data/jobs` lists it. */
+export type JobInfo = S["JobInfo"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

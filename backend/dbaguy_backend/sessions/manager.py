@@ -1,7 +1,8 @@
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
 from uuid import UUID, uuid4
 
 from loguru import logger
@@ -12,6 +13,7 @@ from ..domain.metadata import ServerInfo
 from ..services.connection_service import ConnectionService
 from ..services.profile_service import ProfileService
 from .hooks import SessionHooksFactory
+from .jobs.registry import JobRegistry
 from .worker import Emitter, SessionWorker
 
 
@@ -36,16 +38,18 @@ class _Entry:
 
 
 class SessionManager:
-    """User sessions (one per editor tab). Closed explicitly or after idling without a WebSocket."""
+    """User sessions (one per editor tab, one per data-tools job). Closed explicitly, or once idle without a WebSocket:
+    nothing running or queued (D-06-10), and no attach and no request ending for `idle_timeout`."""
 
     def __init__(
         self, connections: ConnectionService, profiles: ProfileService, hooks: SessionHooksFactory | None = None,
-        idle_timeout: float = 600.0,
+        idle_timeout: float = 600.0, jobs: JobRegistry | None = None,
     ) -> None:
         self._connections = connections
         self._profiles = profiles
         self._hooks = hooks  # None: workers keep their defaults (everything runs, nothing is recorded)
         self._idle_timeout = idle_timeout
+        self.jobs = jobs if jobs is not None else JobRegistry()
         self._sessions: dict[str, _Entry] = {}
         self._lock = threading.Lock()
 
@@ -61,7 +65,10 @@ class SessionManager:
             worker.start()
             server = worker.call(lambda c: c.server_info())
             if self._hooks is not None:
-                worker.configure(self._hooks.build(profile.id, server.current_database))  # before it is registered
+                hooks = self._hooks.build(profile.id, server.current_database)
+                jobs = replace(hooks.jobs, announce=partial(self.jobs.begin, session_id, profile.id),
+                               report=partial(self.jobs.report, session_id))
+                worker.configure(replace(hooks, jobs=jobs))  # before it is registered
         except BaseException:
             worker.close()  # whatever failed, never leave the thread, connection or tunnel behind
             raise
@@ -85,7 +92,8 @@ class SessionManager:
         entry = self._entry(session_id)
         with self._lock:
             entry.attached += 1
-        entry.worker.set_emitter(emit)
+        # A reloaded window gets the last progress or the outcome of the session's job first (D-06-10, pre-flight M2)
+        entry.worker.attach_emitter(emit)
         entry.worker.replay_state()  # a client attaching mid-transaction learns the state before any `finished`
         return entry.worker
 
@@ -141,21 +149,34 @@ class SessionManager:
             except Exception:
                 logger.exception("{} failed for session {}", what, session_id)
 
-    def _is_idle(self, entry: _Entry) -> bool:
-        return entry.attached == 0 and time.monotonic() - entry.detached_at >= self._idle_timeout
+    def _is_quiet(self, entry: _Entry) -> bool:
+        """No WebSocket, and no attach and no request ending for `idle_timeout`. The caller holds the lock."""
+        return not entry.attached and (
+            time.monotonic() - max(entry.detached_at, entry.worker.finished_at) >= self._idle_timeout)
 
     def _idle_ids(self) -> list[str]:
+        """Quiet sessions with nothing running or queued: a job outlives its dialog and the window (D-06-10).
+        `busy()` waits on the worker's state lock, which a cancel holds across a PostgreSQL cancel (up to 3 s), so it
+        is asked outside this manager's lock: `attach` takes that lock on the event loop."""
         with self._lock:
-            return [sid for sid, e in self._sessions.items() if self._is_idle(e)]
+            quiet = [(sid, e.worker) for sid, e in self._sessions.items() if self._is_quiet(e)]
+        return [sid for sid, worker in quiet if not worker.busy()]
 
     def _pop_and_close(self, session_id: str, idle_only: bool = False) -> bool:
-        """Remove a session and close its worker. False when it is gone (or, with idle_only, no longer idle).
+        """Remove a session and close its worker. False when it is gone (or, with idle_only, no longer idle: busy,
+        or attached or active since). A job of it that never reported its outcome is listed as unknown (pre-flight L3).
 
         Never raises for a failing worker: bulk callers (reaper, profile deletion, shutdown) must reach every session.
         """
+        if idle_only:
+            with self._lock:
+                entry = self._sessions.get(session_id)
+            if entry is None or entry.worker.busy():  # outside the lock, as in _idle_ids
+                return False
         with self._lock:
             entry = self._sessions.get(session_id)
-            if entry is None or (idle_only and not self._is_idle(entry)):
+            # A request needs an attached client to be submitted, so one submitted since `busy()` shows here
+            if entry is None or (idle_only and not self._is_quiet(entry)):
                 return False
             del self._sessions[session_id]
         try:
@@ -163,4 +184,7 @@ class SessionManager:
         except Exception:
             logger.exception("Error while closing session {}", session_id)
         logger.info("Closed session {}", session_id)
+        if (abandoned := self.jobs.abandon(session_id)) > 0:
+            logger.warning("Session {} closed before {} of its job(s) reported an outcome: listed as unknown",
+                           session_id, abandoned)
         return True

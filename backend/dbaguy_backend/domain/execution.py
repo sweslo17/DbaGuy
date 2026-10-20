@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .classification import Classification, GuardReason
 from .column_category import ColumnCategory
+from .data_jobs import JobOutcomeEvent, JobProgressEvent
 from .formats import FormatKind, RowFormatOptions
 
 Presentation = Literal["grid", "plan"]  # "plan": an EXPLAIN / ADVISE / profile result the client may show as a plan
@@ -326,7 +327,8 @@ class EditOutcomeEvent(BaseModel):
 
 ServerEvent = Annotated[
     StartedEvent | ResultSetEvent | RowsEvent | ResultSetEndEvent | AffectedEvent | MessageEvent | ErrorEvent
-    | ProgressEvent | ConfirmationRequiredEvent | SessionStateEvent | FinishedEvent | EditOutcomeEvent,
+    | ProgressEvent | ConfirmationRequiredEvent | SessionStateEvent | FinishedEvent | EditOutcomeEvent
+    | JobProgressEvent | JobOutcomeEvent,
     Field(discriminator="type"),
 ]
 

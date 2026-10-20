@@ -1,12 +1,13 @@
 import asyncio
 from contextlib import suppress
-from typing import Any
+from typing import Any, get_args
 
 from fastapi import APIRouter, Depends, Response, WebSocket, WebSocketDisconnect
 from loguru import logger
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from ..container import AppContainer
+from ..domain.data_jobs import JobCommand, JobKind, JobOutcomeEvent
 from ..domain.errors import DomainError, NotFound, SessionNotFound
 from ..domain.execution import (
     ApplyEditsCommand,
@@ -24,6 +25,7 @@ router = APIRouter(prefix="/sessions", tags=["sessions"])
 _COMMANDS: TypeAdapter[Any] = TypeAdapter(ClientCommand)
 _CLOSE_UNAUTHORIZED = 4401
 _CLOSE_SESSION_NOT_FOUND = 4404
+_JOB_TYPES: frozenset[str] = frozenset(get_args(JobKind))  # a job command's `type` is its job kind (run_file, dump)
 
 
 async def _reject(websocket: WebSocket, code: int, reason: str) -> None:
@@ -33,9 +35,11 @@ async def _reject(websocket: WebSocket, code: int, reason: str) -> None:
 
 async def _fail_request(
     outbox: asyncio.Queue[dict[str, Any] | None], request_id: str, message: str, code: str, *, apply: bool = False,
+    job: JobKind | None = None,
 ) -> None:
     """Answer a request the worker never ran: an error plus the `finished` every request must end with — for an
-    apply, with its `edit_outcome` (rolled back: nothing was sent) right before it (ruling E1, pre-flight M1).
+    apply, with its `edit_outcome` (rolled back: nothing was sent) right before it (ruling E1, pre-flight M1); for a
+    job, with its `job_outcome` (not_started) there (spec ⑥ R-06-12, 06a pre-flight M1).
 
     `in_transaction` is false because the connection belongs to the worker thread and may already be gone.
     """
@@ -43,6 +47,9 @@ async def _fail_request(
     if request_id:
         if apply:
             await outbox.put(EditOutcomeEvent(request_id=request_id, outcome="rolled_back").model_dump(mode="json"))
+        if job is not None:
+            outcome = JobOutcomeEvent(request_id=request_id, job=job, outcome="not_started")
+            await outbox.put(outcome.model_dump(mode="json"))
         finished = FinishedEvent(request_id=request_id, elapsed_ms=0, in_transaction=False, cancelled=False)
         await outbox.put(finished.model_dump(mode="json"))
 
@@ -99,8 +106,10 @@ async def session_socket(websocket: WebSocket, session_id: str) -> None:
             except ValidationError as exc:
                 request_id = str(raw.get("request_id", "")) if isinstance(raw, dict) else ""
                 apply = isinstance(raw, dict) and raw.get("type") == "apply_edits"
+                job = raw["type"] if isinstance(raw, dict) and raw.get("type") in _JOB_TYPES else None
                 await _fail_request(
                     outbox, request_id, f"Invalid command: {exc.errors()[0]['msg']}", "invalid_command", apply=apply,
+                    job=job,
                 )
                 continue
             try:
@@ -112,7 +121,8 @@ async def session_socket(websocket: WebSocket, session_id: str) -> None:
                     await asyncio.to_thread(worker.submit, command)
             except DomainError as exc:
                 apply = isinstance(command, ApplyEditsCommand)
-                await _fail_request(outbox, command.request_id, exc.message, exc.code, apply=apply)
+                job = command.job_kind if isinstance(command, JobCommand) else None
+                await _fail_request(outbox, command.request_id, exc.message, exc.code, apply=apply, job=job)
     except WebSocketDisconnect:
         pass
     finally:

@@ -1,0 +1,99 @@
+"""Data tools (spec ⑥): a job — a dump, a run of a SQL file — runs on a session of its own and ends with exactly one
+outcome (R-06-12, ⑤ E1). Its WebSocket events, and what the job list shows of it (D-06-10)."""
+
+from datetime import datetime
+from typing import ClassVar, Literal
+from uuid import UUID
+
+from pydantic import BaseModel
+
+JobKind = Literal["dump", "run_file"]
+# R-06-12. Dump: completed or failed (nothing written). Run, all or nothing: completed, rolled_back, partial (the file
+# or a DDL ended the transaction), unknown (the link died during COMMIT). Run, statement by statement: completed,
+# stopped, unknown (the link died while a statement ran). Any job: not_started (cancelled while queued, its session
+# closed first, or refused before anything was sent). A cancel is the `cancelled` flag on one of these, never an outcome.
+JobOutcomeKind = Literal["completed", "failed", "rolled_back", "partial", "stopped", "unknown", "not_started"]
+JobStage = Literal["starting", "schema", "data", "post_data", "statements", "commit"]
+
+MAX_JOB_ERRORS = 100  # D-06-11: errors kept with their text ("skip and continue"); the rest are only counted
+MAX_JOB_MESSAGES = 200  # D-06-11: server messages (NOTICE, PRINT) forwarded per job; the rest are only counted
+PROGRESS_INTERVAL_S = 0.25  # D-06-11: at most one job_progress this often (and at each object's start and end)
+MAX_JOBS_LISTED = 200  # the job list keeps this many; the oldest finished ones go first
+
+
+class JobCommand(BaseModel):
+    """A WebSocket command that starts a job (D-06-2): the worker runs every subclass through one path."""
+
+    job_kind: ClassVar[JobKind]
+    request_id: str
+
+
+class JobError(BaseModel):
+    """One statement that failed: where, the server's code and its own text (shown, never logged above DEBUG)."""
+
+    line: int | None = None
+    statement: int | None = None  # 1-based among the file's statements
+    code: str | None = None
+    message: str
+
+
+class StoppedAt(BaseModel):
+    """Where a run stopped: the statement that failed, was cancelled or was not sent."""
+
+    line: int
+    statement: int
+
+
+class JobObject(BaseModel):
+    """One object of a dump, with the rows written for it."""
+
+    kind: str  # table, view, sequence, function, …
+    name: str  # as the file names it: schema.name
+    rows: int = 0
+
+
+class JobProgressEvent(BaseModel):
+    """How far a job is (D-06-11): at most every 250 ms, and as each object starts and ends. Cumulative counts."""
+
+    type: Literal["job_progress"] = "job_progress"
+    request_id: str
+    stage: JobStage = "starting"
+    object: str | None = None  # the object being written or read (dump), schema.name
+    rows: int = 0
+    bytes: int = 0  # written (dump) or read (run) so far
+    total_bytes: int | None = None  # the file's size (run)
+    statements: int = 0  # sent (run)
+    errors: int = 0  # skipped (run, statement by statement, continue)
+    line: int | None = None  # where the run is
+
+
+class JobOutcomeEvent(BaseModel):
+    """How a job ended (R-06-12): sent once, right before the request's `session_state` and `finished`."""
+
+    type: Literal["job_outcome"] = "job_outcome"
+    request_id: str
+    job: JobKind
+    outcome: JobOutcomeKind
+    cancelled: bool = False
+    rows: int = 0
+    bytes: int = 0
+    statements: int = 0  # sent and done (run)
+    path: str | None = None  # the file written (dump) or read (run)
+    objects: list[JobObject] = []
+    errors: list[JobError] = []  # the first MAX_JOB_ERRORS
+    error_count: int = 0
+    stopped_at: StoppedAt | None = None
+    warnings: list[str] = []
+
+
+class JobInfo(BaseModel):
+    """A job of this backend run, as the Jobs list shows it (GET /data/jobs)."""
+
+    session_id: str
+    request_id: str
+    job: JobKind
+    title: str
+    profile_id: UUID
+    started_at: datetime
+    progress: JobProgressEvent | None = None  # the last one sent
+    outcome: JobOutcomeEvent | None = None  # set once the job ended
