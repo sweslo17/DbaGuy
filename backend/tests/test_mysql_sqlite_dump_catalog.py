@@ -3,12 +3,13 @@
 dependencies and with the functions they call, SQLite's counters, view triggers and left-out virtual tables, and what
 is not written counted (pre-flight H6); the snapshots (A3: MySQL's SHOW CREATE inside one, InnoDB only (M6), read
 under the restore's sql_mode (M5); A5: SQLite's read transaction and other connections' writes). A `drop_first` script
-built from each catalog in the order Task 8's DumpScript writes it runs twice into a scratch database or file through
-Run SQL file and reads back the same: a scratch schema, and MySQL's seed databases (H7). "The same" is an independent
-inventory read as root (tests/mysql_inventory.py, tests/sqlite_inventory.py: review T10), never the dump's reader.
-The review's cases (T1–T8): what cannot be written takes what needs it out, said by name; MERGE rows; collations;
-one column query; a `*/` in a version comment's string. Scratch: MySQL databases `zz_06_dumpcat_*` /
-`zz_06_restore_*`, dropped (and their grant revoked) by name; SQLite files in `tmp_path`."""
+written from each catalog by Task 8's DumpScript (SQLite's rows by its InsertBatcher) runs twice into a scratch
+database or file through Run SQL file and reads back the same: a scratch schema, and MySQL's seed databases (H7). "The
+same" is an independent inventory read as root (tests/mysql_inventory.py, tests/sqlite_inventory.py: review T10),
+never the dump's reader. The review's cases (T1–T9): what cannot be written takes what needs it out, said by name;
+MERGE rows; collations; one column query; a `*/` in a version comment's string; trailing comments. Scratch: MySQL
+databases `zz_06_dumpcat_*` / `zz_06_restore_*`, dropped (and their grant revoked) by name; SQLite files in
+`tmp_path`."""
 
 import sqlite3
 from pathlib import Path
@@ -18,30 +19,23 @@ import pytest
 
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.adapters.dump import DumpCatalog
-from dbaguy_backend.adapters.mysql.dump import (
-    DEFINERS_LEFT_OUT, RESTORE_SQL_MODE, RESTORE_TIME_ZONE, restored_settings, strip_definer,
-)
+from dbaguy_backend.adapters.mysql.dump import DEFINERS_LEFT_OUT, restored_settings, strip_definer
 from dbaguy_backend.adapters.sqlite.dump import JOURNAL_WARNING
 from dbaguy_backend.adapters.sqlite.dump import SNAPSHOT_TEXT as SQLITE_SNAPSHOT
 from dbaguy_backend.domain.data_jobs import DumpObjectKinds, DumpScope
 from dbaguy_backend.domain.errors import NotFound, ValidationFailed
 from dbaguy_backend.domain.execution import RunFileCommand
-from dbaguy_backend.domain.profiles import SqliteProfile
-from dbaguy_backend.sql.dialects import Dialect, qualified, quote_ident, quote_literal
+from dbaguy_backend.domain.profiles import Engine, SqliteProfile
+from dbaguy_backend.sql.bulk_insert import InsertBatcher
+from dbaguy_backend.sql.dialects import Dialect, qualified, quote_ident
+from dbaguy_backend.sql.dump_script import RESTORE_SQL_MODE, RESTORE_TIME_ZONE, DumpScript, insert_text, table_sql
+from dbaguy_backend.sql.select_builder import build_copy_select
 from tests import mysql_inventory, sqlite_inventory
 from tests.data_support import DataApp, scratch_database
 from tests.edit_support import ScratchDb, scratch_db
 from tests.support import requires_mysql
 
 UTF8MB4 = "SESSION character_set_client = 'utf8mb4', SESSION collation_connection = 'utf8mb4_0900_ai_ci'"
-
-# The restore settings and the reset sql/dump_script.py writes around a MySQL and a SQLite dump (spec §3.3.3, Task 8)
-RESTORE = {
-    "mysql": ("SET NAMES utf8mb4", "SET FOREIGN_KEY_CHECKS = 0", f"SET SESSION sql_mode = '{RESTORE_SQL_MODE}'",
-              f"SET time_zone = '{RESTORE_TIME_ZONE}'"),
-    "sqlite": ("PRAGMA foreign_keys = OFF", "PRAGMA defer_foreign_keys = ON"),
-}
-RESET = {"mysql": ("SET FOREIGN_KEY_CHECKS = 1",), "sqlite": ("PRAGMA foreign_keys = ON",)}
 
 
 @pytest.mark.parametrize("account", [
@@ -73,18 +67,14 @@ def same(found: DumpCatalog) -> tuple:
     return objects, [(table.name, table.columns, table.references) for table in found.tables]
 
 
-def _text(statements, compound: bool = False) -> str:
-    if compound:  # sql/dump_script.object_text
-        return "DELIMITER ;;\n" + "".join(f"{statement};;\n" for statement in statements) + "DELIMITER ;\n"
-    return "".join(f"{statement};\n" for statement in statements)
-
-
 def script(engine: str, found: DumpCatalog, data: list[str]) -> str:
-    """A `drop_first` dump's text in Task 8's order: settings, the DROPs of the objects after the data newest first and
-    then of those before it, the objects before the data, the rows (`data`), the objects after it, the reset."""
-    drops = [item.drop for item in (*reversed(found.post), *reversed(found.pre)) if item.drop]
-    return "".join([_text(RESTORE[engine]), _text(drops), *(_text(item.statements, item.compound) for item in found.pre),
-                    _text(data), *(_text(item.statements, item.compound) for item in found.post), _text(RESET[engine])])
+    """A `drop_first` dump's text as sql/dump_script.DumpScript writes it: the header and settings, the DROPs of the
+    objects after the data newest first and then of those before it, the objects before the data, the rows (`data`),
+    the objects after it, the reset and the last line."""
+    dialect = Dialect.MYSQL if engine == "mysql" else Dialect.SQLITE
+    text = DumpScript(dialect, Engine(engine), found, content="both", drop_first=True, created="2026-10-20T00:00:00Z")
+    return (text.head() + text.pre() + "".join(insert_text(dialect, statement) for statement in data) + text.post()
+            + text.tail(0))
 
 
 def restore(app: DataApp, body: dict, path: Path, mode: str, times: int = 2) -> None:
@@ -575,25 +565,19 @@ def test_a_sqlite_dump_holds_other_writers_back_only_without_wal(tmp_path, journ
         db.close()
 
 
-def _sqlite_literal(value: object) -> str:
-    if value is None:
-        return "NULL"
-    if isinstance(value, bytes):
-        return f"X'{value.hex()}'"
-    return quote_literal(Dialect.SQLITE, value) if isinstance(value, str) else repr(value)
-
-
 def sqlite_rows(source: Path, found: DumpCatalog) -> list[str]:
-    """Each table's rows as INSERTs of the copied columns (the dump's own INSERTs are Task 8's)."""
+    """Each table's rows as the dump writes them: read with build_copy_select, written by InsertBatcher."""
     conn = sqlite3.connect(source)
     try:
         statements = []
         for table in found.tables:
-            columns = [quote_ident(Dialect.SQLITE, column.name) for column in table.columns if column.copied]
-            for row in conn.execute(f"SELECT {', '.join(columns)} FROM {quote_ident(Dialect.SQLITE, table.table)}"):
-                values = ", ".join(_sqlite_literal(value) for value in row)
-                statements.append(f"INSERT INTO {quote_ident(Dialect.SQLITE, table.table)} ({', '.join(columns)}) "
-                                  f"VALUES ({values})")
+            batcher = InsertBatcher(Dialect.SQLITE, table_sql(Dialect.SQLITE, table),
+                                    [column for column in table.columns if column.copied])
+            for row in conn.execute(build_copy_select(Dialect.SQLITE, table.schema, table.table, table.columns)):
+                if (statement := batcher.add(row)) is not None:
+                    statements.append(statement)
+            if (statement := batcher.flush()) is not None:
+                statements.append(statement)
         return statements
     finally:
         conn.close()
@@ -712,5 +696,74 @@ def test_a_sqlite_dump_leaves_out_what_uses_a_virtual_table_and_says_so(tmp_path
             assert conn.execute("SELECT COUNT(*) FROM plain").fetchone() == (2,)
         finally:
             conn.close()
+    finally:
+        db.close()
+
+
+# -- Trailing comments (06a Task 6 review T9, written by Task 8's dump_script)
+
+
+@pytest.mark.parametrize("mode", ["all_or_nothing", "statements"])
+def test_a_sqlite_objects_trailing_comment_never_takes_its_terminator(tmp_path, mode):
+    """SQLite keeps a view's and an index's trailing `-- …`, and a block comment left open at the end: written as they
+    are, the next statement would run into the comment, or the rest of the file would be one. The file restores twice;
+    only the comments do not come back (a statement ends at its last token)."""
+    db = scratch_db("sqlite", tmp_path)
+    db.execute(
+        "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)",
+        "CREATE VIEW v1 AS SELECT a FROM t -- the view's own comment",
+        "CREATE INDEX t_b ON t (b) -- the index's\r",
+        "CREATE VIEW v2 AS SELECT b FROM t /* left open",
+        "CREATE VIEW v3 AS SELECT a FROM v1",
+        "INSERT INTO t VALUES (1, 'x'), (2, NULL)",
+    )
+    try:
+        found = sqlite_catalog(db.file)
+        assert [item.statements[0] for item in found.post if item.kind in ("index", "view")] == [
+            "CREATE INDEX t_b ON t (b) -- the index's\r", "CREATE VIEW v1 AS SELECT a FROM t -- the view's own comment",
+            "CREATE VIEW v2 AS SELECT b FROM t /* left open", "CREATE VIEW v3 AS SELECT a FROM v1"]
+        target = sqlite_restored(db.file, found, tmp_path, mode)
+        source, restored = sqlite_inventory.inventory(db.file), sqlite_inventory.inventory(target)
+        assert {row[1]: row[3] for row in restored["master"]} == {
+            "t": "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)", "t_b": "CREATE INDEX t_b ON t (b)",
+            "v1": "CREATE VIEW v1 AS SELECT a FROM t", "v2": "CREATE VIEW v2 AS SELECT b FROM t",
+            "v3": "CREATE VIEW v3 AS SELECT a FROM v1"}
+        source["master"] = restored["master"]  # the comments
+        assert sqlite_inventory.differences(source, restored) == []
+    finally:
+        db.close()
+
+
+@requires_mysql
+def test_a_mysql_programs_trailing_comment_never_takes_its_terminator(tmp_path):
+    """SHOW CREATE keeps a trailing `# …` or `-- …` of a program whose body is one statement (not after a BEGIN …
+    END's END, probed): between DELIMITER lines its `;;` would be part of the comment, and the program would swallow
+    the SET after it. The file restores twice, and every program works."""
+    db = scratch_db("mysql", tmp_path)
+    try:
+        with scratch_database("mysql", "dumpcat") as (name, admin), \
+                scratch_database("mysql", "restore") as (target, _):
+            admin.run_in(
+                name,
+                "CREATE TABLE t (id INT PRIMARY KEY, n INT)",
+                "CREATE DEFINER=`dbaguy`@`%` PROCEDURE p_hash() SELECT COUNT(*) FROM t # done",
+                "CREATE DEFINER=`dbaguy`@`%` FUNCTION f_dash() RETURNS INT DETERMINISTIC RETURN 7 -- seven",
+                "CREATE DEFINER=`dbaguy`@`%` TRIGGER t_bi BEFORE INSERT ON t FOR EACH ROW SET NEW.n = f_dash() # n",
+                "CREATE DEFINER=`dbaguy`@`%` VIEW v AS SELECT f_dash() AS seven",
+                "CREATE DEFINER=`dbaguy`@`%` EVENT ev ON SCHEDULE AT '2030-01-01 00:00:00' "
+                "DO DELETE FROM t WHERE id < 0 -- never before 2030",
+                "INSERT INTO t (id) VALUES (1)",
+            )
+            found = mysql_catalog(db, name)
+            written = [program(found, each).statements[1] for each in ("p_hash", "f_dash", "t_bi", "ev")]
+            assert [text.rsplit(" ", 1)[-1] for text in written] == ["done", "seven", "n", "2030"]  # the comments
+            mysql_restored(db, found, name, target, tmp_path)
+            assert behaviour(target, "SELECT n FROM t", "SELECT seven FROM v") == [[(7,)], [(7,)]]
+            conn = mysql_inventory.root(target)
+            try:
+                mysql_inventory.run(conn, "INSERT INTO t (id) VALUES (2)")  # the trigger calls the function
+                assert mysql_inventory.run(conn, "SELECT n FROM t WHERE id = 2") == [(7,)]
+            finally:
+                conn.close()
     finally:
         db.close()

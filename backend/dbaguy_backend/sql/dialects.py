@@ -1,4 +1,5 @@
 import json
+import math
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -241,6 +242,20 @@ KEYWORD_ONLY_DIALECTS: frozenset[Dialect] = frozenset({Dialect.SQLPP})
 CASE_SENSITIVE_IDENTIFIERS: frozenset[Dialect] = frozenset({Dialect.SQLPP})
 _DATE_ONLY = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
 _DATE_SPACE_TIME = re.compile(r"(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})", re.ASCII)
+# A space before a time's offset (`12:34:56 +08:00`, as SSMS and CAST write a datetimeoffset): with the `T`, SQL Server
+# refuses it (241, ⑥ A15), so the two are joined
+_SPACE_BEFORE_OFFSET = re.compile(r"(?<=\d)\s+(?=[+-]\d{2}:\d{2}$)", re.ASCII)
+# What SQLite's REAL writes for the values a number literal cannot (⑥ R-06-11, L3): 9e999 is read as infinity, while
+# 'inf' would be stored as text; NaN is stored as NULL anyway. The keys are Python's text of the float (repr).
+# PostgreSQL reads the quoted text ('inf', 'nan'); MySQL and SQL Server floats hold none of them (⑥ S3).
+_NON_FINITE: dict[Dialect, dict[str, str]] = {Dialect.SQLITE: {"inf": "9e999", "-inf": "-9e999", "nan": "NULL"}}
+# −0.0: a number literal without an exponent is an exact numeric, whose zero has no sign. MySQL reads one with an
+# exponent as a DOUBLE (06a Task 4); PostgreSQL's float input reads the quoted text (_QUOTED_NEGATIVE_ZERO)
+_NEGATIVE_ZERO: dict[Dialect, str] = {Dialect.MYSQL: "-0.0e0"}
+_QUOTED_NEGATIVE_ZERO: frozenset[Dialect] = frozenset({Dialect.POSTGRES})
+# Writing an identity column's own values (⑥ D-06-5): PostgreSQL's GENERATED ALWAYS needs OVERRIDING SYSTEM VALUE in
+# the INSERT (P1); SQL Server's IDENTITY needs IDENTITY_INSERT on, one table at a time (A S2)
+_OVERRIDING: dict[Dialect, str] = {Dialect.POSTGRES: "OVERRIDING SYSTEM VALUE"}
 NUMERIC_LITERAL = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?", re.ASCII)  # text that can be written as a bare number
 
 
@@ -314,8 +329,39 @@ def datetime_literal(dialect: Dialect, text: str, *, backslash_escapes: bool | N
         if _DATE_ONLY.fullmatch(text):
             text = text.replace("-", "")
         elif found := _DATE_SPACE_TIME.match(text):
-            text = f"{found.group(1)}T{found.group(2)}{text[found.end():]}"
+            text = _SPACE_BEFORE_OFFSET.sub("", f"{found.group(1)}T{found.group(2)}{text[found.end():]}")
     return quote_literal(dialect, text, backslash_escapes=backslash_escapes)
+
+
+def non_finite_literal(dialect: Dialect, text: str) -> str | None:
+    """How the dialect writes Python's `inf`, `-inf` or `nan` as a number; None: as quoted text (PostgreSQL reads
+    'inf' and 'nan' itself; MySQL and SQL Server cannot hold them)."""
+    return _NON_FINITE.get(dialect, {}).get(text)
+
+
+def float_literal(dialect: Dialect, value: float) -> str | None:
+    """A float as a number literal that reads back as the same value: Python's repr, the shortest text that does
+    (`0.1`, `1e+16`); SQLite's infinities (non_finite_literal); −0.0 with its sign where a plain `-0.0` loses it.
+    None: the value is written as quoted text instead (PostgreSQL's 'inf', 'nan' and '-0.0', which its float input
+    reads)."""
+    text = repr(value)
+    if not math.isfinite(value):
+        return non_finite_literal(dialect, text)
+    if value == 0 and math.copysign(1.0, value) < 0:
+        return None if dialect in _QUOTED_NEGATIVE_ZERO else _NEGATIVE_ZERO.get(dialect, text)
+    return text
+
+
+def overriding_identity(dialect: Dialect) -> str | None:
+    """What an INSERT that writes a GENERATED ALWAYS identity's values says after its column list."""
+    return _OVERRIDING.get(dialect)
+
+
+def identity_insert(dialect: Dialect, table_sql: str) -> tuple[str, str] | None:
+    """The statements around writing an IDENTITY column's values (SQL Server); None where no switch exists."""
+    if dialect is not Dialect.TSQL:
+        return None
+    return f"SET IDENTITY_INSERT {table_sql} ON", f"SET IDENTITY_INSERT {table_sql} OFF"
 
 
 def bool_literal(dialect: Dialect, value: bool) -> str:

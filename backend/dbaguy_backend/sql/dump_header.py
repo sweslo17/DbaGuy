@@ -22,14 +22,24 @@ _FIRST = re.compile(r"-- DbaGuy SQL dump · format (\d+)")
 _FIELD = re.compile(r"-- ([A-Z][A-Za-z ]*): (.*)")
 _SEPARATOR = " · "
 _DROP_FIRST = "drop objects first: "
+# Every character Python's splitlines() breaks a line at (the header is read back with it), and NUL, which no statement
+# may hold: in a comment, each is written as its escape (pre-flight S15)
+_LINE_BREAKS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029\x00"
+_ESCAPED = str.maketrans({ch: ascii(ch)[1:-1] for ch in _LINE_BREAKS})  # "\n" → "\\n", "\u2028" → "\\u2028"
+
+
+def comment_safe(text: str) -> str:
+    """`text` as one line of a `--` comment: a name holding a line break would otherwise end the comment, and the rest
+    of the name would run as SQL (pre-flight S15). `\\r`, `\\n` and the other line breaks are written as text."""
+    return text.translate(_ESCAPED)
 
 
 def header_lines(
     *, engine: Engine, server: str, scope: str, created: str, content: str, snapshot: str, not_included: list[str],
     drop_first: bool,
 ) -> list[str]:
-    """The header's comment lines, without line breaks."""
-    return [
+    """The header's comment lines, without line breaks: each through comment_safe."""
+    lines = [
         f"-- DbaGuy SQL dump · format {FORMAT}",
         f"-- Engine: {engine.value}{_SEPARATOR}{server}{_SEPARATOR}{scope}",
         f"-- Created: {created}",
@@ -38,6 +48,7 @@ def header_lines(
         f"-- Not included: {_SEPARATOR.join(not_included)}",
         f"-- Options: {_DROP_FIRST}{'yes' if drop_first else 'no'}",
     ]
+    return [comment_safe(line) for line in lines]
 
 
 def parse_header(text: str) -> DumpHeader | None:

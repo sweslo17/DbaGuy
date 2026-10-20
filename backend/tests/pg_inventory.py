@@ -14,9 +14,11 @@ from dbaguy_backend.adapters.dump import DumpCatalog
 from dbaguy_backend.adapters.postgres.adapter import PostgresAdapter
 from dbaguy_backend.adapters.postgres.dump import SESSION
 from dbaguy_backend.domain.data_jobs import DumpObjectKinds, DumpScope
+from dbaguy_backend.sql.dialects import Dialect
+from dbaguy_backend.sql.dump_script import RESTORE_SETTINGS
 from tests.support import PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, make_pg_profile
 
-RESTORE = ("SET client_encoding = 'UTF8'", "SET standard_conforming_strings = on", "SET check_function_bodies = false")
+RESTORE = RESTORE_SETTINGS[Dialect.POSTGRES]
 
 
 def connect(database: str, autocommit: bool = True) -> psycopg.Connection:

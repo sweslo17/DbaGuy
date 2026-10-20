@@ -17,8 +17,8 @@ from ..domain.edits import MAX_VALUE_CHARS, CellInput, EditColumn, EditKind, Edi
 from ..domain.errors import ValidationFailed
 from ..domain.well_formed import LONE_SURROGATE
 from .dialects import (
-    NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, datetime_literal, in_list, json_literal, quote_ident,
-    quote_literal, zero_date_as_text,
+    NUMERIC_LITERAL, Dialect, bool_literal, bytes_literal, datetime_literal, float_literal, in_list, json_literal,
+    quote_ident, quote_literal, zero_date_as_text,
 )
 from .jsontext import json_problem
 
@@ -166,8 +166,10 @@ class CellLiterals:
                 return "NULL"
             case Binary():
                 return bytes_literal(self._dialect, cell.hex)
-            case int() | float():
+            case int():
                 return str(cell)
+            case float():  # SQLite's infinity 9e999, MySQL's -0.0e0 (⑥ R-06-11, S3); PostgreSQL's 'inf' and '-0.0'
+                return float_literal(self._dialect, cell) or self._style.quote(self._dialect, repr(cell))
             case _ if category == ColumnCategory.DATETIME:
                 return self._style.datetime(self._dialect, cell)
             case _:

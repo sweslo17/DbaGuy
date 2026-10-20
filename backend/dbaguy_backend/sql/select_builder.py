@@ -1,9 +1,11 @@
-"""The SELECT behind the table-data view: a relation from the object tree, plus an optional filter and sort."""
+"""The SELECT behind the table-data view: a relation from the object tree, plus an optional filter and sort; and the
+SELECT a dump (and later a copy) reads a relation's rows with."""
 
 from collections.abc import Sequence
 
 from pydantic import BaseModel
 
+from ..adapters.columns import TableColumn
 from ..domain.errors import ValidationFailed
 from ..domain.metadata import NodeKind, PathSegment
 from .dialects import Dialect, qualified, quote_ident
@@ -86,4 +88,27 @@ def build_browse_select(
     if order_by and not count:
         keys = ", ".join(f"{quote_ident(dialect, key.column)} {'DESC' if key.descending else 'ASC'}" for key in order_by)
         sql += f"\nORDER BY {keys}"
+    return sql
+
+
+def build_copy_select(
+    dialect: Dialect, schema: str | None, name: str, columns: Sequence[TableColumn], where: str | None = None, *,
+    only: bool = False,
+) -> str:
+    """The SELECT a dump or copy reads a relation's rows with (spec ⑥ D-06-6): the columns it writes, in their order,
+    each through its read expression and named as itself (PostgreSQL money as numeric, MySQL FLOAT as a DOUBLE, SQL
+    Server's 7th fractional digit as text), the table-data tab's filter when given (one expression, as browsing
+    checks it), and PostgreSQL's FROM ONLY for an inheritance parent's own rows. Raises ValidationFailed when no
+    column is written or the filter is not one expression."""
+    picked = []
+    for column in columns:
+        if not column.copied:
+            continue
+        quoted = quote_ident(dialect, column.name)
+        picked.append(f"{column.read_as.format(quoted)} AS {quoted}" if column.read_as else quoted)
+    if not picked:
+        raise ValidationFailed(f"{name} has no column a dump or copy can write")
+    sql = f"SELECT {', '.join(picked)} FROM {'ONLY ' if only else ''}{qualified(dialect, schema, name)}"
+    if condition := _single_expression(where, dialect):
+        sql += f"\nWHERE {condition}"
     return sql

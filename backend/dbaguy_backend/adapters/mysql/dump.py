@@ -32,6 +32,7 @@ from mysql.connector.connection import MySQLConnection
 from ...domain.data_jobs import DumpObjectKinds, DumpScope
 from ...domain.errors import NotFound, ValidationFailed
 from ...sql.dialects import Dialect, qualified, quote_ident, quote_literal
+from ...sql.dump_script import RESTORE_CHARSET, RESTORE_SQL_MODE, RESTORE_TIME_ZONE
 from ...sql.lexer import INSIGNIFICANT, Token, TokenKind, scan
 from ...sql.scope import routines_called
 from ...sql.splitter import after_account
@@ -43,10 +44,7 @@ from ..dump import (
 from . import catalog
 from .columns import schema_columns
 
-# The file's own settings (its header, sql/dump_script.py): zero dates and an id of 0 restore as they are, strict
-RESTORE_SQL_MODE = "STRICT_TRANS_TABLES,NO_AUTO_VALUE_ON_ZERO"
-RESTORE_TIME_ZONE = "+00:00"
-RESTORE_CHARSET = "utf8mb4"  # SET NAMES
+# The file's own settings (RESTORE_SQL_MODE, RESTORE_TIME_ZONE, RESTORE_CHARSET) are sql/dump_script.py's: one source
 SNAPSHOT_TEXT = "one consistent snapshot (InnoDB)"
 DEFINERS_LEFT_OUT = "DEFINER clauses (the account running the file becomes the definer)"  # pre-flight L6
 NO_BACKSLASH_ESCAPES = "NO_BACKSLASH_ESCAPES"
