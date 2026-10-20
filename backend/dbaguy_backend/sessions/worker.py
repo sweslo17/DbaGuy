@@ -916,6 +916,8 @@ class SessionWorker:
                     if len(rows) < want:
                         try:
                             rows += result.fetch(want - len(rows))
+                        except StatementCancelled:
+                            raise  # a cancel ends the result as it always did: nothing more is shown
                         except StatementError:
                             self._send_rows(ex, rows)  # the peeked rows in hand go out before the error (fix round 2)
                             raise

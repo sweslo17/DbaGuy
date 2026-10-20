@@ -600,3 +600,49 @@ def test_sqlite_text_that_is_not_utf8_names_its_table_and_column(tmp_path):  # f
                                          "valid UTF-8")
     finally:
         app.close()
+
+
+# -- Task 9 fix round 3
+
+
+@requires_mssql
+def test_a_number_glued_to_a_keyword_cannot_run_a_second_statement(tmp_path):  # fix round 3 N-NEW-1
+    """SQL Server reads `0x1TRUNCATE` as 0x1 then TRUNCATE and `1eUNION` as 1e then UNION; the filter (and a plain
+    query tab) on a read-only profile must refuse these before anything is sent, so the scratch table keeps its rows."""
+    from dbaguy_backend.domain.execution import ExecuteCommand
+    from dbaguy_backend.domain.metadata import PathSegment
+    from dbaguy_backend.sql.dialects import Dialect
+    from dbaguy_backend.sql.select_builder import build_browse_select
+    from tests.test_sessions import request_events
+
+    db = scratch_db("mssql", tmp_path)
+    app = DataApp(tmp_path)
+    try:
+        with scratch_database("mssql", "glue") as (source, admin):
+            admin.run_in(source, "CREATE TABLE dbo.t (id int PRIMARY KEY, v nvarchar(10))",
+                         "INSERT INTO dbo.t VALUES (1, N'a'), (2, N'b')")
+            profile = app.add_profile(db.profile(database=source, read_only=True))
+            scope = DumpScope(kind="tables", schema_name="dbo", names=["t"])
+            for condition in ("id=0x1TRUNCATE TABLE dbo.t", "id=1eTRUNCATE TABLE dbo.t",
+                              "id=0x1UNION ALL SELECT 99, N'fake'"):
+                ran = dump(app, profile, source, tmp_path / "o.sql", scope, filter=condition)
+                assert ran.outcome.outcome == "not_started" and ran.error.code in ("invalid_filter", "read_only")
+                app.close_sessions()
+            assert admin.rows(source, "SELECT COUNT(*) FROM dbo.t") == [(2,)]
+            # the table-data tab's own filter check refuses the glued UNION before it builds any SELECT
+            from dbaguy_backend.domain.errors import ValidationFailed
+
+            path = [PathSegment(kind="database", name=source), PathSegment(kind="schema", name="dbo"),
+                    PathSegment(kind="table", name="t")]
+            with pytest.raises(ValidationFailed):
+                build_browse_select(Dialect.TSQL, path, "id=0x1UNION ALL SELECT 99, N'fake'", [])
+            # a plain query tab on the read-only profile: the TRUNCATE is blocked, never run
+            tab = app.job_session(profile, source)
+            tab.worker.submit(ExecuteCommand(request_id="q", sql="SELECT 0x1TRUNCATE TABLE dbo.t", history=False))
+            events = request_events(tab.recorder, "q", 30)
+            assert [e.code for e in events if e.type == "error"] == ["read_only"]
+            assert admin.rows(source, "SELECT COUNT(*) FROM dbo.t") == [(2,)]
+            app.close_sessions()
+    finally:
+        app.close()
+        db.close()

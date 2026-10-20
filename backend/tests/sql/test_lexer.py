@@ -266,3 +266,36 @@ def test_sqlpp_comments():
 
 def test_sqlpp_unicode_spaces_follow_the_server():  # A7: the server rejects U+00A0 (syntax error, nothing runs)
     assert kinds("DELETE\u00a0FROM t", SQ) == [(K.WORD, "DELETE\u00a0FROM"), (K.WORD, "t")]
+
+
+@pytest.mark.parametrize("text, tokens", [  # Task 9 fix round 3: T-SQL numbers as SQL Server 2022 reads them
+    ("0x1TRUNCATE", [(K.NUMBER, "0x1"), (K.WORD, "TRUNCATE")]),
+    ("0X1F TABLE", [(K.NUMBER, "0X1F"), (K.WORD, "TABLE")]),
+    ("0xTRUNCATE", [(K.NUMBER, "0x"), (K.WORD, "TRUNCATE")]),  # 0x then a name
+    ("0x1e5z", [(K.NUMBER, "0x1e5"), (K.WORD, "z")]),  # all hex digits belong to 0x
+    ("1eTRUNCATE", [(K.NUMBER, "1e"), (K.WORD, "TRUNCATE")]),
+    ("1Else", [(K.NUMBER, "1E"), (K.WORD, "lse")]),
+    ("1.eUNION", [(K.NUMBER, "1.e"), (K.WORD, "UNION")]),
+    (".5eUNION", [(K.NUMBER, ".5e"), (K.WORD, "UNION")]),
+    ("1e+UNION", [(K.NUMBER, "1e+"), (K.WORD, "UNION")]),
+    ("1E-SELECT", [(K.NUMBER, "1E-"), (K.WORD, "SELECT")]),
+    ("1.5e3x", [(K.NUMBER, "1.5e3"), (K.WORD, "x")]),
+    ("$1UNION", [(K.NUMBER, "$1"), (K.WORD, "UNION")]),  # money literal
+    ("$1.5z", [(K.NUMBER, "$1.5"), (K.WORD, "z")]),
+    ("$1eUNION", [(K.NUMBER, "$1"), (K.WORD, "eUNION")]),  # $ money takes no exponent
+    ("$action", [(K.WORD, "$action")]),  # a pseudocolumn
+    ("1dUNION", [(K.NUMBER, "1"), (K.WORD, "dUNION")]),  # no d/f/m suffix in T-SQL
+    ("0b1UNION", [(K.NUMBER, "0"), (K.WORD, "b1UNION")]),  # no binary 0b literal
+    ("N'0x1'", [(K.STRING, "N'0x1'")]),  # inside a string: untouched
+    ("[0x1z]", [(K.QUOTED, "[0x1z]")]),  # inside brackets: untouched
+])
+def test_tsql_numbers_glued_to_words_match_the_server(text, tokens):
+    assert kinds(text, TS) == tokens
+
+
+def test_other_dialects_keep_their_number_lexing():
+    # PG/MySQL/SQLite read 0x1UNION as 0 then x1UNION (they have no 0x literal); the server rejects it as a syntax
+    # error, so DbaGuy never sends it. Their lexing is unchanged by the T-SQL rule.
+    for dialect in (PG, MY, LITE):
+        assert kinds("0x1UNION", dialect) == [(K.NUMBER, "0"), (K.WORD, "x1UNION")]
+        assert kinds("1e5 x", dialect)[0] == (K.NUMBER, "1e5")

@@ -51,6 +51,11 @@ class LexRules:
     identifier_backslash_escapes: bool = False  # SQL++: `\`` and `\\` inside back-ticks
     named_param_prefixes: frozenset[str] = frozenset()  # SQL++ "$" and "@": `$name`, `@name`, `$1` are one PARAM token
     question_params: bool = False  # SQL++: `?` is a positional PARAM
+    # How a number literal ends; None: the lexer's own (digits, a fraction, an exponent with its digits). T-SQL's
+    # differs, and a token boundary SQL Server draws elsewhere than DbaGuy hides a keyword (Task 9 fix round 3)
+    number: re.Pattern[str] | None = None
+    # T-SQL: `$1.5` is one money literal (no exponent: `$1e` is `$1` and a name), `$action` / `$IDENTITY` one name
+    dollar_money_and_names: bool = False
 
 
 RULES: dict[Dialect, LexRules] = {
@@ -81,6 +86,13 @@ RULES: dict[Dialect, LexRules] = {
         # `"` names an identifier: DbaGuy connects with QUOTED_IDENTIFIER ON (Task 6, Ruling 3)
         identifier_quotes=(("[", "]"), ('"', '"')), variable_prefixes=frozenset("@#"),
         body_rule=BodyRule.TSQL_MODULE, client_command=ClientCommand.GO, national_strings=True, unicode_spaces=True,
+        # As SQL Server 2022 reads them (probed, Task 9 fix round 3): `0x` and any run of hex digits, none included, is
+        # one binary literal (`0x1TRUNCATE` is 0x1 then TRUNCATE; `0xg` is 0x then the name g); an exponent marker
+        # belongs to its number with or without a sign and digits (`1e`, `1.e`, `.5e`, `1e+`, `1E-`: `1eTRUNCATE` is
+        # 1e then TRUNCATE, `1else` 1e then lse). There are no suffixes: `1d`, `1f`, `1m`, `0b1`, `1_0` are a number
+        # and a name, which the lexer's own rule already says.
+        number=re.compile(r"0[xX][0-9a-fA-F]*|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d*)?"),
+        dollar_money_and_names=True,
     ),
     Dialect.SQLPP: LexRules(  # Couchbase SQL++ 7.6 (survey §8.1; spec §3.3.1)
         nested_block_comments=False, line_comment_end=re.compile(r"[\n\r]"), dash_comment_needs_space=False,

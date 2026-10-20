@@ -9,7 +9,7 @@ import pytest
 from loguru import logger
 
 from dbaguy_backend.adapters.base import (
-    AdapterCapabilities, RawJsonRows, ReadAhead, ReadAheadState, RunOptions, StatementError,
+    AdapterCapabilities, RawJsonRows, ReadAhead, ReadAheadState, RunOptions, StatementCancelled, StatementError,
 )
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
@@ -1134,21 +1134,28 @@ def test_steps_stop_after_full_or_done_and_poll_after_waiting(state, most):  # E
 
 
 class _LateErrorResult(FakeResult):
-    """`count` rows, then an error from the next fetch: SQL Server's way with an error later in the set (Task 9 H1)."""
+    """`count` rows, then an error from the next fetch: SQL Server's way with an error later in the set (Task 9 H1);
+    `late` raises a cancel there instead."""
 
-    def __init__(self, count: int) -> None:
+    def __init__(self, count: int, late: StatementError) -> None:
         super().__init__(count)
+        self._late = late
 
     def fetch(self, n):
         if not self._rows:
-            raise StatementError("Divide by zero error encountered.", code="8134")
+            raise self._late
         return super().fetch(n)
 
 
 class LateErrorConnection(FakeConnection):
+    """`late N`: N rows, then error 8134; `cancelled N`: N rows, then StatementCancelled."""
+
     def statement(self, sql, options):
         self.runs.append(sql)
-        return _LateErrorResult(int(sql.split()[1]))
+        word, count = sql.split()
+        late = StatementCancelled() if word == "cancelled" else StatementError("Divide by zero error encountered.",
+                                                                               code="8134")
+        return _LateErrorResult(int(count), late)
 
 
 def test_a_peeked_row_goes_out_before_the_error_that_follows_it():  # Task 9 fix round 2 (N1)
@@ -1167,3 +1174,17 @@ def test_a_peeked_row_goes_out_before_the_error_that_follows_it():  # Task 9 fix
         assert rec.of("p", "error")[0].code == "8134"
     finally:
         worker.close()
+
+
+def test_a_cancel_after_the_peeked_row_shows_nothing_more():  # Task 9 fix round 3 (N-NEW-2): as at da4c158
+    worker, _, rec = make_worker(LateErrorConnection())
+    try:
+        execute(worker, "c", "cancelled 3", page_size=2)
+        rec.wait_for(paused("c", 2))
+        worker.submit(FetchMoreCommand(request_id="c", count=10))
+        rec.wait_for(finished("c"))
+        assert [row[0] for event in rec.of("c", "rows") for row in event.rows] == [0, 1]  # the peeked row stays
+        assert rec.of("c", "finished")[-1].cancelled
+    finally:
+        worker.close()
+

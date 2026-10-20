@@ -39,6 +39,7 @@ class Token:
 
 _DOLLAR_TAG = re.compile(r"\$(?:[A-Za-z_\u0080-\U0010ffff][A-Za-z0-9_\u0080-\U0010ffff]*)?\$")
 _DOLLAR_PARAM = re.compile(r"\$\d+")
+_MONEY = re.compile(r"\$(?:\d+(?:\.\d*)?|\.\d+)")  # T-SQL $1, $1.5, $1., $.5 (no exponent)
 _NUMBER = re.compile(r"\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?")
 _PUNCT = {";": TokenKind.SEMI, ".": TokenKind.DOT, ",": TokenKind.COMMA, "(": TokenKind.LPAREN, ")": TokenKind.RPAREN}
 # Tokens that never change what a statement means: skipped wherever statements are read word by word.
@@ -206,6 +207,14 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
             terminated = close_at >= 0
             i = n if close_at < 0 else close_at + len(tag.group(0))
             kind = TokenKind.STRING
+        elif ch == "$" and rules.dollar_money_and_names and (money := _MONEY.match(text, i)):
+            i = money.end()
+            kind = TokenKind.NUMBER
+        elif ch == "$" and rules.dollar_money_and_names and i + 1 < n and _ident_start(text[i + 1]):
+            i += 1  # a pseudocolumn: $action, $IDENTITY, $ROWGUID, $PARTITION
+            while i < n and name_char(text[i]):
+                i += 1
+            kind = TokenKind.WORD
         elif ch in rules.variable_prefixes:  # MySQL @x, @@x; T-SQL @x, @@x, #t, ##g
             while i < n and text[i] == ch:  # @ or @@, # or ##
                 i += 1
@@ -229,7 +238,7 @@ def scan(text: str, dialect: Dialect, start: int = 0, delimiter: str | None = No
             else:
                 kind = TokenKind.WORD
         elif ch.isdigit() or (ch == "." and i + 1 < n and text[i + 1].isdigit()):
-            match = _NUMBER.match(text, i)
+            match = (rules.number or _NUMBER).match(text, i)
             i = match.end() if match else i + 1
             if delimiter is not None:
                 i = _cut_at_delimiter(text, begin, i, delimiter)

@@ -17,21 +17,24 @@ _COLLECTIONS = frozenset({NodeKind.COLLECTION})
 _TRAILING = INSIGNIFICANT | {TokenKind.SEMI}
 # What a filter is, and the one text of every refusal that it is more (a dump's own check says it too)
 FILTER_NOT_A_CONDITION = "The filter must be a condition on the table's rows (what follows WHERE), and nothing else"
-# Words that end a WHERE clause, outside parentheses: another clause of the SELECT (GROUP BY, HAVING, WINDOW, QUALIFY,
-# ORDER BY, LIMIT, OFFSET, FETCH, FOR UPDATE / FOR XML / FOR JSON, INTO, RETURNING) or another query joined to it
-# (UNION, INTERSECT, EXCEPT). A filter is one condition (Task 9 fix round 2), so none may stand at depth 0. Inside
-# parentheses they are the filter's own (`substring(x FOR 3)`, `x IN (SELECT … ORDER BY y LIMIT 1)`); quoted they are
-# names, in strings and comments text: the lexer tells them apart
-_ENDS_A_CONDITION = frozenset({
-    "UNION", "INTERSECT", "EXCEPT", "FOR", "INTO", "ORDER", "LIMIT", "OFFSET", "FETCH", "GROUP", "HAVING", "WINDOW",
-    "QUALIFY", "RETURNING",
-})
-# … and the dialects' own, where the word is reserved there (so never an unquoted name): MySQL's LOCK IN SHARE MODE,
-# PROCEDURE ANALYSE, MariaDB's MINUS, MySQL's and T-SQL's OPTION (T-SQL's query hints). PostgreSQL and SQLite take
-# `option`, `procedure`, `lock` and `minus` as plain column names.
-_ENDS_A_CONDITION_IN: dict[Dialect, frozenset[str]] = {
-    Dialect.MYSQL: frozenset({"LOCK", "PROCEDURE", "MINUS", "OPTION"}),
-    Dialect.TSQL: frozenset({"OPTION"}),
+# The words that, outside parentheses, begin a clause after a WHERE condition or end the SELECT into something else, so
+# a filter holding one at depth 0 would be more than one condition (Task 9 fix round 2). Each dialect's set is exactly
+# the words its own server parses there (probed on PG 17, MySQL 8.4, SQL Server 2022, SQLite 3, fix round 3), so a
+# word another dialect reserves but this one takes as a plain column is never refused (`qualify`, `returning`, T-SQL
+# `limit`, SQLite `for`…). Inside parentheses they are the filter's own (`substring(x FOR 3)`, `x IN (SELECT … ORDER
+# BY y LIMIT 1)`); quoted they are names, in strings and comments text: the lexer tells them apart. A word that needs a
+# preceding clause (OFFSET/FETCH after LIMIT or ORDER BY) is not listed where that clause is: refusing the first is
+# enough.
+_SET_OPERATORS = {"UNION", "INTERSECT", "EXCEPT"}  # a second query joined to the filter's: every dialect
+_ENDS_A_CONDITION: dict[Dialect, frozenset[str]] = {
+    # FETCH / OFFSET stand alone after WHERE in PostgreSQL (no ORDER BY needed), so both are listed
+    Dialect.POSTGRES: frozenset(_SET_OPERATORS | {"FOR", "ORDER", "LIMIT", "OFFSET", "FETCH", "GROUP", "HAVING",
+                                                  "WINDOW"}),
+    Dialect.MYSQL: frozenset(_SET_OPERATORS | {"FOR", "ORDER", "LIMIT", "GROUP", "HAVING", "WINDOW", "LOCK", "INTO"}),
+    # WINDOW is not listed for SQL Server or SQLite: it is a non-reserved keyword there, so `window = 1` is a plain
+    # condition (an unused WINDOW clause after a fixed select list adds and hides nothing anyway, fix round 3)
+    Dialect.TSQL: frozenset(_SET_OPERATORS | {"ORDER", "GROUP", "HAVING", "OPTION", "FOR"}),
+    Dialect.SQLITE: frozenset(_SET_OPERATORS | {"ORDER", "LIMIT", "GROUP", "HAVING"}),
 }
 
 
@@ -87,7 +90,7 @@ def _single_expression(where: str | None, dialect: Dialect) -> str | None:
 def _one_condition(tokens: list, dialect: Dialect) -> bool:
     """Whether the filter's tokens stay one condition: never a `)` it did not open (`x) UNION … WHERE (1` balances
     again, so balance alone is not enough), and no word that ends a WHERE clause outside parentheses."""
-    ends = _ENDS_A_CONDITION | _ENDS_A_CONDITION_IN.get(dialect, frozenset())
+    ends = _ENDS_A_CONDITION.get(dialect, frozenset())
     depth = 0
     for token in tokens:
         if token.kind is TokenKind.LPAREN:

@@ -214,22 +214,25 @@ def test_a_dumps_count_and_its_filter_check():  # 06a Task 9: a table with no co
         check_filter(Dialect.TSQL, "id = 1 DELETE FROM t")
 
 
-# Task 9 fix round 2 (M2 gap 2): a filter is one condition. A clause that ends the WHERE (or a query joined to it)
-# would change what a dump writes, a SELECT … INTO what it reads
-_EVERY_DIALECT_ENDS = ["UNION", "INTERSECT", "EXCEPT", "FOR", "INTO", "ORDER", "LIMIT", "OFFSET", "FETCH", "GROUP",
-                       "HAVING", "WINDOW", "QUALIFY", "RETURNING"]
-_DIALECT_ENDS = {MY: ["LOCK", "PROCEDURE", "MINUS", "OPTION"], TS: ["OPTION"], PG: [], LITE: []}
+# Task 9 fix round 2/3 (M2 gap 2): a filter is one condition. Each dialect's clause words are exactly those its own
+# server parses after a WHERE condition (probed), so a word another dialect reserves is never refused here.
+_ENDS = {
+    PG: ["UNION", "INTERSECT", "EXCEPT", "FOR", "ORDER", "LIMIT", "OFFSET", "FETCH", "GROUP", "HAVING", "WINDOW"],
+    MY: ["UNION", "INTERSECT", "EXCEPT", "FOR", "ORDER", "LIMIT", "GROUP", "HAVING", "WINDOW", "LOCK", "INTO"],
+    TS: ["UNION", "INTERSECT", "EXCEPT", "ORDER", "GROUP", "HAVING", "OPTION", "FOR"],
+    LITE: ["UNION", "INTERSECT", "EXCEPT", "ORDER", "LIMIT", "GROUP", "HAVING"],
+}
 
 
 @pytest.mark.parametrize("dialect", [PG, MY, TS, LITE])
 def test_a_word_that_ends_the_where_clause_is_refused_outside_parentheses(dialect):
     from dbaguy_backend.sql.select_builder import FILTER_NOT_A_CONDITION, check_filter
 
-    for word in [*_EVERY_DIALECT_ENDS, *_DIALECT_ENDS[dialect]]:
-        for shape in (f"1=1 {word} x", f"id = 1 {word.lower()} BY y", f"(a = 1)\n{word} 1"):
+    for word in _ENDS[dialect]:
+        for shape in (f"1=1 {word} x", f"(a = 1)\n{word} 1"):
             with pytest.raises(ValidationFailed) as refused:
                 check_filter(dialect, shape)
-            # T-SQL: a word that starts a statement (FETCH, OPTION …) is a second statement to its cutter first
+            # T-SQL: a word that starts a statement (FOR …) is a second statement to its cutter first
             assert refused.value.message == FILTER_NOT_A_CONDITION or (
                 dialect is TS and "another T-SQL statement" in refused.value.message), shape
     for shape in ("x) UNION ALL SELECT 1 WHERE (1", "a = 1) OR (b = 2", ")"):  # a ")" it did not open: never
@@ -237,6 +240,30 @@ def test_a_word_that_ends_the_where_clause_is_refused_outside_parentheses(dialec
             check_filter(dialect, shape)
     with pytest.raises(ValidationFailed):
         build_browse_select(dialect, PATHS[dialect], "1=1 UNION ALL SELECT 99, 'fake'", [])  # one check, browsing too
+
+
+@pytest.mark.parametrize("dialect, word", [  # not a clause starter in this dialect: a plain column name is fine
+    (PG, "qualify"), (PG, "returning"), (PG, "into"), (TS, "limit"), (TS, "offset"), (TS, "window"),
+    (TS, "fetch"), (TS, "returning"), (TS, "qualify"), (LITE, "window"), (LITE, "offset"), (LITE, "fetch"),
+    (LITE, "for"), (MY, "offset"), (MY, "qualify"), (MY, "returning"),
+])
+def test_a_word_this_dialect_does_not_start_a_clause_with_is_a_plain_column(dialect, word):
+    from dbaguy_backend.sql.select_builder import check_filter
+
+    assert check_filter(dialect, f"{word} = 1") == f"{word} = 1"
+
+
+@pytest.mark.parametrize("dialect, condition", [  # Task 9 fix round 3: a number glued to a keyword (SQL Server)
+    (TS, "id=0x1UNION ALL SELECT 99"), (TS, "id=0xUNION ALL SELECT 99"), (TS, "id=0x1FUNION ALL SELECT 99"),
+    (TS, "id=1eUNION ALL SELECT 99"), (TS, "id=1.eUNION ALL SELECT 99"), (TS, "id=.5eUNION ALL SELECT 99"),
+    (TS, "id=1e+UNION ALL SELECT 99"), (TS, "id=$1UNION ALL SELECT 99"), (TS, "id=0x1ORDER BY id"),
+    (TS, "id=0x1OPTION (MAXDOP 1)"),
+])
+def test_a_number_glued_to_a_clause_word_is_refused_on_sql_server(dialect, condition):
+    from dbaguy_backend.sql.select_builder import check_filter
+
+    with pytest.raises(ValidationFailed):
+        check_filter(dialect, condition)
 
 
 @pytest.mark.parametrize("dialect, condition", [
