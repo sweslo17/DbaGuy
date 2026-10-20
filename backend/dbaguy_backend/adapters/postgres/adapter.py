@@ -10,6 +10,7 @@ import psycopg
 from loguru import logger
 from psycopg import postgres, pq
 
+from ...domain.data_jobs import DumpObjectKinds, DumpScope
 from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import ColumnMeta, ErrorPosition, MessageSeverity, ServerMessage
@@ -24,6 +25,7 @@ from ..base import (
     DatabaseAdapter,
     DatabaseConnection,
     DataTools,
+    Dumping,
     Endpoint,
     ParsedUrl,
     RowEditing,
@@ -35,9 +37,10 @@ from ..base import (
 )
 from ..cancel_window import CancelWindow
 from ..columns import TableColumn
+from ..dump import DumpCatalog, DumpSession
 from ..positions import offset_to_line_col
 from ..sql_text import first_keyword
-from . import columns, ddl, editing, introspection
+from . import columns, ddl, dump, editing, introspection
 from . import schema as pg_schema
 from .loaders import category_for_oid, configure_user_loaders
 
@@ -332,7 +335,7 @@ class _CursorResult(StatementResult):
             logger.warning("Error while closing PostgreSQL cursor: {}", exc)
 
 
-class PostgresConnection(DatabaseConnection, RowEditing, DataTools):
+class PostgresConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
     def __init__(self, conn: psycopg.Connection, read_only: bool = False) -> None:
         self._conn = conn
         self._read_only = read_only
@@ -428,6 +431,16 @@ class PostgresConnection(DatabaseConnection, RowEditing, DataTools):
     def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
         self._check_database(path)
         return columns.table_columns(self._conn, path)
+
+    def dump_session(self, scope: DumpScope) -> DumpSession:
+        return dump.SESSION
+
+    def dump_catalog(self, scope: DumpScope, kinds: DumpObjectKinds, *, ddl: bool = True) -> DumpCatalog:
+        try:
+            return dump.dump_catalog(self._conn, scope, kinds, self.server_info().version,
+                                     self.current_database() or "", ddl=ddl)
+        except psycopg.Error as exc:
+            raise self.translate_error(exc, "dump catalog") from exc
 
     def schema_snapshot(self) -> SchemaSnapshot:
         # The connection's own (native-loader) cursors: arrays come back as lists, unlike the text-first user cursors.

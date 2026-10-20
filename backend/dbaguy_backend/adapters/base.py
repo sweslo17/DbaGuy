@@ -5,6 +5,7 @@ from enum import StrEnum
 from typing import Any, ClassVar, Literal
 
 from ..domain.couchbase import FieldSample, Keyspace
+from ..domain.data_jobs import DumpObjectKinds, DumpScope
 from ..domain.edits import EditTarget
 from ..domain.errors import ValidationFailed
 from ..domain.execution import ColumnMeta, ErrorPosition, Presentation, QueryContext, ServerMessage, StatementParams
@@ -13,6 +14,7 @@ from ..domain.profiles import AnyDraft, AnyProfile, Engine, EngineInfo, ServerPr
 from ..domain.schema import RelationKind, SchemaSnapshot
 from ..sql.dialects import Dialect
 from .columns import TableColumn
+from .dump import DumpCatalog, DumpSession
 from .positions import offset_to_line_col
 
 
@@ -335,6 +337,21 @@ class DataTools(ABC):
     @abstractmethod
     def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
         """The columns of the table, view or materialized view at `path`, in order; NotFound when it is gone."""
+
+
+class Dumping(ABC):
+    """A connection whose engine DbaGuy dumps (spec ⑥ R-06-2, capability `dump`): what its dump session sends
+    around the reads, and what the dump writes, in order. On the owning worker thread, like every method."""
+
+    @abstractmethod
+    def dump_session(self, scope: DumpScope) -> DumpSession:
+        """The output settings and the snapshot (R-06-4) the dump's own session sends before it reads, and what ends
+        them."""
+
+    @abstractmethod
+    def dump_catalog(self, scope: DumpScope, kinds: DumpObjectKinds, *, ddl: bool = True) -> DumpCatalog:
+        """The objects and tables of `scope`, in the order the dump writes them; `ddl` False (a dump plan): which
+        there are, without their definitions. NotFound when the scope's schema or a named relation is gone."""
 
 
 class DatabaseAdapter(ABC):

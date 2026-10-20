@@ -2,10 +2,10 @@
 outcome (R-06-12, ⑤ E1). Its WebSocket events, and what the job list shows of it (D-06-10)."""
 
 from datetime import datetime
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from .profiles import Engine
 
@@ -139,3 +139,34 @@ class FileInspection(BaseModel):
     preview: str  # its first PREVIEW_LINES lines, at most PREVIEW_BYTES
     preview_truncated: bool
     warnings: list[str] = []
+
+
+MAX_DUMP_NAMES = 500  # relations one `tables` scope may name
+
+
+class DumpScope(BaseModel):
+    """What a dump covers (spec ⑥ §3.3.1): a whole database (PostgreSQL, SQL Server), one schema (MySQL: a database;
+    SQLite: main), or named tables and views of one schema."""
+
+    kind: Literal["database", "schema", "tables"]
+    schema_name: str | None = Field(default=None, min_length=1, max_length=1024)  # schema and tables
+    names: list[str] = Field(default_factory=list, max_length=MAX_DUMP_NAMES)  # tables: the relations, in that schema
+
+    @model_validator(mode="after")
+    def _a_schema_for_schema_and_tables(self) -> Self:
+        if self.kind != "database" and self.schema_name is None:
+            raise ValueError("a schema or tables dump names its schema")
+        if (self.kind == "tables") != bool(self.names):
+            raise ValueError("a tables dump names its tables, and only a tables dump does")
+        return self
+
+
+class DumpObjectKinds(BaseModel):
+    """Which objects besides tables a dump writes (R-06-2); a table's own sequences and column types always come
+    with it. Routines include MySQL events; views include SQL Server synonyms."""
+
+    views: bool = True
+    sequences: bool = True
+    types: bool = True
+    routines: bool = True
+    triggers: bool = True

@@ -39,12 +39,17 @@ _TYPE_LABEL = {"e": "enum", "d": "domain", "c": "composite"}
 _HAS_FOLDERS = (NodeKind.TABLE, NodeKind.PARTITION, NodeKind.VIEW, NodeKind.MATERIALIZED_VIEW)
 _CAN_PARTITION = (NodeKind.TABLE, NodeKind.PARTITION)
 
+# The collation only when it is not the type's own (COLLATE "C" on a text column)
 _COLUMNS_SQL = """
 SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, pg_get_expr(d.adbin, d.adrelid),
        a.attidentity::text, a.attgenerated::text, col_description(a.attrelid, a.attnum),
-       EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = a.attrelid AND i.indisprimary AND a.attnum = ANY (i.indkey))
+       EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = a.attrelid AND i.indisprimary AND a.attnum = ANY (i.indkey)),
+       cn.nspname::text, co.collname::text
 FROM pg_attribute a
 LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+LEFT JOIN pg_type t ON t.oid = a.atttypid
+LEFT JOIN pg_collation co ON co.oid = a.attcollation AND a.attcollation <> t.typcollation
+LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace
 WHERE a.attrelid = %(oid)s AND a.attnum > 0 AND NOT a.attisdropped
 ORDER BY a.attnum
 """
@@ -60,6 +65,7 @@ class PgColumn:
     generated: str  # '' | 's' (stored) | 'v' (virtual, PG 18)
     comment: str | None
     is_pk: bool
+    collation: str | None = None  # qualified, when it is not the type's own
 
     def info(self) -> ColumnInfo:
         return ColumnInfo(
@@ -84,7 +90,8 @@ def relation_oid(conn: psycopg.Connection, qname: str) -> int:
 
 
 def table_columns(conn: psycopg.Connection, oid: int) -> list[PgColumn]:
-    return [PgColumn(*row) for row in conn.execute(_COLUMNS_SQL, {"oid": oid})]
+    return [PgColumn(*row[:8], collation=qualified_pg(row[8], row[9]) if row[9] is not None else None)
+            for row in conn.execute(_COLUMNS_SQL, {"oid": oid})]
 
 
 def _folder(segment: PathSegment) -> Folder:

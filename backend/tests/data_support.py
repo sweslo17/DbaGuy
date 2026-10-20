@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
+import mysql.connector
+import psycopg
+
 from dbaguy_backend.config import Settings
 from dbaguy_backend.container import AppContainer
 from dbaguy_backend.domain.data_jobs import FileInspection, JobCommand, JobOutcomeEvent, JobProgressEvent
@@ -23,7 +26,9 @@ from dbaguy_backend.sessions.manager import SessionCreateRequest
 from dbaguy_backend.sessions.worker import SessionWorker
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
 from tests.edit_support import ScratchDb
-from tests.support import unique_name
+from tests.support import (
+    MSSQL_SA_PASSWORD, PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, mssql_connect, mysql_driver_kwargs, unique_name,
+)
 from tests.test_sessions import Recorder, request_events
 
 SCRATCH_PREFIX = "zz_06_"
@@ -31,6 +36,14 @@ SCRATCH_PREFIX = "zz_06_"
 
 def scratch_name(kind: str) -> str:
     return unique_name(SCRATCH_PREFIX + kind)
+
+
+def drop_statement(db: ScratchDb, kind: str, name: str) -> str:
+    """A scratch schema goes with everything in it (its objects are all the test's); anything else by its name in
+    `db`'s schema."""
+    if kind == "SCHEMA":
+        return f"DROP SCHEMA IF EXISTS {db.q(name)}" + (" CASCADE" if db.engine == "postgres" else "")
+    return f"DROP {kind} IF EXISTS {db.table(name)}"
 
 
 @contextmanager
@@ -50,7 +63,7 @@ def dropping(db: ScratchDb, before_drop: Callable[[], None] | None = None) -> It
         for kind, name in reversed(made):
             assert name.startswith(SCRATCH_PREFIX), f"{name!r} is not a scratch object: never dropped here"
             try:
-                db.execute(f"DROP {kind} IF EXISTS {db.table(name)}")
+                db.execute(drop_statement(db, kind, name))
             except Exception as exc:
                 failures.append(f"{kind} {name}: {exc}")
         return "; ".join(failures)
@@ -64,6 +77,74 @@ def dropping(db: ScratchDb, before_drop: Callable[[], None] | None = None) -> It
     else:
         failed = clean_up()
         assert not failed, "dropping scratch objects failed: " + failed
+
+
+class _Admin:
+    """Creates and drops a scratch database as the engine's administrator (PostgreSQL: the dev login is one; MySQL:
+    root; SQL Server: sa), giving the dev login every right in it."""
+
+    def __init__(self, engine: str) -> None:
+        self.engine = engine
+
+    def create(self, name: str) -> None:
+        self._run(*{
+            "postgres": [f'CREATE DATABASE "{name}"'],
+            "mysql": [f"CREATE DATABASE `{name}`", f"GRANT ALL ON `{name}`.* TO 'dbaguy'@'%'"],
+            "mssql": [f"CREATE DATABASE [{name}]",
+                      f"USE [{name}]; CREATE USER dbaguy FOR LOGIN dbaguy; ALTER ROLE db_owner ADD MEMBER dbaguy"],
+        }[self.engine])
+
+    def drop(self, name: str) -> None:
+        assert name.startswith(SCRATCH_PREFIX), f"{name!r} is not a scratch database: never dropped here"
+        self._run(*{
+            "postgres": [f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'],
+            "mysql": [f"DROP DATABASE IF EXISTS `{name}`"],
+            "mssql": [f"IF DB_ID(N'{name}') IS NOT NULL ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE",
+                      f"DROP DATABASE IF EXISTS [{name}]"],
+        }[self.engine])
+
+    def run_in(self, name: str, *statements: str) -> None:
+        """Set-up statements as the administrator, in database `name`."""
+        self._run(*statements, database=name)
+
+    def _run(self, *statements: str, database: str | None = None) -> None:
+        if self.engine == "postgres":
+            with psycopg.connect(host=PG_HOST, port=PG_PORT, user=PG_USER, password=PG_PASSWORD,
+                                 dbname=database or "postgres", autocommit=True) as conn:
+                for statement in statements:
+                    conn.execute(statement)
+        elif self.engine == "mysql":
+            conn = mysql.connector.connect(**mysql_driver_kwargs(user="root", password="dbaguy", autocommit=True,
+                                                                 database=database or "mysql"))
+            try:
+                for statement in statements:
+                    cursor = conn.cursor()
+                    cursor.execute(statement)
+                    if cursor.with_rows:
+                        cursor.fetchall()
+                    cursor.close()
+            finally:
+                conn.close()
+        else:
+            conn = mssql_connect(user="sa", password=MSSQL_SA_PASSWORD, database=database or "master")
+            try:
+                for statement in statements:
+                    conn.execute_non_query(statement)
+            finally:
+                conn.close()
+
+
+@contextmanager
+def scratch_database(engine: str, kind: str = "db") -> Iterator[tuple[str, "_Admin"]]:
+    """A database `zz_06_<kind>_<random>` the dev login may use (PostgreSQL, MySQL, SQL Server), dropped by its exact
+    name when the block ends, whatever happened."""
+    admin = _Admin(engine)
+    name = scratch_name(kind)
+    admin.create(name)
+    try:
+        yield name, admin
+    finally:
+        admin.drop(name)
 
 
 @dataclass
