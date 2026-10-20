@@ -10,6 +10,7 @@ import { emptyStaged, MAX_CHANGES, rowKeyFromKey, stage, type NewId, type RowRef
 import {
   asksBeforeDiscard,
   CHECKING,
+  closeQuestion,
   discardQuestion,
   dispatchRefusal,
   editMenu,
@@ -459,6 +460,11 @@ describe("the edit bar's words", () => {
   it("asks before discarding more than one change", () => {
     expect([0, 1, 2].map(asksBeforeDiscard)).toEqual([false, false, true]);
     expect(discardQuestion(3, "zz_05b_items")).toBe("Discard 3 staged changes to zz_05b_items? ⌘Z brings them back.");
+  });
+
+  it("asks before closing the tab without offering ⌘Z: the changes go with the tab", () => {
+    expect(closeQuestion(1, "zz_05b_items")).toBe("Discard 1 staged change to zz_05b_items?");
+    expect(closeQuestion(3, "zz_05b_items")).toBe("Discard 3 staged changes to zz_05b_items?");
   });
 });
 

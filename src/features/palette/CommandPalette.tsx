@@ -7,6 +7,7 @@ import { isImeKeyEvent } from "@/lib/ime";
 import { isSettingsKey } from "@/lib/shortcuts";
 import { useAppSettings } from "@/stores/settings";
 import { useWorkspace } from "@/stores/workspace";
+import { readTableEditActions } from "../edits/editActions";
 import { readQueryTabActions } from "../query/tabActions";
 import { openSettings } from "../settings/SettingsDialog";
 import { COMMANDS, SHORTCUTS, type CommandContext } from "./commands";
@@ -24,6 +25,7 @@ function CommandList({ choose }: { choose: Choose }) {
   const context: CommandContext = {
     activeTab,
     tabActions: activeTab?.kind === "query" ? readQueryTabActions(activeTab.id) : null,
+    editActions: activeTab?.kind === "table" ? readTableEditActions(activeTab.id) : null,
     settings: { loaded: settings.loaded, current: settings.settings, save: settings.save },
     queryClient,
   };

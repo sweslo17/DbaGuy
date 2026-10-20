@@ -58,6 +58,7 @@ import {
   gridKeyAction,
   KEY_CHANGED,
   NOT_EDITABLE,
+  NOTHING_SELECTED,
   notKeptHint,
   notNullColumn,
   notNullSkipped,
@@ -461,6 +462,12 @@ export function useTableEdits(input: TableEditsInput): TableEdits {
     if (picked.rows.length) stageAction({ type: "deleteRows", rows: picked.rows });
     else if (picked.refusal) toast("info", picked.refusal);
   };
+  /** The palette's Delete selected rows and Set NULL: over the grid's selection, which they need (said when none). */
+  const overSelection = (act: (rect: Rect) => void) => () => {
+    const rect = selection.current?.rect;
+    if (rect) act(rect);
+    else toast("info", NOTHING_SELECTED);
+  };
   const revertRowsIn = (rect: Rect | null) => {
     const picked = pickRows(rect, lookup);
     if (!picked) return toast("warning", TOO_MANY_ROWS);
@@ -642,8 +649,8 @@ export function useTableEdits(input: TableEditsInput): TableEdits {
     resultRowAt,
     locate,
     addRow,
-    deleteSelected: () => deleteIn(selection.current?.rect ?? null),
-    setNullSelected: () => setNullIn(selection.current?.rect ?? null),
+    deleteSelected: overSelection(deleteIn),
+    setNullSelected: overSelection(setNullIn),
     discardAll: () => void stageAction({ type: "discardAll" }),
     undo: () => void stageAction({ type: "undo" }),
     redo: () => void stageAction({ type: "redo" }),

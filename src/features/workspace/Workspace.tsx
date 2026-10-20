@@ -65,15 +65,16 @@ function tabTooltip(tab: Tab, profile: Profile | undefined, missing: boolean): s
 
 /**
  * One tab in the strip: its connection's engine icon leads it and its colour underlines it; a query tab shows a
- * spinner while it works, and a query tab or a document a dot when it has unsaved changes. Every way of closing it
- * goes through the close guards. It scrolls itself into view when it becomes the active tab.
+ * spinner while it works, and a query tab, a document or a table a dot when it has unsaved work (a script's or a
+ * document's text, a table's staged grid edits). Every way of closing it goes through the close guards. It scrolls
+ * itself into view when it becomes the active tab.
  */
 function TabLabel({ tab, active, profile }: { tab: Tab; active: boolean; profile: Profile | undefined }) {
   const activate = useWorkspace((s) => s.activate);
   const status = useTabStatus(tab.id);
   const tint = profileColor(profile?.color);
   const query = tab.kind === "query";
-  const savable = query || tab.kind === "document";
+  const savable = query || tab.kind === "document" || tab.kind === "table";
   // However it became active (opened, ⌘1–9, ⌃Tab, the palette, the restored workspace), the strip shows it.
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {

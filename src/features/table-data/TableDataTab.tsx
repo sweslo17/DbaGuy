@@ -12,17 +12,21 @@ import { isDialogOpen } from "@/lib/dialogs";
 import { plural } from "@/lib/format";
 import { isImeKeyEvent } from "@/lib/ime";
 import { isCommandKey } from "@/lib/shortcuts";
+import { readStagedEdits } from "@/stores/stagedEdits";
+import { useReportTabStatus } from "@/stores/tabStatus";
 import { useWorkspace, type TableTabState } from "@/stores/workspace";
 import { useEngineInfo, useProfiles } from "../connections/hooks";
 import { RecoverableError } from "../connections/RecoverableError";
 import { COMMIT_RUNNING } from "../edits/commitDialog";
+import { tableEditActions, useTableEditActions } from "../edits/editActions";
 import { EditBar } from "../edits/EditBar";
 import { resultColumns } from "../edits/overlay";
-import { asksBeforeDiscard, discardQuestion } from "../edits/tableEditing";
+import { changeCount } from "../edits/staging";
+import { asksBeforeDiscard, closeQuestion, discardQuestion } from "../edits/tableEditing";
 import { useCommit, useCommitState } from "../edits/useCommit";
 import { useTableEdits } from "../edits/useTableEdits";
-import { ColumnsView, DdlView } from "../explorer/ObjectDetailView";
 import { kindLabel } from "../explorer/kinds";
+import { ColumnsView, DdlView } from "../explorer/ObjectDetailView";
 import { DataGrid, type DataGridHandle } from "../grid/DataGrid";
 import { ExportDialog } from "../grid/ExportDialog";
 import type { GridSort } from "../grid/GridHeader";
@@ -30,7 +34,7 @@ import { useHeldResult } from "../grid/useHeldResult";
 import { CONNECTION_LOST, EXPORT_RUNNING } from "../session/execution";
 import { isExporting } from "../session/SessionController";
 import { useSessionGuards } from "../session/SessionGuards";
-import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
+import { CLOSE_GUARD_ORDER, useCloseGuard, useDiscardQuestion } from "../workspace/closeGuards";
 import { browseView, keptNotice } from "./browseView";
 import { FilterBar } from "./FilterBar";
 import { addCondition, valueCondition, type Relation } from "./filterValue";
@@ -39,6 +43,9 @@ import { useTableData, type TableDataState } from "./useTableData";
 
 type View = "data" | "columns" | "ddl";
 const FILTER_BY_VALUE = "Filter by this value";
+/** Closing is refused while a commit runs (R-05-11): its dialog is modal, so only a profile deletion gets this far. */
+const CLOSE_WHILE_COMMITTING = "A commit is running: wait for it to end, or cancel it in its dialog";
+const NOT_IN_EXPORT = "Staged changes are not committed and are not in the export";
 const CUT_VALUE_MESSAGE = "This value cannot be matched exactly: the grid holds only its beginning";
 const VIEWS: { value: View; label: string }[] = [
   { value: "data", label: "Data" },
@@ -264,6 +271,41 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   useLayoutEffect(() => {
     openAfterEdit.current = commit.openAfterEdit;
   });
+  // Closing asks while changes are staged (R-05-11: Discard / Cancel, no Commit: a commit needs its preview), and is
+  // refused while a commit runs. Registered for every table tab, shown or not: a restored tab's staging is in the store
+  // (C28). An open editor's text is staged first, so it is counted and asked about (L8; never during render or an
+  // effect: flushSync). Losing the connection does not ask (close-only), nor does quitting (the staging is saved).
+  const closing = useDiscardQuestion(tab.id, CLOSE_GUARD_ORDER.edits, () => {
+    if (committing.read()?.step === "applying") return { refuse: CLOSE_WHILE_COMMITTING };
+    edits.flushEditor();
+    const staged = readStagedEdits(tab.id);
+    return staged !== null && changeCount(staged) > 0;
+  });
+  // The tab strip's dot: staged changes are unsaved work.
+  useReportTabStatus(tab.id, { dirty: edits.changes > 0 });
+  // ⌘⇧P's edit commands (spec ⑤ §3.6.4), through the same handlers as the grid's keys and the edit bar (H11).
+  useTableEditActions(
+    tab.id,
+    tableEditActions(
+      {
+        editable: edits.editable,
+        changes: edits.changes,
+        commitBlocked: commit.disabledReason,
+        applying: commit.applying,
+        undoable: (edits.staged?.past.length ?? 0) > 0,
+        redoable: (edits.staged?.future.length ?? 0) > 0,
+      },
+      {
+        addRow: edits.addRow,
+        deleteRows: edits.deleteSelected,
+        setNull: edits.setNullSelected,
+        commit: commit.open,
+        discardAll: requestDiscard,
+        undo: edits.undo,
+        redo: edits.redo,
+      },
+    ),
+  );
   // ⌘S while this tab's Data view is shown, wherever the focus is in it (an editor stages first and asks itself):
   // never the browser's Save page, nothing while a dialog has the keyboard or an input method composes.
   const openCommit = useRef(commit.open);
@@ -327,13 +369,14 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
     },
     [columns, resultRowAt, leading, dialect, exporting, filterByValue],
   );
-  // Export writes the current browse SELECT (filter, sort and refresh wait while it runs).
+  // Export writes the current browse SELECT (filter, sort and refresh wait while it runs): what the server holds.
+  const exportNote = edits.changes > 0 ? NOT_IN_EXPORT : null;
   const exportSource = useMemo(
     () =>
       table.controller && execution && relation
-        ? { controller: table.controller, sql: execution.sql, title: relation.name, tableName }
+        ? { controller: table.controller, sql: execution.sql, title: relation.name, tableName, note: exportNote }
         : null,
-    [table.controller, execution, relation, tableName],
+    [table.controller, execution, relation, tableName, exportNote],
   );
 
   const openInQueryTab = () => {
@@ -451,6 +494,14 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
           setAskingDiscard(false);
           edits.discardAll();
         }}
+      />
+      <ConfirmDialog
+        open={closing.asking}
+        onOpenChange={(open) => !open && closing.answer(false)}
+        title="Close tab"
+        message={closeQuestion(edits.changes, relation?.name ?? tab.title)}
+        confirmLabel="Discard"
+        onConfirm={() => closing.answer(true)}
       />
       {commit.dialog}
       {guards.dialog}

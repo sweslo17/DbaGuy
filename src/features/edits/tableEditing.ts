@@ -43,6 +43,9 @@ export const NOT_EDITABLE = "Rows of this table cannot be edited";
 export const TOO_LARGE_TO_KEEP = "Too large to keep across a restart";
 export const KEEP_MINE_TITLE = "Check the staged values against the server's values now";
 
+/** The palette's Delete selected rows and Set NULL with nothing selected in the grid. */
+export const NOTHING_SELECTED = "Select cells in the grid first";
+
 export const COPY_TEXT = "Copy text";
 export const COPY_FAILED = "Could not copy the text";
 
@@ -414,8 +417,13 @@ export function notKeptHint(saved: SavedEdits): string | null {
 /** Discard… asks first only when more than one change would go (⌘Z brings them back either way). */
 export const asksBeforeDiscard = (changes: number): boolean => changes > 1;
 
+/** Closing a tab with changes staged (R-05-11): they go with the tab, and nothing brings them back. */
+export const closeQuestion = (changes: number, table: string): string =>
+  `Discard ${plural(changes, "staged change")} to ${table}?`;
+
+/** Discard…: the same question, and ⌘Z brings them back. */
 export const discardQuestion = (changes: number, table: string): string =>
-  `Discard ${plural(changes, "staged change")} to ${table}? ⌘Z brings them back.`;
+  `${closeQuestion(changes, table)} ⌘Z brings them back.`;
 
 /** The new rows drawn on top of the loaded rows: how many, and their ids from the top. */
 export interface ShownTop {

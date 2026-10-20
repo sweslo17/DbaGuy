@@ -2,8 +2,10 @@ import type { QueryClient } from "@tanstack/react-query";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
 import type { AppSettings, EngineInfo, ProfileEntry } from "@/lib/api/types";
+import type { TabAction } from "@/lib/tabActions";
 import { openNewQuery, useWorkspace, type Tab } from "@/stores/workspace";
 import { enginesKey, findEngineInfo, profilesKey } from "../connections/hooks";
+import { readTableEditActions, type TableEditActionId, type TableEditActions } from "../edits/editActions";
 import { refreshSchema } from "../explorer/refreshSchema";
 import { HISTORY_VIEW } from "../history/useHistory";
 import { readQueryTabActions, type QueryTabActionId, type QueryTabActions } from "../query/tabActions";
@@ -12,10 +14,16 @@ import { requestCloseTab } from "../workspace/closeGuards";
 
 /**
  * The shortcut labels the palette shows, in one place. The bindings: ⌘↵, ⌘⇧↵, ⌘E and ⌘⇧F are the query tab's editor
- * keymap, ⌘W the workspace, ⌘, the settings dialog, ⌘P and ⌘⇧P the app. A command without a binding has none.
+ * keymap; ⌘S, ⌘⌫, ⌥⌘N, ⌘Z and ⇧⌘Z a table tab's grid (spec ⑤ §3.6.4); ⌘W the workspace; ⌘, the settings dialog;
+ * ⌘P and ⌘⇧P the app. A command without a binding has none.
  */
 export const SHORTCUTS = {
   run: "⌘↵",
+  commitEdits: "⌘S",
+  deleteRows: "⌘⌫",
+  setNull: "⌥⌘N",
+  undoEdit: "⌘Z",
+  redoEdit: "⇧⌘Z",
   runAll: "⌘⇧↵",
   explain: "⌘E",
   format: "⌘⇧F",
@@ -31,6 +39,8 @@ export interface CommandContext {
   activeTab: Tab | null;
   /** The active query tab's own actions and whether each is possible; null when no query tab is active. */
   tabActions: QueryTabActions | null;
+  /** The active table tab's edit actions; null when no table tab is active. */
+  editActions: TableEditActions | null;
   settings: {
     /** The stored settings are known (until then nothing may be saved over them). */
     loaded: boolean;
@@ -56,6 +66,15 @@ export interface PaletteCommand {
 const always = () => true;
 
 /**
+ * Runs a tab's own action as it is now (read again from its registry: the tab may have changed while the palette was
+ * open), or does nothing once it is no longer possible.
+ */
+function runTabAction(action: TabAction | undefined, label: string): void {
+  if (action?.enabled) action.run();
+  else console.info(`Palette: ${label} is no longer possible in the active tab`);
+}
+
+/**
  * A command the active query tab carries out with its own handler (ruling R-02c-15), the one its toolbar button or
  * keymap calls. Asked again when it runs: the tab may have changed while the palette was open.
  */
@@ -72,11 +91,7 @@ function tabCommand(
     visible,
     enabled: (ctx) => ctx.tabActions?.[id].enabled ?? false,
     checked: (ctx) => ctx.tabActions?.[id].checked,
-    run: (ctx) => {
-      const action = ctx.activeTab ? readQueryTabActions(ctx.activeTab.id)?.[id] : undefined;
-      if (action?.enabled) action.run();
-      else console.info(`Palette: ${label} is no longer possible in the active tab`);
-    },
+    run: (ctx) => runTabAction(ctx.activeTab ? readQueryTabActions(ctx.activeTab.id)?.[id] : undefined, label),
   };
 }
 
@@ -87,6 +102,21 @@ function activeEngine(ctx: CommandContext): EngineInfo | null {
     ctx.queryClient.getQueryData<EngineInfo[]>(enginesKey),
     ctx.activeTab?.profileId ?? null,
   );
+}
+
+/**
+ * A table tab's edit command (spec ⑤ §3.6.4), listed only while a table tab of an engine that edits rows is active
+ * (Couchbase has none: a document is edited in its own tab), with the tab's own handler; asked again when it runs.
+ */
+function editCommand(id: TableEditActionId, label: string, shortcut?: string): PaletteCommand {
+  return {
+    id: `edits.${id}`,
+    label,
+    shortcut,
+    visible: (ctx) => ctx.editActions !== null && activeEngine(ctx)?.row_editing === true,
+    enabled: (ctx) => ctx.editActions?.[id].enabled ?? false,
+    run: (ctx) => runTabAction(ctx.activeTab ? readTableEditActions(ctx.activeTab.id)?.[id] : undefined, label),
+  };
 }
 
 /** Couchbase: its plans (Explain). */
@@ -135,6 +165,13 @@ export const COMMANDS: readonly PaletteCommand[] = [
     checked: (ctx) => ctx.settings.current.editor.vim,
     run: (ctx) => void toggleVim(ctx.settings),
   },
+  editCommand("addRow", "Add row"),
+  editCommand("deleteRows", "Delete selected rows", SHORTCUTS.deleteRows),
+  editCommand("setNull", "Set NULL", SHORTCUTS.setNull),
+  editCommand("commit", "Commit changes…", SHORTCUTS.commitEdits),
+  editCommand("discardAll", "Discard all changes"),
+  editCommand("undo", "Undo staged change", SHORTCUTS.undoEdit),
+  editCommand("redo", "Redo staged change", SHORTCUTS.redoEdit),
   tabCommand("toggleAutocommit", "Toggle auto-commit"),
   tabCommand("commit", "Commit"),
   tabCommand("rollback", "Rollback"),
