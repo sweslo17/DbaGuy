@@ -3,12 +3,17 @@ the catalog read inside it (`dump_catalog`), then the file — header, settings,
 table's rows as multi-row INSERTs read a chunk at a time, the objects after the data — written through a temporary
 file (`atomic_text_file`): a dump that fails or is cancelled leaves no file and keeps any old one (R-06-12, CR-4).
 
-Memory stays bounded by the rows' size, not their number (pre-flight M12): a table's first read takes FIRST_FETCH
-rows, each next one about FETCH_CHARS of row text (at most FETCH_ROWS), and the adapters read no rows ahead of a job's
-fetch (RunOptions.describe False). The disk is never filled to its last byte (M14): below DISK_FLOOR_BYTES free the
-dump stops, every DISK_CHECK_CHARS written. A row too long to restore is said once per table (R-06-11, M11). A table
-with no column a dump can write keeps its rows as rows of defaults (06a Task 7 review). A data-only dump writes the
-tables a table's foreign keys reference first (M9).
+Memory stays bounded by the rows' size, not their number (pre-flight M12, Task 9 fix M1): a table's first read takes
+one row, each next one as many as fit FETCH_CHARS of row text at the size of the largest row seen so far (at most
+FETCH_ROWS), and the adapters read no rows ahead of a job's fetch (RunOptions.describe False). A table's rows are read
+until the result says `[]`: a short chunk may come before an error later in the set (fix H1). The disk is never filled
+to its last byte (M14): below DISK_FLOOR_BYTES free the dump stops, every DISK_CHECK_CHARS written. A row too long to
+restore is said once per table (R-06-11, M11). A table with no column a dump can write keeps its rows as rows of
+defaults (06a Task 7 review). A data-only dump writes the tables a table's foreign keys reference first (M9), and
+says what may still fail where the restore checks foreign keys (a cycle, a table that references itself: fix M4).
+
+A filter is a condition and nothing else (fix M2): every SELECT built from it must be a plain read by the classifier
+the read-only allow-list uses, and pass the session's gate, or nothing is sent (`invalid_filter`).
 
 A dump is a read: no History record (like an export), and a read-only connection may dump. Logs: INFO the scope, the
 file and the counts, WARNING a dump that is not one snapshot and what it leaves out (L14); never a value."""
@@ -23,17 +28,18 @@ from typing import TextIO
 
 from loguru import logger
 
-from ...adapters.base import INVALID_TEXT, Dumping, StatementCancelled, StatementError
+from ...adapters.base import INVALID_TEXT, Dumping, InvalidText, StatementCancelled, StatementError
 from ...adapters.columns import TableColumn
 from ...adapters.dump import DumpCatalog, DumpSession, DumpTable, parents_first
 from ...domain.data_jobs import BE_DUMPED, JobObject, cannot
 from ...domain.errors import DomainError
 from ...domain.execution import DumpCommand
 from ...domain.profiles import Engine
+from ...services.safety import GuardAction, is_plain_read
 from ...sql.bulk_insert import InsertBatcher, size_warning
 from ...sql.dialects import Dialect
 from ...sql.dump_script import (
-    RESTORE_BACKSLASH_ESCAPES, DumpScript, default_rows_text, insert_text, table_sql,
+    RESTORE_BACKSLASH_ESCAPES, RESTORE_CHECKS_FOREIGN_KEYS, DumpScript, default_rows_text, statement_end, table_sql,
 )
 from ...sql.select_builder import build_copy_select, build_count_select, check_filter
 from ...storage.atomic_file import atomic_text_file
@@ -42,14 +48,23 @@ from .context import Job, JobContext, JobReport
 DUMP_IO = "dump_io"
 FETCH_ROWS = 1000  # rows read at a time at most (the export's chunk)
 FETCH_CHARS = 32 * 1_048_576  # … and about this much row text (pre-flight M12)
-FIRST_FETCH = 16  # a table's first read, before the size of its rows is known (an estimate never raises it)
-DISK_CHECK_CHARS = 64 * 1_048_576  # the free space is looked at every this much written (pre-flight M14)
+FIRST_FETCH = 1  # a table's first read, before the size of its rows is known (Task 9 fix M1)
+# The free space is looked at every this much written (pre-flight M14): at most 64 MiB of bytes (4 a character, Task 9
+# fix L6) between two looks, under DISK_FLOOR_BYTES
+DISK_CHECK_CHARS = 16 * 1_048_576
 DISK_FLOOR_BYTES = 256 * 1_048_576  # below this much free, the dump stops before the disk is full
 SQLITE_HEADER = b"SQLite format 3\x00"
 SQLITE_SIDE_FILES = ("-wal", "-shm", "-journal")
 FK_CYCLE = "Foreign keys between these tables form a cycle: a data-only restore may fail"
+SELF_REFERENCE = "{} references itself: a data-only restore may fail unless its rows load in order"  # fix M4
 NOT_UNICODE = ("holds text that is not valid Unicode (half of a surrogate pair), which a UTF-8 file cannot hold. "
                "Nothing was written")
+NOT_UTF8 = "holds text that is not valid UTF-8, which a UTF-8 file cannot hold. Nothing was written"  # fix L2
+CATALOG_NOT_UTF8 = f"A name or definition in this database {NOT_UTF8}"
+INVALID_FILTER = "invalid_filter"
+# Task 9 fix M2: never the filter's text (it is the user's, and the log keeps messages)
+FILTER_NOT_A_CONDITION = ("The filter must be a condition on the table's rows (what follows WHERE): this one does more "
+                          "than read them")
 
 
 def scope_text(command: DumpCommand) -> str:
@@ -86,6 +101,17 @@ def target_problem(path: str, source_file: Path | None = None) -> str | None:
     if _is_database_file(target, source_file):
         return f"{path} is a SQLite database file: choose another file to dump into"
     return None
+
+
+def data_order(dialect: Dialect, tables: tuple[DumpTable, ...]) -> tuple[list[DumpTable], list[str]]:
+    """A data-only dump's tables, parents first (pre-flight M9), and what may still fail where the restore checks
+    foreign keys as rows load (RESTORE_CHECKS_FOREIGN_KEYS): a cycle, and each table that references itself (Task 9
+    fix M4). The dump's outcome and its plan say the same."""
+    ordered, cycle = parents_first(tables)
+    if dialect not in RESTORE_CHECKS_FOREIGN_KEYS:
+        return ordered, []
+    said = [FK_CYCLE] if cycle else []
+    return ordered, said + [SELF_REFERENCE.format(table.name) for table in ordered if table.self_referencing]
 
 
 def _first_unicode_problem(text: str) -> int | None:
@@ -130,8 +156,8 @@ class DumpJob(Job):
         connection = ctx.connection
         if not isinstance(connection, Dumping):
             raise StatementError(cannot(self._engine, BE_DUMPED), code="not_supported")
+        self._check_filter(ctx)
         try:
-            check_filter(ctx.dialect, self._command.filter)
             session = connection.dump_session(self._command.scope)  # SQL Server reads whether SNAPSHOT is allowed
         except DomainError as exc:
             raise StatementError(exc.message, code=exc.code) from None
@@ -144,6 +170,32 @@ class DumpJob(Job):
             return self._dump(ctx, connection, session, Path(self._command.path).expanduser())
         finally:
             self._end_session(ctx, session.teardown)
+
+    def _check_filter(self, ctx: JobContext) -> None:
+        """Before anything is sent: the filter is one condition (as browsing checks it), and the SELECT it makes only
+        reads (fix M2)."""
+        command = self._command
+        if command.filter is None:
+            return
+        try:
+            check_filter(ctx.dialect, command.filter)
+            scope = command.scope
+            self._read_only_filter(ctx, build_count_select(ctx.dialect, scope.schema_name, scope.names[0],
+                                                           command.filter))
+        except DomainError as exc:
+            raise StatementError(exc.message, code=INVALID_FILTER) from None
+
+    def _read_only_filter(self, ctx: JobContext, sql: str) -> str:
+        """`sql`, a SELECT built from the filter, when it is a plain read on any profile (the read-only allow-list's
+        classifier) and the session's gate lets it through (a read-only profile can never send more): else nothing of
+        it is sent. Without a filter every SELECT is DbaGuy's own."""
+        if self._command.filter is None:
+            return sql
+        if not is_plain_read(sql, ctx.dialect):
+            raise StatementError(FILTER_NOT_A_CONDITION, code=INVALID_FILTER)
+        if ctx.hooks.gate(sql).action != GuardAction.RUN:
+            raise StatementError(f"This connection is read-only: {FILTER_NOT_A_CONDITION}", code="read_only")
+        return sql
 
     def broke(self, ctx: JobContext, exc: Exception) -> JobReport:
         """A dump only reads: whatever broke, nothing was written (the temporary file is gone)."""
@@ -164,8 +216,8 @@ class DumpJob(Job):
             script = DumpScript(ctx.dialect, self._engine, catalog, content=command.content,
                                 drop_first=command.drop_first,
                                 created=datetime.now().astimezone().isoformat("T", "seconds"))
-            tables, cycle = parents_first(catalog.tables) if not script.schema else (list(catalog.tables), False)
-            warnings = [*catalog.warnings, *([FK_CYCLE] if cycle else [])]
+            tables, said = data_order(ctx.dialect, catalog.tables) if not script.schema else (list(catalog.tables), [])
+            warnings = [*catalog.warnings, *said]
             self._log_start(catalog, target)
             with atomic_text_file(target) as file:
                 writer = _Writer(file, ctx, target.parent)
@@ -183,6 +235,8 @@ class DumpJob(Job):
                 ctx.tick(force=True)
                 writer.write(script.post())
                 writer.write(script.tail(rows))
+        except InvalidText:  # in the catalog (a table's rows are named in _table)
+            return self._failed(ctx, StatementError(CATALOG_NOT_UTF8, code=INVALID_TEXT))
         except StatementError as exc:
             if exc.code in session.changed_codes and not isinstance(exc, _Changed | StatementCancelled):
                 exc = StatementError(f"A table was changed while the dump ran: dump it again\n{exc.message}",
@@ -218,6 +272,9 @@ class DumpJob(Job):
                 for text in default_rows_text(dialect, table, count):
                     writer.write(text)
                 ctx.progress.rows += count
+        except InvalidText as exc:  # fix L2: the driver's own text quotes the value
+            where = f"{table.name}.{exc.column}" if exc.column else table.name
+            raise StatementError(f"{where} {NOT_UTF8}", code=INVALID_TEXT) from None
         except StatementError as exc:
             if exc.code in session.changed_codes and not isinstance(exc, StatementCancelled):
                 raise _Changed(f"{table.name} was changed while the dump ran: dump it again\n{exc.message}",
@@ -238,6 +295,7 @@ class DumpJob(Job):
                                 only=table.only)
         warned = False
         count = 0
+        end = statement_end(dialect)
 
         def write(statement: str | None) -> None:
             nonlocal warned
@@ -247,45 +305,41 @@ class DumpJob(Job):
                 warnings.append(said)
                 warned = True
             try:
-                writer.write(insert_text(dialect, statement))
+                writer.write(statement)  # and its terminator on its own: a large statement is not copied again
+                writer.write(end)
             except UnicodeEncodeError:
                 offset = _first_unicode_problem(statement)
                 column = batcher.column_at(statement, offset) if offset is not None else None
                 where = f"{table.name}.{column}" if column is not None else f"A name of {table.name}"
                 raise StatementError(f"{where} {NOT_UNICODE}", code=INVALID_TEXT) from None
 
-        size = self._first_fetch(table)
-        result = ctx.run(sql)
+        size, largest = FIRST_FETCH, 0
+        result = ctx.run(self._read_only_filter(ctx, sql))
         try:
+            # Until `[]`: a short chunk may come before an error later in the set (fix H1); a result that knows it is
+            # over says `[]` without a round trip
             while chunk := result.fetch(size):
-                before = batcher.row_chars
                 for row in chunk:
+                    before = batcher.row_chars
                     write(batcher.add(row))
+                    largest = max(largest, batcher.row_chars - before)
                 count += len(chunk)
                 ctx.progress.rows += len(chunk)
                 ctx.raise_if_cancelled()
                 ctx.tick()
-                if len(chunk) < size:
-                    break
-                size = max(1, min(FETCH_ROWS, len(chunk) * FETCH_CHARS // max(batcher.row_chars - before, 1)))
+                size = max(1, min(FETCH_ROWS, FETCH_CHARS // max(largest, 1)))  # fix M1: the largest row, not the mean
         finally:
             ctx.close(result)
         write(batcher.flush())
         return count
 
-    @staticmethod
-    def _first_fetch(table: DumpTable) -> int:
-        """FIRST_FETCH rows, fewer when the catalog says they are large: its size on disk may hold them compressed
-        (PostgreSQL's TOAST), so an estimate only ever lowers it."""
-        if table.rows_estimate and table.bytes_estimate:
-            return max(1, min(FIRST_FETCH, FETCH_CHARS * table.rows_estimate // table.bytes_estimate))
-        return FIRST_FETCH
-
     def _count(self, ctx: JobContext, table: DumpTable) -> int:
-        result = ctx.run(build_count_select(ctx.dialect, table.schema, table.table, self._command.filter,
-                                            only=table.only))
+        sql = build_count_select(ctx.dialect, table.schema, table.table, self._command.filter, only=table.only)
+        result = ctx.run(self._read_only_filter(ctx, sql))
         try:
             found = result.fetch(1)
+            while result.fetch(1):  # to its `[]`, so an error after the row is not lost (fix H1)
+                pass
         finally:
             ctx.close(result)
         return int(found[0][0]) if found and found[0][0] is not None else 0

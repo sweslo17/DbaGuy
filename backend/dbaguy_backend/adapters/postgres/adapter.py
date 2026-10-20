@@ -47,6 +47,10 @@ from .loaders import category_for_oid, configure_user_loaders
 _ROW_KEYWORDS = frozenset({"select", "with", "values", "table", "show", "explain", "fetch", "("})
 _RETURNING = re.compile(r"\breturning\b", re.IGNORECASE)
 _STREAM_CHUNK = 200
+PLAN_LOCK_TIMEOUT_MS = 5_000  # a dump plan's catalog read waits at most this long for a table's lock (Task 9 fix M3)
+_LOCK_NOT_AVAILABLE = "55P03"
+LOCKED_FOR_PLAN = ("A table in this scope is locked by another session (for example an uncommitted ALTER): try again "
+                   "after it commits")
 # Statements DECLARE CURSOR accepts, judged conservatively: a wrong "no" only means the result is read in full,
 # a wrong "yes" would make DECLARE fail and abort the user's transaction.
 _DECLARABLE_KEYWORDS = frozenset({"select", "values", "table", "(", "with"})
@@ -442,11 +446,34 @@ class PostgresConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
         return dump.SESSION
 
     def dump_catalog(self, scope: DumpScope, kinds: DumpObjectKinds, *, ddl: bool = True) -> DumpCatalog:
+        """The dump job's read (`ddl`, inside its own snapshot) as it is: it is cancellable. A plan's (on the metadata
+        connection) waits at most PLAN_LOCK_TIMEOUT_MS for a lock (an uncommitted ALTER in another session would hold
+        the connection, and the tree and completion queued behind it, as long as it lasts: Task 9 fix M3), in a block
+        of its own, rolled back: only on an auto-commit connection between statements, as the stable order's EXPLAIN."""
+        version, database = self.server_info().version, self.current_database() or ""
+        bounded = (not ddl and self._conn.autocommit
+                   and self._conn.info.transaction_status == pq.TransactionStatus.IDLE)
         try:
-            return dump.dump_catalog(self._conn, scope, kinds, self.server_info().version,
-                                     self.current_database() or "", ddl=ddl)
+            if bounded:
+                self._conn.execute("BEGIN")
+                self._conn.execute(f"SET LOCAL lock_timeout = {PLAN_LOCK_TIMEOUT_MS}")
+            return dump.dump_catalog(self._conn, scope, kinds, version, database, ddl=ddl)
         except psycopg.Error as exc:
+            if bounded and exc.sqlstate == _LOCK_NOT_AVAILABLE:
+                raise StatementError(LOCKED_FOR_PLAN, code=_LOCK_NOT_AVAILABLE) from exc
             raise self.translate_error(exc, "dump catalog") from exc
+        finally:
+            if bounded:
+                self._end_block()
+
+    def _end_block(self) -> None:
+        """Rolls back a block DbaGuy opened on this connection; one that is gone has nothing to roll back."""
+        if self._conn.info.transaction_status == pq.TransactionStatus.IDLE:
+            return
+        try:
+            self._conn.execute("ROLLBACK")
+        except psycopg.Error as exc:
+            logger.debug("A plan's block was not rolled back: {}", exc.sqlstate or type(exc).__name__)
 
     def schema_snapshot(self) -> SchemaSnapshot:
         # The connection's own (native-loader) cursors: arrays come back as lists, unlike the text-first user cursors.

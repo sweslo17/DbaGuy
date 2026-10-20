@@ -869,11 +869,12 @@ class _Reader:
     def _data(self, obj: Object, columns: list[TableColumn], sizes: tuple | None, parts: TableStatements,
               by_name: dict[tuple[str, str], Object]) -> DumpTable:
         estimate, size = sizes if sizes is not None else (None, None)
-        references = {by_name[key.references].label for key in parts.foreign_keys
-                      if key.references in by_name and by_name[key.references].object_id != obj.object_id}
+        targets = [by_name[key.references] for key in parts.foreign_keys if key.references in by_name]
+        references = {target.label for target in targets if target.object_id != obj.object_id}
         return DumpTable(schema=obj.schema, table=obj.name, name=obj.label, columns=tuple(columns),
                          rows_estimate=int(estimate) if estimate is not None else None,
-                         bytes_estimate=int(size) if size is not None else None, references=tuple(sorted(references)))
+                         bytes_estimate=int(size) if size is not None else None, references=tuple(sorted(references)),
+                         self_referencing=any(target.object_id == obj.object_id for target in targets))
 
 
 def dump_catalog(

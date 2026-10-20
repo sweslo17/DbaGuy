@@ -107,16 +107,22 @@ def size_warning(dialect: Dialect, name: str, statement: str, packet_bytes: int 
     """What a dump says about a statement too large to restore (R-06-11, pre-flight M11), or None: past Run SQL file's
     limit (characters, as it measures), any dialect; past MySQL's max_allowed_packet (UTF-8 bytes, measured only when
     the characters could reach it): `packet_bytes`, the dumped server's own (5.7's default is 4 MiB), or MySQL 8's
-    default when it is not known. Only a single row makes one: a statement of several holds at most
-    MAX_INSERT_CHARS. `name`: the table as the file names it."""
+    default when it is not known. A statement of one row or of several (Task 9 fix L5: under a small packet a batch
+    of MAX_INSERT_CHARS can be too long too). `name`: the table as the file names it."""
     chars = len(statement)
     if chars + _TERMINATOR > MAX_STATEMENT_CHARS:
-        return f"{name} has a row over {MAX_STATEMENT_CHARS // _MEBIBYTE} MiB: Run SQL file cannot restore it"
+        return f"{name} has an INSERT statement over {_size(MAX_STATEMENT_CHARS)}: Run SQL file cannot restore it"
     limit = packet_bytes or MYSQL_PACKET_BYTES
     if dialect is Dialect.MYSQL and chars * _UTF8_MOST > limit:
         size = chars if statement.isascii() else len(statement.encode("utf-8", "surrogatepass"))
         if size > limit:
-            where = f"{limit / _MEBIBYTE:g} MiB on the server dumped" if packet_bytes else "64 MiB by default"
-            return (f"{name} has a row of {size / _MEBIBYTE:.0f} MiB: MySQL refuses statements over its "
+            where = f"{_size(limit)} on the server dumped" if packet_bytes else "64 MiB by default"
+            return (f"{name} has an INSERT statement of {_size(size)}: MySQL refuses statements over its "
                     f"max_allowed_packet ({where}) when the file is run")
     return None
+
+
+def _size(count: int) -> str:
+    """`4 KiB`, `64 MiB`, `66.8 MiB`: KiB under a MiB, one decimal at most."""
+    value, unit = (count / _MEBIBYTE, "MiB") if count >= _MEBIBYTE else (count / 1024, "KiB")
+    return f"{value:.1f}".rstrip("0").rstrip(".") + f" {unit}"

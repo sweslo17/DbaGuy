@@ -101,7 +101,18 @@ def transaction_open_error() -> StatementError:
 
 
 INVALID_TEXT = "invalid_text"
+CONNECTION_LOST = "connection_lost"  # the link to the server is gone (a statement may or may not have run)
 INVALID_PARAMS = "invalid_params"  # a parameter refused before sending; the message names it, never its value
+
+
+class InvalidText(StatementError):
+    """Text the driver could not decode (SQLite's bytes that are not UTF-8): the column the driver names, never the
+    text itself (it would reach the screen and the log garbled)."""
+
+    def __init__(self, column: str | None) -> None:
+        where = f"Column {column}" if column else "A value"
+        super().__init__(f"{where} holds text that is not valid UTF-8", code=INVALID_TEXT)
+        self.column = column
 
 
 def invalid_text_error(sql: str, index: int) -> StatementError:
@@ -163,7 +174,10 @@ class StatementResult(ABC):
 
     @abstractmethod
     def fetch(self, n: int) -> list[list[Any]]:
-        """Up to n raw rows of the current result set; fewer (or none) means exhausted."""
+        """Up to n raw rows of the current result set. Only `[]` means the set is exhausted: fewer than n may come
+        before an error later in the set (SQL Server raises it on the next call, Task 9 fix H1), so a reader that must
+        know it read every row fetches until `[]`, or asks `next_result()`. An adapter that knows the set is over
+        returns `[]` without a round trip."""
 
     @abstractmethod
     def affected_rows(self) -> int | None: ...

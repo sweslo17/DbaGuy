@@ -1427,8 +1427,9 @@ export interface components {
          *     collations, types, sequences, routines, tables, views, triggers, events, synonyms, rules, extended statistics and
          *     policies. The parts of another object are left to it: a table's indexes, foreign keys, check constraints,
          *     defaults and settings, a trigger's state, a sequence's owner and value, an identity's value, a table's row-level
-         *     security switch, SQLite's header settings (user_version, application_id). A data-only plan lists the tables alone,
-         *     parents first. `not_included` is the header's Not included list, word for word.
+         *     security switch, SQLite's header settings (user_version, application_id). A data-only plan lists the tables, parents
+         *     first, then what only a data-only dump writes (`refresh`: PostgreSQL's materialized views, made again from the
+         *     rows). `not_included` is the header's Not included list, word for word.
          */
         DumpPlan: {
             /** Objects */

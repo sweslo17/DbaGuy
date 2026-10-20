@@ -41,6 +41,10 @@ RESTORE_SETTINGS: dict[Dialect, tuple[str, ...]] = {
     # checks until its COMMIT
     Dialect.SQLITE: ("PRAGMA foreign_keys = OFF", "PRAGMA defer_foreign_keys = ON"),
 }
+# The restores that check each row's foreign keys as it loads (MySQL's header turns the checks off, SQLite's defers
+# them to the COMMIT): only there can a data-only restore fail on the order of its rows (pre-flight M9, Task 9 fix M4)
+RESTORE_CHECKS_FOREIGN_KEYS = frozenset({Dialect.POSTGRES, Dialect.TSQL})
+MAX_GO_REPEAT = 1000  # the largest `GO n` a dump writes: the query tab runs up to this many (Task 9 fix L4)
 RESET_SETTINGS: dict[Dialect, tuple[str, ...]] = {
     Dialect.MYSQL: ("SET FOREIGN_KEY_CHECKS = 1",), Dialect.SQLITE: ("PRAGMA foreign_keys = ON",),
 }
@@ -97,6 +101,12 @@ def insert_text(dialect: Dialect, statement: str) -> str:
     return statement + _end(dialect)
 
 
+def statement_end(dialect: Dialect) -> str:
+    """What `insert_text` puts after a statement: a dump writes it on its own after a large INSERT, so the statement's
+    text is never copied once more (Task 9 fix M1)."""
+    return _end(dialect)
+
+
 def object_text(dialect: Dialect, item: DumpObject) -> str:
     if item.compound and dialect is Dialect.MYSQL:
         return ("DELIMITER ;;\n" + "".join(f"{_closed(dialect, statement)};;\n" for statement in item.statements)
@@ -127,9 +137,9 @@ def not_included(catalog: DumpCatalog) -> list[str]:
 def default_rows_text(dialect: Dialect, table: DumpTable, count: int) -> Iterator[str]:
     """`count` rows of a table with no column a dump can write (only rowversion, computed or sql_variant columns; a
     PostgreSQL table of no columns): each a row of its defaults, so the restore has as many rows as the source (06a
-    Task 7 review). PostgreSQL in one statement; MySQL MAX_DEFAULT_ROWS rows a statement; T-SQL one batch run `count`
-    times (`GO n`, which Run SQL file runs and counts each time); SQLite (whose tables always have such a column) a
-    statement a row."""
+    Task 7 review). PostgreSQL in one statement; MySQL MAX_DEFAULT_ROWS rows a statement; T-SQL one batch run n times
+    (`GO n`, which Run SQL file runs and counts each time), n at most MAX_GO_REPEAT, as the query tab runs it; SQLite
+    (whose tables always have such a column) a statement a row."""
     if count <= 0:
         return
     name = table_sql(dialect, table)
@@ -140,7 +150,8 @@ def default_rows_text(dialect: Dialect, table: DumpTable, count: int) -> Iterato
             rows = min(MAX_DEFAULT_ROWS, count - start)
             yield insert_text(dialect, f"INSERT INTO {name} () VALUES " + ", ".join(["()"] * rows))
     elif dialect is Dialect.TSQL:
-        yield f"INSERT INTO {name} DEFAULT VALUES\nGO {count}\n"
+        for start in range(0, count, MAX_GO_REPEAT):
+            yield f"INSERT INTO {name} DEFAULT VALUES\nGO {min(MAX_GO_REPEAT, count - start)}\n"
     else:
         statement = insert_text(dialect, f"INSERT INTO {name} DEFAULT VALUES")
         for start in range(0, count, MAX_DEFAULT_ROWS):
@@ -171,8 +182,10 @@ class DumpScript:
         self.drops = drop_first and self.schema  # a data-only file drops nothing, and its header says so
 
     def _written(self, objects: Iterable[DumpObject]) -> list[DumpObject]:
-        """The objects this content writes: the structure's, the data's (setval, counters), or both."""
-        return [item for item in objects if (self.schema if item.section == "schema" else self.data)]
+        """The objects this content writes: the structure's, the data's (setval, counters), or both; a data-only
+        dump's own (PostgreSQL's REFRESH MATERIALIZED VIEW) only there."""
+        wanted = {"schema": self.schema, "data": self.data, "data_only": self.data and not self.schema}
+        return [item for item in objects if wanted[item.section]]
 
     def summary(self) -> str:
         counts = Counter(item.kind for item in (*self._written(self.catalog.pre), *self._written(self.catalog.post)))

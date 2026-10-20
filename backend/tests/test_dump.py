@@ -391,3 +391,189 @@ def test_the_adapters_read_no_rows_ahead_of_a_jobs_fetch(tmp_path, engine):
     finally:
         conn.close()
         db.close()
+
+
+# -- Task 9 fix round 1
+
+
+@requires_mssql
+def test_an_error_later_in_a_sql_server_result_fails_the_dump_and_the_export(tmp_path):  # fix H1
+    """SQL Server sends the rows before an error later in the set first (a filter that divides by zero at row 2500):
+    the dump fails instead of writing 2,499 rows as the whole table, and so does a CSV export of the same SELECT."""
+    from dbaguy_backend.domain.execution import ExportCommand
+    from tests.test_sessions import request_events
+
+    db = scratch_db("mssql", tmp_path)
+    app = DataApp(tmp_path)
+    try:
+        with scratch_database("mssql", "mid") as (source, admin):
+            admin.run_in(source, "CREATE TABLE dbo.t (id int PRIMARY KEY, v int)",
+                         "INSERT INTO dbo.t SELECT TOP (3000) ROW_NUMBER() OVER (ORDER BY (SELECT 1)), 1 "
+                         "FROM sys.all_objects a CROSS JOIN sys.all_objects b")
+            profile = app.add_profile(db.profile(database=source))
+            target = tmp_path / "t.sql"
+            target.write_text("the old dump")
+            dumped = dump(app, profile, source, target, DumpScope(kind="tables", schema_name="dbo", names=["t"]),
+                          filter="10 / (id - 2500) IS NOT NULL")
+            assert (dumped.outcome.outcome, dumped.error.code) == ("failed", "8134")
+            assert target.read_text() == "the old dump" and not list(tmp_path.glob(".*.part"))
+            tab = app.job_session(profile, source)
+            csv = tmp_path / "e.csv"
+            tab.worker.submit(ExportCommand(request_id="e", sql="SELECT id FROM dbo.t WHERE 10 / (id - 2500) IS NOT "
+                                                                "NULL", format="csv", path=str(csv)))
+            events = request_events(tab.recorder, "e", 60)
+            assert [(e.type, getattr(e, "code", None)) for e in events if e.type in ("error", "finished")] == [
+                ("error", "8134"), ("finished", None)]
+            assert not csv.exists()
+            app.close_sessions()
+    finally:
+        app.close()
+        db.close()
+
+
+@pytest.mark.parametrize("engine, read_only, condition", [
+    pytest.param("mysql", True, "1=1 INTO OUTFILE '/var/lib/mysql-files/zz_06_never.txt'", marks=requires_mysql),
+    pytest.param("mysql", False, "1=1 INTO OUTFILE '/var/lib/mysql-files/zz_06_never.txt'", marks=requires_mysql),
+    pytest.param("mysql", True, "1=1 FOR UPDATE", marks=requires_mysql),
+    pytest.param("postgres", False, "id = 1; COPY t TO STDOUT", marks=requires_pg),
+    pytest.param("mssql", False, "1=1 SELECT * INTO dbo.zz_06_never FROM dbo.t", marks=requires_mssql),
+    pytest.param("mssql", False, "1=1 EXEC sp_who", marks=requires_mssql),
+])
+def test_a_filter_is_a_condition_and_nothing_else(tmp_path, engine, read_only, condition):  # fix M2
+    db = scratch_db(engine, tmp_path)
+    app = DataApp(tmp_path)
+    try:
+        with scratch_database(engine, "ro") as (source, admin):
+            schema = {"postgres": "public", "mysql": source, "mssql": "dbo"}[engine]
+            admin.run_in(source, f"CREATE TABLE {'' if engine == 'mysql' else schema + '.'}t (id int PRIMARY KEY)")
+            profile = app.add_profile(db.profile(database=source, read_only=read_only))
+            ran = dump(app, profile, source, tmp_path / "o.sql", DumpScope(kind="tables", schema_name=schema,
+                                                                          names=["t"]), filter=condition)
+            assert (ran.outcome.outcome, ran.error.code) == ("not_started", "invalid_filter")
+            assert condition not in ran.error.message and not (tmp_path / "o.sql").exists()
+            app.close_sessions()
+    finally:
+        app.close()
+        db.close()
+
+
+@requires_pg
+def test_a_plan_waits_for_a_locked_table_at_most_five_seconds_and_says_why(tmp_path):  # fix M3
+    """An uncommitted ALTER in another session: the plan answers in about 5 s with what is wrong, and the tree (on
+    the same metadata connection) answers right after it."""
+    import threading
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from dbaguy_backend.app import create_app
+    from dbaguy_backend.domain.metadata import MetadataRequest, PathSegment
+
+    db = scratch_db("postgres", tmp_path)
+    app = DataApp(tmp_path)
+    try:
+        with scratch_database("postgres", "lock") as (source, admin):
+            admin.run_in(source, "CREATE TABLE t (id int)", "CREATE TABLE other (id int)")
+            profile = app.add_profile(db.profile(database=source))
+            tree = MetadataRequest(profile_id=profile, path=[PathSegment(kind="database", name=source),
+                                                             PathSegment(kind="schema", name="public")])
+            assert app.container.metadata.children(tree)
+            hold = pg_inventory.connect(source, autocommit=False)
+            try:
+                hold.execute("ALTER TABLE t ADD COLUMN x int")  # uncommitted, as in a manual-commit tab
+                answered: dict[str, float] = {}
+
+                def tree_later():
+                    time.sleep(1)
+                    app.container.metadata.children(tree)
+                    answered["tree"] = time.monotonic()
+
+                later = threading.Thread(target=tree_later)
+                started = time.monotonic()
+                later.start()
+                with TestClient(create_app(app.container.settings, app.container), base_url="http://127.0.0.1") as c:
+                    plan = c.post("/data/dump/plan", headers={"Authorization": "Bearer data"}, json={
+                        "profile_id": str(profile), "database": source,
+                        "scope": {"kind": "tables", "schema_name": "public", "names": ["other"]}})
+                took = time.monotonic() - started
+                later.join(10)
+                assert plan.status_code == 400 and plan.json()["error"] == {
+                    "code": "55P03", "message": "A table in this scope is locked by another session (for example an "
+                                                "uncommitted ALTER): try again after it commits"}
+                assert 4.5 < took < 8 and answered["tree"] - started < took + 1.5
+            finally:
+                hold.rollback()
+                hold.close()
+            plan = app.container.data.dump_plan(profile, source, DumpScope(kind="tables", schema_name="public",
+                                                                           names=["other"]), "both",
+                                                DumpObjectKinds(), None)
+            assert [(o.kind, o.name) for o in plan.objects] == [("schema", "public"), ("table", "public.other")]
+            app.close_sessions()
+    finally:
+        app.close()
+        db.close()
+
+
+@requires_pg
+def test_a_postgresql_data_only_dump_refreshes_its_views_and_says_which_tables_reference_themselves(tmp_path):
+    """Fix L3: a data-only file ends with REFRESH MATERIALIZED VIEW, so a view restored with the schema alone (empty)
+    comes back with the rows; the plan lists it. Fix M4: a table that references itself is said in the plan and the
+    outcome (its rows here load in order, so this restore works)."""
+    db = scratch_db("postgres", tmp_path)
+    app = DataApp(tmp_path)
+    try:
+        with scratch_database("postgres", "src") as (source, admin), \
+                scratch_database("postgres", "restore") as (target, _):
+            admin.run_in(source, "CREATE TABLE p (id int PRIMARY KEY, v text)",
+                         "CREATE TABLE c (id int PRIMARY KEY, p_id int REFERENCES p (id))",
+                         "CREATE TABLE emp (id int PRIMARY KEY, boss int REFERENCES emp (id))",
+                         "INSERT INTO p SELECT g, 'v' || g FROM generate_series(1, 30) g",
+                         "INSERT INTO c SELECT g, g FROM generate_series(1, 30) g",
+                         "INSERT INTO emp SELECT g, NULLIF(g - 1, 0) FROM generate_series(1, 50) g",
+                         "CREATE MATERIALIZED VIEW mv AS SELECT count(*) AS n FROM p",
+                         "CREATE MATERIALIZED VIEW mv_later AS SELECT 1 AS one WITH NO DATA")
+            profile = app.add_profile(db.profile(database=source))
+            scope = DumpScope(kind="database")
+            said = "public.emp references itself: a data-only restore may fail unless its rows load in order"
+            plan = app.container.data.dump_plan(profile, source, scope, "data", DumpObjectKinds(), None)
+            assert [(o.kind, o.name) for o in plan.objects] == [
+                ("table", "public.p"), ("table", "public.c"), ("table", "public.emp"), ("refresh", "public.mv")]
+            assert plan.warnings == [said]
+            schema_file, data_file = tmp_path / "schema.sql", tmp_path / "data.sql"
+            assert dump(app, profile, source, schema_file, scope, content="schema").outcome.outcome == "completed"
+            dumped = dump(app, profile, source, data_file, scope, content="data")
+            assert (dumped.outcome.outcome, dumped.outcome.warnings) == ("completed", [said])
+            assert "REFRESH MATERIALIZED VIEW public.mv;" in data_file.read_text()
+            assert "REFRESH" not in schema_file.read_text() and "mv_later" not in data_file.read_text()
+            both = tmp_path / "both.sql"
+            assert dump(app, profile, source, both, scope).outcome.outcome == "completed"
+            assert "REFRESH" not in both.read_text()  # with the schema the view is made with its rows
+            restored = app.add_profile(db.profile(database=target))
+            for path in (schema_file, data_file):
+                ran = restore(app, restored, target, path, "all_or_nothing")
+                assert (ran.outcome.outcome, ran.error) == ("completed", None)
+            app.close_sessions()
+            assert pg_inventory.differences(pg_inventory.inventory(source), pg_inventory.inventory(target)) == {}
+    finally:
+        app.close()
+        db.close()
+
+
+def test_sqlite_text_that_is_not_utf8_names_its_table_and_column(tmp_path):  # fix L2
+    source = tmp_path / "bad.db"
+    conn = sqlite3.connect(source, isolation_level=None)
+    conn.executescript("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1, 'ok'); "
+                       "INSERT INTO t VALUES (2, CAST(X'61FF62' AS TEXT));")
+    conn.close()
+    app = DataApp(tmp_path)
+    try:
+        profile = app.add_profile({"profile": {"engine": "sqlite", "name": "bad", "path": str(source)}})
+        target = tmp_path / "bad.sql"
+        target.write_text("old")
+        ran = dump(app, profile, None, target, DumpScope(kind="schema", schema_name="main"))
+        assert (ran.outcome.outcome, ran.error.code, ran.error.message) == (
+            "failed", "invalid_text", "t.v holds text that is not valid UTF-8, which a UTF-8 file cannot hold. "
+                                      "Nothing was written")
+        assert target.read_text() == "old"
+    finally:
+        app.close()

@@ -205,11 +205,17 @@ class MssqlResult(StatementResult):
         return self._columns
 
     def fetch(self, n: int) -> list[list[Any]]:
+        """The rows that arrived before an error later in the set come first; the error itself with the next call
+        (Task 9 fix H1): a reader that stops at a short chunk still learns of it from `next_result()`, and one that
+        reads until `[]` (a dump, an export) from here, instead of taking the cut rows for the whole set."""
         if self._columns is None or self._closed:
             return []
         rows, self._buffer = self._buffer[:n], self._buffer[n:]
         if len(rows) < n and not self._rows_done:
             rows += self._read(n - len(rows))
+        if not rows and self._deferred is not None:
+            error, self._deferred = self._deferred, None
+            raise error
         return [self._convert(row) for row in rows]
 
     def affected_rows(self) -> int | None:

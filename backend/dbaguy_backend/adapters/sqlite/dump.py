@@ -168,14 +168,17 @@ class _Reader:
         (pre-flight M9); a foreign key to a table outside the dump stays in its DDL, and a warning says the file needs
         that table."""
         references = set()
+        itself = False
         for (target,) in self.conn.execute(_REFERENCES, (name, "main")).fetchall():
             if (found := dumped.get(_folded(target))) is None:
                 self.warnings.append(kept_foreign_key(name, target))
             elif found != name:
                 references.add(found)
+            else:
+                itself = True
         return DumpTable(schema="main", table=name, name=name,
                          columns=tuple(columns_of(read_relation(self.conn, "main", name))),
-                         references=tuple(sorted(references)))
+                         references=tuple(sorted(references)), self_referencing=itself)
 
 
 def dump_catalog(

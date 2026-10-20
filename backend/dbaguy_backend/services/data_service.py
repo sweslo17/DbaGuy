@@ -13,16 +13,17 @@ from uuid import UUID
 
 from loguru import logger
 
-from ..adapters.base import DatabaseAdapter, DatabaseConnection, Dumping
-from ..adapters.dump import DumpCatalog, parents_first
+from ..adapters.base import DatabaseAdapter, DatabaseConnection, Dumping, InvalidText, StatementError
+from ..adapters.dump import DumpCatalog
 from ..adapters.registry import AdapterRegistry
+from ..adapters.base import CONNECTION_LOST, INVALID_TEXT
 from ..domain.data_jobs import (
     BE_DUMPED, ENGINE_NAMES, RUN_SQL_FILES, DumpContent, DumpHeader, DumpObjectKinds, DumpPlan, DumpPlanObject,
     DumpScope, FileInspection, cannot, cannot_read,
 )
-from ..domain.errors import FileNotFound, NotFound, NotSupported, ReadOnlyProfile, StorageError
+from ..domain.errors import FileNotFound, NotFound, NotSupported, QueryFailed, ReadOnlyProfile, StorageError
 from ..domain.profiles import AnyProfile, Engine, SqliteProfile
-from ..sessions.jobs.dump import FK_CYCLE, target_problem
+from ..sessions.jobs.dump import data_order, target_problem
 from ..sessions.jobs.registry import JobRegistry
 from ..sql.dump_header import CUT_SHORT, END_BYTES, cut_short, parse_header
 from ..sql.dump_script import not_included
@@ -36,10 +37,21 @@ LOW_DISK_BYTES = 1 << 30  # CR-4: below this much free space a dump's plan warns
 _GIB = 1 << 30
 _COPY_FROM_STDIN = re.compile(r"COPY\s.*\sFROM\s+stdin", re.IGNORECASE)
 _HEX_BLOB = "mysqldump: use --hex-blob"
+_PLAN_NOT_UTF8 = ("A name or definition in this database holds text that is not valid UTF-8: a dump cannot write "
+                  "it to a UTF-8 file")  # Task 9 fix L2: never the driver's text, which quotes it
 # The parts of another object, which a dump plan's list leaves to it (DumpPlan)
 _PARTS = frozenset({"index", "foreign key", "check constraint", "default", "column default", "table settings",
                     "trigger state", "sequence owner", "sequence value", "identity value", "row-level security",
                     "setting"})
+
+
+def _final(message: str, code: str | None) -> QueryFailed:
+    """A plan's catalog read that the server refused (a lock it waited for too long, say): the answer, with the server's
+    code, never a reconnect and a second wait (the metadata connection resends only on a lost connection)."""
+    error = QueryFailed(message)
+    if code:
+        error.code = code
+    return error
 
 
 def _open_in_finder(path: Path) -> None:
@@ -80,16 +92,26 @@ class DataService:
         def read(connection: DatabaseConnection) -> DumpCatalog:
             if not isinstance(connection, Dumping):
                 raise NotSupported(cannot(profile.engine, BE_DUMPED))
-            return connection.dump_catalog(scope, kinds, ddl=False)
+            try:
+                return connection.dump_catalog(scope, kinds, ddl=False)
+            except InvalidText:
+                raise _final(_PLAN_NOT_UTF8, INVALID_TEXT) from None
+            except StatementError as exc:
+                if exc.code == CONNECTION_LOST:
+                    raise  # the metadata connection reconnects once
+                raise _final(exc.message, exc.code) from exc  # the server's answer: never sent again
 
         catalog = self._metadata.with_connection(profile_id, database, read)
         estimates = {table.name: table.rows_estimate for table in catalog.tables}
         warnings = list(catalog.warnings)
         if content == "data":
-            tables, cycle = parents_first(catalog.tables)
+            tables, said = data_order(self._registry.get(profile.engine).dialect, catalog.tables)
             objects = [DumpPlanObject(kind="table", name=table.name, rows_estimate=table.rows_estimate)
                        for table in tables]
-            warnings += [FK_CYCLE] if cycle else []
+            # what only a data-only dump writes (PostgreSQL's REFRESH MATERIALIZED VIEW, fix L3)
+            objects += [DumpPlanObject(kind=item.kind, name=item.name) for item in catalog.post
+                        if item.section == "data_only"]
+            warnings += said
         else:
             rows = content == "both"  # a schema-only dump writes no rows
             named = [item for item in (*catalog.pre, *catalog.post)

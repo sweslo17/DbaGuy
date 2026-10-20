@@ -63,7 +63,8 @@ def steps(found: DumpCatalog, drop_first: bool = True, data: bool = True) -> lis
     out += [("sql", s) for item in found.pre for s in item.statements]
     if data:
         out += [("data", table) for table in found.tables]
-    return out + [("sql", s) for item in found.post for s in item.statements]
+    # a data-only dump's own (REFRESH MATERIALIZED VIEW) is not in a file with the schema
+    return out + [("sql", s) for item in found.post if item.section != "data_only" for s in item.statements]
 
 
 def _copy(src: psycopg.Connection, dst: psycopg.Connection, table) -> None:

@@ -102,6 +102,7 @@ def test_a_schema_dump_orders_every_object_by_its_dependencies(schema):
         ("sequence value", "Child Rows_id_seq"), ("index", "child_note"), ("index", "events_v"),
         ("foreign key", "Child Rows.Child Rows_parent_id_fkey"), ("function", "parents()"),
         ("function", "n_parents()"), ("view", "v_base"), ("view", "v_top"), ("materialized view", "mv"),
+        ("refresh", "mv"),  # written by a data-only dump alone (Task 9 fix L3)
         ("view", "v_n"), ("trigger", "parent.touch"),
     ]
     assert [(t.name.replace(f"{name}.", ""), t.only) for t in found.tables] == [
@@ -265,7 +266,8 @@ def test_a_drop_first_dump_restores_twice_and_reads_back_the_same():
             ("sequence value", "counter"), ("sequence value", "acct_id_seq"), ("index", "acct_owner"),
             ("foreign key", "kid.kid_mom"), ("foreign key", "pt.pt_acct_id_fkey"),
             ("check constraint", "acct.n_positive"), ("table settings", "acct"), ("function", "acct_count()"),
-            ("view", "v_count"), ("view", "v_acct"), ("materialized view", "mv"), ("function", "seen()"),
+            ("view", "v_count"), ("view", "v_acct"), ("materialized view", "mv"), ("refresh", "mv"),
+            ("function", "seen()"),
             ("column default", "late.n"), ("check constraint", "late.late_m_check"), ("index", "mv_k"),
             ("trigger", "acct.stamp"), ("trigger", "v_count.v_insert"), ("rule", "acct.no_delete"),
             ("rule", "mom.mom_also"), ("statistics", "acct_stats"), ("row-level security", "acct"),

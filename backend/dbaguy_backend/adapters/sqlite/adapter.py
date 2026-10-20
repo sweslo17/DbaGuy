@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -24,6 +25,7 @@ from ..base import (
     DataTools,
     Dumping,
     Endpoint,
+    InvalidText,
     ParsedUrl,
     RowEditing,
     RunOptions,
@@ -39,6 +41,7 @@ from . import columns, dump, editing, introspection
 from . import schema as sqlite_schema
 
 _PEEK_ROWS = 200
+_NOT_UTF8 = re.compile(r"Could not decode to UTF-8 column '(.*?)' with text", re.DOTALL)  # the driver's
 # sqlite3 keeps this many compiled statements per connection (128 by default). Run SQL file's multi-row INSERTs
 # never repeat, and 128 compiled 1,000-row INSERTs held 300 MB (⑥ A10): statements are compiled each time instead
 _STATEMENT_CACHE = 0
@@ -53,6 +56,8 @@ def _translate(exc: sqlite3.Error) -> StatementError:
     message = str(exc)
     if isinstance(exc, sqlite3.OperationalError) and message == "interrupted":
         return StatementCancelled()
+    if isinstance(exc, sqlite3.OperationalError) and (found := _NOT_UTF8.match(message)):
+        return InvalidText(found.group(1))  # the driver's text quotes the value (Task 9 fix L2)
     return StatementError(message, code=getattr(exc, "sqlite_errorname", None))
 
 

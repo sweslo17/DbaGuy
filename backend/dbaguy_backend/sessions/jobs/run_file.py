@@ -25,7 +25,7 @@ from typing import BinaryIO
 
 from loguru import logger
 
-from ...adapters.base import RunOptions, StatementCancelled, StatementError
+from ...adapters.base import CONNECTION_LOST, RunOptions, StatementCancelled, StatementError
 from ...domain.data_jobs import MAX_JOB_ERRORS, JobError, JobOutcomeKind, StoppedAt, cannot_read
 from ...domain.errors import READ_ONLY_MESSAGE
 from ...domain.execution import MessageSeverity, RunFileCommand
@@ -43,7 +43,6 @@ from ...sql.transaction_text import (
 from ..edit_apply import TRANSACTION_ENDED as ENDED_INSIDE  # SQL Server 3609, as ⑤ reads it
 from .context import JOB_ROLLBACK_FAILED, Job, JobContext, JobReport
 
-CONNECTION_LOST = "connection_lost"
 READ_ONLY = "read_only"
 UNSUPPORTED_COPY = "unsupported_copy"
 TRANSACTION_IN_FILE = "transaction_in_file"

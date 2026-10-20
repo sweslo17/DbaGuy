@@ -10,7 +10,9 @@ from typing import Literal
 from .columns import TableColumn
 
 Consistency = Literal["snapshot", "per_table"]
-Section = Literal["schema", "data"]
+# schema: the structure; data: what the rows need (setval, counters), in any dump with the data; data_only: what only a
+# data-only dump writes (PostgreSQL's REFRESH MATERIALIZED VIEW: a dump with the schema creates the view with its rows)
+Section = Literal["schema", "data", "data_only"]
 OWNERS_AND_PRIVILEGES = "owners and privileges"  # never dumped (R-06-2)
 
 
@@ -58,6 +60,7 @@ class DumpTable:
     # The `name`s of the other tables of this dump that its foreign keys reference: a data-only dump writes those
     # first (pre-flight M9), since its file restores into a schema whose foreign keys are already there
     references: tuple[str, ...] = ()
+    self_referencing: bool = False  # a foreign key of its own references it: its rows load only in the right order
 
 
 @dataclass(frozen=True)

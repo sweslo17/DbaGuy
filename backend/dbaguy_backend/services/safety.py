@@ -99,6 +99,14 @@ class SafetyPolicy:
         return dangers
 
 
+def is_plain_read(sql: str, dialect: Dialect) -> bool:
+    """Whether `sql` only reads, by the classifier and the rules the read-only allow-list uses (a READ it lets
+    through): what a dump's SELECT built from the user's filter must be, on every profile (Task 9 fix M2)."""
+    classification = classify(sql, dialect)
+    return (classification.kind == StatementKind.READ
+            and SafetyPolicy._allowed_when_read_only(sql, classification, dialect))
+
+
 def _single_statement_tokens(sql: str, dialect: Dialect) -> list[Token] | None:
     """The significant tokens of `sql` when it is exactly one statement, else None.
 

@@ -20,7 +20,7 @@ from dbaguy_backend.domain.execution import DumpCommand
 from dbaguy_backend.domain.profiles import Engine
 from dbaguy_backend.sessions.jobs import dump as dump_module
 from dbaguy_backend.sessions.jobs.context import JobHooks
-from dbaguy_backend.sessions.jobs.dump import FETCH_CHARS, FIRST_FETCH, FK_CYCLE, DumpJob
+from dbaguy_backend.sessions.jobs.dump import FETCH_CHARS, FIRST_FETCH, FK_CYCLE, SELF_REFERENCE, DumpJob
 from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks
 from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.dump_header import parse_header
@@ -40,7 +40,9 @@ TABLE = DumpTable(schema="main", table="t", name="t", columns=COLUMNS)
 
 class Rows(FakeResult):
     """`count` rows (id, value(id)); with `stop_at`, waits once `stop_at` rows were read until a cancel, then
-    StatementCancelled. Every `n` asked for is kept in the connection's `fetches`."""
+    StatementCancelled. With `fails_at`, a short chunk ends at that row and the next fetch raises the connection's
+    `late_error`, as SQL Server's result does with an error later in the set. Every `n` asked for is kept in the
+    connection's `fetches`."""
 
     def __init__(self, count: int, conn: "DumpFake") -> None:
         super().__init__(0)
@@ -52,7 +54,9 @@ class Rows(FakeResult):
             self._conn.blocked.set()
             assert self._conn._unblock.wait(10), "never cancelled"
             raise StatementCancelled()
-        end = min(self._next + n, self._count)
+        if self._conn.fails_at is not None and self._next >= self._conn.fails_at:
+            raise self._conn.late_error
+        end = min(self._next + n, self._count, self._conn.fails_at or self._count)
         rows = [[i, self._conn.value(i)] for i in range(self._next, end)]
         self._next = end
         return rows
@@ -63,9 +67,11 @@ class DumpFake(FakeConnection, Dumping):
 
     def __init__(self, rows: int = 2500, stop_at: int | None = None, fail_select: StatementError | None = None,
                  tables: tuple[DumpTable, ...] = (TABLE,), session: DumpSession | None = None, value=None,
-                 **catalog) -> None:
+                 fails_at: int | None = None, late_error: StatementError | None = None,
+                 catalog_error: StatementError | None = None, **catalog) -> None:
         super().__init__()
         self.rows, self.stop_at, self.fail_select = rows, stop_at, fail_select
+        self.fails_at, self.late_error, self.catalog_error = fails_at, late_error, catalog_error
         self.tables, self.catalog = tables, catalog
         self.session = session or DumpSession(setup=("snapshot on",), teardown=("snapshot off",),
                                               consistency="snapshot")
@@ -81,6 +87,8 @@ class DumpFake(FakeConnection, Dumping):
         return self.session
 
     def dump_catalog(self, scope, kinds, *, ddl=True):
+        if self.catalog_error is not None:
+            raise self.catalog_error
         return DumpCatalog(
             server="SQLite 3", scope="schema main", consistency="snapshot",
             pre=(DumpObject("table", "t", ("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",),
@@ -109,19 +117,26 @@ class DumpFake(FakeConnection, Dumping):
 class _Count(FakeResult):
     def __init__(self, count: int) -> None:
         super().__init__(0)
-        self._count = count
+        self._rows = [[count]]
 
     def fetch(self, n):
-        return [[self._count]]
+        taken, self._rows = self._rows[:n], self._rows[n:]
+        return taken
 
 
 class Env:
-    def __init__(self, conn: DumpFake, dialect: Dialect, engine: Engine, source: Path | None) -> None:
+    def __init__(self, conn: DumpFake, dialect: Dialect, engine: Engine, source: Path | None, gate) -> None:
         self.conn = conn
         lease = FakeLease(conn)
         self.worker = SessionWorker("dump", lambda: lease)
         self.worker.start()
-        jobs = JobHooks(build=lambda command: DumpJob(command, "Fake", engine, source_file=source))
+        self.gated: list[str] = []
+
+        def gating(sql):
+            self.gated.append(sql)
+            return gate(sql) if gate is not None else JobHooks().gate(sql)
+
+        jobs = JobHooks(build=lambda command: DumpJob(command, "Fake", engine, source_file=source), gate=gating)
         self.worker.configure(WorkerHooks(dialect=dialect, capabilities=AdapterCapabilities(dump=True), jobs=jobs))
         self.recorder = Recorder()
         self.worker.set_emitter(self.recorder)
@@ -140,8 +155,8 @@ def env():
     made: list[Env] = []
 
     def make(conn: DumpFake | None = None, dialect: Dialect = Dialect.SQLITE, engine: Engine = Engine.SQLITE,
-             source: Path | None = None) -> Env:
-        made.append(Env(conn or DumpFake(), dialect, engine, source))
+             source: Path | None = None, gate=None) -> Env:
+        made.append(Env(conn or DumpFake(), dialect, engine, source, gate))
         return made[-1]
 
     yield make
@@ -309,8 +324,44 @@ def test_a_filter_reads_only_the_matching_rows_as_the_tab_reads_them(env, tmp_pa
     assert "SET search_path TO DEFAULT" not in e.conn.runs  # without a filter the rows are read as the catalog was
     e = env()
     events = e.run(tmp_path / "bad.sql", scope=one, filter="1; DROP TABLE t")
-    assert (outcome(events).outcome, error(events).message) == ("not_started", "A filter must be a single expression")
+    assert (outcome(events).outcome, error(events).code, error(events).message) == (
+        "not_started", "invalid_filter", "A filter must be a single expression")
     assert e.conn.runs == []
+
+
+@pytest.mark.parametrize("dialect, condition", [
+    (Dialect.MYSQL, "1=1 INTO OUTFILE '/var/lib/mysql-files/zz_06_never.txt'"),
+    (Dialect.MYSQL, "1=1 FOR UPDATE"), (Dialect.MYSQL, "1=1 LOCK IN SHARE MODE"),
+    (Dialect.POSTGRES, "set_config('default_transaction_read_only', 'off', false) IS NOT NULL"),
+    (Dialect.POSTGRES, "1=1 FOR SHARE"),
+])
+def test_a_filter_that_does_more_than_read_is_never_sent(env, tmp_path, dialect, condition):  # Task 9 fix M2
+    """Whatever the profile (this one is writable): the SELECT the filter makes must be a plain read."""
+    e = env(dialect=dialect)
+    events = e.run(tmp_path / "out.sql", scope=DumpScope(kind="tables", schema_name="main", names=["t"]),
+                   filter=condition)
+    assert (outcome(events).outcome, error(events).code) == ("not_started", "invalid_filter")
+    assert error(events).message == dump_module.FILTER_NOT_A_CONDITION and condition not in error(events).message
+    assert e.conn.runs == [] and list(tmp_path.iterdir()) == []
+
+
+def test_a_read_only_profiles_gate_sees_every_select_a_filter_makes(env, tmp_path):  # Task 9 fix M2
+    from dbaguy_backend.domain.classification import Classification, StatementKind
+    from dbaguy_backend.services.safety import GuardAction, GuardDecision
+
+    def refuse(sql):
+        return GuardDecision(action=GuardAction.BLOCK, classification=Classification(kind=StatementKind.READ))
+
+    e = env(gate=refuse)
+    one = DumpScope(kind="tables", schema_name="main", names=["t"])
+    events = e.run(tmp_path / "out.sql", scope=one, filter="id < 3")
+    assert (outcome(events).outcome, error(events).code) == ("not_started", "read_only") and e.conn.runs == []
+    e = env()
+    assert outcome(e.run(tmp_path / "ok.sql", scope=one, filter="id < 3")).outcome == "completed"
+    assert e.gated == ["SELECT COUNT(*) FROM main.t\nWHERE id < 3", "SELECT id, v FROM main.t\nWHERE id < 3"]
+    e = env()
+    e.run(tmp_path / "all.sql", scope=one)
+    assert e.gated == []  # without a filter every SELECT is DbaGuy's own
 
 
 def test_a_cancel_between_chunks_stops_the_dump(env, tmp_path):
@@ -323,8 +374,8 @@ def test_a_cancel_between_chunks_stops_the_dump(env, tmp_path):
     assert (done.outcome, done.cancelled) == ("failed", True) and not target.exists()
 
 
-def test_large_rows_are_read_a_few_at_a_time(env, tmp_path):  # pre-flight M12
-    """40 rows of 2 MiB of text: the first read takes FIRST_FETCH, the next ones about FETCH_CHARS of row text, so
+def test_large_rows_are_read_a_few_at_a_time(env, tmp_path):  # pre-flight M12, Task 9 fix M1
+    """40 rows of 2 MiB of text: the first read takes one row, the next ones FETCH_CHARS of row text at that size, so
     the dump never holds every row (80 MiB) at once."""
     big = "x" * (2 << 20)
     e = env(DumpFake(rows=40, value=lambda i: big))
@@ -336,16 +387,27 @@ def test_large_rows_are_read_a_few_at_a_time(env, tmp_path):  # pre-flight M12
         tracemalloc.stop()
     assert (done.outcome, done.rows) == ("completed", 40)
     per_fetch = FETCH_CHARS // ((2 << 20) + 2)  # rows of row text (the value's quotes) a fetch is sized to
-    assert e.conn.fetches == [FIRST_FETCH, per_fetch, per_fetch]
+    assert FIRST_FETCH == 1 and e.conn.fetches == [1, per_fetch, per_fetch, per_fetch, per_fetch]  # … then `[]`
     assert peak < 60 << 20, peak  # ≈ 30 MiB of rows + a statement's text; all 40 at once would be 80 MiB and more
+
+
+def test_reads_are_sized_by_the_largest_row_seen(env, tmp_path):  # Task 9 fix M1
+    """Short rows, then one of 4 MiB: from then on a read takes what fits FETCH_CHARS at 4 MiB a row, even when the
+    rows after it are short again (the mean would let a thousand of the next large ones in)."""
+    big = "x" * (4 << 20)
+    e = env(DumpFake(rows=3000, value=lambda i: big if i == 5 else "s"))
+    assert outcome(e.run(tmp_path / "out.sql")).rows == 3000
+    small = FETCH_CHARS // ((4 << 20) + 2)
+    assert e.conn.fetches[:4] == [1, 1000, small, small] and max(e.conn.fetches[2:]) == small
 
 
 def test_a_row_too_long_for_the_server_is_said_once_for_its_table(env, tmp_path):  # pre-flight M11
     e = env(DumpFake(rows=400, value=lambda i: "x" * 5000, max_statement_bytes=4096), Dialect.MYSQL, Engine.MYSQL)
     done = outcome(e.run(tmp_path / "out.sql", scope=DumpScope(kind="schema", schema_name="main")))
     assert done.outcome == "completed" and len(statements(tmp_path / "out.sql", Dialect.MYSQL)) > 6  # 2 INSERTs
-    assert done.warnings == ["a warning", "t has a row of 1 MiB: MySQL refuses statements over its max_allowed_packet "
-                                          "(0.00390625 MiB on the server dumped) when the file is run"]
+    [said] = done.warnings[1:]  # once for the table
+    assert said.startswith("t has an INSERT statement of 10") and said.endswith(  # a batch of about 1 MiB
+        " KiB: MySQL refuses statements over its max_allowed_packet (4 KiB on the server dumped) when the file is run")
 
 
 def test_text_that_is_not_unicode_names_its_table_and_column(env, tmp_path):  # pre-flight L15
@@ -370,9 +432,9 @@ def test_a_table_with_no_column_a_dump_writes_keeps_its_rows_as_rows_of_defaults
     e = env(DumpFake(rows=1203, tables=(bare,)), Dialect.TSQL, Engine.MSSQL)
     e.run(target)
     text = target.read_text()
-    assert "INSERT INTO main.t DEFAULT VALUES\nGO 1203\n" in text
+    assert "INSERT INTO main.t DEFAULT VALUES\nGO 1000\n" in text  # Task 9 fix L4: as a query tab runs it too
     assert [(s.text, s.repeat) for s in split(text, Dialect.TSQL) if "DEFAULT VALUES" in s.text] == [
-        ("INSERT INTO main.t DEFAULT VALUES", 1203)]
+        ("INSERT INTO main.t DEFAULT VALUES", 1000), ("INSERT INTO main.t DEFAULT VALUES", 203)]
 
 
 def test_a_data_only_dump_writes_parents_first_and_says_when_it_cannot(env, tmp_path):  # pre-flight M9
@@ -386,9 +448,17 @@ def test_a_data_only_dump_writes_parents_first_and_says_when_it_cannot(env, tmp_
     done = outcome(e.run(tmp_path / "both.sql"))
     assert [o.name for o in done.objects] == ["child", "parent"]  # with the schema: the catalog's order
     looped = DumpTable(schema="main", table="parent", name="parent", columns=COLUMNS, references=("child",))
-    e = env(DumpFake(rows=2, tables=(child, looped)))
+    emp = DumpTable(schema="main", table="emp", name="emp", columns=COLUMNS, self_referencing=True)
+    e = env(DumpFake(rows=2, tables=(child, looped, emp)), Dialect.POSTGRES, Engine.POSTGRES)
     done = outcome(e.run(tmp_path / "cycle.sql", content="data"))
-    assert [o.name for o in done.objects] == ["child", "parent"] and done.warnings == ["a warning", FK_CYCLE]
+    assert [o.name for o in done.objects] == ["emp", "child", "parent"]  # the cycle keeps the catalog's order
+    assert done.warnings == ["a warning", FK_CYCLE, SELF_REFERENCE.format("emp")]  # Task 9 fix M4
+    assert SELF_REFERENCE.format("emp") == ("emp references itself: a data-only restore may fail unless its rows load "
+                                            "in order")
+    e = env(DumpFake(rows=2, tables=(child, looped, emp)))  # SQLite defers the checks to the COMMIT: nothing to say
+    assert outcome(e.run(tmp_path / "lite.sql", content="data")).warnings == ["a warning"]
+    e = env(DumpFake(rows=2, tables=(emp,)), Dialect.POSTGRES, Engine.POSTGRES)
+    assert outcome(e.run(tmp_path / "both.sql")).warnings == ["a warning"]  # with the schema: the keys come after
 
 
 def test_a_table_changed_while_the_dump_ran_is_named(env, tmp_path):  # Task 6 review: MySQL 1412
@@ -437,3 +507,30 @@ def test_the_file_reaches_the_disk_before_it_replaces_the_old_one(env, tmp_path,
     monkeypatch.setattr(atomic_file.os, "replace", lambda a, b: (order.append("replace"), real_replace(a, b))[1])
     assert outcome(env().run(tmp_path / "out.sql")).outcome == "completed"
     assert order == ["fsync", "replace"]
+
+
+def test_an_error_after_a_short_chunk_fails_the_dump(env, tmp_path):  # Task 9 fix H1
+    """SQL Server gives the rows before an error later in the set, then the error on the next fetch: the dump reads
+    until `[]`, so it fails instead of writing the cut table as complete."""
+    target = tmp_path / "out.sql"
+    target.write_text("old")
+    late = StatementError("Divide by zero error encountered.", code="8134")
+    e = env(DumpFake(rows=3000, fails_at=2499, late_error=late), Dialect.TSQL, Engine.MSSQL)
+    events = e.run(target)
+    assert (outcome(events).outcome, error(events).code, error(events).message) == (
+        "failed", "8134", "Divide by zero error encountered.")
+    assert target.read_text() == "old" and [p.name for p in tmp_path.iterdir()] == ["out.sql"]
+
+
+def test_text_the_driver_cannot_decode_names_its_table_and_column(env, tmp_path):  # Task 9 fix L2
+    from dbaguy_backend.adapters.base import InvalidText
+
+    events = env(DumpFake(rows=3000, fails_at=10, late_error=InvalidText("v"))).run(tmp_path / "out.sql")
+    assert (outcome(events).outcome, error(events).code, error(events).message) == (
+        "failed", "invalid_text", "t.v holds text that is not valid UTF-8, which a UTF-8 file cannot hold. Nothing "
+                                  "was written")
+    events = env(DumpFake(catalog_error=InvalidText("sql"))).run(tmp_path / "out.sql")
+    assert error(events).message == ("A name or definition in this database holds text that is not valid UTF-8, which "
+                                     "a UTF-8 file cannot hold. Nothing was written")
+    assert list(tmp_path.iterdir()) == []
+

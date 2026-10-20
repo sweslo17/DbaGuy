@@ -110,12 +110,16 @@ def test_a_row_too_large_to_restore_is_said(monkeypatch):  # R-06-11, pre-flight
     batcher.add([1, "x" * 5000])
     statement = batcher.flush()
     assert size_warning(MY, "big", statement) == (
-        "big has a row of 0 MiB: MySQL refuses statements over its max_allowed_packet (64 MiB by default) when the "
-        "file is run")
+        "big has an INSERT statement of 4.9 KiB: MySQL refuses statements over its max_allowed_packet (64 MiB by "
+        "default) when the file is run")
+    assert size_warning(MY, "big", statement, packet_bytes=4096) == (  # the dumped server's own (Task 9 fix L5)
+        "big has an INSERT statement of 4.9 KiB: MySQL refuses statements over its max_allowed_packet (4 KiB on the "
+        "server dumped) when the file is run")
     assert size_warning(PG, "big", statement) is None
     assert size_warning(MY, "t", "中" * 1200) is None and size_warning(MY, "t", "中" * 1400) is not None  # UTF-8 bytes
     monkeypatch.setattr(bulk_insert, "MAX_STATEMENT_CHARS", 1000)
-    assert size_warning(LITE, "big", statement) == "big has a row over 0 MiB: Run SQL file cannot restore it"
+    assert size_warning(LITE, "big", statement) == (
+        "big has an INSERT statement over 1 KiB: Run SQL file cannot restore it")
 
 
 def test_an_identity_written_with_its_values():
@@ -280,6 +284,8 @@ def test_a_table_with_no_column_to_write_gets_rows_of_defaults():  # 06a Task 7 
     assert [text.count("()") - 1 for text in mysql] == [MAX_DEFAULT_ROWS, 2]  # `t ()` and each row's `()`
     assert mysql[1] == "INSERT INTO t () VALUES (), ();\n"
     assert list(default_rows_text(TS, table("dbo", "t t"), 3)) == ["INSERT INTO dbo.[t t] DEFAULT VALUES\nGO 3\n"]
+    assert list(default_rows_text(TS, table("dbo", "t"), 2003)) == [  # GO n at most MAX_GO_REPEAT (Task 9 fix L4)
+        "INSERT INTO dbo.t DEFAULT VALUES\nGO 1000\n"] * 2 + ["INSERT INTO dbo.t DEFAULT VALUES\nGO 3\n"]
     [(text, repeat)] = [(s.text, s.repeat) for s in split("SELECT 1\nGO\n" + "".join(
         default_rows_text(TS, table("dbo", "t"), 3)), TS) if "DEFAULT" in s.text]
     assert (text, repeat) == ("INSERT INTO dbo.t DEFAULT VALUES", 3)

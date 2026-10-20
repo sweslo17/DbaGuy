@@ -198,6 +198,7 @@ class _Reader:
         self.needing: list[str] = []  # T4: what uses a routine or view the dump leaves out
         self.invalid: list[str] = []  # T5
         self.cannot: set[str] = set()  # the routines no file can carry (unreadable, NO_BACKSLASH_ESCAPES), folded
+        self.self_referencing: set[str] = set()  # tables a foreign key of their own references (Task 9 fix M4)
 
     def rows(self, sql: str, *params: object) -> list[tuple]:
         return catalog.query(self.conn, sql, params)
@@ -296,7 +297,8 @@ class _Reader:
         name, _, estimate, size, _, _ = row
         return DumpTable(schema=self.database, table=name, name=name, columns=tuple(columns),
                          rows_estimate=int(estimate) if estimate is not None else None,
-                         bytes_estimate=int(size) if size is not None else None, references=references)
+                         bytes_estimate=int(size) if size is not None else None, references=references,
+                         self_referencing=name in self.self_referencing)
 
     def _foreign_keys(self, names: set[str]) -> dict[str, tuple[str, ...]]:
         """The dumped tables each table's foreign keys reference (pre-flight M9); a foreign key to a table outside the
@@ -308,6 +310,8 @@ class _Reader:
             if schema == self.database and target in names:
                 if target != table:
                     found.setdefault(table, set()).add(target)
+                else:
+                    self.self_referencing.add(table)
             else:
                 where = target if schema == self.database else f"{schema}.{target}"
                 self.warnings.append(kept_foreign_key(table, where, key))

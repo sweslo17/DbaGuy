@@ -195,6 +195,7 @@ class _Reader:
         self.triggers_by_oid: dict[int, str] = {}
         self.dumped: set[int] = set()  # the tables written
         self.references: dict[int, set[int]] = defaultdict(set)  # table → the dumped tables its foreign keys reference
+        self.self_referencing: set[int] = set()  # tables a foreign key of their own references (Task 9 fix M4)
         self.scope_oids: list[int] = []  # every object of the scope's schemas a dependency can name
         self.held: dict[int, Held] = {}  # table → what its CREATE TABLE holds back (P3)
         # Definitions, read in one query per kind before the objects are made (P5)
@@ -736,6 +737,8 @@ class _Reader:
                 continue
             if self._root(referenced) != self._root(table):  # M9: what a data-only dump writes first
                 self.references[self._root(table)].add(self._root(referenced))
+            else:
+                self.self_referencing.add(self._root(table))
             statements = (f"ALTER TABLE {relation.only}{relation.sql} ADD CONSTRAINT {_q(name)} {definition}",
                           *self.comment("pg_constraint", oid, f"CONSTRAINT {_q(name)} ON {relation.sql}")) \
                 if self.ddl else ()
@@ -795,8 +798,17 @@ class _Reader:
         merged = sorted([*((r.oid, r.key) for r in views), *((oid, f"f{oid}") for oid in routines)])
         keys = [key for _, key in merged]
         ordering = Ordering({key: set(self.create.get(key, ())) for key in keys})
-        return [self._view(self.relations[int(key[1:])]) if key[0] == "r" else self._routine(self.routines[int(key[1:])])
-                for key in ordering.order(keys)]
+        found: list[DumpObject] = []
+        for key in ordering.order(keys):
+            if key[0] != "r":
+                found.append(self._routine(self.routines[int(key[1:])]))
+                continue
+            relation = self.relations[int(key[1:])]
+            found.append(self._view(relation))
+            if relation.relkind == "m" and relation.populated:  # Task 9 fix L3: a data-only dump's rows change it
+                refresh = (f"REFRESH MATERIALIZED VIEW {relation.sql}",) if self.ddl else ()
+                found.append(DumpObject("refresh", relation.label, refresh, section="data_only"))
+        return found
 
     def _view(self, relation: _Relation) -> DumpObject:
         materialized = relation.relkind == "m"
@@ -975,7 +987,8 @@ class _Reader:
             found.append(DumpTable(
                 schema=r.schema, table=r.name, name=r.label, columns=tuple(_held_column(c, held) for c in columns[r.oid]),
                 rows_estimate=rows, bytes_estimate=size, only=r.relkind == "r",
-                references=tuple(self.relations[oid].label for oid in sorted(self.references.get(r.oid, ())))))
+                references=tuple(self.relations[oid].label for oid in sorted(self.references.get(r.oid, ()))),
+                self_referencing=r.oid in self.self_referencing))
         return found
 
 
