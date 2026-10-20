@@ -931,3 +931,20 @@ def test_only_an_insert_takes_the_shortcut():
     assert classify(f"SELECT {filler} 1", PG).kind == K.READ
     for dialect in (PG, MY, LITE, Dialect.TSQL):  # nothing to judge is not a write
         assert classify(filler + "\n" * 10, dialect).kind != K.WRITE, dialect
+
+
+def test_a_large_t_sql_insert_exec_stays_unknown():
+    # The shortcut judges one statement by its first word; the batch's floor (EXEC may write anything) must still win
+    limit = classifier.LARGE_INSERT_CHARS
+    for sql in (
+        f"INSERT INTO t EXEC p @a = '{'x' * limit}'",
+        f"INSERT INTO t (a, b) EXECUTE dbo.p @a = '{'x' * limit}'",
+        f"INSERT t EXEC('{'x' * limit}')",
+        f"INSERT /* {'x' * limit} */ INTO t EXEC p",
+    ):
+        assert len(sql) > limit
+        assert classify(sql, Dialect.TSQL) == Classification(kind=K.UNKNOWN), sql[:40]
+    small = "INSERT INTO t EXEC p @a = 'x'"
+    assert classify(small, Dialect.TSQL) == Classification(kind=K.UNKNOWN)  # what the small one has always been
+    values = f"INSERT INTO t VALUES ('{'x' * limit}')"
+    assert classify(values, Dialect.TSQL) == Classification(kind=K.WRITE)  # and the plain large one stays a write

@@ -118,12 +118,60 @@ def test_any_chunk_size_gives_the_same_statements(dialect, chunk):
     assert streamed(File().read, dialect, chunk=chunk) == whole(data, dialect)
 
 
-def test_split_is_unchanged_by_the_single_pass():
-    for dialect, text in CORPUS.items():  # meta lines are only spans of their own in a file
-        assert [s.text for s in split(text, dialect)] == [
-            s.text for s in iter_spans(text, dialect) if not s.meta
-        ]
-    assert not any(s.meta for s in split(CORPUS[PG], PG))
+# What the splitter gave for CORPUS before the single pass (recorded from 9a8775d's split(), a test of its own
+# written once, not computed here): (start, end, terminator_end, text, has_body, repeat, params). split() is binding (02a).
+EXPECTED_SPANS = {
+    PG: [
+        (0, 39, 40, '\\restrict k3y\nSET statement_timeout = 0', False, 1, ()),
+        (41, 95, 96, "SELECT pg_catalog.set_config('search_path', '', false)", False, 1, ()),
+        (97, 186, 187, 'CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $fn$\nBEGIN\n  RETURN 1; -- ;\nEND;\n$fn$', False, 1, ()),
+        (188, 247, 248, "INSERT INTO t VALUES (1, 'a;\nb'), (2, E'c\\';d'), (3, '中文😀')", False, 1, ()),
+        (281, 289, 290, 'SELECT 2', False, 1, ()),
+        (291, 392, 393, 'CREATE FUNCTION g(x int) RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT CASE WHEN x > 0 THEN 1 END; END', True, 1, ()),
+        (396, 434, 435, "\\connect other\nSELECT '\\not a command'", False, 1, ()),
+        (436, 451, 451, '\\unrestrict k3y', False, 1, ()),
+    ],
+    MY: [
+        (0, 29, 30, '/*!40101 SET NAMES utf8mb4 */', False, 1, ()),
+        (31, 52, 53, 'LOCK TABLES `t` WRITE', False, 1, ()),
+        (54, 116, 117, 'INSERT INTO `t` VALUES (1,\'it\'\'s \\\\ back\'),(2,"x;y"),(3,\'中文😀\')', False, 1, ()),
+        (132, 184, 187, 'CREATE PROCEDURE p()\nBEGIN\n  SELECT 1; SELECT 2;\nEND', True, 1, ()),
+        (219, 227, 228, 'SELECT 3', False, 1, ()),
+        (241, 315, 316, 'CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW BEGIN SET NEW.a = 1; END', True, 1, ()),
+        (317, 330, 331, 'UNLOCK TABLES', False, 1, ()),
+    ],
+    TS: [
+        (0, 15, 18, 'SET NOCOUNT ON;', False, 1, ()),
+        (19, 78, 81, "CREATE PROCEDURE dbo.p AS\nSELECT 1;\nSELECT 'GO\nnot a line';", True, 1, ()),
+        (82, 122, 129, "INSERT INTO t VALUES (N'中文😀'), (N'x]y');", False, 3, ()),
+        (140, 152, 157, "PRINT 'done'", False, 1, ()),
+        (158, 166, 166, 'SELECT 2', False, 1, ()),
+    ],
+    LITE: [
+        (0, 23, 24, 'PRAGMA foreign_keys=OFF', False, 1, ()),
+        (25, 42, 43, 'BEGIN TRANSACTION', False, 1, ()),
+        (44, 73, 74, 'CREATE TABLE t (a, "b;" TEXT)', False, 1, ()),
+        (75, 171, 172, 'CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET a = 1; SELECT CASE WHEN 1 THEN 2 END; END', True, 1, ()),
+        (173, 225, 226, "INSERT INTO t VALUES(1,'x\ny;'),(2,X'00ff'),(3,'中文😀')", False, 1, ()),
+        (227, 233, 234, 'COMMIT', False, 1, ()),
+    ],
+    SQ: [
+        (0, 53, 54, 'UPSERT INTO ks (KEY, VALUE) VALUES (\'k1\', {"a": ";"})', False, 1, ()),
+        (55, 88, 89, 'SELECT `a;b` FROM ks WHERE x = $v', False, 1, ('$v',)),
+        (98, 126, 127, "DELETE FROM ks USE KEYS 'k1'", False, 1, ()),
+    ],
+}
+
+
+@pytest.mark.parametrize("dialect", list(CORPUS), ids=lambda d: d.value)
+def test_split_gives_what_it_gave_before_the_single_pass(dialect):
+    # (The splitter's own suites, test_splitter.py and test_tsql.py, are unchanged and pass: that is A6's other half.)
+    text = CORPUS[dialect]
+    expected = EXPECTED_SPANS[dialect]
+    as_tuples = lambda spans: [(s.start, s.end, s.terminator_end, s.text, s.has_body, s.repeat, s.params) for s in spans]
+    assert as_tuples(split(text, dialect)) == expected
+    assert as_tuples(iter_spans(text, dialect)) == expected  # without meta_commands, a psql line is part of a statement
+    assert not any(s.meta for s in split(text, dialect))
 
 
 def test_psql_meta_lines_are_spans_of_their_own_in_a_postgresql_file():
@@ -305,3 +353,197 @@ def test_a_psql_line_without_its_line_break_is_not_given_until_the_text_is_final
     state = SplitState()
     assert list(iter_spans("SELECT 1;\n\\conn", PG, state, final=False, meta_commands=True))[0].text == "SELECT 1"
     assert state.resume == len("SELECT 1;")  # the unfinished line is the statement that has not ended: kept
+
+
+# --- the limit on one statement: what is held, where it is measured from, which line it names -------------------------
+
+class File:
+    """A file read in the sizes it is asked for, which it keeps."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data, self.position, self.asked = data, 0, []
+
+    def read(self, size: int) -> bytes:
+        self.asked.append(size)
+        piece = self.data[self.position:self.position + size]
+        self.position += len(piece)
+        return piece
+
+
+@pytest.mark.parametrize("chunk", [1, 16, 4096, 1 << 20])
+def test_a_read_never_goes_past_the_limit_by_more_than_a_character(chunk):
+    cap = 1000
+    for data in (b"SELECT '" + b"x" * 50_000 + b"'",  # one line
+                 b"INSERT INTO t VALUES\n" + b"(1),\n" * 20_000 + b"(2);\n"):  # many
+        file = File(data)
+        stream = StatementStream(file.read, PG, chunk=chunk, max_statement_chars=cap)
+        with pytest.raises(StreamError) as raised:
+            list(stream)
+        assert raised.value.code == STATEMENT_TOO_LARGE
+        assert max(file.asked) <= cap + 1, file.asked  # no read is larger than the room left
+        assert stream.bytes_read <= cap + chunk and stream.bytes_read == file.position  # held: cap plus one chunk at most
+        assert sum(file.asked) <= cap * 3 + chunk  # and the doubling reads that got there are few
+
+
+def test_the_limit_is_measured_from_the_first_token_at_every_chunk_size_and_cut():
+    # 60 characters of statement under a limit of 70, behind 50 of comment: fine, whichever way the file is read
+    statement = "SELECT '" + "x" * 50 + "';"
+    data = ("SELECT 1;\n-- " + "c" * 47 + "\n" + statement + "\n").encode()
+    assert len(statement) == 60
+    expected = [("SELECT 1", 1), ("SELECT '" + "x" * 50 + "'", 3)]
+    for chunk in (1, 2, 3, 7, 16, 64, 100, 1 << 20):
+        assert [(s.text, s.line) for s in streamed(File(data).read, PG, chunk=chunk, max_statement_chars=70)] == expected
+    for cut in range(len(data) + 1):
+        statements = streamed(Pieces(data[:cut], data[cut:]).read, PG, max_statement_chars=70)
+        assert [(s.text, s.line) for s in statements] == expected, cut
+    for cap in (59, 58):  # the statement and its terminator are 60 characters: one more than the limit stops it
+        with pytest.raises(StreamError) as raised:
+            streamed(File(data).read, PG, chunk=7, max_statement_chars=cap)
+        assert (raised.value.code, raised.value.line) == (STATEMENT_TOO_LARGE, 3)
+
+
+def test_the_line_of_a_statement_past_the_limit_is_its_own_not_a_comment_s():
+    data = (b"SELECT 1;\n\n-- one comment line\n/* and another */\n  INSERT INTO t VALUES\n" + b"(1),\n" * 60 + b"(2);\n")
+    seen = set()
+    for chunk in (1, 3, 16, 100, 1 << 20):  # held back across reads, or finished inside one read (the large chunk)
+        for cap in (100, 150):
+            with pytest.raises(StreamError) as raised:
+                streamed(File(data).read, PG, chunk=chunk, max_statement_chars=cap)
+            seen.add((raised.value.code, raised.value.line))
+    assert seen == {(STATEMENT_TOO_LARGE, 5)}  # the INSERT, not line 3 where the comments begin
+    for cut in range(len(data) + 1):
+        with pytest.raises(StreamError) as raised:
+            streamed(Pieces(data[:cut], data[cut:]).read, PG, max_statement_chars=120)
+        assert (raised.value.code, raised.value.line) == (STATEMENT_TOO_LARGE, 5), cut
+
+
+def test_comments_and_blank_lines_between_statements_are_not_held_against_the_limit():
+    # 130 KB of comments and blank lines under a limit of 100 characters: dropped as they are read, never counted
+    data = b"SELECT 1;\n" + (b"-- a comment that goes on\n\n/* and a block\n comment */\n" * 2000) + b"SELECT 2;\n"
+    for chunk in (1, 16, 4096, 1 << 20):
+        statements = streamed(File(data).read, PG, chunk=chunk, max_statement_chars=100)
+        assert [(s.text, s.line) for s in statements] == [("SELECT 1", 1), ("SELECT 2", 8002)], chunk
+    for cut in range(0, len(data) + 1, 997):
+        assert len(streamed(Pieces(data[:cut], data[cut:]).read, PG, max_statement_chars=100)) == 2
+
+
+def test_a_block_comment_that_stays_open_past_the_limit_names_the_line_it_opened_on():
+    data = b"SELECT 1;\n\n  /* an open comment\n" + b"and more of it\n" * 40
+    for chunk in (1, 16, 1 << 20):
+        with pytest.raises(StreamError) as raised:
+            streamed(File(data).read, PG, chunk=chunk, max_statement_chars=100)
+        assert (raised.value.code, raised.value.line) == (STATEMENT_TOO_LARGE, 3), chunk
+
+
+def test_a_statement_at_the_limit_gets_through_and_one_character_more_does_not():
+    statement = "INSERT INTO t VALUES\n(1),\n(2);"  # 30 characters with its terminator
+    data = ("SELECT 1;\n-- c\n" + statement + "\n").encode()
+    assert len(statement) == 30
+    for chunk in (1, 2, 5, 16, 1 << 20):
+        assert len(streamed(File(data).read, PG, chunk=chunk, max_statement_chars=30)) == 2, chunk
+        with pytest.raises(StreamError) as raised:
+            streamed(File(data).read, PG, chunk=chunk, max_statement_chars=29)
+        assert (raised.value.code, raised.value.line) == (STATEMENT_TOO_LARGE, 3), chunk
+    for cut in range(len(data) + 1):  # a read that hands out more than it was asked for: the finished statement is judged
+        assert len(streamed(Pieces(data[:cut], data[cut:]).read, PG, max_statement_chars=30)) == 2, cut
+        with pytest.raises(StreamError) as raised:
+            streamed(Pieces(data[:cut], data[cut:]).read, PG, max_statement_chars=29)
+        assert (raised.value.code, raised.value.line) == (STATEMENT_TOO_LARGE, 3), cut
+
+
+def test_the_last_statement_of_a_file_without_a_terminator_is_measured_to_the_end_of_the_text():
+    data = b"SELECT 1;\nSELECT '" + b"x" * 20 + b"'\n"  # 29 characters, then a line break and the end of the file
+    for chunk in (1, 4, 1 << 20):
+        assert len(streamed(File(data).read, PG, chunk=chunk, max_statement_chars=30)) == 2, chunk  # with the "\n"
+        with pytest.raises(StreamError):
+            streamed(File(data).read, PG, chunk=chunk, max_statement_chars=29)
+    for cut in range(len(data) + 1):
+        assert len(streamed(Pieces(data[:cut], data[cut:]).read, PG, max_statement_chars=30)) == 2, cut
+        with pytest.raises(StreamError):
+            streamed(Pieces(data[:cut], data[cut:]).read, PG, max_statement_chars=29)
+
+
+def test_a_file_of_small_statements_on_one_line_is_limited_like_one_statement():
+    # The text is cut at a line break, and the line it is cut in is read whole (the module's docstring says so)
+    data = b"SELECT 1;" * 100  # 900 characters, 100 statements, no line break
+    assert len(streamed(File(data).read, PG, chunk=16, max_statement_chars=2000)) == 100
+    for chunk in (16, 1 << 20):
+        with pytest.raises(StreamError) as raised:
+            streamed(File(data).read, PG, chunk=chunk, max_statement_chars=500)
+        assert (raised.value.code, raised.value.line) == (STATEMENT_TOO_LARGE, 1)
+    with_breaks = data.replace(b";", b";\n")  # the same statements on lines: no limit in the way
+    assert len(streamed(File(with_breaks).read, PG, chunk=16, max_statement_chars=500)) == 100
+
+
+def test_characters_not_bytes_are_what_the_limit_counts():
+    statement = "SELECT '" + "中文😀" * 10 + "';"  # 8 + 30 + 2 = 40 characters, 8 + 100 + 2 = 110 bytes
+    data = (statement + "\n").encode()
+    assert (len(statement), len(statement.encode())) == (40, 110)
+    for chunk in (1, 3, 1 << 20):
+        assert len(streamed(File(data).read, PG, chunk=chunk, max_statement_chars=40)) == 1, chunk
+        with pytest.raises(StreamError):
+            streamed(File(data).read, PG, chunk=chunk, max_statement_chars=39)
+    for cut in range(len(data) + 1):
+        assert len(streamed(Pieces(data[:cut], data[cut:]).read, PG, max_statement_chars=40)) == 1, cut
+        with pytest.raises(StreamError):
+            streamed(Pieces(data[:cut], data[cut:]).read, PG, max_statement_chars=39)
+
+
+def test_byte_counts_cross_the_slices_a_stretch_is_encoded_in(monkeypatch):
+    from dbaguy_backend.sql import statement_stream
+
+    monkeypatch.setattr(statement_stream, "_SLICE", 3)
+    text = "中a😀b\n中文é\n" * 3 + "tail"
+    for start in range(len(text) + 1):
+        for end in range(start, len(text) + 1):
+            cursor = statement_stream._Cursor(byte=5)
+            cursor.advance(text, start)
+            before = (cursor.line, cursor.byte)
+            cursor.advance(text, end)
+            assert (cursor.line, cursor.byte) == (
+                1 + text.count("\n", 0, end), 5 + len(text[:end].encode())), (start, end)
+            assert before == (1 + text.count("\n", 0, start), 5 + len(text[:start].encode()))
+    ascii_cursor = statement_stream._Cursor(byte=0)
+    ascii_cursor.advance("ab\ncd\n", 4)
+    assert (ascii_cursor.line, ascii_cursor.byte) == (2, 4)
+
+
+def test_a_large_file_of_one_row_inserts_is_streamed_in_bounded_memory():
+    import subprocess
+    import sys
+    import textwrap
+    from pathlib import Path
+
+    # A 20 MB file generated as it is read (the test never holds it), in a process of its own so that what the
+    # interpreter held before does not hide the growth. Reading it whole would grow the process by several times this.
+    code = textwrap.dedent("""
+        import resource, sys
+        from dbaguy_backend.sql.dialects import Dialect
+        from dbaguy_backend.sql.statement_stream import StatementStream
+
+        total = 20 * 1_048_576
+        line = ("INSERT INTO t VALUES (7, '" + "中文😀 name " * 8 + "it''s');\\n").encode()
+        pattern = line * 4096
+        sent = 0
+
+        def read(size):
+            global sent
+            n = min(size, total - sent)
+            start = sent % len(pattern)
+            piece = (pattern + pattern)[start:start + n]
+            sent += n
+            return piece
+
+        scale = 1 if sys.platform == "darwin" else 1024  # ru_maxrss: bytes on macOS, kilobytes elsewhere
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
+        stream = StatementStream(read, Dialect.POSTGRES)
+        count = sum(1 for _ in stream)
+        grown = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale - before
+        print(count, stream.bytes_read, grown)
+    """)
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120,
+                            cwd=Path(__file__).parents[2])
+    assert result.returncode == 0, result.stderr
+    count, bytes_read, grown = (int(n) for n in result.stdout.split())
+    assert count > 100_000 and bytes_read == 20 * 1_048_576
+    assert grown < 48 * 1_048_576, f"the process grew by {grown:,} bytes streaming a 20 MiB file"  # measured 13 MB
