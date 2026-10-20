@@ -26,6 +26,7 @@ from ..base import (
     AdapterCapabilities,
     DatabaseAdapter,
     DatabaseConnection,
+    DataTools,
     Endpoint,
     ParsedUrl,
     RowEditing,
@@ -37,8 +38,9 @@ from ..base import (
     transaction_open_error,
 )
 from ..cancel_window import CancelWindow
+from ..columns import TableColumn
 from ..sockets import enable_keepalive
-from . import catalog, editing, introspection
+from . import catalog, columns, editing, introspection
 from . import schema as mysql_schema
 from .settings import URL_SCHEMES, connect_params, kill_params, parse_mysql_url, requires_tls, session_settings
 from .types import column_meta, row_converter
@@ -183,7 +185,7 @@ class MysqlResult(StatementResult):
         self._owner.finish(self._cursor, more_results=not self._failed)
 
 
-class MysqlConnection(DatabaseConnection, RowEditing):
+class MysqlConnection(DatabaseConnection, RowEditing, DataTools):
     def __init__(self, conn: MySQLConnection, kill_params: dict[str, Any], read_only: bool, database: str | None) -> None:
         self._conn = conn
         self._kill_params = kill_params
@@ -491,6 +493,12 @@ class MysqlConnection(DatabaseConnection, RowEditing):
 
     def edit_target(self, path: list[PathSegment]) -> EditTarget:
         return editing.edit_target(self._conn, path)
+
+    def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
+        try:
+            return columns.table_columns(self._conn, path)
+        except mysql.connector.Error as exc:
+            raise self.translate_error(exc) from exc
 
     def schema_snapshot(self) -> SchemaSnapshot:
         return mysql_schema.build_snapshot(self._conn)

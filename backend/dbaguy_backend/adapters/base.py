@@ -12,6 +12,7 @@ from ..domain.metadata import Folder, NodeKind, ObjectDetail, ObjectNode, PathSe
 from ..domain.profiles import AnyDraft, AnyProfile, Engine, EngineInfo, ServerProfile
 from ..domain.schema import RelationKind, SchemaSnapshot
 from ..sql.dialects import Dialect
+from .columns import TableColumn
 from .positions import offset_to_line_col
 
 
@@ -325,6 +326,15 @@ class RowEditing(ABC):
     def edit_target(self, path: list[PathSegment]) -> EditTarget:
         """A view or another non-table, or a table without a usable key: `editable=False` with the reason, never an
         error. NotFound when the table does not exist."""
+
+
+class DataTools(ABC):
+    """A connection whose relations data tools read and write (spec ⑥ D-06-1: dump, copy). Every method runs on the
+    owning worker thread, like the others."""
+
+    @abstractmethod
+    def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
+        """The columns of the table, view or materialized view at `path`, in order; NotFound when it is gone."""
 
 
 class DatabaseAdapter(ABC):

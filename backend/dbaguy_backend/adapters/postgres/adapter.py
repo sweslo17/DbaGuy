@@ -23,6 +23,7 @@ from ..base import (
     AdapterCapabilities,
     DatabaseAdapter,
     DatabaseConnection,
+    DataTools,
     Endpoint,
     ParsedUrl,
     RowEditing,
@@ -33,9 +34,10 @@ from ..base import (
     transaction_open_error,
 )
 from ..cancel_window import CancelWindow
+from ..columns import TableColumn
 from ..positions import offset_to_line_col
 from ..sql_text import first_keyword
-from . import ddl, editing, introspection
+from . import columns, ddl, editing, introspection
 from . import schema as pg_schema
 from .loaders import category_for_oid, configure_user_loaders
 
@@ -330,7 +332,7 @@ class _CursorResult(StatementResult):
             logger.warning("Error while closing PostgreSQL cursor: {}", exc)
 
 
-class PostgresConnection(DatabaseConnection, RowEditing):
+class PostgresConnection(DatabaseConnection, RowEditing, DataTools):
     def __init__(self, conn: psycopg.Connection, read_only: bool = False) -> None:
         self._conn = conn
         self._read_only = read_only
@@ -422,6 +424,10 @@ class PostgresConnection(DatabaseConnection, RowEditing):
     def edit_target(self, path: list[PathSegment]) -> EditTarget:
         self._check_database(path)
         return editing.edit_target(self._conn, path)
+
+    def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
+        self._check_database(path)
+        return columns.table_columns(self._conn, path)
 
     def schema_snapshot(self) -> SchemaSnapshot:
         # The connection's own (native-loader) cursors: arrays come back as lists, unlike the text-first user cursors.

@@ -20,6 +20,7 @@ from ..base import (
     AdapterCapabilities,
     DatabaseAdapter,
     DatabaseConnection,
+    DataTools,
     Endpoint,
     ParsedUrl,
     RowEditing,
@@ -30,7 +31,8 @@ from ..base import (
     transaction_open_error,
 )
 from ..cancel_window import CancelWindow
-from . import editing, introspection
+from ..columns import TableColumn
+from . import columns, editing, introspection
 from . import schema as sqlite_schema
 
 _PEEK_ROWS = 200
@@ -174,7 +176,7 @@ class SqliteStatementResult(StatementResult):
             self._cursor.close()
 
 
-class SqliteConnection(DatabaseConnection, RowEditing):
+class SqliteConnection(DatabaseConnection, RowEditing, DataTools):
     def __init__(self, conn: sqlite3.Connection, path: Path) -> None:
         self._conn = conn  # isolation_level=None: the driver never begins a transaction on its own
         self._path = path
@@ -202,6 +204,12 @@ class SqliteConnection(DatabaseConnection, RowEditing):
     def edit_target(self, path: list[PathSegment]) -> EditTarget:
         try:
             return editing.edit_target(self._conn, path)
+        except sqlite3.Error as exc:
+            raise _translate(exc) from exc
+
+    def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
+        try:
+            return columns.table_columns(self._conn, path)
         except sqlite3.Error as exc:
             raise _translate(exc) from exc
 
