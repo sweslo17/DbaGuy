@@ -20,7 +20,7 @@ from dbaguy_backend.app import create_app
 from dbaguy_backend.config import Settings
 from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager, write_askpass_script
 from dbaguy_backend.container import AppContainer
-from dbaguy_backend.domain.data_jobs import JobCommand, JobOutcomeEvent, JobProgressEvent, StoppedAt
+from dbaguy_backend.domain.data_jobs import JobCommand, JobError, JobOutcomeEvent, JobProgressEvent, StoppedAt
 from dbaguy_backend.domain.execution import ExecuteCommand, MessageSeverity
 from dbaguy_backend.domain.profiles import ProfileUpsertRequest
 from dbaguy_backend.services.connection_service import ConnectionService
@@ -190,6 +190,8 @@ def test_an_error_goes_out_right_before_the_outcome(env):
     assert types(events)[-4:] == ["error", "job_outcome", "session_state", "finished"]
     error = next(ev for ev in events if ev.type == "error")
     assert (error.code, error.message, outcome(events).outcome) == ("42P01", "it failed", "stopped")
+    assert outcome(events).error == JobError(code="42P01", message="it failed")  # fix wave F3: kept for a replay
+    assert outcome(env().run("sql x")).error is None
 
 
 def test_a_job_cancelled_while_queued_or_closed_before_it_started_says_not_started(env):
@@ -202,6 +204,7 @@ def test_a_job_cancelled_while_queued_or_closed_before_it_started_says_not_start
     queued = request_events(e.recorder, "queued")
     assert types(queued) == ["started", "message", "job_outcome", "session_state", "finished"]
     assert (outcome(queued).outcome, outcome(queued).cancelled, queued[-1].cancelled) == ("not_started", True, True)
+    assert outcome(queued).warnings == [queued[1].text]  # the warning sent live, kept for a later window (F3)
     assert "x" not in e.conn.runs
 
     closing = env()
@@ -211,6 +214,7 @@ def test_a_job_cancelled_while_queued_or_closed_before_it_started_says_not_start
     closing.worker.close()
     late = request_events(closing.recorder, "late")
     assert (outcome(late).outcome, outcome(late).cancelled) == ("not_started", False)
+    assert outcome(late).warnings == [next(ev for ev in late if ev.type == "message").text]
 
 
 def test_a_cancel_reaches_the_running_statement(env):
@@ -285,6 +289,18 @@ def test_a_client_that_attaches_later_gets_the_last_progress_and_the_outcome(env
     e.worker.attach_emitter(later)
     assert types(later.events) == ["job_progress", "job_outcome"]
     assert later.events[0].statements == 1
+
+
+def test_a_client_that_attaches_after_a_job_stopped_learns_why(env):  # fix wave F3
+    e = env()
+    e.submit("sql x", "tick!", "sql block", "sql after")
+    assert e.conn.blocked.wait(5)
+    e.worker.cancel("j")
+    request_events(e.recorder, "j")
+    later = Recorder()
+    e.worker.attach_emitter(later)
+    assert types(later.events) == ["job_progress", "job_outcome"]  # never the error event itself
+    assert later.events[1].error == JobError(line=1, statement=2, code="cancelled", message="Query cancelled")
 
 
 @pytest.mark.parametrize(("event", "error", "expected"), [
@@ -505,6 +521,8 @@ def test_a_job_command_refused_by_the_websocket_still_gets_its_outcome(api, monk
         assert [(e["type"], e["request_id"]) for e in events] == [
             ("error", rid), ("job_outcome", rid), ("finished", rid)]
         assert (events[0]["code"], events[1]["job"], events[1]["outcome"]) == (code, job, "not_started")
+        assert events[1]["error"] == {"line": None, "statement": None, "code": code,
+                                      "message": events[0]["message"]}  # fix wave F3: as the worker's carry it
 
 
 def test_a_cancel_a_job_lets_through_is_its_outcomes_flag(env):  # fix round 1: not_started, or unknown once sent
@@ -548,6 +566,7 @@ def test_a_broken_jobs_rollback_that_fails_says_so_in_a_jobs_words(env):  # fix 
     events = env(conn=StuckConnection()).run("sql begin", "crash")
     assert [ev.text for ev in events if ev.type == "message"] == [JOB_ROLLBACK_FAILED]
     assert outcome(events).outcome == "unknown" and events[-1].in_transaction
+    assert outcome(events).warnings == [JOB_ROLLBACK_FAILED]  # in the outcome too, for a later window (F3)
 
 
 def test_idle_time_counts_from_the_last_finished_not_from_the_detach(tmp_path):  # D-06-10, fix round 1

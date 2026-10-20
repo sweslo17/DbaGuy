@@ -1383,6 +1383,13 @@ export interface components {
              * @default false
              */
             drop_first: boolean;
+            /**
+             * Filtered
+             * @default false
+             */
+            filtered: boolean;
+            /** Filtered Table */
+            filtered_table?: string | null;
             /** Lines */
             lines: string[];
         };
@@ -1492,6 +1499,13 @@ export interface components {
             objects: components["schemas"]["DumpObjectKinds"];
             /** Path */
             path?: string | null;
+            /**
+             * Drop First
+             * @default false
+             */
+            drop_first: boolean;
+            /** Filter */
+            filter?: string | null;
         };
         /**
          * DumpScope
@@ -2272,6 +2286,7 @@ export interface components {
              */
             error_count: number;
             stopped_at?: components["schemas"]["StoppedAt"] | null;
+            error?: components["schemas"]["JobError"] | null;
             /**
              * Warnings
              * @default []

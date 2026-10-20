@@ -9,11 +9,11 @@ from collections import Counter
 from collections.abc import Iterable, Iterator
 
 from ..adapters.columns import SQL_VARIANT
-from ..adapters.dump import DumpCatalog, DumpObject, DumpTable
+from ..adapters.dump import DumpCatalog, DumpObject, DumpTable, plural
 from ..domain.data_jobs import DumpContent
 from ..domain.profiles import Engine
 from .dialects import RULES, ClientCommand, Dialect, identity_insert, qualified, quote_ident, quote_literal
-from .dump_header import comment_safe, complete_line, header_lines
+from .dump_header import comment_safe, complete_line, filtered_rows, header_lines
 from .lexer import Token, TokenKind, scan
 
 _CONTENT = {"schema": "schema only", "data": "data only", "both": "schema and data"}
@@ -48,9 +48,6 @@ MAX_GO_REPEAT = 1000  # the largest `GO n` a dump writes: the query tab runs up 
 RESET_SETTINGS: dict[Dialect, tuple[str, ...]] = {
     Dialect.MYSQL: ("SET FOREIGN_KEY_CHECKS = 1",), Dialect.SQLITE: ("PRAGMA foreign_keys = ON",),
 }
-_PLURALS = {"materialized view": "materialized views", "sequence value": "sequence values", "index": "indexes",
-            "foreign key": "foreign keys", "identity value": "identity values", "sequence owner": "sequence owners",
-            "policy": "policies", "statistics": "statistics"}
 # The kinds the Content line counts (what a reader looks for); the others (indexes, constraints, policies, …) are in
 # the file, not in the count
 _COUNTED = ("table", "view", "materialized view", "sequence", "type", "domain", "function", "aggregate", "procedure",
@@ -134,6 +131,29 @@ def not_included(catalog: DumpCatalog) -> list[str]:
     return [*catalog.not_included, *(f"the values of sql_variant column {name}" for name in lost_columns(catalog))]
 
 
+def drops_objects(content: DumpContent, drop_first: bool) -> bool:
+    """Whether the file drops what it creates: a data-only file creates nothing, so it drops nothing (and its header
+    says so)."""
+    return drop_first and content in ("schema", "both")
+
+
+def filtered_table(catalog: DumpCatalog, content: DumpContent, filter: str | None) -> str | None:
+    """The table whose rows a filter picked, as the file names it (its header's Rows line), when the file holds rows;
+    else None. A filter's scope is one table (`filter_fits`)."""
+    if filter is None or content == "schema" or not catalog.tables:
+        return None
+    return catalog.tables[0].name
+
+
+def filter_warnings(catalog: DumpCatalog, content: DumpContent, drop_first: bool, filter: str | None) -> list[str]:
+    """A filtered file that also drops and recreates its table: restoring it replaces the table with the filter's rows
+    (06a fix wave F2). The dump's plan and its outcome say it."""
+    table = filtered_table(catalog, content, filter)
+    if table is None or not drops_objects(content, drop_first):
+        return []
+    return [filtered_rows(table, replaces=True)]
+
+
 def default_rows_text(dialect: Dialect, table: DumpTable, count: int) -> Iterator[str]:
     """`count` rows of a table with no column a dump can write (only rowversion, computed or sql_variant columns; a
     PostgreSQL table of no columns): each a row of its defaults, so the restore has as many rows as the source (06a
@@ -158,11 +178,6 @@ def default_rows_text(dialect: Dialect, table: DumpTable, count: int) -> Iterato
             yield statement * min(MAX_DEFAULT_ROWS, count - start)
 
 
-def _plural(kind: str, count: int) -> str:
-    word = kind if count == 1 else _PLURALS.get(kind, kind + "s")
-    return f"{count:,} {word}"
-
-
 def _comment(text: str) -> str:
     return f"-- {comment_safe(text)}\n"
 
@@ -173,13 +188,15 @@ class DumpScript:
 
     def __init__(
         self, dialect: Dialect, engine: Engine, catalog: DumpCatalog, *, content: DumpContent, drop_first: bool,
-        created: str,
+        created: str, filter: str | None = None,
     ) -> None:
         self.dialect, self.engine, self.catalog = dialect, engine, catalog
         self.content, self.drop_first, self.created = content, drop_first, created
         self.schema = content in ("schema", "both")
         self.data = content in ("data", "both")
-        self.drops = drop_first and self.schema  # a data-only file drops nothing, and its header says so
+        self.drops = drops_objects(content, drop_first)
+        table = filtered_table(catalog, content, filter)
+        self.filtered = (table, filter) if table is not None and filter is not None else None  # the Rows line
 
     def _written(self, objects: Iterable[DumpObject]) -> list[DumpObject]:
         """The objects this content writes: the structure's, the data's (setval, counters), or both; a data-only
@@ -191,7 +208,7 @@ class DumpScript:
         counts = Counter(item.kind for item in (*self._written(self.catalog.pre), *self._written(self.catalog.post)))
         if not self.schema:
             counts["table"] = len(self.catalog.tables)
-        parts = [_plural(kind, counts[kind]) for kind in _COUNTED if counts[kind]]
+        parts = [plural(kind, counts[kind]) for kind in _COUNTED if counts[kind]]
         return _CONTENT[self.content] + (" · " + ", ".join(parts) if parts else "")
 
     def head(self) -> str:
@@ -201,7 +218,7 @@ class DumpScript:
         lines = header_lines(
             engine=self.engine, server=self.catalog.server, scope=self.catalog.scope, created=self.created,
             content=self.summary(), snapshot=self.catalog.snapshot_text, not_included=not_included(self.catalog),
-            drop_first=self.drops,
+            drop_first=self.drops, filtered=self.filtered,
         )
         text = "\n".join(lines) + "\n\n" + "".join(insert_text(self.dialect, s) for s in RESTORE_SETTINGS[self.dialect])
         if self.drops:

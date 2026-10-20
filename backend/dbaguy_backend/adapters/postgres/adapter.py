@@ -65,10 +65,14 @@ _COPY_CLIENT_STREAM = re.compile(r"\b(?:stdin|stdout)\b", re.IGNORECASE)
 _UNSUPPORTED_COPY = "COPY FROM STDIN / TO STDOUT is not supported in the console yet"
 _SSL_QUERY_KEYS = {"sslmode": "mode", "sslrootcert": "ca_file", "sslcert": "cert_file", "sslkey": "key_file"}
 _URL_CONNECTION_KEYS = ("user", "password", "host", "port", "dbname")  # query-string spellings of URL parts
+# psycopg's own connect() arguments, not libpq keys: `open()` passes autocommit and prepare_threshold itself, and a
+# free-form option of the same name would collide with them (TypeError) or reach psycopg as a string (fix wave F1).
+_PSYCOPG_CONNECT_KEYS = ("autocommit", "prepare_threshold", "context", "row_factory", "cursor_factory")
 # libpq keys that pick the target or carry secrets: they come from the profile fields and the keychain,
-# never from free-form `options` (they could redirect the connection or leak a password into profiles.json).
+# never from free-form `options` (they could redirect the connection or leak a password into profiles.json); and
+# psycopg's own arguments.
 _RESERVED_OPTION_KEYS = frozenset(
-    {*_URL_CONNECTION_KEYS, "hostaddr", "service", "passfile", "sslpassword"}
+    {*_URL_CONNECTION_KEYS, *_PSYCOPG_CONNECT_KEYS, "hostaddr", "service", "passfile", "sslpassword"}
 )
 _DEFAULT_CONNECT_PARAMS: dict[str, Any] = {
     "connect_timeout": 10,
@@ -660,7 +664,11 @@ class PostgresAdapter(DatabaseAdapter):
             params["hostaddr"] = endpoint.host  # tunnelled: connect locally, verify TLS against the real host
         params = {k: v for k, v in params.items() if v not in (None, "")}
         try:
-            conn = psycopg.connect(autocommit=True, **params)
+            # prepare_threshold=None: psycopg's PrepareManager otherwise keeps the encoded text of the last 100
+            # distinct queries even when none is prepared, so a restore of 1 MiB INSERTs (or one 10 MB INSERT in a
+            # query tab) held ~100 MB until the session closed (06a fix wave F1). Nothing in DbaGuy uses named
+            # prepared statements; `describe()` uses libpq's unnamed statement, which this does not touch.
+            conn = psycopg.connect(autocommit=True, prepare_threshold=None, **params)
         except psycopg.Error as exc:
             raise ConnectionFailed(str(exc).strip()) from exc
         if profile.read_only:

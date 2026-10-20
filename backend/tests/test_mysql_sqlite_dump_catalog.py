@@ -196,7 +196,7 @@ def test_a_mysql_dump_orders_its_objects_and_drops_their_definers(tmp_path):
             assert listed(bare) == [("table", "child"), ("table", "parent")]
             assert bare.not_included == ("owners and privileges", "3 views (not chosen)",
                                          "2 functions and procedures (not chosen)", "2 triggers (not chosen)",
-                                         "1 events (not chosen)")
+                                         "1 event (not chosen)")  # F5: one event
             named = mysql_catalog(db, name, DumpScope(kind="tables", schema_name=name, names=["child", "calls_add1"]))
             # the function its view calls comes with it (VIEW_ROUTINE_USAGE)
             assert listed(named) == [("table", "child"), ("function", "add1"), ("view", "calls_add1"),
@@ -287,12 +287,13 @@ def test_a_mysql_dump_read_under_ansi_quotes_restores_twice_and_says_what_is_not
                 ("trigger", "kid_first"), ("trigger", "kid_bi"), ("event", "nightly")]
             assert (found.consistency, found.snapshot_text, found.warnings) == (  # M6; the MERGE table is not read
                 "per_table", "one consistent snapshot of the InnoDB tables; 3 other tables read as the dump reached them",
-                ("Not in the snapshot (not InnoDB): logbook, part1, part2",))
+                ("Not in the snapshot (not InnoDB): logbook, part1, part2",
+                 "Not written, their definition cannot be read by this login: procedure roots"))  # named (F5)
             assert [(table.name, table.references) for table in found.tables] == [
                 ("kid", ("mom",)), ("logbook", ()), ("mom", ()), ("part1", ()), ("part2", ()), ("pl", ())]  # T2
-            unreadable = ("owners and privileges", "1 procedures whose definition cannot be read", "1 column histograms",
-                          "1 MERGE and FEDERATED tables written without their rows (other tables hold them)",
-                          DEFINERS_LEFT_OUT)
+            unreadable = ("owners and privileges", "1 procedure whose definition cannot be read", "1 column histogram",
+                          "1 MERGE or FEDERATED table written without rows (other tables hold them)",
+                          DEFINERS_LEFT_OUT)  # F5: a count of one in the singular
             assert found.not_included == unreadable
             plan = mysql_catalog(db, name, ddl=False)  # it knows without reading the definitions
             assert (listed(plan), plan.not_included) == (listed(found), unreadable)
@@ -359,11 +360,12 @@ def test_what_a_mysql_dump_cannot_write_takes_what_needs_it_out_by_name(tmp_path
             found = mysql_catalog(db, name)
             assert listed(found) == [("table", "base"), ("view", "v_fine"), ("trigger", "base_fine")]
             assert found.not_included == (
-                "owners and privileges", "1 functions whose definition cannot be read",
-                "1 procedures whose definition cannot be read", "2 stored programs made under NO_BACKSLASH_ESCAPES",
-                "2 invalid views", "5 views, triggers and events that use a routine or view the dump leaves out",
+                "owners and privileges", "1 function whose definition cannot be read",
+                "1 procedure whose definition cannot be read", "2 stored programs made under NO_BACKSLASH_ESCAPES",
+                "2 invalid views", "5 views, triggers and events using a routine or view the dump leaves out",
                 DEFINERS_LEFT_OUT)
             assert found.warnings == (
+                "Not written, their definition cannot be read by this login: function f_root, procedure p_root",  # F5
                 "Not written, made under NO_BACKSLASH_ESCAPES (the file reads a backslash in a string as an escape): "
                 "function f_nbe, trigger base_nbe",
                 "Not written, invalid where they are (a table, column or function they use is gone, or their definer "

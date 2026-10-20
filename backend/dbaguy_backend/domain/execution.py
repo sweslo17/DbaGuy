@@ -6,7 +6,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .classification import Classification, GuardReason
 from .column_category import ColumnCategory
-from .data_jobs import DumpContent, DumpObjectKinds, DumpScope, JobCommand, JobOutcomeEvent, JobProgressEvent
+from .data_jobs import (
+    DUMP_FILTER_LENGTH, FILTER_ONE_TABLE, DumpContent, DumpObjectKinds, DumpScope, JobCommand, JobOutcomeEvent,
+    JobProgressEvent, filter_fits,
+)
 from .formats import FormatKind, RowFormatOptions
 
 Presentation = Literal["grid", "plan"]  # "plan": an EXPLAIN / ADVISE / profile result the client may show as a plan
@@ -243,12 +246,12 @@ class DumpCommand(JobCommand):
     content: DumpContent = "both"
     objects: DumpObjectKinds = DumpObjectKinds()
     drop_first: bool = False  # a DROP … IF EXISTS before each object it creates (the header says so)
-    filter: str | None = Field(default=None, max_length=65_536)  # one table only: the table-data tab's filter
+    filter: str | None = Field(default=None, max_length=DUMP_FILTER_LENGTH)  # one table only: the table-data tab's
 
     @model_validator(mode="after")
     def _a_filter_for_one_table_only(self) -> Self:
-        if self.filter is not None and (self.scope.kind != "tables" or len(self.scope.names) != 1):
-            raise ValueError("a filter applies to a dump of one table")
+        if not filter_fits(self.scope, self.filter):
+            raise ValueError(FILTER_ONE_TABLE)
         return self
 
 

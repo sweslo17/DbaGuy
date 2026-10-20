@@ -34,11 +34,11 @@ def profile(container, tmp_path, **fields):
     return container.profiles.create(ProfileUpsertRequest.model_validate(body)).profile.id
 
 
-def header(engine=Engine.POSTGRES, drop_first=False) -> str:
+def header(engine=Engine.POSTGRES, drop_first=False, filtered=None) -> str:
     return "\n".join(header_lines(
         engine=engine, server="PostgreSQL 17.11", scope="database dbaguy · schema public",
         created="2026-10-20T12:34:56+08:00", content="schema and data · 2 tables", snapshot="one consistent snapshot",
-        not_included=["owners and privileges"], drop_first=drop_first,
+        not_included=["owners and privileges"], drop_first=drop_first, filtered=filtered,
     )) + "\n"
 
 
@@ -58,6 +58,20 @@ def test_the_inspection_of_a_dbaguy_dump_written_for_another_engine(container, t
     assert (found.size, found.header.engine, found.preview_truncated) == (path.stat().st_size, Engine.POSTGRES, False)
     assert found.preview.endswith("CREATE TABLE t (a int);\n-- Dump complete: 0 rows in 1 tables\n")
     assert found.warnings == ["Written for PostgreSQL, the target is SQLite", "This dump drops and recreates its objects"]
+
+
+@pytest.mark.parametrize(("drop_first", "said"), [
+    (True, "The file holds only the rows of main.t that match a filter: restoring it drops the table and replaces it "
+           "with those rows"),
+    (False, "The file holds only the rows of main.t that match a filter"),
+])
+def test_a_filtered_dump_says_whose_rows_it_holds(container, tmp_path, drop_first, said):  # fix wave F2
+    path = tmp_path / "d.sql"
+    path.write_text(header(Engine.SQLITE, drop_first, ("main.t", "secret = 'x'\n*/ DROP")) + complete_line(1, 1) + "\n")
+    found = container.data.inspect(profile(container, tmp_path), str(path))
+    assert (found.header.filtered, found.header.filtered_table) == (True, "main.t")
+    assert found.warnings == ["This dump drops and recreates its objects", said] if drop_first else [said]
+    assert not any("secret" in warning for warning in found.warnings)  # the filter's text is in the preview only
 
 
 def test_the_preview_is_the_first_lines_and_says_when_there_is_more(container, tmp_path):

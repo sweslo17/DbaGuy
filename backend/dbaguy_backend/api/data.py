@@ -1,13 +1,17 @@
 """Data tools (spec ⑥ §3.2): the jobs of this backend run. A job itself is a WebSocket command on a session of its
 own (dump, run_file); these routes find it again after the window reloads, and cancel it."""
 
+from typing import Self
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..container import AppContainer
-from ..domain.data_jobs import DumpContent, DumpObjectKinds, DumpPlan, DumpScope, FileInspection, JobInfo
+from ..domain.data_jobs import (
+    DUMP_FILTER_LENGTH, FILTER_ONE_TABLE, DumpContent, DumpObjectKinds, DumpPlan, DumpScope, FileInspection, JobInfo,
+    filter_fits,
+)
 from ..domain.errors import NotFound
 from .deps import get_container, require_token
 
@@ -37,6 +41,15 @@ class DumpPlanRequest(BaseModel):
     content: DumpContent = "both"
     objects: DumpObjectKinds = DumpObjectKinds()
     path: str | None = Field(default=None, min_length=1, max_length=4096)  # where it would go: checks and free space
+    # as the dump command has them: a filtered file that drops and recreates its table is warned of (fix wave F2)
+    drop_first: bool = False
+    filter: str | None = Field(default=None, max_length=DUMP_FILTER_LENGTH)
+
+    @model_validator(mode="after")
+    def _a_filter_for_one_table_only(self) -> Self:
+        if not filter_fits(self.scope, self.filter):
+            raise ValueError(FILTER_ONE_TABLE)
+        return self
 
 
 class RevealRequest(BaseModel):
@@ -49,7 +62,8 @@ class RevealRequest(BaseModel):
 def dump_plan(body: DumpPlanRequest, container: AppContainer = Depends(get_container)) -> DumpPlan:
     """The dump dialog's object list, what the header leaves out, the consistency and the warnings (the metadata
     connection; nothing is written). 422 `not_supported` for an engine without dumps."""
-    return container.data.dump_plan(body.profile_id, body.database, body.scope, body.content, body.objects, body.path)
+    return container.data.dump_plan(body.profile_id, body.database, body.scope, body.content, body.objects, body.path,
+                                    drop_first=body.drop_first, filter=body.filter)
 
 
 @router.post("/reveal", status_code=204)

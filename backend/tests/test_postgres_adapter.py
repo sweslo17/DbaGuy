@@ -225,6 +225,19 @@ def test_transaction_failed_tracks_the_aborted_state(conn):
     assert not conn.in_transaction() and not conn.transaction_failed()
 
 
+def test_the_connection_keeps_no_copy_of_the_statements_it_ran(conn):
+    """psycopg's prepared-statement cache keeps the encoded text of the last 100 distinct queries even when none is
+    prepared: a restore of 1 MiB INSERTs held ~100 MB until the session closed (06a fix wave F1)."""
+    pad = "x" * 10_000
+    conn.run("CREATE TEMP TABLE zz_06_prep (id int, pad text)")
+    for i in range(30):
+        assert conn.run(f"INSERT INTO zz_06_prep VALUES ({i}, '{pad}')").affected_rows() == 1
+    for _ in range(8):  # past psycopg's default threshold of 5: it would have been prepared
+        assert conn.run("UPDATE zz_06_prep SET id = id WHERE id = 0").affected_rows() == 1
+    assert conn._conn.prepare_threshold is None
+    assert not conn._conn._prepared._counts and not conn._conn._prepared._names
+
+
 def test_parse_url():
     parsed = PostgresAdapter().parse_url("postgresql://me:p%40ss@db.example.com:6543/app?sslmode=require&connect_timeout=5")
     draft = parsed.profile
@@ -319,6 +332,8 @@ def test_profile_options_cannot_redirect_or_override_the_connection():
     reserved = {
         "host": "attacker.invalid", "hostaddr": "203.0.113.1", "port": "1", "dbname": "analytics", "user": "nobody",
         "password": "wrong-secret", "service": "nope", "passfile": "/nonexistent/passfile", "sslpassword": "ssl-secret",
+        # psycopg's own connect() arguments: open() passes these itself (F1)
+        "autocommit": "off", "prepare_threshold": "0", "row_factory": "x", "cursor_factory": "x", "context": "x",
     }
     messages: list[str] = []
     sink = logger.add(messages.append, level="WARNING", format="{message}")

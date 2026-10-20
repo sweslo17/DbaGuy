@@ -14,9 +14,9 @@ from dbaguy_backend.domain.profiles import Engine
 from dbaguy_backend.sql import bulk_insert
 from dbaguy_backend.sql.bulk_insert import MYSQL_PACKET_BYTES, InsertBatcher, size_warning
 from dbaguy_backend.sql.dialects import Dialect, datetime_literal, float_literal, identity_insert, non_finite_literal
-from dbaguy_backend.sql.dump_header import comment_safe, parse_header
+from dbaguy_backend.sql.dump_header import comment_safe, filtered_rows, parse_header
 from dbaguy_backend.sql.dump_script import (
-    DumpScript, insert_text, lost_columns, object_text, statement_text, table_sql,
+    DumpScript, filter_warnings, insert_text, lost_columns, object_text, statement_text, table_sql,
 )
 from dbaguy_backend.sql.select_builder import build_copy_select
 from dbaguy_backend.sql.splitter import split
@@ -270,6 +270,41 @@ def test_every_line_break_python_reads_is_written_as_text():  # S15: parse_heade
                         drop_first=True, created="x")
     header = parse_header(script.head())
     assert header.scope == "schema a\\u2028b" and header.lines[-1] == "-- Options: drop objects first: yes"
+
+
+HOSTILE_FILTER = "v = 'a'\nDROP TABLE victim; -- */ x\r y */ that match a filter: z\x00"
+REPLACES = ("The file holds only the rows of public.t that match a filter: restoring it drops the table and replaces "
+            "it with those rows")
+
+
+@pytest.mark.parametrize(("dialect", "engine"), [(PG, Engine.POSTGRES), (MY, Engine.MYSQL), (TS, Engine.MSSQL),
+                                                 (LITE, Engine.SQLITE)])
+def test_a_filtered_file_says_so_in_its_header_and_its_filter_stays_in_the_comment(dialect, engine):  # fix wave F2
+    text = whole(DumpScript(dialect, engine, catalog(), content="both", drop_first=True, created="x",
+                            filter=HOSTILE_FILTER))
+    header = parse_header(text)
+    assert (header.filtered, header.filtered_table, header.drop_first) == (True, "public.t", True)
+    rows = comment_safe(f"-- Rows: only those of public.t that match a filter: {HOSTILE_FILTER}")
+    assert rows in header.lines and rows.count("\n") == 0 and text.count("victim") == 1
+    assert not any("victim" in s.text for s in split(text, dialect))  # it never runs as SQL
+    data = parse_header(whole(DumpScript(dialect, engine, catalog(), content="data", drop_first=True, created="x",
+                                         filter="id < 3")))
+    assert (data.filtered, data.filtered_table, data.drop_first) == (True, "public.t", False)
+    for script in (DumpScript(dialect, engine, catalog(), content="schema", drop_first=True, created="x",
+                              filter="id < 3"),  # no rows: nothing to say of them
+                   DumpScript(dialect, engine, catalog(), content="both", drop_first=True, created="x")):
+        header = parse_header(whole(script))
+        assert (header.filtered, header.filtered_table) == (False, None)
+        assert not any(line.startswith("-- Rows:") for line in header.lines)
+
+
+def test_a_filtered_file_that_drops_its_table_is_said_to_replace_it():  # fix wave F2: the plan's and outcome's
+    assert filter_warnings(catalog(), "both", True, "id < 3") == [REPLACES]
+    for content, drop_first, where in [("both", False, "id < 3"), ("data", True, "id < 3"),
+                                       ("schema", True, "id < 3"), ("both", True, None)]:
+        assert filter_warnings(catalog(), content, drop_first, where) == []
+    assert filter_warnings(catalog(tables=()), "both", True, "id < 3") == []  # a view's: no rows written
+    assert filtered_rows("public.t", replaces=False) == "The file holds only the rows of public.t that match a filter"
 
 
 def test_a_table_with_no_column_to_write_gets_rows_of_defaults():  # 06a Task 7 review, Task 9

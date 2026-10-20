@@ -102,6 +102,10 @@ class JobOutcomeEvent(BaseModel):
     errors: list[JobError] = []  # the first MAX_JOB_ERRORS
     error_count: int = 0
     stopped_at: StoppedAt | None = None
+    # Why it stopped or failed: the `error` event sent right before it, with where the run stopped when it did, so a
+    # window that attaches later or lists the jobs (GET /data/jobs) knows it too (06a fix wave F3). None: no error
+    error: JobError | None = None
+    # What the outcome means, and the job's own warnings sent live as messages too (JOB_ROLLBACK_FAILED, F3)
     warnings: list[str] = []
 
 
@@ -128,6 +132,10 @@ class DumpHeader(BaseModel):
     scope: str | None = None  # `database dbaguy · schema public`
     created: str | None = None
     drop_first: bool = False
+    # Only the rows of one table that match a filter (its Rows line, 06a fix wave F2): with drop_first, restoring the
+    # file replaces that table with them
+    filtered: bool = False
+    filtered_table: str | None = None  # as the file names it (comment_safe: a line break is written as text)
     lines: list[str]  # the header's comment lines, as written
 
 
@@ -174,6 +182,13 @@ class DumpObjectKinds(BaseModel):
 
 
 DumpContent = Literal["schema", "data", "both"]
+DUMP_FILTER_LENGTH = 65_536  # the longest filter a dump (and its plan) takes
+FILTER_ONE_TABLE = "a filter applies to a dump of one table"
+
+
+def filter_fits(scope: DumpScope, filter: str | None) -> bool:
+    """A dump's filter is the table-data tab's: it applies to a `tables` scope of one name (the dump and its plan)."""
+    return filter is None or (scope.kind == "tables" and len(scope.names) == 1)
 
 
 class DumpPlanObject(BaseModel):

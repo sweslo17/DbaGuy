@@ -241,6 +241,12 @@ def test_a_table_with_no_column_a_dump_writes_keeps_its_rows(tmp_path, engine): 
         db.close()
 
 
+SQLITE_JOURNAL = ("While the dump reads, other connections cannot write to this file (it uses a rollback journal, "
+                  "not WAL)")
+REPLACES_T = ("The file holds only the rows of t that match a filter: restoring it drops the table and replaces it "
+              "with those rows")
+
+
 def test_a_dump_of_one_table_with_a_filter_and_never_into_its_own_file(tmp_path, monkeypatch):
     source = tmp_path / "source.db"
     conn = sqlite3.connect(source, isolation_level=None)
@@ -256,10 +262,20 @@ def test_a_dump_of_one_table_with_a_filter_and_never_into_its_own_file(tmp_path,
         ran = dump(app, profile, None, path, one, content="data", filter="id <= 10")
         assert (ran.outcome.outcome, ran.outcome.rows) == ("completed", 10)
         assert "CREATE TABLE" not in path.read_text() and "(10, 'v10')" in path.read_text()
+        assert ran.outcome.warnings == [SQLITE_JOURNAL] and parse_header(path.read_text()).filtered_table == "t"
+        # fix wave F2: a filtered file that drops and recreates its table replaces the table's rows with the filter's
+        replaced = dump(app, profile, None, path, one, drop_first=True, filter="id <= 10")
+        assert (replaced.outcome.outcome, replaced.outcome.warnings) == ("completed", [REPLACES_T, SQLITE_JOURNAL])
+        header = parse_header(path.read_text())
+        assert (header.filtered, header.filtered_table, header.drop_first) == (True, "t", True)
+        assert "-- Rows: only those of t that match a filter: id <= 10" in header.lines
+        assert app.container.data.dump_plan(profile, None, one, "both", DumpObjectKinds(), str(path), drop_first=True,
+                                            filter="id <= 10").warnings == [REPLACES_T, SQLITE_JOURNAL]
+        assert app.container.data.dump_plan(profile, None, one, "data", DumpObjectKinds(), str(path), drop_first=True,
+                                            filter="id <= 10").warnings == [SQLITE_JOURNAL]  # it drops nothing
         plan = app.container.data.dump_plan(profile, None, one, "both", DumpObjectKinds(), str(path))
         assert [(o.kind, o.name, o.rows_estimate) for o in plan.objects] == [("table", "t", None)]
-        assert plan.warnings == ["While the dump reads, other connections cannot write to this file (it uses a "
-                                 "rollback journal, not WAL)"]
+        assert plan.warnings == [SQLITE_JOURNAL]
         from dbaguy_backend.services import data_service
 
         class Usage:  # CR-4: little free space where the dump goes is said, never refused
@@ -280,6 +296,7 @@ def test_a_dump_of_one_table_with_a_filter_and_never_into_its_own_file(tmp_path,
         assert app.history() == []  # a dump is a read: no History record
         assert [(job.job, job.title, job.outcome.outcome) for job in app.container.jobs.list()] == [
             ("dump", f"Dump main.t of source to {source.name}", "not_started"),
+            ("dump", "Dump main.t of source to t.sql", "completed"),
             ("dump", "Dump main.t of source to t.sql", "completed")]
     finally:
         app.close()
@@ -308,6 +325,13 @@ def test_the_dump_routes_plan_and_show_only_what_a_dump_wrote(tmp_path, monkeypa
             assert [(o["kind"], o["name"]) for o in plan.json()["objects"]] == [("table", "t"), ("view", "v")]
             assert plan.json()["consistency"] == "snapshot"
             assert plan.json()["not_included"] == ["owners and privileges"]
+            one = {"kind": "tables", "schema_name": "main", "names": ["t"]}
+            filtered = client.post("/data/dump/plan", headers=auth, json={  # fix wave F2
+                "profile_id": str(profile), "scope": one, "drop_first": True, "filter": "id < 3"})
+            assert filtered.status_code == 200 and filtered.json()["warnings"][0] == REPLACES_T
+            assert client.post("/data/dump/plan", headers=auth, json={
+                "profile_id": str(profile), "scope": {"kind": "schema", "schema_name": "main"},
+                "filter": "id < 3"}).status_code == 422  # a filter needs one table, as the dump's does
             assert client.post("/data/reveal", headers=auth, json={"path": str(path)}).status_code == 404
             ran = dump(app, profile, None, path, DumpScope(kind="schema", schema_name="main"))
             assert ran.outcome.outcome == "completed" and "PRAGMA user_version = 3" in path.read_text()
@@ -562,6 +586,93 @@ def test_a_postgresql_data_only_dump_refreshes_its_views_and_says_which_tables_r
     finally:
         app.close()
         db.close()
+
+
+def test_a_window_that_comes_back_learns_why_a_run_stopped_and_a_dump_failed(tmp_path):  # fix wave F3
+    from fastapi.testclient import TestClient
+
+    from dbaguy_backend.app import create_app
+    from tests.test_sessions import Recorder
+
+    source = tmp_path / "s.db"
+    conn = sqlite3.connect(source, isolation_level=None)
+    conn.executescript("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); "
+                       "INSERT INTO t VALUES (1, CAST(X'61FF62' AS TEXT));")
+    conn.close()
+    sql = tmp_path / "f.sql"
+    sql.write_text("INSERT INTO t VALUES (2, 'a');\nINSERT INTO t VALUES (2, 'b');\nINSERT INTO t VALUES (3, 'c');\n")
+    stopped = {"line": 2, "statement": 2, "code": "SQLITE_CONSTRAINT_PRIMARYKEY",
+               "message": "UNIQUE constraint failed: t.id"}
+    failed = {"line": None, "statement": None, "code": "invalid_text",
+              "message": "t.v holds text that is not valid UTF-8, which a UTF-8 file cannot hold. Nothing was written"}
+    app = DataApp(tmp_path)
+    try:
+        profile = app.add_profile({"profile": {"engine": "sqlite", "name": "s", "path": str(source)}})
+        jobs = (
+            (lambda rid: RunFileCommand(request_id=rid, path=str(sql), mode="statements"), "stopped", stopped),
+            (lambda rid: DumpCommand(request_id=rid, path=str(tmp_path / "d.sql"),
+                                     scope=DumpScope(kind="schema", schema_name="main")), "failed", failed),
+        )
+        for make, expected, error in jobs:
+            tab = app.job_session(profile)
+            ran = tab.run(make)
+            assert (ran.outcome.outcome, ran.error.code, ran.error.message) == (expected, error["code"],
+                                                                                error["message"])
+            assert ran.outcome.error.model_dump() == error  # the live outcome carries it too
+            app.container.sessions.detach(tab.session_id, tab.recorder)
+            later = Recorder()  # a reloaded window: only the replay, never the error event
+            app.container.sessions.attach(tab.session_id, later)
+            [replayed] = [event for event in later.events if event.type == "job_outcome"]
+            assert "error" not in [event.type for event in later.events] and replayed.error.model_dump() == error
+        with TestClient(create_app(app.container.settings, app.container), base_url="http://127.0.0.1") as client:
+            listed = client.get("/data/jobs", headers={"Authorization": "Bearer data"}).json()
+        assert [(job["outcome"]["outcome"], job["outcome"]["error"]) for job in listed] == [
+            ("failed", failed), ("stopped", stopped)]
+    finally:
+        app.close()
+
+
+def test_a_sqlite_source_whose_rows_break_a_foreign_key_restores_statement_by_statement(tmp_path):  # fix wave F4
+    """Its rows broke the key in the source already (sqlite3's foreign_keys is off by default): all or nothing, the
+    deferred check refuses the COMMIT and says how the file loads; statement by statement, the file's PRAGMA takes
+    effect and the rows load as they were."""
+    from dbaguy_backend.sessions.jobs.run_file import FOREIGN_KEYS_OFF_HINT
+
+    source = tmp_path / "source.db"
+    conn = sqlite3.connect(source, isolation_level=None)
+    conn.executescript("CREATE TABLE p (id INTEGER PRIMARY KEY); CREATE TABLE c (id INTEGER PRIMARY KEY, "
+                       "p_id INTEGER REFERENCES p (id)); INSERT INTO p VALUES (1); "
+                       "INSERT INTO c VALUES (1, 1), (2, 99);")
+    conn.close()
+    app = DataApp(tmp_path)
+    try:
+        profile = app.add_profile({"profile": {"engine": "sqlite", "name": "source", "path": str(source)}})
+        path = tmp_path / "d.sql"
+        assert dump(app, profile, None, path, DumpScope(kind="schema", schema_name="main")).outcome.outcome == \
+            "completed"
+        pragma = next(number for number, line in enumerate(path.read_text().splitlines(), start=1)
+                      if line == "PRAGMA foreign_keys = OFF;")
+        for mode, expected in (("all_or_nothing", "rolled_back"), ("statements", "completed")):
+            target = tmp_path / f"{mode}.db"
+            sqlite3.connect(target).close()
+            restored = app.add_profile({"profile": {"engine": "sqlite", "name": mode, "path": str(target)}})
+            ran = restore(app, restored, None, path, mode)
+            app.close_sessions()
+            assert ran.outcome.outcome == expected
+            check = sqlite3.connect(target)
+            try:
+                if mode == "all_or_nothing":
+                    assert (ran.error.code, ran.error.message) == (
+                        "SQLITE_CONSTRAINT_FOREIGNKEY", "FOREIGN KEY constraint failed\nThe transaction was rolled "
+                        f"back: nothing was applied\n{FOREIGN_KEYS_OFF_HINT.format(pragma)}")
+                    assert check.execute("SELECT name FROM sqlite_master").fetchall() == []
+                else:
+                    assert check.execute("SELECT * FROM c ORDER BY id").fetchall() == [(1, 1), (2, 99)]
+                    assert check.execute("PRAGMA foreign_key_check").fetchall() == [("c", 2, "p", 0)]  # as before
+            finally:
+                check.close()
+    finally:
+        app.close()
 
 
 def test_sqlite_text_that_is_not_utf8_names_its_table_and_column(tmp_path):  # fix L2

@@ -26,8 +26,8 @@ from ..domain.errors import FileNotFound, NotFound, NotSupported, QueryFailed, R
 from ..domain.profiles import AnyProfile, Engine, SqliteProfile
 from ..sessions.jobs.dump import data_order, target_problem
 from ..sessions.jobs.registry import JobRegistry
-from ..sql.dump_header import CUT_SHORT, END_BYTES, cut_short, parse_header
-from ..sql.dump_script import not_included
+from ..sql.dump_header import CUT_SHORT, END_BYTES, cut_short, filtered_rows, parse_header
+from ..sql.dump_script import filter_warnings, not_included
 from ..sql.statement_stream import UTF16_MESSAGE, starts_with_utf16_bom
 from .metadata_service import MetadataService
 from .profile_service import ProfileService
@@ -83,11 +83,13 @@ class DataService:
 
     def dump_plan(
         self, profile_id: UUID, database: str | None, scope: DumpScope, content: DumpContent, kinds: DumpObjectKinds,
-        path: str | None,
+        path: str | None, *, drop_first: bool = False, filter: str | None = None,
     ) -> DumpPlan:
         """What a dump of `scope` would write (the objects under their own names, DumpPlan), what its header says is
-        left out, its consistency and its warnings: the catalog's, a data-only dump's foreign-key cycle, and for `path`
-        a file the dump would refuse (M13) or little free disk where it goes (CR-4: never a refusal)."""
+        left out, its consistency and its warnings: a filtered file that drops and recreates its table (fix wave F2),
+        the catalog's, a data-only dump's foreign-key cycle, and for `path` a file the dump would refuse (M13) or
+        little free disk where it goes (CR-4: never a refusal). The filter is only looked at for that warning: the
+        dump checks it before anything is sent."""
         profile, _ = self._admit(profile_id, BE_DUMPED, "dump")
 
         def read(connection: DatabaseConnection) -> DumpCatalog:
@@ -104,7 +106,7 @@ class DataService:
 
         catalog = self._metadata.with_connection(profile_id, database, read)
         estimates = {table.name: table.rows_estimate for table in catalog.tables}
-        warnings = list(catalog.warnings)
+        warnings = [*filter_warnings(catalog, content, drop_first, filter), *catalog.warnings]
         if content == "data":
             tables, said = data_order(self._registry.get(profile.engine).dialect, catalog.tables)
             objects = [DumpPlanObject(kind="table", name=table.name, rows_estimate=table.rows_estimate)
@@ -160,8 +162,8 @@ class DataService:
 
     def inspect(self, profile_id: UUID, path: str) -> FileInspection:
         """Run SQL file's look at a file before it runs: its size, its first lines, a DbaGuy dump's header, and what
-        the run will stop at or should be told (another engine's dump, objects dropped first, not UTF-8 or UTF-16,
-        COPY, a dump cut short)."""
+        the run will stop at or should be told (another engine's dump, objects dropped first, only a filter's rows of a
+        table, not UTF-8 or UTF-16, COPY, a dump cut short)."""
         profile, _ = self._admit(profile_id, RUN_SQL_FILES, "run_file")
         if profile.read_only:
             raise ReadOnlyProfile()
@@ -203,6 +205,8 @@ class DataService:
             warnings.append(f"Written for {ENGINE_NAMES[header.engine]}, the target is {ENGINE_NAMES[Engine(engine)]}")
         if header is not None and header.drop_first:
             warnings.append("This dump drops and recreates its objects")
+        if header is not None and header.filtered_table is not None:  # fix wave F2
+            warnings.append(filtered_rows(header.filtered_table, replaces=header.drop_first))
         if bad_line is not None:
             hint = f" ({_HEX_BLOB})" if engine == Engine.MYSQL else ""
             warnings.append(f"Line {bad_line:,} is not UTF-8 text: a run stops there{hint}")

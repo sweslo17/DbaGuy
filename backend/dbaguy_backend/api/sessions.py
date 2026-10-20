@@ -7,7 +7,7 @@ from loguru import logger
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from ..container import AppContainer
-from ..domain.data_jobs import JobCommand, JobKind, JobOutcomeEvent
+from ..domain.data_jobs import JobCommand, JobError, JobKind, JobOutcomeEvent
 from ..domain.errors import DomainError, NotFound, SessionNotFound
 from ..domain.execution import (
     ApplyEditsCommand,
@@ -48,7 +48,8 @@ async def _fail_request(
         if apply:
             await outbox.put(EditOutcomeEvent(request_id=request_id, outcome="rolled_back").model_dump(mode="json"))
         if job is not None:
-            outcome = JobOutcomeEvent(request_id=request_id, job=job, outcome="not_started")
+            outcome = JobOutcomeEvent(request_id=request_id, job=job, outcome="not_started",
+                                      error=JobError(code=code, message=message))  # as the worker's carry it (F3)
             await outbox.put(outcome.model_dump(mode="json"))
         finished = FinishedEvent(request_id=request_id, elapsed_ms=0, in_transaction=False, cancelled=False)
         await outbox.put(finished.model_dump(mode="json"))

@@ -6,7 +6,7 @@ import math
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
@@ -18,8 +18,8 @@ from ...adapters.base import (
 )
 from ...domain.classification import Classification, StatementKind
 from ...domain.data_jobs import (
-    MAX_JOB_MESSAGES, PROGRESS_INTERVAL_S, JobCommand, JobKind, JobOutcomeEvent, JobOutcomeKind, JobProgressEvent,
-    JobStage,
+    MAX_JOB_MESSAGES, PROGRESS_INTERVAL_S, JobCommand, JobError, JobKind, JobOutcomeEvent, JobOutcomeKind,
+    JobProgressEvent, JobStage,
 )
 from ...domain.execution import MessageEvent, MessageSeverity, ServerMessage
 from ...domain.history import HistoryStatus
@@ -89,6 +89,21 @@ class JobReport:
     outcome: JobOutcomeEvent
     error: StatementError | None = None
     schema_changed: bool = False
+
+    def sent_outcome(self) -> JobOutcomeEvent:
+        """The job_outcome as sent: with `error` — the live `error` event's code and text, and where the run stopped
+        when it did — so a window that attaches later, or the job list, knows why it stopped or failed (06a fix wave
+        F3)."""
+        if self.error is None:
+            return self.outcome
+        at = self.outcome.stopped_at
+        error = JobError(line=at.line if at else None, statement=at.statement if at else None, code=self.error.code,
+                         message=self.error.message)
+        return self.outcome.model_copy(update={"error": error})
+
+    def warned(self, text: str) -> "JobReport":
+        """This report with one more of the outcome's warnings (a job-level warning also sent live, F3)."""
+        return replace(self, outcome=self.outcome.model_copy(update={"warnings": [*self.outcome.warnings, text]}))
 
 
 Runner = Callable[[str, RunOptions, Callable[[ServerMessage], None]], StatementResult]

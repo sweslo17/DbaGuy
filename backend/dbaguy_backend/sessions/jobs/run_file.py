@@ -32,7 +32,7 @@ from ...domain.execution import MessageSeverity, RunFileCommand
 from ...services.safety import GuardAction
 from ...sql.dialects import Dialect, quote_ident, transaction_frame
 from ...sql.dump_header import CUT_SHORT, END_BYTES, cut_short, parse_header
-from ...sql.session_settings import is_session_setting
+from ...sql.session_settings import is_session_setting, turns_foreign_keys_off
 from ...sql.statement_stream import (
     FILE_NOT_UTF8, MAX_STATEMENT_CHARS, UTF16_MESSAGE, FileStatement, StatementStream, StreamError,
 )
@@ -55,6 +55,11 @@ FILE_TRUNCATED = "file_truncated"
 COPY_HINT = "pg_dump: use --inserts, or run this file with psql"
 HEX_BLOB_HINT = "mysqldump writes binary columns as raw bytes unless it is given --hex-blob"
 ROLLED_BACK = "The transaction was rolled back: nothing was applied"
+# SQLite's COMMIT refused for rows that break a foreign key, in a file that turns the checks off (F4): a DbaGuy dump of
+# a database whose rows already broke one, say (its header defers the checks to the COMMIT)
+_SQLITE_FOREIGN_KEY = "SQLITE_CONSTRAINT_FOREIGNKEY"
+FOREIGN_KEYS_OFF_HINT = ("Line {:,} turns foreign key checks off, which SQLite ignores inside a transaction: run the "
+                         "file statement by statement to load its rows as they are")
 KEPT = "Some tables cannot roll back (non-transactional): their changes stayed"  # ruling R3
 # Rulings R10, N6: a trigger's or a procedure's COMMIT (or ROLLBACK) and BEGIN TRANSACTION, which neither text tells
 RESTARTED = ("The transaction was ended and restarted inside the file (a trigger or a procedure): some changes may "
@@ -187,6 +192,7 @@ class _Run:
         self.last_line = 0  # the line of the last statement read
         self.warnings = warnings  # for the outcome, as they come up
         self.settings_sent = 0  # session settings before from_statement, sent all the same (R4)
+        self.foreign_keys_off: int | None = None  # SQLite: the line of the file's first PRAGMA foreign_keys = OFF (F4)
         self.kept = False  # a ROLLBACK left some tables' changes (MySQL, non-transactional tables; R3)
         # SQL Server: the id of the transaction the run (all or nothing) or the file (statement by statement) began, and
         # whether another one was current at a failure (R10)
@@ -284,6 +290,7 @@ class _Run:
         except StatementError as exc:
             raise _Stop(exc, None) from None
         self.settings_sent += 1
+        self._note_foreign_keys(statement)
 
     def _at(self, line: int) -> FileStatement:
         """Where a run stops that has no statement of its own (a line that is not text): the statement after the last
@@ -339,11 +346,16 @@ class _Run:
             self.rows += max(affected or 0, 0)
         self.done += 1
         self.bytes = statement.end_byte
+        self._note_foreign_keys(statement)
         if self.all_or_nothing:
             self._check_transaction(statement)
         else:
             self._track_transaction(statement, rows_before)
         self._progress(statement)
+
+    def _note_foreign_keys(self, statement: FileStatement) -> None:
+        if self.foreign_keys_off is None and turns_foreign_keys_off(statement.text, self.dialect):
+            self.foreign_keys_off = statement.line
 
     def _refuse_what_ends_the_transaction(self, statement: FileStatement) -> None:
         """All or nothing: the file's own transaction statements are never sent, nor (MySQL) a statement MySQL commits
@@ -734,7 +746,10 @@ class _Run:
                 return self._report("unknown", exc)
             self._note_restart()
             self._rollback()  # SQLite keeps the transaction after a busy COMMIT (⑤ A14)
-            return self._report("rolled_back", StatementError(f"{exc.message}\n{ROLLED_BACK}", code=exc.code))
+            text = f"{exc.message}\n{ROLLED_BACK}"
+            if exc.code == _SQLITE_FOREIGN_KEY and self.foreign_keys_off is not None:  # F4
+                text += "\n" + FOREIGN_KEYS_OFF_HINT.format(self.foreign_keys_off)
+            return self._report("rolled_back", StatementError(text, code=exc.code))
         try:
             left_open = connection.in_transaction()
         except StatementError as exc:
@@ -767,6 +782,8 @@ class _Run:
             logger.info("[run] the rollback after a stopped run failed ({})", exc.code)
             if self._open():  # still there and still open: the server ends it when the job's session closes
                 self.ctx.message(MessageSeverity.WARNING, JOB_ROLLBACK_FAILED)
+                if JOB_ROLLBACK_FAILED not in self.warnings:  # and in the outcome, for a later window (F3)
+                    self.warnings.append(JOB_ROLLBACK_FAILED)
             return False
         if self.dialect is Dialect.MYSQL and self._warnings_kept_changes():
             self.kept = True

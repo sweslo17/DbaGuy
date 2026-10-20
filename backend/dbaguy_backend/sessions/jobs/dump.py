@@ -10,7 +10,9 @@ until the result says `[]`: a short chunk may come before an error later in the 
 to its last byte (M14): below DISK_FLOOR_BYTES free the dump stops, every DISK_CHECK_CHARS written. A row too long to
 restore is said once per table (R-06-11, M11). A table with no column a dump can write keeps its rows as rows of
 defaults (06a Task 7 review). A data-only dump writes the tables a table's foreign keys reference first (M9), and
-says what may still fail where the restore checks foreign keys (a cycle, a table that references itself: fix M4).
+says what may still fail where the restore checks foreign keys (a cycle, a table that references itself: fix M4). A
+filtered file says so in its header, and when it also drops and recreates its table, its outcome says that restoring it
+replaces the table with the filter's rows (06a fix wave F2).
 
 A filter is a condition and nothing else (fix M2): every SELECT built from it must be a plain read by the classifier
 the read-only allow-list uses, and pass the session's gate, or nothing is sent (`invalid_filter`).
@@ -39,7 +41,8 @@ from ...services.safety import GuardAction, is_plain_read
 from ...sql.bulk_insert import InsertBatcher, size_warning
 from ...sql.dialects import Dialect
 from ...sql.dump_script import (
-    RESTORE_BACKSLASH_ESCAPES, RESTORE_CHECKS_FOREIGN_KEYS, DumpScript, default_rows_text, statement_end, table_sql,
+    RESTORE_BACKSLASH_ESCAPES, RESTORE_CHECKS_FOREIGN_KEYS, DumpScript, default_rows_text, filter_warnings,
+    statement_end, table_sql,
 )
 from ...sql.select_builder import FILTER_NOT_A_CONDITION, build_copy_select, build_count_select, check_filter
 from ...storage.atomic_file import atomic_text_file
@@ -211,10 +214,11 @@ class DumpJob(Job):
                 for sql in session.filter_setup:
                     ctx.drain(ctx.run(sql))
             script = DumpScript(ctx.dialect, self._engine, catalog, content=command.content,
-                                drop_first=command.drop_first,
+                                drop_first=command.drop_first, filter=command.filter,
                                 created=datetime.now().astimezone().isoformat("T", "seconds"))
             tables, said = data_order(ctx.dialect, catalog.tables) if not script.schema else (list(catalog.tables), [])
-            warnings = [*catalog.warnings, *said]
+            warnings = [*filter_warnings(catalog, command.content, command.drop_first, command.filter),
+                        *catalog.warnings, *said]
             self._log_start(catalog, target)
             with atomic_text_file(target) as file:
                 writer = _Writer(file, ctx, target.parent)

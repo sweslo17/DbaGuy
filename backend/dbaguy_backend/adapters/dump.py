@@ -17,11 +17,26 @@ OWNERS_AND_PRIVILEGES = "owners and privileges"  # never dumped (R-06-2)
 
 
 SHOWN_NAMES = 10  # the names a warning lists before "…"
+_PLURALS = {"materialized view": "materialized views", "sequence value": "sequence values", "index": "indexes",
+            "foreign key": "foreign keys", "identity value": "identity values", "sequence owner": "sequence owners",
+            "policy": "policies", "statistics": "statistics", "function or procedure": "functions and procedures",
+            "view, trigger or event": "views, triggers and events"}
 
 
 def shown_names(names: list[str]) -> str:
     """Names for a warning: the first SHOWN_NAMES, then "…"."""
     return ", ".join(names[:SHOWN_NAMES]) + (" …" if len(names) > SHOWN_NAMES else "")
+
+
+def plural(kind: str, count: int) -> str:
+    """`1 view`, `2 views`, `3 indexes`: a count of a kind of object (the header's Content and Not included lines)."""
+    word = kind if count == 1 else _PLURALS.get(kind, kind + "s")
+    return f"{count:,} {word}"
+
+
+def counted(kind: str, count: int, rest: str = "") -> str:
+    """A Not included count: `1 function whose definition cannot be read`, `2 functions …` (06a fix wave F5)."""
+    return plural(kind, count) + (f" {rest}" if rest else "")
 
 
 def kept_foreign_key(table: str, target: str, key: str | None = None) -> str:

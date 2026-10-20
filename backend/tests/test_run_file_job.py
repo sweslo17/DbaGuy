@@ -11,12 +11,13 @@ from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.domain.classification import Classification, StatementKind
 from dbaguy_backend.domain.dialect import Dialect
+from dbaguy_backend.domain.data_jobs import JobError
 from dbaguy_backend.domain.execution import RunFileCommand
 from dbaguy_backend.domain.profiles import Engine, SqliteProfile
 from dbaguy_backend.services.safety import GuardAction, GuardDecision
 from dbaguy_backend.sessions.hooks import SessionHooksFactory
 from dbaguy_backend.sessions.jobs import run_file
-from dbaguy_backend.sessions.jobs.context import JobHooks
+from dbaguy_backend.sessions.jobs.context import JOB_ROLLBACK_FAILED, JobHooks
 from dbaguy_backend.sessions.jobs.run_file import COPY_HINT, HEX_BLOB_HINT, RunFileJob, summary
 from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks
 from dbaguy_backend.sql.dump_header import CUT_SHORT, complete_line, header_lines
@@ -223,6 +224,21 @@ def test_all_or_nothing_stops_roll_everything_back(env, sql_file, statement, cod
     assert events[-1].cancelled == (statement == "block")
 
 
+class StuckRollback(RunFake):
+    """A ROLLBACK that fails and leaves the transaction open."""
+
+    def rollback(self) -> None:
+        raise StatementError("rollback refused", code="08006")
+
+
+def test_a_run_whose_rollback_fails_says_so_live_and_in_its_outcome(env, sql_file):  # fix wave F3
+    events = env(StuckRollback()).run(sql_file("rows 1;\nfail boom;\nrows 3;"))
+    assert [e.text for e in events if e.type == "message"] == [JOB_ROLLBACK_FAILED]
+    done = outcome(events)
+    assert (done.outcome, done.warnings) == ("rolled_back", [JOB_ROLLBACK_FAILED])
+    assert done.error == JobError(line=2, statement=2, code=error(events).code, message=error(events).message)
+
+
 def test_a_transaction_the_file_ends_stops_an_all_or_nothing_run_as_partial(env, sql_file):  # MySQL DDL, M8
     e = env(dialect=Dialect.MYSQL)
     events = e.run(sql_file("rows 1;\nendtx;\nrows 3;"))
@@ -260,6 +276,23 @@ def test_what_commit_answers_decides_the_outcome(env, sql_file, commit_error, ke
         assert error(events).message == "deferred constraint\nThe transaction was rolled back: nothing was applied"
     if keeps:
         assert error(events).code == "commit_unconfirmed" and e.conn.rollbacks == 1
+
+
+@pytest.mark.parametrize(("text", "hint"), [
+    ("PRAGMA foreign_keys = OFF;\nPRAGMA defer_foreign_keys = ON;\nrows 1;", True),  # a DbaGuy dump's header
+    ("rows 1;\nPRAGMA foreign_keys(0);\nrows 2;", True),
+    ("PRAGMA foreign_keys = ON;\nrows 1;", False),
+    ("rows 1;", False),
+])
+def test_a_sqlite_commit_refused_for_a_foreign_key_says_how_the_file_loads(env, sql_file, text, hint):  # F4
+    refused = StatementError("FOREIGN KEY constraint failed", code="SQLITE_CONSTRAINT_FOREIGNKEY")
+    events = env(RunFake(commit_error=refused)).run(sql_file(text))
+    line = 1 if text.startswith("PRAGMA foreign_keys = OFF") else 2
+    said = f"\n{run_file.FOREIGN_KEYS_OFF_HINT.format(line)}" if hint else ""
+    assert (outcome(events).outcome, error(events).message) == (
+        "rolled_back", f"FOREIGN KEY constraint failed\nThe transaction was rolled back: nothing was applied{said}")
+    other = env(RunFake(commit_error=StatementError("UNIQUE constraint failed", code="SQLITE_CONSTRAINT_UNIQUE")))
+    assert "foreign key" not in error(other.run(sql_file(text))).message  # only a foreign key's refusal
 
 
 def test_statement_by_statement_stops_at_an_error_or_skips_it(env, sql_file):

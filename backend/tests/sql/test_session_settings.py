@@ -4,7 +4,7 @@ allow-list per dialect, never what outlives the session or belongs to one transa
 import pytest
 
 from dbaguy_backend.sql.dialects import Dialect
-from dbaguy_backend.sql.session_settings import is_session_setting
+from dbaguy_backend.sql.session_settings import is_session_setting, turns_foreign_keys_off
 
 PG, MYSQL, TSQL, SQLITE, SQLPP = Dialect.POSTGRES, Dialect.MYSQL, Dialect.TSQL, Dialect.SQLITE, Dialect.SQLPP
 
@@ -50,3 +50,15 @@ PG, MYSQL, TSQL, SQLITE, SQLPP = Dialect.POSTGRES, Dialect.MYSQL, Dialect.TSQL, 
 ])
 def test_what_a_run_from_statement_n_still_sends(text, dialect, sent):
     assert is_session_setting(text, dialect) is sent
+
+
+@pytest.mark.parametrize(("text", "dialect", "off"), [  # 06a fix wave F4
+    ("PRAGMA foreign_keys = OFF", SQLITE, True), ("pragma foreign_keys=0", SQLITE, True),
+    ("PRAGMA foreign_keys = 'off'", SQLITE, True), ("PRAGMA foreign_keys(false)", SQLITE, True),
+    ("PRAGMA main.foreign_keys = no", SQLITE, True), (" PRAGMA foreign_keys = OFF ", SQLITE, True),
+    ("PRAGMA foreign_keys = ON", SQLITE, False), ("PRAGMA foreign_keys", SQLITE, False),
+    ("PRAGMA defer_foreign_keys = OFF", SQLITE, False), ("PRAGMA foreign_keys = 'off", SQLITE, False),
+    ("PRAGMA foreign_keys = offline", SQLITE, False), ("PRAGMA foreign_keys = OFF", PG, False),
+])
+def test_what_turns_sqlites_foreign_key_checks_off(text, dialect, off):
+    assert turns_foreign_keys_off(text, dialect) is off

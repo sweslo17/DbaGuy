@@ -4422,6 +4422,22 @@
             "title": "Drop First",
             "default": false
           },
+          "filtered": {
+            "type": "boolean",
+            "title": "Filtered",
+            "default": false
+          },
+          "filtered_table": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filtered Table"
+          },
           "lines": {
             "items": {
               "type": "string"
@@ -4604,6 +4620,23 @@
               }
             ],
             "title": "Path"
+          },
+          "drop_first": {
+            "type": "boolean",
+            "title": "Drop First",
+            "default": false
+          },
+          "filter": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 65536
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filter"
           }
         },
         "additionalProperties": false,
@@ -6595,6 +6628,16 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/StoppedAt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobError"
               },
               {
                 "type": "null"

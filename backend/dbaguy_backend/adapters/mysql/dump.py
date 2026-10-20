@@ -14,10 +14,10 @@ its DEFINER (the account that runs the file becomes it; keeping it needs SUPER o
 and views are made under their own collation_connection, which their literals compare by, and character_set_client
 (review T6). Routines and events follow `routines`, as in S17.
 
-What cannot be written takes what needs it out with it, said by name (review T3–T5): a program made under
-NO_BACKSLASH_ESCAPES (DbaGuy splits files with backslash escapes, whatever a statement's mode), a routine the login
-cannot read, an invalid view; then the views that use them (VIEW_ROUTINE_USAGE, VIEW_TABLE_USAGE) and the triggers and
-events that call them. A MERGE or FEDERATED table's rows are other tables' and are not written (T2).
+What cannot be written takes what needs it out with it, said by name (review T3–T5; 06a fix wave F5): a program made
+under NO_BACKSLASH_ESCAPES (DbaGuy splits files with backslash escapes, whatever a statement's mode), a routine the
+login cannot read, an invalid view; then the views that use them (VIEW_ROUTINE_USAGE, VIEW_TABLE_USAGE) and the
+triggers and events that call them. A MERGE or FEDERATED table's rows are other tables' and are not written (T2).
 
 A `tables` scope writes its tables and views, the tables' triggers, and the functions its views call
 (VIEW_ROUTINE_USAGE). Only InnoDB reads from the snapshot: any other table is read as the dump reaches it, and the
@@ -38,8 +38,8 @@ from ...sql.scope import routines_called
 from ...sql.splitter import after_account
 from ..columns import TableColumn
 from ..dump import (
-    OWNERS_AND_PRIVILEGES, Consistency, DumpCatalog, DumpObject, DumpSession, DumpTable, Ordering, kept_foreign_key,
-    shown_names,
+    OWNERS_AND_PRIVILEGES, Consistency, DumpCatalog, DumpObject, DumpSession, DumpTable, Ordering, counted,
+    kept_foreign_key, shown_names,
 )
 from . import catalog
 from .columns import schema_columns
@@ -48,6 +48,8 @@ from .columns import schema_columns
 SNAPSHOT_TEXT = "one consistent snapshot (InnoDB)"
 DEFINERS_LEFT_OUT = "DEFINER clauses (the account running the file becomes the definer)"  # pre-flight L6
 NO_BACKSLASH_ESCAPES = "NO_BACKSLASH_ESCAPES"
+UNREADABLE = "whose definition cannot be read"  # counted per kind; named in one warning (06a fix wave F5)
+NOT_CHOSEN = "(not chosen)"
 _UNKNOWN_TABLE = 1109  # an information_schema table this server does not have (before 8.0.13, MariaDB)
 TABLE_CHANGED = "1412"  # ER_TABLE_DEF_CHANGED: DDL changed a table after the snapshot began (Task 6 review)
 _ROWS_ELSEWHERE = frozenset({"mrg_myisam", "federated"})  # T2: a MERGE table's rows are its tables', FEDERATED's remote
@@ -191,12 +193,13 @@ class _Reader:
                  ddl: bool) -> None:
         self.conn, self.database, self.scope, self.kinds, self.ddl = conn, database, scope, kinds, ddl
         self.named = scope.kind == "tables"
-        self.left_out: dict[str, int] = {}  # counted for the header's Not included
+        self.left_out: dict[tuple[str, str], int] = {}  # (kind, what of it) counted for the header's Not included
         self.warnings: list[str] = []
         self.outside: list[str] = []  # the tables whose rows are read that are not InnoDB: not in the snapshot (M6)
         self.no_backslash: list[str] = []  # T3: "kind name" of each, for the warning
         self.needing: list[str] = []  # T4: what uses a routine or view the dump leaves out
         self.invalid: list[str] = []  # T5
+        self.unreadable: list[str] = []  # "kind name" of each definition the login cannot read (F5)
         self.cannot: set[str] = set()  # the routines no file can carry (unreadable, NO_BACKSLASH_ESCAPES), folded
         self.self_referencing: set[str] = set()  # tables a foreign key of their own references (Task 9 fix M4)
 
@@ -214,9 +217,13 @@ class _Reader:
             logger.debug("MySQL error {} reading the dump catalog: that table is not on this server", exc.errno)
             return []
 
-    def leave_out(self, what: str, count: int = 1) -> None:
+    def leave_out(self, kind: str, count: int = 1, rest: str = "") -> None:
+        """Count `count` objects of `kind` the file leaves out, and why (`rest`): the header's `1 view (not chosen)`."""
         if count:
-            self.left_out[what] = self.left_out.get(what, 0) + count
+            self.left_out[kind, rest] = self.left_out.get((kind, rest), 0) + count
+
+    def left_out_texts(self) -> list[str]:
+        return [counted(kind, count, rest) for (kind, rest), count in self.left_out.items()]
 
     def show(self, kind: str, name: str) -> tuple | None:
         """SHOW CREATE's row, or None when the account may not read the definition (it is left out)."""
@@ -229,7 +236,8 @@ class _Reader:
             logger.debug("MySQL error {} on SHOW CREATE {} {}: left out of the dump", exc.errno, word, name)
             row = None
         if row is None or not row[index]:
-            self.leave_out(f"{word.lower()}s whose definition cannot be read")
+            self.leave_out(word.lower(), rest=UNREADABLE)
+            self.unreadable.append(f"{kind} {name}")
             return None
         return row
 
@@ -241,7 +249,7 @@ class _Reader:
                 raise NotFound(f"Not found in {self.database}: {', '.join(sorted(missing))}")
             relations = [row for row in relations if row[0] in wanted]
         for kind in sorted({row[1] for row in relations} - {"BASE TABLE", "VIEW"}):  # MariaDB's SEQUENCE, …
-            self.leave_out(f"relations of type {kind}", sum(row[1] == kind for row in relations))
+            self.leave_out("relation", sum(row[1] == kind for row in relations), rest=f"of type {kind}")
         pre: list[DumpObject] = []
         tables: list[tuple] = []
         for row in (row for row in relations if row[1] == "BASE TABLE"):
@@ -251,7 +259,7 @@ class _Reader:
         names = {row[0] for row in tables}
         views = [row for row in relations if row[1] == "VIEW"]
         if not (self.kinds.views or self.named):
-            self.leave_out("views (not chosen)", len(views))
+            self.leave_out("view", len(views), rest=NOT_CHOSEN)
             views = []
         uses_routines: dict[str, set[str]] = {}
         for view, routine in self.optional_rows(_VIEW_ROUTINES, self.database, self.database) if views else []:
@@ -259,28 +267,31 @@ class _Reader:
         routines = self._routines({routine for row in views for routine in uses_routines.get(row[0], ())})
         post = [*routines, *self._views(views, uses_routines), *self._triggers(names), *self._events()]
         self._said()
-        self.leave_out("column histograms", sum(table in names for (table,) in self.optional_rows(
+        self.leave_out("column histogram", sum(table in names for (table,) in self.optional_rows(
             _HISTOGRAMS, self.database)))
         references = self._foreign_keys(names)
         elsewhere = [row for row in tables if (row[4] or "").lower() in _ROWS_ELSEWHERE]  # T2: the DDL only
-        self.leave_out("MERGE and FEDERATED tables written without their rows (other tables hold them)",
-                       len(elsewhere))
+        self.leave_out("MERGE or FEDERATED table", len(elsewhere), rest="written without rows (other tables hold them)")
         read = [row for row in tables if row not in elsewhere]
         self.outside = [row[0] for row in read if (row[4] or "").lower() != "innodb"]
         columns = schema_columns(self.conn, self.database)  # T7: one query, not one per table
         return pre, [self._data(row, columns.get(row[0], []), references.get(row[0], ())) for row in read], post
 
     def _said(self) -> None:
-        """The objects left out because of what they are or use, counted (H6) and named (T3–T5)."""
-        for names, what, why in (
-            (self.no_backslash, "stored programs made under NO_BACKSLASH_ESCAPES",
+        """The objects left out because of what they are or use, counted (H6) and named (T3–T5); and those whose
+        definition the login cannot read, named here (counted per kind as they are met, F5)."""
+        if self.unreadable:
+            self.warnings.append(f"Not written, their definition cannot be read by this login: "
+                                 f"{shown_names(self.unreadable)}")
+        for names, kind, rest, why in (
+            (self.no_backslash, "stored program", "made under NO_BACKSLASH_ESCAPES",
              "made under NO_BACKSLASH_ESCAPES (the file reads a backslash in a string as an escape)"),
-            (self.invalid, "invalid views", "invalid where they are (a table, column or function they use is gone, "
-                                            "or their definer lacks rights to it)"),
-            (self.needing, "views, triggers and events that use a routine or view the dump leaves out",
+            (self.invalid, "invalid view", "", "invalid where they are (a table, column or function they use is gone, "
+                                               "or their definer lacks rights to it)"),
+            (self.needing, "view, trigger or event", "using a routine or view the dump leaves out",
              "they use a routine or view the dump leaves out"),
         ):
-            self.leave_out(what, len(names))
+            self.leave_out(kind, len(names), rest)
             if names:
                 self.warnings.append(f"Not written, {why}: {shown_names(names)}")
 
@@ -336,11 +347,12 @@ class _Reader:
         else:
             chosen = [row for row in routines if row[1] == "FUNCTION" and row[0].lower() in called]
             if not self.named:
-                self.leave_out("functions and procedures (not chosen)", len(routines) - len(chosen))
+                self.leave_out("function or procedure", len(routines) - len(chosen), rest=NOT_CHOSEN)
         found = []
         for name, kind, unreadable, sql_mode in chosen:
             if unreadable:
-                self.leave_out(f"{kind.lower()}s whose definition cannot be read")
+                self.leave_out(kind.lower(), rest=UNREADABLE)
+                self.unreadable.append(f"{kind.lower()} {name}")
             elif not self._writable(kind.lower(), name, sql_mode):
                 continue
             elif (obj := self._program(kind.lower(), name)) is not None:
@@ -359,7 +371,7 @@ class _Reader:
     def _triggers(self, tables: set[str]) -> list[DumpObject]:
         triggers = [row for row in self.rows(_TRIGGERS, self.database) if row[1] in tables]
         if not self.kinds.triggers:
-            self.leave_out("triggers (not chosen)", len(triggers))
+            self.leave_out("trigger", len(triggers), rest=NOT_CHOSEN)
             return []
         return [obj for name, _, sql_mode, body in triggers
                 if self._writable("trigger", name, sql_mode) and not self._calls_what_is_left_out("trigger", name, body)
@@ -370,7 +382,7 @@ class _Reader:
             return []
         events = self.rows(_EVENTS, self.database)
         if not self.kinds.routines:
-            self.leave_out("events (not chosen)", len(events))
+            self.leave_out("event", len(events), rest=NOT_CHOSEN)
             return []
         return [obj for name, sql_mode, body in events
                 if self._writable("event", name, sql_mode) and not self._calls_what_is_left_out("event", name, body)
@@ -439,7 +451,7 @@ def dump_catalog(
         raise RuntimeError(f"The dump session USEs {name} before its catalog is read (the connection is in {database})")
     reader = _Reader(conn, name, scope, kinds, ddl)
     pre, tables, post = reader.read()
-    left_out = [OWNERS_AND_PRIVILEGES, *(f"{count:,} {what}" for what, count in reader.left_out.items())]
+    left_out = [OWNERS_AND_PRIVILEGES, *reader.left_out_texts()]
     if post:  # views and stored programs: their DEFINER is not written (A14)
         left_out.append(DEFINERS_LEFT_OUT)
     consistency: Consistency = "snapshot"

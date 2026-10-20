@@ -5,11 +5,15 @@ format, defined here once). Pure.
     -- Engine: postgres · PostgreSQL 17.11 · database dbaguy · schema public
     -- Created: 2026-10-20T12:34:56+08:00
     -- Content: schema and data · 12 tables, 2 views
+    -- Rows: only those of public.orders that match a filter: status = 'open'
     -- Snapshot: one consistent snapshot (REPEATABLE READ)
     -- Not included: owners and privileges · 1 extension's objects
     -- Options: drop objects first: no
 
-and its last line, `-- Dump complete: 1,234 rows in 12 tables`: a dump that lacks it was cut short (pre-flight M15).
+The Rows line is there only when a filter picked the rows of the file's one table (06a fix wave F2): with `drop
+objects first`, restoring the file replaces that table with those rows, which the dump's plan and outcome and Run SQL
+file's inspection say (FILTERED_ROWS). Its last line, `-- Dump complete: 1,234 rows in 12 tables`: a dump that lacks it
+was cut short (pre-flight M15).
 """
 
 import re
@@ -22,6 +26,11 @@ _FIRST = re.compile(r"-- DbaGuy SQL dump · format (\d+)")
 _FIELD = re.compile(r"-- ([A-Z][A-Za-z ]*): (.*)")
 _SEPARATOR = " · "
 _DROP_FIRST = "drop objects first: "
+# The Rows line's value; the table is the text up to the first " that match a filter: " (a name holding those words
+# is shown cut there: the header is a hint, never a permission), the filter all the rest
+_FILTERED = re.compile(r"only those of (.*?) that match a filter: (.*)")
+FILTERED_ROWS = "The file holds only the rows of {} that match a filter"
+_REPLACES = ": restoring it drops the table and replaces it with those rows"
 # Every character Python's splitlines() breaks a line at (the header is read back with it), and NUL, which no statement
 # may hold: in a comment, each is written as its escape (pre-flight S15)
 _LINE_BREAKS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029\x00"
@@ -34,16 +43,24 @@ def comment_safe(text: str) -> str:
     return text.translate(_ESCAPED)
 
 
+def filtered_rows(table: str, *, replaces: bool) -> str:
+    """What a file of the rows a filter picked says (its plan, its outcome, Run SQL file's inspection): with `replaces`
+    (it drops and recreates its objects), that a restore leaves only those rows in the table."""
+    return FILTERED_ROWS.format(table) + (_REPLACES if replaces else "")
+
+
 def header_lines(
     *, engine: Engine, server: str, scope: str, created: str, content: str, snapshot: str, not_included: list[str],
-    drop_first: bool,
+    drop_first: bool, filtered: tuple[str, str] | None = None,
 ) -> list[str]:
-    """The header's comment lines, without line breaks: each through comment_safe."""
+    """The header's comment lines, without line breaks: each through comment_safe. `filtered`: the table and the
+    filter its rows were picked by, when a filter was given and the file holds rows."""
     lines = [
         f"-- DbaGuy SQL dump · format {FORMAT}",
         f"-- Engine: {engine.value}{_SEPARATOR}{server}{_SEPARATOR}{scope}",
         f"-- Created: {created}",
         f"-- Content: {content}",
+        *([f"-- Rows: only those of {filtered[0]} that match a filter: {filtered[1]}"] if filtered else []),
         f"-- Snapshot: {snapshot}",
         f"-- Not included: {_SEPARATOR.join(not_included)}",
         f"-- Options: {_DROP_FIRST}{'yes' if drop_first else 'no'}",
@@ -68,9 +85,11 @@ def parse_header(text: str) -> DumpHeader | None:
     if engine not in {member.value for member in Engine}:
         return None
     server, _, scope = rest.partition(_SEPARATOR)
+    filtered = _FILTERED.fullmatch(fields.get("Rows", ""))
     return DumpHeader(
         format=int(first.group(1)), engine=Engine(engine), server=server or None, scope=scope or None,
-        created=fields.get("Created"), drop_first=fields.get("Options", "").endswith(f"{_DROP_FIRST}yes"), lines=kept,
+        created=fields.get("Created"), drop_first=fields.get("Options", "").endswith(f"{_DROP_FIRST}yes"),
+        filtered=filtered is not None, filtered_table=filtered.group(1) if filtered else None, lines=kept,
     )
 
 

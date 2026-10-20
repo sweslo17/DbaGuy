@@ -1191,26 +1191,30 @@ class SessionWorker:
         finally:
             self._close_result(result)
 
-    def _rollback_quietly(self, request_id: str, what: str = "apply", failed_text: str = ROLLBACK_FAILED) -> None:
+    def _rollback_quietly(
+        self, request_id: str, what: str = "apply", failed_text: str = ROLLBACK_FAILED,
+    ) -> str | None:
         """End the apply's (or a broken job's) transaction once it stopped. No Cancel may reach the ROLLBACK, so the
         request stops running first. A connection that is gone cannot roll back: the server does it as the connection
         ends (R-05-6). One that is still there and still in the transaction gets `failed_text` as a warning: a
-        table-data tab has no Rollback (pre-flight L8), and a job's dialog none either."""
+        table-data tab has no Rollback (pre-flight L8), and a job's dialog none either. Returns the warning sent."""
         self._set_running(None)
         try:
             self.connection.rollback()
-            return
+            return None
         except Exception as exc:
             logger.info("[{}] the rollback after a stopped {} failed ({})", self.name, what,
                         getattr(exc, "code", None) or type(exc).__name__)
         try:
             still_open = self.connection.in_transaction()
         except Exception:
-            return  # it cannot tell: as for a connection that is gone
-        if still_open:
-            logger.warning("[{}] {} {}: its transaction is still open after the rollback failed", self.name, what,
-                           request_id)
-            self._send(MessageEvent(request_id=request_id, severity=MessageSeverity.WARNING, text=failed_text))
+            return None  # it cannot tell: as for a connection that is gone
+        if not still_open:
+            return None
+        logger.warning("[{}] {} {}: its transaction is still open after the rollback failed", self.name, what,
+                       request_id)
+        self._send(MessageEvent(request_id=request_id, severity=MessageSeverity.WARNING, text=failed_text))
+        return failed_text
 
     def _end_apply(self, req: _Request, plan: EditPlan | None, report: EditReport) -> None:
         """The apply's last events: its error (for a commit that stood, a warning instead), the edit_outcome, then the
@@ -1257,8 +1261,9 @@ class SessionWorker:
             self._job_events = {}
 
         def not_started(why: str) -> None:  # right before the `finished` _start_request sends
-            self._job_event(JobOutcomeEvent(
+            self._job_event(JobOutcomeEvent(  # `why` is the warning sent live, kept for a later window too (F3)
                 request_id=req.request_id, job=kind, outcome="not_started", cancelled=why != CLOSED_BEFORE_START,
+                warnings=[why],
             ))
 
         if not self._start_request(req, before_finished=not_started):
@@ -1292,7 +1297,8 @@ class SessionWorker:
                 report = self._broke(job, ctx, exc)
                 if cancelled and not report.outcome.cancelled:
                     report = replace(report, outcome=report.outcome.model_copy(update={"cancelled": True}))
-                self._release_broken_job(req.request_id)
+                if (said := self._release_broken_job(req.request_id)) is not None:
+                    report = report.warned(said)
         finally:
             self._set_running(None)
         self._end_job(req, ctx, report)
@@ -1318,16 +1324,18 @@ class SessionWorker:
                              self.name)
             return Job.broke(job, ctx, exc)
 
-    def _release_broken_job(self, request_id: str) -> None:
+    def _release_broken_job(self, request_id: str) -> str | None:
         """A job that broke may have left its transaction open (an all-or-nothing run's BEGIN), holding its locks
-        until the session closes: roll it back (pre-flight L2). The outcome stays what `broke()` said."""
+        until the session closes: roll it back (pre-flight L2). The outcome stays what `broke()` said; the warning
+        sent when the rollback failed is returned for its warnings too (F3)."""
         try:
             open_now = self.connection.in_transaction()
         except Exception:
-            return  # it cannot tell (the connection is gone): the server ends the transaction with the connection
+            return None  # it cannot tell (the connection is gone): the server ends the transaction with it
         if open_now:
             logger.warning("[{}] job {} broke inside a transaction: rolling it back", self.name, request_id)
-            self._rollback_quietly(request_id, "job", JOB_ROLLBACK_FAILED)
+            return self._rollback_quietly(request_id, "job", JOB_ROLLBACK_FAILED)
+        return None
 
     def _job_statement(
         self, req: _Request, sql: str, options: RunOptions, listener: Callable[[ServerMessage], None],
@@ -1351,10 +1359,10 @@ class SessionWorker:
     def _end_job(self, req: _Request, ctx: JobContext | None, report: JobReport) -> None:
         """The job's last events: its error, the job_outcome, then its History record, the schema cache, the
         session_state and `finished`."""
-        rid, outcome, error = req.request_id, report.outcome, report.error
+        rid, outcome, error = req.request_id, report.sent_outcome(), report.error
         if error is not None:
             self._send(ErrorEvent(request_id=rid, message=error.message, code=error.code, position=error.position))
-        self._job_event(outcome)
+        self._job_event(outcome)  # with the error, for a later window and the job list (F3)
         if ctx is not None and ctx.record_id is not None:
             status, text = history_status(outcome, error)
             self._notify("history", self._hooks.jobs.finish_record, ctx.record_id, status, req.elapsed_ms(),
