@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from itertools import islice
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
@@ -74,16 +75,19 @@ def _valid(adapter: TypeAdapter[Any], value: Any, extra: _Extra) -> bool:
     return True
 
 
-def _repair_tab(tab: Any, extra: _Extra) -> _Repair:
+def _repair_tab(tab: Any, extra: _Extra, texts_only: bool) -> _Repair:
     """The tab without what is wrong in its saved parameter drafts, query context, document CAS and staged grid edits:
     a draft with a name or a size the model refuses is removed (and the drafts beyond the limit), a context it refuses
     goes back to the profile's default, a CAS it refuses is forgotten (the document tab then reads as a new document),
     and staged edits it refuses (or on a tab that is not a table tab) are dropped, the tab kept (B40: one bad entry must
     not cost every tab its saved state). A lone surrogate in any text is replaced (`_well_formed_fields`). Everything else,
-    the buffer first, stays as it was."""
+    the buffer first, stays as it was. `texts_only`: only the text is repaired (the model takes a lone surrogate; it
+    refuses everything else this repairs, so a state it takes needs nothing else, `validated_workspace`)."""
     if not isinstance(tab, dict):
         return _Repair(tab)
     tab, texts_repaired = _well_formed_fields(tab, skip="staged_edits")
+    if texts_only:
+        return _Repair(tab, texts_repaired=texts_repaired)
     repaired, removed, reset = tab, 0, False
     drafts = tab.get("params")
     if drafts is not None:
@@ -106,42 +110,67 @@ def _repair_tab(tab: Any, extra: _Extra) -> _Repair:
     return _Repair(repaired, removed, reset, cas_reset, staged_reset, texts_repaired)
 
 
-def _repaired_tabs(raw: Any, where: str, extra: _Extra) -> Any:
-    """`raw` (a workspace object) with every tab repaired (`_repair_tab`); each repair is one WARNING that counts what
-    it took out and never names or shows it (a name or a draft is the user's text). Anything else is returned as is."""
+def _repaired_tabs(raw: Any, where: str, extra: _Extra, texts_only: bool = False) -> tuple[Any, list[str]]:
+    """`raw` (a workspace object) with every tab repaired (`_repair_tab`), and the WARNING lines that say so: one per
+    repair, counting what it took out and never naming or showing it (a name or a draft is the user's text). Anything
+    else is returned as is."""
     if not isinstance(raw, dict):
-        return raw
+        return raw, []
     raw, texts_repaired = _well_formed_fields(raw, skip="tabs")  # the active tab's id, the sidebar's tab
-    if texts_repaired:
-        logger.warning("Repaired the {}: replaced a lone surrogate in {} text(s)", where, texts_repaired)
+    warnings = [f"Repaired the {where}: replaced a lone surrogate in {texts_repaired} text(s)"] if texts_repaired else []
     tabs = raw.get("tabs")
     if not isinstance(tabs, list):
-        return raw
+        return raw, warnings
     repaired = []
     for index, tab in enumerate(tabs):
-        result = _repair_tab(tab, extra)
+        result = _repair_tab(tab, extra, texts_only)
         parts = (f"removed {result.drafts_removed} parameter draft(s)" if result.drafts_removed else "",
                  "reset the query context" if result.context_reset else "",
                  "reset the document CAS" if result.cas_reset else "",
                  "dropped the staged edits" if result.staged_reset else "",
                  f"replaced a lone surrogate in {result.texts_repaired} text(s)" if result.texts_repaired else "")
         if any(parts):
-            logger.warning("Repaired tab {} of the {}: {}", index, where, " and ".join(part for part in parts if part))
+            warnings.append(f"Repaired tab {index} of the {where}: " + " and ".join(part for part in parts if part))
         repaired.append(result.tab)
-    return {**raw, "tabs": repaired}
+    return {**raw, "tabs": repaired}, warnings
+
+
+def _logged(repaired: tuple[Any, list[str]]) -> Any:
+    state, warnings = repaired
+    for warning in warnings:
+        logger.warning("{}", warning)
+    return state
+
+
+_SAVED = "workspace being saved"
 
 
 def repaired_workspace(raw: Any) -> Any:
     """For `PUT /workspace`, before validation: one bad draft name must not cost the whole save (the frontend already
     filters names, B40; this is the backstop)."""
-    return _repaired_tabs(raw, "workspace being saved", None)
+    return _logged(_repaired_tabs(raw, _SAVED, None))
+
+
+def validated_workspace(raw: Any, handler: Callable[[Any], WorkspaceState]) -> WorkspaceState:
+    """`PUT /workspace`'s body (a wrap validator): validated once, and only when the model refuses it repaired
+    (`repaired_workspace`) and validated again. The repair checks a staged set with the model's own definition, so
+    repairing before every validation validated an 8 MiB set twice per save (0.3–0.4 s). A lone surrogate in a text is
+    replaced first either way: the model takes one in a plain `str`, and `workspace.json` could not be written with it
+    (K7). What is kept, and every WARNING, are as when every save was repaired first: the model refuses everything else
+    the repair changes."""
+    well_formed, warnings = _repaired_tabs(raw, _SAVED, None, texts_only=True)
+    try:
+        state = handler(well_formed)
+    except ValidationError:
+        return handler(repaired_workspace(raw))  # its WARNINGs include the text repairs
+    return _logged((state, warnings))
 
 
 def _drop_invalid_tabs(raw: dict[str, Any]) -> dict[str, Any]:
     """Judge each tab on its own: a bad parameter draft or context is repaired (`_repair_tab`), and a tab that is still
     invalid (e.g. a kind from a newer build) is dropped with a warning, so the other tabs still load. A `tabs` that is
     not a list is left for the whole-file validation to reject."""
-    raw = _repaired_tabs(raw, "saved workspace", "ignore")
+    raw = _logged(_repaired_tabs(raw, "saved workspace", "ignore"))
     tabs = raw.get("tabs")
     if not isinstance(tabs, list):
         return raw

@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { SavedTab, SavedWorkspace } from "@/lib/api/types";
 import type { EditorBuffer } from "@/stores/editorBuffers";
 import type { DocumentTabState, QueryTabState, Tab } from "@/stores/workspace";
-import { fromSavedWorkspace, toSavedWorkspace, workspaceJson } from "./workspaceFile";
+import { fromSavedWorkspace, restoreLosses, toSavedWorkspace, workspaceJson } from "./workspaceFile";
 
 /*
  * What `workspace.json` keeps of a Couchbase document tab (rulings C15, C33): unsaved text and the CAS it is based on,
@@ -262,6 +262,15 @@ describe("a table tab's staged edits", () => {
       expect(restored.snapshot.tabs.map((tab) => tab.id)).toEqual(["table:bad", "table:1"]); // the tab stays
       expect([...restored.staged.keys()]).toEqual(["table:1"]); // the good set stays, the malformed one is dropped
       expect(restored.closed).toEqual(["gone"]); // a dropped tab with a set that does not read: no count to give
+      // the restore's toast names the tab that lost its staged edits, beside the closed one, and never a value
+      expect(restored.dropped).toEqual(["bad: its staged changes could not be read and were dropped"]);
+      expect(restoreLosses(restored)).toBe(
+        "Some tabs' connections no longer exist.\nClosed: gone\nbad: its staged changes could not be read and were dropped",
+      );
+      expect(restoreLosses({ ...restored, closed: [] })).toBe(
+        "bad: its staged changes could not be read and were dropped",
+      );
+      expect(restoreLosses({ ...restored, closed: [], dropped: [] })).toBeNull();
       const said = warn.mock.calls.flat().join(" ");
       expect(warn).toHaveBeenCalledTimes(2);
       expect(said).toContain("TypeError"); // the kind of error

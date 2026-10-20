@@ -10,7 +10,14 @@ import { useWorkspace } from "@/stores/workspace";
 import { fetchProfiles, profilesKey } from "../connections/hooks";
 import { restoredEdits, savedEdits } from "../edits/savedEdits";
 import { clearPendingWorkspace, readPendingWorkspace, writePendingWorkspace } from "./pendingWorkspace";
-import { fromSavedWorkspace, toSavedWorkspace, workspaceJson, type RestoredWorkspace } from "./workspaceFile";
+import { SaveWaiters } from "./saveWaiters";
+import {
+  fromSavedWorkspace,
+  restoreLosses,
+  toSavedWorkspace,
+  workspaceJson,
+  type RestoredWorkspace,
+} from "./workspaceFile";
 
 /** A change is saved at most this long after it was made, so a crash loses at most the last half second of typing. */
 const SAVE_DELAY_MS = 500;
@@ -86,6 +93,8 @@ class WorkspaceWriter {
   private backend: BackendInfo | null = null;
   /** What the last flush sent: `pagehide` and `beforeunload` both fire, and it is sent once. */
   private flushed: string | null = null;
+  /** `saveNow`'s callers, each waiting for a save that started after it asked. */
+  private readonly waiters = new SaveWaiters();
 
   /**
    * `lastSaved`: the JSON the file holds already, or null to save the current state at once. `mirroredAt`: when the
@@ -118,15 +127,21 @@ class WorkspaceWriter {
     else if (this.timer === null) this.timer = window.setTimeout(this.save, SAVE_DELAY_MS);
   };
 
-  /** Saves at once, skipping any delay or pending retry (the backend is back, maybe on a new port and token). */
-  readonly saveNow = async (): Promise<void> => {
+  /**
+   * Saves at once, skipping any delay or pending retry (the backend is back, maybe on a new port and token). Resolves
+   * once a save that started after the call has ended: true when it saved the state (or the file held it already),
+   * false when it failed (it is retried as any failed save). Never rejects.
+   */
+  readonly saveNow = async (): Promise<boolean> => {
+    const ended = this.waiters.wait();
     if (this.saving) {
-      this.saveNowRequested = true;
-      return;
+      this.saveNowRequested = true; // the save running serialized the state before the call: one more follows it
+      return ended;
     }
     this.clearTimer();
     await this.refreshBackend();
     await this.save();
+    return ended;
   };
 
   private clearTimer(): void {
@@ -149,10 +164,12 @@ class WorkspaceWriter {
     }
     this.clearTimer();
     const serializedAt = Date.now();
+    const started = this.waiters.start();
     const { file, json } = serialize();
     if (json === this.lastSaved) {
       // The file already holds this state (e.g. a change was undone while saving failed): nothing is unsaved.
       if (this.failures > 0 || this.mirroredAt !== null) this.succeeded(serializedAt, false);
+      this.waiters.ended(started, true);
       return;
     }
     this.saving = true;
@@ -171,8 +188,10 @@ class WorkspaceWriter {
       );
       this.lastSaved = json;
       this.succeeded(serializedAt, true);
+      this.waiters.ended(started, true);
     } catch (error) {
       retryInMs = this.failed(json, error);
+      this.waiters.ended(started, false);
     } finally {
       this.saving = false;
     }
@@ -246,14 +265,15 @@ let writer: WorkspaceWriter | null = null;
 
 /**
  * Saves the workspace at once, skipping any delay or pending retry: called when the backend is back (restarted, or
- * reachable again), so that what was typed meanwhile is not left waiting, and as a grid commit is sent, so that a
- * reload, crash or quit before its outcome finds it unknown (05b pre-flight H1). `why` is the log line's reason. Does
- * nothing before the workspace is restored.
+ * reachable again), so that what was typed meanwhile is not left waiting, and before a grid commit is sent, so that a
+ * reload, crash or quit before its outcome finds it unknown (05b pre-flight H1; the commit waits for it). `why` is the
+ * log line's reason. Resolves once a save of the state as it is now has ended: true when it was saved, false when it
+ * failed or the workspace is not restored yet (nothing is saved before). Never rejects.
  */
-export function saveWorkspaceNow(why = "The backend is back"): void {
-  if (!writer) return;
+export function saveWorkspaceNow(why = "The backend is back"): Promise<boolean> {
+  if (!writer) return Promise.resolve(false);
   console.info(`${why}: saving the workspace now`);
-  void writer.saveNow();
+  return writer.saveNow();
 }
 
 /** `GET /workspace`; a missing answer is retried (the backend may still be starting), a refusal is not. */
@@ -295,12 +315,6 @@ async function knownProfileIds(queryClient: QueryClient): Promise<Set<string> | 
   }
 }
 
-function reportLostConnections({ closed, detached }: RestoredWorkspace): void {
-  const lines = ["Some tabs' connections no longer exist."];
-  if (closed.length) lines.push(`Closed: ${closed.join(", ")}`);
-  if (detached.length) lines.push(`Reopened without a connection: ${detached.join(", ")}`);
-  if (lines.length > 1) toast("warning", lines.join("\n"));
-}
 
 function describeTime(at: number): string {
   const when = new Date(at);
@@ -343,14 +357,16 @@ async function restoreSaved(queryClient: QueryClient): Promise<WriterStart> {
   const { tabs } = restored.snapshot;
   console.info(
     `Restored ${tabs.length} tabs from ${source} ` +
-      `(${restored.closed.length} closed, ${restored.detached.length} without a connection)`,
+      `(${restored.closed.length} closed, ${restored.detached.length} without a connection, ` +
+      `${restored.dropped.length} without staged edits that did not read)`,
   );
-  reportLostConnections(restored);
+  const lost = restoreLosses(restored);
+  if (lost) toast("warning", lost);
   if (fromPending && pending) {
     toast("info", `Restored unsaved changes from ${describeTime(pending.at)}`);
     return { lastSaved: null, mirroredAt: pending.at }; // pushed to the backend at once
   }
-  const changed = restored.closed.length > 0 || restored.detached.length > 0;
+  const changed = restored.closed.length > 0 || restored.detached.length > 0 || restored.dropped.length > 0;
   return { lastSaved: changed ? null : serialize().json, mirroredAt: null };
 }
 

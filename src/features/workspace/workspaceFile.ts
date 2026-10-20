@@ -172,6 +172,28 @@ export interface RestoredWorkspace {
   detached: string[];
   /** The staged edits of the table tabs restored, by tab id (they go into `stores/stagedEdits.ts`). */
   staged: ReadonlyMap<string, StagedEditsFile>;
+  /**
+   * What the restore says of the table tabs restored without their staged edits, because the set did not read
+   * (`readableEdits`): one line each (`stagedNotRead`), never a value.
+   */
+  dropped: string[];
+}
+
+/** The restore's line for a table tab whose staged edits did not read (Q2: never dropped without a word). */
+export const stagedNotRead = (title: string): string =>
+  `${title || "A table tab"}: its staged changes could not be read and were dropped`;
+
+/**
+ * The restore's one warning, or null: the tabs closed or reopened without a connection because theirs is gone (a closed
+ * table tab says how many staged changes went with it), and the tabs whose staged edits did not read.
+ */
+export function restoreLosses({ closed, detached, dropped }: RestoredWorkspace): string | null {
+  const lines: string[] = [];
+  if (closed.length || detached.length) lines.push("Some tabs' connections no longer exist.");
+  if (closed.length) lines.push(`Closed: ${closed.join(", ")}`);
+  if (detached.length) lines.push(`Reopened without a connection: ${detached.join(", ")}`);
+  lines.push(...dropped);
+  return lines.length > 0 ? lines.join("\n") : null;
 }
 
 /** The changes a staged set holds as the close question counts them (L20): an UPDATE under its DELETE is not one. */
@@ -247,6 +269,7 @@ export function fromSavedWorkspace(saved: SavedWorkspace, profileExists: (id: st
   const tabs: Tab[] = [];
   const closed: string[] = [];
   const detached: string[] = [];
+  const dropped: string[] = [];
   const staged = new Map<string, StagedEditsFile>();
   const seen = new Set<string>();
   for (const entry of saved.tabs) {
@@ -270,9 +293,12 @@ export function fromSavedWorkspace(saved: SavedWorkspace, profileExists: (id: st
       }
     } else if (connected && entry.object_path?.length) {
       tabs.push({ id: entry.id, kind: entry.kind, profileId, path: entry.object_path, title: entry.title });
-      // a set that does not read costs the tab its staged edits, never the restore (`readableEdits` says so once)
-      if (entry.kind === "table" && entry.staged_edits && readableEdits(entry.staged_edits))
-        staged.set(entry.id, entry.staged_edits);
+      // a set that does not read costs the tab its staged edits, never the restore (`readableEdits` logs it once, and
+      // the restore's toast says so)
+      if (entry.kind === "table" && entry.staged_edits) {
+        if (readableEdits(entry.staged_edits)) staged.set(entry.id, entry.staged_edits);
+        else dropped.push(stagedNotRead(entry.title));
+      }
     } else {
       // R-05-11: a table tab's staged edits go with it, and the list of closed tabs says so.
       const lost = entry.staged_edits ? stagedCount(entry.staged_edits) : 0;
@@ -289,5 +315,6 @@ export function fromSavedWorkspace(saved: SavedWorkspace, profileExists: (id: st
     closed,
     detached,
     staged,
+    dropped,
   };
 }

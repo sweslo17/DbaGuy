@@ -1,4 +1,4 @@
-import type { EditCounts, EditOutcome, EditPreview, PlannedStatement } from "@/lib/api/types";
+import type { EditCounts, EditPreview, PlannedStatement } from "@/lib/api/types";
 import { plural } from "@/lib/format";
 import { positionToOffset } from "../query/runPlan";
 import { EXPORT_RUNNING, type ExecutionState } from "../session/execution";
@@ -18,7 +18,7 @@ import {
   type CommitReport,
   type SettledCommit,
 } from "./commitFlow";
-import { hasChanges, type StagedEdits, type Staging } from "./staging";
+import { hasChanges, type AppliedOutcome, type StagedEdits, type Staging } from "./staging";
 import { REREAD_FIRST, ROWS_LOADING } from "./tableEditing";
 
 /*
@@ -42,8 +42,12 @@ export type CommitDialogState =
   | PreviewStep
   | (Omit<PreviewStep, "step"> & {
       readonly step: "applying";
-      readonly requestId: string;
-      /** The browse had not ended when the apply was sent: the apply ends it (L15). */
+      /**
+       * The apply's request; null while it waits for the "applying" save before it is sent (`sentStep`): a hard kill
+       * before that save lands would restore the staging as unsent, and Commit would insert its new rows twice.
+       */
+      readonly requestId: string | null;
+      /** The browse had not ended when Commit was clicked: the apply ends it (L15). */
       readonly browseWasPaused: boolean;
     })
   | (Omit<PreviewStep, "step"> & {
@@ -62,6 +66,8 @@ export interface PreviewStep {
 
 export type ShownPreview = Exclude<CommitDialogState, { step: "previewing" } | { step: "failed" }>;
 export type ApplyingStep = Extract<CommitDialogState, { step: "applying" }>;
+/** An apply that has been sent: its outcome is read from its request. */
+export type SentStep = ApplyingStep & { readonly requestId: string };
 
 /** The steps that show a preview's statements. */
 export const hasPreview = (state: CommitDialogState): state is ShownPreview =>
@@ -110,10 +116,18 @@ export function commitStep(state: CommitDialogState | null, now: Staging | null)
   return { kind: "apply", planId: state.preview.plan_id };
 }
 
-/** The preview's plan is being applied as request `requestId`. */
-export function applyingStep(state: PreviewStep, requestId: string, browseWasPaused: boolean): ApplyingStep {
-  return { ...state, step: "applying", requestId, browseWasPaused };
+/** Commit was clicked: the preview's plan is applied, once the "applying" save has ended (it is not sent yet). */
+export function applyingStep(state: PreviewStep, browseWasPaused: boolean): ApplyingStep {
+  return { ...state, step: "applying", requestId: null, browseWasPaused };
 }
+
+/** The apply has been sent as request `requestId`. */
+export function sentStep(state: ApplyingStep, requestId: string): SentStep {
+  return { ...state, requestId };
+}
+
+/** Whether the apply has been sent (its outcome comes from its request), or still waits for the "applying" save. */
+export const isSent = (state: ApplyingStep): state is SentStep => state.requestId !== null;
 
 /** The apply is over and its outcome is shown. */
 export function resultStep(state: ShownPreview, report: CommitReport, messages: Messages): CommitDialogState {
@@ -157,10 +171,11 @@ export function commitBlocked(facts: CommitFacts): string | null {
 }
 
 /**
- * Pre-flight M5: the staging as it was before an outcome took changes away (a commit, or a partial one), drawn by the
- * grid instead of the store's until the re-read's rows are in, so committed values never flip back to the loaded ones
- * on the rows held meanwhile, deleted rows stay struck through and new rows stay on top (the selection and the anchor
- * keep their rows). `since` is the browse request delivered at the outcome and `position` the browse's position then.
+ * Pre-flight M5: the staging as it was before an outcome took changes away (a commit, a partial one, or an unknown one
+ * that names changes applied), drawn by the grid instead of the store's until the re-read's rows are in, so committed
+ * values never flip back to the loaded ones on the rows held meanwhile, deleted rows stay struck through and new rows
+ * stay on top (the selection and the anchor keep their rows). `since` is the browse request delivered at the outcome
+ * and `position` the browse's position then.
  */
 export interface Afterglow {
   readonly staged: StagedEdits;
@@ -176,10 +191,22 @@ export interface BrowseNow {
   readonly position: number;
 }
 
-/** The afterglow of an outcome, or null when it took nothing away (rolled back, unknown, nothing staged). */
-export function afterglowOf(outcome: EditOutcome, before: StagedEdits | null, browse: BrowseNow): Afterglow | null {
-  if (outcome !== "committed" && outcome !== "partial") return null;
-  if (!before || !hasChanges(before)) return null;
+/**
+ * The afterglow of an outcome as the staging takes it, or null when it took nothing away: rolled back, unknown with
+ * nothing named applied, or nothing staged. An unknown outcome that names changes applied (a table that cannot roll
+ * back) takes them out of the staging as a partial one does, and its rows are not read again until the user's Refresh
+ * (`rerunAfter`): until then the grid would show their old values.
+ */
+export function afterglowOf(
+  outcome: Pick<AppliedOutcome, "outcome" | "applied">,
+  before: StagedEdits | null,
+  browse: BrowseNow,
+): Afterglow | null {
+  const tookAway =
+    outcome.outcome === "committed" ||
+    outcome.outcome === "partial" ||
+    (outcome.outcome === "unknown" && outcome.applied.length > 0);
+  if (!tookAway || !before || !hasChanges(before)) return null;
   return { staged: before, since: browse.deliveredRequest, position: browse.position };
 }
 
@@ -413,6 +440,8 @@ export function lastWarning(messages: Messages): string | null {
   return null;
 }
 
+export const COMMITTING = "Committing…";
+
 /** The applying dialog's progress line and controls (pre-flight M1, M2, ruling K11). */
 export interface ApplyingView {
   readonly progress: string;
@@ -432,7 +461,10 @@ export function applyingView(wait: {
   const { counted, statements } = wait;
   const progress =
     counted < statements
-      ? `Committing… statement ${(counted + 1).toLocaleString()} of ${statements.toLocaleString()}`
-      : "Committing…";
+      ? `${COMMITTING} statement ${(counted + 1).toLocaleString()} of ${statements.toLocaleString()}`
+      : COMMITTING;
   return { progress, canCancel: counted < statements, closeUnknown: mayStopWaiting(wait) };
 }
+
+/** While the apply waits for the "applying" save (at most a couple of seconds): nothing has been sent to cancel. */
+export const SENDING_VIEW: ApplyingView = { progress: COMMITTING, canCancel: false, closeUnknown: false };

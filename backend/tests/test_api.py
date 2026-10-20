@@ -485,6 +485,19 @@ def test_staged_edits_nested_to_the_limit_are_saved_and_read_back(client, levels
     assert again.status_code == 200 and again.json() == state
 
 
+def test_a_save_validates_its_staged_edits_once(client, monkeypatch):  # the fix wave's follow-up to L18
+    """`PUT /workspace` validated an 8 MiB staged set twice per save (the repair's check, then the model): now once,
+    and the repair runs only when the model refuses the body."""
+    from dbaguy_backend.domain import edits
+    counted = []
+    measured = edits._text_chars
+    monkeypatch.setattr(edits, "_text_chars", lambda *changes: counted.append(1) or measured(*changes))
+    tab = {"id": "t1", "kind": "table", "title": "orders", "staged_edits": deep_staged_edits(3)}
+    assert client.put("/workspace", json={"tabs": [tab]}, headers=AUTH).status_code == 204
+    assert len(counted) == 1
+    assert client.get("/workspace", headers=AUTH).json()["tabs"][0]["staged_edits"] is not None
+
+
 def test_a_save_with_a_lone_surrogate_in_a_buffer_keeps_every_tab(client):  # ruling K7: it was a 500 for every tab
     """A client that sends the text as it is (the frontend replaces it first, `workspaceJson`): pydantic takes a lone
     surrogate in a plain `str`, but `workspace.json` cannot be written with one. It is replaced, not dropped."""

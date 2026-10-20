@@ -162,7 +162,7 @@ export interface TableEdits {
   keyChanged: boolean;
   staged: StagedEdits | null;
   changes: number;
-  /** Why the staged changes are not kept across a restart (`savedEdits`, K5), or null. */
+  /** Why the staged changes are not kept across a restart, or not all of them (`savedEdits`, K5, K3b), or null. */
   notKept: string | null;
   display: Overlay;
   /** The grid's `edits`; undefined when nothing can be edited and nothing is staged or drawn. */

@@ -90,12 +90,8 @@ describe("saving staged edits", () => {
       edit(i, "x".repeat(MAX_SAVED_VALUE_CHARS)),
     );
     expect(savedEdits(staged(...big))).toEqual({ file: null, tooLarge: true, unsaveable: null });
-    // Entries are counted as the file holds them: a DELETE and the UPDATE under it are two.
-    const many = staged(...Array.from({ length: MAX_CHANGES / 2 + 1 }, (_, i) => edit(i, "b")), {
-      type: "deleteRows",
-      rows: Array.from({ length: MAX_CHANGES / 2 }, (_, i) => ref(i)),
-    });
-    expect(savedEdits(many).tooLarge).toBe(true);
+    const over = staged({ type: "deleteRows", rows: Array.from({ length: MAX_CHANGES + 1 }, (_, i) => ref(i)) });
+    expect(savedEdits(over)).toEqual({ file: null, tooLarge: true, unsaveable: null });
     const exactly = staged({ type: "deleteRows", rows: Array.from({ length: MAX_CHANGES }, (_, i) => ref(i)) });
     expect(savedEdits(exactly).file?.deletes).toHaveLength(MAX_CHANGES); // the limit itself is kept
   });
@@ -313,6 +309,66 @@ describe("restoring staged edits", () => {
     expect(savedEdits(back).file).toEqual(file);
   });
 
+  describe("beyond a limit, without the UPDATEs hidden under DELETEs (ruling K3b)", () => {
+    const hiddenUnder = (count: number, text = "b") =>
+      staged(...Array.from({ length: count }, (_, i) => edit(i, text)), {
+        type: "deleteRows",
+        rows: Array.from({ length: count }, (_, i) => ref(i)),
+      });
+
+    it("counts entries as the file holds them; over 10,000 the hidden UPDATEs go, what a commit sends stays", () => {
+      // A DELETE and the UPDATE under it are two entries: 5,001 UPDATEs, 5,000 of them under DELETEs, and one new row.
+      const state = stage(hiddenUnder(MAX_CHANGES / 2), edit(MAX_CHANGES, "c"));
+      const withNew = stage(state, { type: "addRow", id: "i:x" });
+      const saved = savedEdits(withNew);
+      expect(saved).toMatchObject({ tooLarge: false, unsaveable: null, withoutHidden: true });
+      expect([saved.file?.updates?.length, saved.file?.inserts?.length, saved.file?.deletes?.length]).toEqual([
+        1,
+        1,
+        MAX_CHANGES / 2,
+      ]);
+      const back = restoredEdits(JSON.parse(JSON.stringify(saved.file)));
+      expect(toChanges(back)).toEqual(toChanges(withNew)); // what a commit sends is all kept
+      expect(Object.keys(back.deletes)).toHaveLength(MAX_CHANGES / 2); // marked again, their edits gone
+      expect(savedEdits(back)).toEqual({ file: saved.file, tooLarge: false, unsaveable: null }); // within the limits
+    });
+
+    it("leaves them out over 8 MiB, or over one value's limit, and keeps the outcome", () => {
+      const nine = hiddenUnder(9, "x".repeat(MAX_SAVED_VALUE_CHARS)); // 9 MiB in UPDATEs nobody sends
+      expect(savedEdits(nine)).toMatchObject({ tooLarge: false, withoutHidden: true, file: { updates: [] } });
+      const one = stage(hiddenUnder(1, "x".repeat(MAX_SAVED_VALUE_CHARS + 1)), { type: "applying" });
+      expect(savedEdits(one)).toMatchObject({ withoutHidden: true, file: { updates: [], outcome_unknown: true } });
+      expect(savedEdits(one).file?.deletes).toHaveLength(1);
+    });
+
+    it("keeps nothing when the rest is still beyond a limit, or nothing was hidden", () => {
+      const big = Array.from({ length: 9 }, (_, i) => edit(100 + i, "x".repeat(MAX_SAVED_VALUE_CHARS)));
+      const still = staged(...big, edit(1, "b"), { type: "deleteRows", rows: [ref(1)] });
+      expect(savedEdits(still)).toEqual({ file: null, tooLarge: true, unsaveable: null });
+      expect(savedEdits(staged(...big))).toEqual({ file: null, tooLarge: true, unsaveable: null });
+    });
+
+    it("leaves out only for a limit: a hidden UPDATE the backend would refuse still keeps nothing (K5)", () => {
+      const broken = staged(edit(1, "a\ud800b"), { type: "deleteRows", rows: [ref(1)] });
+      expect(savedEdits(broken)).toEqual({ file: null, tooLarge: false, unsaveable: "value" });
+      // The first problem found is the answer, as before: a hidden value over its limit, then a value the backend
+      // refuses in the rest, is too large (the whole is); 8 MiB in hidden values and the refused value is that value
+      // (the total is judged last).
+      const over = staged(edit(1, "x".repeat(MAX_SAVED_VALUE_CHARS + 1)), { type: "deleteRows", rows: [ref(1)] });
+      expect(savedEdits(stage(over, edit(2, "c\ud800")))).toEqual({ file: null, tooLarge: true, unsaveable: null });
+      const nine = staged(...Array.from({ length: 9 }, (_, i) => edit(i, "x".repeat(MAX_SAVED_VALUE_CHARS))), {
+        type: "deleteRows",
+        rows: Array.from({ length: 9 }, (_, i) => ref(i)),
+      });
+      expect(savedEdits(stage(nine, edit(20, "c\ud800")))).toEqual({ file: null, tooLarge: false, unsaveable: "value" });
+    });
+
+    it("keeps them when everything fits (ruling K3), and says nothing then", () => {
+      expect(savedEdits(hiddenUnder(3))).toMatchObject({ tooLarge: false, file: { updates: [{}, {}, {}] } });
+      expect(savedEdits(hiddenUnder(3)).withoutHidden).toBeUndefined();
+    });
+  });
+
   it("brings an unknown outcome back as waiting for fresh rows", () => {
     const file = {
       version: 1 as const,
@@ -334,27 +390,56 @@ describe("restoring staged edits", () => {
 interface RefusalCase {
   name: string;
   accepted: boolean;
-  reason: Unsaveable | null;
+  /** Why the frontend keeps nothing (or, with `kept_without_hidden`, not all): K5's reasons, and K3b's limits. */
+  reason: Unsaveable | "too_large" | null;
   file: StagedEditsFile;
+  /** K3b: what is written instead of `file` (beyond a limit), or null when nothing is; absent for the other cases. */
+  kept_without_hidden?: StagedEditsFile | null;
+}
+
+/**
+ * The fixture's shorthand, read the same way by `test_local_stores.py`: in a list, `{"$repeat": n, "item": …}` stands
+ * for n copies of `item`, with `{n}` in its strings replaced by 1…n (a file over 10,000 entries or 8 MiB stays small).
+ */
+function expanded(value: unknown, n?: number): unknown {
+  if (typeof value === "string") return n === undefined ? value : value.replaceAll("{n}", String(n));
+  if (Array.isArray(value)) {
+    return value.flatMap((item: unknown) => {
+      if (typeof item !== "object" || item === null || !("$repeat" in item)) return [expanded(item, n)];
+      const { $repeat: count, item: repeated } = item as { $repeat: number; item: unknown };
+      return Array.from({ length: count }, (_, i) => expanded(repeated, i + 1));
+    });
+  }
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, expanded(item, n)]));
+  }
+  return value;
 }
 
 // The backend's `test_local_stores.py` puts the same files through `StagedEditsFile`: what is kept here is what the
 // model takes there, and what is refused here is what it refuses.
-const CASES = JSON.parse(
-  readFileSync(new URL("../../../backend/tests/fixtures/staged_edits_cases.json", import.meta.url), "utf8"),
+const CASES = expanded(
+  JSON.parse(readFileSync(new URL("../../../backend/tests/fixtures/staged_edits_cases.json", import.meta.url), "utf8")),
 ) as RefusalCase[];
 
-describe("keeping exactly what the backend's model takes (ruling K5)", () => {
+describe("keeping exactly what the backend's model takes (rulings K5, K3b)", () => {
   it("has cases of every kind, each named once", () => {
     expect(new Set(CASES.map((c) => c.name)).size).toBe(CASES.length);
-    expect(new Set(CASES.map((c) => c.reason))).toEqual(new Set([null, "value", "name", "other"]));
+    expect(new Set(CASES.map((c) => c.reason))).toEqual(new Set([null, "value", "name", "other", "too_large"]));
     expect(new Set(CASES.map((c) => c.accepted))).toEqual(new Set([true, false]));
+    const reduced = CASES.map((c) => (c.kept_without_hidden === undefined ? "-" : c.kept_without_hidden !== null));
+    expect(new Set(reduced)).toEqual(new Set(["-", true, false]));
+    expect(CASES.find((c) => c.name.includes("10,000"))?.file.deletes).toHaveLength(5001); // the shorthand was read
   });
 
-  it.each(CASES)("$name", ({ file, accepted, reason }) => {
+  it.each(CASES)("$name", ({ file, accepted, reason, kept_without_hidden: reduced }) => {
     const saved = savedEdits(restoredEdits(file));
     if (accepted) {
       expect(saved).toEqual({ file, tooLarge: false, unsaveable: null }); // written back as it is
+    } else if (reduced) {
+      expect(saved).toEqual({ file: reduced, tooLarge: false, unsaveable: null, withoutHidden: true });
+    } else if (reason === "too_large") {
+      expect(saved).toEqual({ file: null, tooLarge: true, unsaveable: null });
     } else {
       expect(saved).toEqual({ file: null, tooLarge: false, unsaveable: reason });
     }

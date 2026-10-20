@@ -5,7 +5,7 @@ import type { GridSelection, Rect } from "../grid/selection";
 import { KEY_INCOMPLETE, MARKED_DELETED } from "./editing";
 import type { GridEditKey } from "./editKeys";
 import { REPEATED_KEY } from "./overlay";
-import { savedEdits, UNSAVEABLE_HINT } from "./savedEdits";
+import { savedEdits, UNSAVEABLE_HINT, type SavedEdits } from "./savedEdits";
 import { emptyStaged, MAX_CHANGES, rowKeyFromKey, stage, type NewId, type RowRef, type StageAction, type StagedEdits } from "./staging";
 import {
   asksBeforeDiscard,
@@ -17,6 +17,7 @@ import {
   editMode,
   gridKeyAction,
   KEEP_MINE_TITLE,
+  KEPT_WITHOUT_HIDDEN,
   KEY_CHANGED,
   keyComplete,
   notKeptHint,
@@ -451,10 +452,12 @@ describe("the edit target's read", () => {
 });
 
 describe("the edit bar's words", () => {
-  it("says why staged changes are not kept across a restart (K5)", () => {
+  it("says why staged changes are not kept across a restart (K5), or not all of them (K3b)", () => {
     expect(notKeptHint(savedEdits(staged(edit(1, "label", "x"))))).toBeNull();
     expect(notKeptHint({ file: null, tooLarge: true, unsaveable: null })).toBe(TOO_LARGE_TO_KEEP);
     expect(notKeptHint(savedEdits(staged(edit(1, "label", "\ud800"))))).toBe(UNSAVEABLE_HINT.value);
+    const kept = savedEdits(staged(edit(1, "label", "x")));
+    expect(notKeptHint({ ...kept, withoutHidden: true } as SavedEdits)).toBe(KEPT_WITHOUT_HIDDEN);
   });
 
   it("asks before discarding more than one change", () => {

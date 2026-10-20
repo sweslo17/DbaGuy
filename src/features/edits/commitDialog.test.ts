@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { EditPreview, EditWarning, PlannedStatement, ServerEvent } from "@/lib/api/types";
+import type { EditOutcome, EditPreview, EditWarning, PlannedStatement, ServerEvent } from "@/lib/api/types";
 import { applyEvent, EXPORT_RUNNING, newExecution, type ExecutionState } from "../session/execution";
 import {
   afterglowHolds,
@@ -14,6 +14,7 @@ import {
   commitStep,
   countParts,
   failedPlace,
+  isSent,
   LIST_MAX,
   moreText,
   nextSqlModeRefusals,
@@ -27,6 +28,8 @@ import {
   refreshBy,
   resultStep,
   rowLabel,
+  SENDING_VIEW,
+  sentStep,
   statementLayout,
   UNKNOWN_REFRESH_FIRST,
   type Afterglow,
@@ -39,6 +42,7 @@ import {
   NEW_ROWS_NOTE,
   NOT_SENT_REPORT,
   OUTCOME_WAIT_MS,
+  rerunAfter,
   UNKNOWN_BEFORE,
   type CommitReport,
   type EndedCommit,
@@ -161,16 +165,19 @@ describe("which preview's plan is applied (05a M7, H8)", () => {
     expect(commitStep(shown(previewOf({ plan_id: null }), staged), stagingOf(staged))).toEqual({ kind: "none" });
     expect(commitStep(previewing(1), stagingOf(staged))).toEqual({ kind: "none" });
     expect(commitStep(null, stagingOf(staged))).toEqual({ kind: "none" });
-    const applying = applyingStep(shown(previewOf(), staged), "r1", false);
-    expect(commitStep(applying, stagingOf(staged))).toEqual({ kind: "none" }); // a second click never sends again
+    const saving = applyingStep(shown(previewOf(), staged), false);
+    expect(commitStep(saving, stagingOf(staged))).toEqual({ kind: "none" }); // a second click never sends again
+    expect(commitStep(sentStep(saving, "r1"), stagingOf(staged))).toEqual({ kind: "none" });
   });
 
   it("closes on anything but a running commit", () => {
     const state = shown(previewOf(), edited(1));
-    const applying = applyingStep(state, "r1", true);
+    const saving = applyingStep(state, true);
+    const applying = sentStep(saving, "r1");
     expect(closable(null)).toBe(true);
     expect(closable(previewing(1))).toBe(true);
     expect(closable(state)).toBe(true);
+    expect(closable(saving)).toBe(false); // waiting for the "applying" save before it is sent
     expect(closable(applying)).toBe(false);
     const report: CommitReport = { ...NOT_SENT_REPORT };
     expect(closable(resultStep(applying, report, []))).toBe(true);
@@ -178,7 +185,11 @@ describe("which preview's plan is applied (05a M7, H8)", () => {
 
   it("keeps the preview, its staging and its editor through applying and the result", () => {
     const state = shown(previewOf(), edited(1));
-    const applying = applyingStep(state, "r1", true);
+    const saving = applyingStep(state, true);
+    expect(saving).toMatchObject({ step: "applying", requestId: null, browseWasPaused: true });
+    expect(isSent(saving)).toBe(false);
+    const applying = sentStep(saving, "r1");
+    expect(isSent(applying)).toBe(true);
     expect(applying).toMatchObject({ step: "applying", preview: state.preview, staging: state.staging, key: 1 });
     expect(applying).toMatchObject({ requestId: "r1", browseWasPaused: true });
     const result = resultStep(applying, NOT_SENT_REPORT, [{ severity: "info", text: "m" }]);
@@ -223,41 +234,51 @@ describe("when Commit… may start", () => {
 describe("the afterglow: the staging from before a commit, until the re-read is in (pre-flight M5)", () => {
   const before = edited(2, edited(1));
   const at = { deliveredRequest: "browse-1", position: 3 };
+  const taken = (outcome: EditOutcome, applied: string[] = []) => ({ outcome, applied });
 
   it("is kept for a commit and a partial one, which take changes away", () => {
-    expect(afterglowOf("committed", before, at)).toEqual({ staged: before, since: "browse-1", position: 3 });
-    expect(afterglowOf("partial", before, at)).toEqual({ staged: before, since: "browse-1", position: 3 });
+    expect(afterglowOf(taken("committed"), before, at)).toEqual({ staged: before, since: "browse-1", position: 3 });
+    expect(afterglowOf(taken("partial", ["u:1"]), before, at)).toEqual({ staged: before, since: "browse-1", position: 3 });
+  });
+
+  it("is kept for an unknown outcome that names changes applied: they leave the staging, and no re-read follows", () => {
+    // A table that cannot roll back: the statements before the one that failed took effect (05a G10, G13).
+    expect(afterglowOf(taken("unknown", ["u:1"]), before, at)).toEqual({ staged: before, since: "browse-1", position: 3 });
+    expect(rerunAfter("unknown", false)).toBe(false); // it goes with the user's Refresh
+    const glow = afterglowOf(taken("unknown", ["u:1"]), before, at) as Afterglow;
+    expect(afterglowNow(glow, at)).toBe(glow);
+    expect(afterglowNow(glow, { deliveredRequest: "browse-2", position: 3 })).toBeNull();
   });
 
   it("is not kept when the outcome took nothing away, or nothing was staged", () => {
-    expect(afterglowOf("rolled_back", before, at)).toBeNull();
-    expect(afterglowOf("unknown", before, at)).toBeNull();
-    expect(afterglowOf("committed", null, at)).toBeNull();
-    expect(afterglowOf("committed", emptyStaged(["id"]), at)).toBeNull();
+    expect(afterglowOf(taken("rolled_back"), before, at)).toBeNull();
+    expect(afterglowOf(taken("unknown"), before, at)).toBeNull();
+    expect(afterglowOf(taken("committed"), null, at)).toBeNull();
+    expect(afterglowOf(taken("committed"), emptyStaged(["id"]), at)).toBeNull();
   });
 
   it("holds while the re-read loads, and goes once another request delivers its rows", () => {
-    const glow = afterglowOf("committed", before, at) as Afterglow;
+    const glow = afterglowOf(taken("committed"), before, at) as Afterglow;
     expect(afterglowHolds(glow, at)).toBe(true); // the commit's own render: the old rows are still the ones shown
     expect(afterglowHolds(glow, { deliveredRequest: null, position: 3 })).toBe(true); // the re-read loads
     expect(afterglowHolds(glow, { deliveredRequest: "browse-2", position: 3 })).toBe(false); // its rows are in
   });
 
   it("goes with a new sort or filter", () => {
-    const glow = afterglowOf("committed", before, at) as Afterglow;
+    const glow = afterglowOf(taken("committed"), before, at) as Afterglow;
     expect(afterglowHolds(glow, { deliveredRequest: null, position: 4 })).toBe(false);
     expect(afterglowHolds(glow, { deliveredRequest: "browse-1", position: 4 })).toBe(false);
   });
 
   it("stays over held rows after a re-read cut short (K17), until a request delivers", () => {
-    const glow = afterglowOf("partial", before, at) as Afterglow;
+    const glow = afterglowOf(taken("partial", ["u:1"]), before, at) as Afterglow;
     // The re-read was cancelled: nothing delivered, the rows from before stay on screen, and so does the afterglow.
     expect(afterglowNow(glow, { deliveredRequest: null, position: 3 })).toBe(glow);
     expect(afterglowNow(glow, { deliveredRequest: "browse-9", position: 3 })).toBeNull(); // the user's Refresh
   });
 
   it("is never drawn again once it went (a later load delivers nothing for a while)", () => {
-    let glow: Afterglow | null = afterglowOf("committed", before, at);
+    let glow: Afterglow | null = afterglowOf(taken("committed"), before, at);
     const seen: boolean[] = [];
     for (const deliveredRequest of ["browse-1", null, "browse-2", null, "browse-1"]) {
       glow = afterglowNow(glow, { deliveredRequest, position: 3 });
@@ -267,7 +288,7 @@ describe("the afterglow: the staging from before a commit, until the re-read is 
   });
 
   it("starts after a browse that had delivered nothing (rows kept after a cancelled Refresh)", () => {
-    const glow = afterglowOf("committed", before, { deliveredRequest: null, position: 3 }) as Afterglow;
+    const glow = afterglowOf(taken("committed"), before, { deliveredRequest: null, position: 3 }) as Afterglow;
     expect(afterglowHolds(glow, { deliveredRequest: null, position: 3 })).toBe(true);
     expect(afterglowHolds(glow, { deliveredRequest: "browse-2", position: 3 })).toBe(false);
   });
@@ -592,5 +613,9 @@ describe("the applying dialog (pre-flight M1, M2, ruling K11)", () => {
     expect(applyingView({ ...waiting, counted: 3, quietMs: OUTCOME_WAIT_MS }).closeUnknown).toBe(true);
     expect(applyingView({ ...waiting, counted: 3, quietMs: OUTCOME_WAIT_MS - 1 }).closeUnknown).toBe(false);
     expect(applyingView({ ...waiting, quietMs: OUTCOME_WAIT_MS, sinceCancelMs: OUTCOME_WAIT_MS }).closeUnknown).toBe(true);
+  });
+
+  it("says Committing… with nothing to cancel or close while the apply waits for its save, before it is sent", () => {
+    expect(SENDING_VIEW).toEqual({ progress: "Committing…", canCancel: false, closeUnknown: false });
   });
 });

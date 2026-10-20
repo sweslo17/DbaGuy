@@ -17,6 +17,7 @@ import {
   closable,
   commitBlocked,
   commitStep,
+  isSent,
   NO_CHANGES,
   NOT_SHOWN,
   nextSqlModeRefusals,
@@ -26,14 +27,16 @@ import {
   previewing,
   refreshBy,
   resultStep,
+  sentStep,
   type Afterglow,
-  type ApplyingStep,
   type BrowseNow,
   type CommitDialogState,
+  type SentStep,
 } from "./commitDialog";
 import {
   abandonedCommit,
   commitState,
+  NOT_SENT_OUTCOME,
   NOT_SENT_REPORT,
   problemsOf,
   rerunAfter,
@@ -47,6 +50,30 @@ import { editsErrorMessage, previewEdits } from "./editsApi";
 import { PreviewDialog } from "./PreviewDialog";
 import { changeCount, stagingOf, toChanges } from "./staging";
 import type { TableEdits } from "./useTableEdits";
+
+/**
+ * How long Commit waits for the "applying" save before it sends the apply anyway (H1): without the wait, a hard kill
+ * between the click and that save restores the staging as unsent, and the next Commit inserts its new rows twice. A
+ * save that fails or takes longer does not stop the commit (the user asked for it; the writer retries the save).
+ */
+const APPLYING_SAVE_WAIT_MS = 2_000;
+
+/** Saves the workspace with the staging "applying" (H1), giving up on waiting after APPLYING_SAVE_WAIT_MS. */
+async function savedBeforeSending(): Promise<void> {
+  let timer = 0;
+  const waited = new Promise<"timeout">((resolve) => {
+    timer = window.setTimeout(() => resolve("timeout"), APPLYING_SAVE_WAIT_MS);
+  });
+  try {
+    const saved = await Promise.race([saveWorkspaceNow("A grid commit is being sent"), waited]);
+    if (saved !== true) {
+      const why = saved === "timeout" ? `took over ${APPLYING_SAVE_WAIT_MS} ms` : "failed";
+      console.warn(`Grid edits: saving the workspace before the commit ${why}; sending the commit anyway`);
+    }
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
 
 /*
  * Committing a table tab's staged changes (spec ⑤ §3.5, §3.6.5, R-05-6, R-05-7): ⌘S or Commit… previews them (the
@@ -234,14 +261,23 @@ export function useCommit(input: CommitInput): Commit {
     }
     const paused = browseWasPaused(browse.execution);
     holder.setAfterglow(null); // the last commit's: this apply takes over
-    // H1: unknown until its outcome arrives, and saved so at once: a reload, crash or quit meanwhile restores it as
-    // unknown, never as unsent (Commit would send it again: new rows twice).
+    // H1: unknown until its outcome arrives, and saved so before it is sent: a reload, crash or quit meanwhile restores
+    // it as unknown, never as unsent (Commit would send it again: new rows twice). The dialog says "Committing…" and
+    // the staging is locked from here (the step is "applying"), so a second click lands on nothing.
     dispatchStaged(tab.id, { type: "applying" });
-    saveWorkspaceNow("A grid commit is being sent");
-    applyController.current = session;
-    const requestId = session.applyEdits(step.planId);
-    console.info(`Grid edits: applying ${current.preview.statements.length} statement(s)`);
-    holder.setDialog(applyingStep(current, requestId, paused));
+    const saving = applyingStep(current, paused);
+    holder.setDialog(saving);
+    void savedBeforeSending().then(() => {
+      if (holder.read() !== saving) {
+        // Nothing moves the dialog off this step meanwhile; should anything, nothing was sent, and the apply ends so.
+        dispatchStaged(tab.id, { type: "applyOutcome", outcome: NOT_SENT_OUTCOME });
+        return;
+      }
+      applyController.current = session;
+      const requestId = session.applyEdits(step.planId);
+      console.info(`Grid edits: applying ${current.preview.statements.length} statement(s)`);
+      holder.setDialog(sentStep(saving, requestId));
+    });
   };
 
   /**
@@ -249,20 +285,22 @@ export function useCommit(input: CommitInput): Commit {
    * one `applyOutcome`, a command that never left included: H1), History is read again, the apply's execution is
    * forgotten, the browse is read again when the outcome asks for it, and the dialog says what happened.
    */
-  const settle = (held: ApplyingStep, commit: SettledCommit) => {
+  const settle = (held: SentStep, commit: SettledCommit) => {
     if (settledRequest.current === held.requestId) return;
     settledRequest.current = held.requestId;
     const { browse, table } = latest.current;
     applyController.current?.forget(held.requestId);
     refreshHistory(queryClient);
+    const outcome = stagedOutcome(commit);
     if (commit.kind === "ended") {
-      // Before the staging changes: the grid keeps drawing what it drew until the re-read is in (M5). Both updates
-      // are taken in the same render (this runs in a layout effect or an event), so nothing flips back meanwhile.
-      holder.setAfterglow(afterglowOf(commit.outcome, readStagedEdits(tab.id), browse));
+      // Before the staging changes: the grid keeps drawing what it drew until the re-read is in (M5), or after an
+      // unknown outcome that took applied changes out, until the user's Refresh. Both updates are taken in the same
+      // render (this runs in a layout effect or an event), so nothing flips back meanwhile.
+      holder.setAfterglow(afterglowOf(outcome, readStagedEdits(tab.id), browse));
       if (commit.outcome === "unknown") unknownSince.current = browse.deliveredRequest;
     }
     sqlModeRefusals.current = nextSqlModeRefusals(sqlModeRefusals.current, commit);
-    dispatchStaged(tab.id, { type: "applyOutcome", outcome: stagedOutcome(commit) });
+    dispatchStaged(tab.id, { type: "applyOutcome", outcome });
     if (commit.kind === "ended" && rerunAfter(commit.outcome, held.browseWasPaused)) browse.reread();
     console.info(`Grid edits: ${commit.kind === "ended" ? commit.outcome : "not sent"}`);
     const view = outcomeView(commit, { table, counts: held.preview.counts, sqlModeRefusals: sqlModeRefusals.current });
@@ -277,7 +315,7 @@ export function useCommit(input: CommitInput): Commit {
 
   // The apply's events: once it is over, its outcome is taken. A layout effect: the afterglow and the staging change
   // in the same render (a store update and a state update made here are both rendered before the next paint).
-  const held = dialog?.step === "applying" ? dialog : null;
+  const held = dialog?.step === "applying" && isSent(dialog) ? dialog : null; // not before it is sent
   const execution = held ? (snapshot?.executions[held.requestId] ?? null) : null;
   const latestSettle = useRef(settle);
   useLayoutEffect(() => {
@@ -370,14 +408,14 @@ export function useCommit(input: CommitInput): Commit {
    */
   const closeUnknown = () => {
     const current = holder.read();
-    if (current?.step !== "applying") return;
+    if (current?.step !== "applying" || !isSent(current)) return;
     const execution = applyController.current?.store.getState().executions[current.requestId] ?? null;
     settle(current, abandonedCommit(execution, true));
   };
 
   const cancelApply = () => {
     const current = holder.read();
-    if (current?.step === "applying") applyController.current?.cancel(current.requestId);
+    if (current?.step === "applying" && isSent(current)) applyController.current?.cancel(current.requestId);
   };
 
   // The dialog's handlers keep their identity (it is memoized and renders again only when its step changes).

@@ -41,6 +41,11 @@ export const CHECKING = "Checking whether this table's rows can be edited";
 /** A target that is not editable and gives no reason. */
 export const NOT_EDITABLE = "Rows of this table cannot be edited";
 export const TOO_LARGE_TO_KEEP = "Too large to keep across a restart";
+/**
+ * Ruling K3b: the changes were beyond a limit and are kept without the UPDATEs hidden under DELETEs (a commit never
+ * sends those): after a restart, Restore brings those rows back without their edits.
+ */
+export const KEPT_WITHOUT_HIDDEN = "Kept across a restart without the edits of rows marked for deletion";
 export const KEEP_MINE_TITLE = "Check the staged values against the server's values now";
 
 /** The palette's Delete selected rows and Set NULL with nothing selected in the grid. */
@@ -412,9 +417,10 @@ export function targetView(read: TargetRead): TargetView {
   return read.failedSinceOpen ? "unlock" : "checking";
 }
 
-/** Why the staged changes are not kept across a restart (`savedEdits`, ruling K5), or null. */
+/** Why the staged changes are not kept across a restart, or not all of them (`savedEdits`, K5, K3b), or null. */
 export function notKeptHint(saved: SavedEdits): string | null {
   if (saved.tooLarge) return TOO_LARGE_TO_KEEP;
+  if (saved.withoutHidden) return KEPT_WITHOUT_HIDDEN;
   return saved.unsaveable ? UNSAVEABLE_HINT[saved.unsaveable] : null;
 }
 

@@ -17,8 +17,10 @@ import {
  * one staged set the backend refuses would fail every save and a crash would lose every tab's unsaved work (Q2, B40):
  * `savedEdits` writes only what the backend's `StagedEditsFile` takes, and a set beyond its limits, or one it would
  * refuse, not at all (the edit bar then says it will not survive a restart, and why). The staging itself stays in
- * memory as it is and can still be committed: only keeping it across a restart is skipped. The undo history and the
- * last preview's problems are never kept.
+ * memory as it is and can still be committed: only keeping it across a restart is skipped. A set beyond a limit is
+ * written without the UPDATEs hidden under DELETEs when that fits (ruling K3b): a commit never sends them (the DELETE
+ * is what it sends, and that is kept), so only Restore of those rows' edits is lost after a restart, and the edit bar
+ * says so. The undo history and the last preview's problems are never kept.
  *
  * Everything is judged as the backend judges it (`domain/edits.py`): a set the frontend writes must be one the backend
  * keeps, or the repair drops it unseen (pre-flight M3, ruling K5).
@@ -54,10 +56,14 @@ export type Unsaveable = "value" | "name" | "other";
 /** Why nothing is kept for a tab: `savedEdits` gives it as `tooLarge` or `unsaveable`. */
 type NotKept = "too_large" | Unsaveable;
 
-/** `tooLarge`: beyond a limit. `unsaveable`: the backend would refuse them (set only when `tooLarge` is false). */
+/**
+ * `tooLarge`: beyond a limit. `unsaveable`: the backend would refuse them (set only when `tooLarge` is false).
+ * `withoutHidden`: the changes were beyond a limit, and `file` holds them without the UPDATEs hidden under DELETEs
+ * (ruling K3b).
+ */
 export type SavedEdits =
-  | { file: StagedEditsFile; tooLarge: false; unsaveable: null }
-  | { file: null; tooLarge: boolean; unsaveable: Unsaveable | null };
+  | { file: StagedEditsFile; tooLarge: false; unsaveable: null; withoutHidden?: true }
+  | { file: null; tooLarge: boolean; unsaveable: Unsaveable | null; withoutHidden?: never };
 
 /** What the edit bar says when `unsaveable` is set (for `tooLarge` it says "Too large to keep across a restart"). */
 export const UNSAVEABLE_HINT: Readonly<Record<Unsaveable, string>> = {
@@ -183,15 +189,30 @@ function measure(keyColumns: readonly string[], { updates, inserts, deletes }: C
 
 function build(staged: StagedEdits): SavedEdits {
   const updates = bySeq(Object.values(staged.updates));
-  const inserts = bySeq(staged.inserts);
-  const deletes = bySeq(Object.values(staged.deletes));
-  // Every entry counts, an UPDATE under its row's DELETE included (ruling K3: it is kept so Restore brings it back).
-  const entries = updates.length + inserts.length + deletes.length;
-  if (entries === 0 && staged.unknownOutcome === null) return NOTHING;
-  if (entries > MAX_CHANGES) return NOT_KEPT.too_large;
-  const total = measure(staged.keyColumns, { updates, inserts, deletes });
+  const changes = { updates, inserts: bySeq(staged.inserts), deletes: bySeq(Object.values(staged.deletes)) };
+  if (entriesOf(changes) === 0 && staged.unknownOutcome === null) return NOTHING;
+  // Every entry counts, an UPDATE under its row's DELETE included (ruling K3: it is kept so Restore brings it back) …
+  const all = written(staged, changes);
+  if (!all.tooLarge) return all;
+  // … unless that is beyond a limit: then without those UPDATEs, when that fits (ruling K3b); still beyond, not kept.
+  const hidden = new Set<StagedUpdate>();
+  for (const [rowKey, update] of Object.entries(staged.updates)) {
+    if (Object.hasOwn(staged.deletes, rowKey)) hidden.add(update);
+  }
+  if (hidden.size === 0) return all;
+  const shown = written(staged, { ...changes, updates: updates.filter((update) => !hidden.has(update)) });
+  return shown.file ? { ...shown, withoutHidden: true } : all;
+}
+
+const entriesOf = ({ updates, inserts, deletes }: Changes) => updates.length + inserts.length + deletes.length;
+
+/** The file of these changes, or why it is not kept. */
+function written(staged: StagedEdits, changes: Changes): SavedEdits {
+  if (entriesOf(changes) > MAX_CHANGES) return NOT_KEPT.too_large;
+  const total = measure(staged.keyColumns, changes);
   if (typeof total === "string") return NOT_KEPT[total];
   if (total > MAX_SAVED_CHARS) return NOT_KEPT.too_large;
+  const { updates, inserts, deletes } = changes;
   return {
     tooLarge: false,
     unsaveable: null,

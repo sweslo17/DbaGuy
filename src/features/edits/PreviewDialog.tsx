@@ -19,6 +19,7 @@ import type { SessionSnapshot } from "../session/SessionController";
 import {
   applyingView,
   BUILDING,
+  COMMITTING,
   countParts,
   failedPlace,
   hasPreview,
@@ -29,8 +30,10 @@ import {
   PROBLEMS_INTRO,
   previewLists,
   rowLabel,
+  SENDING_VIEW,
   statementLayout,
   TRANSACTIONAL_NOTE,
+  type ApplyingView,
   type CommitDialogState,
   type FailedPlace,
   type StatementLayout,
@@ -142,6 +145,10 @@ function ApplyProgress({
   const counted = useStore(store, (s) => s.executions[requestId]?.affected.length ?? 0);
   const warning = useStore(store, (s) => lastWarning(s.executions[requestId]?.messages ?? []));
   const { progress } = applyingView({ phase: "open", counted, statements, quietMs: 0, sinceCancelMs: null });
+  return <ProgressLines progress={progress} warning={warning} />;
+}
+
+function ProgressLines({ progress, warning }: { progress: string; warning: string | null }) {
   return (
     <div className="flex flex-col gap-1" aria-live="polite">
       <p className="flex items-center gap-2">
@@ -207,23 +214,38 @@ function ApplyingFooter({
     quietMs: Math.max(0, now - lastEventAt),
     sinceCancelMs: cancelAt === null ? null : Math.max(0, now - cancelAt),
   });
+  const cancel = () => {
+    if (cancelAt === null) setCancelAt(Date.now());
+    onCancel();
+  };
+  return <ApplyingButtons view={view} red={red} onCancel={cancel} onCloseUnknown={onCloseUnknown} />;
+}
+
+/**
+ * The applying footer's buttons: the same while the apply waits for its "applying" save (`SENDING_VIEW`: nothing to
+ * cancel yet), so the dialog does not change between that and sending it, and a double click stays on "Committing…".
+ */
+function ApplyingButtons({
+  view,
+  red,
+  onCancel,
+  onCloseUnknown,
+}: {
+  view: ApplyingView;
+  red: boolean;
+  onCancel?: () => void;
+  onCloseUnknown?: () => void;
+}) {
   return (
     <>
       <div className="mr-auto flex items-center gap-2">
-        <Button
-          variant="ghost"
-          onClick={() => {
-            if (cancelAt === null) setCancelAt(Date.now());
-            onCancel();
-          }}
-          disabled={!view.canCancel}
-        >
+        <Button variant="ghost" onClick={onCancel} disabled={!view.canCancel}>
           Cancel
         </Button>
         {view.closeUnknown && <Button onClick={onCloseUnknown}>{CLOSE_UNKNOWN_LABEL}</Button>}
       </div>
       <Button variant={red ? "danger" : "primary"} disabled>
-        Committing…
+        {COMMITTING}
       </Button>
     </>
   );
@@ -320,7 +342,7 @@ function PreviewDialogView(props: PreviewDialogProps) {
           </Button>
         );
       case "applying":
-        return store ? (
+        return store && state.requestId !== null ? (
           <ApplyingFooter
             store={store}
             requestId={state.requestId}
@@ -329,7 +351,9 @@ function PreviewDialogView(props: PreviewDialogProps) {
             onCancel={props.onCancelApply}
             onCloseUnknown={props.onCloseUnknown}
           />
-        ) : null;
+        ) : (
+          <ApplyingButtons view={SENDING_VIEW} red={red} />
+        );
       case "result":
         return (
           <>
@@ -424,7 +448,12 @@ function PreviewDialogView(props: PreviewDialogProps) {
         {state.step === "preview" && state.preview.plan_id && lists && (
           <p className="text-muted">{lists.transactional ? TRANSACTIONAL_NOTE : NON_TRANSACTIONAL_NOTE}</p>
         )}
-        {applying && store && <ApplyProgress store={store} requestId={state.requestId} statements={statements} />}
+        {applying &&
+          (store && state.requestId !== null ? (
+            <ApplyProgress store={store} requestId={state.requestId} statements={statements} />
+          ) : (
+            <ProgressLines progress={SENDING_VIEW.progress} warning={null} />
+          ))}
         {state.step === "result" && (
           <div className="flex flex-col gap-1" data-selectable>
             <p className={cn("text-[13px] font-semibold", TONES[state.report.tone])}>{state.report.title}</p>

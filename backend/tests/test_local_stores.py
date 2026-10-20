@@ -1,10 +1,11 @@
 import json
 import os
 from pathlib import Path
+from typing import Annotated
 
 import pytest
 from loguru import logger
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError, WrapValidator
 
 from dbaguy_backend.domain.edits import MAX_STAGED_CHARS, MAX_VALUE_CHARS, StagedEditsFile
 from dbaguy_backend.domain.errors import AlreadyExists, NotFound, StorageError, ValidationFailed
@@ -15,7 +16,7 @@ from dbaguy_backend.domain.workspace import WorkspaceState, WorkspaceTab
 from dbaguy_backend.services import scripts_service
 from dbaguy_backend.services.scripts_service import ScriptsService
 from dbaguy_backend.services.settings_service import SettingsService
-from dbaguy_backend.services.workspace_service import WorkspaceService, repaired_workspace
+from dbaguy_backend.services.workspace_service import WorkspaceService, repaired_workspace, validated_workspace
 from dbaguy_backend.storage.atomic_file import atomic_text_file
 from dbaguy_backend.storage.json_files import JsonDocument, write_text_atomic
 
@@ -783,16 +784,40 @@ def test_staged_keys_count_their_column_names():  # pre-flight M3
 
 # ---- what the model refuses beyond size (ruling K5): the frontend's `savedEdits` must write only what it takes ----
 # `fixtures/staged_edits_cases.json` is read by this test and by `savedEdits.test.ts`: the same files go through both,
-# so what one side keeps the other takes and what one side refuses the other refuses. Size is not in it (it has its own
-# boundary tests above and in `savedEdits.test.ts`); an update that sets nothing, a repeated id, a name of 0 or 1,025
-# characters, a lone surrogate (a text that is not valid Unicode) and a cell nested 255 levels are.
-STAGED_CASES = json.loads((Path(__file__).parent / "fixtures" / "staged_edits_cases.json").read_text())
+# so what one side keeps the other takes and what one side refuses the other refuses. Size is mostly not in it (it has
+# its own boundary tests above and in `savedEdits.test.ts`); an update that sets nothing, a repeated id, a name of 0 or
+# 1,025 characters, a lone surrogate (a text that is not valid Unicode) and a cell nested 255 levels are. So are the
+# sets beyond a limit that the frontend writes without the UPDATEs hidden under DELETEs (ruling K3b,
+# `kept_without_hidden`: the file it writes instead, which the model must take; null when it writes none).
+# `{"$repeat": n, "item": ...}` in a list stands for n copies of the item, with `{n}` in its strings replaced by 1...n
+# (`savedEdits.test.ts` reads it the same way), so a file beyond 10,000 entries or 8 MiB stays small.
+def _expanded(value, n=None):
+    if isinstance(value, str):
+        return value if n is None else value.replace("{n}", str(n))
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            if isinstance(item, dict) and "$repeat" in item:
+                items.extend(_expanded(item["item"], i) for i in range(1, item["$repeat"] + 1))
+            else:
+                items.append(_expanded(item, n))
+        return items
+    if isinstance(value, dict):
+        return {name: _expanded(item, n) for name, item in value.items()}
+    return value
+
+
+STAGED_CASES = _expanded(json.loads((Path(__file__).parent / "fixtures" / "staged_edits_cases.json").read_text()))
 
 
 def test_the_staged_edits_cases_cover_what_they_claim():
     assert len({case["name"] for case in STAGED_CASES}) == len(STAGED_CASES)
-    assert {case["reason"] for case in STAGED_CASES} == {None, "value", "name", "other"}
+    assert {case["reason"] for case in STAGED_CASES} == {None, "value", "name", "other", "too_large"}
     assert {case["accepted"] for case in STAGED_CASES} == {True, False}
+    reduced = [case["kept_without_hidden"] for case in STAGED_CASES if "kept_without_hidden" in case]
+    assert any(file is None for file in reduced) and any(file is not None for file in reduced)
+    counted = next(case for case in STAGED_CASES if "10,000" in case["name"])
+    assert len(counted["file"]["deletes"]) == 5_001  # the shorthand was read
 
 
 @pytest.mark.parametrize("case", STAGED_CASES, ids=lambda case: case["name"])
@@ -802,6 +827,11 @@ def test_the_staged_edits_model_refuses_exactly_what_the_frontend_does_not_write
     else:
         with pytest.raises(ValidationError):
             StagedEditsFile.model_validate(case["file"])
+    if case.get("kept_without_hidden"):  # K3b: what the frontend writes instead is taken, every change of it
+        reduced = case["kept_without_hidden"]
+        taken = StagedEditsFile.model_validate(reduced)
+        assert [len(taken.updates), len(taken.inserts), len(taken.deletes), taken.outcome_unknown] == [
+            len(reduced["updates"]), len(reduced["inserts"]), len(reduced["deletes"]), reduced["outcome_unknown"]]
 
 
 @pytest.mark.parametrize("case", STAGED_CASES, ids=lambda case: case["name"])
@@ -811,6 +841,10 @@ def test_the_repair_drops_what_the_model_refuses_and_keeps_the_rest(case):  # th
     query, table = WorkspaceState.model_validate(repaired_workspace(raw)).tabs
     assert query.buffer == "kept" and table.title == "orders"
     assert (table.staged_edits is not None) == case["accepted"]
+    if case.get("kept_without_hidden"):  # K3b: the file the frontend writes instead is kept
+        raw["tabs"][1]["staged_edits"] = case["kept_without_hidden"]
+        kept = WorkspaceState.model_validate(repaired_workspace(raw)).tabs[1].staged_edits
+        assert kept is not None and len(kept.deletes) == len(case["kept_without_hidden"]["deletes"])
 
 
 # ---- ruling K7: a lone surrogate in a tab's text must never fail the save of every tab ----
@@ -869,3 +903,75 @@ def test_the_change_limit_says_what_is_done_with_the_changes():
         EditChanges.model_validate({"inserts": many})
     with pytest.raises(ValidationError, match="at most 10,000 changes are kept at once"):
         WorkspaceTab(id="t", kind="table", staged_edits=staged_edits(inserts=many, updates=[], deletes=[]))
+
+
+# ---- `PUT /workspace` validates once (the fix wave's follow-up to L18): repaired and validated again only when the
+# model refuses the body, with what is kept and every WARNING as when every save was repaired first ----
+PUT_BODY = TypeAdapter(Annotated[WorkspaceState, WrapValidator(validated_workspace)])  # as `api/workspace.py` has it
+BROKEN = "\ud800"
+
+
+def nested_list(levels):
+    cell = 1
+    for _ in range(levels):
+        cell = [cell]
+    return cell
+
+SAVES = {
+    "plain": {"tabs": [{"id": "q", "kind": "query", "buffer": "kept"},
+                       {"id": "t", "kind": "table", "title": "orders", "object_path": STAGED_PATH,
+                        "staged_edits": staged_edits()}], "active_tab_id": "t"},
+    "a lone surrogate in a text (K7)": {"tabs": [{"id": "q", "kind": "query", "title": f"t{BROKEN}",
+                                                   "buffer": f"a{BROKEN}b", "params": {"$a": f"x{BROKEN}"}}],
+                                        "sidebar_tab": f"s{BROKEN}"},
+    "a refused staged set beside a good one (H14)": {"tabs": [
+        {"id": "t1", "kind": "table", "title": "bad", "staged_edits": staged_edits(key_columns=[])},
+        {"id": "t2", "kind": "table", "title": "good", "staged_edits": staged_edits()}]},
+    "a staged set nested beyond the cap": {"tabs": [
+        {"id": "t", "kind": "table", "staged_edits": staged_edits(
+            updates=[], inserts=[], deletes=[{"id": "d:1", "key": {"id": nested_list(65)}}])}]},
+    "everything at once in one tab": {"tabs": [
+        {"id": "t", "kind": "table", "title": f"o{BROKEN}", "params": {"bad name": "x"},
+         "staged_edits": staged_edits(updates=[{"id": "u:1", "key": {"id": BROKEN}, "set": {"a": {"kind": "null"}},
+                                                "original": {"a": 1}}])},
+        {"id": "d", "kind": "document", "document_cas": "12ab", "query_context": {"bucket": ""}},
+        {"id": "q", "kind": "query", "staged_edits": staged_edits()}]},
+    "a tab no repair can save": {"tabs": [{"id": "x", "kind": "chart"}, {"id": "q", "kind": "query", "title": BROKEN}]},
+}
+
+
+@pytest.mark.parametrize("raw", SAVES.values(), ids=SAVES.keys())
+def test_a_save_keeps_and_says_what_repairing_every_save_first_did(raw, logged_warnings):
+    try:
+        expected = WorkspaceState.model_validate(repaired_workspace(raw))
+    except ValidationError:
+        expected = None
+    said = list(logged_warnings)
+    logged_warnings.clear()
+    if expected is None:
+        with pytest.raises(ValidationError):
+            PUT_BODY.validate_python(raw)
+    else:
+        assert PUT_BODY.validate_python(raw).model_dump() == expected.model_dump()
+    assert logged_warnings == said
+
+
+@pytest.mark.parametrize("case", STAGED_CASES, ids=lambda case: case["name"])
+def test_a_save_of_each_staged_edits_case_keeps_what_the_repair_kept(case):
+    raw = {"tabs": [{"id": "q", "kind": "query", "buffer": "kept"},
+                    {"id": "t", "kind": "table", "title": "orders", "staged_edits": case["file"]}]}
+    assert PUT_BODY.validate_python(raw).model_dump() == WorkspaceState.model_validate(
+        repaired_workspace(raw)).model_dump()
+
+
+def test_a_save_validates_its_staged_edits_once(monkeypatch):
+    from dbaguy_backend.domain import edits
+    counted = []
+    measured = edits._text_chars
+    monkeypatch.setattr(edits, "_text_chars", lambda *changes: counted.append(1) or measured(*changes))
+    raw = SAVES["plain"]
+    assert PUT_BODY.validate_python(raw).tabs[1].staged_edits is not None
+    assert len(counted) == 1
+    counted.clear()
+    WorkspaceState.model_validate(repaired_workspace(raw))  # how every save was validated before: twice
+    assert len(counted) == 2
