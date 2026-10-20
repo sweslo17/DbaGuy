@@ -10,7 +10,7 @@ from loguru import logger
 from ..domain.classification import Classification, DangerReason, StatementKind
 from .dialects import KEYWORD_ONLY_DIALECTS, Dialect
 from .lexer import (
-    HINT_COMMENT_START, INSIGNIFICANT, VERSION_COMMENT_STARTS, Token, TokenKind, tokenize, with_ascii_spaces,
+    HINT_COMMENT_START, INSIGNIFICANT, VERSION_COMMENT_STARTS, Token, TokenKind, scan, tokenize, with_ascii_spaces,
 )
 from .splitter import split
 from .tsql import statements
@@ -150,6 +150,12 @@ _SQLPP_KIND: dict[str, StatementKind] = {
 _SELECT_FAMILY = ("SELECT", "WITH")
 _SQLPP_SELECT_FIRST = (*_SELECT_FAMILY, "FROM")  # the words a SQL++ select starts with (T-SQL has no FROM-first)
 _DML_WORDS = frozenset({"INSERT", "UPDATE", "DELETE", "MERGE"})  # the statements that write rows, in every dialect
+# D-06-4: an INSERT longer than this is judged by its first word alone. sqlglot answers WRITE without a reason for every
+# INSERT (ON CONFLICT, ON DUPLICATE KEY, INSERT … SELECT, REPLACE INTO included; A X1) — the keyword rules' answer — but
+# parses a 1,000-row INSERT in 150–210 ms with a memory peak of about 113 times its text (10 MB: about 1.1 GB).
+LARGE_INSERT_CHARS = 64 * 1024
+_BULK_INSERT_WORDS: dict[Dialect, frozenset[str]] = {Dialect.MYSQL: frozenset({"INSERT", "REPLACE"})}
+_INSERT_WORDS = frozenset({"INSERT"})
 _SQLPP_DML = _DML_WORDS | {"UPSERT"}
 _SQLPP_SEQUENCE_ADVANCE = (("NEXT", "VALUE", "FOR"), ("NEXTVAL", "FOR"))  # PREV VALUE FOR only reads
 _SQLPP_FILTERS = (("WHERE",), ("USE", "KEYS"), ("ON", "KEYS"))  # a statement given its documents is targeted
@@ -494,8 +500,29 @@ def _classify_statement(sql: str, dialect: Dialect, has_body: bool = False) -> C
     return _classify_single(sql, dialect, has_body)
 
 
+def _bulk_insert(sql: str, dialect: Dialect) -> bool:
+    """`sql` is one INSERT (MySQL: or REPLACE), read lazily (never a token list: D-06-3's concern too). An executable
+    comment anywhere, or a second statement after a `;`, leaves it to the full rules."""
+    words = _BULK_INSERT_WORDS.get(dialect, _INSERT_WORDS)
+    first, ended = True, False
+    for token in scan(sql, dialect):
+        if token.kind in INSIGNIFICANT:
+            continue
+        if token.kind == TokenKind.EXEC_COMMENT or ended:
+            return False
+        if first:
+            if token.kind != TokenKind.WORD or token.upper not in words:
+                return False
+            first = False
+        elif token.kind == TokenKind.SEMI:
+            ended = True
+    return not first
+
+
 def _classify_single(sql: str, dialect: Dialect, has_body: bool = False) -> Classification:
     """One statement; `has_body`: it holds a routine or trigger body."""
+    if dialect is not Dialect.SQLPP and len(sql) > LARGE_INSERT_CHARS and _bulk_insert(sql, dialect):
+        return Classification(kind=StatementKind.WRITE)  # what the keyword rules and sqlglot both say (D-06-4)
     tokens = tokenize(sql, dialect)
     if dialect is Dialect.SQLPP:
         return _classify_sqlpp(tokens)  # keyword rules only: no version comments, no sqlglot, no EXPLAIN ANALYZE

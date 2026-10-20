@@ -871,3 +871,63 @@ def test_tsql_unfiltered_dml_is_unchanged():  # the helper was generalised for S
     # a CTE named like a SQL++ statement word is still a CTE, and USE KEYS is no T-SQL filter
     for sql in ("WITH upsert AS (SELECT 1 AS id) DELETE FROM t", "DELETE FROM t OUTPUT deleted.* USE KEYS"):
         assert classify(sql, Dialect.TSQL).dangerous_reasons == [D.DELETE_WITHOUT_WHERE]
+
+
+# --- D-06-4: a large INSERT is judged by its first word ---------------------------------------------------------------
+
+_ROWS = ", ".join(f"({i}, 'name {i} it''s', {i}.5, NULL)" for i in range(2_000))  # about 64 KiB and more
+LARGE_INSERTS = [
+    (PG, f"INSERT INTO t (a, b, c, d) VALUES {_ROWS}"),
+    (PG, f"INSERT INTO t (a, b, c, d) VALUES {_ROWS} ON CONFLICT (a) DO UPDATE SET b = excluded.b"),
+    (MY, f"INSERT INTO t (a, b, c, d) VALUES {_ROWS} ON DUPLICATE KEY UPDATE b = VALUES(b)"),
+    (MY, f"REPLACE INTO t (a, b, c, d) VALUES {_ROWS}"),
+    (LITE, f"INSERT OR ABORT INTO t (a, b, c, d) VALUES {_ROWS}"),
+    (Dialect.TSQL, f"INSERT INTO dbo.t (a, b, c, d) VALUES {_ROWS}"),
+    (PG, f"INSERT INTO t SELECT * FROM u WHERE b IN ({_ROWS.replace('NULL', '0')})"),
+]
+
+
+@pytest.mark.parametrize(("dialect", "sql"), LARGE_INSERTS)
+def test_a_large_insert_gets_the_answer_sqlglot_gives(monkeypatch, dialect, sql):
+    assert len(sql) > classifier.LARGE_INSERT_CHARS
+    capped = classify(sql, dialect)
+    monkeypatch.setattr(classifier, "LARGE_INSERT_CHARS", 10**12)
+    assert classify(sql, dialect) == capped == Classification(kind=K.WRITE)
+
+
+def test_a_large_insert_never_hides_a_second_statement():
+    drop = f"DELIMITER $$\nINSERT INTO t VALUES {_ROWS}; DROP TABLE t$$"  # one span under the custom delimiter
+    result = classify(drop, MY)
+    assert (result.kind, result.dangerous_reasons) == (K.DDL, [DangerReason.DROP])
+    hinted = f"INSERT /*+ SET_VAR(sort_buffer_size = 16M) */ INTO t VALUES {_ROWS}"  # an executable comment: full rules
+    assert classify(hinted, MY).kind == K.WRITE
+    versioned = f"/*!40000 INSERT INTO t VALUES {_ROWS} */"
+    assert classify(versioned, MY).kind == K.UNKNOWN
+
+
+def test_a_large_insert_is_classified_without_its_tokens_in_memory():
+    import tracemalloc
+
+    sql = f"INSERT INTO t (a, b, c, d) VALUES {', '.join([_ROWS] * 8)}"  # about 0.6 MB
+    tracemalloc.start()
+    try:
+        assert classify(sql, PG) == Classification(kind=K.WRITE)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 4 * len(sql), f"peak {peak:,} bytes for a {len(sql):,}-character INSERT"  # sqlglot: about 113 times
+
+
+def test_a_large_insert_with_an_executable_comment_after_its_first_word_is_judged_by_the_full_rules():
+    versioned = f"INSERT INTO t VALUES {_ROWS} /*!50000 ON DUPLICATE KEY UPDATE b = 1 */"
+    assert len(versioned) > classifier.LARGE_INSERT_CHARS
+    assert classify(versioned, MY).kind == K.UNKNOWN
+
+
+def test_only_an_insert_takes_the_shortcut():
+    filler = "/* " + "x" * (classifier.LARGE_INSERT_CHARS + 10) + " */"  # long text inside the statement, not a row
+    assert classify(f"DELETE {filler} FROM t", PG).dangerous_reasons == [DangerReason.DELETE_WITHOUT_WHERE]
+    assert classify(f"UPDATE {filler} t SET a = 1", PG).dangerous_reasons == [DangerReason.UPDATE_WITHOUT_WHERE]
+    assert classify(f"SELECT {filler} 1", PG).kind == K.READ
+    for dialect in (PG, MY, LITE, Dialect.TSQL):  # nothing to judge is not a write
+        assert classify(filler + "\n" * 10, dialect).kind != K.WRITE, dialect
