@@ -6,6 +6,7 @@ import {
   rowKeyFromKey,
   stage,
   toChanges,
+  UNDO_CELLS,
   UNDO_LIMIT,
   type AppliedOutcome,
   type LoadedRowRef,
@@ -13,6 +14,7 @@ import {
   type StageAction,
   type StagedEdits,
 } from "./staging";
+import { NULL_INPUT } from "./cells";
 import { NOT_SENT_OUTCOME } from "./commitFlow";
 
 /*
@@ -386,6 +388,137 @@ describe("undo and redo", () => {
     const middle = stage(stage(back, { type: "undo" }), { type: "redo" });
     expect(middle.updates).toBe(back.updates);
     expect(middle.deletes).toEqual({});
+  });
+});
+
+describe("the undo history's weight (ruling K22)", () => {
+  const sum = (cells: readonly number[]) => cells.reduce((total, weight) => total + weight, 0);
+  const ROWS = Array.from({ length: 10_000 }, (_, i) => row(i + 1));
+  const COLUMNS = Array.from({ length: 29 }, (_, i) => `c${i + 1}`);
+  const columnCells = (column: string) => ROWS.map((r) => ({ row: r, column, original: "v" }));
+  /** ⌥⌘N over 10,000 rows, column by column (c1…c29): each step makes 10,000 UPDATEs one column wider. */
+  const mass = () => {
+    const newId = counter();
+    return COLUMNS.reduce(
+      (state, column) => stage(state, { type: "setNull", cells: columnCells(column) }, newId),
+      emptyStaged(["id"]),
+    );
+  };
+
+  it("weighs each step: the map entries the action copied, and each change it made with its entries", () => {
+    const state = run(
+      { type: "edit", cell: { row: row(1), column: "a", original: 1 }, input: value("2") }, // 0 + (1 + 1 + 1)
+      { type: "edit", cell: { row: row(1), column: "b", original: 1 }, input: value("2") }, // 1 + (1 + 2 + 2)
+      { type: "deleteRows", rows: [row(2)] }, // 1 + 1
+      { type: "addRow", id: "i:x" }, // 2 + (1 + 0)
+      { type: "revertCells", cells: [{ row: row(1), column: "a" }, { row: row(1), column: "b" }] }, // 3 + 0
+      { type: "discardAll" }, // makes nothing
+    );
+    expect(state.pastCells).toEqual([3, 6, 2, 3, 3, 0]);
+    expect(state.past).toHaveLength(6);
+    // The weight goes with its step: to the redo list and back.
+    const back = stage(stage(state, { type: "undo" }), { type: "undo" });
+    expect(back).toMatchObject({ pastCells: [3, 6, 2, 3], futureCells: [3, 0] });
+    const again = stage(back, { type: "redo" });
+    expect(again).toMatchObject({ pastCells: [3, 6, 2, 3, 3], futureCells: [0] });
+    const edited = stage(again, { type: "edit", cell: { row: row(9), column: "a", original: 1 }, input: value("2") });
+    expect(edited).toMatchObject({ pastCells: [3, 6, 2, 3, 3, 5], futureCells: [], future: [] }); // 2 + (1 + 1 + 1)
+  });
+
+  it(`keeps all ${UNDO_LIMIT} steps of editing cells one by one at 10,000 staged changes of 29 columns`, () => {
+    const wide = mass();
+    expect(changeCount(wide)).toBe(10_000);
+    const newId = counter();
+    let state = wide;
+    for (let i = 0; i < UNDO_LIMIT; i += 1) {
+      const cell = { row: ROWS[i * 37], column: "c1", original: null };
+      state = stage(state, { type: "edit", cell, input: value(`x${i}`) }, newId);
+    }
+    expect(state.past).toHaveLength(UNDO_LIMIT);
+    expect(sum(state.pastCells)).toBeLessThanOrEqual(UNDO_CELLS);
+    for (let i = 0; i < UNDO_LIMIT; i += 1) state = stage(state, { type: "undo" });
+    expect(state.updates).toBe(wide.updates); // every one of them undone, back to the 29 columns
+    expect(stage(state, { type: "undo" })).toBe(state); // the mass steps went to make room
+  });
+
+  it("after actions over 10,000 rows keeps only the last few, and undoes and redoes those", () => {
+    const state = mass();
+    // ⌥⌘N on the k-th column: 10,000 entries copied (none for the first) + 10,000 × (1 + k + k)
+    expect(state.pastCells).toEqual([560_000, 580_000, 600_000]);
+    let back = state;
+    for (let i = 0; i < 3; i += 1) back = stage(back, { type: "undo" });
+    expect(stage(back, { type: "undo" })).toBe(back);
+    expect(Object.keys(Object.values(back.updates)[0].set)).toHaveLength(26);
+    let forward = back;
+    for (let i = 0; i < 3; i += 1) forward = stage(forward, { type: "redo" });
+    expect(forward.updates).toBe(state.updates);
+    expect(forward.pastCells).toEqual(state.pastCells);
+  });
+
+  it("keeps steps that weigh exactly as much as the history may: ⌥⌘N and Revert on one column, 50 times each", () => {
+    // ⌥⌘N: no entry copied (Revert left none) + 10,000 × (1 + 1 + 1); Revert: 10,000 copied, nothing made
+    const newId = counter();
+    let state = emptyStaged(["id"]);
+    for (let i = 0; i < UNDO_LIMIT; i += 1) {
+      const cells = columnCells("c1");
+      state = stage(state, i % 2 === 0 ? { type: "setNull", cells } : { type: "revertCells", cells }, newId);
+    }
+    expect(sum(state.pastCells)).toBe(UNDO_CELLS);
+    expect(state.past).toHaveLength(UNDO_LIMIT);
+  });
+
+  it("keeps the last step even when it alone weighs more than the whole history may", () => {
+    // 10,000 UPDATEs of 100 columns each, then ⌥⌘N on a 101st: 10,000 + 10,000 × (1 + 101 + 101) cells
+    const columns = Array.from({ length: 100 }, (_, i) => `w${i}`);
+    const updates = Object.fromEntries(
+      ROWS.map((r, i) => [
+        r.rowKey,
+        {
+          id: `u:w${i}`,
+          key: r.key,
+          set: Object.fromEntries(columns.map((column) => [column, NULL_INPUT])),
+          original: Object.fromEntries(columns.map((column) => [column, "v"])),
+          seq: i,
+        },
+      ]),
+    );
+    const wide: StagedEdits = { ...emptyStaged(["id"]), updates, nextSeq: ROWS.length };
+    const edited = stage(wide, { type: "addRow", id: "i:x" });
+    const state = stage(edited, { type: "setNull", cells: columnCells("w100") });
+    expect(state.pastCells).toEqual([2_040_001]);
+    expect(state.past).toHaveLength(1); // the step before it went
+    expect(stage(state, { type: "undo" }).inserts).toBe(edited.inserts);
+  });
+
+  it("goes with the steps when an outcome clears the history", () => {
+    const state = run(
+      { type: "edit", cell: { row: row(1), column: "a", original: 1 }, input: value("2") },
+      { type: "deleteRows", rows: [row(2)] },
+      { type: "undo" },
+    );
+    expect(state).toMatchObject({ pastCells: [3], futureCells: [2] });
+    const outcome: AppliedOutcome = { outcome: "committed", applied: [], failedChange: null, message: null };
+    expect(stage(state, { type: "applyOutcome", outcome })).toMatchObject({ pastCells: [], futureCells: [] });
+  });
+
+  it("reverts a row's cells in one copy of its set and original, however many columns go (a select-all Revert)", () => {
+    const rows = ROWS.slice(0, 1_000);
+    const cells = ["a", "b", "c"].flatMap((column) => rows.map((r) => ({ row: r, column, original: 1 })));
+    const state = stage(emptyStaged(["id"]), { type: "setNull", cells }, counter());
+    const spy = vi.spyOn(Object, "fromEntries");
+    let all: StagedEdits;
+    let copies: number;
+    try {
+      all = stage(state, { type: "revertCells", cells });
+    } finally {
+      copies = spy.mock.calls.length;
+      spy.mockRestore();
+    }
+    expect(all.updates).toEqual({});
+    expect(copies).toBe(2 * rows.length);
+    const two = stage(state, { type: "revertCells", cells: cells.filter((cell) => cell.column !== "c") });
+    expect(two.updates[rows[0].rowKey]).toMatchObject({ set: { c: NULL_INPUT }, original: { c: 1 } });
+    expect(Object.keys(two.updates[rows[0].rowKey].set)).toEqual(["c"]);
   });
 });
 

@@ -8,7 +8,9 @@ import { inputMatches, NULL_INPUT, sameCell, sameInput, type CellInput } from ".
  * key the result no longer shows keeps its change. New rows are a list of their own (they have no key yet).
  *
  * Every user action is one undo step (D-05-14): `past` keeps the stagings before it (at most UNDO_LIMIT), sharing every
- * change it did not touch, so an untouched change keeps its object (the overlay's cache, and so Q1, rely on it).
+ * change it did not touch, so an untouched change keeps its object (the overlay's cache, and so Q1, rely on it). Each
+ * step weighs what its action made, in cells (ruling K22): the history holds at most UNDO_CELLS of them, so actions
+ * over 10,000 rows keep only the last few steps, while editing cells one by one keeps all UNDO_LIMIT.
  *
  * Column names are looked up as own properties only (`own`): a table may have a column named `constructor` or
  * `__proto__`, which a plain lookup would find on the object's prototype.
@@ -18,6 +20,14 @@ import { inputMatches, NULL_INPUT, sameCell, sameInput, type CellInput } from ".
 export const MAX_CHANGES = 10_000;
 /** D-05-14: undo steps kept (memory only). */
 export const UNDO_LIMIT = 100;
+/**
+ * Ruling K22: the cells all undo steps weigh together at most (`stepCells`: the map entries an action copied, and each
+ * change it made, 1 and its `set`, `original` and `values` entries). Beyond it the oldest steps go; the last one always
+ * stays. 100 single-cell edits at 10,000 staged changes weigh about 1,000,000; one ⌥⌘N or Revert over 10,000 rows of
+ * 29 staged columns about 600,000, so after such actions only the last three to five can be undone. Measured in V8, a
+ * cell costs 10–14 bytes in wide rows and about 70 in one-column changes: at most about 145 MB in all.
+ */
+export const UNDO_CELLS = 2_000_000;
 
 /** A loaded row's key cells, as loaded, as JSON in key order. */
 export type RowKey = string;
@@ -82,7 +92,11 @@ export interface StagedEdits extends Staging {
   /** The next change's `seq`: within each kind, changes are sent in the order they were staged (D-05-3). */
   readonly nextSeq: number;
   readonly past: readonly Staging[];
+  /** Each step of `past`, in its order: what the action after it weighs in cells (ruling K22). */
+  readonly pastCells: readonly number[];
   readonly future: readonly Staging[];
+  /** Each step of `future`, in its order: what redoing it weighs. */
+  readonly futureCells: readonly number[];
 }
 
 export type LoadedRowRef = { readonly kind: "row"; readonly rowKey: RowKey; readonly key: Cells };
@@ -164,7 +178,9 @@ export function emptyStaged(keyColumns: readonly string[]): StagedEdits {
     beforeApplying: null,
     nextSeq: 0,
     past: [],
+    pastCells: [],
     future: [],
+    futureCells: [],
   };
 }
 
@@ -243,27 +259,37 @@ const isEmpty = (record: object): boolean => Object.keys(record).length === 0;
 /**
  * `record` without the entries named in `keys`, copied once however many go (M1: dropping the problems of 10,000
  * changes stays linear), or `record` itself when none of them is in it. This is the one place a record is copied to
- * take entries out; the copy holds own entries whatever their names (`fromEntries`, never an assignment to `__proto__`).
+ * take entries out. The copy is built from the entries that stay, never by `delete` (K22: a record something was
+ * deleted from turns into a dictionary in V8, several times larger, and the undo history keeps every one of them), and
+ * holds own entries whatever their names (`fromEntries`, never an assignment to `__proto__`).
  */
-function withoutAll<T>(record: Readonly<Record<string, T>>, keys: Iterable<string>): Readonly<Record<string, T>> {
-  let copy: Record<string, T> | null = null;
+function withoutAll<T>(record: Readonly<Record<string, T>>, keys: ReadonlySet<string>): Readonly<Record<string, T>> {
+  let found = false;
   for (const key of keys) {
-    if (!Object.hasOwn(record, key)) continue;
-    copy ??= Object.fromEntries(Object.entries(record));
-    delete copy[key];
+    if (Object.hasOwn(record, key)) {
+      found = true;
+      break;
+    }
   }
-  return copy ?? record;
+  return found ? Object.fromEntries(Object.entries(record).filter(([key]) => !keys.has(key))) : record;
 }
 
-const without = <T>(record: Readonly<Record<string, T>>, key: string) => withoutAll(record, [key]);
+const without = <T>(record: Readonly<Record<string, T>>, key: string) => withoutAll(record, new Set([key]));
 
-const withoutColumn = (update: StagedUpdate, column: string): StagedUpdate => ({
+const withoutColumns = (update: StagedUpdate, columns: ReadonlySet<string>): StagedUpdate => ({
   ...update,
-  set: without(update.set, column),
-  original: without(update.original, column),
+  set: withoutAll(update.set, columns),
+  original: withoutAll(update.original, columns),
 });
 
-/** One action's work on copies of the maps (entries are shared until replaced); `edited`: changes whose problems go. */
+const entryCount = (record: object): number => Object.keys(record).length;
+
+/**
+ * One action's work on copies of the maps (entries are shared until replaced); `edited`: changes whose problems go.
+ * `cells` is what the action weighs in the undo history (ruling K22): the map entries copied, and the deletes made; the
+ * updates and new rows it made are counted once it is done (`stepCells`), from `touched` and `insertsTouched`, so a row
+ * an action changes column by column counts once, as it ends up.
+ */
 interface Work {
   updates: Record<RowKey, StagedUpdate>;
   inserts: StagedInsert[];
@@ -272,6 +298,9 @@ interface Work {
   changed: boolean;
   edited: Set<string>;
   newId: NewId;
+  cells: number;
+  touched: Set<RowKey>;
+  insertsTouched: boolean;
 }
 
 function begin(state: StagedEdits, newId: NewId): Work {
@@ -283,7 +312,39 @@ function begin(state: StagedEdits, newId: NewId): Work {
     changed: false,
     edited: new Set(),
     newId,
+    cells: entryCount(state.updates) + state.inserts.length + entryCount(state.deletes),
+    touched: new Set(),
+    insertsTouched: false,
   };
+}
+
+/** What the action done in `work` weighs in cells: what it copied, and each change it made with its entries (K22). */
+function stepCells(state: StagedEdits, work: Work): number {
+  let cells = work.cells;
+  for (const rowKey of work.touched) {
+    const update = work.updates[rowKey]; // made by this action (a row it touched has a new UPDATE, or none)
+    if (update) cells += 1 + entryCount(update.set) + entryCount(update.original);
+  }
+  if (work.insertsTouched) {
+    const kept = new Set(state.inserts);
+    for (const insert of work.inserts) if (!kept.has(insert)) cells += 1 + entryCount(insert.values);
+  }
+  return cells;
+}
+
+/**
+ * The undo history with `staging` as its newest step, weighing `cells` (ruling K22): the oldest steps go while there
+ * are more than UNDO_LIMIT, or while all of them weigh more than UNDO_CELLS; the newest always stays.
+ */
+function pushed(state: StagedEdits, staging: Staging, cells: number): Pick<StagedEdits, "past" | "pastCells"> {
+  const past = [...state.past, staging];
+  // Weights are matched to the steps from the newest: a step without one (never made by `stage`) weighs nothing.
+  const offset = state.pastCells.length - state.past.length;
+  const weights = [...state.past.map((_, i) => state.pastCells[i + offset] ?? 0), cells];
+  let total = weights.reduce((sum, weight) => sum + weight, 0);
+  let drop = 0;
+  while (drop < past.length - 1 && (past.length - drop > UNDO_LIMIT || total > UNDO_CELLS)) total -= weights[drop++];
+  return drop === 0 ? { past, pastCells: weights } : { past: past.slice(drop), pastCells: weights.slice(drop) };
 }
 
 /** The state after `work` as one undo step; the state itself when nothing changed. */
@@ -296,8 +357,9 @@ function finish(state: StagedEdits, work: Work): StagedEdits {
     deletes: work.deletes,
     nextSeq: work.seq,
     problems: withoutAll(state.problems, work.edited),
-    past: [...state.past, stagingOf(state)].slice(-UNDO_LIMIT),
+    ...pushed(state, stagingOf(state), stepCells(state, work)),
     future: [],
+    futureCells: [],
   };
 }
 
@@ -306,6 +368,7 @@ function setUpdate(work: Work, rowKey: RowKey, update: StagedUpdate | null, id: 
   else delete work.updates[rowKey];
   work.changed = true;
   work.edited.add(id);
+  work.touched.add(rowKey);
 }
 
 function editLoaded(
@@ -322,7 +385,7 @@ function editLoaded(
   const original = staged ? own(existing.original, column) : loaded;
   if (inputMatches(input, original, kind)) {
     // Back to the value it was loaded with: no change to the cell (there is no no-op UPDATE).
-    if (staged) setUpdate(work, row.rowKey, withoutColumn(existing, column), existing.id);
+    if (staged) setUpdate(work, row.rowKey, withoutColumns(existing, new Set([column])), existing.id);
     return;
   }
   if (staged && sameInput(existing.set[column], input)) return;
@@ -346,6 +409,7 @@ function editInsert(work: Work, id: string, column: string, input: CellInput): v
   const values = input.kind === "default" ? without(insert.values, column) : { ...insert.values, [column]: input };
   work.inserts[index] = { ...insert, values };
   work.changed = true;
+  work.insertsTouched = true;
   work.edited.add(id);
 }
 
@@ -354,15 +418,27 @@ function editCell(work: Work, cell: CellTarget, input: CellInput, kind?: EditKin
   else if (input.kind !== "default") editLoaded(work, cell.row, cell.column, input, cell.original, kind);
 }
 
-function revertCell(work: Work, cell: CellTarget): void {
-  if (cell.row.kind === "insert") {
-    editInsert(work, cell.row.id, cell.column, DEFAULT_INPUT);
-    return;
+/**
+ * Reverts the cells: a new row's go back to DEFAULT; a loaded row's columns go from its UPDATE in one copy of its `set`
+ * and `original` however many there are (a select-all Revert copies each row once, not once per cell).
+ */
+function revertCells(work: Work, cells: readonly CellTarget[]): void {
+  const byRow = new Map<RowKey, Set<string>>();
+  for (const cell of cells) {
+    if (cell.row.kind === "insert") editInsert(work, cell.row.id, cell.column, DEFAULT_INPUT);
+    else {
+      const columns = byRow.get(cell.row.rowKey);
+      if (columns) columns.add(cell.column);
+      else byRow.set(cell.row.rowKey, new Set([cell.column]));
+    }
   }
-  if (cell.row.rowKey in work.deletes) return; // a marked row's UPDATE is hidden, kept as it is until Restore
-  const existing = work.updates[cell.row.rowKey];
-  if (!existing || !Object.hasOwn(existing.set, cell.column)) return;
-  setUpdate(work, cell.row.rowKey, withoutColumn(existing, cell.column), existing.id);
+  for (const [rowKey, columns] of byRow) {
+    if (rowKey in work.deletes) continue; // a marked row's UPDATE is hidden, kept as it is until Restore
+    const existing = work.updates[rowKey];
+    if (!existing) continue;
+    const reverted = withoutColumns(existing, columns);
+    if (reverted.set !== existing.set) setUpdate(work, rowKey, reverted, existing.id);
+  }
 }
 
 function removeInsert(work: Work, id: string): void {
@@ -370,6 +446,7 @@ function removeInsert(work: Work, id: string): void {
   if (index < 0) return;
   work.inserts.splice(index, 1);
   work.changed = true;
+  work.insertsTouched = true;
   work.edited.add(id); // its problems go with it (an undo brings the row back without them)
 }
 
@@ -400,6 +477,7 @@ function deleteRows(work: Work, rows: readonly RowRef[]): void {
       if (hidden) work.edited.add(hidden.id); // not sent while the row is marked: the last preview's problems go
       work.deletes[row.rowKey] = { id: work.newId("d"), key: row.key, seq: work.seq++ };
       work.changed = true;
+      work.cells += 1;
     }
   }
 }
@@ -489,8 +567,7 @@ function applyOutcome(state: StagedEdits, outcome: AppliedOutcome): StagedEdits 
     problems: sameProblems ? state.problems : (failed ?? {}),
     unknownOutcome,
     beforeApplying: null,
-    past: clearHistory ? [] : state.past,
-    future: clearHistory ? [] : state.future,
+    ...(clearHistory ? { past: [], pastCells: [], future: [], futureCells: [] } : {}),
   };
 }
 
@@ -498,9 +575,17 @@ function applyOutcome(state: StagedEdits, outcome: AppliedOutcome): StagedEdits 
 export function stage(state: StagedEdits, action: StageAction, newId: NewId = newChangeId): StagedEdits {
   switch (action.type) {
     case "undo": {
+      // The step's weight goes with it: it is what redoing it makes again.
       const previous = state.past.at(-1);
       if (!previous) return state;
-      return { ...state, ...previous, past: state.past.slice(0, -1), future: [stagingOf(state), ...state.future] };
+      return {
+        ...state,
+        ...previous,
+        past: state.past.slice(0, -1),
+        pastCells: state.pastCells.slice(0, -1),
+        future: [stagingOf(state), ...state.future],
+        futureCells: [state.pastCells.at(-1) ?? 0, ...state.futureCells],
+      };
     }
     case "redo": {
       const next = state.future[0];
@@ -508,8 +593,9 @@ export function stage(state: StagedEdits, action: StageAction, newId: NewId = ne
       return {
         ...state,
         ...next,
-        past: [...state.past, stagingOf(state)].slice(-UNDO_LIMIT),
+        ...pushed(state, stagingOf(state), state.futureCells[0] ?? 0),
         future: state.future.slice(1),
+        futureCells: state.futureCells.slice(1),
       };
     }
     case "setProblems": {
@@ -532,8 +618,9 @@ export function stage(state: StagedEdits, action: StageAction, newId: NewId = ne
         inserts: [],
         deletes: {},
         problems: {},
-        past: [...state.past, stagingOf(state)].slice(-UNDO_LIMIT),
+        ...pushed(state, stagingOf(state), 0), // it makes nothing: what it took away is the steps' before it
         future: [],
+        futureCells: [],
       };
     }
     default:
@@ -552,7 +639,7 @@ export function stage(state: StagedEdits, action: StageAction, newId: NewId = ne
         if (cell.row.kind === "insert") editInsert(work, cell.row.id, cell.column, DEFAULT_INPUT);
       break;
     case "revertCells":
-      for (const cell of action.cells) revertCell(work, cell);
+      revertCells(work, action.cells);
       break;
     case "revertRows":
       for (const row of action.rows) revertRow(work, row);
@@ -567,6 +654,7 @@ export function stage(state: StagedEdits, action: StageAction, newId: NewId = ne
       if (work.inserts.some((insert) => insert.id === action.id)) break; // a change id is sent once
       work.inserts.push({ id: action.id, values: {}, seq: work.seq++ });
       work.changed = true;
+      work.insertsTouched = true;
       break;
     case "keepMine":
       keepMine(work, action.row, action.current, action.kinds);
