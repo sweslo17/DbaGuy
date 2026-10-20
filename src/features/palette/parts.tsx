@@ -90,8 +90,8 @@ export interface PaletteItemProps {
   pending?: boolean;
   onSelect: () => void;
   /**
-   * A lucide icon (muted, in the text colour), or a ready-made element such as an `EngineIcon`, which keeps its own
-   * colour except on the highlighted row, where its `svg`s take the row's text colour.
+   * A lucide icon (muted, in the text colour), or a ready-made element such as an `EngineIcon`, drawn in the row's text
+   * colour (the highlighted row's too).
    */
   icon?: LucideIcon | ReactElement;
   label: string;

@@ -2,10 +2,14 @@
 no second thread ever enters it."""
 
 import socket
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 
 import pytest
+from loguru import logger
 
 from dbaguy_backend.adapters.mssql import driver
 from dbaguy_backend.adapters.mssql.adapter import MssqlConnection
@@ -132,3 +136,59 @@ def test_closing_an_mssql_connection_under_a_read_on_another_thread_drops_the_so
     assert peer.recv(1) == b""  # the socket was shut down
     mine.close()
     peer.close()
+
+
+def test_an_error_answering_the_attention_logs_its_number_and_keeps_the_text_at_debug(monkeypatch):  # G12, spec ⑤ §5
+    class ServerError(Exception):  # shaped as pymssql raises one: ((number, message bytes),)
+        number = 3621
+
+    class Answering(FakeRaw):
+        def cancel(self) -> None:
+            raise ServerError((3621, b"The statement has been terminated: 'zz-secret'"))
+
+    monkeypatch.setattr(driver, "ERRORS", (ServerError,))
+    connection = MssqlConnection(GuardedConnection(Answering()), spid=7, database="dbaguy", read_only=False,
+                                 state=(0, 0, False))
+    records = []
+    sink = logger.add(lambda message: records.append((message.record["level"].no, message.record["message"])),
+                      level=0)
+    try:
+        connection._attention()
+    finally:
+        logger.remove(sink)
+    assert [text for level, text in records if level == 30] == [
+        "Stopping the statement on SQL Server SPID 7 reported error 3621"]
+    assert not [text for level, text in records if level >= 20 and "zz-secret" in text]
+    assert [text for level, text in records if level == 10 and "zz-secret" in text]
+
+
+def test_an_error_pymssql_did_not_fill_in_is_read_from_its_args_without_crashing():  # ruling G14
+    """`.text` and `.procname` of an MSSQLDatabaseException built in Python are NULL char*: reading one crashes the
+    process, so this runs in a child process (a regression fails the test, never pytest itself)."""
+    script = textwrap.dedent("""
+        from pymssql import _mssql
+        from dbaguy_backend.adapters.mssql.adapter import MssqlConnection, server_text
+        from dbaguy_backend.adapters.mssql.driver import GuardedConnection
+
+        class Raw:
+            def execute_non_query(self, sql):
+                pass
+
+            def set_msghandler(self, handler):
+                pass
+
+            def close(self):
+                pass
+
+        exc = _mssql.MSSQLDatabaseException((8134, b"Divide by zero error encountered.DB-Lib error message 20018, "
+                                                   b"severity 16:\\nGeneral SQL Server error: Check messages from the "
+                                                   b"SQL Server\\n"))
+        connection = MssqlConnection(GuardedConnection(Raw()), spid=7, database="dbaguy", read_only=False,
+                                     state=(0, 0, False))
+        error = connection.translate_error(exc)
+        print(repr(server_text(exc)), repr(error.message), repr(error.code))
+    """)
+    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr[-2000:]
+    expected = "'Divide by zero error encountered.'"
+    assert done.stdout.strip() == f"{expected} {expected} None"

@@ -201,9 +201,18 @@ class SetAutocommitCommand(BaseModel):
     enabled: bool
 
 
+class ApplyEditsCommand(BaseModel):
+    """Apply a previewed grid-edit plan (spec ⑤ §3.5): its statements exactly as previewed, in one transaction on this
+    session. A Cancel stops it until its COMMIT has been sent."""
+
+    type: Literal["apply_edits"] = "apply_edits"
+    request_id: str
+    plan_id: str = Field(min_length=1, max_length=64)
+
+
 ClientCommand = Annotated[
     ExecuteCommand | ExportCommand | FetchMoreCommand | CancelCommand | DiscardCommand | CommitCommand
-    | RollbackCommand | SetAutocommitCommand,
+    | RollbackCommand | SetAutocommitCommand | ApplyEditsCommand,
     Field(discriminator="type"),
 ]
 
@@ -300,9 +309,24 @@ class FinishedEvent(BaseModel):
     skipped: bool = False  # never ran: it needs the user's confirmation first
 
 
+EditOutcome = Literal["committed", "rolled_back", "partial", "unknown"]
+
+
+class EditOutcomeEvent(BaseModel):
+    """How an apply ended (spec ⑤ R-05-6): sent once, right before the request's `session_state` and `finished`."""
+
+    type: Literal["edit_outcome"] = "edit_outcome"
+    request_id: str
+    outcome: EditOutcome
+    applied: list[str] = []  # change ids that took effect: all when committed; those before the failure when partial
+    already_gone: list[str] = []  # DELETEs that matched no row: the row was gone already (R-05-5)
+    failed_change: str | None = None
+    statement: int | None = None  # the failing statement's index in the plan's statements (0-based)
+
+
 ServerEvent = Annotated[
     StartedEvent | ResultSetEvent | RowsEvent | ResultSetEndEvent | AffectedEvent | MessageEvent | ErrorEvent
-    | ProgressEvent | ConfirmationRequiredEvent | SessionStateEvent | FinishedEvent,
+    | ProgressEvent | ConfirmationRequiredEvent | SessionStateEvent | FinishedEvent | EditOutcomeEvent,
     Field(discriminator="type"),
 ]
 

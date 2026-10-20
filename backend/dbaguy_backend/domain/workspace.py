@@ -1,9 +1,10 @@
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .couchbase import CAS_PATTERN
+from .edits import StagedEditsFile
 from .execution import PARAM_NAME, QueryContext
 from .metadata import PathSegment
 
@@ -43,6 +44,14 @@ class WorkspaceTab(BaseModel):
     params: dict[ParamName, ParamDraft] | None = Field(default=None, max_length=MAX_PARAM_DRAFTS)
     # Couchbase document tab: the CAS its unsaved `buffer` is based on (decimal text); None for a new document
     document_cas: DocumentCas | None = None
+    # A table tab's staged grid edits (spec ⑤ §3.7); None: nothing staged, or too large to keep
+    staged_edits: StagedEditsFile | None = None
+
+    @model_validator(mode="after")
+    def _staged_edits_on_a_table_tab(self) -> Self:
+        if self.staged_edits is not None and self.kind != "table":
+            raise ValueError("only a table tab keeps staged edits")
+        return self
 
 
 class WorkspaceState(BaseModel):

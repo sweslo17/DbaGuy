@@ -4,7 +4,7 @@ import { toast } from "@/components/ui/Toast";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import type { AppSettings, GuardDecision, QueryContext } from "@/lib/api/types";
 import { refreshHistory } from "../history/useHistory";
-import { CONNECTION_LOST, type ExecutionState } from "../session/execution";
+import { CONNECTION_LOST, NOT_CONNECTED_CODE, type ExecutionState } from "../session/execution";
 import { busy, type SessionController } from "../session/SessionController";
 import { expandRepeats, sentText, type PlannedStatement } from "./runPlan";
 
@@ -67,7 +67,7 @@ export interface QueryRunnerArgs {
 const MAX_GO_REPEAT = 1000;
 
 /** Errors after which nothing more can run on this session, whatever `continue_on_error` says. */
-const FATAL_CODES = new Set(["not_connected", CONNECTION_LOST]);
+const FATAL_CODES = new Set([NOT_CONNECTED_CODE, CONNECTION_LOST]);
 
 async function analyze(profileId: string, statements: string[]): Promise<GuardDecision[]> {
   const client = await api();

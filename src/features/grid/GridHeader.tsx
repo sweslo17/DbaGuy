@@ -1,7 +1,9 @@
+import { KeyRound } from "lucide-react";
 import { memo, type PointerEvent } from "react";
 import { cn } from "@/lib/cn";
-import { HEADER_HEIGHT } from "./columns";
+import { HEADER_HEIGHT, KEY_ICON_SIZE } from "./columns";
 import { columnClass, columnStyle, SELECTED_CLASS, type ColumnStrip } from "./layout";
+import { headerNotes, type HeaderMark } from "./marks";
 
 export interface GridSort {
   column: number;
@@ -18,6 +20,8 @@ interface GridHeaderProps {
   /** Selected column range (-1 when nothing is selected). Selecting is done by the grid's pointer handler. */
   selLeft: number;
   selRight: number;
+  /** An editable table's columns (spec ⑤ §3.6.2): a key icon, and why a column cannot be written (its tooltip). */
+  marks?: readonly (HeaderMark | undefined)[];
 }
 
 interface ResizeHandleProps {
@@ -94,7 +98,7 @@ function SortControl({ mark, onSort }: SortControlProps) {
  * 12 px semibold, type font-sans 11 px).
  */
 export const GridHeader = memo(function GridHeader(props: GridHeaderProps) {
-  const { strip, sort, onHeaderClick, onResize, onAutofit, selLeft, selRight } = props;
+  const { strip, sort, onHeaderClick, onResize, onAutofit, selLeft, selRight, marks } = props;
   return (
     <div
       role="row"
@@ -111,6 +115,7 @@ export const GridHeader = memo(function GridHeader(props: GridHeaderProps) {
       />
       {strip.drawn.map((column) => {
         const meta = strip.columns[column.col];
+        const mark = marks?.[column.col];
         return (
           <div
             key={column.col}
@@ -125,10 +130,11 @@ export const GridHeader = memo(function GridHeader(props: GridHeaderProps) {
               column.col >= selLeft && column.col <= selRight && SELECTED_CLASS,
             )}
             style={columnStyle(column)}
-            title={`${meta.name}\n${meta.type_name}`}
+            title={[meta.name, meta.type_name, ...headerNotes(mark)].join("\n")}
           >
             <div className="flex min-w-0 items-center gap-1">
-              <span className="truncate font-semibold">{meta.name}</span>
+              {mark?.key && <KeyRound size={KEY_ICON_SIZE} className="shrink-0 text-muted" aria-label="Key column" />}
+              <span className={cn("truncate font-semibold", mark?.readOnly && "text-muted")}>{meta.name}</span>
               {onHeaderClick && (
                 <SortControl
                   mark={sortMark(sort, column.col)}

@@ -67,6 +67,24 @@ _STRINGS: dict[int, tuple[str, str]] = {  # (text name, binary name)
     FieldType.LONG_BLOB: ("text", "blob"), FieldType.BLOB: ("text", "blob"),
 }
 
+# The spatial types' names in information_schema.COLUMNS.DATA_TYPE (the protocol calls them all GEOMETRY)
+SPATIAL_TYPES = frozenset({
+    "geometry", "point", "linestring", "polygon", "multipoint", "multilinestring", "multipolygon", "geometrycollection",
+    "geomcollection",
+})
+_BY_DATA_TYPE: dict[str, ColumnCategory] = {
+    **{kind.name: kind.category for kind in _FIXED.values()},
+    **{text: ColumnCategory.TEXT for text, _ in _STRINGS.values()},
+    **{binary: ColumnCategory.BINARY for _, binary in _STRINGS.values()},
+    **dict.fromkeys(("tinytext", "mediumtext", "longtext", "enum", "set"), ColumnCategory.TEXT),
+    **dict.fromkeys(("tinyblob", "mediumblob", "longblob", *SPATIAL_TYPES), ColumnCategory.BINARY),
+}
+
+
+def category_for_data_type(data_type: str) -> ColumnCategory:
+    """The grid category of a column by its information_schema DATA_TYPE (grid editing reads the catalog)."""
+    return _BY_DATA_TYPE.get(data_type.lower(), ColumnCategory.OTHER)
+
 
 def column_kind(description: tuple) -> ColumnKind:
     """description: a mysql-connector cursor description entry (name, type, …, flags at [7], charset at [8])."""

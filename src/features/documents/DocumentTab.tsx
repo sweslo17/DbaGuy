@@ -20,7 +20,7 @@ import { RecoverableError } from "../connections/RecoverableError";
 import { CodeEditor, type CodeEditorHandle } from "../editor/CodeEditor";
 import { keyspaceLabel } from "../explorer/fieldSamples";
 import { formatJson, parseJson } from "../grid/json";
-import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
+import { CLOSE_GUARD_ORDER, useDiscardQuestion } from "../workspace/closeGuards";
 import { ConflictDialog } from "./ConflictDialog";
 import { deleteQuestion, documentRef, problemMessage } from "./documentApi";
 import { canEdit, panelOf, type DocumentLoad, type Panel } from "./documentState";
@@ -245,30 +245,7 @@ export function DocumentTab({ tab, active }: { tab: DocumentTabState; active: bo
 
   // Closing a tab with unsaved text asks first (ruling C20): Discard or Cancel, never Save (a save can need a preview or
   // a conflict decision, which a close prompt cannot host). Decided from the store, not from the last render.
-  const discardAnswer = useRef<((discard: boolean) => void) | null>(null);
-  const [askingDiscard, setAskingDiscard] = useState(false);
-  const answerDiscard = (discard: boolean) => {
-    const answer = discardAnswer.current;
-    discardAnswer.current = null;
-    setAskingDiscard(false);
-    answer?.(discard);
-  };
-  useCloseGuard(tab.id, CLOSE_GUARD_ORDER.document, () => {
-    if (!factsOf(tab.id)?.dirty) return true;
-    discardAnswer.current?.(false);
-    return new Promise<boolean>((resolve) => {
-      discardAnswer.current = resolve;
-      setAskingDiscard(true);
-    });
-  });
-  // A tab that goes while it is asking keeps its text: the answer is no.
-  useEffect(
-    () => () => {
-      discardAnswer.current?.(false);
-      discardAnswer.current = null;
-    },
-    [],
-  );
+  const closing = useDiscardQuestion(tab.id, CLOSE_GUARD_ORDER.document, () => !!factsOf(tab.id)?.dirty);
 
   // ⌘S and ⇧⌘F while this tab is shown, wherever the focus is in it (the editor's own keymap takes ⌘S inside it, and
   // has no binding for ⇧⌘F). ⌘S is never the browser's "Save page"; nothing happens while a dialog has the keyboard.
@@ -480,14 +457,14 @@ export function DocumentTab({ tab, active }: { tab: DocumentTabState; active: bo
           onConfirm={() => void saving.remove().then(() => setConfirmingDelete(false))}
         />
       )}
-      {askingDiscard && (
+      {closing.asking && (
         <ConfirmDialog
           open
           title="Unsaved changes"
           message={`Discard unsaved changes to ${ref.id}?`}
           confirmLabel="Discard"
-          onOpenChange={(open) => !open && answerDiscard(false)}
-          onConfirm={() => answerDiscard(true)}
+          onOpenChange={(open) => !open && closing.answer(false)}
+          onConfirm={() => closing.answer(true)}
         />
       )}
     </div>

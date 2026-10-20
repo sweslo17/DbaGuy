@@ -1,28 +1,50 @@
 import { ChevronDown, ChevronRight, Loader2, RefreshCw, SquareTerminal } from "lucide-react";
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import type { MenuItem } from "@/components/ui/ContextMenu";
 import { Tabs } from "@/components/ui/Tabs";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
 import type { ColumnMeta, Dialect } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
+import { isDialogOpen } from "@/lib/dialogs";
 import { plural } from "@/lib/format";
+import { isImeKeyEvent } from "@/lib/ime";
+import { isCommandKey } from "@/lib/shortcuts";
+import { readStagedEdits } from "@/stores/stagedEdits";
+import { useReportTabStatus } from "@/stores/tabStatus";
 import { useWorkspace, type TableTabState } from "@/stores/workspace";
-import { useDialect, useProfiles } from "../connections/hooks";
+import { useEngineInfo, useProfiles } from "../connections/hooks";
 import { RecoverableError } from "../connections/RecoverableError";
-import { ColumnsView, DdlView } from "../explorer/ObjectDetailView";
+import { COMMIT_RUNNING } from "../edits/commitDialog";
+import { tableEditActions, useTableEditActions } from "../edits/editActions";
+import { EditBar } from "../edits/EditBar";
+import { resultColumns } from "../edits/overlay";
+import { changeCount } from "../edits/staging";
+import {
+  asksBeforeDiscard,
+  CLOSE_WHILE_COMMITTING,
+  closeQuestion,
+  discardQuestion,
+  NOT_IN_EXPORT,
+} from "../edits/tableEditing";
+import { useCommit, useCommitState } from "../edits/useCommit";
+import { useTableEdits } from "../edits/useTableEdits";
 import { kindLabel } from "../explorer/kinds";
-import { DataGrid } from "../grid/DataGrid";
+import { ColumnsView, DdlView } from "../explorer/ObjectDetailView";
+import { DataGrid, type DataGridHandle } from "../grid/DataGrid";
 import { ExportDialog } from "../grid/ExportDialog";
 import type { GridSort } from "../grid/GridHeader";
 import { useHeldResult } from "../grid/useHeldResult";
-import { CONNECTION_LOST } from "../session/execution";
+import { CONNECTION_LOST, EXPORT_RUNNING } from "../session/execution";
 import { isExporting } from "../session/SessionController";
 import { useSessionGuards } from "../session/SessionGuards";
-import { CLOSE_GUARD_ORDER, useCloseGuard } from "../workspace/closeGuards";
+import { CLOSE_GUARD_ORDER, useCloseGuard, useDiscardQuestion } from "../workspace/closeGuards";
+import { browseView, keptNotice } from "./browseView";
 import { FilterBar } from "./FilterBar";
 import { addCondition, valueCondition, type Relation } from "./filterValue";
+import { useAnchoredRerun } from "./useAnchoredRerun";
 import { useTableData, type TableDataState } from "./useTableData";
 
 type View = "data" | "columns" | "ddl";
@@ -33,6 +55,28 @@ const VIEWS: { value: View; label: string }[] = [
   { value: "columns", label: "Columns" },
   { value: "ddl", label: "DDL" },
 ];
+
+/**
+ * How long a Cancel that takes Refresh's place ignores clicks (05b K12): the second click of a double click on Refresh
+ * lands on it, and must not cancel the re-run the first one started.
+ */
+const CANCEL_ARMS_AFTER_MS = 400;
+
+/** Cancel, in Refresh's place while a browse's first page loads; a click in its first moments is not one on it. */
+function FirstPageCancel({ disabled, onCancel }: { disabled: boolean; onCancel: () => void }) {
+  const [shownAt] = useState(() => performance.now());
+  return (
+    <Button
+      size="sm"
+      onClick={() => {
+        if (performance.now() - shownAt >= CANCEL_ARMS_AFTER_MS) onCancel();
+      }}
+      disabled={disabled}
+    >
+      Cancel
+    </Button>
+  );
+}
 
 /** Count rows, then "N rows" (or the error) beside it; a spinner and Cancel while it runs. */
 function CountControl({
@@ -152,25 +196,162 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   const table = useTableData(tab, active);
   const { state, execution, snapshot, relation } = table;
   const { applyFilter, toggleSort, sortBy } = table;
-  const dialect = useDialect(tab.profileId);
+  const engine = useEngineInfo(tab.profileId);
+  const dialect = engine?.dialect ?? null;
   const openQuery = useWorkspace((s) => s.openQuery);
   const profiles = useProfiles();
-  const profileName = profiles.data?.find((entry) => entry.profile.id === tab.profileId)?.profile.name;
+  const profile = profiles.data?.find((entry) => entry.profile.id === tab.profileId)?.profile;
+  const profileName = profile?.name;
   const guards = useSessionGuards(table.controller, profileName ? `${tab.title} · ${profileName}` : tab.title);
   useCloseGuard(tab.id, CLOSE_GUARD_ORDER.export, (intent) => guards.exportStep(intent));
   const [exportOpen, setExportOpen] = useState(false);
   const openExport = useCallback(() => setExportOpen(true), []);
   const phase = snapshot?.phase ?? "opening";
-  const current = execution?.resultSets[0] ?? null;
-  // Until a sort, filter or refresh delivers its first page, the grid keeps the previous rows (and its layout), dimmed.
-  const shown = useHeldResult(current, table.pending);
+  // Until a sort, filter or refresh has its whole first page, the grid keeps the previous rows (and its layout),
+  // dimmed: it never flashes empty, and a re-run that keeps the position finds it (A12). A Refresh that ends before
+  // its first page is complete (cancelled, failed, interrupted) leaves those rows as they were.
+  const view = browseView(execution, table.rerun);
+  const shown = useHeldResult(view.set, table.pending, Object.is, view.keepPrevious);
   const set = shown.value;
   const columns = set?.columns;
   const rows = set?.rows;
-  const firstPagePending = execution?.status === "running" && !current;
+  const firstPagePending = execution?.status === "running" && !view.set;
+  // The rows on screen are those from before a Refresh that ended early: their request is gone, nothing more to load.
+  const kept = view.keepPrevious && !!set;
+  const notice = keptNotice(execution, view, !!set);
   const filterByValue = useFilterByValue(state.filter, applyFilter);
   // An export runs on this session: filter, sort and refresh would only wait behind it.
   const exporting = isExporting(snapshot);
+  const gridRef = useRef<DataGridHandle>(null);
+  // The commit's dialog and afterglow are held here, above the edits: a running commit locks the staging, and until
+  // the re-read is in the grid draws the staging as it was before the commit (pre-flight M5), in the same render.
+  const committing = useCommitState({ deliveredRequest: table.deliveredRequest, position: table.position });
+  // A commit's re-read has been asked for and not delivered yet: its rows count as loading from the moment it is asked
+  // (before it is sent, the rows shown are not stale yet), so nothing says "Refresh first" meanwhile.
+  const rereading = table.pending && committing.afterglow !== null;
+  const openAfterEdit = useRef<() => void>(() => undefined);
+  const edits = useTableEdits({
+    tab,
+    columns,
+    rows,
+    rowEditing: engine?.row_editing === true,
+    sessionOpen: phase === "open",
+    stale: shown.stale || rereading,
+    locked: committing.applying ? COMMIT_RUNNING : null,
+    gridRef,
+    onRequestCommit: () => openAfterEdit.current(),
+    afterglow: committing.afterglow,
+  });
+  const [askingDiscard, setAskingDiscard] = useState(false);
+  /** Discard…: more than one change asks first (⌘Z brings them back either way). */
+  const requestDiscard = () => (asksBeforeDiscard(edits.changes) ? setAskingDiscard(true) : edits.discardAll());
+  const refresh = () => {
+    table.refresh();
+    edits.refetchTarget(); // DDL since: the next edit uses the table as it is now (spec §3.2.1)
+  };
+  const commit = useCommit({
+    tab,
+    table: relation ? qualifiedName(relation) : tab.title,
+    profile,
+    dialect,
+    controller: table.controller,
+    snapshot,
+    browse: {
+      execution,
+      // The rows are being read: held while a re-run loads them, or the first ones not there yet.
+      pending: shown.stale || rereading || (table.pending && !set),
+      deliveredRequest: table.deliveredRequest,
+      position: table.position,
+      reread: table.refresh,
+      refresh,
+    },
+    edits,
+    exporting,
+    gridRef,
+    retrySession: table.retry,
+    holder: committing,
+  });
+  useLayoutEffect(() => {
+    openAfterEdit.current = commit.openAfterEdit;
+  });
+  // Closing asks while changes are staged (R-05-11: Discard / Cancel, no Commit: a commit needs its preview), and is
+  // refused while a commit runs. Registered for every table tab, shown or not: a restored tab's staging is in the store
+  // (C28). An open editor's text is staged first, so it is counted and asked about (L8; never during render or an
+  // effect: flushSync). Losing the connection does not ask (close-only), nor does quitting (the staging is saved).
+  /** The question ended the shown tab's open editor: its input had the focus, so Cancel gives it to the grid. */
+  const refocusOnKeep = useRef(false);
+  const closing = useDiscardQuestion(tab.id, CLOSE_GUARD_ORDER.edits, () => {
+    if (committing.read()?.step === "applying") return { refuse: CLOSE_WHILE_COMMITTING };
+    refocusOnKeep.current = edits.flushEditor() && active;
+    const staged = readStagedEdits(tab.id);
+    return staged !== null && changeCount(staged) > 0;
+  });
+  const keepTab = () => {
+    closing.answer(false);
+    if (!refocusOnKeep.current) return;
+    refocusOnKeep.current = false;
+    // Once the dialog has closed: it gives the focus back to what had it when it opened, and that was the page. Never
+    // over a focus something else took meanwhile.
+    requestAnimationFrame(() => {
+      const lost = !document.activeElement || document.activeElement === document.body;
+      if (lost && !isDialogOpen()) gridRef.current?.focus();
+    });
+  };
+  // The tab strip's dot: staged changes are unsaved work.
+  useReportTabStatus(tab.id, { dirty: edits.changes > 0 });
+  // ⌘⇧P's edit commands (spec ⑤ §3.6.4), through the same handlers as the grid's keys and the edit bar (H11).
+  useTableEditActions(
+    tab.id,
+    tableEditActions(
+      {
+        editable: edits.editable,
+        shown: active,
+        changes: edits.changes,
+        commitBlocked: commit.disabledReason,
+        applying: commit.applying,
+        undoable: (edits.staged?.past.length ?? 0) > 0,
+        redoable: (edits.staged?.future.length ?? 0) > 0,
+      },
+      {
+        addRow: edits.addRow,
+        deleteRows: edits.deleteSelected,
+        setNull: edits.setNullSelected,
+        commit: commit.open,
+        discardAll: requestDiscard,
+        undo: edits.undo,
+        redo: edits.redo,
+      },
+    ),
+  );
+  // ⌘S while this tab's Data view is shown, wherever the focus is in it (an editor stages first and asks itself):
+  // never the browser's Save page, nothing while a dialog has the keyboard or an input method composes.
+  const openCommit = useRef(commit.open);
+  useLayoutEffect(() => {
+    openCommit.current = commit.open;
+  });
+  useEffect(() => {
+    if (!active) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (isImeKeyEvent(e) || e.defaultPrevented || !isCommandKey(e, "s")) return;
+      e.preventDefault();
+      if (!isDialogOpen()) openCommit.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [active]);
+  const tableKey = table.target?.key;
+  const keyIndexes = useMemo(
+    () => (columns && tableKey ? resultColumns(columns, tableKey).keyIndexes : null),
+    [columns, tableKey],
+  );
+  useAnchoredRerun(
+    gridRef,
+    { request: state.requestId, position: table.position, view },
+    columns,
+    rows,
+    keyIndexes,
+    edits.display.leading, // the new rows staged on top: the selection was made over them
+  );
 
   const gridSort = useMemo<GridSort[]>(
     () =>
@@ -191,24 +372,28 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
     (col: number, descending: boolean) => columns && sortBy(columns[col].name, descending),
     [columns, sortBy],
   );
+  const { resultRowAt } = edits;
+  const { leading } = edits.display;
   const extraCellMenu = useCallback(
     (row: number, col: number): MenuItem[] => {
+      if (row < leading) return []; // a new row has no value on the server to filter by (§3.6.6)
       const column = columns?.[col];
-      if (!column || !rows || row >= rows.length || !dialect || exporting) {
-        return [{ label: FILTER_BY_VALUE, disabled: true }];
-      }
-      const value = rows[row][col];
+      // The loaded row under the display row: a changed cell filters by the server's value, not the staged one.
+      const source = resultRowAt(row);
+      if (!column || !source || !dialect || exporting) return [{ label: FILTER_BY_VALUE, disabled: true }];
+      const value = source[col];
       return [{ label: FILTER_BY_VALUE, onSelect: () => void filterByValue(dialect, column, value) }];
     },
-    [columns, rows, dialect, exporting, filterByValue],
+    [columns, resultRowAt, leading, dialect, exporting, filterByValue],
   );
-  // Export writes the current browse SELECT (filter, sort and refresh wait while it runs).
+  // Export writes the current browse SELECT (filter, sort and refresh wait while it runs): what the server holds.
+  const exportNote = edits.changes > 0 ? NOT_IN_EXPORT : null;
   const exportSource = useMemo(
     () =>
       table.controller && execution && relation
-        ? { controller: table.controller, sql: execution.sql, title: relation.name, tableName }
+        ? { controller: table.controller, sql: execution.sql, title: relation.name, tableName, note: exportNote }
         : null,
-    [table.controller, execution, relation, tableName],
+    [table.controller, execution, relation, tableName, exportNote],
   );
 
   const openInQueryTab = () => {
@@ -235,15 +420,13 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
           disabled={exporting}
         />
         {firstPagePending ? (
-          <Button size="sm" onClick={table.cancel} disabled={phase !== "open"}>
-            Cancel
-          </Button>
+          <FirstPageCancel onCancel={table.cancel} disabled={phase !== "open"} />
         ) : (
           <Button
             size="sm"
-            onClick={table.refresh}
+            onClick={refresh}
             disabled={phase !== "open" || exporting}
-            title={exporting ? "An export is running on this session" : "Run the query again"}
+            title={exporting ? EXPORT_RUNNING : "Run the query again"}
           >
             <RefreshCw size={12} /> Refresh
           </Button>
@@ -254,8 +437,29 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
           onCount={table.countRows}
           onCancel={table.cancelCount}
         />
+        <div className="flex max-w-[60%] min-w-0 shrink justify-end">
+          <EditBar
+            editable={edits.tableEditable}
+            paused={edits.paused}
+            checking={edits.checking}
+            readOnlyReason={edits.readOnlyReason}
+            targetError={edits.targetError}
+            onRetryTarget={edits.refetchTarget}
+            changes={edits.changes}
+            notShown={edits.display.notShown}
+            notKept={edits.notKept}
+            keyChanged={edits.keyChanged}
+            unknownOutcome={edits.staged?.unknownOutcome === "pending"}
+            onAddRow={edits.addRow}
+            onDiscard={requestDiscard}
+            onCommit={commit.open}
+            commitDisabled={commit.disabledReason}
+          />
+        </div>
       </div>
       <RecoverableError profileId={tab.profileId} error={snapshot?.error ?? null} onRetry={table.retry} />
+      {/* The edit target still wants a password after the session opened (L13): an unlock, then it is read again. */}
+      <RecoverableError profileId={tab.profileId} error={edits.targetUnlock} onRetry={edits.refetchTarget} />
       {state.error && (
         <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-1.5 text-[12px] text-danger">
           <span className="min-w-0 flex-1 whitespace-pre-wrap" data-selectable>
@@ -268,16 +472,20 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
           )}
         </div>
       )}
+      {notice && <div className="shrink-0 border-b border-border px-3 py-1.5 text-[12px] text-muted">{notice}</div>}
       {state.sql && <SqlRow sql={state.sql} onOpen={openInQueryTab} />}
       <div className="min-h-0 flex-1">
         {set ? (
           <DataGrid
+            ref={gridRef}
             columns={set.columns}
-            rows={set.rows}
-            hasMore={set.hasMore}
+            rows={edits.display.rows}
+            hasMore={set.hasMore && !kept}
+            partial={set.partial || view.partial || (kept && set.hasMore)}
             loadingMore={execution?.status === "running"}
-            onLoadMore={phase === "open" ? table.loadMore : undefined}
+            onLoadMore={phase === "open" && !kept ? table.loadMore : undefined}
             stale={shown.stale}
+            resetScrollOn={table.position}
             dialect={dialect}
             tableName={tableName}
             sort={gridSort}
@@ -285,12 +493,34 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
             onSortBy={exporting ? undefined : onSortBy}
             extraCellMenu={extraCellMenu}
             onExport={exportSource ? openExport : undefined}
+            edits={edits.grid}
+            onSelectionChange={edits.onSelectionChange}
           />
         ) : (
           placeholder && <p className="p-4 text-[12px] text-muted">{placeholder}</p>
         )}
       </div>
       {exportSource && <ExportDialog source={exportSource} open={exportOpen} onOpenChange={setExportOpen} />}
+      <ConfirmDialog
+        open={askingDiscard}
+        onOpenChange={setAskingDiscard}
+        title="Discard staged changes"
+        message={discardQuestion(edits.changes, relation?.name ?? tab.title)}
+        confirmLabel="Discard"
+        onConfirm={() => {
+          setAskingDiscard(false);
+          edits.discardAll();
+        }}
+      />
+      <ConfirmDialog
+        open={closing.asking}
+        onOpenChange={(open) => !open && keepTab()}
+        title="Close tab"
+        message={closeQuestion(edits.changes, relation?.name ?? tab.title)}
+        confirmLabel="Discard"
+        onConfirm={() => closing.answer(true)}
+      />
+      {commit.dialog}
       {guards.dialog}
     </div>
   );

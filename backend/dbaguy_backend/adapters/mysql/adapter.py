@@ -11,8 +11,10 @@ from typing import Any
 import mysql.connector
 from loguru import logger
 from mysql.connector.connection import MySQLConnection
+from mysql.connector.constants import ServerFlag
 from mysql.connector.cursor import MySQLCursorRaw
 
+from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import ColumnMeta, ErrorPosition, MessageSeverity, ServerMessage
 from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
@@ -26,6 +28,7 @@ from ..base import (
     DatabaseConnection,
     Endpoint,
     ParsedUrl,
+    RowEditing,
     RunOptions,
     StatementCancelled,
     StatementError,
@@ -35,7 +38,7 @@ from ..base import (
 )
 from ..cancel_window import CancelWindow
 from ..sockets import enable_keepalive
-from . import catalog, introspection
+from . import catalog, editing, introspection
 from . import schema as mysql_schema
 from .settings import URL_SCHEMES, connect_params, kill_params, parse_mysql_url, requires_tls, session_settings
 from .types import column_meta, row_converter
@@ -69,18 +72,36 @@ _READ_ONLY_SESSION = "SET SESSION TRANSACTION READ ONLY"
 # diagnostic statement, keeps what SHOW WARNINGS, SHOW ERRORS and GET DIAGNOSTICS report (R-03a-T9e; `DO 0` cleared it).
 _STATUS_PROBE = "SHOW WARNINGS LIMIT 0"
 _PARSE_ERRNOS = frozenset({1064, 1065})  # syntax error, empty query: rejected before anything ran
+_INFO_COUNT = re.compile(r"[0-9]+")  # the server prints the counts with %ld: ASCII digits
+
+
+def rows_matched(info: str | None) -> int | None:
+    """The rows an UPDATE matched, from its OK packet's info: `Rows matched: 1  Changed: 0  Warnings: 0` (⑤ A1), which
+    lc_messages translates (`Datensätze gefunden: 1  Geändert: 0  Warnungen: 0`, `該当した行: 1  変更: 0  警告: 0`) with
+    the three counts in the same order (ruling G8): the first of exactly three numbers; None otherwise (fail closed)."""
+    counts = _INFO_COUNT.findall(info or "")
+    return int(counts[0]) if len(counts) == 3 else None
 
 
 class _VerbatimCursor(MySQLCursorRaw):
     """Sends a statement exactly as written. `MySQLCursor.execute()` first runs any text containing `delimiter `
     through the connector's DELIMITER-script rewriter (even inside a comment or as an alias), which changes user SQL."""
 
+    ok_info: str | None = None  # the OK packet's info text of the last statement (`rows_matched`)
+    ok_status: int | None = None  # the OK packet's status flags of the last statement (`backslash_escapes`)
+
     def execute_verbatim(self, sql: str) -> None:
         self._connection.handle_unread_result()
         self._reset_result()
         statement = sql.encode(self._connection.python_charset)
         self._executed = statement
-        self._handle_result(self._connection.cmd_query(statement))
+        answer = self._connection.cmd_query(statement)
+        # An UPDATE's OK packet says how many rows it matched, which affected_rows (rows changed) does not (⑤ D-05-5),
+        # and every OK packet whether the session reads backslashes as escapes (05a review M2)
+        ok = isinstance(answer, dict) and "affected_rows" in answer
+        self.ok_info = answer.get("info_msg") if ok else None
+        self.ok_status = answer.get("status_flag") if ok else None
+        self._handle_result(answer)
 
     def next_set_within(self, seconds: float | None) -> bool:
         """nextset() that waits at most `seconds` for the next result set to start (ReadTimeoutError after that). The
@@ -93,8 +114,9 @@ class _VerbatimCursor(MySQLCursorRaw):
 
 
 class MysqlResult(StatementResult):
-    def __init__(self, owner: "MysqlConnection", cursor: _VerbatimCursor) -> None:
+    def __init__(self, owner: "MysqlConnection", cursor: _VerbatimCursor, *, update: bool = False) -> None:
         self._owner, self._cursor = owner, cursor
+        self._update = update  # an UPDATE: its rows matched are in the OK packet's info (matched_rows)
         self._closed = False
         # After an error packet the statement is over: never ask for another result set (the flags are stale then).
         # A cancel seen after a successful read is not a failure: the rest of the statement is still on the wire.
@@ -129,6 +151,9 @@ class MysqlResult(StatementResult):
         rowcount = self._cursor.rowcount
         return rowcount if self._columns is None and rowcount >= 0 else None
 
+    def matched_rows(self) -> int | None:
+        return rows_matched(self._cursor.ok_info) if self._update else self.affected_rows()
+
     def next_result(self) -> bool:
         if self._closed or self._failed:
             return False
@@ -158,7 +183,7 @@ class MysqlResult(StatementResult):
         self._owner.finish(self._cursor, more_results=not self._failed)
 
 
-class MysqlConnection(DatabaseConnection):
+class MysqlConnection(DatabaseConnection, RowEditing):
     def __init__(self, conn: MySQLConnection, kill_params: dict[str, Any], read_only: bool, database: str | None) -> None:
         self._conn = conn
         self._kill_params = kill_params
@@ -171,6 +196,7 @@ class MysqlConnection(DatabaseConnection):
         # A cancel before run() has sent anything is kept here: KILL QUERY does nothing to an idle thread (Task 6b)
         self._window = CancelWindow("MySQL")
         self._lost = False  # the connection is gone (or was dropped): it has no transaction any more
+        self._ok_status: int | None = None  # the status flags of the last run()'s OK packet (backslash_escapes)
 
     # ---- statements ----
 
@@ -365,12 +391,14 @@ class MysqlConnection(DatabaseConnection):
 
     def run(self, sql: str, options: RunOptions | None = None) -> StatementResult:
         self._killed.clear()
-        if _MENTIONS_AUTOCOMMIT.search(sql) or first_keyword(sql, Dialect.MYSQL) in _MAY_SET_AUTOCOMMIT:
+        keyword = first_keyword(sql, Dialect.MYSQL)
+        if _MENTIONS_AUTOCOMMIT.search(sql) or keyword in _MAY_SET_AUTOCOMMIT:
             self._autocommit_stale = True
         # Right before the first send, after the clear: a cancel kept while armed means nothing is sent; from here
         # one sets the KILL flag and KILLs.
         self._window.take_over()
         cursor = _VerbatimCursor(self._conn)  # not conn.cursor(): that sends a PING first, one round trip per statement
+        self._ok_status = None
         try:
             cursor.execute_verbatim(sql)
         except (mysql.connector.Error, UnicodeEncodeError) as exc:
@@ -379,7 +407,8 @@ class MysqlConnection(DatabaseConnection):
             with suppress(mysql.connector.Error):
                 cursor.close()
             raise error from exc
-        result = MysqlResult(self, cursor)
+        self._ok_status = cursor.ok_status
+        result = MysqlResult(self, cursor, update=keyword == "UPDATE")
         if self._killed.is_set():  # it ended normally after KILL QUERY (SLEEP() returns 1): still a cancel
             result.close()  # finish() clears the flag
             raise StatementCancelled()
@@ -420,6 +449,12 @@ class MysqlConnection(DatabaseConnection):
         # The status flag of the last packet, no round trip; a lost connection has no transaction any more.
         return not self._lost and bool(self._conn.in_transaction)
 
+    def backslash_escapes(self) -> bool | None:
+        # SERVER_STATUS_NO_BACKSLASH_ESCAPES in the last run()'s OK packet: the session's own sql_mode, no round trip
+        if self._ok_status is None:
+            return None
+        return not self._ok_status & ServerFlag.STATUS_NO_BACKSLASH_ESCAPES
+
     def commit(self) -> None:
         try:
             self._conn.commit()
@@ -452,6 +487,9 @@ class MysqlConnection(DatabaseConnection):
 
     def object_detail(self, path: list[PathSegment]) -> ObjectDetail:
         return introspection.object_detail(self._conn, path)
+
+    def edit_target(self, path: list[PathSegment]) -> EditTarget:
+        return editing.edit_target(self._conn, path)
 
     def schema_snapshot(self) -> SchemaSnapshot:
         return mysql_schema.build_snapshot(self._conn)
@@ -498,7 +536,8 @@ class MysqlAdapter(DatabaseAdapter):
     url_schemes = URL_SCHEMES
     default_port = 3306
     dialect = Dialect.MYSQL
-    capabilities = AdapterCapabilities()  # one connection sees every database; KILL QUERY keeps the transaction
+    # one connection sees every database; KILL QUERY keeps the transaction
+    capabilities = AdapterCapabilities(row_editing=True)
 
     def parse_url(self, url: str) -> ParsedUrl:
         return parse_mysql_url(url)

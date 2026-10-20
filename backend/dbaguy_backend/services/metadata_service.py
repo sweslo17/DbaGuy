@@ -10,7 +10,7 @@ from loguru import logger
 from ..adapters.base import DatabaseConnection, StatementError, StatementNotSent
 from ..adapters.registry import AdapterRegistry
 from ..domain.errors import DomainError, QueryFailed, SessionBusy, WriteOutcomeUnknown
-from ..domain.metadata import MetadataRequest, NodeKind, ObjectDetail, ObjectNode
+from ..domain.metadata import MetadataRequest, ObjectDetail, ObjectNode, path_database
 from ..domain.profiles import AnyProfile
 from ..sessions.worker import SessionWorker
 from .connection_service import ConnectionService
@@ -132,9 +132,7 @@ class MetadataService:
         return self._call_on(profile, target, fn) if retry else self._write_on(profile, target, fn)
 
     def _call(self, request: MetadataRequest, fn: Callable[[DatabaseConnection], T]) -> T:
-        head = request.path[0] if request.path else None
-        database = head.name if head is not None and head.kind == NodeKind.DATABASE else None
-        return self.with_connection(request.profile_id, database, fn)
+        return self.with_connection(request.profile_id, path_database(request.path), fn)
 
     def _call_on(self, profile: AnyProfile, database: str | None, fn: Callable[[DatabaseConnection], T]) -> T:
         key = (profile.id, database)

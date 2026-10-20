@@ -1,3 +1,4 @@
+import json
 import socket
 import sqlite3
 import threading
@@ -171,6 +172,10 @@ def test_engines(client):
             continue
         assert info["transactions"] and info["plan_format"] is None
         assert not (info["query_context"] or info["parameters"] or info["documents"] or info["executed_plan"])
+    assert {name: info["row_editing"] for name, info in engines.items()} == {
+        "postgres": True, "mysql": True, "mssql": True, "sqlite": True, "couchbase": False}
+    # Only PostgreSQL's unsorted order moves an UPDATEd row: its table tabs browse in the key's order (05b K13)
+    assert [name for name, info in engines.items() if info["orders_browse_by_key"]] == ["postgres"]
 
 
 def test_metadata_and_session_over_websocket(client, sqlite_profile_id):
@@ -264,6 +269,24 @@ def test_command_rejected_by_a_closed_session_gets_an_error_and_finished(client,
         finished = receive(ws)
     assert error["type"] == "error" and error["request_id"] == "late" and error["code"] == "session_busy"
     assert finished["type"] == "finished" and finished["request_id"] == "late" and finished["cancelled"] is False
+
+
+def test_every_apply_ends_with_its_edit_outcome_even_one_the_worker_never_ran(client, sqlite_profile_id):  # E1, M1
+    sid = client.post("/sessions", json={"profile_id": sqlite_profile_id}, headers=AUTH).json()["session_id"]
+    with client.websocket_connect(f"{WS_BASE}/sessions/{sid}/ws?token={TOKEN}") as ws:
+        ws.send_json({"type": "apply_edits", "request_id": "r", "plan_id": ""})  # refused by the protocol model
+        invalid = [receive(ws) for _ in range(3)]
+        ws.send_json({"type": "apply_edits", "request_id": "gone", "plan_id": "never-previewed"})  # the worker's own
+        expired = [receive(ws) for _ in range(4)]
+        client.app.state.container.sessions.worker(sid).close()  # the socket stays attached to a dead worker
+        ws.send_json({"type": "apply_edits", "request_id": "late", "plan_id": "p"})
+        busy = [receive(ws) for _ in range(3)]
+    for events, rid, code in ((invalid, "r", "invalid_command"), (busy, "late", "session_busy")):
+        assert [(e["type"], e["request_id"]) for e in events] == [
+            ("error", rid), ("edit_outcome", rid), ("finished", rid)]
+        assert (events[0]["code"], events[1]["outcome"], events[1]["applied"]) == (code, "rolled_back", [])
+    assert [e["type"] for e in expired] == ["started", "error", "edit_outcome", "finished"]
+    assert (expired[1]["code"], expired[2]["outcome"]) == ("plan_expired", "rolled_back")
 
 
 def test_websocket_rejects_bad_token(client, sqlite_profile_id):
@@ -400,6 +423,122 @@ def test_a_save_with_a_bad_draft_name_or_context_keeps_the_rest(client):  # B40 
     assert any("workspace being saved" in line for line in logged) and "bad name" not in "".join(logged)
     # a tab that is wrong in any other way still refuses the whole save
     assert client.put("/workspace", json={"tabs": [{"id": "t3", "kind": "chart"}]}, headers=AUTH).status_code == 422
+
+
+@pytest.mark.parametrize("staged", [
+    # a lone surrogate in a key, in a nested name, in an original: a `JsonValue` takes it, the file cannot be written
+    {"deletes": [{"id": "d:1", "key": {"id": "\ud800"}}]},
+    {"deletes": [{"id": "d:1", "key": {"id": {"\udc00": 1}}}]},
+    {"updates": [{"id": "u:1", "key": {"id": 1}, "set": {"a": {"kind": "null"}}, "original": {"a": "x\ud800"}}]},
+    {"inserts": [{"id": "i:1", "values": {"a": {"kind": "value", "text": "\ud800"}}}]},  # and in a value
+])
+def test_a_save_with_staged_edits_that_cannot_be_written_keeps_the_rest(client, staged):  # B40 and ruling K5
+    """What a browser sends for such a text: JSON with the surrogate escaped. The staged edits are dropped (a WARNING
+    without the text), every other tab is saved, and the workspace is still readable."""
+    logged: list[str] = []
+    sink = logger.add(lambda m: logged.append(m.record["message"]), level="DEBUG")
+    tab = {"id": "t1", "kind": "table", "title": "orders",
+           "staged_edits": {"version": 1, "key_columns": ["id"], **staged}}
+    body = json.dumps({"tabs": [{"id": "q1", "kind": "query", "buffer": "SELECT 1"}, tab], "active_tab_id": "q1"})
+    try:
+        saved = client.put("/workspace", content=body.encode(), headers={**AUTH, "Content-Type": "application/json"})
+    finally:
+        logger.remove(sink)
+    assert saved.status_code == 204
+    state = client.get("/workspace", headers=AUTH).json()
+    assert [(t["id"], t["staged_edits"]) for t in state["tabs"]] == [("q1", None), ("t1", None)]
+    assert state["tabs"][0]["buffer"] == "SELECT 1" and state["tabs"][1]["title"] == "orders"
+    assert any("dropped the staged edits" in line for line in logged)
+
+
+def nested(levels, leaf):
+    """`leaf` inside `levels` lists and objects, alternating."""
+    for index in range(levels):
+        leaf = {"a": leaf} if index % 2 else [leaf]
+    return leaf
+
+
+def deep_staged_edits(levels):
+    return {"version": 1, "key_columns": ["id"], "outcome_unknown": False, "inserts": [],
+            "updates": [{"id": "u:1", "key": {"id": nested(levels, 1)}, "set": {"a": {"kind": "value", "text": "x"}},
+                         "original": {"a": nested(levels, "was")}}],
+            "deletes": [{"id": "d:1", "key": {"id": nested(levels - 1, [])}}]}  # an empty list counts as a level too
+
+
+@pytest.mark.parametrize("levels, kept", [(64, True), (65, False), (254, False)])
+def test_staged_edits_nested_to_the_limit_are_saved_and_read_back(client, levels, kept):  # B40: a file must read back
+    """A cell of 254 levels was taken by the model, the file was written, and then `GET /workspace` failed to serialize
+    it: the next start lost every tab. The cap is 64 (`MAX_CELL_LEVELS`): at 64 the file reads back as it was written,
+    beyond it the staged edits are dropped (the tab and the others are kept) and the workspace still reads."""
+    staged = deep_staged_edits(levels)
+    tabs = [{"id": "q1", "kind": "query", "buffer": "SELECT 1"},
+            {"id": "t1", "kind": "table", "title": "orders", "staged_edits": staged,
+             "object_path": [{"kind": "schema", "name": "public"}, {"kind": "table", "name": "orders"}]}]
+    assert client.put("/workspace", json={"tabs": tabs}, headers=AUTH).status_code == 204
+    read = client.get("/workspace", headers=AUTH)
+    assert read.status_code == 200
+    state = read.json()
+    assert [t["id"] for t in state["tabs"]] == ["q1", "t1"] and state["tabs"][0]["buffer"] == "SELECT 1"
+    assert (state["tabs"][1]["staged_edits"] == staged) if kept else state["tabs"][1]["staged_edits"] is None
+    # and it is still there after the file is read again from disk
+    again = client.get("/workspace", headers=AUTH)
+    assert again.status_code == 200 and again.json() == state
+
+
+def test_a_save_validates_its_staged_edits_once(client, monkeypatch):  # the fix wave's follow-up to L18
+    """`PUT /workspace` validated an 8 MiB staged set twice per save (the repair's check, then the model): now once,
+    and the repair runs only when the model refuses the body."""
+    from dbaguy_backend.domain import edits
+    counted = []
+    measured = edits._text_chars
+    monkeypatch.setattr(edits, "_text_chars", lambda *changes: counted.append(1) or measured(*changes))
+    tab = {"id": "t1", "kind": "table", "title": "orders", "staged_edits": deep_staged_edits(3)}
+    assert client.put("/workspace", json={"tabs": [tab]}, headers=AUTH).status_code == 204
+    assert len(counted) == 1
+    assert client.get("/workspace", headers=AUTH).json()["tabs"][0]["staged_edits"] is not None
+
+
+def test_a_save_with_a_lone_surrogate_in_a_buffer_keeps_every_tab(client):  # ruling K7: it was a 500 for every tab
+    """A client that sends the text as it is (the frontend replaces it first, `workspaceJson`): pydantic takes a lone
+    surrogate in a plain `str`, but `workspace.json` cannot be written with one. It is replaced, not dropped."""
+    logged: list[str] = []
+    sink = logger.add(lambda m: logged.append(m.record["message"]), level="DEBUG")
+    tabs = [{"id": "q1", "kind": "query", "buffer": "SELECT 'a\ud800b \U0001F600'", "title": "t\udc00"},
+            {"id": "q2", "kind": "query", "buffer": "SELECT 1"}]
+    try:
+        saved = client.put("/workspace", content=json.dumps({"tabs": tabs, "active_tab_id": "q1"}).encode(),
+                           headers={**AUTH, "Content-Type": "application/json"})
+    finally:
+        logger.remove(sink)
+    assert saved.status_code == 204
+    read = client.get("/workspace", headers=AUTH)
+    assert read.status_code == 200
+    state = read.json()
+    assert [t["buffer"] for t in state["tabs"]] == ["SELECT 'a\ufffdb \U0001F600'", "SELECT 1"]
+    assert state["tabs"][0]["title"] == "t\ufffd" and state["active_tab_id"] == "q1"
+    assert any("replaced a lone surrogate in 2 text(s)" in line for line in logged)
+    assert "SELECT" not in "".join(logged)  # the text is the user's: never logged
+
+
+@pytest.mark.parametrize("state", [
+    {"tabs": [], "sidebar_tab": "a\ud800"},
+    {"sidebar_tab": "a\ud800"},  # no `tabs` at all: the repair of the tabs is not reached
+    {"tabs": [{"id": "q1", "kind": "query", "buffer": "SELECT 1"}], "active_tab_id": "q1", "sidebar_tab": "a\udc00"},
+])
+def test_a_save_with_a_lone_surrogate_outside_the_tabs_works_too(client, state):  # ruling K7: it was a 500
+    """The workspace's own text fields (the sidebar's tab, the active tab's id) are repaired like a tab's."""
+    logged: list[str] = []
+    sink = logger.add(lambda m: logged.append(m.record["message"]), level="DEBUG")
+    try:
+        saved = client.put("/workspace", content=json.dumps(state).encode(),
+                           headers={**AUTH, "Content-Type": "application/json"})
+    finally:
+        logger.remove(sink)
+    assert saved.status_code == 204
+    read = client.get("/workspace", headers=AUTH)
+    assert read.status_code == 200 and read.json()["sidebar_tab"] == "a\ufffd"
+    assert read.json()["active_tab_id"] == state.get("active_tab_id")
+    assert any("replaced a lone surrogate in 1 text(s)" in line for line in logged)
 
 
 def test_settings_and_workspace_reject_bad_input(client):

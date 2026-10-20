@@ -32,5 +32,10 @@ def configure_user_loaders(adapters: AdaptersMap) -> None:
             adapters.register_loader(info.array_oid, TextLoader)
 
 
+def category_for_type_name(name: str) -> ColumnCategory:
+    """The grid category of a built-in type by its pg_type name (grid editing reads columns from the catalog)."""
+    return _NAME_CATEGORY.get(name, ColumnCategory.OTHER)
+
+
 def category_for_oid(oid: int) -> ColumnCategory:
     return _OID_CATEGORY.get(oid, ColumnCategory.OTHER)

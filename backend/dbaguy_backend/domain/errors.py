@@ -46,6 +46,12 @@ class UnsupportedFormat(ValidationFailed):
     code = "unsupported_format"
 
 
+class NotEditable(ValidationFailed):
+    """Grid editing refused for this table or engine (spec ⑤ §3.4): the message is the target's reason."""
+
+    code = "not_editable"
+
+
 class ConnectionFailed(DomainError):
     code = "connection_failed"
     status = 502
@@ -165,9 +171,12 @@ class NumberOutOfRange(ValidationFailed):
         )
 
 
+READ_ONLY_MESSAGE = "This connection is read-only"
+
+
 class ReadOnlyProfile(DomainError):
     code = "read_only"
     status = 403
 
     def __init__(self) -> None:
-        super().__init__("This connection is read-only")
+        super().__init__(READ_ONLY_MESSAGE)

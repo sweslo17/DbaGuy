@@ -2,6 +2,7 @@ import itertools
 import queue
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager
@@ -26,16 +27,20 @@ from ..adapters.base import (
     StatementError,
     StatementResult,
     invalid_text_error,
+    transaction_open_error,
 )
 from ..adapters.values import PLAN_TEXT_LIMIT, TEXT_LIMIT, encode_row
 from ..domain.classification import Classification, StatementKind
+from ..domain.edits import PLAN_EXPIRED, PLAN_EXPIRED_MESSAGE, EditPlan, PlanUnavailable
 from ..domain.errors import ConnectionFailed, SessionBusy
 from ..domain.execution import (
     AffectedEvent,
+    ApplyEditsCommand,
     CancelCommand,
     CommitCommand,
     ConfirmationRequiredEvent,
     DiscardCommand,
+    EditOutcomeEvent,
     ErrorEvent,
     ExecuteCommand,
     ExportCommand,
@@ -67,12 +72,24 @@ from ..sql.formatting import (
     unsupported_reason,
 )
 from ..storage.atomic_file import atomic_text_file
+from .edit_apply import (
+    COMMIT_WARNING,
+    CONNECTION_LOST,
+    ROLLBACK_FAILED,
+    ROW_COUNT_UNKNOWN,
+    SQL_MODE_CHANGED,
+    SQL_MODE_CHANGED_MESSAGE,
+    EditProgress,
+    EditReport,
+    history_error,
+    refused,
+)
 from .options import run_options
 from .read_ahead import READ_AHEAD_POLL_S, STALL_RESET_FACTOR, StallClock
 from .session_state import SessionStateTracker
 
 T = TypeVar("T")
-RequestCommand = TypeVar("RequestCommand", ExecuteCommand, ExportCommand)
+RequestCommand = TypeVar("RequestCommand", ExecuteCommand, ExportCommand, ApplyEditsCommand)
 Emitter = Callable[[BaseModel], None]
 TransactionCommand = CommitCommand | RollbackCommand | SetAutocommitCommand
 _CHUNK = 200
@@ -81,6 +98,12 @@ _READ_AHEAD = object()  # what `_next_task` gives when no task is queued and the
 _EXPORT_CHUNK = 1000  # rows fetched, written and checked for a cancel at a time
 _PROGRESS_EVERY = 10_000  # an export reports its row count each time it passes a multiple of this
 _EXPORT_SELECT_ONLY = "Only a statement that returns rows (SELECT, WITH, VALUES…) can be exported"
+# The warning of a queued request whose session closed before it ran. src/features/edits/commitFlow.ts matches it to say
+# so for an apply (rather than "Cancelled"): change both together
+CLOSED_BEFORE_START = "Session closed before the query started"
+# A grid commit's texts (BEGIN, its DML, COMMIT) return no result set to show: nothing to describe (05a review M1). A
+# trigger's SELECT still comes back as a result set, which has no count (row_count_unknown, ruling E9).
+_EDIT_OPTIONS = RunOptions(describe=False)
 
 
 def paused_result_closed_text(limit_s: float) -> str:
@@ -138,6 +161,10 @@ def _ignore(*_: object) -> None:
     return None
 
 
+def _no_edit_plans(plan_id: str) -> EditPlan:
+    raise PlanUnavailable(PLAN_EXPIRED, PLAN_EXPIRED_MESSAGE)
+
+
 @dataclass(frozen=True)
 class WorkerHooks:
     """How a worker reaches the rest of the app. The defaults run everything and record nothing."""
@@ -147,6 +174,8 @@ class WorkerHooks:
     on_record: Callable[[ExecutionRecord], None] = _ignore
     on_schema_change: Callable[[], None] = _ignore
     capabilities: AdapterCapabilities = AdapterCapabilities()  # which run() options the engine takes; idle limits
+    # The previewed grid-edit plan with this id, taken once (spec ⑤ D-05-7); raises PlanUnavailable
+    take_edit_plan: Callable[[str], EditPlan] = _no_edit_plans
 
 
 @dataclass
@@ -320,6 +349,8 @@ class SessionWorker:
                 self._submit_request(command, self._execute)
             case ExportCommand():
                 self._submit_request(command, self._export)
+            case ApplyEditsCommand():
+                self._submit_request(command, self._apply_edits)
             case FetchMoreCommand():
                 self._put(lambda: self._fetch_more(command))
             case DiscardCommand():
@@ -606,7 +637,7 @@ class SessionWorker:
             if cancelled:
                 return "Query cancelled before it started"
             if self._closed:
-                return "Session closed before the query started"
+                return CLOSED_BEFORE_START
             self._running_request = request_id
             self._cancel_requested = False
             self._cancels = 0
@@ -614,13 +645,16 @@ class SessionWorker:
             self._tracker.activity(busy=True)
         return None
 
-    def _start_request(self, req: _Request) -> bool:
-        """Leave the queue and announce `started`. When the request must not run, end it here and return False."""
+    def _start_request(self, req: _Request, *, before_finished: BaseModel | None = None) -> bool:
+        """Leave the queue and announce `started`. When the request must not run, end it here (with `before_finished`
+        right before its `finished`, when given) and return False."""
         skipped = self._begin_request(req.request_id)
         self._send(StartedEvent(request_id=req.request_id))
         if skipped is None:
             return True
         self._send(MessageEvent(request_id=req.request_id, severity=MessageSeverity.WARNING, text=skipped))
+        if before_finished is not None:
+            self._send(before_finished)
         self._send_finished(req.request_id, req.elapsed_ms(), cancelled=True)
         return False
 
@@ -800,8 +834,11 @@ class SessionWorker:
         self._send(MessageEvent(request_id=request_id, severity=message.severity, text=message.text))
 
     def _send_messages(self, ex: _OpenExecution) -> None:
-        for message in ex.result.take_messages():
-            self._send_live_message(ex.request_id, message)
+        self._forward_messages(ex.request_id, ex.result)
+
+    def _forward_messages(self, request_id: str, result: StatementResult) -> None:
+        for message in result.take_messages():
+            self._send_live_message(request_id, message)
 
     def _pump(self, ex: _OpenExecution, budget: int) -> None:
         result = ex.result
@@ -944,6 +981,196 @@ class SessionWorker:
             # Before `finished` goes out and the result closes: from now on a cancel must not reach the connection.
             self._set_running(None)
             self._close_result(result)
+
+    def _apply_edits(self, cmd: ApplyEditsCommand) -> None:
+        """Apply a previewed plan (spec ⑤ §3.5): its texts and nothing else, in one explicit transaction on this
+        session, every statement checked to match what it must (R-05-5), the outcome classified once (`EditProgress`)
+        and never sent again. Events: started → affected × n → [error] → edit_outcome → session_state → finished;
+        every apply ends with one edit_outcome, a refused or skipped one too (ruling E1)."""
+        self._discard_open()  # the grid's paused result ends first (R-05-4); its own `finished` goes out as usual
+        req = _Request(request_id=cmd.request_id, sql="", kind=StatementKind.WRITE)
+        skipped = EditOutcomeEvent(request_id=req.request_id, outcome="rolled_back")
+        if not self._start_request(req, before_finished=skipped):
+            return
+        plan: EditPlan | None = None
+        progress: EditProgress | None = None
+        try:
+            plan = self._take_plan(cmd.plan_id)
+            req.sql = plan.script  # what History keeps (D-05-9)
+            progress = EditProgress(plan.statements, plan.transactional, dialect=self._hooks.dialect)
+            self._check_plan(plan)
+            report = self._run_plan(req, plan, progress)
+        except StatementError as exc:  # refused before anything was sent: _run_plan classifies every stop of its own
+            report = refused(exc)
+        except Exception as exc:
+            logger.exception("Unexpected error applying edits on {}", self.name)
+            if req.ran and not (progress is not None and progress.committing):
+                # release what the BEGIN opened (a table that cannot roll back too); the outcome stays as broke() says
+                self._rollback_quietly(req.request_id)
+            report = (progress if progress is not None else EditProgress((), True)).broke(exc)
+        finally:
+            self._set_running(None)
+        self._end_apply(req, plan, report)
+
+    def _take_plan(self, plan_id: str) -> EditPlan:
+        try:
+            return self._hooks.take_edit_plan(plan_id)
+        except PlanUnavailable as exc:
+            raise StatementError(exc.message, code=exc.code) from None
+
+    def _check_plan(self, plan: EditPlan) -> None:
+        """Before anything is sent (spec §3.5 steps 3–4): every text can reach the driver whole, the policy passes every
+        DML statement (a profile made read-only since the preview is refused here, and the server refuses again,
+        R-05-7), and no transaction is open (R-05-4)."""
+        for sql in (plan.begin, *(statement.sql for statement in plan.statements), plan.commit):
+            _check_text(sql)
+        for statement in plan.statements:
+            decision = self._hooks.check(statement.sql, True)
+            if decision.action == GuardAction.BLOCK:
+                logger.info("[{}] blocked an apply of {} statement(s) (read-only)", self.name, len(plan.statements))
+                raise StatementError(_read_only_message(decision.classification.kind), code="read_only")
+        if self.connection.in_transaction():
+            raise transaction_open_error()
+
+    def _run_plan(self, req: _Request, plan: EditPlan, progress: EditProgress) -> EditReport:
+        """BEGIN, each statement, the checks before COMMIT, COMMIT. Every stop from the BEGIN on is classified here
+        (never by the caller's "refused"), so nothing that went out reads as if it had not."""
+        rid = req.request_id
+        try:
+            self._edit_statement(req, plan.begin)
+            self._check_literals(plan)
+        except StatementError as exc:
+            # A BEGIN that failed opened nothing; one whose answer was lost died with its link; one refused by the
+            # check after it sent nothing else
+            self._rollback_quietly(rid)
+            return refused(exc)
+        progress.sent = True
+        for index, statement in enumerate(plan.statements):
+            progress.index, progress.reached = index, False
+            try:
+                self._raise_if_cancelled()  # a Cancel between statements: this one was never sent
+                progress.reached = True
+                rows = self._edit_statement(req, statement.sql)
+                if rows is not None and rows >= 0:
+                    req.rows += rows
+                    self._send(AffectedEvent(request_id=rid, index=index, rows=rows))
+                if (mismatch := progress.matched(rows)) is not None:
+                    logger.info("[{}] apply {}: statement {} ({}) matched {} row(s)", self.name, rid, index,
+                                statement.kind, rows)
+                    raise mismatch
+            except StatementError as exc:
+                self._rollback_quietly(rid)
+                return progress.failed(exc)
+        cancelled = self._set_running(None)  # from here a Cancel never reaches the driver (R-05-6)
+        if plan.transactional:  # ruling E11: a table that cannot roll back has every statement applied already
+            if (stopped := self._before_commit(rid, progress, cancelled)) is not None:
+                return stopped
+        progress.committing = True
+        try:
+            self._edit_statement(req, plan.commit)
+        except StatementError as exc:
+            if exc.code != CONNECTION_LOST:
+                self._rollback_quietly(rid)  # SQLite keeps the transaction after a busy COMMIT (A14); a no-op elsewhere
+            return progress.commit_failed(exc)
+        return self._after_commit(rid, progress)
+
+    def _check_literals(self, plan: EditPlan) -> None:
+        """Right after BEGIN, before any DML: this session reads a backslash as the plan's literals were written for
+        (D-05-13; 05a review M2). The plan has that from the metadata connection; BEGIN's own answer says this
+        session's (MySQL's OK packet, no extra round trip). An engine whose answers do not say passes."""
+        session = self.connection.backslash_escapes()
+        if session is not None and session != plan.backslash_escapes:
+            logger.info("[{}] refused an apply: the session's backslash escapes are {}, the plan's {}", self.name,
+                        session, plan.backslash_escapes)
+            raise StatementError(SQL_MODE_CHANGED_MESSAGE, code=SQL_MODE_CHANGED)
+
+    def _before_commit(self, request_id: str, progress: EditProgress, cancelled: bool) -> EditReport | None:
+        """Spec §3.5 step 7 for a transactional target (ruling E12): what stops the COMMIT, or None to send it. Nothing
+        is committed yet, so every stop rolls back, but a transaction that vanished has an unknown fate. A state that
+        cannot be read stops it too, rolled back (pre-flight L8)."""
+        connection = self.connection
+        try:
+            if cancelled:
+                report = progress.cancelled_before_commit()
+            elif connection.transaction_failed():
+                report = progress.aborted_before_commit()
+            elif not connection.in_transaction():
+                return progress.ended_before_commit()
+            else:
+                return None
+        except StatementError as exc:
+            report = refused(exc)
+        self._rollback_quietly(request_id)
+        return report
+
+    def _after_commit(self, request_id: str, progress: EditProgress) -> EditReport:
+        """COMMIT returned: it committed only if no transaction is left open (pre-flight L7). One still open is rolled
+        back, so the tab is not left holding it; `commit_unconfirmed` says what that means for the outcome."""
+        try:
+            left_open = self.connection.in_transaction()
+        except StatementError as exc:  # the connection cannot say
+            return progress.commit_unconfirmed(exc)
+        if not left_open:
+            return progress.committed()
+        self._rollback_quietly(request_id)
+        return progress.commit_unconfirmed()
+
+    def _edit_statement(self, req: _Request, sql: str) -> int | None:
+        """Run one text of the plan: the rows it matched are read first, then the rest of its answer to the end, so
+        SQL Server never has to stop it with an attention (ruling E9); its messages (a trigger's NOTICE or PRINT) go
+        to the request."""
+        result = self._run_statement(req, "edit", sql, _EDIT_OPTIONS)
+        try:
+            rows = result.matched_rows()
+            self._forward_messages(req.request_id, result)
+            while result.next_result():
+                self._forward_messages(req.request_id, result)
+            return rows
+        finally:
+            self._close_result(result)
+
+    def _rollback_quietly(self, request_id: str) -> None:
+        """End the apply's transaction once it stopped. No Cancel may reach the ROLLBACK, so the request stops running
+        first. A connection that is gone cannot roll back: the server does it as the connection ends (R-05-6). One that
+        is still there and still in the transaction gets a warning: a table-data tab has no Rollback (pre-flight L8)."""
+        self._set_running(None)
+        try:
+            self.connection.rollback()
+            return
+        except Exception as exc:
+            logger.info("[{}] the rollback after a stopped apply failed ({})", self.name,
+                        getattr(exc, "code", None) or type(exc).__name__)
+        try:
+            still_open = self.connection.in_transaction()
+        except Exception:
+            return  # it cannot tell: as for a connection that is gone
+        if still_open:
+            logger.warning("[{}] apply {}: its transaction is still open after the rollback failed", self.name,
+                           request_id)
+            self._send(MessageEvent(request_id=request_id, severity=MessageSeverity.WARNING, text=ROLLBACK_FAILED))
+
+    def _end_apply(self, req: _Request, plan: EditPlan | None, report: EditReport) -> None:
+        """The apply's last events: its error (for a commit that stood, a warning instead), the edit_outcome, then the
+        History record, session_state and finished (`_complete`)."""
+        rid, error = req.request_id, report.error
+        if error is not None and report.outcome == "committed":
+            text = f"{COMMIT_WARNING}: {error.message}"
+            self._send(MessageEvent(request_id=rid, severity=MessageSeverity.WARNING, text=text))
+        elif error is not None:
+            self._send(ErrorEvent(request_id=rid, message=error.message, code=error.code, position=error.position))
+        self._send(EditOutcomeEvent(
+            request_id=rid, outcome=report.outcome, applied=report.applied, already_gone=report.already_gone,
+            failed_change=report.failed_change, statement=report.statement,
+        ))
+        statements = plan.statements if plan is not None else ()
+        kinds = Counter(statement.kind for statement in statements)  # counts only: never a key or a value (spec §5)
+        warn = report.outcome in ("unknown", "partial") or (error is not None and error.code == ROW_COUNT_UNKNOWN)
+        logger.log("WARNING" if warn else "INFO",
+                   "[{}] apply {}: {} delete(s), {} update(s), {} insert(s) on {} → {} in {} ms{}", self.name, rid,
+                   kinds["delete"], kinds["update"], kinds["insert"], plan.table if plan is not None else "-",
+                   report.outcome, req.elapsed_ms(), f" ({error.code})" if error is not None and error.code else "")
+        cancelled = report.outcome == "rolled_back" and isinstance(error, StatementCancelled)
+        self._complete(req, error=history_error(report, len(statements)), cancelled=cancelled)
 
     def _transaction_command(self, cmd: TransactionCommand) -> None:
         self._discard_open()
@@ -1095,8 +1322,10 @@ class SessionWorker:
     def _close_result(self, result: StatementResult) -> None:
         try:
             result.close()
-        except Exception as exc:
-            logger.warning("Error closing result on {}: {}", self.name, exc)
+        except Exception as exc:  # the code only above DEBUG: a server's text may echo literals (spec ⑤ §5, L9)
+            code = getattr(exc, "code", None) or type(exc).__name__
+            logger.warning("Error closing result on {} ({})", self.name, code)
+            logger.debug("Error closing result on {}: {}", self.name, exc)
 
     def _finish(self, ex: _OpenExecution, cancelled: bool = False) -> None:
         self._clear_paused()

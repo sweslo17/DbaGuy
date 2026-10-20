@@ -34,6 +34,8 @@ export interface ExportSource {
   title: string;
   /** Prefills the INSERT target (table data). */
   tableName?: TableName | null;
+  /** A line the dialog shows above its settings (table data: staged changes are not in the export). */
+  note?: string | null;
 }
 
 type ExportFormat = Exclude<FormatKind, "in_list">;
@@ -327,6 +329,11 @@ export function ExportDialog({
         </div>
       ) : (
         <div className="flex flex-col gap-2">
+          {source.note && (
+            <p className="text-[12px] text-warning" data-selectable>
+              {source.note}
+            </p>
+          )}
           <FieldRow label="Format">
             <Select value={format} onChange={(e) => changeFormat(e.target.value as ExportFormat)}>
               {formats.map((kind) => (

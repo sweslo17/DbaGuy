@@ -5,6 +5,7 @@ from enum import StrEnum
 from typing import Any, ClassVar, Literal
 
 from ..domain.couchbase import FieldSample, Keyspace
+from ..domain.edits import EditTarget
 from ..domain.errors import ValidationFailed
 from ..domain.execution import ColumnMeta, ErrorPosition, Presentation, QueryContext, ServerMessage, StatementParams
 from ..domain.metadata import Folder, NodeKind, ObjectDetail, ObjectNode, PathSegment, ServerInfo, child_path
@@ -42,6 +43,9 @@ class AdapterCapabilities:
     # the server is not held back while the user looks at a page; None: the engine does not read ahead (not in
     # EngineInfo)
     read_ahead_bytes: int | None = None
+    row_editing: bool = False  # a table-data grid can be edited (spec ⑤): the connection is RowEditing
+    # A table-data tab's first browse waits for the edit target and sorts by its `stable_order` (PostgreSQL, 05b K13)
+    orders_browse_by_key: bool = False
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,9 @@ class RunOptions:
     params: StatementParams | None = None  # needs capabilities.parameters
     profile_plan: bool = False  # needs capabilities.executed_plan (04b)
     retry_safe: bool = False  # the statement was classified READ: an adapter may send it again after a stale connection
+    # False: the statement returns no result set to show (a grid commit's own texts, spec ⑤ §3.5), so an adapter may
+    # skip reading its result's column types first (SQL Server's describe: a round trip per statement, 05a review M1)
+    describe: bool = True
 
 
 @dataclass(frozen=True)
@@ -166,6 +173,12 @@ class StatementResult(ABC):
         transaction open and healthy (e.g. PostgreSQL closes a cursor instead of cancelling the statement).
         """
 
+    def matched_rows(self) -> int | None:
+        """How many rows the DML statement matched (spec ⑤ D-05-5), an UPDATE whose new values equal the old ones
+        included. The default is affected_rows(); an engine whose count is rows changed overrides it (MySQL). None: not
+        known (the apply then fails closed)."""
+        return self.affected_rows()
+
     def presentation(self) -> Presentation:
         """How the client may show the current result set: "plan" for an EXPLAIN / ADVISE / profile result."""
         return "grid"
@@ -236,6 +249,12 @@ class DatabaseConnection(ABC):
         """True when the open transaction is aborted and only accepts ROLLBACK (PostgreSQL); False otherwise."""
         return False
 
+    def backslash_escapes(self) -> bool | None:
+        """Whether the session reads a backslash in a string literal as an escape, as the answer to the last `run()`
+        said (no round trip; a grid commit checks it after its BEGIN, ⑤ D-05-13). None when the engine's answers do not
+        say (every engine but MySQL) or that answer did not (rows, an error)."""
+        return None
+
     @abstractmethod
     def autocommit(self) -> bool: ...
 
@@ -292,6 +311,16 @@ class FieldSampling(ABC):
         the owning worker thread like every method; a server's error answer is raised as StatementError."""
 
 
+class RowEditing(ABC):
+    """A connection whose engine can tell how a table's rows are identified and written (capability `row_editing`,
+    spec ⑤ §3.2). The profile's metadata connection answers it, on its worker thread like every method."""
+
+    @abstractmethod
+    def edit_target(self, path: list[PathSegment]) -> EditTarget:
+        """A view or another non-table, or a table without a usable key: `editable=False` with the reason, never an
+        error. NotFound when the table does not exist."""
+
+
 class DatabaseAdapter(ABC):
     engine: ClassVar[Engine]
     url_schemes: ClassVar[tuple[str, ...]]
@@ -333,6 +362,7 @@ class DatabaseAdapter(ABC):
             cancel_aborts_transaction=caps.cancel_aborts_transaction, server_read_only=caps.server_read_only,
             transactions=caps.transactions, query_context=caps.query_context, parameters=caps.parameters,
             documents=caps.documents, executed_plan=caps.executed_plan, plan_format=caps.plan_format,
+            row_editing=caps.row_editing, orders_browse_by_key=caps.orders_browse_by_key,
         )
 
     def relation_path(self, database: str | None, schema: str, name: str, kind: RelationKind) -> list[PathSegment]:

@@ -23,6 +23,7 @@ from json.decoder import scanstring
 from typing import NoReturn
 
 from ..domain.couchbase import ChangeCounts, ChangeKind, DocumentChange
+from ..domain.well_formed import LONE_SURROGATE
 
 CHANGES_PER_KIND = 100  # changes kept per kind; the counts still count every one
 CHANGES_LISTED = 200  # changes listed in a preview
@@ -151,8 +152,6 @@ def without_strings(text: str) -> str:
 
 
 _PLAIN_KEY = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
-# A surrogate code point in a str: a decoded `\ud800`, never half of a pair (a str holds pairs as one character).
-LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
 _NUMBER_START = frozenset("-0123456789")
 _KIND_ORDER: tuple[ChangeKind, ...] = ("other", "duplicate_key", "number", "key_order")
 Steps = tuple[str | int, ...]

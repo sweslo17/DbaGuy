@@ -1,10 +1,13 @@
 import json
 import os
+from pathlib import Path
+from typing import Annotated
 
 import pytest
 from loguru import logger
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError, WrapValidator
 
+from dbaguy_backend.domain.edits import MAX_STAGED_CHARS, MAX_VALUE_CHARS, StagedEditsFile
 from dbaguy_backend.domain.errors import AlreadyExists, NotFound, StorageError, ValidationFailed
 from dbaguy_backend.domain.execution import QueryContext
 from dbaguy_backend.domain.metadata import PathSegment
@@ -13,7 +16,7 @@ from dbaguy_backend.domain.workspace import WorkspaceState, WorkspaceTab
 from dbaguy_backend.services import scripts_service
 from dbaguy_backend.services.scripts_service import ScriptsService
 from dbaguy_backend.services.settings_service import SettingsService
-from dbaguy_backend.services.workspace_service import WorkspaceService, repaired_workspace
+from dbaguy_backend.services.workspace_service import WorkspaceService, repaired_workspace, validated_workspace
 from dbaguy_backend.storage.atomic_file import atomic_text_file
 from dbaguy_backend.storage.json_files import JsonDocument, write_text_atomic
 
@@ -670,3 +673,305 @@ def test_workspace_keeps_the_tab_context_and_params(tmp_path):  # Review Focus 5
         WorkspaceTab(id="d", kind="query", params={"n": "1"})  # a draft is keyed by `$name` or `$n`
     with pytest.raises(ValidationError):
         WorkspaceTab(id="d", kind="query", query_context="all")
+
+
+STAGED_PATH = [{"kind": "database", "name": "dbaguy"}, {"kind": "schema", "name": "public"},
+               {"kind": "folder", "name": "tables"}, {"kind": "table", "name": "orders"}]
+
+
+def staged_edits(**overrides):
+    """A table tab's staged edits as the frontend writes them (`savedEdits`, spec ⑤ §3.7)."""
+    return {
+        "version": 1,
+        "key_columns": ["id"],
+        "updates": [{"id": "u:1", "key": {"id": "9007199254740993"},
+                     "set": {"label": {"kind": "value", "text": "b"}, "note": {"kind": "null"}},
+                     "original": {"label": "a", "note": ""}},
+                    {"id": "u:2", "key": {"id": 2}, "set": {"data": {"kind": "value", "text": "0xdead"}},
+                     "original": {"data": {"$type": "bytes", "size": 100, "preview": "ab" * 64}}}],
+        "inserts": [{"id": "i:3", "values": {"label": {"kind": "value", "text": ""}}}, {"id": "i:4", "values": {}}],
+        "deletes": [{"id": "d:5", "key": {"id": 2}}],
+        "outcome_unknown": True,
+        **overrides,
+    }
+
+
+def test_workspace_keeps_a_table_tabs_staged_edits(tmp_path):  # spec ⑤ §3.7, Review Focus 5
+    state = WorkspaceState.model_validate({"tabs": [
+        {"id": "t1", "kind": "table", "title": "orders", "object_path": STAGED_PATH, "staged_edits": staged_edits()},
+        {"id": "t2", "kind": "table", "title": "orders", "object_path": STAGED_PATH},
+    ]})
+    service = WorkspaceService(tmp_path / "workspace.json")
+    service.put(state)
+    assert service.get() == state
+    assert service.get().tabs[0].staged_edits.updates[0].key == {"id": "9007199254740993"}  # digits stay text
+
+
+@pytest.mark.parametrize("bad", [
+    {"updates": [{"id": "u:1", "key": {"id": 1}, "set": {"a": {"kind": "value", "text": "x" * (1_048_576 + 1)}},
+                  "original": {"a": None}}]},  # one value over 1 MiB (D-05-11)
+    {"inserts": [{"id": f"i:{n}", "values": {}} for n in range(10_001)], "updates": [], "deletes": []},
+    {"inserts": [{"id": "i:1", "values": {}}, {"id": "i:1", "values": {}}]},  # a repeated id
+    {"inserts": [{"id": f"i:{n}", "values": {"a": {"kind": "value", "text": "x" * 1_048_576}}} for n in range(9)]},
+    {"updates": [{"id": "u:1", "key": {"id": 1}, "set": {"a": {"kind": "null"}}, "original": {}}]},  # no original
+    {"updates": [{"id": "u:1", "key": {"id": 1}, "set": {}, "original": {}}]},  # an UPDATE that sets nothing
+    {"key_columns": []},
+    {"version": 2},
+    {"extra": True},
+])
+def test_staged_edits_beyond_their_limits_are_refused(bad):
+    with pytest.raises(ValidationError):
+        WorkspaceTab(id="t", kind="table", staged_edits=staged_edits(**bad))
+
+
+def test_only_a_table_tab_keeps_staged_edits():
+    with pytest.raises(ValidationError):
+        WorkspaceTab(id="q", kind="query", staged_edits=staged_edits())
+
+
+def test_a_tab_with_staged_edits_the_model_refuses_keeps_everything_else(tmp_path, logged_warnings):  # B40
+    path = tmp_path / "workspace.json"
+    secret = "secret-value"
+    path.write_text(json.dumps({"tabs": [
+        {"id": "t1", "kind": "table", "title": "orders", "object_path": STAGED_PATH,
+         "staged_edits": staged_edits(inserts=[{"id": "i:1", "values": {"a": {"kind": "value", "text": secret}}},
+                                               {"id": "i:1", "values": {}}])},
+        {"id": "q1", "kind": "query", "buffer": "kept", "staged_edits": staged_edits()},
+        {"id": "t2", "kind": "table", "title": "orders", "object_path": STAGED_PATH, "staged_edits": staged_edits()},
+    ]}))
+    t1, q1, t2 = WorkspaceService(path).get().tabs
+    assert (t1.id, t1.object_path is not None, t1.staged_edits) == ("t1", True, None)
+    assert (q1.buffer, q1.staged_edits) == ("kept", None)
+    assert t2.staged_edits is not None  # a good one is untouched
+    assert [line for line in logged_warnings if line.startswith("Repaired")] == [
+        "Repaired tab 0 of the saved workspace: dropped the staged edits",
+        "Repaired tab 1 of the saved workspace: dropped the staged edits"]
+    assert secret not in "".join(logged_warnings)
+    raw = {"tabs": [{"id": "t1", "kind": "table", "staged_edits": {"version": 1, "key_columns": []}}]}
+    assert WorkspaceState.model_validate(repaired_workspace(raw)).tabs[0].staged_edits is None  # `PUT /workspace`
+
+
+@pytest.mark.parametrize("original, original_chars", [
+    ("a", 1), ("\U0001F600", 1),  # a character beyond the BMP counts once, as `len` does (JavaScript's length says two)
+    ({"$type": "bytes", "size": 100, "preview": "ab" * 64}, 150),  # an object's names count too
+    (["ab", 3, None, [True]], 5)])  # an array's elements, nested ones too: 2 + 1 + 1 + 1
+def test_staged_text_is_counted_to_the_character(original, original_chars):  # pre-flight M3
+    """Eight updates: each key {id: n} counts "id" and 1, each original {label: …} counts "label" and its own text, so
+    a set of `total` characters in all is seven values of the limit and one that makes up the rest. The frontend's
+    `savedEdits.test.ts` builds the same sets: what it measures under the limit must be what this keeps."""
+    def tab(total):
+        last = total - 8 * (3 + 5 + original_chars) - 7 * MAX_VALUE_CHARS
+        updates = [{"id": f"u:{n}", "key": {"id": n}, "original": {"label": original},
+                    "set": {"label": {"kind": "value", "text": "x" * (MAX_VALUE_CHARS if n < 7 else last)}}}
+                   for n in range(8)]
+        return WorkspaceTab(id="t", kind="table", staged_edits=staged_edits(updates=updates, inserts=[], deletes=[]))
+    assert len(tab(MAX_STAGED_CHARS).staged_edits.updates) == 8
+    with pytest.raises(ValidationError):
+        tab(MAX_STAGED_CHARS + 1)
+
+
+def test_staged_keys_count_their_column_names():  # pre-flight M3
+    name = "k" * 900
+
+    def tab(count):
+        deletes = [{"id": f"d:{n}", "key": {name: n}} for n in range(count)]
+        return WorkspaceTab(id="t", kind="table", staged_edits=staged_edits(
+            key_columns=[name], updates=[], inserts=[], deletes=deletes))
+    assert len(tab(9_000).staged_edits.deletes) == 9_000  # 8,109,000 characters
+    with pytest.raises(ValidationError):
+        tab(10_000)  # 9,010,000: the frontend's `savedEdits` says the same
+
+
+# ---- what the model refuses beyond size (ruling K5): the frontend's `savedEdits` must write only what it takes ----
+# `fixtures/staged_edits_cases.json` is read by this test and by `savedEdits.test.ts`: the same files go through both,
+# so what one side keeps the other takes and what one side refuses the other refuses. Size is mostly not in it (it has
+# its own boundary tests above and in `savedEdits.test.ts`); an update that sets nothing, a repeated id, a name of 0 or
+# 1,025 characters, a lone surrogate (a text that is not valid Unicode) and a cell nested 255 levels are. So are the
+# sets beyond a limit that the frontend writes without the UPDATEs hidden under DELETEs (ruling K3b,
+# `kept_without_hidden`: the file it writes instead, which the model must take; null when it writes none).
+# `{"$repeat": n, "item": ...}` in a list stands for n copies of the item, with `{n}` in its strings replaced by 1...n
+# (`savedEdits.test.ts` reads it the same way), so a file beyond 10,000 entries or 8 MiB stays small.
+def _expanded(value, n=None):
+    if isinstance(value, str):
+        return value if n is None else value.replace("{n}", str(n))
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            if isinstance(item, dict) and "$repeat" in item:
+                items.extend(_expanded(item["item"], i) for i in range(1, item["$repeat"] + 1))
+            else:
+                items.append(_expanded(item, n))
+        return items
+    if isinstance(value, dict):
+        return {name: _expanded(item, n) for name, item in value.items()}
+    return value
+
+
+STAGED_CASES = _expanded(json.loads((Path(__file__).parent / "fixtures" / "staged_edits_cases.json").read_text()))
+
+
+def test_the_staged_edits_cases_cover_what_they_claim():
+    assert len({case["name"] for case in STAGED_CASES}) == len(STAGED_CASES)
+    assert {case["reason"] for case in STAGED_CASES} == {None, "value", "name", "other", "too_large"}
+    assert {case["accepted"] for case in STAGED_CASES} == {True, False}
+    reduced = [case["kept_without_hidden"] for case in STAGED_CASES if "kept_without_hidden" in case]
+    assert any(file is None for file in reduced) and any(file is not None for file in reduced)
+    counted = next(case for case in STAGED_CASES if "10,000" in case["name"])
+    assert len(counted["file"]["deletes"]) == 5_001  # the shorthand was read
+
+
+@pytest.mark.parametrize("case", STAGED_CASES, ids=lambda case: case["name"])
+def test_the_staged_edits_model_refuses_exactly_what_the_frontend_does_not_write(case):
+    if case["accepted"]:
+        assert StagedEditsFile.model_validate(case["file"]).key_columns == case["file"]["key_columns"]
+    else:
+        with pytest.raises(ValidationError):
+            StagedEditsFile.model_validate(case["file"])
+    if case.get("kept_without_hidden"):  # K3b: what the frontend writes instead is taken, every change of it
+        reduced = case["kept_without_hidden"]
+        taken = StagedEditsFile.model_validate(reduced)
+        assert [len(taken.updates), len(taken.inserts), len(taken.deletes), taken.outcome_unknown] == [
+            len(reduced["updates"]), len(reduced["inserts"]), len(reduced["deletes"]), reduced["outcome_unknown"]]
+
+
+@pytest.mark.parametrize("case", STAGED_CASES, ids=lambda case: case["name"])
+def test_the_repair_drops_what_the_model_refuses_and_keeps_the_rest(case):  # the same cases through `PUT /workspace`
+    raw = {"tabs": [{"id": "q", "kind": "query", "buffer": "kept"},
+                    {"id": "t", "kind": "table", "title": "orders", "staged_edits": case["file"]}]}
+    query, table = WorkspaceState.model_validate(repaired_workspace(raw)).tabs
+    assert query.buffer == "kept" and table.title == "orders"
+    assert (table.staged_edits is not None) == case["accepted"]
+    if case.get("kept_without_hidden"):  # K3b: the file the frontend writes instead is kept
+        raw["tabs"][1]["staged_edits"] = case["kept_without_hidden"]
+        kept = WorkspaceState.model_validate(repaired_workspace(raw)).tabs[1].staged_edits
+        assert kept is not None and len(kept.deletes) == len(case["kept_without_hidden"]["deletes"])
+
+
+# ---- ruling K7: a lone surrogate in a tab's text must never fail the save of every tab ----
+# pydantic takes one in a plain `str` (a buffer, a title, a path segment's name) and the write of `workspace.json` then
+# fails. The frontend replaces it with U+FFFD before it sends (`workspaceJson`); this is the backstop for any client.
+
+def test_has_lone_surrogate_and_well_formed():
+    from dbaguy_backend.domain.well_formed import has_lone_surrogate, well_formed
+    assert not has_lone_surrogate("plain \U0001F600") and well_formed("plain \U0001F600") == "plain \U0001F600"
+    assert has_lone_surrogate("a\ud800b") and has_lone_surrogate("\udc00")
+    assert well_formed("a\ud800b\udc00\U0001F600") == "a\ufffdb\ufffd\U0001F600"
+
+
+def test_a_lone_surrogate_in_a_tab_text_is_replaced_not_dropped_and_the_save_works(tmp_path, logged_warnings):
+    broken = "\ud800"
+    raw = {"tabs": [
+        {"id": "q1", "kind": "query", "title": f"t{broken}", "buffer": f"a{broken}b\U0001F600", "database": "d",
+         "script_path": f"s{broken}.sql", "params": {"$a": f"x{broken}y"}},
+        {"id": "o1", "kind": "object", "title": "orders", "object_path": [{"kind": "table", "name": f"o{broken}"}]},
+        {"id": "q2", "kind": "query", "buffer": "kept \U0001F600"},
+        {"id": "t1", "kind": "table", "title": "orders", "object_path": STAGED_PATH,
+         "staged_edits": staged_edits(deletes=[{"id": "d:9", "key": {"id": broken}}])},
+    ]}
+    repaired = repaired_workspace(raw)
+    assert repaired["tabs"][2] is raw["tabs"][2]  # a tab without one is the very same object
+    q1, o1, q2, t1 = WorkspaceState.model_validate(repaired).tabs
+    assert (q1.title, q1.buffer, q1.script_path, q1.database) == ("t\ufffd", "a\ufffdb\U0001F600", "s\ufffd.sql", "d")
+    assert q1.params == {"$a": "x\ufffdy"} and o1.object_path[0].name == "o\ufffd" and q2.buffer == "kept \U0001F600"
+    assert t1.staged_edits is None  # not replaced: a value there would change what a commit writes (K5)
+    assert [line for line in logged_warnings if line.startswith("Repaired")] == [
+        "Repaired tab 0 of the workspace being saved: replaced a lone surrogate in 4 text(s)",
+        "Repaired tab 1 of the workspace being saved: replaced a lone surrogate in 1 text(s)",
+        "Repaired tab 3 of the workspace being saved: dropped the staged edits"]
+    service = WorkspaceService(tmp_path / "workspace.json")
+    service.put(WorkspaceState.model_validate(repaired))  # the write that failed for every tab
+    assert WorkspaceService(tmp_path / "workspace.json").get().tabs[0].buffer == "a\ufffdb\U0001F600"
+
+
+def test_a_lone_surrogate_in_the_workspaces_own_text_is_replaced_too(logged_warnings):
+    broken = "\ud800"
+    raw = {"tabs": [{"id": "q1", "kind": "query", "buffer": "kept"}],
+           "active_tab_id": f"a{broken}", "sidebar_tab": f"s{broken}"}
+    repaired = repaired_workspace(raw)
+    assert repaired["tabs"][0] is raw["tabs"][0]  # a tab without one is the very same object
+    state = WorkspaceState.model_validate(repaired)
+    assert (state.active_tab_id, state.sidebar_tab, state.tabs[0].buffer) == ("a\ufffd", "s\ufffd", "kept")
+    assert logged_warnings == ["Repaired the workspace being saved: replaced a lone surrogate in 2 text(s)"]
+    no_tabs = repaired_workspace({"sidebar_tab": broken})  # `tabs` missing: the default list
+    assert WorkspaceState.model_validate(no_tabs).sidebar_tab == "\ufffd"
+
+
+def test_the_change_limit_says_what_is_done_with_the_changes():
+    from dbaguy_backend.domain.edits import EditChanges
+    many = [{"id": f"i:{n}", "values": {}} for n in range(10_001)]
+    with pytest.raises(ValidationError, match="at most 10,000 changes are committed at once"):
+        EditChanges.model_validate({"inserts": many})
+    with pytest.raises(ValidationError, match="at most 10,000 changes are kept at once"):
+        WorkspaceTab(id="t", kind="table", staged_edits=staged_edits(inserts=many, updates=[], deletes=[]))
+
+
+# ---- `PUT /workspace` validates once (the fix wave's follow-up to L18): repaired and validated again only when the
+# model refuses the body, with what is kept and every WARNING as when every save was repaired first ----
+PUT_BODY = TypeAdapter(Annotated[WorkspaceState, WrapValidator(validated_workspace)])  # as `api/workspace.py` has it
+BROKEN = "\ud800"
+
+
+def nested_list(levels):
+    cell = 1
+    for _ in range(levels):
+        cell = [cell]
+    return cell
+
+SAVES = {
+    "plain": {"tabs": [{"id": "q", "kind": "query", "buffer": "kept"},
+                       {"id": "t", "kind": "table", "title": "orders", "object_path": STAGED_PATH,
+                        "staged_edits": staged_edits()}], "active_tab_id": "t"},
+    "a lone surrogate in a text (K7)": {"tabs": [{"id": "q", "kind": "query", "title": f"t{BROKEN}",
+                                                   "buffer": f"a{BROKEN}b", "params": {"$a": f"x{BROKEN}"}}],
+                                        "sidebar_tab": f"s{BROKEN}"},
+    "a refused staged set beside a good one (H14)": {"tabs": [
+        {"id": "t1", "kind": "table", "title": "bad", "staged_edits": staged_edits(key_columns=[])},
+        {"id": "t2", "kind": "table", "title": "good", "staged_edits": staged_edits()}]},
+    "a staged set nested beyond the cap": {"tabs": [
+        {"id": "t", "kind": "table", "staged_edits": staged_edits(
+            updates=[], inserts=[], deletes=[{"id": "d:1", "key": {"id": nested_list(65)}}])}]},
+    "everything at once in one tab": {"tabs": [
+        {"id": "t", "kind": "table", "title": f"o{BROKEN}", "params": {"bad name": "x"},
+         "staged_edits": staged_edits(updates=[{"id": "u:1", "key": {"id": BROKEN}, "set": {"a": {"kind": "null"}},
+                                                "original": {"a": 1}}])},
+        {"id": "d", "kind": "document", "document_cas": "12ab", "query_context": {"bucket": ""}},
+        {"id": "q", "kind": "query", "staged_edits": staged_edits()}]},
+    "a tab no repair can save": {"tabs": [{"id": "x", "kind": "chart"}, {"id": "q", "kind": "query", "title": BROKEN}]},
+}
+
+
+@pytest.mark.parametrize("raw", SAVES.values(), ids=SAVES.keys())
+def test_a_save_keeps_and_says_what_repairing_every_save_first_did(raw, logged_warnings):
+    try:
+        expected = WorkspaceState.model_validate(repaired_workspace(raw))
+    except ValidationError:
+        expected = None
+    said = list(logged_warnings)
+    logged_warnings.clear()
+    if expected is None:
+        with pytest.raises(ValidationError):
+            PUT_BODY.validate_python(raw)
+    else:
+        assert PUT_BODY.validate_python(raw).model_dump() == expected.model_dump()
+    assert logged_warnings == said
+
+
+@pytest.mark.parametrize("case", STAGED_CASES, ids=lambda case: case["name"])
+def test_a_save_of_each_staged_edits_case_keeps_what_the_repair_kept(case):
+    raw = {"tabs": [{"id": "q", "kind": "query", "buffer": "kept"},
+                    {"id": "t", "kind": "table", "title": "orders", "staged_edits": case["file"]}]}
+    assert PUT_BODY.validate_python(raw).model_dump() == WorkspaceState.model_validate(
+        repaired_workspace(raw)).model_dump()
+
+
+def test_a_save_validates_its_staged_edits_once(monkeypatch):
+    from dbaguy_backend.domain import edits
+    counted = []
+    measured = edits._text_chars
+    monkeypatch.setattr(edits, "_text_chars", lambda *changes: counted.append(1) or measured(*changes))
+    raw = SAVES["plain"]
+    assert PUT_BODY.validate_python(raw).tabs[1].staged_edits is not None
+    assert len(counted) == 1
+    counted.clear()
+    WorkspaceState.model_validate(repaired_workspace(raw))  # how every save was validated before: twice
+    assert len(counted) == 2

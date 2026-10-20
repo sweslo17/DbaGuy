@@ -1,9 +1,10 @@
 import { useCallback, useMemo, useState } from "react";
 import type { Dialect } from "@/lib/api/types";
+import { sameElements } from "@/lib/arrays";
 import { cn } from "@/lib/cn";
 import { PlanResult } from "../explain/PlanResult";
 import { planSetLabel } from "../explain/planModel";
-import { sameElements, useHeldResult } from "../grid/useHeldResult";
+import { useHeldResult } from "../grid/useHeldResult";
 import type { ExecutionState, ResultSetState } from "../session/execution";
 import type { RequestOptions, SessionController, SessionPhase } from "../session/SessionController";
 import { ResultGrid } from "./ResultGrid";

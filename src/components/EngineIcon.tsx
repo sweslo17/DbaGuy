@@ -15,15 +15,6 @@ const MARKS: Record<Exclude<Engine, "mssql">, string> = {
     "M20.111 14.104a1.467 1.458 0 0 1-1.235 1.503c-1.422.244-4.385.398-6.875.398s-5.454-.15-6.877-.398c-.814-.14-1.235-.787-1.235-1.503V9.417a1.57 1.56 0 0 1 1.235-1.505 15.72 15.619 0 0 1 2.156-.14.537.533 0 0 1 .523.543v3.303c1.463 0 2.727-.086 4.201-.086 1.474 0 2.727.086 4.196.086V8.342a.535.532 0 0 1 .494-.569h.027a15.995 15.891 0 0 1 2.156.14 1.57 1.56 0 0 1 1.234 1.504zM12.001 0C5.373 0 0 5.374 0 12c0 6.628 5.373 12 12 12 6.628 0 12-5.372 12-12 0-6.626-5.373-12-12-12z",
 };
 
-/** Each engine's colour: a token (light and dark values in `styles.css`), written out in full so Tailwind emits it. */
-const COLORS: Record<Engine, string> = {
-  postgres: "text-engine-postgres",
-  mysql: "text-engine-mysql",
-  mssql: "text-engine-mssql",
-  couchbase: "text-engine-couchbase",
-  sqlite: "text-engine-sqlite",
-};
-
 export interface EngineIconProps {
   engine: Engine;
   size?: number;
@@ -36,15 +27,20 @@ export interface EngineIconProps {
 }
 
 /**
- * The small mark of a database engine, in the engine's colour. On a coloured surface (a highlighted menu row, a chip)
- * the caller sets the text colour of the surface's `svg`s, which wins over the engine's colour.
+ * The small mark of a database engine, drawn in the current text colour (`currentColor`): monochrome, so it follows the
+ * text and muted tokens of both themes, and a highlighted menu row's or a coloured chip's text colour. Engines are told
+ * apart by shape; a profile's own colour (its dot, the tab's underline) is separate (user request, 2026-10-19).
+ *
+ * SQL Server has no mark of its own (ruling H2): Microsoft's trademark terms allow its logos only with explicit
+ * permission — simple-icons removed every Microsoft icon in 13.0.0 for that reason (PR #10019), and Microsoft's Azure
+ * architecture icons are licensed for diagrams, training and documentation only — so it gets lucide's neutral server
+ * glyph (ISC).
  */
 export function EngineIcon({ engine, size = 14, className, decorative = false }: EngineIconProps) {
   const a11y = decorative
     ? ({ "aria-hidden": true } as const)
     : ({ role: "img", "aria-label": ENGINE_LABELS[engine] } as const);
-  const classes = cn("shrink-0", COLORS[engine], className);
-  // Microsoft's brands are not in simple-icons, and its logo is not ours to use: SQL Server gets a plain server glyph.
+  const classes = cn("shrink-0", className);
   if (engine === "mssql") return <Server size={size} className={classes} {...a11y} />;
   return (
     <svg viewBox="0 0 24 24" width={size} height={size} fill="currentColor" className={classes} {...a11y}>

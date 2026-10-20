@@ -5,10 +5,19 @@ import { api, ApiError, errorMessage, unwrap } from "@/lib/api/client";
 import type { SavedWorkspace } from "@/lib/api/types";
 import { getBackendInfo, isTauriRuntime, type BackendInfo } from "@/lib/backend";
 import { forgetEditorBuffersExcept, onEdited, readEditorBuffer } from "@/stores/editorBuffers";
-import { useWorkspace, type WorkspaceSnapshot } from "@/stores/workspace";
+import { forgetStagedEditsExcept, onStagedEditsChanged, putStagedEdits, readStagedEdits } from "@/stores/stagedEdits";
+import { useWorkspace } from "@/stores/workspace";
 import { fetchProfiles, profilesKey } from "../connections/hooks";
+import { restoredEdits, savedEdits } from "../edits/savedEdits";
 import { clearPendingWorkspace, readPendingWorkspace, writePendingWorkspace } from "./pendingWorkspace";
-import { fromSavedWorkspace, toSavedWorkspace, workspaceJson, type RestoredWorkspace } from "./workspaceFile";
+import { SaveWaiters } from "./saveWaiters";
+import {
+  fromSavedWorkspace,
+  restoreLosses,
+  toSavedWorkspace,
+  workspaceJson,
+  type RestoredWorkspace,
+} from "./workspaceFile";
 
 /** A change is saved at most this long after it was made, so a crash loses at most the last half second of typing. */
 const SAVE_DELAY_MS = 500;
@@ -37,16 +46,34 @@ interface Serialized {
   json: string;
 }
 
-/** The whole workspace as `workspace.json` holds it; the editors' text is read now. */
+/** A tab's staged edits as the file keeps them (`savedEdits`: null beyond the limits, B40). */
+const stagedFile = (tabId: string) => savedEdits(readStagedEdits(tabId)).file;
+
+/** The whole workspace as `workspace.json` holds it; the editors' text and the staged edits are read now. */
 function serialize(): Serialized {
   const { tabs, activeTabId, sidebarTab } = useWorkspace.getState();
-  forgetEditorBuffersExcept(new Set(tabs.map((tab) => tab.id)));
-  const file = toSavedWorkspace({ tabs, activeTabId, sidebarTab }, readEditorBuffer);
+  const open = new Set(tabs.map((tab) => tab.id));
+  forgetEditorBuffersExcept(open);
+  forgetStagedEditsExcept(open);
+  const file = toSavedWorkspace({ tabs, activeTabId, sidebarTab }, readEditorBuffer, stagedFile);
   return { file, json: workspaceJson(file) };
 }
 
-/** A restored state's JSON, before any editor is mounted (comparable whatever it was restored from). */
-const snapshotJson = (snapshot: WorkspaceSnapshot) => workspaceJson(toSavedWorkspace(snapshot, () => null));
+/**
+ * A restored state's JSON, before any editor is mounted (comparable whatever it was restored from). A staged set is
+ * normalized through the store's form: the backend's file adds defaults (`text: null`) that a local copy lacks (L3).
+ */
+const snapshotJson = ({ snapshot, staged }: RestoredWorkspace) =>
+  workspaceJson(
+    toSavedWorkspace(
+      snapshot,
+      () => null,
+      (tabId) => {
+        const file = staged.get(tabId);
+        return file ? savedEdits(restoredEdits(file)).file : null;
+      },
+    ),
+  );
 
 /**
  * The one workspace writer (spec §4.8, rulings R-02c-4 and R-02c-7). Every store mutation and editor change
@@ -66,6 +93,8 @@ class WorkspaceWriter {
   private backend: BackendInfo | null = null;
   /** What the last flush sent: `pagehide` and `beforeunload` both fire, and it is sent once. */
   private flushed: string | null = null;
+  /** `saveNow`'s callers, each waiting for a save that started after it asked. */
+  private readonly waiters = new SaveWaiters();
 
   /**
    * `lastSaved`: the JSON the file holds already, or null to save the current state at once. `mirroredAt`: when the
@@ -87,6 +116,7 @@ class WorkspaceWriter {
       if (changed) this.schedule();
     });
     onEdited(this.schedule);
+    onStagedEditsChanged(this.schedule);
     window.addEventListener("pagehide", this.flush);
     window.addEventListener("beforeunload", this.flush);
     this.schedule(); // saves only if the state differs from `lastSaved`
@@ -97,15 +127,21 @@ class WorkspaceWriter {
     else if (this.timer === null) this.timer = window.setTimeout(this.save, SAVE_DELAY_MS);
   };
 
-  /** Saves at once, skipping any delay or pending retry (the backend is back, maybe on a new port and token). */
-  readonly saveNow = async (): Promise<void> => {
+  /**
+   * Saves at once, skipping any delay or pending retry (the backend is back, maybe on a new port and token). Resolves
+   * once a save that started after the call has ended: true when it saved the state (or the file held it already),
+   * false when it failed (it is retried as any failed save). Never rejects.
+   */
+  readonly saveNow = async (): Promise<boolean> => {
+    const ended = this.waiters.wait();
     if (this.saving) {
-      this.saveNowRequested = true;
-      return;
+      this.saveNowRequested = true; // the save running serialized the state before the call: one more follows it
+      return ended;
     }
     this.clearTimer();
     await this.refreshBackend();
     await this.save();
+    return ended;
   };
 
   private clearTimer(): void {
@@ -128,10 +164,12 @@ class WorkspaceWriter {
     }
     this.clearTimer();
     const serializedAt = Date.now();
+    const started = this.waiters.start();
     const { file, json } = serialize();
     if (json === this.lastSaved) {
       // The file already holds this state (e.g. a change was undone while saving failed): nothing is unsaved.
       if (this.failures > 0 || this.mirroredAt !== null) this.succeeded(serializedAt, false);
+      this.waiters.ended(started, true);
       return;
     }
     this.saving = true;
@@ -150,8 +188,10 @@ class WorkspaceWriter {
       );
       this.lastSaved = json;
       this.succeeded(serializedAt, true);
+      this.waiters.ended(started, true);
     } catch (error) {
       retryInMs = this.failed(json, error);
+      this.waiters.ended(started, false);
     } finally {
       this.saving = false;
     }
@@ -188,6 +228,12 @@ class WorkspaceWriter {
     return Math.min(RETRY_FIRST_MS * 2 ** (this.failures - 1), RETRY_MAX_MS);
   }
 
+  /**
+   * Staged grid edits ride along (up to 8 MiB of text), and the browser's storage quota is far smaller (about 5 MB), so
+   * with a large staged set the copy may not fit and is not written at all. It is not written without them instead:
+   * a copy is newer than `workspace.json`, so on the next start it would win and drop the staged edits the file
+   * still holds (pre-flight L19; the known limit says so).
+   */
   private mirror(json: string): void {
     const at = Date.now();
     if (writePendingWorkspace(json, at)) this.mirroredAt = at;
@@ -218,13 +264,16 @@ class WorkspaceWriter {
 let writer: WorkspaceWriter | null = null;
 
 /**
- * Saves the workspace at once, skipping any pending retry: called when the backend is back (restarted, or reachable
- * again), so that what was typed meanwhile is not left waiting. Does nothing before the workspace is restored.
+ * Saves the workspace at once, skipping any delay or pending retry: called when the backend is back (restarted, or
+ * reachable again), so that what was typed meanwhile is not left waiting, and before a grid commit is sent, so that a
+ * reload, crash or quit before its outcome finds it unknown (05b pre-flight H1; the commit waits for it). `why` is the
+ * log line's reason. Resolves once a save of the state as it is now has ended: true when it was saved, false when it
+ * failed or the workspace is not restored yet (nothing is saved before). Never rejects.
  */
-export function saveWorkspaceNow(): void {
-  if (!writer) return;
-  console.info("The backend is back: saving the workspace now");
-  void writer.saveNow();
+export function saveWorkspaceNow(why = "The backend is back"): Promise<boolean> {
+  if (!writer) return Promise.resolve(false);
+  console.info(`${why}: saving the workspace now`);
+  return writer.saveNow();
 }
 
 /** `GET /workspace`; a missing answer is retried (the backend may still be starting), a refusal is not. */
@@ -266,12 +315,6 @@ async function knownProfileIds(queryClient: QueryClient): Promise<Set<string> | 
   }
 }
 
-function reportLostConnections({ closed, detached }: RestoredWorkspace): void {
-  const lines = ["Some tabs' connections no longer exist."];
-  if (closed.length) lines.push(`Closed: ${closed.join(", ")}`);
-  if (detached.length) lines.push(`Reopened without a connection: ${detached.join(", ")}`);
-  if (lines.length > 1) toast("warning", lines.join("\n"));
-}
 
 function describeTime(at: number): string {
   const when = new Date(at);
@@ -301,25 +344,29 @@ async function restoreSaved(queryClient: QueryClient): Promise<WriterStart> {
   const profileExists = (id: string) => !profileIds || profileIds.has(id);
   const fromFile = saved && fromSavedWorkspace(saved, profileExists);
   let fromPending = pending && fromSavedWorkspace(pending.file, profileExists);
-  if (fromPending && fromFile && snapshotJson(fromPending.snapshot) === snapshotJson(fromFile.snapshot)) {
+  if (fromPending && fromFile && snapshotJson(fromPending) === snapshotJson(fromFile)) {
     clearPendingWorkspace(); // the backend has it after all
     fromPending = null;
   }
   const restored = fromPending ?? fromFile;
   if (!restored) throw new Error("Nothing to restore"); // unreachable: no file means there is a local copy
+  // Before the tabs: a table tab finds its staged edits when it mounts (spec ⑤ §3.7).
+  for (const [tabId, file] of restored.staged) putStagedEdits(tabId, restoredEdits(file));
   useWorkspace.getState().restore(restored.snapshot);
   const source = fromPending ? "the unsaved local copy" : "workspace.json";
   const { tabs } = restored.snapshot;
   console.info(
     `Restored ${tabs.length} tabs from ${source} ` +
-      `(${restored.closed.length} closed, ${restored.detached.length} without a connection)`,
+      `(${restored.closed.length} closed, ${restored.detached.length} without a connection, ` +
+      `${restored.dropped.length} without staged edits that did not read)`,
   );
-  reportLostConnections(restored);
+  const lost = restoreLosses(restored);
+  if (lost) toast("warning", lost);
   if (fromPending && pending) {
     toast("info", `Restored unsaved changes from ${describeTime(pending.at)}`);
     return { lastSaved: null, mirroredAt: pending.at }; // pushed to the backend at once
   }
-  const changed = restored.closed.length > 0 || restored.detached.length > 0;
+  const changed = restored.closed.length > 0 || restored.detached.length > 0 || restored.dropped.length > 0;
   return { lastSaved: changed ? null : serialize().json, mirroredAt: null };
 }
 

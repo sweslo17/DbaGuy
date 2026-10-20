@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from enum import StrEnum
 from typing import Literal
 from uuid import UUID
@@ -101,6 +102,12 @@ class MetadataRequest(BaseModel):
 
 def child_path(path: list[PathSegment], kind: str, name: str) -> list[PathSegment]:
     return [*path, PathSegment(kind=kind, name=name)]
+
+
+def path_database(path: Sequence[PathSegment]) -> str | None:
+    """The database a tree path starts with (engines with one connection per database), or None."""
+    head = path[0] if path else None
+    return head.name if head is not None and head.kind == NodeKind.DATABASE else None
 
 
 def make_node(

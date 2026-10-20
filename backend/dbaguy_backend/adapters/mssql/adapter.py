@@ -27,6 +27,7 @@ from typing import Any
 from loguru import logger
 
 from ...domain.column_category import ColumnCategory
+from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, QueryFailed, ValidationFailed
 from ...domain.execution import ColumnMeta, ErrorPosition, MessageSeverity, ServerMessage
 from ...domain.metadata import ObjectDetail, ObjectNode, PathSegment, ServerInfo
@@ -41,6 +42,7 @@ from ..base import (
     Endpoint,
     MessageListener,
     ParsedUrl,
+    RowEditing,
     RunOptions,
     StatementCancelled,
     StatementError,
@@ -48,7 +50,7 @@ from ..base import (
     invalid_text_error,
     transaction_open_error,
 )
-from . import catalog, driver, freetds, introspection
+from . import catalog, driver, editing, freetds, introspection
 from . import schema as mssql_schema
 from .cancel import Call, CallKind, CancelControl, CancelledWhileWaiting, CancelPending
 from .settings import CONNECT_TIMEOUT_S, URL_SCHEMES, connect_params, parse_mssql_url
@@ -99,11 +101,15 @@ def _text(raw: bytes | str | None) -> str:
 
 def server_text(exc: Exception) -> str:
     """The server's message without pymssql's "DB-Lib error message 20018, severity N: …" tail; "" when there is none.
-    MSSQLDatabaseException carries it in `.text` (bytes); MSSQLDriverException only in its args."""
-    raw = getattr(exc, "text", None)
-    if raw is None:
-        first = exc.args[0] if exc.args else ""
-        raw = first[1] if isinstance(first, tuple) and len(first) > 1 else str(first)
+    Read from `exc.args` only: pymssql raises MSSQLDatabaseException(((number, message_bytes),)), copying the message
+    into its args, and MSSQLDriverException carries just the text.
+
+    Never from `.text` (nor `.message`, `.srvname`, `.procname`), ruling G14: those are C char* properties. On an
+    exception pymssql did not fill in (one built in Python) they are NULL and reading one crashes the whole process;
+    on one it raised they point into the connection's message buffer, which a later message overwrites and closing the
+    connection frees."""
+    first = exc.args[0] if exc.args else ""
+    raw = first[1] if isinstance(first, tuple) and len(first) > 1 else str(first)
     text = _text(raw).split("DB-Lib error message", 1)[0].strip()
     return "" if text in ("", "Unknown error") else text
 
@@ -235,7 +241,7 @@ class MssqlResult(StatementResult):
         self._owner.finish_result(self, complete=self._exhausted)
 
 
-class MssqlConnection(DatabaseConnection):
+class MssqlConnection(DatabaseConnection, RowEditing):
     def __init__(
         self, conn: driver.Connection, *, spid: int, database: str | None, read_only: bool,
         state: tuple[int, int, bool],  # (@@TRANCOUNT, XACT_STATE(), IMPLICIT_TRANSACTIONS) read at open
@@ -329,7 +335,11 @@ class MssqlConnection(DatabaseConnection):
             with self._control.call(CallKind.STOP):
                 self._conn.cancel()
         except driver.ERRORS as exc:  # e.g. an error the server sent before the attention: the statement ends anyway
-            logger.warning("Stopping the statement on SQL Server SPID {} reported: {}", self._spid, server_text(exc) or exc)
+            # The number only above DEBUG: the server's text may echo literals (spec ⑤ §5, G12)
+            logger.warning("Stopping the statement on SQL Server SPID {} reported error {}", self._spid,
+                           getattr(exc, "number", None) or type(exc).__name__)
+            logger.debug("Stopping the statement on SQL Server SPID {} reported: {}", self._spid,
+                         server_text(exc) or exc)
 
     def stop_stream(self, cancelled: bool = True) -> StatementError:
         """Worker thread: end the statement whose cancel was flagged (`cancelled`) or whose rows are no longer wanted.
@@ -375,9 +385,9 @@ class MssqlConnection(DatabaseConnection):
             if self._control.cancel_requested:  # kept during STARTING: nothing is sent, not even the state read
                 raise CancelPending()
             self._batch, self._transaction_words = sql, None
-            self._refresh_state()  # the describe needs the current mode; normally fresh (the worker reads it per request)
+            self._refresh_state()  # the transaction state (and the describe's mode); normally fresh (read per request)
             self._stale = True
-            described = self._describe(sql)
+            described = self._describe(sql) if options is None or options.describe else None
             with self._control.call(CallKind.EXECUTE):  # not started when a cancel arrived first: the batch never runs
                 self._conn.execute_query(sql)  # sends the batch verbatim (no params: `%` untouched), waits for set 1
         except CancelPending:
@@ -614,6 +624,8 @@ class MssqlConnection(DatabaseConnection):
         if number == 0:
             return StatementError(text or "SQL Server ended the statement without an error message")
         line = int(getattr(exc, "line", 0) or 0)
+        # Safe only below the `number == 0` return (G14): pymssql sets `number` with its char* fields, and an exception
+        # built in Python has number 0 and a NULL `procname`, whose read would crash the process
         procedure = _text(getattr(exc, "procname", b""))
         message = text + (_PROCEDURE_LINE.format(procedure=procedure, line=line) if procedure else "")
         position = ErrorPosition(line=line, column=1) if line > 0 and not procedure else None
@@ -678,6 +690,10 @@ class MssqlConnection(DatabaseConnection):
         self._check_database(path)
         return self._metadata_call(lambda: introspection.object_detail(self._conn, path))
 
+    def edit_target(self, path: list[PathSegment]) -> EditTarget:
+        self._check_database(path)
+        return self._metadata_call(lambda: editing.edit_target(self._conn, path))
+
     def schema_snapshot(self) -> SchemaSnapshot:
         return self._metadata_call(lambda: mssql_schema.build_snapshot(self._conn))
 
@@ -712,7 +728,9 @@ class MssqlAdapter(DatabaseAdapter):
     default_port = 1433
     dialect = Dialect.TSQL
     # One connection works in one database; an attention keeps the transaction; read-only is DbaGuy's alone (spec §3.4).
-    capabilities = AdapterCapabilities(per_database_connection=True, cancel_aborts_transaction=False, server_read_only=False)
+    capabilities = AdapterCapabilities(
+        per_database_connection=True, cancel_aborts_transaction=False, server_read_only=False, row_editing=True,
+    )
 
     def parse_url(self, url: str) -> ParsedUrl:
         return parse_mssql_url(url)

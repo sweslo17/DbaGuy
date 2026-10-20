@@ -16,11 +16,6 @@
   --color-warning: var(--warning);
   --color-hover: var(--hover);
   --color-selected: var(--selected);
-  --color-engine-postgres: var(--engine-postgres);
-  --color-engine-mysql: var(--engine-mysql);
-  --color-engine-mssql: var(--engine-mssql);
-  --color-engine-couchbase: var(--engine-couchbase);
-  --color-engine-sqlite: var(--engine-sqlite);
   /* Fades in after a short delay: a quick request never flashes its "Loading…" note. */
   --animate-delayed-show: delayed-show 150ms ease-out 150ms both;
 
@@ -49,12 +44,6 @@
   --warning: #b45309;
   --hover: rgba(0, 0, 0, 0.05);
   --selected: rgba(10, 102, 217, 0.14);
-  /* The engines' brand colours (simple-icons): 3.3:1 or more on every surface, 4.0:1 or more on bg and panel. */
-  --engine-postgres: #4169e1;
-  --engine-mysql: #4479a1;
-  --engine-mssql: #cc2927;
-  --engine-couchbase: #ea2328;
-  --engine-sqlite: #003b57;
   color-scheme: light dark;
 }
 
@@ -74,13 +63,6 @@
     --warning: #fbbf24;
     --hover: rgba(255, 255, 255, 0.06);
     --selected: rgba(59, 140, 255, 0.24);
-    /* The brand hues, lightened: 4.3:1 or more on bg, panel and elevated, 3.3:1 or more on a selected row (SQLite's own
-       #003b57 is 1.3:1 on panel). */
-    --engine-postgres: #6e8ff2;
-    --engine-mysql: #5f9bc8;
-    --engine-mssql: #ee6360;
-    --engine-couchbase: #ff5559;
-    --engine-sqlite: #4ba3c7;
   }
 }
 

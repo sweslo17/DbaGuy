@@ -23,7 +23,7 @@ import { formatSql } from "../editor/format";
 import { currentStatementHighlight, refreshStatements, statementsExtension } from "../editor/statements";
 import { ExportDialog } from "../grid/ExportDialog";
 import { useLongQueryNotifications } from "../notifications/useLongQueryNotifications";
-import type { ExecutionState } from "../session/execution";
+import { EXPORT_RUNNING, type ExecutionState } from "../session/execution";
 import { busy, isExporting, type RequestOptions, type SessionPhase } from "../session/SessionController";
 import { useSessionGuards } from "../session/SessionGuards";
 import { useSession } from "../session/useSession";
@@ -175,7 +175,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     tab.profileId === null
       ? "Choose a connection first"
       : exporting
-        ? "An export is running on this session"
+        ? EXPORT_RUNNING
         : phase === "open" && !modeApplied
           ? "Setting the auto-commit mode…"
           : undefined;

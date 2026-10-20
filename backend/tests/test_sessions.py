@@ -72,6 +72,15 @@ def paused(rid, count):
     return lambda e: e.type == "result_set_end" and e.request_id == rid and e.row_count == count
 
 
+def request_events(recorder: Recorder, rid: str, timeout: float = 10.0) -> list:
+    """Once `rid` has finished: its events, from its `started` to its `finished`, with the session_state among them."""
+    recorder.wait_for(finished(rid), timeout)
+    events = list(recorder.events)
+    start = next(i for i, e in enumerate(events) if e.type == "started" and e.request_id == rid)
+    end = next(i for i, e in enumerate(events) if e.type == "finished" and e.request_id == rid)
+    return events[start:end + 1]
+
+
 def test_paging_fetch_more_and_finish(setup):
     _, _, worker, rec = setup
     worker.submit(ExecuteCommand(request_id="r1", sql="SELECT id, v FROM t ORDER BY id", page_size=500))

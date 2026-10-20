@@ -36,14 +36,15 @@ export function useColumnLayout(
   signature: string,
   rows: unknown[][],
   sortable: boolean,
+  keyColumns: ReadonlySet<number>,
 ): ColumnLayout {
   const measure = canvasMeasure();
   const sampled = sampledRows(rows);
   const digits = String(rows.length).length;
   // `rows` is left out of the deps on purpose: only its first `sampled` rows are read, and pages are only appended.
   const estimated = useMemo(
-    () => estimateWidths(columns, rows, measure, sortable),
-    [columns, sampled, measure, sortable],
+    () => estimateWidths(columns, rows, measure, sortable, keyColumns),
+    [columns, sampled, measure, sortable, keyColumns],
   );
   const numbersWidth = useMemo(() => rowNumberWidth(digits, measure), [digits, measure]);
 
@@ -75,8 +76,8 @@ export function useColumnLayout(
     [change],
   );
   const autofit = useCallback(
-    (col: number) => resize(col, autofitWidth(columns[col], rows, col, measure, sortable)),
-    [columns, rows, measure, sortable, resize],
+    (col: number) => resize(col, autofitWidth(columns[col], rows, col, measure, sortable, keyColumns.has(col))),
+    [columns, rows, measure, sortable, keyColumns, resize],
   );
   const pin = useCallback(
     (count: number) => change(() => ({ pinnedCount: Math.max(0, Math.min(count, columns.length)) })),

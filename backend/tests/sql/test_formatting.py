@@ -110,7 +110,7 @@ def test_insert_in_tsql():
     (TS, "order", 42, C.NUMBER, "[order] = 42"),
     (TS, "note", "it's", C.TEXT, "note = N'it''s'"),
     (TS, "seen", "2026-10-18 12:34:56.123", C.DATETIME, "seen = N'2026-10-18T12:34:56.123'"),
-    (TS, "born", "2026-10-18", C.DATETIME, "born = N'2026-10-18'"),
+    (TS, "born", "2026-10-18", C.DATETIME, "born = N'20261018'"),  # datetime reads 2026-10-18 by DATEFORMAT
     (MY, "seen", "2026-10-18 12:34:56", C.DATETIME, "seen = '2026-10-18 12:34:56'"),
     (TS, "data", {"$type": "bytes", "size": 2, "preview": "dead"}, C.BINARY, "data = 0xdead"),
 ])

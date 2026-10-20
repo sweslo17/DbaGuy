@@ -1,12 +1,32 @@
-import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { useCallback, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api, errorMessage, unwrap } from "@/lib/api/client";
 import type { PathSegment } from "@/lib/api/types";
 import type { TableTabState } from "@/stores/workspace";
+import { useEngineInfo } from "../connections/hooks";
+import { isPasswordRequired } from "../connections/UnlockDialog";
+import { editTargetQuery } from "../edits/editsApi";
 import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
-import { isExporting, PAGE_SIZE, type SessionController, type SessionSnapshot } from "../session/SessionController";
+import {
+  isExporting,
+  MAX_PAGE_SIZE,
+  PAGE_SIZE,
+  type SessionController,
+  type SessionSnapshot,
+} from "../session/SessionController";
 import { useSession } from "../session/useSession";
+import { firstPageComplete } from "./browseView";
 import { clearFilterHistory, readFilterHistory, rememberFilter } from "./filterHistory";
 import { relationOf, type Relation } from "./filterValue";
+import {
+  firstBrowse,
+  firstSorts,
+  NOTHING_ASKED,
+  TARGET_WAIT_MS,
+  type FirstAsk,
+  type FirstBrowse,
+  type TargetRead,
+} from "./stableOrder";
 
 export interface SortKey {
   column: string;
@@ -34,13 +54,25 @@ export interface TableDataState {
 interface Job {
   run: number;
   sql: string;
+  /** Rows of its first page. */
+  pageSize: number;
 }
 
 /** The applied browse: what the grid shows (or is loading). */
 interface BrowseJob extends Job {
   filter: string;
   sorts: SortKey[];
+  /**
+   * Changes when the grid should start again at the top (a new filter or sort); a re-run that keeps the position
+   * (Refresh, the re-read after a commit: D-05-12) keeps it.
+   */
+  position: number;
+  /** A Refresh of the browse the grid shows (same filter and sorts), not a new filter or sort. */
+  rerun: boolean;
 }
+
+/** The first page of a re-run that keeps the position: the rows loaded now (at least a page, at most MAX_PAGE_SIZE). */
+export const keptPageSize = (loaded: number) => Math.min(MAX_PAGE_SIZE, Math.max(PAGE_SIZE, loaded));
 
 /** A count asked for `filter`; `sql` is null while it is being built. */
 interface CountJob {
@@ -109,7 +141,7 @@ function useSessionJob<J extends Job>(
     const previous = sent.current?.controller === controller ? sent.current : null;
     if (previous?.run === job.run) return;
     if (previous) endRequest(controller, previous.requestId);
-    const requestId = controller.execute(job.sql, { history: false, pageSize: PAGE_SIZE });
+    const requestId = controller.execute(job.sql, { history: false, pageSize: job.pageSize });
     sent.current = { controller, run: job.run, requestId };
     setCurrent({ requestId, job });
   }, [controller, phase, exporting, job]);
@@ -135,6 +167,40 @@ function countState(
 }
 
 /**
+ * The table's edit target (`editTargetQuery`, which Task 9's edits read too), read from the first time the tab is
+ * shown, in parallel with the session's connect: its key anchors the grid on a re-run (K14), its stable order sorts a
+ * PostgreSQL tab's first browse (K13). A read that failed for want of the password is read again once the session is
+ * open (the unlock dialog is the session's, and gives the password to both), once per session.
+ */
+function useEditTarget(
+  profileId: string,
+  path: PathSegment[],
+  enabled: boolean,
+  session: { controller: SessionController | null; open: boolean },
+) {
+  const query = useQuery({ ...editTargetQuery(profileId, path), enabled });
+  const { refetch } = query;
+  const passwordRequired = query.isError && isPasswordRequired(query.error);
+  const readAgainFor = useRef<SessionController | null>(null);
+  useEffect(() => {
+    if (!session.open || !passwordRequired || readAgainFor.current === session.controller) return;
+    readAgainFor.current = session.controller;
+    void refetch();
+  }, [session.open, session.controller, passwordRequired, refetch]);
+  const { status, data } = query;
+  const read = useMemo<TargetRead>(
+    () =>
+      status === "success"
+        ? { status, target: data }
+        : status === "error"
+          ? { status, passwordRequired }
+          : { status: "pending" },
+    [status, data, passwordRequired],
+  );
+  return { target: data ?? null, read };
+}
+
+/**
  * Browse state of a table data tab (spec §4.5): filter, sorts, the generated SELECT and its paged result on the tab's
  * own session, opened the first time `active` (the Data view is shown) and kept while the tab is open. Count rows runs
  * on a second session, opened on first use (ruling R-02b-2), so the paused page keeps loading more.
@@ -149,6 +215,10 @@ export function useTableData(tab: TableTabState, active: boolean) {
   const data = useSession(profileId, database, { enabled: shown });
   const counting = useSession(profileId, database, { enabled: countRequested });
   const { controller: countController, snapshot: countSnapshot, retry: retryCount } = counting;
+  const engine = useEngineInfo(profileId);
+  const rowEditing = engine?.row_editing === true;
+  const sessionOpen = data.snapshot?.phase === "open";
+  const edit = useEditTarget(profileId, path, shown && rowEditing, { controller: data.controller, open: sessionOpen });
 
   const [browseJob, setBrowseJob] = useState<BrowseJob | null>(null);
   /** The last sort or refresh could not be built. */
@@ -158,9 +228,15 @@ export function useTableData(tab: TableTabState, active: boolean) {
   const [history, setHistory] = useState(() => readFilterHistory(profileId, path));
   const builds = useRef(0);
   const countRuns = useRef(0);
+  // The rows the grid shows, for the page size of a Refresh that keeps the position (D-05-12). Read when the re-run is
+  // asked for, never as a dependency (rows arrive page by page).
+  const loaded = useRef(0);
 
   const sentBrowse = useSessionJob(data.controller, data.snapshot, browseJob);
-  const countReady = useMemo(() => (countJob?.sql ? { run: countJob.run, sql: countJob.sql } : null), [countJob]);
+  const countReady = useMemo(
+    () => (countJob?.sql ? { run: countJob.run, sql: countJob.sql, pageSize: PAGE_SIZE } : null),
+    [countJob],
+  );
   const sentCount = useSessionJob(countController, countSnapshot, countReady);
   const execution: ExecutionState | null = sentBrowse
     ? (data.snapshot?.executions[sentBrowse.requestId] ?? null)
@@ -177,34 +253,75 @@ export function useTableData(tab: TableTabState, active: boolean) {
 
   /**
    * Builds the SELECT for `filter` and `sorts` and makes it the applied browse; a rejected build changes nothing. Only
-   * a build for a newly entered filter (`newFilter`) sets or clears the filter error: a sort keeps it.
+   * a build for a newly entered filter (`newFilter`) sets or clears the filter error: a sort keeps it. `orUnfiltered`
+   * (the first browse, with a filter entered while it waited): a rejected filter still gives the rows, unfiltered, as a
+   * rejected filter leaves the rows shown before it.
    */
   const browse = useCallback(
-    (nextFilter: string, sorts: SortKey[], newFilter = false) => {
-      const ticket = ++builds.current;
-      buildSelect(profileId, path, nextFilter, sorts, false).then(
-        (sql) => {
-          if (ticket !== builds.current) return;
-          setBuildError(null);
-          if (newFilter) setFilterError(null);
-          setBrowseJob((job) => ({ run: (job?.run ?? 0) + 1, sql, filter: nextFilter, sorts }));
-        },
-        (error: unknown) => {
-          if (ticket !== builds.current) return;
-          if (newFilter) setFilterError(errorMessage(error));
-          else setBuildError(errorMessage(error));
-        },
-      );
+    (nextFilter: string, sorts: SortKey[], options: { newFilter?: boolean; orUnfiltered?: boolean } = {}) => {
+      const build = (where: string, newFilter: boolean, orUnfiltered: boolean) => {
+        const ticket = ++builds.current;
+        buildSelect(profileId, path, where, sorts, false).then(
+          (sql) => {
+            if (ticket !== builds.current) return;
+            setBuildError(null);
+            if (newFilter) setFilterError(null);
+            loaded.current = 0; // a new filter or sort starts over: nothing of the old rows is "loaded" for its Refresh
+            setBrowseJob((job) => ({
+              run: (job?.run ?? 0) + 1,
+              sql,
+              filter: where,
+              sorts,
+              pageSize: PAGE_SIZE,
+              position: (job?.position ?? 0) + 1,
+              rerun: false,
+            }));
+          },
+          (error: unknown) => {
+            if (ticket !== builds.current) return;
+            if (newFilter) setFilterError(errorMessage(error));
+            else setBuildError(errorMessage(error));
+            if (orUnfiltered && where) build("", false, false);
+          },
+        );
+      };
+      build(nextFilter, options.newFilter ?? false, options.orUnfiltered ?? false);
     },
     [profileId, path],
   );
 
-  const started = useRef(false);
+  // The first browse: where the engine's unsorted order moves an edited row (PostgreSQL), sorted by the table's stable
+  // order once its target is read (K13). It never waits long: TARGET_WAIT_MS after the session opened, it browses
+  // unsorted. A filter or sort the user asks for meanwhile is kept and goes into it (a sort of theirs wins and needs no
+  // wait). Applied once: a Refresh, a re-read or a filter keeps the sorts the user left.
+  const [waitedOut, setWaitedOut] = useState(false);
+  const [asked, setAsked] = useState<FirstAsk>(NOTHING_ASKED);
+  const ordersByKey = engine ? engine.orders_browse_by_key : null;
+  const defaultSorts = useMemo(
+    () => firstSorts(ordersByKey, edit.read, waitedOut),
+    [ordersByKey, edit.read, waitedOut],
+  );
+  const first = useMemo(() => firstBrowse(defaultSorts, asked), [defaultSorts, asked]);
+  const waiting = shown && !browseJob && first === null;
   useEffect(() => {
-    if (!shown || started.current) return;
-    started.current = true;
-    browse("", []);
-  }, [shown, browse]);
+    if (!waiting || !sessionOpen) return;
+    const timer = setTimeout(() => setWaitedOut(true), TARGET_WAIT_MS);
+    return () => clearTimeout(timer);
+  }, [waiting, sessionOpen]);
+  const started = useRef(false);
+  /** The first browse's filter and sorts, what the next one starts from until it is the applied browse. */
+  const startedWith = useRef<{ filter: string; sorts: SortKey[] }>({ filter: "", sorts: [] });
+  const startFirst = useCallback(
+    (next: FirstBrowse) => {
+      started.current = true;
+      startedWith.current = { filter: next.filter, sorts: next.sorts };
+      browse(next.filter, next.sorts, { newFilter: next.newFilter, orUnfiltered: true });
+    },
+    [browse],
+  );
+  useEffect(() => {
+    if (shown && !started.current && first) startFirst(first);
+  }, [shown, first, startFirst]);
 
   // Remember a filter once it produced a result: a typo the database rejected is not worth keeping.
   const succeeded = !!execution && execution.resultSets.length > 0 && !execution.error;
@@ -235,25 +352,62 @@ export function useTableData(tab: TableTabState, active: boolean) {
     dropOutdatedCount();
   }, [succeededRun]);
 
+  // Before the first browse has started, a filter or sort is kept for it (`asked`); after, the next browse starts from
+  // the applied one, or from the first while that is still being built (read when asked, not when rendered).
+  const current = useCallback(() => browseJob ?? startedWith.current, [browseJob]);
   const applyFilter = useCallback(
-    (text: string) => browse(text.trim(), browseJob?.sorts ?? [], true),
-    [browse, browseJob?.sorts],
+    (text: string) => {
+      const next = text.trim();
+      if (!started.current) setAsked((ask) => ({ ...ask, filter: next }));
+      else browse(next, current().sorts, { newFilter: true });
+    },
+    [browse, current],
+  );
+  const sortAs = useCallback(
+    (sorts: SortKey[]) => {
+      if (!started.current) setAsked((ask) => ({ ...ask, sorts }));
+      else browse(current().filter, sorts);
+    },
+    [browse, current],
   );
   const toggleSort = useCallback(
-    (column: string, additive: boolean) => browse(filter, nextSorts(browseJob?.sorts ?? [], column, additive)),
-    [browse, filter, browseJob?.sorts],
+    (column: string, additive: boolean) =>
+      sortAs(nextSorts(started.current ? current().sorts : (asked.sorts ?? []), column, additive)),
+    [sortAs, current, asked.sorts],
   );
   const sortBy = useCallback(
-    (column: string, descending: boolean) => browse(filter, [{ column, descending }]),
-    [browse, filter],
+    (column: string, descending: boolean) => sortAs([{ column, descending }]),
+    [sortAs],
   );
-  /** Runs the applied browse again (or builds the first one if that failed); a finished count is out of date. */
+  // D-05-12 (CR-1: only an engine whose table data can be edited): a re-run reloads as many rows as are loaded and the
+  // grid keeps its position.
+  const keepsPosition = rowEditing;
+  useLayoutEffect(() => {
+    // The rows of the applied browse's request once its first page is in whole: one still loading it, or cut short,
+    // holds fewer, and a second Refresh meanwhile must reload what the grid shows (the held rows), not what has arrived
+    // so far. The request sent before a new filter or sort took over is not the applied browse's (`browse` reset it).
+    const set = execution?.resultSets[0];
+    if (set && sentBrowse?.job.run === browseJob?.run && firstPageComplete(execution)) loaded.current = set.rows.length;
+  });
+  /**
+   * Runs the applied browse again (or builds the first one if that failed); a finished count is out of date. Where the
+   * engine can edit rows, it loads as many rows as are loaded now (up to MAX_PAGE_SIZE) and keeps the grid's position.
+   */
   const refresh = useCallback(() => {
     setBuildError(null);
     if (!countRunning) setCountJob(null);
-    if (browseJob) setBrowseJob((job) => job && { ...job, run: job.run + 1 });
-    else browse("", []);
-  }, [browse, browseJob, countRunning]);
+    if (!browseJob) {
+      // The first browse again (its build failed), or now while it still waits for the target: with what is known and
+      // what the user asked for meanwhile.
+      startFirst(first ?? firstBrowse([], asked)!);
+      return;
+    }
+    setBrowseJob((job) =>
+      job && keepsPosition
+        ? { ...job, run: job.run + 1, pageSize: keptPageSize(loaded.current), rerun: true }
+        : job && { ...job, run: job.run + 1, pageSize: PAGE_SIZE, position: job.position + 1, rerun: true },
+    );
+  }, [browseJob, countRunning, keepsPosition, first, asked, startFirst]);
   /** Stops a browse that has not delivered its first page yet. */
   const cancel = useCallback(() => {
     if (sentBrowse) data.controller?.cancel(sentBrowse.requestId);
@@ -285,6 +439,11 @@ export function useTableData(tab: TableTabState, active: boolean) {
   /** Escape (the input shows the applied filter again) or an edit: the rejected text is no longer what is shown. */
   const clearFilterError = useCallback(() => setFilterError(null), []);
 
+  // The request whose first page is in whole: a commit whose outcome was unknown waits for another one (fresh rows,
+  // R-05-6), a Refresh or the same browse sent again on a new session alike. A first page cut short (cancelled, failed,
+  // interrupted) is not fresh rows.
+  const deliveredRequest = sentBrowse && firstPageComplete(execution) ? sentBrowse.requestId : null;
+
   const state: TableDataState = {
     filter,
     sorts: browseJob?.sorts ?? [],
@@ -302,6 +461,14 @@ export function useTableData(tab: TableTabState, active: boolean) {
     state,
     execution,
     pending,
+    /** Changes only when the grid should scroll back to the top (D-05-12). */
+    position: browseJob?.position ?? 0,
+    /** The browse request whose first page is in whole (null while one loads, and when one ended before it did). */
+    deliveredRequest,
+    /** The request on screen is a Refresh of what the grid shows: one that ends early leaves the rows as they were. */
+    rerun: sentBrowse?.job.rerun ?? false,
+    /** The table's edit target once read (null before, and when it could not be): its key anchors a re-run (K14). */
+    target: edit.target,
     controller: data.controller,
     snapshot: data.snapshot,
     relation,

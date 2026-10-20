@@ -1,8 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { SavedTab, SavedWorkspace } from "@/lib/api/types";
 import type { EditorBuffer } from "@/stores/editorBuffers";
-import type { DocumentTabState, Tab } from "@/stores/workspace";
-import { fromSavedWorkspace, toSavedWorkspace } from "./workspaceFile";
+import type { DocumentTabState, QueryTabState, Tab } from "@/stores/workspace";
+import { fromSavedWorkspace, restoreLosses, toSavedWorkspace, workspaceJson } from "./workspaceFile";
 
 /*
  * What `workspace.json` keeps of a Couchbase document tab (rulings C15, C33): unsaved text and the CAS it is based on,
@@ -159,5 +159,191 @@ describe("restoring a document tab whose connection is gone (M6)", () => {
 
   it("keeps the text of a tab saved without a connection too", () => {
     expect(restore({ profile_id: null, buffer: "{}" }).detached).toEqual([DETACHED]);
+  });
+});
+
+/* A table tab's staged grid edits (spec ⑤ §3.7): kept beside the tab, restored into the staged-edits store. */
+
+describe("a table tab's staged edits", () => {
+  const TABLE_PATH = [
+    { kind: "schema", name: "public" },
+    { kind: "folder", name: "tables" },
+    { kind: "table", name: "orders" },
+  ];
+  const tableTab: Tab = { id: "table:1", kind: "table", profileId: PROFILE, path: TABLE_PATH, title: "orders" };
+  const file = {
+    version: 1 as const,
+    key_columns: ["id"],
+    updates: [],
+    inserts: [{ id: "i:1", values: {} }],
+    deletes: [{ id: "d:2", key: { id: 7 } }],
+    outcome_unknown: false,
+  };
+  const workspace = (entry: Partial<SavedTab>): SavedWorkspace => ({
+    version: 1,
+    tabs: [{ id: "table:1", kind: "table", title: "orders", profile_id: PROFILE, object_path: TABLE_PATH, ...entry }],
+    active_tab_id: null,
+    sidebar_tab: null,
+  });
+
+  it("are saved from the staged-edits store, and only when there are some", () => {
+    const save = (staged: typeof file | null) =>
+      toSavedWorkspace(
+        { tabs: [tableTab], activeTabId: null, sidebarTab: null },
+        () => null,
+        () => staged,
+      ).tabs[0];
+    expect(save(file)).toMatchObject({ kind: "table", staged_edits: file });
+    expect(save(null)).not.toHaveProperty("staged_edits");
+  });
+
+  it("are restored beside their tab", () => {
+    const restored = fromSavedWorkspace(workspace({ staged_edits: file }), () => true);
+    expect(restored.snapshot.tabs).toEqual([tableTab]);
+    expect(restored.staged.get("table:1")).toEqual(file);
+  });
+
+  it("go with a tab whose connection is gone, and the closed list says how many", () => {
+    const restored = fromSavedWorkspace(workspace({ staged_edits: file }), () => false);
+    expect(restored.closed).toEqual(["orders (2 staged changes discarded)"]);
+    expect(restored.staged.size).toBe(0);
+  });
+
+  it("count an UPDATE under its row's DELETE once in that list, as the close question does (L20)", () => {
+    const hidden = {
+      ...file,
+      updates: [{ id: "u:1", key: { id: 7 }, set: { a: { kind: "null" as const } }, original: { a: 1 } }],
+    };
+    const restored = fromSavedWorkspace(workspace({ staged_edits: hidden }), () => false);
+    expect(restored.closed).toEqual(["orders (2 staged changes discarded)"]); // the new row and the delete, not three
+  });
+
+  it("that do not read (a local copy is only checked for its tabs) cost that tab its staged edits, not the restore", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const secret = "secret-value";
+      // a key missing, as a damaged or older local copy could have it
+      const malformed = {
+        ...file,
+        updates: [{ id: "u:1", set: { a: { kind: "value", text: secret } }, original: { a: 1 } }],
+      };
+      const saved: SavedWorkspace = {
+        version: 1,
+        tabs: [
+          {
+            id: "table:bad",
+            kind: "table",
+            title: "bad",
+            profile_id: PROFILE,
+            object_path: TABLE_PATH,
+            staged_edits: malformed as never,
+          },
+          {
+            id: "table:1",
+            kind: "table",
+            title: "orders",
+            profile_id: PROFILE,
+            object_path: TABLE_PATH,
+            staged_edits: file,
+          },
+          {
+            id: "table:gone",
+            kind: "table",
+            title: "gone",
+            profile_id: null,
+            object_path: TABLE_PATH,
+            staged_edits: malformed as never,
+          },
+        ],
+        active_tab_id: null,
+        sidebar_tab: null,
+      };
+      const restored = fromSavedWorkspace(saved, (id) => id === PROFILE);
+      expect(restored.snapshot.tabs.map((tab) => tab.id)).toEqual(["table:bad", "table:1"]); // the tab stays
+      expect([...restored.staged.keys()]).toEqual(["table:1"]); // the good set stays, the malformed one is dropped
+      expect(restored.closed).toEqual(["gone"]); // a dropped tab with a set that does not read: no count to give
+      // the restore's toast names the tab that lost its staged edits, beside the closed one, and never a value
+      expect(restored.dropped).toEqual(["bad: its staged changes could not be read and were dropped"]);
+      expect(restoreLosses(restored)).toBe(
+        "Some tabs' connections no longer exist.\nClosed: gone\nbad: its staged changes could not be read and were dropped",
+      );
+      expect(restoreLosses({ ...restored, closed: [] })).toBe(
+        "bad: its staged changes could not be read and were dropped",
+      );
+      expect(restoreLosses({ ...restored, closed: [], dropped: [] })).toBeNull();
+      const said = warn.mock.calls.flat().join(" ");
+      expect(warn).toHaveBeenCalledTimes(2);
+      expect(said).toContain("TypeError"); // the kind of error
+      expect(said).not.toContain(secret); // never a value
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("are restored for a table tab only", () => {
+    const restored = fromSavedWorkspace(workspace({ kind: "object", staged_edits: file }), () => true);
+    expect(restored.snapshot.tabs).toHaveLength(1);
+    expect(restored.staged.size).toBe(0);
+  });
+});
+
+/*
+ * Ruling K7: a lone surrogate (half an emoji, from a broken paste) cannot be written as UTF-8, and one in a tab's text
+ * would fail the backend's write of `workspace.json` for every tab (Q2, B40). The stored copy has U+FFFD in its place;
+ * the open editor keeps its exact text, and no other tab changes.
+ */
+
+describe("a lone surrogate in a tab's text", () => {
+  const queryTab = (id: string, overrides: Partial<QueryTabState> = {}): QueryTabState => ({
+    id,
+    kind: "query",
+    title: id,
+    profileId: PROFILE,
+    database: null,
+    scriptPath: null,
+    savedText: null,
+    textFromFile: false,
+    initialText: "",
+    autocommit: true,
+    ...overrides,
+  });
+  const EMOJI = "\u{1F600}";
+  const editors: Record<string, EditorBuffer> = {
+    broken: { text: `a\uD800b${EMOJI}\uD83D`, selection: { anchor: 0, head: 0 } },
+    fine: { text: `SELECT '${EMOJI}'`, selection: { anchor: 0, head: 0 } },
+  };
+
+  /** What the backend is sent, as it reads it. */
+  const stored = (tabs: Tab[]) => {
+    const file = toSavedWorkspace({ tabs, activeTabId: null, sidebarTab: null }, (id) => editors[id] ?? null);
+    const json = workspaceJson(file);
+    return { file, json, saved: JSON.parse(json) as SavedWorkspace };
+  };
+
+  it("is stored as U+FFFD, in the stored copy only, and the other tabs are untouched", () => {
+    const { file, json, saved } = stored([queryTab("broken"), queryTab("fine")]);
+    expect(saved.tabs.map((tab) => tab.buffer)).toEqual([`a\uFFFDb${EMOJI}\uFFFD`, `SELECT '${EMOJI}'`]);
+    expect(json).not.toMatch(/\\ud[89a-f]/i); // not even as an escape: the backend would decode it to the same surrogate
+    expect(editors.broken.text).toBe(`a\uD800b${EMOJI}\uD83D`); // the open editor keeps its exact text
+    expect(file.tabs[0].buffer).toBe(`a\uD800b${EMOJI}\uD83D`); // the state handed over is the editor's, as it is
+    expect(saved.tabs[1]).toEqual(JSON.parse(JSON.stringify(file.tabs[1]))); // nothing else changed
+  });
+
+  it("comes back with U+FFFD where the broken half was", () => {
+    const { saved } = stored([queryTab("broken")]);
+    const restored = fromSavedWorkspace(saved, () => true);
+    expect(restored.snapshot.tabs[0]).toMatchObject({ kind: "query", initialText: `a\uFFFDb${EMOJI}\uFFFD` });
+  });
+
+  it("is replaced in every kind of text: a script's, a document's and a parameter draft", () => {
+    const scripted = queryTab("script", { scriptPath: "a.sql", savedText: "SELECT 1" });
+    const withParams = queryTab("params", { params: { $a: "x\uDC00y" } });
+    const document = documentTab({ isNew: true, cas: null, initialText: '{"a": "\uD800"}' });
+    editors.script = { text: "SELECT '\uDC00'", selection: { anchor: 0, head: 0 } };
+    editors[document.id] = { text: '{"a": "\uD800"}', selection: { anchor: 0, head: 0 } };
+    const { saved } = stored([scripted, withParams, document]);
+    expect(saved.tabs[0].buffer).toBe("SELECT '\uFFFD'");
+    expect(saved.tabs[1].params).toEqual({ $a: "x\uFFFDy" });
+    expect(saved.tabs[2].buffer).toBe('{"a": "\uFFFD"}');
   });
 });

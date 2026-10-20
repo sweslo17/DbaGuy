@@ -1,6 +1,8 @@
-import type { PathSegment, SavedTab, SavedWorkspace, TextSelection } from "@/lib/api/types";
+import type { PathSegment, SavedTab, SavedWorkspace, StagedEditsFile, TextSelection } from "@/lib/api/types";
+import { plural } from "@/lib/format";
 import { PARAM_NAME } from "@/lib/paramNames";
 import { matchesFile } from "@/lib/scriptText";
+import { wellFormed } from "@/lib/unicodeText";
 import type { EditorBuffer } from "@/stores/editorBuffers";
 import {
   startSelection,
@@ -9,6 +11,8 @@ import {
   type Tab,
   type WorkspaceSnapshot,
 } from "@/stores/workspace";
+import { readableEdits } from "../edits/savedEdits";
+import { changeCount } from "../edits/staging";
 import { keyspaceOfPath } from "../explorer/fieldSamples";
 
 /*
@@ -20,20 +24,17 @@ import { keyspaceOfPath } from "../explorer/fieldSamples";
  * text as typed, so a crash or a restart loses none of them (`savedParams`). A Couchbase document tab keeps its
  * connection, its path (the collection, then the document), the CAS its text is based on, and its text only while it
  * is unsaved (a new document, or edited): a clean document is read again from the server (ruling C15). Unsaved document
- * text whose connection is gone comes back in a query tab without a connection (M6).
+ * text whose connection is gone comes back in a query tab without a connection (M6). A table tab keeps its staged grid
+ * edits (spec ⑤ §3.7) as `savedEdits` gives them: they are not tab state, so they are read and restored beside it.
  */
 
 const WORKSPACE_VERSION = 1;
 
 /**
- * Lone UTF-16 surrogates (a broken paste, an odd object name): the backend cannot write them as UTF-8, which would
- * fail every save.
+ * The JSON `PUT /workspace` sends: every string well-formed (a title, a name or the text alike), each lone surrogate
+ * replaced by U+FFFD (a lone surrogate fails the backend's write of the file, for every tab). The stored copy only: the
+ * open editor keeps its exact text, and a restore shows the replacement where the broken half was.
  */
-const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
-
-const wellFormed = (text: string) => text.replace(LONE_SURROGATE, "\uFFFD");
-
-/** The JSON `PUT /workspace` sends: every string well-formed (a title, a name or the text alike). */
 export function workspaceJson(file: SavedWorkspace): string {
   return JSON.stringify(file, (_key, value: unknown) => (typeof value === "string" ? wellFormed(value) : value));
 }
@@ -108,8 +109,16 @@ function savedDocument(tab: DocumentTabState, readBuffer: (tabId: string) => Edi
   };
 }
 
-function savedTab(tab: Tab, readBuffer: (tabId: string) => EditorBuffer | null): SavedTab {
+/** A table tab's staged edits as `workspace.json` keeps them (`savedEdits`), or null. */
+export type ReadStaged = (tabId: string) => StagedEditsFile | null;
+
+function savedTab(tab: Tab, readBuffer: (tabId: string) => EditorBuffer | null, readStaged: ReadStaged): SavedTab {
   if (tab.kind === "document") return savedDocument(tab, readBuffer);
+  if (tab.kind === "table") {
+    const saved = { id: tab.id, kind: tab.kind, title: tab.title, profile_id: tab.profileId, object_path: tab.path };
+    const staged = readStaged(tab.id);
+    return staged ? { ...saved, staged_edits: staged } : saved;
+  }
   if (tab.kind !== "query") {
     return { id: tab.id, kind: tab.kind, title: tab.title, profile_id: tab.profileId, object_path: tab.path };
   }
@@ -132,14 +141,18 @@ function savedTab(tab: Tab, readBuffer: (tabId: string) => EditorBuffer | null):
   };
 }
 
-/** The workspace as `PUT /workspace` takes it; `readBuffer` gives a query tab's current editor content. */
+/**
+ * The workspace as `PUT /workspace` takes it; `readBuffer` gives a query tab's current editor content, `readStaged` a
+ * table tab's staged edits.
+ */
 export function toSavedWorkspace(
   snapshot: WorkspaceSnapshot,
   readBuffer: (tabId: string) => EditorBuffer | null,
+  readStaged: ReadStaged = () => null,
 ): SavedWorkspace {
   return {
     version: WORKSPACE_VERSION,
-    tabs: snapshot.tabs.map((tab) => savedTab(tab, readBuffer)),
+    tabs: snapshot.tabs.map((tab) => savedTab(tab, readBuffer, readStaged)),
     active_tab_id: snapshot.activeTabId,
     sidebar_tab: snapshot.sidebarTab,
   };
@@ -157,7 +170,37 @@ export interface RestoredWorkspace {
    * whose unsaved text was reopened that way (said as such).
    */
   detached: string[];
+  /** The staged edits of the table tabs restored, by tab id (they go into `stores/stagedEdits.ts`). */
+  staged: ReadonlyMap<string, StagedEditsFile>;
+  /**
+   * What the restore says of the table tabs restored without their staged edits, because the set did not read
+   * (`readableEdits`): one line each (`stagedNotRead`), never a value.
+   */
+  dropped: string[];
 }
+
+/** The restore's line for a table tab whose staged edits did not read (Q2: never dropped without a word). */
+export const stagedNotRead = (title: string): string =>
+  `${title || "A table tab"}: its staged changes could not be read and were dropped`;
+
+/**
+ * The restore's one warning, or null: the tabs closed or reopened without a connection because theirs is gone (a closed
+ * table tab says how many staged changes went with it), and the tabs whose staged edits did not read.
+ */
+export function restoreLosses({ closed, detached, dropped }: RestoredWorkspace): string | null {
+  const lines: string[] = [];
+  if (closed.length || detached.length) lines.push("Some tabs' connections no longer exist.");
+  if (closed.length) lines.push(`Closed: ${closed.join(", ")}`);
+  if (detached.length) lines.push(`Reopened without a connection: ${detached.join(", ")}`);
+  lines.push(...dropped);
+  return lines.length > 0 ? lines.join("\n") : null;
+}
+
+/** The changes a staged set holds as the close question counts them (L20): an UPDATE under its DELETE is not one. */
+const stagedCount = (file: StagedEditsFile) => {
+  const edits = readableEdits(file);
+  return edits ? changeCount(edits) : 0;
+};
 
 /** A query tab as saved; with `profileId` null it reopens without a connection (nor its database or query context). */
 function restoredQuery(entry: SavedTab, profileId: string | null): QueryTabState {
@@ -226,6 +269,8 @@ export function fromSavedWorkspace(saved: SavedWorkspace, profileExists: (id: st
   const tabs: Tab[] = [];
   const closed: string[] = [];
   const detached: string[] = [];
+  const dropped: string[] = [];
+  const staged = new Map<string, StagedEditsFile>();
   const seen = new Set<string>();
   for (const entry of saved.tabs) {
     if (seen.has(entry.id)) continue; // React keys and close guards need unique ids
@@ -248,8 +293,16 @@ export function fromSavedWorkspace(saved: SavedWorkspace, profileExists: (id: st
       }
     } else if (connected && entry.object_path?.length) {
       tabs.push({ id: entry.id, kind: entry.kind, profileId, path: entry.object_path, title: entry.title });
+      // a set that does not read costs the tab its staged edits, never the restore (`readableEdits` logs it once, and
+      // the restore's toast says so)
+      if (entry.kind === "table" && entry.staged_edits) {
+        if (readableEdits(entry.staged_edits)) staged.set(entry.id, entry.staged_edits);
+        else dropped.push(stagedNotRead(entry.title));
+      }
     } else {
-      closed.push(entry.title);
+      // R-05-11: a table tab's staged edits go with it, and the list of closed tabs says so.
+      const lost = entry.staged_edits ? stagedCount(entry.staged_edits) : 0;
+      closed.push(lost ? `${entry.title} (${plural(lost, "staged change")} discarded)` : entry.title);
     }
   }
   const active = saved.active_tab_id ?? null;
@@ -261,5 +314,7 @@ export function fromSavedWorkspace(saved: SavedWorkspace, profileExists: (id: st
     },
     closed,
     detached,
+    staged,
+    dropped,
   };
 }

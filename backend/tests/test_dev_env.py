@@ -1,11 +1,14 @@
 import http.client
 import json
+import threading
+import time
 
 import mysql.connector
 import psycopg
 import pytest
 from pymssql import _mssql
 
+from tests.edit_support import ENGINES, SCRATCH_PREFIX, SERVER_ENGINES, items_table, scratch, scratch_db
 from tests.fake_ssh import wait_until
 from tests.support import (
     COUCHBASE_HOST,
@@ -27,6 +30,7 @@ from tests.support import (
     requires_mssql,
     requires_mysql,
     requires_pg,
+    scaled,
     scratch_documents,
     scratch_key,
     stored_document,
@@ -198,3 +202,68 @@ def test_scratch_documents_are_stored_as_sent_and_removed():
         assert stored_document(binary).type == "base64"
         assert stored_document(expiring).expiration == 2_000_000_000
     assert [stored_document(key) for key in (text, binary, expiring)] == [None, None, None]
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_scratch_objects_are_made_and_dropped_by_exact_name(engine, tmp_path):
+    db = scratch_db(engine, tmp_path)
+    try:
+        with scratch(db) as make:
+            table = items_table(db, make)
+            assert table.startswith(SCRATCH_PREFIX + "table_")
+            assert db.rows(f"SELECT id, label FROM {db.table(table)} ORDER BY id") == [(1, "a"), (2, "b"), (3, "c")]
+            db.fill(db.table(table), 1000, 100)
+            assert db.rows(f"SELECT COUNT(*) FROM {db.table(table)}") == [(1003,)]
+            assert db.exists(table)
+        assert not db.exists(table)  # gone from the catalog, asked on the same live connection
+    finally:
+        db.close()
+
+
+# a one-row UPDATE that runs about half a second with no lock held, per engine (`{t}` table, `{o}` the order column)
+SLOW_UPDATES = {
+    "postgres": "UPDATE {t} SET {o} = 5 WHERE id = 1 AND (SELECT pg_sleep(0.5)) IS NOT NULL",
+    "mysql": "UPDATE {t} SET {o} = 5 WHERE id = 1 AND SLEEP(0.5) = 0",
+    "mssql": "WAITFOR DELAY '00:00:00.500'; UPDATE {t} SET {o} = 5 WHERE id = 1",
+}
+
+
+@pytest.mark.parametrize("engine", SERVER_ENGINES)
+def test_waiting_is_a_lock_wait_on_the_tables_own_statements(engine, tmp_path):
+    db, other_connection = scratch_db(engine, tmp_path), scratch_db(engine, tmp_path)
+    try:
+        with scratch(db) as make:
+            table, unrelated = items_table(db, make), make("TABLE", f"CREATE TABLE {{t}} (id {db.bigint} PRIMARY KEY)")
+            update = f"UPDATE {db.table(table)} SET {db.q('order')} = 99 WHERE id = 1"
+            results: list[BaseException | None] = []
+
+            def run(sql):
+                try:
+                    other_connection.execute(sql)
+                    results.append(None)
+                except BaseException as exc:  # reported by the assert below
+                    results.append(exc)
+
+            assert not db.waiting(table)
+            # a short statement that holds no lock is not a wait, however many times it is polled
+            slow = SLOW_UPDATES[engine].format(t=db.table(table), o=db.q("order"))
+            thread = threading.Thread(target=run, args=(slow,))
+            thread.start()
+            polls = []
+            while thread.is_alive():
+                polls.append(db.waiting(table))
+                time.sleep(0.02)
+            thread.join()
+            assert results == [None] and polls and not any(polls)
+            # a statement blocked by a row lock is, for its own table only
+            results.clear()
+            with db.holding(update):
+                thread = threading.Thread(target=run, args=(update,))
+                thread.start()
+                wait_until(lambda: db.waiting(table), scaled(10))  # asserts when the wait is never seen
+                assert not db.waiting(unrelated)
+            thread.join(scaled(15))
+            assert results == [None] and not db.waiting(table)  # released with the lock, and done
+    finally:
+        other_connection.close()
+        db.close()

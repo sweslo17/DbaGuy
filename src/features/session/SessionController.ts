@@ -15,6 +15,7 @@ import {
   applyEvent,
   interruptExecution,
   newExecution,
+  NOT_CONNECTED_CODE,
   type ExecutionKind,
   type ExecutionState,
   type RequestOptions,
@@ -74,9 +75,11 @@ export interface SessionControllerOptions {
 }
 
 export const PAGE_SIZE = 500;
+/** The largest page a request may ask for (`ExecuteCommand.page_size`): a re-run reloads at most this many rows. */
+export const MAX_PAGE_SIZE = 10_000;
 const MAX_SESSION_MESSAGES = 50;
 const SESSION_GONE = "The session is no longer available.";
-const NOT_CONNECTED: ExecutionState["error"] = { message: "Not connected", code: "not_connected" };
+const NOT_CONNECTED: ExecutionState["error"] = { message: "Not connected", code: NOT_CONNECTED_CODE };
 
 export function emptySnapshot(phase: SessionPhase): SessionSnapshot {
   return { phase, info: null, error: null, state: null, executions: {}, sessionMessages: [] };
@@ -217,6 +220,16 @@ export class SessionController {
   }
 
   /**
+   * Applies a previewed grid-edit plan (spec ⑤ §3.5): its statements as previewed, in one transaction. The execution
+   * ends with its `editOutcome`; one that ends without (the socket or the backend went away) is an unknown outcome, and
+   * is never sent again. Issued while the socket is not open, it ends at once with `not_connected`: it never left, so
+   * nothing happened (R-05-6, pre-flight H1). Returns the request id.
+   */
+  applyEdits(planId: string): string {
+    return this.track("edits", "", { type: "apply_edits", request_id: crypto.randomUUID(), plan_id: planId });
+  }
+
+  /**
    * Runs `sql` again and writes its whole result to `path` on the backend; `progressRows` reports the rows written.
    * `request` is what the statement was run with (an execution's `request`): the same context and parameters.
    */
@@ -341,6 +354,9 @@ export class SessionController {
    */
   private onOpen(): void {
     const { executions, state } = this.store.getState();
+    // An orphan may be a grid-edit apply (`edits`): its outcome is unknown from here on (it ended without one, R-05-6),
+    // and the cancel below may still stop it before its COMMIT and roll it back. It still reads as unknown, which is
+    // honest: whether the cancel reached it in time cannot be told, and nothing is ever sent again.
     const orphans = Object.values(executions).filter(unfinished);
     this.store.setState({ phase: "open", executions: orphans.length ? interruptAll(executions) : executions });
     const cancelKeepsTransaction = !state?.inTransaction || !this.cancelAbortsTransaction();

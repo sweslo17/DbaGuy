@@ -1,13 +1,15 @@
 import type {
   Classification,
   ColumnMeta,
+  EditOutcomeEvent,
   GuardReason,
   QueryContext,
   ServerEvent,
   StatementParams,
 } from "@/lib/api/types";
 
-export type ExecutionKind = "execute" | "export" | "transaction";
+/** `edits`: a grid-edit plan applied (`apply_edits`, spec ⑤ §3.5); it ends with its `editOutcome`. */
+export type ExecutionKind = "execute" | "export" | "transaction" | "edits";
 
 /**
  * What a request is sent with besides its statement (Couchbase): the query context and the typed parameters.
@@ -58,12 +60,31 @@ export interface ExecutionState {
   skipped: boolean;
   /** The connection dropped mid-request: later events are ignored because some were lost. */
   interrupted: boolean;
+  /** An `edits` request's outcome (exactly one per apply, 05a E1); null until it arrives, and for other kinds. */
+  editOutcome: EditOutcomeEvent | null;
+  /**
+   * A transaction was open on the session when the request finished (`finished.in_transaction`); false until then. After
+   * an apply it is one the apply could not end (its rollback failed, 05a contract) or one open before it
+   * (`transaction_open`): only a Rollback or a new session ends it.
+   */
+  inTransaction: boolean;
 }
 
 export const INTERRUPTED_MESSAGE = "Connection interrupted — results may be incomplete";
+/** Why a statement is not sent now: an export runs on the session, and it would only wait behind it. */
+export const EXPORT_RUNNING = "An export is running on this session";
 /** Error code of a statement whose database connection dropped: the session must be reopened (retried). */
 export const CONNECTION_LOST = "connection_lost";
-/** Error codes the backend sends for requests it never ran; the request is over even if `finished` goes missing. */
+/**
+ * Error code of a request that never left: the socket was not open when it was issued (`SessionController`), so the
+ * backend never saw it. Only the controller sets it; the backend has no such code.
+ */
+export const NOT_CONNECTED_CODE = "not_connected";
+/**
+ * Error codes the backend sends for requests it never ran; the request is over even if `finished` goes missing. Not for
+ * an `edits` request: a refused apply still sends its `edit_outcome` after the error (05a M6), and an apply that ended
+ * without one would read as an unknown outcome (ruling H21).
+ */
 const TERMINAL_ERROR_CODES = new Set(["no_open_result", "invalid_command"]);
 
 export function newExecution(
@@ -92,6 +113,8 @@ export function newExecution(
     timedOut: false,
     skipped: false,
     interrupted: false,
+    editOutcome: null,
+    inTransaction: false,
   };
 }
 
@@ -115,6 +138,15 @@ function endSets(sets: ResultSetState[]): ResultSetState[] {
 /** Rebuilds only the touched result set, so appending rows stays linear in the total row count. */
 function updateSet(state: ExecutionState, index: number, fn: (set: ResultSetState) => ResultSetState): ExecutionState {
   return { ...state, resultSets: state.resultSets.map((s) => (s.index === index ? fn(s) : s)) };
+}
+
+/**
+ * The request's first result set has all of its first page (the page ended, it paused, or the request is over): a
+ * re-run replaces the rows shown only then, so the grid never flashes empty and keeps its scroll position (A12).
+ */
+export function firstPageDelivered(execution: ExecutionState | null): boolean {
+  const set = execution?.resultSets[0];
+  return !!execution && !!set && (set.rowCount > 0 || set.hasMore || execution.status !== "running");
 }
 
 /** Folds one server event of this execution into its state. `session_state` is session-wide and never applies. */
@@ -151,13 +183,15 @@ export function applyEvent(state: ExecutionState, event: ServerEvent): Execution
       return { ...state, messages: [...state.messages, { severity: event.severity, text: event.text }] };
     case "error": {
       const error = { message: event.message, code: event.code, position: event.position };
-      const terminal = event.code != null && TERMINAL_ERROR_CODES.has(event.code);
+      const terminal = event.code != null && TERMINAL_ERROR_CODES.has(event.code) && state.kind !== "edits";
       return terminal ? { ...state, error, status: "done" } : { ...state, error };
     }
     case "confirmation_required":
       return { ...state, confirmation: { reasons: event.reasons, classification: event.classification } };
     case "progress":
       return { ...state, progressRows: event.rows };
+    case "edit_outcome":
+      return { ...state, editOutcome: event };
     case "finished":
       return {
         ...state,
@@ -166,6 +200,7 @@ export function applyEvent(state: ExecutionState, event: ServerEvent): Execution
         cancelled: event.cancelled,
         timedOut: event.timed_out,
         skipped: event.skipped,
+        inTransaction: event.in_transaction,
         resultSets: endSets(state.resultSets),
       };
     default:

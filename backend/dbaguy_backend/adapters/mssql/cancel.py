@@ -277,8 +277,10 @@ class CancelControl:
         try:
             self._conn.cancel()
         except Exception as exc:  # never raise into the driver
-            logger.warning("SQL Server cancel of SPID {} from a message failed: {}: {}", self._spid,
-                           type(exc).__name__, exc)
+            # The number only above DEBUG: a server's text may echo literals (spec ⑤ §5, G12)
+            logger.warning("SQL Server cancel of SPID {} from a message failed: {} {}", self._spid,
+                           type(exc).__name__, getattr(exc, "number", "") or "")
+            logger.debug("SQL Server cancel of SPID {} from a message failed: {}", self._spid, exc)
             return
         logger.info("SQL Server cancel sent to SPID {} from its message handler ({})", self._spid, call.kind)
 

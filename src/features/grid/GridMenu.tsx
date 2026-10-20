@@ -5,6 +5,13 @@ import { copyColumnNames, COPY_FORMAT_LABELS, type CopyFormat } from "./copy";
 import type { GridHit } from "./hitTest";
 import type { CellPos, Rect } from "./selection";
 
+/**
+ * An editing grid's menu items (spec ⑤ §3.6.4), leading a cell's menu (`cell`) or the row numbers' (not `cell`), for the
+ * selection `rect`. Asked whenever the grid has `edits`: a table that cannot be edited now may still have items (revert
+ * what is staged on it).
+ */
+export type EditItems = (pos: CellPos | null, cell: boolean, rect: Rect | null) => MenuItem[];
+
 /** What the grid's menus act on: the current selection, plus the cell or header the context click landed on. */
 export interface GridMenuActions {
   columns: ColumnMeta[];
@@ -27,6 +34,10 @@ export interface GridMenuActions {
   extraCellMenu?: (row: number, column: number) => MenuItem[];
   /** "Export…": the whole result to a file (shown only when set). */
   openExport?: () => void;
+  /** An editing grid's items (`GridEditing.menu`). */
+  editItems?: EditItems;
+  /** Return edits the active cell (the grid is editable now), so View value loses its ↵. */
+  returnEdits?: boolean;
 }
 
 /** The group starts with a separator. */
@@ -66,9 +77,11 @@ function headerItems(col: number, a: GridMenuActions): MenuItem[] {
 
 /** Copy, Copy as, Export, the drawers; for a cell (`cell` set) also pinning and the caller's extra items. */
 function selectionItems(pos: CellPos | null, cell: boolean, a: GridMenuActions): MenuItem[] {
-  const { openValue, openRecord, openExport } = a;
+  const { openValue, openRecord, openExport, editItems } = a;
+  const edits = editItems?.(pos, cell, a.rect) ?? [];
   const items: MenuItem[] = [
-    { label: "Copy", shortcut: "⌘C", onSelect: a.copyDefault },
+    ...edits,
+    { label: "Copy", shortcut: "⌘C", onSelect: a.copyDefault, separatorBefore: edits.length > 0 },
     {
       label: "Copy as",
       children: a.copyFormats.map((format) => ({ label: COPY_FORMAT_LABELS[format], onSelect: () => a.copy(format) })),
@@ -76,7 +89,7 @@ function selectionItems(pos: CellPos | null, cell: boolean, a: GridMenuActions):
     ...(openExport ? [{ label: "Export…", onSelect: openExport }] : []),
     {
       label: "View value",
-      shortcut: "↵",
+      shortcut: a.returnEdits ? undefined : "↵",
       separatorBefore: true,
       disabled: !openValue || !pos,
       onSelect: () => pos && openValue?.(pos),

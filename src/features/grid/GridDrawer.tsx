@@ -1,3 +1,4 @@
+import { useState, type ReactNode } from "react";
 import { Panel } from "react-resizable-panels";
 import { PanelHandle } from "@/components/ui/PanelHandle";
 import type { ColumnMeta } from "@/lib/api/types";
@@ -63,21 +64,44 @@ function DrawerContent({ drawer, columns, rows, hasMore, focus, onMove, onClose 
 }
 
 /**
- * The drawer's divider and panel, rendered inside the grid's horizontal Group. It follows the grid's active cell
- * (value viewer) or row (record view). Keeps its pixel width when the window resizes.
+ * The drawer's divider and panel, rendered inside the grid's horizontal Group. Keeps its pixel width when the window
+ * resizes. The value viewer, the record view and the value editor all sit in it.
+ *
+ * `width` is the width it opens with and is read once: the panel registers its default size, so a different one on a
+ * later render (the grid keeps the dragged width for the next opening, not for this one) would register it again, and
+ * a double click on the divider goes back to it.
  */
-export function GridDrawerPanel(props: GridDrawerPanelProps) {
+export function DrawerPanel({
+  width,
+  onWidthChange,
+  children,
+}: {
+  /** Initial width in px. */
+  width: number;
+  onWidthChange: (width: number) => void;
+  children: ReactNode;
+}) {
+  const [opening] = useState(width);
   return (
     <>
       <PanelHandle orientation="horizontal" />
       <Panel
-        defaultSize={props.width}
+        defaultSize={opening}
         minSize={MIN_WIDTH}
         groupResizeBehavior="preserve-pixel-size"
-        onResize={(size) => props.onWidthChange(size.inPixels)}
+        onResize={(size) => onWidthChange(size.inPixels)}
       >
-        <DrawerContent {...props} />
+        {children}
       </Panel>
     </>
+  );
+}
+
+/** The value viewer or the record view in the drawer: it follows the grid's active cell (or row). */
+export function GridDrawerPanel(props: GridDrawerPanelProps) {
+  return (
+    <DrawerPanel width={props.width} onWidthChange={props.onWidthChange}>
+      <DrawerContent {...props} />
+    </DrawerPanel>
   );
 }
