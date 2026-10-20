@@ -641,7 +641,7 @@ def test_a_do_block_that_commits_then_fails_says_part_may_be_applied(tool_env, t
         assert ids(db, table) == [1, 2]
 
 
-RESTARTED = ("The transaction was committed and restarted inside the file (a trigger or a procedure): some changes may "
+RESTARTED = ("The transaction was ended and restarted inside the file (a trigger or a procedure): some changes may "
              "stand")
 
 
@@ -687,8 +687,9 @@ def test_a_procedure_that_commits_and_begins_again_is_unknown(tool_env, tmp_path
         db.execute(f"DELETE FROM {db.table(table)}")
         path = write(tmp_path, db, [*inserts(db, table, 1), f"EXEC {db.table(proc)}", *inserts(db, table, 2)],
                      name="whole.sql")
-        ran = app.job_session(profile).run(command(path, "all_or_nothing"))  # nothing failed: all of it committed
-        assert (ran.outcome.outcome, ids(db, table)) == ("completed", [1, 2])
+        ran = app.job_session(profile).run(command(path, "all_or_nothing"))  # nothing failed: all of it committed,
+        # but another transaction than the run's is the one its COMMIT ends: unknown (N4, either way it ended)
+        assert (ran.outcome.outcome, ran.outcome.warnings, ids(db, table)) == ("unknown", [RESTARTED], [1, 2])
 
 
 @requires_mssql
@@ -718,3 +719,142 @@ def test_a_stopped_mysql_run_leaves_no_table_locked(tool_env, tmp_path):  # R9
         finally:
             other.close()
         assert ids(db, table) == [1, 5]
+
+
+# ---- fix round 3 (rulings N1–N6), from the re-review's probes ---------------------------------------------------
+
+
+@requires_mysql
+def test_a_mysql_procedure_that_commits_inside_the_files_transaction_is_unknown(tool_env, tmp_path):  # N1
+    db, app, profile = tool_env("mysql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        proc = scratch_name("reopen")
+        made.append(("PROCEDURE", proc))
+        db.execute(f"CREATE PROCEDURE {db.table(proc)}() BEGIN COMMIT; START TRANSACTION; END")
+        path = write(tmp_path, db, ["START TRANSACTION", *inserts(db, table, 1), f"CALL {db.table(proc)}()",
+                                    *inserts(db, table, 2, 1), "COMMIT"])
+        ran = app.job_session(profile).run(command(path, "statements"))
+        assert (ran.outcome.outcome, ran.outcome.statements, ran.outcome.stopped_at.statement) == ("unknown", 4, 5)
+        assert ran.outcome.warnings == ["Line 3 may have committed or rolled back the file's transaction from line 1 "
+                                        "(statement 1): the statements from there on may or may not be applied"]
+        assert ids(db, table) == [1]
+
+
+BEGAN_INSIDE = "Line 1 runs several statements and began the transaction inside them: what it did before that may be applied"
+
+
+@requires_mysql
+def test_a_mysql_procedure_that_works_before_its_start_transaction_stays_counted(tool_env, tmp_path):  # N2
+    db, app, profile = tool_env("mysql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        proc = scratch_name("half")
+        made.append(("PROCEDURE", proc))
+        db.execute(f"CREATE PROCEDURE {db.table(proc)}() BEGIN INSERT INTO {db.table(table)} VALUES (1, 'p'); "
+                   f"START TRANSACTION; INSERT INTO {db.table(table)} VALUES (2, 'p'); END")
+        path = write(tmp_path, db, [f"CALL {db.table(proc)}()", *inserts(db, table, 3, 3)])
+        ran = app.job_session(profile).run(command(path, "statements"))
+        assert (ran.outcome.outcome, ran.outcome.statements, ran.outcome.warnings[-1]) == ("stopped", 1, BEGAN_INSIDE)
+        assert ids(db, table) == [1]
+
+
+@requires_mssql
+@pytest.mark.parametrize("batch", ["INSERT INTO {t} VALUES (1, 'a')\nBEGIN TRANSACTION\nINSERT INTO {t} VALUES (2, 'b')",
+                                   "BEGIN TRANSACTION\nINSERT INTO {t} VALUES (1, 'a')\nCOMMIT TRANSACTION\n"
+                                   "BEGIN TRANSACTION\nINSERT INTO {t} VALUES (2, 'b')"])
+def test_a_tsql_batch_that_works_before_its_begin_tran_stays_counted(tool_env, tmp_path, batch):  # N2
+    db, app, profile = tool_env("mssql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        path = write(tmp_path, db, [batch.replace("{t}", db.table(table)), *inserts(db, table, 2)])
+        ran = app.job_session(profile).run(command(path, "statements"))
+        assert (ran.outcome.outcome, ran.outcome.statements, ran.outcome.warnings[-1]) == ("stopped", 1, BEGAN_INSIDE)
+        assert ids(db, table) == [1]
+
+
+@requires_mysql
+def test_a_mysql_set_that_calls_a_function_is_not_sent_again(tool_env, tmp_path):  # N3
+    db, app, profile = tool_env("mysql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        log, function = scratch_name("log"), scratch_name("f")
+        made += [("TABLE", log), ("FUNCTION", function)]
+        db.execute(f"CREATE TABLE {db.table(log)} (id INT AUTO_INCREMENT PRIMARY KEY, at VARCHAR(20))",
+                   f"CREATE FUNCTION {db.table(function)}() RETURNS INT MODIFIES SQL DATA BEGIN "
+                   f"INSERT INTO {db.table(log)} (at) VALUES ('called'); RETURN 1; END")
+        path = write(tmp_path, db, [f"SET @x = (SELECT {db.table(function)}())", f"SET @y = {db.table(function)}()",
+                                    "/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE */", *inserts(db, table, 1, 2)])
+        ran = app.job_session(profile).run(command(path, "statements", from_statement=5))
+        assert (ran.outcome.outcome, ran.outcome.statements) == ("completed", 1)
+        assert ran.outcome.warnings == ["1 session settings before statement 5 were run again (SET, USE, PRAGMA); "
+                                        "the other statements before it were skipped"]  # only mysqldump's line
+        assert ids(db, table) == [2] and db.rows(f"SELECT COUNT(*) FROM {db.table(log)}") == [(0,)]
+
+
+@requires_mssql
+def test_a_trigger_that_rolls_back_and_begins_again_is_unknown_though_the_run_completes(tool_env, tmp_path):  # N4
+    db, app, profile = tool_env("mssql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        trigger = scratch_name("trg")  # dropped with its table
+        db.execute(f"CREATE TRIGGER {db.table(trigger)} ON {db.table(table)} AFTER INSERT AS IF EXISTS "
+                   "(SELECT 1 FROM inserted WHERE id = 99) BEGIN ROLLBACK TRANSACTION; BEGIN TRANSACTION; END")
+        path = write(tmp_path, db, inserts(db, table, 1, 99, 1))  # the third INSERT 1 runs after the rollback
+        ran = app.job_session(profile).run(command(path, "all_or_nothing"))
+        assert (ran.outcome.outcome, ran.outcome.warnings) == ("unknown", [RESTARTED])  # it used to say completed
+        assert ids(db, table) == [1]
+
+
+@requires_mysql
+def test_a_mysql_deadlock_victim_that_wrote_myisam_is_unknown(tool_env, tmp_path):  # N5
+    db, app, profile = tool_env("mysql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        heavy, myisam = scratch_name("heavy"), scratch_name("myisam")
+        made += [("TABLE", heavy), ("TABLE", myisam)]
+        db.execute(*inserts(db, table, 1, 2), f"CREATE TABLE {db.table(heavy)} (id INT PRIMARY KEY)",
+                   f"CREATE TABLE {db.table(myisam)} (id INT PRIMARY KEY, label VARCHAR(50)) ENGINE=MyISAM")
+        path = write(tmp_path, db, [*inserts(db, myisam, 5), f"UPDATE {db.table(table)} SET label = 'run' WHERE id = 1",
+                                    f"UPDATE {db.table(table)} SET label = 'run' WHERE id = 2"])
+        other = mysql.connector.connect(**mysql_driver_kwargs())
+        try:
+            cursor = other.cursor()
+            cursor.execute("START TRANSACTION")  # heavier than the run's: InnoDB rolls the run back as the victim
+            cursor.execute(f"INSERT INTO {db.table(heavy)} WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 "
+                           "FROM n WHERE i < 200) SELECT i FROM n")
+            # InnoDB spares a transaction that wrote a non-transactional table: this one writes MyISAM too
+            cursor.execute(f"INSERT INTO {db.table(myisam)} VALUES (900, 'other')")
+            cursor.execute(f"UPDATE {db.table(table)} SET label = 'other' WHERE id = 2")
+            tab = app.job_session(profile)
+            rid = tab.submit(command(path, "all_or_nothing"))
+            assert wait_until(lambda: db.waiting(table), 20)
+            cursor.execute(f"UPDATE {db.table(table)} SET label = 'other' WHERE id = 1")  # the deadlock
+            ran = tab.wait(rid)
+            other.rollback()
+        finally:
+            other.close()
+        assert (ran.outcome.outcome, ran.error.code) == ("unknown", "1213")
+        assert ran.outcome.warnings == ["Some tables cannot roll back (non-transactional): their changes stayed"]
+        assert ids(db, myisam) == [5, 900]
+        assert db.rows(f"SELECT id, label FROM {db.table(table)} ORDER BY id") == [(1, "row 1"), (2, "row 2")]
+
+
+@requires_mssql
+def test_a_rollback_and_begin_inside_the_file_says_ended_not_committed(tool_env, tmp_path):  # N6
+    db, app, profile = tool_env("mssql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        proc = scratch_name("rb")
+        made.append(("PROCEDURE", proc))
+        db.execute(f"CREATE PROCEDURE {db.table(proc)} AS BEGIN ROLLBACK TRANSACTION; BEGIN TRANSACTION; END")
+        path = write(tmp_path, db, [*inserts(db, table, 1), f"EXEC {db.table(proc)}", *inserts(db, table, 2, 2)])
+        ran = app.job_session(profile).run(command(path, "all_or_nothing"))
+        assert (ran.outcome.outcome, ran.outcome.warnings) == ("unknown", [RESTARTED])
+        assert ids(db, table) == []
+        path = write(tmp_path, db, ["BEGIN TRANSACTION", *inserts(db, table, 1),
+                                    "ROLLBACK TRANSACTION\nBEGIN TRANSACTION", *inserts(db, table, 2, 2),
+                                    "COMMIT TRANSACTION"], name="own.sql")
+        ran = app.job_session(profile).run(command(path, "statements"))
+        assert (ran.outcome.outcome, ran.outcome.warnings[-1]) == ("unknown", RESTARTED)
+        assert ids(db, table) == []

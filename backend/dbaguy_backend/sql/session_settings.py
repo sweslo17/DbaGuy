@@ -7,7 +7,7 @@ password) or belongs to one transaction. Pure."""
 import re
 
 from .dialects import Dialect
-from .lexer import INSIGNIFICANT, TokenKind, tokenize
+from .lexer import INSIGNIFICANT, TokenKind, scan, tokenize
 from .transaction_text import first_words, statement_head
 from .tsql import statements
 
@@ -21,6 +21,8 @@ _PG_SET_CONFIG = re.compile(
 # inside one, 1568)
 _MYSQL_NOT = re.compile(r"\b(?:GLOBAL|PERSIST|PERSIST_ONLY|PASSWORD|DEFAULT\s+ROLE)\b|@@(?:GLOBAL|PERSIST)",
                         re.IGNORECASE)
+# SET RESOURCE GROUP g FOR <thread ids> moves other sessions' threads (ruling N3)
+_MYSQL_RESOURCE_GROUP_FOR = re.compile(r"\bRESOURCE\s+GROUP\b.*\bFOR\b", re.IGNORECASE | re.DOTALL)
 _SQLITE_PRAGMA = re.compile(r"PRAGMA\s+(?:foreign_keys|defer_foreign_keys|recursive_triggers)\s*(?:=|\()",
                             re.IGNORECASE)
 _ON_OFF = frozenset({"ON", "OFF"})
@@ -39,12 +41,19 @@ def is_session_setting(text: str, dialect: Dialect) -> bool:
             words = first_words(head, dialect, 2)
             if words[:1] == ["USE"]:
                 return True
-            return words[:1] == ["SET"] and words[1:2] != ["TRANSACTION"] and _MYSQL_NOT.search(head) is None
+            return (words[:1] == ["SET"] and words[1:2] != ["TRANSACTION"] and _MYSQL_NOT.search(head) is None
+                    and _MYSQL_RESOURCE_GROUP_FOR.search(head) is None and not _calls(head, dialect))
         case Dialect.TSQL:
             return _tsql_settings(text)
         case Dialect.SQLITE:
             return _SQLITE_PRAGMA.match(text.strip()) is not None
     return False
+
+
+def _calls(text: str, dialect: Dialect) -> bool:
+    """A `(` outside strings and comments: the right side calls something (`SET @x = (SELECT f())`, `SET @y = f()`),
+    which may write (ruling N3). mysqldump's settings never hold one (`SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE=''`)."""
+    return any(token.kind == TokenKind.LPAREN for token in scan(text, dialect))
 
 
 def _tsql_settings(text: str) -> bool:

@@ -105,6 +105,7 @@ class RunFake(FakeConnection):
             return FakeResult(0)
         if word in ("failend", "deadlock", "trig"):
             self.tx = False
+            self.rolled_back_kept = self.kept and word == "deadlock"  # the victim's own warnings (N5)
             code = {"failend": "40001", "deadlock": "1213", "trig": "3609"}[word]
             raise StatementError("the transaction ended", code=code)
         if word == "reopen":
@@ -673,7 +674,7 @@ def test_a_do_block_that_fails_may_have_applied_part_of_its_work(env, sql_file):
     assert done.outcome == "stopped" and done.warnings[0].startswith("Line 1 runs several statements")
 
 
-RESTARTED = ("The transaction was committed and restarted inside the file (a trigger or a procedure): some changes may "
+RESTARTED = ("The transaction was ended and restarted inside the file (a trigger or a procedure): some changes may "
              "stand")
 
 
@@ -689,11 +690,18 @@ def test_a_commit_and_restart_inside_the_file_is_unknown_at_a_failure(env, sql_f
         "unknown", 3, ["The file's transaction from line 1 (statement 1) was still open: it was rolled back", RESTARTED])
 
 
-def test_a_commit_and_restart_on_a_run_that_completes_is_completed(env, sql_file):  # R10: no read, all committed
+def test_a_restart_on_a_run_that_completes_is_unknown(env, sql_file):  # N4: one more read, right before COMMIT
     e = env(dialect=Dialect.TSQL, acts={"EXEC p": "reopen"})
     script = "rows 1\nGO\n" + "EXEC p\nGO\n" * 5 + "rows 3\nGO\n"
-    assert outcome(e.run(sql_file(script))).outcome == "completed"
-    assert e.conn.id_reads == 1  # once, after the run's BEGIN: never around each EXEC
+    done = outcome(e.run(sql_file(script)))
+    assert (done.outcome, done.warnings) == ("unknown", [RESTARTED])
+    assert e.conn.id_reads == 2 and e.conn.commits == 1  # after the run's BEGIN and before its COMMIT: never per EXEC
+
+
+def test_a_run_that_completes_in_one_transaction_is_completed(env, sql_file):  # N4: the same id
+    e = env(dialect=Dialect.TSQL)
+    done = outcome(e.run(sql_file("rows 1\nGO\n" + "EXEC p\nGO\n" * 5)))
+    assert (done.outcome, done.warnings, e.conn.id_reads) == ("completed", [], 2)
 
 
 def test_a_failure_with_the_same_transaction_stays_rolled_back(env, sql_file):  # R10: the ids agree
@@ -716,3 +724,33 @@ def test_a_stopped_mysql_run_unlocks_its_tables_after_the_rollback(env, sql_file
     e = env(dialect=Dialect.MYSQL)
     e.run(sql_file("START TRANSACTION;\nrows 2;\nfail boom;"), mode="statements")
     assert e.conn.runs[-2:] == ["SHOW WARNINGS", "UNLOCK TABLES"] and e.conn.rollbacks == 1
+
+
+# ---- fix round 3 (rulings N1–N6) ------------------------------------------------------------------------------
+
+
+def test_a_procedure_inside_the_files_transaction_makes_its_rollback_unknown(env, sql_file):  # N1
+    e = env(dialect=Dialect.MYSQL)
+    done = outcome(e.run(sql_file("tx;\nrows 2;\nCALL p();\nrows 4;\nfail boom;"), mode="statements"))
+    assert (done.outcome, done.statements) == ("unknown", 4)  # not counted out: the CALL may have committed
+    assert done.warnings == ["Line 3 may have committed or rolled back the file's transaction from line 1 (statement "
+                             "1): the statements from there on may or may not be applied"]
+
+
+def test_a_statement_that_began_the_transaction_inside_it_stays_counted(env, sql_file):  # N2
+    e = env(dialect=Dialect.MYSQL, acts={"CALL p()": "tx"})  # a procedure doing work, then START TRANSACTION
+    done = outcome(e.run(sql_file("CALL p();\nrows 2;\nfail boom;"), mode="statements"))
+    assert (done.outcome, done.statements) == ("stopped", 1)
+    assert done.warnings == [
+        "The file's transaction from line 1 (statement 1) was still open: it was rolled back, so the statements after "
+        "it are not applied",
+        "Line 1 runs several statements and began the transaction inside them: what it did before that may be applied"]
+
+
+def test_a_deadlock_victim_whose_table_cannot_roll_back_is_unknown(env, sql_file):  # N5
+    e = env(dialect=Dialect.MYSQL, kept=True)
+    done = outcome(e.run(sql_file("rows 1;\ndeadlock;")))
+    assert (done.outcome, done.warnings) == ("unknown", [
+        "Some tables cannot roll back (non-transactional): their changes stayed"])
+    plain = env(dialect=Dialect.MYSQL)
+    assert outcome(plain.run(sql_file("rows 1;\ndeadlock;"))).outcome == "rolled_back"

@@ -29,6 +29,12 @@ PG, MYSQL, TSQL, SQLITE, SQLPP = Dialect.POSTGRES, Dialect.MYSQL, Dialect.TSQL, 
     ("SET PASSWORD = 'x'", MYSQL, False), ("SET DEFAULT ROLE ALL TO u", MYSQL, False),
     ("SET TRANSACTION READ ONLY", MYSQL, False), ("/*!40000 ALTER TABLE `t` DISABLE KEYS */", MYSQL, False),
     ("LOCK TABLES `t` WRITE", MYSQL, False),
+    # N3: a right side that calls something may write; SET RESOURCE GROUP … FOR moves other threads
+    ("SET @x = (SELECT zz_06_f())", MYSQL, False), ("SET @y = zz_06_f()", MYSQL, False),
+    ("SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI')", MYSQL, False),
+    ("/*!40101 SET @x = zz_06_f() */", MYSQL, False), ("SET @note = 'f(x)'", MYSQL, True),
+    ("SET RESOURCE GROUP rg FOR 17, 18", MYSQL, False), ("SET RESOURCE GROUP rg", MYSQL, True),
+    ("/*!40014 SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0 */", MYSQL, True),
     # T-SQL: SET <option> ON|OFF and USE, every statement of the batch
     ("SET ANSI_NULLS ON", TSQL, True), ("SET QUOTED_IDENTIFIER ON\nSET ANSI_PADDING ON", TSQL, True),
     ("SET IDENTITY_INSERT [dbo].[t] ON", TSQL, True), ("USE [dbaguy]", TSQL, True),
