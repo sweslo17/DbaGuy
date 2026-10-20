@@ -641,8 +641,37 @@ def test_a_do_block_that_commits_then_fails_says_part_may_be_applied(tool_env, t
         assert ids(db, table) == [1, 2]
 
 
+RESTARTED = ("The transaction was committed and restarted inside the file (a trigger or a procedure): some changes may "
+             "stand")
+
+
 @requires_mssql
-def test_a_procedure_that_commits_and_begins_again_is_unknown(tool_env, tmp_path):  # R7, SQL Server
+def test_a_trigger_that_commits_and_begins_again_is_unknown_at_a_later_failure(tool_env, tmp_path):  # R10
+    """COMMIT; BEGIN TRANSACTION inside a trigger keeps @@TRANCOUNT and raises no 3609: only the transaction's id,
+    read after the run's BEGIN and again at the failure, tells."""
+    db, app, profile = tool_env("mssql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        trigger = scratch_name("trg")  # dropped with its table
+        db.execute(f"CREATE TRIGGER {db.table(trigger)} ON {db.table(table)} AFTER INSERT AS IF EXISTS "
+                   "(SELECT 1 FROM inserted WHERE id = 99) BEGIN COMMIT TRANSACTION; BEGIN TRANSACTION; END")
+        path = write(tmp_path, db, inserts(db, table, 1, 99, 1))  # the third is a duplicate key
+        ran = app.job_session(profile).run(command(path, "all_or_nothing"))
+        assert (ran.outcome.outcome, ran.error.code, ran.outcome.stopped_at.statement) == ("unknown", "2627", 3)
+        assert ran.outcome.warnings == [RESTARTED]
+        assert ids(db, table) == [1, 99]
+        db.execute(f"DELETE FROM {db.table(table)}")
+        path = write(tmp_path, db, ["BEGIN TRANSACTION", *inserts(db, table, 1, 99, 1), "COMMIT TRANSACTION"],
+                     name="own.sql")
+        ran = app.job_session(profile).run(command(path, "statements"))  # inside the file's own BEGIN TRAN
+        assert (ran.outcome.outcome, ran.outcome.stopped_at.statement, ran.outcome.statements) == ("unknown", 4, 3)
+        assert ran.outcome.warnings == ["The file's transaction from line 1 (statement 1) was still open: it was "
+                                        "rolled back", RESTARTED]
+        assert ids(db, table) == [1, 99]
+
+
+@requires_mssql
+def test_a_procedure_that_commits_and_begins_again_is_unknown(tool_env, tmp_path):  # R7 → R10, SQL Server
     db, app, profile = tool_env("mssql")
     with dropping(db, app.close_sessions) as made:
         table = make_table(db, made)
@@ -652,9 +681,24 @@ def test_a_procedure_that_commits_and_begins_again_is_unknown(tool_env, tmp_path
         path = write(tmp_path, db, [*inserts(db, table, 1), f"EXEC {db.table(proc)}", *inserts(db, table, 1)])
         ran = app.job_session(profile).run(command(path, "all_or_nothing"))
         # it used to say rolled_back here: the procedure's COMMIT stood
-        assert (ran.outcome.outcome, ran.error.code, ran.outcome.stopped_at.statement) == (
-            "unknown", "transaction_ended", 2)
+        assert (ran.outcome.outcome, ran.error.code, ran.outcome.stopped_at.statement) == ("unknown", "2627", 3)
+        assert ran.outcome.warnings == [RESTARTED]
         assert ids(db, table) == [1]
+        db.execute(f"DELETE FROM {db.table(table)}")
+        path = write(tmp_path, db, [*inserts(db, table, 1), f"EXEC {db.table(proc)}", *inserts(db, table, 2)],
+                     name="whole.sql")
+        ran = app.job_session(profile).run(command(path, "all_or_nothing"))  # nothing failed: all of it committed
+        assert (ran.outcome.outcome, ids(db, table)) == ("completed", [1, 2])
+
+
+@requires_mssql
+def test_a_sql_server_failure_without_a_restart_stays_rolled_back(tool_env, tmp_path):  # R10: same id, no change
+    db, app, profile = tool_env("mssql")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        path = write(tmp_path, db, ["EXEC sp_executesql N'SELECT 1'", *inserts(db, table, 1, 1)])
+        ran = app.job_session(profile).run(command(path, "all_or_nothing"))
+        assert (ran.outcome.outcome, ran.outcome.warnings, ids(db, table)) == ("rolled_back", [], [])
 
 
 @requires_mysql

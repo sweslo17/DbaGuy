@@ -62,6 +62,7 @@ class RunFake(FakeConnection):
         self.kept = kept
         self.seen: dict[str, int] = {}
         self.txid = 100
+        self.id_reads = 0  # CURRENT_TRANSACTION_ID() reads
         self.rolled_back_kept = False  # the last ROLLBACK left 1196 for SHOW WARNINGS
 
     def rollback(self) -> None:
@@ -71,6 +72,7 @@ class RunFake(FakeConnection):
     def statement(self, sql, options):
         self.seen[sql] = self.seen.get(sql, 0) + 1
         if sql == "SELECT CURRENT_TRANSACTION_ID()":
+            self.id_reads += 1
             return RowsResult([[self.txid]])
         if sql == "SHOW WARNINGS":
             self.runs.append(sql)
@@ -671,18 +673,33 @@ def test_a_do_block_that_fails_may_have_applied_part_of_its_work(env, sql_file):
     assert done.outcome == "stopped" and done.warnings[0].startswith("Line 1 runs several statements")
 
 
-def test_a_tsql_batch_that_commits_and_begins_another_is_unknown(env, sql_file):  # R7, SQL Server
-    acts = {"EXEC p": "reopen"}
+RESTARTED = ("The transaction was committed and restarted inside the file (a trigger or a procedure): some changes may "
+             "stand")
+
+
+@pytest.mark.parametrize("statement", ["EXEC p", "INSERT INTO t VALUES (99)"])  # a procedure, a trigger
+def test_a_commit_and_restart_inside_the_file_is_unknown_at_a_failure(env, sql_file, statement):  # R10
+    acts = {statement: "reopen"}
     whole = env(dialect=Dialect.TSQL, acts=acts)
-    events = whole.run(sql_file("rows 1\nGO\nEXEC p\nGO\nrows 3\nGO\n"))
-    assert (outcome(events).outcome, error(events).code) == ("unknown", "transaction_ended")
-    assert error(events).message.startswith("The transaction ended and another began inside line 3")
-    each = env(dialect=Dialect.TSQL, acts=acts)
-    done = outcome(each.run(sql_file("tx\nGO\nrows 2\nGO\nEXEC p\nGO\nrows 4\nGO\nfail boom\nGO\n"),
-                            mode="statements"))
-    assert (done.outcome, done.statements) == ("stopped", 3)  # the restart at EXEC: from there on rolled back
-    assert done.warnings[0].startswith("Line 5 may have committed or rolled back the file's transaction from line 1")
-    assert done.warnings[1].startswith("The file's transaction from line 5 (statement 3) was still open")
+    done = outcome(whole.run(sql_file(f"rows 1\nGO\n{statement}\nGO\nfail boom\nGO\n")))
+    assert (done.outcome, done.stopped_at.statement, done.warnings) == ("unknown", 3, [RESTARTED])
+    each = env(dialect=Dialect.TSQL, acts=acts)  # inside the file's own BEGIN TRAN: not counted out
+    done = outcome(each.run(sql_file(f"tx\nGO\nrows 2\nGO\n{statement}\nGO\nfail boom\nGO\n"), mode="statements"))
+    assert (done.outcome, done.statements, done.warnings) == (
+        "unknown", 3, ["The file's transaction from line 1 (statement 1) was still open: it was rolled back", RESTARTED])
+
+
+def test_a_commit_and_restart_on_a_run_that_completes_is_completed(env, sql_file):  # R10: no read, all committed
+    e = env(dialect=Dialect.TSQL, acts={"EXEC p": "reopen"})
+    script = "rows 1\nGO\n" + "EXEC p\nGO\n" * 5 + "rows 3\nGO\n"
+    assert outcome(e.run(sql_file(script))).outcome == "completed"
+    assert e.conn.id_reads == 1  # once, after the run's BEGIN: never around each EXEC
+
+
+def test_a_failure_with_the_same_transaction_stays_rolled_back(env, sql_file):  # R10: the ids agree
+    e = env(dialect=Dialect.TSQL)
+    done = outcome(e.run(sql_file("rows 1\nGO\nEXEC p\nGO\nfail boom\nGO\n")))
+    assert (done.outcome, done.warnings) == ("rolled_back", [])
 
 
 def test_a_statement_that_finished_before_its_cancel_counts_as_applied(env, sql_file):  # R8

@@ -9,8 +9,9 @@ the statements MySQL commits around, SET autocommit and procedure calls (pre-fli
 that ends anyway stops the run (`partial` when only MySQL's commit can have ended it, `unknown` otherwise, H3). When a
 statement fails, what it may have done to the transaction decides between `rolled_back` and `unknown`
 (`sql/transaction_text.py`; MySQL: any failure that ended it but a deadlock, R1; SQL Server: a trigger's COMMIT, 3609,
-R2; a COMMIT and a new transaction inside a batch, told by CURRENT_TRANSACTION_ID(), R7). A ROLLBACK that left a table's
-changes (MySQL MyISAM) makes any outcome `unknown` (R3). Statement by statement, the file's own open transaction is
+R2). SQL Server: the transaction's id, read once when it begins and again at a failure, tells a COMMIT and a new
+transaction inside the file (a trigger, a procedure) apart (R10). A ROLLBACK that left a table's changes (MySQL MyISAM)
+makes any outcome `unknown` (R3). Statement by statement, the file's own open transaction is
 followed (H2, R5): a run that stops inside it, or ends with it open, rolls it back and says which statements that undid.
 A run from statement N still sends the session settings before N (R4).
 
@@ -56,10 +57,12 @@ COPY_HINT = "pg_dump: use --inserts, or run this file with psql"
 HEX_BLOB_HINT = "mysqldump writes binary columns as raw bytes unless it is given --hex-blob"
 ROLLED_BACK = "The transaction was rolled back: nothing was applied"
 KEPT = "Some tables cannot roll back (non-transactional): their changes stayed"  # ruling R3
+RESTARTED = ("The transaction was committed and restarted inside the file (a trigger or a procedure): some changes may "
+             "stand")  # ruling R10
 # A job session of SQL Server: a login whose `user options` turn implicit transactions on would make each statement
 # by statement open one, and an all-or-nothing BEGIN nest (pre-flight L8)
 _NO_IMPLICIT_TRANSACTIONS = "SET IMPLICIT_TRANSACTIONS OFF"
-_TRANSACTION_ID = "SELECT CURRENT_TRANSACTION_ID()"  # SQL Server 2016+: another id = another transaction (R7)
+_TRANSACTION_ID = "SELECT CURRENT_TRANSACTION_ID()"  # SQL Server 2016+: another id = another transaction (R10)
 _SHOW_WARNINGS = "SHOW WARNINGS"
 _UNLOCK_TABLES = "UNLOCK TABLES"
 _NOT_ROLLED_BACK = "1196"  # MySQL: "Some non-transactional changed tables couldn't be rolled back"
@@ -71,17 +74,16 @@ _FATAL = frozenset({UNSUPPORTED_COPY, PSQL_META_COMMAND, READ_ONLY})  # a skip-a
 
 class _Stop(Exception):
     """The run stops at `statement` (None: before any statement of the file): why; whether the statement reached the
-    server (`sent`: it failed or was cancelled there), whether the link died while it ran (`lost`), whether another
-    transaction began inside it (`reopened`), and the outcome when the reason itself decides it."""
+    server (`sent`: it failed or was cancelled there), whether the link died while it ran (`lost`), and the outcome
+    when the reason itself decides it."""
 
     def __init__(self, error: StatementError, statement: FileStatement | None, *, sent: bool = False,
-                 lost: bool = False, reopened: bool = False, outcome: JobOutcomeKind | None = None) -> None:
+                 lost: bool = False, outcome: JobOutcomeKind | None = None) -> None:
         super().__init__(error.message)
         self.error = error
         self.statement = statement
         self.sent = sent
         self.lost = lost
-        self.reopened = reopened
         self.outcome = outcome
 
 
@@ -186,6 +188,11 @@ class _Run:
         self.warnings = warnings  # for the outcome, as they come up
         self.settings_sent = 0  # session settings before from_statement, sent all the same (R4)
         self.kept = False  # a ROLLBACK left some tables' changes (MySQL, non-transactional tables; R3)
+        # SQL Server: the id of the transaction the run (all or nothing) or the file (statement by statement) began, and
+        # whether another one was current at a failure (R10)
+        self.tx_id: int | None = None
+        self.restarted = False
+        self.cancel_pending = False  # a Cancel taken by a read after a statement that ran: it stops the next one
         # Statement by statement: where the file's own open transaction began (its statements take effect only at its
         # COMMIT), and the counts from before it (pre-flight H2)
         self.tx_from: FileStatement | None = None
@@ -219,6 +226,11 @@ class _Run:
             try:
                 self.ctx.drain(self.ctx.run(sql, self.options))
             except StatementError as exc:
+                raise _Stop(exc, None) from None
+        if self.all_or_nothing and self.dialect is Dialect.TSQL:
+            try:
+                self.tx_id = self._transaction_id()
+            except StatementCancelled as exc:
                 raise _Stop(exc, None) from None
 
     def _statements(self, stream: StatementStream) -> Iterator[FileStatement]:
@@ -286,6 +298,9 @@ class _Run:
         """What a statement passes before it is sent: a Cancel between statements, the read-only gate, and (all or
         nothing) what would end the transaction."""
         self.ctx.raise_if_cancelled()  # a Cancel between statements: this one is never sent
+        if self.cancel_pending:
+            self.cancel_pending = False
+            raise StatementCancelled()
         if (decision := self.ctx.hooks.gate(statement.text)).action != GuardAction.RUN:
             kind = decision.classification.kind
             raise StatementError(f"This connection is read-only: {kind} statements are not allowed", code=READ_ONLY)
@@ -297,7 +312,6 @@ class _Run:
         rows_before = self.rows
         try:
             self._admit(statement)
-            before = self._transaction_id() if statement.repeat and self._watched(statement) else None
         except StatementError as exc:
             raise _Stop(exc, statement) from None
         if statement.repeat == 0:  # T-SQL `GO 0`: never sent, so not counted (pre-flight L7)
@@ -314,17 +328,16 @@ class _Run:
                     # stops the run at the next statement
                     runs += 1
                     break
-                self._failed(exc, statement, runs, rows_before, self._reopened(before))
+                self._failed(exc, statement, runs, rows_before)
                 return
             runs += 1
             self.rows += max(affected or 0, 0)
         self.done += 1
         self.bytes = statement.end_byte
-        reopened = self._reopened(before)
         if self.all_or_nothing:
-            self._check_transaction(statement, reopened)
+            self._check_transaction(statement)
         else:
-            self._track_transaction(statement, rows_before, reopened)
+            self._track_transaction(statement, rows_before)
         self._progress(statement)
 
     def _refuse_what_ends_the_transaction(self, statement: FileStatement) -> None:
@@ -349,29 +362,23 @@ class _Run:
                 f"Line {line:,} calls a procedure or a prepared statement, which may commit MySQL's transaction inside "
                 "it, so this file cannot run all or nothing: run it statement by statement", code=PROCEDURE_CALL)
 
-    def _check_transaction(self, statement: FileStatement, reopened: bool) -> None:
-        """All or nothing, after a statement: the transaction must still be open, and still the same one. Only MySQL's
-        commit around a statement is known to be a commit (S16, pre-flight H3); anything else may have committed or
-        rolled back."""
-        open_now = self._open()
-        if open_now is None or (open_now and not reopened):
+    def _check_transaction(self, statement: FileStatement) -> None:
+        """All or nothing, after a statement: the transaction must still be open. Only MySQL's commit around a
+        statement is known to be a commit (S16, pre-flight H3); anything else may have committed or rolled back."""
+        if self._open() is not False:
             return
         line = statement.line
         outcome: JobOutcomeKind = "unknown"
-        if not open_now and self.dialect is Dialect.MYSQL and not calls_a_procedure(statement.text, self.dialect):
+        if self.dialect is Dialect.MYSQL and not calls_a_procedure(statement.text, self.dialect):
             message = (f"The transaction ended at line {line:,} (MySQL commits around DDL): the statements before it "
                        "are applied; run the rest statement by statement")
             outcome = "partial"
-        elif not open_now:
+        else:
             message = (f"The transaction ended at line {line:,} (a statement in the file committed or rolled it "
                        "back): what ran before it may or may not be applied; run the rest statement by statement")
-        else:
-            message = (f"The transaction ended and another began inside line {line:,} (a procedure or dynamic SQL): "
-                       "what ran before it may or may not be applied; run the rest statement by statement")
         raise _Stop(StatementError(message, code=TRANSACTION_ENDED), statement, sent=True, outcome=outcome)
 
-    def _failed(self, exc: StatementError, statement: FileStatement, runs: int, rows_before: int,
-                reopened: bool) -> None:
+    def _failed(self, exc: StatementError, statement: FileStatement, runs: int, rows_before: int) -> None:
         """A statement that failed: the run stops, or (skip and continue) the error is kept and the run goes on."""
         if runs:  # `GO n`: some of its runs went through (pre-flight L7)
             exc = _reworded(exc, f"{exc.message} (after {runs:,} of {statement.repeat:,} runs)")
@@ -380,7 +387,7 @@ class _Run:
         lost = exc.code == CONNECTION_LOST
         if self.all_or_nothing or self.command.on_error == "stop" or lost or exc.code in _FATAL \
                 or isinstance(exc, StatementCancelled):
-            raise _Stop(exc, statement, sent=True, lost=lost, reopened=reopened)
+            raise _Stop(exc, statement, sent=True, lost=lost)
         if self._aborted():  # PostgreSQL, or SQL Server's XACT_STATE() = -1: every statement after it would fail too
             raise _Stop(_reworded(exc, f"{exc.message}\nThis error aborted the file's own transaction: nothing after "
                                        "it can run until that transaction ends"), statement, sent=True)
@@ -390,7 +397,7 @@ class _Run:
         if len(self.errors) < MAX_JOB_ERRORS:
             self.errors.append(JobError(line=statement.line, statement=statement.index, code=exc.code,
                                         message=exc.message))
-        self._track_after_failure(statement, exc, rows_before, reopened)
+        self._track_after_failure(statement, exc, rows_before)
         self.bytes = statement.end_byte
         self._progress(statement)
 
@@ -440,14 +447,8 @@ class _Run:
                 return None  # a procedure stopped midway may have committed or rolled back
         return self._open()
 
-    def _watched(self, statement: FileStatement) -> bool:
-        """SQL Server, inside a transaction: a batch that may commit and begin another (EXEC, sp_executesql) is told by
-        the transaction's id before and after it (R7)."""
-        return self.dialect is Dialect.TSQL and (self.all_or_nothing or self.tx_from is not None) \
-            and may_commit(statement.text, self.dialect)
-
     def _transaction_id(self) -> int | None:
-        """CURRENT_TRANSACTION_ID(), or None when it cannot be read (a Cancel still stops the run)."""
+        """CURRENT_TRANSACTION_ID(), or None when it cannot be read (a Cancel is raised)."""
         try:
             result = self.ctx.run(_TRANSACTION_ID)
             try:
@@ -461,52 +462,61 @@ class _Run:
             return None
         return int(rows[0][0]) if rows and rows[0][0] is not None else None
 
-    def _reopened(self, before: int | None) -> bool:
-        """Whether a transaction is open after a watched batch, and another one than before it (R7). One that ended
-        is the ended paths' to tell."""
-        if before is None or self._open() is not True:
+    def _note_restart(self) -> bool:
+        """SQL Server, at a failure, before the ROLLBACK: whether the transaction open now is another one than the run
+        or the file began, so that a trigger or a procedure committed the first (R10: COMMIT; BEGIN TRANSACTION keeps
+        @@TRANCOUNT and raises no 3609). Read only while one is open: a transaction already gone (XACT_ABORT, a
+        deadlock) is the ended paths' to tell, and the read would only show its own."""
+        if self.tx_id is None or self.dialect is not Dialect.TSQL or self._open() is not True:
             return False
+        self.ctx.stop_cancels()  # the read must reach the server whatever Cancel stopped the run
         try:
-            after = self._transaction_id()
+            now = self._transaction_id()
         except StatementCancelled:
-            return False  # the batch has run: a Cancel now stops the run at the next statement
-        return after is not None and after != before
+            return False
+        if now is not None and now != self.tx_id:
+            self.restarted = True
+        return self.restarted
 
-    def _track_transaction(self, statement: FileStatement, rows_before: int, reopened: bool) -> None:
+    def _start_tracking(self, statement: FileStatement, done_before: int, rows_before: int) -> None:
+        """Statement by statement: the file's own transaction is open from `statement` on (H2); SQL Server reads its id
+        (R10)."""
+        self.tx_from, self.done_before_tx, self.rows_before_tx = statement, done_before, rows_before
+        self.tx_id = None
+        if self.dialect is Dialect.TSQL:
+            try:
+                self.tx_id = self._transaction_id()
+            except StatementCancelled:
+                self.cancel_pending = True  # the read took it: the next statement stops
+
+    def _track_transaction(self, statement: FileStatement, rows_before: int) -> None:
         """Statement by statement, after a statement that ran: where the file's own open transaction began (pre-flight
-        H2). No round trip (SQL Server: the state its next statement reads anyway)."""
+        H2). No round trip (SQL Server: the state its next statement reads anyway; its id once per transaction)."""
         open_now = self._open()
         if open_now is False:
-            self.tx_from = None  # the file committed or rolled back its own transaction: its own doing
+            self.tx_from = self.tx_id = None  # the file committed or rolled back its own transaction: its own doing
             return
         if open_now is None:
             return
         if self.tx_from is None:
-            self.tx_from, self.done_before_tx, self.rows_before_tx = statement, self.done - 1, rows_before
-        elif reopened:  # the batch ended the file's transaction and began another (R7)
-            self.warnings.append(self._may_have_ended(self.tx_from, statement))
-            self.tx_from, self.done_before_tx, self.rows_before_tx = statement, self.done, self.rows
+            self._start_tracking(statement, self.done - 1, rows_before)
         elif ends_the_transaction(statement.text, self.dialect):  # COMMIT AND CHAIN: the one before is over (R5)
             self.tx_from, self.done_before_tx, self.rows_before_tx = statement, self.done, self.rows
 
-    def _track_after_failure(self, statement: FileStatement, error: StatementError, rows_before: int,
-                             reopened: bool) -> None:
+    def _track_after_failure(self, statement: FileStatement, error: StatementError, rows_before: int) -> None:
         """Skip and continue, after a statement that failed: the file's transaction may have ended with it (a deadlock,
         XACT_ABORT, MySQL's commit around DDL) or begun in it (a T-SQL batch's BEGIN TRAN before its error)."""
         open_now = self._open_after_failure(statement, error)
         if open_now:
             if self.tx_from is None:
-                self.tx_from, self.done_before_tx, self.rows_before_tx = statement, self.done, rows_before
-            elif reopened:
-                self.warnings.append(self._may_have_ended(self.tx_from, statement))
-                self.tx_from, self.done_before_tx, self.rows_before_tx = statement, self.done, rows_before
+                self._start_tracking(statement, self.done, rows_before)
             return
         if self.tx_from is None:
             return
         if open_now is None:  # left to the end of the run, which reads the state again
             self.warnings.append(self._may_have_ended(self.tx_from, statement))
             return
-        tx, self.tx_from = self.tx_from, None
+        tx, self.tx_from, self.tx_id = self.tx_from, None, None
         self.warnings += self._ended_in(tx, statement, error)
 
     def _ended_in(self, tx: FileStatement, failed: FileStatement, error: StatementError | None) -> list[str]:
@@ -536,6 +546,8 @@ class _Run:
         open_now = self._open_after_failure(failed, error) if failed is not None and error is not None else self._open()
         if open_now is False:
             return [] if tx is None or failed is None else self._ended_in(tx, failed, error)
+        restarted = tx is not None and open_now is True and self._note_restart()
+        self.tx_id = None
         kept = self._rollback()  # open, or it cannot tell: never left behind
         if tx is None:
             if open_now is None:
@@ -545,7 +557,7 @@ class _Run:
             return ["The file left a transaction open: it was rolled back, so the statements in it are not applied"]
         if open_now is None:
             return [self._may_have_ended(tx, failed)] if failed is not None else []
-        if kept:  # what stayed is not known statement by statement: the counts stay, the outcome is unknown
+        if kept or restarted:  # what stayed is not known statement by statement: the counts stay, the outcome is unknown
             return [f"The file's transaction from line {tx.line:,} (statement {tx.index:,}) was still open: it was "
                     "rolled back"]
         self.done, self.rows = self.done_before_tx, self.rows_before_tx
@@ -557,6 +569,9 @@ class _Run:
     def _report(self, outcome: JobOutcomeKind, error: StatementError | None = None, *, cancelled: bool = False,
                 stopped: FileStatement | None = None, warnings: list[str] | None = None) -> JobReport:
         said = [*self.warnings, *(warnings or [])]
+        if self.restarted and outcome != "not_started":  # R10: a COMMIT inside the file stood
+            outcome = "unknown"
+            said.append(RESTARTED)
         if self.kept and outcome != "not_started":  # R3: a ROLLBACK left some changes, whatever the run said
             outcome = "unknown"
             said.append(KEPT)
@@ -583,9 +598,6 @@ class _Run:
         if stop.lost:  # the link died while this statement ran: it may have taken effect
             return self._report("unknown", error, stopped=statement, warnings=self._lost_in_file_transaction(statement))
         warnings = []
-        if stop.reopened and self.tx_from is not None:  # the file's transaction ended inside it, another began (R7)
-            warnings.append(self._may_have_ended(self.tx_from, statement))
-            self.tx_from, self.done_before_tx, self.rows_before_tx = statement, self.done, self.rows
         if stop.sent and self.tx_from is None and runs_several(statement.text, self.dialect):
             warnings.append(f"Line {statement.line:,} runs several statements (a batch or a procedure), each taking "
                             "effect on its own: those that ran before it stopped may be applied")
@@ -600,7 +612,8 @@ class _Run:
 
     def _unwound(self, stop: _Stop) -> tuple[JobOutcomeKind, StatementError]:
         """All or nothing, stopped before the COMMIT: rolled back, unless the statement that stopped it may have
-        committed while the transaction is gone (pre-flight H1, R1, R2), or ended it and began another (R7)."""
+        committed while the transaction is gone (pre-flight H1, R1, R2), or another transaction than the run's is the
+        open one (R10, said by `_report`)."""
         error, statement = stop.error, stop.statement
         assert statement is not None
         line = statement.line
@@ -612,10 +625,6 @@ class _Run:
                 return "unknown", _reworded(error, f"{error.message}\nThe connection was lost while line {line:,} "
                                                    "ran, which may commit: what ran before it may be applied")
             return "rolled_back", error
-        if stop.reopened:
-            self._rollback()
-            return "unknown", _reworded(error, f"{error.message}\nThe transaction ended and another began inside line "
-                                               f"{line:,}: what ran before it may or may not be applied")
         if stop.sent:
             if self._ended_inside(error):
                 self._rollback()
@@ -627,6 +636,7 @@ class _Run:
                 why = ("The transaction had ended when line {:,} failed" if open_now is False
                        else "Line {:,} may have ended the transaction (a procedure stopped midway)").format(line)
                 return "unknown", _reworded(error, f"{error.message}\n{why}: what ran before it may be applied")
+        self._note_restart()
         self._rollback()  # a transaction the server ended itself (a deadlock, XACT_ABORT) has nothing left to undo
         return "rolled_back", error
 
@@ -653,9 +663,11 @@ class _Run:
         connection = ctx.connection
         try:
             if cancelled:
+                self._note_restart()
                 self._rollback()
                 return self._report("rolled_back", StatementCancelled(), cancelled=True)
             if connection.transaction_failed():
+                self._note_restart()
                 self._rollback()
                 return self._report("rolled_back", StatementError(ROLLED_BACK, code="transaction_failed"))
             if not connection.in_transaction():  # each statement was checked: nothing known ended it
@@ -670,6 +682,7 @@ class _Run:
         except StatementError as exc:
             if exc.code == CONNECTION_LOST:
                 return self._report("unknown", exc)
+            self._note_restart()
             self._rollback()  # SQLite keeps the transaction after a busy COMMIT (⑤ A14)
             return self._report("rolled_back", StatementError(f"{exc.message}\n{ROLLED_BACK}", code=exc.code))
         try:
