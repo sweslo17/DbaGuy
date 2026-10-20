@@ -438,6 +438,11 @@ def test_an_error_later_in_a_sql_server_result_fails_the_dump_and_the_export(tmp
     pytest.param("postgres", False, "id = 1; COPY t TO STDOUT", marks=requires_pg),
     pytest.param("mssql", False, "1=1 SELECT * INTO dbo.zz_06_never FROM dbo.t", marks=requires_mssql),
     pytest.param("mssql", False, "1=1 EXEC sp_who", marks=requires_mssql),
+    # fix round 2: clauses after the condition (a fabricated row, XML as a value, rows into variables)
+    pytest.param("postgres", False, "1=1 UNION ALL SELECT 99", marks=requires_pg),
+    pytest.param("mssql", False, "1=1 UNION ALL SELECT 99", marks=requires_mssql),
+    pytest.param("mssql", False, "1=1 FOR XML PATH", marks=requires_mssql),
+    pytest.param("mysql", False, "id = 1 INTO @a", marks=requires_mysql),
 ])
 def test_a_filter_is_a_condition_and_nothing_else(tmp_path, engine, read_only, condition):  # fix M2
     db = scratch_db(engine, tmp_path)
@@ -498,8 +503,8 @@ def test_a_plan_waits_for_a_locked_table_at_most_five_seconds_and_says_why(tmp_p
                 took = time.monotonic() - started
                 later.join(10)
                 assert plan.status_code == 400 and plan.json()["error"] == {
-                    "code": "55P03", "message": "A table in this scope is locked by another session (for example an "
-                                                "uncommitted ALTER): try again after it commits"}
+                    "code": "55P03", "message": "A table in a schema this dump reads is locked by another session (for "
+                                                "example an uncommitted ALTER): try again after it commits"}
                 assert 4.5 < took < 8 and answered["tree"] - started < took + 1.5
             finally:
                 hold.rollback()
@@ -575,5 +580,23 @@ def test_sqlite_text_that_is_not_utf8_names_its_table_and_column(tmp_path):  # f
             "failed", "invalid_text", "t.v holds text that is not valid UTF-8, which a UTF-8 file cannot hold. "
                                       "Nothing was written")
         assert target.read_text() == "old"
+        # fix round 2 (N2): in a name, the tree says the schema, never the catalog's own column
+        named = tmp_path / "badname.db"
+        conn = sqlite3.connect(named, isolation_level=None)
+        conn.execute("CREATE TABLE ok (id INTEGER)")
+        conn.execute("PRAGMA writable_schema = ON")
+        name, ddl = "61ff", 'CREATE TABLE "a\xff" (id INTEGER)'.encode("latin-1").hex()  # a name that is not UTF-8
+        conn.execute(f"UPDATE sqlite_master SET name = CAST(X'{name}' AS TEXT), tbl_name = CAST(X'{name}' AS TEXT), "
+                     f"sql = CAST(X'{ddl}' AS TEXT) WHERE name = 'ok'")
+        conn.close()
+        from dbaguy_backend.domain.errors import QueryFailed
+        from dbaguy_backend.domain.metadata import MetadataRequest, PathSegment
+
+        bad = app.add_profile({"profile": {"engine": "sqlite", "name": "badname", "path": str(named)}})
+        tables = [PathSegment(kind="schema", name="main"), PathSegment(kind="folder", name="tables")]
+        with pytest.raises(QueryFailed) as refused:
+            app.container.metadata.children(MetadataRequest(profile_id=bad, path=tables))
+        assert refused.value.message == ("A name or definition in the database's schema holds text that is not "
+                                         "valid UTF-8")
     finally:
         app.close()

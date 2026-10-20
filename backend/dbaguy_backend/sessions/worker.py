@@ -914,13 +914,12 @@ class SessionWorker:
                     want = min(budget, _CHUNK)
                     rows, ex.peeked = ex.peeked[:want], ex.peeked[want:]
                     if len(rows) < want:
-                        rows += result.fetch(want - len(rows))
-                    if rows:
-                        cells = [encode_row(r, ex.text_limit) for r in rows]
-                        self._send(RowsEvent(request_id=ex.request_id, index=ex.index, rows=cells))
-                        ex.sent += len(rows)
-                        ex.req.rows += len(rows)
-                        budget -= len(rows)
+                        try:
+                            rows += result.fetch(want - len(rows))
+                        except StatementError:
+                            self._send_rows(ex, rows)  # the peeked rows in hand go out before the error (fix round 2)
+                            raise
+                    budget -= self._send_rows(ex, rows)
                     self._send_messages(ex)
                     if len(rows) < want:
                         break  # result set exhausted
@@ -939,6 +938,15 @@ class SessionWorker:
             ex.columns_sent = False
             ex.peeked = []
         self._finish(ex)
+
+    def _send_rows(self, ex: _OpenExecution, rows: list) -> int:
+        """Send `rows` of the current result set (none: nothing); how many."""
+        if rows:
+            cells = [encode_row(r, ex.text_limit) for r in rows]
+            self._send(RowsEvent(request_id=ex.request_id, index=ex.index, rows=cells))
+            ex.sent += len(rows)
+            ex.req.rows += len(rows)
+        return len(rows)
 
     def _export(self, cmd: ExportCommand) -> None:
         self._discard_open()  # one connection: a result the grid left paused ends before the export runs
@@ -971,8 +979,10 @@ class SessionWorker:
     def _fail_export(self, req: _Request, cmd: ExportCommand, exc: StatementError) -> None:
         if isinstance(exc, StatementCancelled):
             logger.info("[{}] export {} to {} cancelled", self.name, cmd.request_id, cmd.path)
-        else:
-            logger.warning("[{}] export {} to {} failed: {}", self.name, cmd.request_id, cmd.path, exc.message)
+        else:  # the code above DEBUG: the server's text can echo the statement's literals (spec §5)
+            logger.warning("[{}] export {} to {} failed ({})", self.name, cmd.request_id, cmd.path,
+                           exc.code or type(exc).__name__)
+            logger.debug("[{}] export {} failed: {}", self.name, cmd.request_id, exc.message)
         self._fail(req, exc)
 
     def _check_export(self, cmd: ExportCommand, req: _Request) -> Path:
@@ -1409,7 +1419,8 @@ class SessionWorker:
             self.connection.rollback()
         except Exception as exc:  # e.g. the connection is gone
             if isinstance(exc, StatementError):
-                logger.warning("Idle rollback failed on {}: {}", self.name, exc.message)
+                logger.warning("Idle rollback failed on {} ({})", self.name, exc.code or type(exc).__name__)
+                logger.debug("Idle rollback failed on {}: {}", self.name, exc.message)  # the server's text: DEBUG only
                 reason = exc.message
             else:
                 logger.exception("Idle rollback failed on {}", self.name)

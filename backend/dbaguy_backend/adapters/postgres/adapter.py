@@ -49,8 +49,10 @@ _RETURNING = re.compile(r"\breturning\b", re.IGNORECASE)
 _STREAM_CHUNK = 200
 PLAN_LOCK_TIMEOUT_MS = 5_000  # a dump plan's catalog read waits at most this long for a table's lock (Task 9 fix M3)
 _LOCK_NOT_AVAILABLE = "55P03"
-LOCKED_FOR_PLAN = ("A table in this scope is locked by another session (for example an uncommitted ALTER): try again "
-                   "after it commits")
+# The plan reads the catalog of the scope's schemas (sizes included): a lock on any table of one of them stops it, and
+# none elsewhere does (probed, fix round 2 N3)
+LOCKED_FOR_PLAN = ("A table in a schema this dump reads is locked by another session (for example an uncommitted "
+                   "ALTER): try again after it commits")
 # Statements DECLARE CURSOR accepts, judged conservatively: a wrong "no" only means the result is read in full,
 # a wrong "yes" would make DECLARE fail and abort the user's transaction.
 _DECLARABLE_KEYWORDS = frozenset({"select", "values", "table", "(", "with"})

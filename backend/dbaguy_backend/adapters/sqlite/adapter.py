@@ -52,12 +52,13 @@ _NO_AUTO_BEGIN = frozenset(
 )
 
 
-def _translate(exc: sqlite3.Error) -> StatementError:
+def _translate(exc: sqlite3.Error, *, catalog: bool = False) -> StatementError:
+    """`catalog`: the error came from a read of the schema (sqlite_master, the pragmas), not of the user's rows."""
     message = str(exc)
     if isinstance(exc, sqlite3.OperationalError) and message == "interrupted":
         return StatementCancelled()
     if isinstance(exc, sqlite3.OperationalError) and (found := _NOT_UTF8.match(message)):
-        return InvalidText(found.group(1))  # the driver's text quotes the value (Task 9 fix L2)
+        return InvalidText(found.group(1), in_catalog=catalog)  # the driver's text quotes the value (Task 9 fix L2)
     return StatementError(message, code=getattr(exc, "sqlite_errorname", None))
 
 
@@ -204,25 +205,25 @@ class SqliteConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
         try:
             return introspection.list_children(self._conn, path)
         except sqlite3.Error as exc:
-            raise _translate(exc) from exc
+            raise _translate(exc, catalog=True) from exc
 
     def object_detail(self, path: list[PathSegment]) -> ObjectDetail:
         try:
             return introspection.object_detail(self._conn, path)
         except sqlite3.Error as exc:
-            raise _translate(exc) from exc
+            raise _translate(exc, catalog=True) from exc
 
     def edit_target(self, path: list[PathSegment]) -> EditTarget:
         try:
             return editing.edit_target(self._conn, path)
         except sqlite3.Error as exc:
-            raise _translate(exc) from exc
+            raise _translate(exc, catalog=True) from exc
 
     def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
         try:
             return columns.table_columns(self._conn, path)
         except sqlite3.Error as exc:
-            raise _translate(exc) from exc
+            raise _translate(exc, catalog=True) from exc
 
     def dump_session(self, scope: DumpScope) -> DumpSession:
         return dump.SESSION
@@ -231,13 +232,13 @@ class SqliteConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
         try:
             return dump.dump_catalog(self._conn, scope, kinds, ddl=ddl)
         except sqlite3.Error as exc:
-            raise _translate(exc) from exc
+            raise _translate(exc, catalog=True) from exc
 
     def schema_snapshot(self) -> SchemaSnapshot:
         try:
             return sqlite_schema.build_snapshot(self._conn)
         except sqlite3.Error as exc:
-            raise _translate(exc) from exc
+            raise _translate(exc, catalog=True) from exc
 
     def _begin_if_manual(self, sql: str) -> None:
         """Manual mode: open the transaction the statement runs in, as psycopg does for PostgreSQL.

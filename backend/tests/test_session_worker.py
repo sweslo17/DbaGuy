@@ -8,7 +8,9 @@ import time
 import pytest
 from loguru import logger
 
-from dbaguy_backend.adapters.base import AdapterCapabilities, RawJsonRows, ReadAhead, ReadAheadState, RunOptions
+from dbaguy_backend.adapters.base import (
+    AdapterCapabilities, RawJsonRows, ReadAhead, ReadAheadState, RunOptions, StatementError,
+)
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager, write_askpass_script
@@ -1127,5 +1129,41 @@ def test_steps_stop_after_full_or_done_and_poll_after_waiting(state, most):  # E
         wait_until(lambda: connection.results[0].calls >= 1)  # the step at the pause
         time.sleep(0.6)
         assert connection.results[0].calls <= most
+    finally:
+        worker.close()
+
+
+class _LateErrorResult(FakeResult):
+    """`count` rows, then an error from the next fetch: SQL Server's way with an error later in the set (Task 9 H1)."""
+
+    def __init__(self, count: int) -> None:
+        super().__init__(count)
+
+    def fetch(self, n):
+        if not self._rows:
+            raise StatementError("Divide by zero error encountered.", code="8134")
+        return super().fetch(n)
+
+
+class LateErrorConnection(FakeConnection):
+    def statement(self, sql, options):
+        self.runs.append(sql)
+        return _LateErrorResult(int(sql.split()[1]))
+
+
+def test_a_peeked_row_goes_out_before_the_error_that_follows_it():  # Task 9 fix round 2 (N1)
+    """A page of 2 of 3 rows pauses on the third, held as the peek; Load more takes it, then the error comes: the
+    third row is shown, then the error (it used to be lost)."""
+    worker, _, rec = make_worker(LateErrorConnection())
+    try:
+        execute(worker, "p", "late 3", page_size=2)
+        rec.wait_for(paused("p", 2))
+        worker.submit(FetchMoreCommand(request_id="p", count=10))
+        rec.wait_for(finished("p"))
+        rows = [row[0] for event in rec.of("p", "rows") for row in event.rows]
+        assert rows == [0, 1, 2]
+        types = [event.type for event in rec.events if getattr(event, "request_id", None) == "p"]
+        assert types.index("error") > max(i for i, kind in enumerate(types) if kind == "rows")
+        assert rec.of("p", "error")[0].code == "8134"
     finally:
         worker.close()

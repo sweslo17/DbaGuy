@@ -13,10 +13,11 @@ from uuid import UUID
 
 from loguru import logger
 
-from ..adapters.base import DatabaseAdapter, DatabaseConnection, Dumping, InvalidText, StatementError
+from ..adapters.base import (
+    CONNECTION_LOST, INVALID_TEXT, DatabaseAdapter, DatabaseConnection, Dumping, InvalidText, StatementError,
+)
 from ..adapters.dump import DumpCatalog
 from ..adapters.registry import AdapterRegistry
-from ..adapters.base import CONNECTION_LOST, INVALID_TEXT
 from ..domain.data_jobs import (
     BE_DUMPED, ENGINE_NAMES, RUN_SQL_FILES, DumpContent, DumpHeader, DumpObjectKinds, DumpPlan, DumpPlanObject,
     DumpScope, FileInspection, cannot, cannot_read,

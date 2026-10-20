@@ -212,3 +212,65 @@ def test_a_dumps_count_and_its_filter_check():  # 06a Task 9: a table with no co
     assert check_filter(Dialect.MYSQL, "  -- nothing\n") is None and check_filter(Dialect.MYSQL, "a = 1;") == "a = 1"
     with pytest.raises(ValidationFailed):
         check_filter(Dialect.TSQL, "id = 1 DELETE FROM t")
+
+
+# Task 9 fix round 2 (M2 gap 2): a filter is one condition. A clause that ends the WHERE (or a query joined to it)
+# would change what a dump writes, a SELECT … INTO what it reads
+_EVERY_DIALECT_ENDS = ["UNION", "INTERSECT", "EXCEPT", "FOR", "INTO", "ORDER", "LIMIT", "OFFSET", "FETCH", "GROUP",
+                       "HAVING", "WINDOW", "QUALIFY", "RETURNING"]
+_DIALECT_ENDS = {MY: ["LOCK", "PROCEDURE", "MINUS", "OPTION"], TS: ["OPTION"], PG: [], LITE: []}
+
+
+@pytest.mark.parametrize("dialect", [PG, MY, TS, LITE])
+def test_a_word_that_ends_the_where_clause_is_refused_outside_parentheses(dialect):
+    from dbaguy_backend.sql.select_builder import FILTER_NOT_A_CONDITION, check_filter
+
+    for word in [*_EVERY_DIALECT_ENDS, *_DIALECT_ENDS[dialect]]:
+        for shape in (f"1=1 {word} x", f"id = 1 {word.lower()} BY y", f"(a = 1)\n{word} 1"):
+            with pytest.raises(ValidationFailed) as refused:
+                check_filter(dialect, shape)
+            # T-SQL: a word that starts a statement (FETCH, OPTION …) is a second statement to its cutter first
+            assert refused.value.message == FILTER_NOT_A_CONDITION or (
+                dialect is TS and "another T-SQL statement" in refused.value.message), shape
+    for shape in ("x) UNION ALL SELECT 1 WHERE (1", "a = 1) OR (b = 2", ")"):  # a ")" it did not open: never
+        with pytest.raises(ValidationFailed):
+            check_filter(dialect, shape)
+    with pytest.raises(ValidationFailed):
+        build_browse_select(dialect, PATHS[dialect], "1=1 UNION ALL SELECT 99, 'fake'", [])  # one check, browsing too
+
+
+@pytest.mark.parametrize("dialect, condition", [
+    (PG, "substring(x FOR 3) = 'abc'"), (PG, "substring(x FROM 1 FOR 3) = 'abc'"),
+    (PG, "x IN (SELECT y FROM t ORDER BY y LIMIT 1)"), (MY, "x IN (SELECT y FROM t ORDER BY y LIMIT 1)"),
+    (LITE, "x IN (SELECT y FROM t ORDER BY y LIMIT 1 OFFSET 2)"), (TS, "x IN (SELECT TOP 1 y FROM t ORDER BY y)"),
+    (MY, "`order` = 1"), (PG, '"union" = 1'), (LITE, '"for" = 1'), (TS, "[group] = 1"), (PG, "'for' = v"),
+    (MY, "v = 'x UNION SELECT 1'"), (PG, "x = 1 /* ORDER BY y */"),
+    (PG, "x IN (SELECT a FROM u UNION SELECT b FROM w)"),
+    (PG, "option = 1 AND procedure = 2 AND lock = 3 AND minus = 4"),  # plain names in PostgreSQL
+    (LITE, "option = 1 AND lock = 2"),
+    # the Task 9 re-review's ordinary filters
+    (MY, "REPLACE(v, 'a', 'b') = 'x'"), (MY, "INSERT(v, 1, 1, 'x') = 'y'"), (MY, "FIND_IN_SET('a', v) > 0"),
+    (MY, "v LIKE '%update%'"), (MY, "`update` = 1"), (MY, "id IN (SELECT id FROM t2 WHERE x = 1)"),
+    (MY, "created > NOW() - INTERVAL 1 DAY"), (MY, "JSON_EXTRACT(j, '$.a') = 1"), (MY, "v REGEXP '^a'"),
+    (MY, "MATCH(v) AGAINST ('x')"), (MY, "`delete` IS NULL"), (MY, "`share` = 1"),
+    (MY, "v = 'x' COLLATE utf8mb4_bin"), (MY, "CAST(v AS CHAR) = '1'"), (MY, "values_col = 1"), (MY, "`into` = 1"),
+    (PG, "replace(v, 'a', 'b') = 'x'"), (PG, "v ~ 'update'"), (PG, '"update" = 1'),
+    (PG, "created > now() - interval '1 day'"), (PG, "j->>'a' = '1'"), (PG, "id = ANY(ARRAY[1,2])"),
+    (PG, "v ILIKE 'a%'"), (PG, "lower(v) = 'a'"), (PG, "tsv @@ to_tsquery('x')"),
+    (PG, "EXISTS (SELECT 1 FROM t2 WHERE t2.id = t.id)"), (PG, "v IS DISTINCT FROM 'a'"), (PG, "coalesce(v, '') = ''"),
+    (PG, '"into" = 1'), (PG, '"set_config_note" = 1'), (PG, "v = 'set_config'"),
+    (TS, "REPLACE(v, 'a', 'b') = 'x'"), (TS, "v LIKE '%update%'"), (TS, "[update] = 1"),
+    (TS, "created > DATEADD(day, -1, GETDATE())"), (TS, "JSON_VALUE(j, '$.a') = '1'"), (TS, "TRY_CAST(v AS int) = 1"),
+    (TS, "id IN (SELECT id FROM dbo.t2)"), (TS, "[into] = 1"), (TS, "CONTAINS(v, 'x')"),
+    (TS, "v = N'x' COLLATE Latin1_General_BIN"), (TS, "IIF(v = 'a', 1, 0) = 1"),
+    (LITE, "replace(v, 'a', 'b') = 'x'"), (LITE, "v GLOB 'a*'"), (LITE, "json_extract(j, '$.a') = 1"),
+    (LITE, '"update" = 1'), (LITE, "rowid > 10"), (LITE, "v LIKE 'a%' ESCAPE '\\'"),
+    (LITE, "id IN (SELECT id FROM t2)"),
+    (LITE, "typeof(v) = 'text'"),
+])
+def test_an_ordinary_condition_is_never_refused(dialect, condition):
+    from dbaguy_backend.services.safety import is_plain_read
+    from dbaguy_backend.sql.select_builder import build_count_select, check_filter
+
+    assert check_filter(dialect, condition) is not None
+    assert is_plain_read(build_count_select(dialect, "s", "t", condition), dialect)

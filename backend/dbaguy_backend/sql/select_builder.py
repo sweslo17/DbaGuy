@@ -15,6 +15,24 @@ from .tsql import statements
 _RELATION_KINDS = frozenset({NodeKind.TABLE, NodeKind.VIEW, NodeKind.MATERIALIZED_VIEW, NodeKind.PARTITION})
 _COLLECTIONS = frozenset({NodeKind.COLLECTION})
 _TRAILING = INSIGNIFICANT | {TokenKind.SEMI}
+# What a filter is, and the one text of every refusal that it is more (a dump's own check says it too)
+FILTER_NOT_A_CONDITION = "The filter must be a condition on the table's rows (what follows WHERE), and nothing else"
+# Words that end a WHERE clause, outside parentheses: another clause of the SELECT (GROUP BY, HAVING, WINDOW, QUALIFY,
+# ORDER BY, LIMIT, OFFSET, FETCH, FOR UPDATE / FOR XML / FOR JSON, INTO, RETURNING) or another query joined to it
+# (UNION, INTERSECT, EXCEPT). A filter is one condition (Task 9 fix round 2), so none may stand at depth 0. Inside
+# parentheses they are the filter's own (`substring(x FOR 3)`, `x IN (SELECT … ORDER BY y LIMIT 1)`); quoted they are
+# names, in strings and comments text: the lexer tells them apart
+_ENDS_A_CONDITION = frozenset({
+    "UNION", "INTERSECT", "EXCEPT", "FOR", "INTO", "ORDER", "LIMIT", "OFFSET", "FETCH", "GROUP", "HAVING", "WINDOW",
+    "QUALIFY", "RETURNING",
+})
+# … and the dialects' own, where the word is reserved there (so never an unquoted name): MySQL's LOCK IN SHARE MODE,
+# PROCEDURE ANALYSE, MariaDB's MINUS, MySQL's and T-SQL's OPTION (T-SQL's query hints). PostgreSQL and SQLite take
+# `option`, `procedure`, `lock` and `minus` as plain column names.
+_ENDS_A_CONDITION_IN: dict[Dialect, frozenset[str]] = {
+    Dialect.MYSQL: frozenset({"LOCK", "PROCEDURE", "MINUS", "OPTION"}),
+    Dialect.TSQL: frozenset({"OPTION"}),
+}
 
 
 class SortKey(BaseModel):
@@ -61,7 +79,26 @@ def _single_expression(where: str | None, dialect: Dialect) -> str | None:
     # T-SQL needs no `;` before a second statement: `id = 1 DELETE FROM t` would run the DELETE.
     if dialect is Dialect.TSQL and len(statements([t for t in tokens if t.kind not in INSIGNIFICANT])) > 1:
         raise ValidationFailed("A filter must be a single expression: this one holds another T-SQL statement")
+    if not _one_condition(tokens, dialect):
+        raise ValidationFailed(FILTER_NOT_A_CONDITION)
     return "".join(" " if token.kind == TokenKind.COMMENT else token.text for token in tokens).strip() or None
+
+
+def _one_condition(tokens: list, dialect: Dialect) -> bool:
+    """Whether the filter's tokens stay one condition: never a `)` it did not open (`x) UNION … WHERE (1` balances
+    again, so balance alone is not enough), and no word that ends a WHERE clause outside parentheses."""
+    ends = _ENDS_A_CONDITION | _ENDS_A_CONDITION_IN.get(dialect, frozenset())
+    depth = 0
+    for token in tokens:
+        if token.kind is TokenKind.LPAREN:
+            depth += 1
+        elif token.kind is TokenKind.RPAREN:
+            depth -= 1
+            if depth < 0:
+                return False
+        elif token.kind is TokenKind.WORD and depth == 0 and token.upper in ends:
+            return False
+    return True
 
 
 def _sqlpp_browse_select(

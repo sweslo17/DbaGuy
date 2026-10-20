@@ -107,12 +107,16 @@ INVALID_PARAMS = "invalid_params"  # a parameter refused before sending; the mes
 
 class InvalidText(StatementError):
     """Text the driver could not decode (SQLite's bytes that are not UTF-8): the column the driver names, never the
-    text itself (it would reach the screen and the log garbled)."""
+    text itself (it would reach the screen and the log garbled). `in_catalog`: it was a catalog read's (the column is
+    then the catalog's own, `name` or `sql`, so the message says the schema instead: fix round 2, N2)."""
 
-    def __init__(self, column: str | None) -> None:
-        where = f"Column {column}" if column else "A value"
-        super().__init__(f"{where} holds text that is not valid UTF-8", code=INVALID_TEXT)
-        self.column = column
+    def __init__(self, column: str | None, *, in_catalog: bool = False) -> None:
+        if in_catalog:
+            message = "A name or definition in the database's schema holds text that is not valid UTF-8"
+        else:
+            message = f"{f'Column {column}' if column else 'A value'} holds text that is not valid UTF-8"
+        super().__init__(message, code=INVALID_TEXT)
+        self.column = None if in_catalog else column
 
 
 def invalid_text_error(sql: str, index: int) -> StatementError:

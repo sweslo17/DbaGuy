@@ -41,7 +41,7 @@ from ...sql.dialects import Dialect
 from ...sql.dump_script import (
     RESTORE_BACKSLASH_ESCAPES, RESTORE_CHECKS_FOREIGN_KEYS, DumpScript, default_rows_text, statement_end, table_sql,
 )
-from ...sql.select_builder import build_copy_select, build_count_select, check_filter
+from ...sql.select_builder import FILTER_NOT_A_CONDITION, build_copy_select, build_count_select, check_filter
 from ...storage.atomic_file import atomic_text_file
 from .context import Job, JobContext, JobReport
 
@@ -61,10 +61,7 @@ NOT_UNICODE = ("holds text that is not valid Unicode (half of a surrogate pair),
                "Nothing was written")
 NOT_UTF8 = "holds text that is not valid UTF-8, which a UTF-8 file cannot hold. Nothing was written"  # fix L2
 CATALOG_NOT_UTF8 = f"A name or definition in this database {NOT_UTF8}"
-INVALID_FILTER = "invalid_filter"
-# Task 9 fix M2: never the filter's text (it is the user's, and the log keeps messages)
-FILTER_NOT_A_CONDITION = ("The filter must be a condition on the table's rows (what follows WHERE): this one does more "
-                          "than read them")
+INVALID_FILTER = "invalid_filter"  # Task 9 fix M2; its text is select_builder's FILTER_NOT_A_CONDITION, never the value
 
 
 def scope_text(command: DumpCommand) -> str:
