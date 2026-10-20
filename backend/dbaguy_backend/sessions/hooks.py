@@ -6,8 +6,9 @@ from uuid import UUID
 
 from ..adapters.base import StatementError
 from ..adapters.registry import AdapterRegistry
-from ..domain.data_jobs import JobCommand
+from ..domain.data_jobs import RUN_SQL_FILES, JobCommand, cannot
 from ..domain.edits import PLAN_EXPIRED, PLAN_EXPIRED_MESSAGE, EditPlan, PlanUnavailable
+from ..domain.execution import RunFileCommand
 from ..domain.history import HistoryRecord, HistoryStatus
 from ..domain.profiles import AnyProfile
 from ..services.edit_plans import EditPlanStore
@@ -16,6 +17,7 @@ from ..services.profile_service import ProfileService
 from ..services.safety import GuardDecision, SafetyPolicy
 from ..services.schema_cache import SchemaCache
 from .jobs.context import Job, JobHooks
+from .jobs.run_file import RunFileJob
 from .worker import ExecutionRecord, WorkerHooks
 
 READ_ONLY_RECHECK_S = 1.0  # a job's statement gate re-reads the profile at most this often (R-06-6)
@@ -116,5 +118,12 @@ class SessionHooksFactory:
         )
 
     def build_job(self, command: JobCommand, profile: AnyProfile, database: str | None) -> Job:
-        """The job object for a job command on a session of `profile` (the composition root of data tools' jobs)."""
-        raise StatementError(f"{type(command).__name__} is not a job this backend runs", code="not_supported")
+        """The job object for a job command on a session of `profile` (the composition root of data tools' jobs). A
+        command the engine has no tool for is refused with §4's sentence (pre-flight L4)."""
+        capabilities = self._registry.get(profile.engine).capabilities
+        match command:
+            case RunFileCommand() if capabilities.run_file:
+                return RunFileJob(command, profile.name)
+            case RunFileCommand():
+                raise StatementError(cannot(profile.engine, RUN_SQL_FILES), code="not_supported")
+        raise StatementError(f"{type(command).__name__} is not a job this connection runs", code="not_supported")

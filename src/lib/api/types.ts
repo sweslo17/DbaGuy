@@ -138,6 +138,12 @@ export type JobOutcomeKind = JobOutcomeEvent["outcome"];
 export type JobError = S["JobError"];
 /** Data tools (spec ⑥ D-06-10): a job of this backend run, as `GET /data/jobs` lists it. */
 export type JobInfo = S["JobInfo"];
+/** Run SQL file (spec ⑥ §3.4): run a file on a job session, all or nothing or statement by statement. */
+export type RunFileCommand = S["RunFileCommand"];
+/** Run SQL file (spec ⑥ §3.2): the size, first lines, DbaGuy header and warnings of a file, before it runs. */
+export type FileInspection = S["FileInspection"];
+/** The header of a dump DbaGuy wrote, read back by the inspection: a hint, never a permission. */
+export type DumpHeader = S["DumpHeader"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

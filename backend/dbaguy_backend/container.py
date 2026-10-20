@@ -15,6 +15,7 @@ from .config import Settings, default_data_dir
 from .connectivity.ssh_tunnel import SshTunnelManager
 from .services.connection_service import ConnectionService
 from .services.couchbase_service import CouchbaseService
+from .services.data_service import DataService
 from .services.document_service import DocumentService
 from .services.edit_service import EditService
 from .services.field_sample_service import FieldSampleService
@@ -82,6 +83,7 @@ class AppContainer:
         self.documents = DocumentService(self.metadata, self.profiles, self.registry)
         self.edits = EditService(self.metadata, self.profiles, self.registry)
         self.field_samples = FieldSampleService(self.metadata, self.app_settings)
+        self.data = DataService(self.profiles, self.registry)
         self.history = HistoryService(history_file(data_dir))
         self.policy = SafetyPolicy()
         hooks = SessionHooksFactory(

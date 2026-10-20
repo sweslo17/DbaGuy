@@ -1,11 +1,13 @@
 """Data tools (spec ⑥ §3.2): the jobs of this backend run. A job itself is a WebSocket command on a session of its
 own (dump, run_file); these routes find it again after the window reloads, and cancel it."""
 
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, Response
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..container import AppContainer
-from ..domain.data_jobs import JobInfo
+from ..domain.data_jobs import FileInspection, JobInfo
 from ..domain.errors import NotFound
 from .deps import get_container, require_token
 
@@ -17,6 +19,19 @@ class JobCancelRequest(BaseModel):
 
     session_id: str
     request_id: str
+
+
+class RunFileInspectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile_id: UUID  # the connection the file would run on
+    path: str = Field(min_length=1, max_length=4096)
+
+
+@router.post("/run-file/inspect", response_model=FileInspection)
+def inspect_run_file(body: RunFileInspectRequest, container: AppContainer = Depends(get_container)) -> FileInspection:
+    """Run SQL file's dialog: the file's size, first lines and warnings. A read-only connection is refused (403)."""
+    return container.data.inspect(body.profile_id, body.path)
 
 
 @router.get("/jobs", response_model=list[JobInfo])

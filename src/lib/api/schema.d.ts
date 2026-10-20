@@ -481,6 +481,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/data/run-file/inspect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Inspect Run File
+         * @description Run SQL file's dialog: the file's size, first lines and warnings. A read-only connection is refused (403).
+         */
+        post: operations["inspect_run_file_data_run_file_inspect_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/data/jobs": {
         parameters: {
             query?: never;
@@ -1262,6 +1282,29 @@ export interface components {
             /** Size */
             size: number;
         };
+        /**
+         * DumpHeader
+         * @description The first lines of a dump DbaGuy wrote (spec ⑥ §3.3.2), as Run SQL file's inspection reads them back: a hint
+         *     for the dialog, never a permission.
+         */
+        DumpHeader: {
+            /** Format */
+            format: number;
+            engine: components["schemas"]["Engine"];
+            /** Server */
+            server?: string | null;
+            /** Scope */
+            scope?: string | null;
+            /** Created */
+            created?: string | null;
+            /**
+             * Drop First
+             * @default false
+             */
+            drop_first: boolean;
+            /** Lines */
+            lines: string[];
+        };
         /** EditChanges */
         EditChanges: {
             /** Updates */
@@ -1509,6 +1552,11 @@ export interface components {
             row_editing: boolean;
             /** Orders Browse By Key */
             orders_browse_by_key: boolean;
+            /**
+             * Run File
+             * @default false
+             */
+            run_file: boolean;
         };
         /** ErrorEvent */
         ErrorEvent: {
@@ -1574,7 +1622,7 @@ export interface components {
          */
         ExecutionSchema: {
             /** Command */
-            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["ExportCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"] | components["schemas"]["CommitCommand"] | components["schemas"]["RollbackCommand"] | components["schemas"]["SetAutocommitCommand"] | components["schemas"]["ApplyEditsCommand"];
+            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["ExportCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"] | components["schemas"]["CommitCommand"] | components["schemas"]["RollbackCommand"] | components["schemas"]["SetAutocommitCommand"] | components["schemas"]["ApplyEditsCommand"] | components["schemas"]["RunFileCommand"];
             /** Event */
             event: components["schemas"]["StartedEvent"] | components["schemas"]["ResultSetEvent"] | components["schemas"]["RowsEvent"] | components["schemas"]["ResultSetEndEvent"] | components["schemas"]["AffectedEvent"] | components["schemas"]["MessageEvent"] | components["schemas"]["ErrorEvent"] | components["schemas"]["ProgressEvent"] | components["schemas"]["ConfirmationRequiredEvent"] | components["schemas"]["SessionStateEvent"] | components["schemas"]["FinishedEvent"] | components["schemas"]["EditOutcomeEvent"] | components["schemas"]["JobProgressEvent"] | components["schemas"]["JobOutcomeEvent"];
         };
@@ -1666,6 +1714,26 @@ export interface components {
             elapsed_ms: number;
             /** Fields */
             fields: components["schemas"]["FieldPath"][];
+        };
+        /**
+         * FileInspection
+         * @description What Run SQL file's dialog shows of a file before it runs (POST /data/run-file/inspect).
+         */
+        FileInspection: {
+            /** Path */
+            path: string;
+            /** Size */
+            size: number;
+            header?: components["schemas"]["DumpHeader"] | null;
+            /** Preview */
+            preview: string;
+            /** Preview Truncated */
+            preview_truncated: boolean;
+            /**
+             * Warnings
+             * @default []
+             */
+            warnings: string[];
         };
         /** FinishedEvent */
         FinishedEvent: {
@@ -2467,6 +2535,52 @@ export interface components {
             index: number;
             /** Rows */
             rows: unknown[][];
+        };
+        /**
+         * RunFileCommand
+         * @description Run a SQL file on this session, a statement at a time (spec ⑥ §3.4): all of it in one transaction, or each
+         *     statement on its own (stopping at an error, or skipping it). Statements before `from_statement` are read, never
+         *     sent.
+         */
+        RunFileCommand: {
+            /** Request Id */
+            request_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "run_file";
+            /** Path */
+            path: string;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "all_or_nothing" | "statements";
+            /**
+             * On Error
+             * @default stop
+             * @enum {string}
+             */
+            on_error: "stop" | "continue";
+            /**
+             * From Statement
+             * @default 1
+             */
+            from_statement: number;
+            /** Search Path */
+            search_path?: string | null;
+            query_context?: components["schemas"]["QueryContext"] | null;
+        };
+        /** RunFileInspectRequest */
+        RunFileInspectRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Path */
+            path: string;
         };
         /** RunSettings */
         RunSettings: {
@@ -4128,6 +4242,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["EditPreview"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    inspect_run_file_data_run_file_inspect_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RunFileInspectRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FileInspection"];
                 };
             };
             /** @description Validation Error */

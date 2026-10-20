@@ -34,6 +34,9 @@ from . import editing, introspection
 from . import schema as sqlite_schema
 
 _PEEK_ROWS = 200
+# sqlite3 keeps this many compiled statements per connection (128 by default). Run SQL file's multi-row INSERTs
+# never repeat, and 128 compiled 1,000-row INSERTs held 300 MB (⑥ A10): statements are compiled each time instead
+_STATEMENT_CACHE = 0
 _PROGRESS_OPS = 10_000  # VM instructions between two looks at the cancel flag: ~0.3% slower, stops within ~0.1 ms
 # Statements that control the transaction themselves or cannot run inside one: manual mode does not BEGIN for them.
 _NO_AUTO_BEGIN = frozenset(
@@ -277,7 +280,7 @@ class SqliteAdapter(DatabaseAdapter):
     url_schemes = ("sqlite",)
     default_port = None
     dialect = Dialect.SQLITE
-    capabilities = AdapterCapabilities(row_editing=True)
+    capabilities = AdapterCapabilities(row_editing=True, run_file=True)
 
     def parse_url(self, url: str) -> ParsedUrl:
         """`sqlite:///abs/path` and `sqlite:////abs/path` (SQLAlchemy's absolute form) are absolute paths, `sqlite://rel`
@@ -303,7 +306,8 @@ class SqliteAdapter(DatabaseAdapter):
         uri = f"file:{quote(str(path))}?mode={mode}"
         conn: sqlite3.Connection | None = None
         try:
-            conn = sqlite3.connect(uri, uri=True, isolation_level=None, check_same_thread=True)
+            conn = sqlite3.connect(uri, uri=True, isolation_level=None, check_same_thread=True,
+                                   cached_statements=_STATEMENT_CACHE)
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("SELECT count(*) FROM sqlite_master").fetchone()  # fails for non-database files
         except sqlite3.Error as exc:

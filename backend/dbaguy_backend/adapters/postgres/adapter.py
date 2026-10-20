@@ -557,6 +557,7 @@ class PostgresAdapter(DatabaseAdapter):
     dialect = Dialect.POSTGRES
     capabilities = AdapterCapabilities(
         per_database_connection=True, cancel_aborts_transaction=True, row_editing=True, orders_browse_by_key=True,
+        run_file=True,
     )
 
     def parse_url(self, url: str) -> ParsedUrl:

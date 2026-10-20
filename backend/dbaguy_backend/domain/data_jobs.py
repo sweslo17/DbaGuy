@@ -7,6 +7,8 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from .profiles import Engine
+
 JobKind = Literal["dump", "run_file"]
 # R-06-12. Dump: completed or failed (nothing written). Run, all or nothing: completed, rolled_back, partial (the file
 # or a DDL ended the transaction), unknown (the link died during COMMIT). Run, statement by statement: completed,
@@ -19,6 +21,17 @@ MAX_JOB_ERRORS = 100  # D-06-11: errors kept with their text ("skip and continue
 MAX_JOB_MESSAGES = 200  # D-06-11: server messages (NOTICE, PRINT) forwarded per job; the rest are only counted
 PROGRESS_INTERVAL_S = 0.25  # D-06-11: at most one job_progress this often (and at each object's start and end)
 MAX_JOBS_LISTED = 200  # the job list keeps this many; the oldest finished ones go first
+ENGINE_NAMES: dict[Engine, str] = {  # what messages call an engine (the UI's ENGINE_LABELS)
+    Engine.POSTGRES: "PostgreSQL", Engine.MYSQL: "MySQL", Engine.MSSQL: "SQL Server", Engine.SQLITE: "SQLite",
+    Engine.COUCHBASE: "Couchbase",
+}
+RUN_SQL_FILES = "run SQL files"  # what a connection without `run_file` cannot do (spec §4)
+
+
+def cannot(engine: Engine | str, action: str) -> str:
+    """§4's refusal of a data tool the engine lacks (D-06-13): `Couchbase connections cannot be dumped`. The one text
+    of both the REST routes (422 `not_supported`) and a job command on the WebSocket (pre-flight L4)."""
+    return f"{ENGINE_NAMES[Engine(engine)]} connections cannot {action}"
 
 
 class JobCommand(BaseModel):
@@ -97,3 +110,27 @@ class JobInfo(BaseModel):
     started_at: datetime
     progress: JobProgressEvent | None = None  # the last one sent
     outcome: JobOutcomeEvent | None = None  # set once the job ended
+
+
+class DumpHeader(BaseModel):
+    """The first lines of a dump DbaGuy wrote (spec ⑥ §3.3.2), as Run SQL file's inspection reads them back: a hint
+    for the dialog, never a permission."""
+
+    format: int
+    engine: Engine
+    server: str | None = None  # `PostgreSQL 17.11`
+    scope: str | None = None  # `database dbaguy · schema public`
+    created: str | None = None
+    drop_first: bool = False
+    lines: list[str]  # the header's comment lines, as written
+
+
+class FileInspection(BaseModel):
+    """What Run SQL file's dialog shows of a file before it runs (POST /data/run-file/inspect)."""
+
+    path: str
+    size: int  # bytes
+    header: DumpHeader | None = None  # a DbaGuy dump's header
+    preview: str  # its first PREVIEW_LINES lines, at most PREVIEW_BYTES
+    preview_truncated: bool
+    warnings: list[str] = []

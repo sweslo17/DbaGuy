@@ -1780,6 +1780,66 @@
         }
       }
     },
+    "/data/run-file/inspect": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Inspect Run File",
+        "description": "Run SQL file's dialog: the file's size, first lines and warnings. A read-only connection is refused (403).",
+        "operationId": "inspect_run_file_data_run_file_inspect_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunFileInspectRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileInspection"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/data/jobs": {
       "get": {
         "tags": [
@@ -4134,6 +4194,70 @@
         "title": "DocumentView",
         "description": "One document as the server holds it (spec \u00a73.9.2, R-04-2)."
       },
+      "DumpHeader": {
+        "properties": {
+          "format": {
+            "type": "integer",
+            "title": "Format"
+          },
+          "engine": {
+            "$ref": "#/components/schemas/Engine"
+          },
+          "server": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Server"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
+          },
+          "created": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created"
+          },
+          "drop_first": {
+            "type": "boolean",
+            "title": "Drop First",
+            "default": false
+          },
+          "lines": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Lines"
+          }
+        },
+        "type": "object",
+        "required": [
+          "format",
+          "engine",
+          "lines"
+        ],
+        "title": "DumpHeader",
+        "description": "The first lines of a dump DbaGuy wrote (spec \u2465 \u00a73.3.2), as Run SQL file's inspection reads them back: a hint\nfor the dialog, never a permission."
+      },
       "EditChanges": {
         "properties": {
           "updates": {
@@ -4742,6 +4866,11 @@
           "orders_browse_by_key": {
             "type": "boolean",
             "title": "Orders Browse By Key"
+          },
+          "run_file": {
+            "type": "boolean",
+            "title": "Run File",
+            "default": false
           }
         },
         "type": "object",
@@ -4936,6 +5065,9 @@
               },
               {
                 "$ref": "#/components/schemas/ApplyEditsCommand"
+              },
+              {
+                "$ref": "#/components/schemas/RunFileCommand"
               }
             ],
             "title": "Command",
@@ -4950,6 +5082,7 @@
                 "export": "#/components/schemas/ExportCommand",
                 "fetch_more": "#/components/schemas/FetchMoreCommand",
                 "rollback": "#/components/schemas/RollbackCommand",
+                "run_file": "#/components/schemas/RunFileCommand",
                 "set_autocommit": "#/components/schemas/SetAutocommitCommand"
               }
             }
@@ -5228,6 +5361,53 @@
         ],
         "title": "FieldSample",
         "description": "A manual sample of a keyspace (R-04-11): the field paths derived in Python from the documents read."
+      },
+      "FileInspection": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "size": {
+            "type": "integer",
+            "title": "Size"
+          },
+          "header": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DumpHeader"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "preview": {
+            "type": "string",
+            "title": "Preview"
+          },
+          "preview_truncated": {
+            "type": "boolean",
+            "title": "Preview Truncated"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "size",
+          "preview",
+          "preview_truncated"
+        ],
+        "title": "FileInspection",
+        "description": "What Run SQL file's dialog shows of a file before it runs (POST /data/run-file/inspect)."
       },
       "FinishedEvent": {
         "properties": {
@@ -7263,6 +7443,102 @@
           "rows"
         ],
         "title": "RowsEvent"
+      },
+      "RunFileCommand": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "type": {
+            "type": "string",
+            "const": "run_file",
+            "title": "Type",
+            "default": "run_file"
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "all_or_nothing",
+              "statements"
+            ],
+            "title": "Mode"
+          },
+          "on_error": {
+            "type": "string",
+            "enum": [
+              "stop",
+              "continue"
+            ],
+            "title": "On Error",
+            "default": "stop"
+          },
+          "from_statement": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "From Statement",
+            "default": 1
+          },
+          "search_path": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1024,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Search Path"
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "path",
+          "mode"
+        ],
+        "title": "RunFileCommand",
+        "description": "Run a SQL file on this session, a statement at a time (spec \u2465 \u00a73.4): all of it in one transaction, or each\nstatement on its own (stopping at an error, or skipping it). Statements before `from_statement` are read, never\nsent."
+      },
+      "RunFileInspectRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "path"
+        ],
+        "title": "RunFileInspectRequest"
       },
       "RunSettings": {
         "properties": {
