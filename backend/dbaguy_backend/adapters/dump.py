@@ -14,6 +14,14 @@ Section = Literal["schema", "data"]
 OWNERS_AND_PRIVILEGES = "owners and privileges"  # never dumped (R-06-2)
 
 
+def kept_foreign_key(table: str, target: str, key: str | None = None) -> str:
+    """The warning for a foreign key its table's DDL keeps (MySQL, SQLite: the checks are off while the file runs)
+    although the table it references is not in the dump."""
+    which = f"Foreign key {key} of {table}" if key else f"A foreign key of {table}"
+    return (f"{which} references {target}, which is not in this dump: the file keeps it, and needs that table where "
+            "it is run")
+
+
 @dataclass(frozen=True)
 class DumpObject:
     """One object's DDL: its statements in order (no terminators), the DROP … IF EXISTS a `drop_first` dump writes

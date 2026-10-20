@@ -8,6 +8,7 @@ from urllib.parse import quote, unquote, urlparse
 
 from loguru import logger
 
+from ...domain.data_jobs import DumpObjectKinds, DumpScope
 from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import ColumnCategory, ColumnMeta, ServerMessage
@@ -21,6 +22,7 @@ from ..base import (
     DatabaseAdapter,
     DatabaseConnection,
     DataTools,
+    Dumping,
     Endpoint,
     ParsedUrl,
     RowEditing,
@@ -32,7 +34,8 @@ from ..base import (
 )
 from ..cancel_window import CancelWindow
 from ..columns import TableColumn
-from . import columns, editing, introspection
+from ..dump import DumpCatalog, DumpSession
+from . import columns, dump, editing, introspection
 from . import schema as sqlite_schema
 
 _PEEK_ROWS = 200
@@ -176,7 +179,7 @@ class SqliteStatementResult(StatementResult):
             self._cursor.close()
 
 
-class SqliteConnection(DatabaseConnection, RowEditing, DataTools):
+class SqliteConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
     def __init__(self, conn: sqlite3.Connection, path: Path) -> None:
         self._conn = conn  # isolation_level=None: the driver never begins a transaction on its own
         self._path = path
@@ -210,6 +213,15 @@ class SqliteConnection(DatabaseConnection, RowEditing, DataTools):
     def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
         try:
             return columns.table_columns(self._conn, path)
+        except sqlite3.Error as exc:
+            raise _translate(exc) from exc
+
+    def dump_session(self, scope: DumpScope) -> DumpSession:
+        return dump.SESSION
+
+    def dump_catalog(self, scope: DumpScope, kinds: DumpObjectKinds, *, ddl: bool = True) -> DumpCatalog:
+        try:
+            return dump.dump_catalog(self._conn, scope, kinds, ddl=ddl)
         except sqlite3.Error as exc:
             raise _translate(exc) from exc
 

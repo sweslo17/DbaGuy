@@ -99,7 +99,7 @@ class _BodyTracker:
         return self._head_word(0) == "CREATE" and created == "TRIGGER"
 
 
-def _after_account(head: list[Token], i: int) -> int:
+def after_account(head: list[Token], i: int) -> int:
     """`head[i]` follows the word DEFINER: skips `= account`, the account being user, 'user'@'host', `user`@`host`,
     user@host or CURRENT_USER[()], and returns the index after it. The lexer reads `@host` as one word, and a bare
     `@` as a word of its own that a quoted host follows."""
@@ -128,7 +128,7 @@ def _creates_stored_program(head: list[Token]) -> bool:
     if words[i:i + 2] == ["OR", "REPLACE"]:
         i += 2
     if words[i:i + 1] == ["DEFINER"]:
-        i = _after_account(head, i + 1)
+        i = after_account(head, i + 1)
     if words[i:i + 2] == ["SQL", "SECURITY"]:
         i += 3
     return i < len(words) and words[i] in _COMPOUND_OBJECTS

@@ -51,61 +51,65 @@ def read_relation(
                           conn.execute(_INDEXES, (name, schema)).fetchall())
 
 
-def affinity_kind(declared: str, strict: bool = False) -> tuple[EditKind, Compare]:
-    """SQLite's affinity rules in their order — INT; CHAR, CLOB, TEXT; BLOB or no type; REAL, FLOA, DOUB; else NUMERIC
-    — and inside NUMERIC what the declared name says: DATE / TIME, BOOL, JSON (ruling E6). REAL affinity holds floating
-    point, which is not compared. In a STRICT table ANY keeps every value as given, like no type ('007' stays text);
-    elsewhere it is NUMERIC ('007' is stored as 7)."""
-    upper = declared.upper()
+def _affinity(upper: str, strict: bool) -> str:
+    """What a declared type (upper case) is, by SQLite's affinity rules in their order — INT; CHAR, CLOB, TEXT;
+    BLOB; no type; REAL, FLOA, DOUB; else NUMERIC — and inside NUMERIC by what its name says: DATE / TIME, BOOL, JSON
+    (ruling E6). In a STRICT table ANY keeps every value as given, like no type. The one ladder `affinity_kind` and
+    `_family` both read."""
     if strict and upper == "ANY":
-        return "other", "equals"
+        return "none"
     if "INT" in upper:
-        return "number", "equals"
+        return "integer"
     if any(word in upper for word in ("CHAR", "CLOB", "TEXT")):
-        return "text", "equals"
+        return "text"
     if "BLOB" in upper:
-        return "binary", "equals"
+        return "blob"
     if not upper.strip():
-        return "other", "equals"
+        return "none"
     if any(word in upper for word in ("REAL", "FLOA", "DOUB")):
-        return "number", "none"
+        return "real"
     if "DATE" in upper or "TIME" in upper:
-        return "datetime", "equals"
+        return "datetime"
     if "BOOL" in upper:
-        return "bool", "equals"
+        return "bool"
     if "JSON" in upper:
-        return "json", "equals"
-    return "number", "equals"
+        return "json"
+    return "numeric"
+
+
+# REAL affinity holds floating point, which is not compared. Outside a STRICT table ANY is NUMERIC ('007' is stored as
+# 7); in one it keeps every value as given, like no type ('007' stays text)
+_EDIT_KINDS: dict[str, tuple[EditKind, Compare]] = {
+    "none": ("other", "equals"), "integer": ("number", "equals"), "text": ("text", "equals"),
+    "blob": ("binary", "equals"), "real": ("number", "none"), "datetime": ("datetime", "equals"),
+    "bool": ("bool", "equals"), "json": ("json", "equals"), "numeric": ("number", "equals"),
+}
+_FAMILIES: dict[str, TypeFamily] = {"none": "other", "integer": "int64", "blob": "binary", "real": "float64",
+                                    "bool": "bool", "json": "json"}
+
+
+def affinity_kind(declared: str, strict: bool = False) -> tuple[EditKind, Compare]:
+    """Grid editing's kind and compare rule for a declared type (`_affinity`)."""
+    return _EDIT_KINDS[_affinity(declared.upper(), strict)]
 
 
 def _family(declared: str, strict: bool) -> tuple[TypeFamily, dict]:
-    """The family a declared type names, by the same order as `affinity_kind`, with its sizes."""
+    """The family a declared type names (`_affinity`), with its sizes."""
     upper = declared.upper()
+    affinity = _affinity(upper, strict)
+    if affinity in _FAMILIES:
+        return _FAMILIES[affinity], {}
     sizes = _SIZES.search(upper)
     first = int(sizes.group(1)) if sizes else None
     second = int(sizes.group(2)) if sizes and sizes.group(2) else None
-    if strict and upper == "ANY" or not upper.strip():
-        return "other", {}
-    if "INT" in upper:
-        return "int64", {}
-    if any(word in upper for word in ("CHAR", "CLOB", "TEXT")):
+    if affinity == "text":
         if "CHAR" in upper and first is not None:
             return ("varchar" if "VAR" in upper else "char"), {"length": first}
         return "text", {}
-    if "BLOB" in upper:
-        return "binary", {}
-    if any(word in upper for word in ("REAL", "FLOA", "DOUB")):
-        return "float64", {}
-    if "DATE" in upper and "TIME" in upper or "TIMESTAMP" in upper:
-        return "timestamp", {}
-    if "DATE" in upper:
-        return "date", {}
-    if "TIME" in upper:
-        return "time", {}
-    if "BOOL" in upper:
-        return "bool", {}
-    if "JSON" in upper:
-        return "json", {}
+    if affinity == "datetime":
+        if "DATE" in upper and "TIME" in upper or "TIMESTAMP" in upper:
+            return "timestamp", {}
+        return ("date" if "DATE" in upper else "time"), {}
     return "decimal", ({"precision": first, "scale": second if second is not None else 0} if first else {})
 
 
