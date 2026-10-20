@@ -6,23 +6,25 @@ each batch; MySQL stored programs between DELIMITER lines). Every comment line g
 a catalog's statement ending in a comment cannot take its terminator into it (06a Task 6 review T9). Pure."""
 
 from collections import Counter
-from collections.abc import Iterable
-from typing import Literal
+from collections.abc import Iterable, Iterator
 
 from ..adapters.columns import SQL_VARIANT
 from ..adapters.dump import DumpCatalog, DumpObject, DumpTable
+from ..domain.data_jobs import DumpContent
 from ..domain.profiles import Engine
 from .dialects import RULES, ClientCommand, Dialect, identity_insert, qualified, quote_ident, quote_literal
 from .dump_header import comment_safe, complete_line, header_lines
 from .lexer import Token, TokenKind, scan
 
-Content = Literal["schema", "data", "both"]
 _CONTENT = {"schema": "schema only", "data": "data only", "both": "schema and data"}
 
 # MySQL: what a file restores under, and so what its dump session reads definitions and rows under (adapters/mysql/
 # dump.py, pre-flight M5): zero dates and an id of 0 restore as they are (no NO_ZERO_DATE; NO_AUTO_VALUE_ON_ZERO),
 # strict, so a value that does not fit stops the run instead of being cut; TIMESTAMPs read and written in UTC
 RESTORE_SQL_MODE = "STRICT_TRANS_TABLES,NO_AUTO_VALUE_ON_ZERO"
+# … so a restore reads backslashes as escapes, and a dump's MySQL literals are written for that (never for the mode
+# of the server dumped)
+RESTORE_BACKSLASH_ESCAPES = "NO_BACKSLASH_ESCAPES" not in RESTORE_SQL_MODE.split(",")
 RESTORE_TIME_ZONE = "+00:00"
 RESTORE_CHARSET = "utf8mb4"  # SET NAMES
 # What a restore must run under (D-06-7, §3.3.3)
@@ -50,6 +52,7 @@ _PLURALS = {"materialized view": "materialized views", "sequence value": "sequen
 _COUNTED = ("table", "view", "materialized view", "sequence", "type", "domain", "function", "aggregate", "procedure",
             "trigger", "event", "synonym")
 _COMMENTS = frozenset({TokenKind.COMMENT, TokenKind.EXEC_COMMENT})
+MAX_DEFAULT_ROWS = 1000  # rows of defaults a statement (MySQL) or a piece of text (SQLite) holds
 
 
 def _end(dialect: Dialect) -> str:
@@ -115,6 +118,35 @@ def lost_columns(catalog: DumpCatalog) -> list[str]:
             if column.not_copied_reason == SQL_VARIANT]
 
 
+def not_included(catalog: DumpCatalog) -> list[str]:
+    """The header's Not included list, which a dump plan shows word for word: what the catalog left out, then the
+    values of each column a dump cannot carry."""
+    return [*catalog.not_included, *(f"the values of sql_variant column {name}" for name in lost_columns(catalog))]
+
+
+def default_rows_text(dialect: Dialect, table: DumpTable, count: int) -> Iterator[str]:
+    """`count` rows of a table with no column a dump can write (only rowversion, computed or sql_variant columns; a
+    PostgreSQL table of no columns): each a row of its defaults, so the restore has as many rows as the source (06a
+    Task 7 review). PostgreSQL in one statement; MySQL MAX_DEFAULT_ROWS rows a statement; T-SQL one batch run `count`
+    times (`GO n`, which Run SQL file runs and counts each time); SQLite (whose tables always have such a column) a
+    statement a row."""
+    if count <= 0:
+        return
+    name = table_sql(dialect, table)
+    if dialect is Dialect.POSTGRES:
+        yield insert_text(dialect, f"INSERT INTO {name} SELECT FROM generate_series(1, {count})")
+    elif dialect is Dialect.MYSQL:
+        for start in range(0, count, MAX_DEFAULT_ROWS):
+            rows = min(MAX_DEFAULT_ROWS, count - start)
+            yield insert_text(dialect, f"INSERT INTO {name} () VALUES " + ", ".join(["()"] * rows))
+    elif dialect is Dialect.TSQL:
+        yield f"INSERT INTO {name} DEFAULT VALUES\nGO {count}\n"
+    else:
+        statement = insert_text(dialect, f"INSERT INTO {name} DEFAULT VALUES")
+        for start in range(0, count, MAX_DEFAULT_ROWS):
+            yield statement * min(MAX_DEFAULT_ROWS, count - start)
+
+
 def _plural(kind: str, count: int) -> str:
     word = kind if count == 1 else _PLURALS.get(kind, kind + "s")
     return f"{count:,} {word}"
@@ -129,7 +161,7 @@ class DumpScript:
     its INSERTs (`insert_text`) and table_tail(), post(), tail()."""
 
     def __init__(
-        self, dialect: Dialect, engine: Engine, catalog: DumpCatalog, *, content: Content, drop_first: bool,
+        self, dialect: Dialect, engine: Engine, catalog: DumpCatalog, *, content: DumpContent, drop_first: bool,
         created: str,
     ) -> None:
         self.dialect, self.engine, self.catalog = dialect, engine, catalog
@@ -153,11 +185,9 @@ class DumpScript:
         """The header, the restore's settings, and a `drop_first` file's DROPs: those of the objects after the data
         newest first, then those before it (H7: a foreign key's goes before its tables'). Only objects the file
         creates again are dropped."""
-        not_included = [*self.catalog.not_included,
-                        *(f"the values of sql_variant column {name}" for name in lost_columns(self.catalog))]
         lines = header_lines(
             engine=self.engine, server=self.catalog.server, scope=self.catalog.scope, created=self.created,
-            content=self.summary(), snapshot=self.catalog.snapshot_text, not_included=not_included,
+            content=self.summary(), snapshot=self.catalog.snapshot_text, not_included=not_included(self.catalog),
             drop_first=self.drops,
         )
         text = "\n".join(lines) + "\n\n" + "".join(insert_text(self.dialect, s) for s in RESTORE_SETTINGS[self.dialect])

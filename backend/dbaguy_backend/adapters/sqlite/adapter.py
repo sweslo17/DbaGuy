@@ -126,8 +126,10 @@ class _CancelGate:
 
 
 class SqliteStatementResult(StatementResult):
-    def __init__(self, cursor: sqlite3.Cursor, gate: _CancelGate) -> None:
-        """Called by `run()` inside `gate.call()`, right after `execute()`, so reading the first rows is covered too."""
+    def __init__(self, cursor: sqlite3.Cursor, gate: _CancelGate, *, peek: bool = True) -> None:
+        """Called by `run()` inside `gate.call()`, right after `execute()`, so reading the first rows is covered too.
+        `peek` False (RunOptions.describe False: nobody is shown the columns' types): no rows are read ahead for them
+        (a dump sizes its reads by the rows' size, 06a pre-flight M12)."""
         self._cursor = cursor
         self._gate = gate
         self._buffer: list[tuple[Any, ...]] = []
@@ -135,7 +137,8 @@ class SqliteStatementResult(StatementResult):
         self._closed = False
         if cursor.description is not None:
             try:
-                self._buffer = cursor.fetchmany(_PEEK_ROWS)
+                if peek:
+                    self._buffer = cursor.fetchmany(_PEEK_ROWS)
             except sqlite3.Error as exc:
                 raise _translate(exc) from exc
             self._columns = [self._column(i, d[0]) for i, d in enumerate(cursor.description)]
@@ -250,7 +253,7 @@ class SqliteConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
             cursor = self._conn.cursor()
             try:
                 cursor.execute(sql)
-                return SqliteStatementResult(cursor, self._gate)
+                return SqliteStatementResult(cursor, self._gate, peek=options is None or options.describe)
             except sqlite3.Error as exc:
                 cursor.close()
                 raise _translate(exc) from exc
@@ -300,7 +303,7 @@ class SqliteAdapter(DatabaseAdapter):
     url_schemes = ("sqlite",)
     default_port = None
     dialect = Dialect.SQLITE
-    capabilities = AdapterCapabilities(row_editing=True, run_file=True)
+    capabilities = AdapterCapabilities(row_editing=True, run_file=True, dump=True)
 
     def parse_url(self, url: str) -> ParsedUrl:
         """`sqlite:///abs/path` and `sqlite:////abs/path` (SQLAlchemy's absolute form) are absolute paths, `sqlite://rel`

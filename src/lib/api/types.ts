@@ -144,6 +144,16 @@ export type RunFileCommand = S["RunFileCommand"];
 export type FileInspection = S["FileInspection"];
 /** The header of a dump DbaGuy wrote, read back by the inspection: a hint, never a permission. */
 export type DumpHeader = S["DumpHeader"];
+/** Dump (spec ⑥ §3.3): dump a database, a schema or named tables of this session to a SQL file. */
+export type DumpCommand = S["DumpCommand"];
+/** Dump: what it covers ("database", "schema", "tables" with their names). */
+export type DumpScope = S["DumpScope"];
+/** Dump: which objects besides tables it writes (views, sequences, types, routines, triggers). */
+export type DumpObjectKinds = S["DumpObjectKinds"];
+/** Dump (POST /data/dump/plan): the objects, what the header leaves out, the consistency and the warnings. */
+export type DumpPlan = S["DumpPlan"];
+/** Dump plan: one object the dump writes under its own name (a table with its rows estimate). */
+export type DumpPlanObject = S["DumpPlanObject"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

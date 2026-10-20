@@ -1,27 +1,49 @@
-"""Data tools' previews (spec ⑥ §3.2): what a dialog shows before a job starts. No job runs here, and Run SQL file's
-inspection opens no connection at all (a read-only profile is refused first, R-06-6).
+"""Data tools' previews (spec ⑥ §3.2): what a dialog shows before a job starts, and Show in Finder for what a dump
+wrote. No job runs here. Run SQL file's inspection opens no connection at all (a read-only profile is refused first,
+R-06-6); a dump's plan reads the catalog on the metadata connection, without definitions (a read-only profile may dump).
 
-Logs: INFO the profile and the path of each inspection; never the file's contents."""
+Logs: INFO the profile and the path of each inspection, plan and reveal; never the file's contents."""
 
 import re
+import shutil
+import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from uuid import UUID
 
 from loguru import logger
 
-from ..adapters.base import DatabaseAdapter
+from ..adapters.base import DatabaseAdapter, DatabaseConnection, Dumping
+from ..adapters.dump import DumpCatalog, parents_first
 from ..adapters.registry import AdapterRegistry
-from ..domain.data_jobs import ENGINE_NAMES, RUN_SQL_FILES, DumpHeader, FileInspection, cannot, cannot_read
-from ..domain.errors import FileNotFound, NotSupported, ReadOnlyProfile, StorageError
-from ..domain.profiles import AnyProfile, Engine
+from ..domain.data_jobs import (
+    BE_DUMPED, ENGINE_NAMES, RUN_SQL_FILES, DumpContent, DumpHeader, DumpObjectKinds, DumpPlan, DumpPlanObject,
+    DumpScope, FileInspection, cannot, cannot_read,
+)
+from ..domain.errors import FileNotFound, NotFound, NotSupported, ReadOnlyProfile, StorageError
+from ..domain.profiles import AnyProfile, Engine, SqliteProfile
+from ..sessions.jobs.dump import FK_CYCLE, target_problem
+from ..sessions.jobs.registry import JobRegistry
 from ..sql.dump_header import CUT_SHORT, END_BYTES, cut_short, parse_header
+from ..sql.dump_script import not_included
 from ..sql.statement_stream import UTF16_MESSAGE, starts_with_utf16_bom
+from .metadata_service import MetadataService
 from .profile_service import ProfileService
 
 PREVIEW_LINES = 200  # spec §3.2: the first lines of a file Run SQL file shows
 PREVIEW_BYTES = 64 * 1024
+LOW_DISK_BYTES = 1 << 30  # CR-4: below this much free space a dump's plan warns, whatever its estimate
+_GIB = 1 << 30
 _COPY_FROM_STDIN = re.compile(r"COPY\s.*\sFROM\s+stdin", re.IGNORECASE)
 _HEX_BLOB = "mysqldump: use --hex-blob"
+# The parts of another object, which a dump plan's list leaves to it (DumpPlan)
+_PARTS = frozenset({"index", "foreign key", "check constraint", "default", "column default", "table settings",
+                    "trigger state", "sequence owner", "sequence value", "identity value", "row-level security",
+                    "setting"})
+
+
+def _open_in_finder(path: Path) -> None:
+    subprocess.run(["/usr/bin/open", "-R", str(path)], check=False, timeout=10)
 
 
 def _decoded(head: bytes) -> tuple[str, int | None]:
@@ -36,9 +58,82 @@ def _decoded(head: bytes) -> tuple[str, int | None]:
 
 
 class DataService:
-    def __init__(self, profiles: ProfileService, registry: AdapterRegistry) -> None:
+    def __init__(
+        self, profiles: ProfileService, registry: AdapterRegistry, metadata: MetadataService, jobs: JobRegistry,
+        reveal: Callable[[Path], None] = _open_in_finder,
+    ) -> None:
         self._profiles = profiles
         self._registry = registry
+        self._metadata = metadata
+        self._jobs = jobs
+        self._reveal = reveal
+
+    def dump_plan(
+        self, profile_id: UUID, database: str | None, scope: DumpScope, content: DumpContent, kinds: DumpObjectKinds,
+        path: str | None,
+    ) -> DumpPlan:
+        """What a dump of `scope` would write (the objects under their own names, DumpPlan), what its header says is
+        left out, its consistency and its warnings: the catalog's, a data-only dump's foreign-key cycle, and for `path`
+        a file the dump would refuse (M13) or little free disk where it goes (CR-4: never a refusal)."""
+        profile, _ = self._admit(profile_id, BE_DUMPED, "dump")
+
+        def read(connection: DatabaseConnection) -> DumpCatalog:
+            if not isinstance(connection, Dumping):
+                raise NotSupported(cannot(profile.engine, BE_DUMPED))
+            return connection.dump_catalog(scope, kinds, ddl=False)
+
+        catalog = self._metadata.with_connection(profile_id, database, read)
+        estimates = {table.name: table.rows_estimate for table in catalog.tables}
+        warnings = list(catalog.warnings)
+        if content == "data":
+            tables, cycle = parents_first(catalog.tables)
+            objects = [DumpPlanObject(kind="table", name=table.name, rows_estimate=table.rows_estimate)
+                       for table in tables]
+            warnings += [FK_CYCLE] if cycle else []
+        else:
+            rows = content == "both"  # a schema-only dump writes no rows
+            named = [item for item in (*catalog.pre, *catalog.post)
+                     if item.section == "schema" and item.kind not in _PARTS]
+            objects = [DumpPlanObject(kind=item.kind, name=item.name,
+                                      rows_estimate=estimates.get(item.name) if rows and item.kind == "table" else None)
+                       for item in named]
+        if path is not None:
+            warnings += self._target_warnings(profile, catalog, content, path)
+        logger.info("Dump plan for {}: {} object(s), {} table(s), {}", profile.name, len(objects), len(catalog.tables),
+                    catalog.consistency)
+        return DumpPlan(objects=objects, not_included=not_included(catalog), consistency=catalog.consistency,
+                        warnings=warnings)
+
+    @staticmethod
+    def _target_warnings(profile: AnyProfile, catalog: DumpCatalog, content: DumpContent, path: str) -> list[str]:
+        """A file the dump would refuse (pre-flight M13), and CR-4's free space: a warning when the destination's disk
+        has less than LOW_DISK_BYTES free, or less than the dump may take (about twice the tables' size on disk: an
+        INSERT's text is longer than the rows it holds; a SQLite file's size when the catalog has no sizes)."""
+        source = Path(profile.path) if isinstance(profile, SqliteProfile) else None
+        if (problem := target_problem(path, source)) is not None:
+            return [problem]
+        if content == "schema":
+            return []
+        folder = Path(path).expanduser().parent
+        try:
+            free = shutil.disk_usage(folder).free
+        except OSError:
+            return []
+        estimate = 2 * sum(table.bytes_estimate or 0 for table in catalog.tables)
+        if not estimate and source is not None and source.expanduser().is_file():
+            estimate = 2 * source.expanduser().stat().st_size
+        if free >= max(estimate, LOW_DISK_BYTES):
+            return []
+        need = f" (the dump may need about {estimate / _GIB:.1f} GB)" if estimate > free else ""
+        return [f"Only {free / _GIB:.1f} GB free where the dump is written{need}"]
+
+    def reveal(self, path: str) -> None:
+        """Show in Finder: only a file a completed dump of this backend run wrote, and only while it is there."""
+        target = Path(path).expanduser()
+        if not self._jobs.dumped(str(target)) or not target.is_file():
+            raise NotFound(f"{path} is not a file a dump of this run wrote")
+        logger.info("Showing {} in Finder", target)
+        self._reveal(target)
 
     def inspect(self, profile_id: UUID, path: str) -> FileInspection:
         """Run SQL file's look at a file before it runs: its size, its first lines, a DbaGuy dump's header, and what

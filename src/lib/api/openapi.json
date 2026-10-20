@@ -1780,6 +1780,119 @@
         }
       }
     },
+    "/data/dump/plan": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Dump Plan",
+        "description": "The dump dialog's object list, what the header leaves out, the consistency and the warnings (the metadata\nconnection; nothing is written). 422 `not_supported` for an engine without dumps.",
+        "operationId": "dump_plan_data_dump_plan_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DumpPlanRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DumpPlan"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/data/reveal": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Reveal",
+        "description": "Show in Finder, for a file a completed dump of this backend run wrote (404 for any other path).",
+        "operationId": "reveal_data_reveal_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevealRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/data/run-file/inspect": {
       "post": {
         "tags": [
@@ -4194,6 +4307,74 @@
         "title": "DocumentView",
         "description": "One document as the server holds it (spec \u00a73.9.2, R-04-2)."
       },
+      "DumpCommand": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "type": {
+            "type": "string",
+            "const": "dump",
+            "title": "Type",
+            "default": "dump"
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/DumpScope"
+          },
+          "content": {
+            "type": "string",
+            "enum": [
+              "schema",
+              "data",
+              "both"
+            ],
+            "title": "Content",
+            "default": "both"
+          },
+          "objects": {
+            "$ref": "#/components/schemas/DumpObjectKinds",
+            "default": {
+              "views": true,
+              "sequences": true,
+              "types": true,
+              "routines": true,
+              "triggers": true
+            }
+          },
+          "drop_first": {
+            "type": "boolean",
+            "title": "Drop First",
+            "default": false
+          },
+          "filter": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 65536
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filter"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "path",
+          "scope"
+        ],
+        "title": "DumpCommand",
+        "description": "Dump a scope of this session's database to a SQL file (spec \u2465 \u00a73.3): written through a temporary file, so a\ndump that fails or is cancelled leaves no file and keeps any old one."
+      },
       "DumpHeader": {
         "properties": {
           "format": {
@@ -4257,6 +4438,221 @@
         ],
         "title": "DumpHeader",
         "description": "The first lines of a dump DbaGuy wrote (spec \u2465 \u00a73.3.2), as Run SQL file's inspection reads them back: a hint\nfor the dialog, never a permission."
+      },
+      "DumpObjectKinds": {
+        "properties": {
+          "views": {
+            "type": "boolean",
+            "title": "Views",
+            "default": true
+          },
+          "sequences": {
+            "type": "boolean",
+            "title": "Sequences",
+            "default": true
+          },
+          "types": {
+            "type": "boolean",
+            "title": "Types",
+            "default": true
+          },
+          "routines": {
+            "type": "boolean",
+            "title": "Routines",
+            "default": true
+          },
+          "triggers": {
+            "type": "boolean",
+            "title": "Triggers",
+            "default": true
+          }
+        },
+        "type": "object",
+        "title": "DumpObjectKinds",
+        "description": "Which objects besides tables a dump writes (R-06-2); a table's own sequences and column types always come\nwith it. Routines include MySQL events; views include SQL Server synonyms."
+      },
+      "DumpPlan": {
+        "properties": {
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/DumpPlanObject"
+            },
+            "type": "array",
+            "title": "Objects"
+          },
+          "not_included": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Not Included"
+          },
+          "consistency": {
+            "type": "string",
+            "enum": [
+              "snapshot",
+              "per_table"
+            ],
+            "title": "Consistency"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "objects",
+          "not_included",
+          "consistency"
+        ],
+        "title": "DumpPlan",
+        "description": "What a dump of a scope would write (POST /data/dump/plan): the dialog's object list and warnings. Read on the\nmetadata connection, outside any snapshot; the dump reads the catalog again inside its own.\n\n`objects` are the objects the content writes under their own names, in the file's order: schemas, extensions,\ncollations, types, sequences, routines, tables, views, triggers, events, synonyms, rules, extended statistics and\npolicies. The parts of another object are left to it: a table's indexes, foreign keys, check constraints,\ndefaults and settings, a trigger's state, a sequence's owner and value, an identity's value, a table's row-level\nsecurity switch, SQLite's header settings (user_version, application_id). A data-only plan lists the tables alone,\nparents first. `not_included` is the header's Not included list, word for word."
+      },
+      "DumpPlanObject": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "rows_estimate": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rows Estimate"
+          },
+          "notes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Notes",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind",
+          "name"
+        ],
+        "title": "DumpPlanObject",
+        "description": "One object a dump writes under its own name, as the dump dialog lists it."
+      },
+      "DumpPlanRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "database": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Database"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/DumpScope"
+          },
+          "content": {
+            "type": "string",
+            "enum": [
+              "schema",
+              "data",
+              "both"
+            ],
+            "title": "Content",
+            "default": "both"
+          },
+          "objects": {
+            "$ref": "#/components/schemas/DumpObjectKinds",
+            "default": {
+              "views": true,
+              "sequences": true,
+              "types": true,
+              "routines": true,
+              "triggers": true
+            }
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 4096,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "scope"
+        ],
+        "title": "DumpPlanRequest"
+      },
+      "DumpScope": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "database",
+              "schema",
+              "tables"
+            ],
+            "title": "Kind"
+          },
+          "schema_name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1024,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schema Name"
+          },
+          "names": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 500,
+            "title": "Names"
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "title": "DumpScope",
+        "description": "What a dump covers (spec \u2465 \u00a73.3.1): a whole database (PostgreSQL, SQL Server), one schema (MySQL: a database;\nSQLite: main), or named tables and views of one schema."
       },
       "EditChanges": {
         "properties": {
@@ -4871,6 +5267,11 @@
             "type": "boolean",
             "title": "Run File",
             "default": false
+          },
+          "dump": {
+            "type": "boolean",
+            "title": "Dump",
+            "default": false
           }
         },
         "type": "object",
@@ -5068,6 +5469,9 @@
               },
               {
                 "$ref": "#/components/schemas/RunFileCommand"
+              },
+              {
+                "$ref": "#/components/schemas/DumpCommand"
               }
             ],
             "title": "Command",
@@ -5078,6 +5482,7 @@
                 "cancel": "#/components/schemas/CancelCommand",
                 "commit": "#/components/schemas/CommitCommand",
                 "discard": "#/components/schemas/DiscardCommand",
+                "dump": "#/components/schemas/DumpCommand",
                 "execute": "#/components/schemas/ExecuteCommand",
                 "export": "#/components/schemas/ExportCommand",
                 "fetch_more": "#/components/schemas/FetchMoreCommand",
@@ -7243,6 +7648,22 @@
           "columns"
         ],
         "title": "ResultSetEvent"
+      },
+      "RevealRequest": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "title": "RevealRequest"
       },
       "RollbackCommand": {
         "properties": {

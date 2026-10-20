@@ -50,7 +50,7 @@ _IMPLICIT_OFF = "SET IMPLICIT_TRANSACTIONS OFF"
 SNAPSHOT = DumpSession(setup=(_IMPLICIT_OFF, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT", "BEGIN TRANSACTION"),
                        teardown=("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",  # review S6: 3961 / 3951 end it first
                                  "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"),
-                       consistency="snapshot")
+                       consistency="snapshot", changed_codes=frozenset({"3961"}))  # DDL after the snapshot began
 PER_TABLE = DumpSession(setup=(_IMPLICIT_OFF,), teardown=(), consistency="per_table")
 SNAPSHOT_TEXT = "one consistent snapshot (SNAPSHOT isolation)"
 PER_TABLE_TEXT = "not one consistent snapshot: each table was read in its turn (READ COMMITTED)"

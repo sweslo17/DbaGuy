@@ -83,13 +83,14 @@ class AppContainer:
         self.documents = DocumentService(self.metadata, self.profiles, self.registry)
         self.edits = EditService(self.metadata, self.profiles, self.registry)
         self.field_samples = FieldSampleService(self.metadata, self.app_settings)
-        self.data = DataService(self.profiles, self.registry)
+        self.jobs = JobRegistry()
+        self.data = DataService(self.profiles, self.registry, self.metadata, self.jobs)
         self.history = HistoryService(history_file(data_dir))
         self.policy = SafetyPolicy()
         hooks = SessionHooksFactory(
             self.registry, self.profiles, self.policy, self.history, self.schema_cache, self.edits.plans,
         )
-        self.sessions = SessionManager(self.connections, self.profiles, hooks, jobs=JobRegistry())
+        self.sessions = SessionManager(self.connections, self.profiles, hooks, jobs=self.jobs)
         self._stop = threading.Event()
         self._housekeeper: threading.Thread | None = None
 

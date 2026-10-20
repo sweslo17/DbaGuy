@@ -15,6 +15,7 @@ from uuid import UUID
 
 import mysql.connector
 import psycopg
+from pymssql import _mssql
 
 from dbaguy_backend.config import Settings
 from dbaguy_backend.container import AppContainer
@@ -32,6 +33,7 @@ from tests.support import (
 from tests.test_sessions import Recorder, request_events
 
 SCRATCH_PREFIX = "zz_06_"
+_ROW_TUPLE = _mssql.ROW_FORMAT_TUPLE
 
 
 def scratch_name(kind: str) -> str:
@@ -109,12 +111,19 @@ class _Admin:
         """Set-up statements as the administrator, in database `name`."""
         self._run(*statements, database=name)
 
-    def _run(self, *statements: str, database: str | None = None) -> None:
+    def rows(self, database: str, sql: str) -> list[tuple]:
+        """A read as the administrator, in database `database` (checks compare the source and the restore with it)."""
+        return self._run(sql, database=database)
+
+    def _run(self, *statements: str, database: str | None = None) -> list[tuple]:
+        """The statements in order; the rows of the last one."""
+        found: list[tuple] = []
         if self.engine == "postgres":
             with psycopg.connect(host=PG_HOST, port=PG_PORT, user=PG_USER, password=PG_PASSWORD,
                                  dbname=database or "postgres", autocommit=True) as conn:
                 for statement in statements:
-                    conn.execute(statement)
+                    cursor = conn.execute(statement)
+                    found = [tuple(row) for row in cursor.fetchall()] if cursor.description else []
         elif self.engine == "mysql":
             conn = mysql.connector.connect(**mysql_driver_kwargs(user="root", password="dbaguy", autocommit=True,
                                                                  database=database or "mysql"))
@@ -122,8 +131,7 @@ class _Admin:
                 for statement in statements:
                     cursor = conn.cursor()
                     cursor.execute(statement)
-                    if cursor.with_rows:
-                        cursor.fetchall()
+                    found = [tuple(row) for row in cursor.fetchall()] if cursor.with_rows else []
                     cursor.close()
             finally:
                 conn.close()
@@ -131,9 +139,14 @@ class _Admin:
             conn = mssql_connect(user="sa", password=MSSQL_SA_PASSWORD, database=database or "master")
             try:
                 for statement in statements:
-                    conn.execute_non_query(statement)
+                    conn.execute_query(statement)
+                    found = [tuple(row) for row in conn.get_iterator(_ROW_TUPLE)]
+                    while conn.nextresult():
+                        for _ in conn.get_iterator(_ROW_TUPLE):
+                            pass
             finally:
                 conn.close()
+        return found
 
 
 @contextmanager

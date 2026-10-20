@@ -51,6 +51,13 @@ class JobRegistry:
             info = self._jobs.get((session_id, request_id))
             return info.model_copy() if info is not None else None
 
+    def dumped(self, path: str) -> bool:
+        """Whether a dump of this backend run wrote the file at `path` (Show in Finder reveals only those). A cleared
+        job's file is forgotten with it."""
+        with self._lock:
+            return any(info.job == "dump" and info.outcome is not None and info.outcome.outcome == "completed"
+                       and info.outcome.path == path for info in self._jobs.values())
+
     def clear_finished(self) -> int:
         """Forget every job that has ended; the number forgotten."""
         with self._lock:

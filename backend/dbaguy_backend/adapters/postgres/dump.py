@@ -47,6 +47,9 @@ SESSION = DumpSession(
            "SET search_path = ''", "SET TimeZone = 'UTC'", "SET row_security = off",
            "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY"),
     teardown=("ROLLBACK",), consistency="snapshot",
+    # pre-flight L11: a filter reads as the table-data tab does (its unqualified function, a citext column's `=`); the
+    # catalog's text is read by then, and without a filter the rows stay read under '' (regclass values in full)
+    filter_setup=("SET search_path TO DEFAULT",),
 )
 SNAPSHOT_TEXT = "one consistent snapshot (REPEATABLE READ)"
 RLS_SNAPSHOT = "; row_security off: row-level security hides no rows"  # when a dumped table has it (M10)

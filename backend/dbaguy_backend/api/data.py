@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..container import AppContainer
-from ..domain.data_jobs import FileInspection, JobInfo
+from ..domain.data_jobs import DumpContent, DumpObjectKinds, DumpPlan, DumpScope, FileInspection, JobInfo
 from ..domain.errors import NotFound
 from .deps import get_container, require_token
 
@@ -26,6 +26,37 @@ class RunFileInspectRequest(BaseModel):
 
     profile_id: UUID  # the connection the file would run on
     path: str = Field(min_length=1, max_length=4096)
+
+
+class DumpPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile_id: UUID
+    database: str | None = None  # the database node's (PostgreSQL, SQL Server); else the profile's
+    scope: DumpScope
+    content: DumpContent = "both"
+    objects: DumpObjectKinds = DumpObjectKinds()
+    path: str | None = Field(default=None, min_length=1, max_length=4096)  # where it would go: checks and free space
+
+
+class RevealRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=4096)
+
+
+@router.post("/dump/plan", response_model=DumpPlan)
+def dump_plan(body: DumpPlanRequest, container: AppContainer = Depends(get_container)) -> DumpPlan:
+    """The dump dialog's object list, what the header leaves out, the consistency and the warnings (the metadata
+    connection; nothing is written). 422 `not_supported` for an engine without dumps."""
+    return container.data.dump_plan(body.profile_id, body.database, body.scope, body.content, body.objects, body.path)
+
+
+@router.post("/reveal", status_code=204)
+def reveal(body: RevealRequest, container: AppContainer = Depends(get_container)) -> Response:
+    """Show in Finder, for a file a completed dump of this backend run wrote (404 for any other path)."""
+    container.data.reveal(body.path)
+    return Response(status_code=204)
 
 
 @router.post("/run-file/inspect", response_model=FileInspection)

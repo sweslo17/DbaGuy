@@ -285,8 +285,12 @@ class _CursorResult(StatementResult):
     silently rolls back). close() runs CLOSE instead, which leaves the transaction exactly as it was.
     """
 
-    def __init__(self, owner: "PostgresConnection", cursor: psycopg.ServerCursor, sql: str) -> None:
+    def __init__(self, owner: "PostgresConnection", cursor: psycopg.ServerCursor, sql: str, *,
+                 read_ahead: bool = True) -> None:
         self._owner, self._cursor, self._sql = owner, cursor, sql
+        # False (RunOptions.describe False: a job's read): each FETCH takes only the rows asked for, never a page more
+        # (a dump sizes its reads by the rows' size, 06a pre-flight M12)
+        self._read_ahead = read_ahead
         self._pending: list[Any] = []
         self._done = False
         self._closed = False
@@ -304,7 +308,9 @@ class _CursorResult(StatementResult):
 
     def fetch(self, n: int) -> list[list[Any]]:
         while len(self._pending) < n and not self._done and self._columns is not None:
-            want = max(n - len(self._pending), _STREAM_CHUNK)  # read ahead: one FETCH per page, not per call
+            want = n - len(self._pending)
+            if self._read_ahead:
+                want = max(want, _STREAM_CHUNK)  # read ahead: one FETCH per page, not per call
             try:
                 page = self._cursor.fetchmany(want)
             except psycopg.Error as exc:
@@ -513,7 +519,8 @@ class PostgresConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
                 # In a transaction, or about to open one (manual mode: psycopg begins before the first statement):
                 # never stream, abandoning a stream would cancel it and abort the user's transaction.
                 if status in (pq.TransactionStatus.IDLE, pq.TransactionStatus.INTRANS) and _declarable(sql):
-                    return _CursorResult(self, self._server_cursor(), sql)
+                    return _CursorResult(self, self._server_cursor(), sql,
+                                         read_ahead=options is None or options.describe)
                 # Anything else (SHOW, EXPLAIN, RETURNING, scripts…) is read in full.
             return self._run_buffered(sql)
         except psycopg.Error as exc:  # e.g. creating a cursor on a dead connection
@@ -576,7 +583,7 @@ class PostgresAdapter(DatabaseAdapter):
     dialect = Dialect.POSTGRES
     capabilities = AdapterCapabilities(
         per_database_connection=True, cancel_aborts_transaction=True, row_editing=True, orders_browse_by_key=True,
-        run_file=True,
+        run_file=True, dump=True,
     )
 
     def parse_url(self, url: str) -> ParsedUrl:

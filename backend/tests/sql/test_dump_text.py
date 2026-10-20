@@ -266,3 +266,35 @@ def test_every_line_break_python_reads_is_written_as_text():  # S15: parse_heade
                         drop_first=True, created="x")
     header = parse_header(script.head())
     assert header.scope == "schema a\\u2028b" and header.lines[-1] == "-- Options: drop objects first: yes"
+
+
+def test_a_table_with_no_column_to_write_gets_rows_of_defaults():  # 06a Task 7 review, Task 9
+    from dbaguy_backend.sql.dump_script import MAX_DEFAULT_ROWS, default_rows_text
+
+    def table(schema, name):
+        return DumpTable(schema=schema, table=name, name=name, columns=())
+
+    assert list(default_rows_text(PG, table("s", "t"), 0)) == []
+    assert list(default_rows_text(PG, table("s", "t"), 5)) == ["INSERT INTO s.t SELECT FROM generate_series(1, 5);\n"]
+    mysql = list(default_rows_text(MY, table("db", "t"), MAX_DEFAULT_ROWS + 2))
+    assert [text.count("()") - 1 for text in mysql] == [MAX_DEFAULT_ROWS, 2]  # `t ()` and each row's `()`
+    assert mysql[1] == "INSERT INTO t () VALUES (), ();\n"
+    assert list(default_rows_text(TS, table("dbo", "t t"), 3)) == ["INSERT INTO dbo.[t t] DEFAULT VALUES\nGO 3\n"]
+    [(text, repeat)] = [(s.text, s.repeat) for s in split("SELECT 1\nGO\n" + "".join(
+        default_rows_text(TS, table("dbo", "t"), 3)), TS) if "DEFAULT" in s.text]
+    assert (text, repeat) == ("INSERT INTO dbo.t DEFAULT VALUES", 3)
+    sqlite = "".join(default_rows_text(LITE, table("main", "t"), 3))
+    assert [s.text for s in split(sqlite, LITE)] == ["INSERT INTO t DEFAULT VALUES"] * 3
+
+
+@pytest.mark.parametrize("dialect", [PG, MY, TS, LITE])
+def test_the_column_whose_value_a_file_cannot_hold_is_found(dialect):  # pre-flight L15
+    batcher = InsertBatcher(dialect, "t", [col("id"), col("note", "text"), col("other", "text")])
+    batcher.add([1, "a, (b) 'c'", None])
+    batcher.add([2, "fine", "half \ud83d"])
+    statement = batcher.flush()
+    bad = next(i for i, ch in enumerate(statement) if "\ud800" <= ch <= "\udfff")
+    assert batcher.column_at(statement, bad) == "other"
+    assert batcher.column_at(statement, 0) is None  # the head: a name
+    nested = batcher._head + "(1, CONVERT(int, 2), 'half \ud83d')"  # a value's own commas are not a column's
+    assert batcher.column_at(nested, len(nested) - 3) == "other"

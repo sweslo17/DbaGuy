@@ -26,6 +26,7 @@ ENGINE_NAMES: dict[Engine, str] = {  # what messages call an engine (the UI's EN
     Engine.COUCHBASE: "Couchbase",
 }
 RUN_SQL_FILES = "run SQL files"  # what a connection without `run_file` cannot do (spec §4)
+BE_DUMPED = "be dumped"  # what a connection without `dump` cannot (spec §4)
 
 
 def cannot_read(path: str, exc: OSError) -> str:
@@ -170,3 +171,32 @@ class DumpObjectKinds(BaseModel):
     types: bool = True
     routines: bool = True
     triggers: bool = True
+
+
+DumpContent = Literal["schema", "data", "both"]
+
+
+class DumpPlanObject(BaseModel):
+    """One object a dump writes under its own name, as the dump dialog lists it."""
+
+    kind: str  # table, view, function, …
+    name: str  # as the file names it: schema.name (MySQL, SQLite: name)
+    rows_estimate: int | None = None  # ≈ the catalog's statistics (tables whose rows the dump writes)
+    notes: list[str] = []
+
+
+class DumpPlan(BaseModel):
+    """What a dump of a scope would write (POST /data/dump/plan): the dialog's object list and warnings. Read on the
+    metadata connection, outside any snapshot; the dump reads the catalog again inside its own.
+
+    `objects` are the objects the content writes under their own names, in the file's order: schemas, extensions,
+    collations, types, sequences, routines, tables, views, triggers, events, synonyms, rules, extended statistics and
+    policies. The parts of another object are left to it: a table's indexes, foreign keys, check constraints,
+    defaults and settings, a trigger's state, a sequence's owner and value, an identity's value, a table's row-level
+    security switch, SQLite's header settings (user_version, application_id). A data-only plan lists the tables alone,
+    parents first. `not_included` is the header's Not included list, word for word."""
+
+    objects: list[DumpPlanObject]
+    not_included: list[str]
+    consistency: Literal["snapshot", "per_table"]
+    warnings: list[str] = []

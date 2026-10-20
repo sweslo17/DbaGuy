@@ -201,3 +201,14 @@ def test_sqlpp_browse_select_reads_the_collection_with_its_meta_id():  # D-04-11
     for where, order, count in [("x = 1", [], False), (None, [SortKey(column="x")], False), (None, [], True)]:
         with pytest.raises(ValidationFailed, match="SQL\\+\\+ in a query tab"):
             build_browse_select(Dialect.SQLPP, path("dbaguy", "app", "orders"), where, order, count)
+
+
+def test_a_dumps_count_and_its_filter_check():  # 06a Task 9: a table with no column a dump writes, a filter up front
+    from dbaguy_backend.sql.select_builder import build_count_select, check_filter
+
+    assert build_count_select(Dialect.POSTGRES, "s", "t", "id < 3", only=True) == (
+        "SELECT COUNT(*) FROM ONLY s.t\nWHERE id < 3")
+    assert build_count_select(Dialect.TSQL, "dbo", "o t") == "SELECT COUNT(*) FROM dbo.[o t]"
+    assert check_filter(Dialect.MYSQL, "  -- nothing\n") is None and check_filter(Dialect.MYSQL, "a = 1;") == "a = 1"
+    with pytest.raises(ValidationFailed):
+        check_filter(Dialect.TSQL, "id = 1 DELETE FROM t")

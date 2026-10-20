@@ -49,14 +49,16 @@ SNAPSHOT_TEXT = "one consistent snapshot (InnoDB)"
 DEFINERS_LEFT_OUT = "DEFINER clauses (the account running the file becomes the definer)"  # pre-flight L6
 NO_BACKSLASH_ESCAPES = "NO_BACKSLASH_ESCAPES"
 _UNKNOWN_TABLE = 1109  # an information_schema table this server does not have (before 8.0.13, MariaDB)
+TABLE_CHANGED = "1412"  # ER_TABLE_DEF_CHANGED: DDL changed a table after the snapshot began (Task 6 review)
 _ROWS_ELSEWHERE = frozenset({"mrg_myisam", "federated"})  # T2: a MERGE table's rows are its tables', FEDERATED's remote
 _VALID_VIEW = "VIEW"  # a view's TABLE_COMMENT; an invalid one's holds the server's message instead (T5, probed)
 _UTF8_CLIENTS = frozenset({"utf8mb4", "utf8mb3", "utf8"})  # read the file's UTF-8 as it is
 # Its default, and utf8mb4's (what a file restores under; a parameter without a character set takes the database's)
+# … and the longest statement the server takes (a restore on it refuses a longer INSERT, pre-flight M11)
 _SCHEMA = """
 SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME,
        (SELECT COLLATION_NAME FROM information_schema.COLLATIONS WHERE CHARACTER_SET_NAME = 'utf8mb4'
-        AND IS_DEFAULT = 'Yes')
+        AND IS_DEFAULT = 'Yes'), @@max_allowed_packet
 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s
 """
 _RELATIONS = """
@@ -118,7 +120,7 @@ def session(database: str) -> DumpSession:
                f"SET SESSION sql_mode = {quote_literal(Dialect.MYSQL, RESTORE_SQL_MODE)}",  # pre-flight M5
                f"SET time_zone = {quote_literal(Dialect.MYSQL, RESTORE_TIME_ZONE)}",
                "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"),
-        teardown=("ROLLBACK",), consistency="snapshot",
+        teardown=("ROLLBACK",), consistency="snapshot", changed_codes=frozenset({TABLE_CHANGED}),
     )
 
 
@@ -438,7 +440,7 @@ def dump_catalog(
         left_out.append(DEFINERS_LEFT_OUT)
     consistency: Consistency = "snapshot"
     snapshot, warnings = SNAPSHOT_TEXT, list(reader.warnings)
-    charset, collation, utf8mb4 = found
+    charset, collation, utf8mb4, packet = found
     if collation != utf8mb4 and any(item.compound for item in post):  # T6
         warnings.append(
             f"This database's default is {charset} ({collation}), not {RESTORE_CHARSET} ({utf8mb4}): its stored "
@@ -452,4 +454,5 @@ def dump_catalog(
         warnings.insert(0, f"Not in the snapshot (not InnoDB): {shown_names(reader.outside)}")
     return DumpCatalog(server=server, scope=f"database {name}", consistency=consistency, pre=tuple(pre),
                        tables=tuple(tables), post=tuple(post), not_included=tuple(left_out),
-                       warnings=tuple(warnings), snapshot_text=snapshot)
+                       warnings=tuple(warnings), snapshot_text=snapshot,
+                       max_statement_bytes=int(packet) if packet is not None else None)

@@ -71,6 +71,9 @@ class DumpCatalog:
     not_included: tuple[str, ...] = (OWNERS_AND_PRIVILEGES,)  # what the header lists as left out
     warnings: tuple[str, ...] = ()
     snapshot_text: str = "one consistent snapshot"  # the header's Snapshot line
+    # The longest statement the server dumped takes (MySQL's max_allowed_packet): a restore on such a server refuses
+    # a longer INSERT, so the dump warns of it (R-06-11, pre-flight M11); None: the dialect's default limit
+    max_statement_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,13 @@ class DumpSession:
     setup: tuple[str, ...]
     teardown: tuple[str, ...]
     consistency: Consistency
+    # Sent after the catalog is read and before the rows, when the dump has a filter: the filter is then read as the
+    # table-data tab reads it (PostgreSQL: the catalog is read under an empty search_path, a filter's unqualified
+    # function or citext operator is the user's; pre-flight L11)
+    filter_setup: tuple[str, ...] = ()
+    # The server's error codes for a table that DDL changed after the snapshot began (MySQL 1412, SQL Server 3961):
+    # the dump says which table, and to dump it again
+    changed_codes: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -122,3 +132,17 @@ class Ordering:
                 if not deps and dependent not in done:
                     heapq.heappush(ready, index[dependent])
         return placed
+
+
+def parents_first(tables: tuple[DumpTable, ...]) -> tuple[list[DumpTable], bool]:
+    """The tables a data-only dump writes, each after the tables its foreign keys reference (pre-flight M9: its file
+    restores into a schema whose foreign keys are already there), else in the catalog's order; and whether their
+    foreign keys form a cycle (an order no restore with those keys checked can take)."""
+    by_name = {table.name: table for table in tables}
+    order = Ordering({table.name: set(table.references) for table in tables}).order(list(by_name))
+    placed: set[str] = set()
+    cycle = False
+    for name in order:
+        cycle = cycle or any(ref in by_name and ref != name and ref not in placed for ref in by_name[name].references)
+        placed.add(name)
+    return [by_name[name] for name in order], cycle

@@ -481,6 +481,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/data/dump/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Dump Plan
+         * @description The dump dialog's object list, what the header leaves out, the consistency and the warnings (the metadata
+         *     connection; nothing is written). 422 `not_supported` for an engine without dumps.
+         */
+        post: operations["dump_plan_data_dump_plan_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/data/reveal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reveal
+         * @description Show in Finder, for a file a completed dump of this backend run wrote (404 for any other path).
+         */
+        post: operations["reveal_data_reveal_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/data/run-file/inspect": {
         parameters: {
             query?: never;
@@ -1283,6 +1324,46 @@ export interface components {
             size: number;
         };
         /**
+         * DumpCommand
+         * @description Dump a scope of this session's database to a SQL file (spec ⑥ §3.3): written through a temporary file, so a
+         *     dump that fails or is cancelled leaves no file and keeps any old one.
+         */
+        DumpCommand: {
+            /** Request Id */
+            request_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "dump";
+            /** Path */
+            path: string;
+            scope: components["schemas"]["DumpScope"];
+            /**
+             * Content
+             * @default both
+             * @enum {string}
+             */
+            content: "schema" | "data" | "both";
+            /**
+             * @default {
+             *       "views": true,
+             *       "sequences": true,
+             *       "types": true,
+             *       "routines": true,
+             *       "triggers": true
+             *     }
+             */
+            objects: components["schemas"]["DumpObjectKinds"];
+            /**
+             * Drop First
+             * @default false
+             */
+            drop_first: boolean;
+            /** Filter */
+            filter?: string | null;
+        };
+        /**
          * DumpHeader
          * @description The first lines of a dump DbaGuy wrote (spec ⑥ §3.3.2), as Run SQL file's inspection reads them back: a hint
          *     for the dialog, never a permission.
@@ -1304,6 +1385,128 @@ export interface components {
             drop_first: boolean;
             /** Lines */
             lines: string[];
+        };
+        /**
+         * DumpObjectKinds
+         * @description Which objects besides tables a dump writes (R-06-2); a table's own sequences and column types always come
+         *     with it. Routines include MySQL events; views include SQL Server synonyms.
+         */
+        DumpObjectKinds: {
+            /**
+             * Views
+             * @default true
+             */
+            views: boolean;
+            /**
+             * Sequences
+             * @default true
+             */
+            sequences: boolean;
+            /**
+             * Types
+             * @default true
+             */
+            types: boolean;
+            /**
+             * Routines
+             * @default true
+             */
+            routines: boolean;
+            /**
+             * Triggers
+             * @default true
+             */
+            triggers: boolean;
+        };
+        /**
+         * DumpPlan
+         * @description What a dump of a scope would write (POST /data/dump/plan): the dialog's object list and warnings. Read on the
+         *     metadata connection, outside any snapshot; the dump reads the catalog again inside its own.
+         *
+         *     `objects` are the objects the content writes under their own names, in the file's order: schemas, extensions,
+         *     collations, types, sequences, routines, tables, views, triggers, events, synonyms, rules, extended statistics and
+         *     policies. The parts of another object are left to it: a table's indexes, foreign keys, check constraints,
+         *     defaults and settings, a trigger's state, a sequence's owner and value, an identity's value, a table's row-level
+         *     security switch, SQLite's header settings (user_version, application_id). A data-only plan lists the tables alone,
+         *     parents first. `not_included` is the header's Not included list, word for word.
+         */
+        DumpPlan: {
+            /** Objects */
+            objects: components["schemas"]["DumpPlanObject"][];
+            /** Not Included */
+            not_included: string[];
+            /**
+             * Consistency
+             * @enum {string}
+             */
+            consistency: "snapshot" | "per_table";
+            /**
+             * Warnings
+             * @default []
+             */
+            warnings: string[];
+        };
+        /**
+         * DumpPlanObject
+         * @description One object a dump writes under its own name, as the dump dialog lists it.
+         */
+        DumpPlanObject: {
+            /** Kind */
+            kind: string;
+            /** Name */
+            name: string;
+            /** Rows Estimate */
+            rows_estimate?: number | null;
+            /**
+             * Notes
+             * @default []
+             */
+            notes: string[];
+        };
+        /** DumpPlanRequest */
+        DumpPlanRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Database */
+            database?: string | null;
+            scope: components["schemas"]["DumpScope"];
+            /**
+             * Content
+             * @default both
+             * @enum {string}
+             */
+            content: "schema" | "data" | "both";
+            /**
+             * @default {
+             *       "views": true,
+             *       "sequences": true,
+             *       "types": true,
+             *       "routines": true,
+             *       "triggers": true
+             *     }
+             */
+            objects: components["schemas"]["DumpObjectKinds"];
+            /** Path */
+            path?: string | null;
+        };
+        /**
+         * DumpScope
+         * @description What a dump covers (spec ⑥ §3.3.1): a whole database (PostgreSQL, SQL Server), one schema (MySQL: a database;
+         *     SQLite: main), or named tables and views of one schema.
+         */
+        DumpScope: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "database" | "schema" | "tables";
+            /** Schema Name */
+            schema_name?: string | null;
+            /** Names */
+            names?: string[];
         };
         /** EditChanges */
         EditChanges: {
@@ -1557,6 +1760,11 @@ export interface components {
              * @default false
              */
             run_file: boolean;
+            /**
+             * Dump
+             * @default false
+             */
+            dump: boolean;
         };
         /** ErrorEvent */
         ErrorEvent: {
@@ -1622,7 +1830,7 @@ export interface components {
          */
         ExecutionSchema: {
             /** Command */
-            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["ExportCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"] | components["schemas"]["CommitCommand"] | components["schemas"]["RollbackCommand"] | components["schemas"]["SetAutocommitCommand"] | components["schemas"]["ApplyEditsCommand"] | components["schemas"]["RunFileCommand"];
+            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["ExportCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"] | components["schemas"]["CommitCommand"] | components["schemas"]["RollbackCommand"] | components["schemas"]["SetAutocommitCommand"] | components["schemas"]["ApplyEditsCommand"] | components["schemas"]["RunFileCommand"] | components["schemas"]["DumpCommand"];
             /** Event */
             event: components["schemas"]["StartedEvent"] | components["schemas"]["ResultSetEvent"] | components["schemas"]["RowsEvent"] | components["schemas"]["ResultSetEndEvent"] | components["schemas"]["AffectedEvent"] | components["schemas"]["MessageEvent"] | components["schemas"]["ErrorEvent"] | components["schemas"]["ProgressEvent"] | components["schemas"]["ConfirmationRequiredEvent"] | components["schemas"]["SessionStateEvent"] | components["schemas"]["FinishedEvent"] | components["schemas"]["EditOutcomeEvent"] | components["schemas"]["JobProgressEvent"] | components["schemas"]["JobOutcomeEvent"];
         };
@@ -2456,6 +2664,11 @@ export interface components {
              * @enum {string}
              */
             presentation: "grid" | "plan";
+        };
+        /** RevealRequest */
+        RevealRequest: {
+            /** Path */
+            path: string;
         };
         /** RollbackCommand */
         RollbackCommand: {
@@ -4243,6 +4456,74 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["EditPreview"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    dump_plan_data_dump_plan_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DumpPlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DumpPlan"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reveal_data_reveal_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RevealRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

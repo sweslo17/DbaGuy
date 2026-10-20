@@ -91,6 +91,28 @@ def build_browse_select(
     return sql
 
 
+def check_filter(dialect: Dialect, where: str | None) -> str | None:
+    """The table-data tab's filter as a dump or copy would send it (one expression, as browsing checks it), or None
+    when it is empty; ValidationFailed otherwise. A job checks it before it sends anything."""
+    return _single_expression(where, dialect)
+
+
+def build_count_select(
+    dialect: Dialect, schema: str | None, name: str, where: str | None = None, *, only: bool = False,
+) -> str:
+    """How many rows a dump or copy of a relation would read (with the filter): what a table with no column it can
+    write is restored as, a row of defaults each (06a Task 7 review)."""
+    return "SELECT COUNT(*) " + _rows_of(dialect, schema, name, where, only)
+
+
+def _rows_of(dialect: Dialect, schema: str | None, name: str, where: str | None, only: bool) -> str:
+    """`FROM [ONLY] relation` and the filter's WHERE: the rows a dump or copy reads."""
+    sql = f"FROM {'ONLY ' if only else ''}{qualified(dialect, schema, name)}"
+    if condition := _single_expression(where, dialect):
+        sql += f"\nWHERE {condition}"
+    return sql
+
+
 def build_copy_select(
     dialect: Dialect, schema: str | None, name: str, columns: Sequence[TableColumn], where: str | None = None, *,
     only: bool = False,
@@ -108,7 +130,4 @@ def build_copy_select(
         picked.append(f"{column.read_as.format(quoted)} AS {quoted}" if column.read_as else quoted)
     if not picked:
         raise ValidationFailed(f"{name} has no column a dump or copy can write")
-    sql = f"SELECT {', '.join(picked)} FROM {'ONLY ' if only else ''}{qualified(dialect, schema, name)}"
-    if condition := _single_expression(where, dialect):
-        sql += f"\nWHERE {condition}"
-    return sql
+    return f"SELECT {', '.join(picked)} " + _rows_of(dialect, schema, name, where, only)

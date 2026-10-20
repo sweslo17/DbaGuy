@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .classification import Classification, GuardReason
 from .column_category import ColumnCategory
-from .data_jobs import JobCommand, JobOutcomeEvent, JobProgressEvent
+from .data_jobs import DumpContent, DumpObjectKinds, DumpScope, JobCommand, JobOutcomeEvent, JobProgressEvent
 from .formats import FormatKind, RowFormatOptions
 
 Presentation = Literal["grid", "plan"]  # "plan": an EXPLAIN / ADVISE / profile result the client may show as a plan
@@ -232,9 +232,29 @@ class RunFileCommand(JobCommand):
         return self
 
 
+class DumpCommand(JobCommand):
+    """Dump a scope of this session's database to a SQL file (spec ⑥ §3.3): written through a temporary file, so a
+    dump that fails or is cancelled leaves no file and keeps any old one."""
+
+    job_kind = "dump"
+    type: Literal["dump"] = "dump"
+    path: str = Field(min_length=1, max_length=4096)  # absolute, in an existing folder
+    scope: DumpScope
+    content: DumpContent = "both"
+    objects: DumpObjectKinds = DumpObjectKinds()
+    drop_first: bool = False  # a DROP … IF EXISTS before each object it creates (the header says so)
+    filter: str | None = Field(default=None, max_length=65_536)  # one table only: the table-data tab's filter
+
+    @model_validator(mode="after")
+    def _a_filter_for_one_table_only(self) -> Self:
+        if self.filter is not None and (self.scope.kind != "tables" or len(self.scope.names) != 1):
+            raise ValueError("a filter applies to a dump of one table")
+        return self
+
+
 ClientCommand = Annotated[
     ExecuteCommand | ExportCommand | FetchMoreCommand | CancelCommand | DiscardCommand | CommitCommand
-    | RollbackCommand | SetAutocommitCommand | ApplyEditsCommand | RunFileCommand,
+    | RollbackCommand | SetAutocommitCommand | ApplyEditsCommand | RunFileCommand | DumpCommand,
     Field(discriminator="type"),
 ]
 

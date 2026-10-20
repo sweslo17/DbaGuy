@@ -2,21 +2,23 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from uuid import UUID
 
 from ..adapters.base import StatementError
 from ..adapters.registry import AdapterRegistry
-from ..domain.data_jobs import RUN_SQL_FILES, JobCommand, cannot
+from ..domain.data_jobs import BE_DUMPED, RUN_SQL_FILES, JobCommand, cannot
 from ..domain.edits import PLAN_EXPIRED, PLAN_EXPIRED_MESSAGE, EditPlan, PlanUnavailable
-from ..domain.execution import RunFileCommand
+from ..domain.execution import DumpCommand, RunFileCommand
 from ..domain.history import HistoryRecord, HistoryStatus
-from ..domain.profiles import AnyProfile
+from ..domain.profiles import AnyProfile, Engine, SqliteProfile
 from ..services.edit_plans import EditPlanStore
 from ..services.history_service import HistoryService
 from ..services.profile_service import ProfileService
 from ..services.safety import GuardDecision, SafetyPolicy
 from ..services.schema_cache import SchemaCache
 from .jobs.context import Job, JobHooks
+from .jobs.dump import DumpJob
 from .jobs.run_file import RunFileJob
 from .worker import ExecutionRecord, WorkerHooks
 
@@ -126,4 +128,9 @@ class SessionHooksFactory:
                 return RunFileJob(command, profile.name)
             case RunFileCommand():
                 raise StatementError(cannot(profile.engine, RUN_SQL_FILES), code="not_supported")
+            case DumpCommand() if capabilities.dump:
+                source = Path(profile.path) if isinstance(profile, SqliteProfile) else None  # never its own target
+                return DumpJob(command, profile.name, Engine(profile.engine), source_file=source)
+            case DumpCommand():
+                raise StatementError(cannot(profile.engine, BE_DUMPED), code="not_supported")
         raise StatementError(f"{type(command).__name__} is not a job this connection runs", code="not_supported")

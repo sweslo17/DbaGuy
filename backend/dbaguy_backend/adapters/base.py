@@ -50,6 +50,7 @@ class AdapterCapabilities:
     # A table-data tab's first browse waits for the edit target and sorts by its `stable_order` (PostgreSQL, 05b K13)
     orders_browse_by_key: bool = False
     run_file: bool = False  # Run SQL file (spec ⑥ R-06-1, D-06-13)
+    dump: bool = False  # a native SQL dump (spec ⑥ R-06-1): the connection is Dumping
 
 
 @dataclass(frozen=True)
@@ -61,8 +62,10 @@ class RunOptions:
     params: StatementParams | None = None  # needs capabilities.parameters
     profile_plan: bool = False  # needs capabilities.executed_plan (04b)
     retry_safe: bool = False  # the statement was classified READ: an adapter may send it again after a stale connection
-    # False: the statement returns no result set to show (a grid commit's own texts, spec ⑤ §3.5), so an adapter may
-    # skip reading its result's column types first (SQL Server's describe: a round trip per statement, 05a review M1)
+    # False: the statement returns no result set to show (a grid commit's own texts, spec ⑤ §3.5; a job's statements),
+    # so an adapter may skip reading its result's column types first (SQL Server's describe: a round trip per statement,
+    # 05a review M1), and reads no rows ahead of what `fetch()` asks for (the rows it peeks at for the types, SQLite's
+    # and SQL Server's; PostgreSQL's cursor read-ahead): a dump sizes its reads by the rows' size (06a pre-flight M12)
     describe: bool = True
 
 
@@ -396,6 +399,7 @@ class DatabaseAdapter(ABC):
             transactions=caps.transactions, query_context=caps.query_context, parameters=caps.parameters,
             documents=caps.documents, executed_plan=caps.executed_plan, plan_format=caps.plan_format,
             row_editing=caps.row_editing, orders_browse_by_key=caps.orders_browse_by_key, run_file=caps.run_file,
+            dump=caps.dump,
         )
 
     def relation_path(self, database: str | None, schema: str, name: str, kind: RelationKind) -> list[PathSegment]:

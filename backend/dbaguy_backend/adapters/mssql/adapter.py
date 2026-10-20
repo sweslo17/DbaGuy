@@ -132,8 +132,12 @@ def _mentions_transaction(sql: str) -> bool:
 class MssqlResult(StatementResult):
     """The result sets of one batch, read on the worker thread."""
 
-    def __init__(self, owner: "MssqlConnection", described: list[ColumnKind] | None) -> None:
+    def __init__(self, owner: "MssqlConnection", described: list[ColumnKind] | None, *, peek: bool = True) -> None:
         self._owner = owner
+        # False (RunOptions.describe False: nobody is shown the columns' types): no rows are read ahead to guess them
+        # (a dump sizes its reads by the rows' size, 06a pre-flight M12); each column's type then comes from the
+        # driver's type code alone
+        self._peek = peek
         self._closed = False
         self._exhausted = False  # every result set read, or the batch failed
         # An error that came while rows were read (a procedure's RAISERROR right after its SELECT arrives with the
@@ -153,7 +157,7 @@ class MssqlResult(StatementResult):
         if described is not None and len(described) == len(names):  # run() already matched the described names
             kinds = described
         else:
-            self._buffer = self._read(_TYPE_PEEK)
+            self._buffer = self._read(_TYPE_PEEK) if self._peek else []
             kinds = guessed_kinds(header, self._buffer)
         if len(names) == 1 and names[0] in _JOINED_COLUMNS:
             kinds = [_JOINED_COLUMNS[names[0]]]
@@ -416,7 +420,7 @@ class MssqlConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
         header = self.header()
         names = [h[0] for h in header] if header else []
         kinds = [kind for _, kind in described] if described and [name for name, _ in described] == names else None
-        self._result = MssqlResult(self, kinds)
+        self._result = MssqlResult(self, kinds, peek=options is None or options.describe)
         return self._result
 
     def next_set(self) -> bool:
@@ -751,7 +755,7 @@ class MssqlAdapter(DatabaseAdapter):
     # One connection works in one database; an attention keeps the transaction; read-only is DbaGuy's alone (spec §3.4).
     capabilities = AdapterCapabilities(
         per_database_connection=True, cancel_aborts_transaction=False, server_read_only=False, row_editing=True,
-        run_file=True,
+        run_file=True, dump=True,
     )
 
     def parse_url(self, url: str) -> ParsedUrl:

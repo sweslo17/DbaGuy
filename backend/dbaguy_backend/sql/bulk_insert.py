@@ -12,6 +12,7 @@ from ..adapters.columns import TableColumn
 from ..domain.column_category import ColumnCategory
 from ..domain.edits import kind_category
 from .dialects import Dialect, overriding_identity, quote_ident
+from .lexer import TokenKind, scan
 from .literals import Cell, CellLiterals, LiteralStyle, normalise_raw
 from .statement_stream import MAX_STATEMENT_CHARS
 
@@ -46,6 +47,8 @@ class InsertBatcher:
         self, dialect: Dialect, table_sql: str, columns: Sequence[TableColumn], *, backslash_escapes: bool | None = None,
         max_rows: int | None = None, max_chars: int = MAX_INSERT_CHARS,
     ) -> None:
+        self._dialect = dialect
+        self._names = [column.name for column in columns]
         names = ", ".join(quote_ident(dialect, column.name) for column in columns)
         overriding = overriding_identity(dialect) if any(c.identity == "always" for c in columns) else None
         self._head = f"INSERT INTO {table_sql} ({names}){f' {overriding}' if overriding else ''} VALUES\n"
@@ -80,18 +83,40 @@ class InsertBatcher:
         self._rows, self._chars = [], 0
         return statement
 
+    def column_at(self, statement: str, offset: int) -> str | None:
+        """The column whose value holds character `offset` of one of this batcher's statements (where a write met text
+        that is not Unicode, pre-flight L15); None when it is in the statement's head (a name). Scans the statement:
+        for an error, never for each row."""
+        if offset < len(self._head):
+            return None
+        depth = index = 0
+        for token in scan(statement, self._dialect, len(self._head)):
+            if token.start <= offset < token.end:
+                return self._names[index] if depth >= 1 and index < len(self._names) else None
+            if token.kind is TokenKind.LPAREN:
+                depth += 1
+                index = 0 if depth == 1 else index
+            elif token.kind is TokenKind.RPAREN:
+                depth -= 1
+            elif token.kind is TokenKind.COMMA and depth == 1:
+                index += 1
+        return None
 
-def size_warning(dialect: Dialect, name: str, statement: str) -> str | None:
+
+def size_warning(dialect: Dialect, name: str, statement: str, packet_bytes: int | None = None) -> str | None:
     """What a dump says about a statement too large to restore (R-06-11, pre-flight M11), or None: past Run SQL file's
-    limit (characters, as it measures), any dialect; past MySQL's default max_allowed_packet (UTF-8 bytes, measured
-    only when the characters could reach it). Only a single row makes one: a statement of several holds at most
+    limit (characters, as it measures), any dialect; past MySQL's max_allowed_packet (UTF-8 bytes, measured only when
+    the characters could reach it): `packet_bytes`, the dumped server's own (5.7's default is 4 MiB), or MySQL 8's
+    default when it is not known. Only a single row makes one: a statement of several holds at most
     MAX_INSERT_CHARS. `name`: the table as the file names it."""
     chars = len(statement)
     if chars + _TERMINATOR > MAX_STATEMENT_CHARS:
         return f"{name} has a row over {MAX_STATEMENT_CHARS // _MEBIBYTE} MiB: Run SQL file cannot restore it"
-    if dialect is Dialect.MYSQL and chars * _UTF8_MOST > MYSQL_PACKET_BYTES:
+    limit = packet_bytes or MYSQL_PACKET_BYTES
+    if dialect is Dialect.MYSQL and chars * _UTF8_MOST > limit:
         size = chars if statement.isascii() else len(statement.encode("utf-8", "surrogatepass"))
-        if size > MYSQL_PACKET_BYTES:
+        if size > limit:
+            where = f"{limit / _MEBIBYTE:g} MiB on the server dumped" if packet_bytes else "64 MiB by default"
             return (f"{name} has a row of {size / _MEBIBYTE:.0f} MiB: MySQL refuses statements over its "
-                    "max_allowed_packet (64 MiB by default) when the file is run")
+                    f"max_allowed_packet ({where}) when the file is run")
     return None
