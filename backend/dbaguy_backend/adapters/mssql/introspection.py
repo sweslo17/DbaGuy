@@ -452,7 +452,8 @@ def _constraint(name: str, system_named: bool | None, named: bool) -> str:
     return f"CONSTRAINT {q(name)} " if named and not system_named else ""
 
 
-def _column_line(c: _Column, named: bool) -> str:
+def _column_line(c: _Column, named: bool, later: frozenset[str] = frozenset()) -> str:
+    """`later`: constraint names the dump adds after the data (a default among them is left out of the line)."""
     if c.is_computed:
         line = f"{_quote(c.name)} AS {_need(c.computed, 'a computed column definition')}"
         if c.persisted:
@@ -476,7 +477,7 @@ def _column_line(c: _Column, named: bool) -> str:
     parts.append("NULL" if c.nullable else "NOT NULL")
     if c.rowguidcol:
         parts.append("ROWGUIDCOL")
-    if c.has_default:
+    if c.has_default and c.default_name not in later:
         default = _need(c.default, "a default definition")
         parts.append(f"{_constraint(c.default_name, c.default_system_named, named)}DEFAULT {default}")
     return " ".join(parts)
@@ -512,17 +513,28 @@ def _index_statement(schema: str, table: str, name: str, parts: list[tuple]) -> 
     return sql + ";"
 
 
-def _body_lines(columns: list[_Column], keys: list[tuple], checks: list[tuple], named: bool) -> list[str]:
+def _body_lines(columns: list[_Column], keys: list[tuple], checks: list[tuple], named: bool,
+                later: frozenset[str] = frozenset()) -> list[str]:
     """Columns, then PRIMARY KEY / UNIQUE, then CHECK constraints. `named`: a table names its constraints; a table type
-    may not. keys: _KEYS rows; checks: _CHECKS rows."""
-    lines = [_column_line(c, named) for c in columns]
+    may not. keys: _KEYS rows; checks: _CHECKS rows; `later`: the defaults and checks a dump adds after the data."""
+    lines = [_column_line(c, named, later) for c in columns]
     for name, parts in _grouped(keys).items():
         kind = "PRIMARY KEY" if parts[0][1] else "UNIQUE"
         key_columns = ", ".join(_quote(p[3]) + (" DESC" if p[4] else "") for p in parts)
         lines.append(f"{_constraint(name, parts[0][5], named)}{kind} {parts[0][2]} ({key_columns})")
     for name, definition, system_named, _, _, not_for_replication in checks:
-        lines.append(f"{_constraint(name, system_named, named)}{_check(definition, not_for_replication)}")
+        if name not in later:
+            lines.append(f"{_constraint(name, system_named, named)}{_check(definition, not_for_replication)}")
     return lines
+
+
+def _inline_index(name: str, parts: list[tuple]) -> str:
+    """A table type's own index, in its body (`INDEX [ix] NONCLUSTERED ([b])`): _INDEXES rows of one index. A table
+    type's index has neither INCLUDE nor a filter."""
+    if any(p[6] for p in parts) or parts[0][10]:
+        raise _Withheld("an index a table type cannot have")
+    keys = ", ".join(_quote(p[4]) + (" DESC" if p[5] else "") for p in parts)
+    return f"INDEX {q(name)} {'UNIQUE ' if parts[0][1] else ''}{parts[0][2]} ({keys})"
 
 
 def _check(definition: str | None, not_for_replication: bool) -> str:
@@ -542,9 +554,10 @@ def _table_ddl(schema: str, table: str, columns: list[_Column], keys: list[tuple
 
 @dataclass(frozen=True, slots=True)
 class AddedConstraint:
-    """A constraint a dump adds with ALTER TABLE after the data: a foreign key, or a CHECK the server does not enforce
-    or does not trust (created with its table it would check the rows the dump writes, which need not pass: 547).
-    Its name is always kept, so that NOCHECK and a `drop_first` DROP can name it (pre-flight H7, L13)."""
+    """A constraint a dump adds with ALTER TABLE after the data: a foreign key; a CHECK the server does not enforce or
+    does not trust (created with its table it would check the rows the dump writes, which need not pass: 547); a
+    CHECK or a DEFAULT whose function reads a table, view or synonym (review S1: those exist, with their rows, only
+    then). Its name is always kept, so that NOCHECK and a `drop_first` DROP can name it (pre-flight H7, L13)."""
 
     name: str
     statements: tuple[str, ...]  # ADD …, then NOCHECK CONSTRAINT for one the server does not enforce
@@ -553,73 +566,114 @@ class AddedConstraint:
 
 @dataclass(frozen=True, slots=True)
 class TableStatements:
-    """A table's DDL as a dump writes it (spec ⑥ §3.3.3): CREATE TABLE without its foreign keys and without the CHECKs
-    it does not enforce, then — after the data — its other indexes and the constraints it adds. No `;` at the ends."""
+    """A table's DDL as a dump writes it (spec ⑥ §3.3.3): CREATE TABLE without its foreign keys, the CHECKs it does not
+    enforce and the defaults and checks added later, then — after the data — its other indexes and the constraints it
+    adds. No `;` at the ends."""
 
     create: str | None  # None: a definition it needs is hidden from the account (VIEW DEFINITION)
     indexes: list[str]
     foreign_keys: list[AddedConstraint]
-    checks: list[AddedConstraint]
-    hidden: int  # indexes, foreign keys and checks not written: their definition is hidden from the account
+    checks: list[AddedConstraint]  # not enforced or not trusted, or added after the views (`later`)
+    defaults: list[AddedConstraint]  # added after the views (`later`)
+    hidden: int  # indexes, foreign keys, checks and defaults not written: their definition is hidden from the account
 
 
-def table_statements_of(conn: driver.Connection, tables: dict[int, tuple[str, str]],
-                        within: str | None = None) -> dict[int, TableStatements]:
-    """Many tables' DDL (`tables`: object id → (schema, name)), one batch per ID_CHUNK of them or one over `within`
+@dataclass(frozen=True, slots=True)
+class TableRows:
+    """A table's catalog rows, the five queries its detail reads; its statements come from them."""
+
+    schema: str
+    name: str
+    columns: list[_Column]
+    keys: list[tuple]
+    checks: list[tuple]
+    foreign_keys: list[tuple]
+    indexes: list[tuple]
+
+    def user_types(self) -> set[tuple[str, str]]:
+        """(schema, name) of the user types its columns use."""
+        return {(c.user_schema, c.type_name) for c in self.columns if c.user_schema}
+
+    def statements(self, later: frozenset[str] = frozenset()) -> TableStatements:
+        """`later`: the names of its defaults and trusted checks a dump adds after the views."""
+        schema, name = self.schema, self.name
+        target = f"{q(schema)}.{q(name)}"
+        hidden = 0
+
+        def written(build: Callable[[], str]) -> str | None:
+            nonlocal hidden
+            text = _written(NodeKind.TABLE, schema, name, build)
+            hidden += text is None
+            return text
+
+        def added(constraint: str, clause: str, trusted: bool, enabled: bool) -> tuple[str, ...]:
+            statements = (f"ALTER TABLE {target} WITH {'CHECK' if trusted else 'NOCHECK'} ADD {clause}",)
+            return statements + (() if enabled else (f"ALTER TABLE {target} NOCHECK CONSTRAINT {q(constraint)}",))
+
+        enforced = [check for check in self.checks if not (check[3] or check[4])]  # neither disabled nor untrusted
+        create = _written(NodeKind.TABLE, schema, name, lambda: "CREATE TABLE {} (\n    {}\n)".format(
+            target, ",\n    ".join(_body_lines(self.columns, self.keys, enforced, named=True, later=later))))
+        index_statements = []
+        for index, parts in _grouped(self.indexes).items():
+            if parts[0][7] or parts[0][8]:  # constraint indexes are in the body
+                continue
+            if (statement := written(lambda p=parts, i=index: _index_statement(schema, name, i, p))) is not None:
+                index_statements.append(statement.rstrip(";"))
+        keys_out = []
+        for key, parts in _grouped(self.foreign_keys).items():
+            clause = written(lambda p=parts, k=key: _foreign_key_clause(k, p, keep_name=True))
+            if clause is not None:
+                keys_out.append(AddedConstraint(key, added(key, clause, not parts[0][9], not parts[0][8]),
+                                                (parts[0][2], parts[0][3])))
+        checks_out = []
+        for check, definition, _, disabled, untrusted, not_for_replication in self.checks:
+            if not (disabled or untrusted or check in later):
+                continue
+            clause = written(lambda c=check, d=definition, r=not_for_replication: f"CONSTRAINT {q(c)} {_check(d, r)}")
+            if clause is not None:
+                checks_out.append(AddedConstraint(check, added(check, clause, not untrusted, not disabled)))
+        defaults_out = []
+        for column in self.columns:
+            if column.has_default and column.default_name in later:
+                clause = written(lambda c=column: f"CONSTRAINT {q(c.default_name)} DEFAULT "
+                                                  f"{_need(c.default, 'a default definition')} FOR {q(c.name)}")
+                if clause is not None:
+                    defaults_out.append(AddedConstraint(column.default_name, (f"ALTER TABLE {target} ADD {clause}",)))
+        return TableStatements(create, index_statements, keys_out, checks_out, defaults_out, hidden)
+
+
+def table_rows_of(conn: driver.Connection, tables: dict[int, tuple[str, str]],
+                  within: str | None = None) -> dict[int, TableRows]:
+    """Many tables' rows (`tables`: object id → (schema, name)), one batch per ID_CHUNK of them or one over `within`
     (catalog.id_sources) — the five queries the table's detail reads (Q1). A table that is gone has no entry."""
-    found: dict[int, TableStatements] = {}
+    found: dict[int, TableRows] = {}
     for source in id_sources(tables, within):
         column_rows, keys, checks, foreign_keys, indexes = (by_object(part) for part in result_sets(conn, batch(
             _COLUMNS.many(source), _KEYS.many(source), _CHECKS.many(source), _FOREIGN_KEYS.many(source),
             _INDEXES.many(source))))
         for object_id, columns in column_rows.items():
-            if object_id not in tables:
-                continue
-            schema, name = tables[object_id]
-            found[object_id] = _table_statements(
-                schema, name, [_Column(*row) for row in columns], keys.get(object_id, []), checks.get(object_id, []),
-                foreign_keys.get(object_id, []), indexes.get(object_id, []))
+            if object_id in tables:
+                found[object_id] = TableRows(
+                    *tables[object_id], [_Column(*row) for row in columns], keys.get(object_id, []),
+                    checks.get(object_id, []), foreign_keys.get(object_id, []), indexes.get(object_id, []))
     return found
 
 
-def _table_statements(schema: str, name: str, columns: list[_Column], keys: list[tuple], checks: list[tuple],
-                      foreign_keys: list[tuple], indexes: list[tuple]) -> TableStatements:
-    target = f"{q(schema)}.{q(name)}"
-    enforced = [check for check in checks if not (check[3] or check[4])]  # neither disabled nor untrusted
-    hidden = 0
-
-    def written(build: Callable[[], str]) -> str | None:
-        nonlocal hidden
-        text = _written(NodeKind.TABLE, schema, name, build)
-        hidden += text is None
-        return text
-
-    def added(constraint: str, clause: str, trusted: bool, enabled: bool) -> tuple[str, ...]:
-        statements = (f"ALTER TABLE {target}{'' if trusted else ' WITH NOCHECK'} ADD {clause}",)
-        return statements + (() if enabled else (f"ALTER TABLE {target} NOCHECK CONSTRAINT {q(constraint)}",))
-
-    create = _written(NodeKind.TABLE, schema, name, lambda: "CREATE TABLE {} (\n    {}\n)".format(
-        target, ",\n    ".join(_body_lines(columns, keys, enforced, named=True))))
-    index_statements = []
-    for index, parts in _grouped(indexes).items():
-        if parts[0][7] or parts[0][8]:  # constraint indexes are in the body
-            continue
-        if (statement := written(lambda p=parts, i=index: _index_statement(schema, name, i, p))) is not None:
-            index_statements.append(statement.rstrip(";"))
-    keys_out = []
-    for key, parts in _grouped(foreign_keys).items():
-        clause = written(lambda p=parts, k=key: _foreign_key_clause(k, p, keep_name=True))
-        if clause is not None:
-            keys_out.append(AddedConstraint(key, added(key, clause, not parts[0][9], not parts[0][8]),
-                                            (parts[0][2], parts[0][3])))
-    checks_out = []
-    for check, definition, _, disabled, untrusted, not_for_replication in checks:
-        if not (disabled or untrusted):
-            continue
-        clause = written(lambda c=check, d=definition, r=not_for_replication: f"CONSTRAINT {q(c)} {_check(d, r)}")
-        if clause is not None:
-            checks_out.append(AddedConstraint(check, added(check, clause, not untrusted, not disabled)))
-    return TableStatements(create, index_statements, keys_out, checks_out, hidden)
+def view_indexes_of(conn: driver.Connection, views: dict[int, tuple[str, str]],
+                    within: str | None = None) -> dict[int, list[str]]:
+    """The indexes of indexed views (object id → CREATE … INDEX, the unique clustered one first: the others need it;
+    no `;`), one query per ID_CHUNK of them or one over `within` (review S3)."""
+    found: dict[int, list[str]] = {}
+    for source in id_sources(views, within):
+        for object_id, rows_ in by_object(rows(conn, _INDEXES.many(source))).items():
+            if object_id not in views:
+                continue
+            schema, name = views[object_id]
+            groups = sorted(_grouped(rows_).items(), key=lambda item: item[1][0][2] != "CLUSTERED")
+            texts = [_written(NodeKind.VIEW, schema, name, lambda i=index, p=parts: _index_statement(schema, name, i, p))
+                     for index, parts in groups]
+            found[object_id] = [text.rstrip(";") for text in texts if text is not None]
+    return found
 
 
 def _sequence_statement(schema: str, name: str, row: tuple, start: str | None = None) -> str:
@@ -706,13 +760,15 @@ def synonyms_of(conn: driver.Connection, synonyms: dict[int, tuple[str, str]],
 
 
 def _type_statement(schema: str, name: str, type_row: tuple, column_rows: list[tuple], key_rows: list[tuple],
-                    check_rows: list[tuple]) -> str | None:
-    """`type_row`: (is_table_type, base, max_length, precision, scale, nullable). None for a CLR type: its assembly is
-    not something a catalog query can write back."""
+                    check_rows: list[tuple], index_rows: list[tuple]) -> str | None:
+    """`type_row`: (is_table_type, base, max_length, precision, scale, nullable). A table type's own indexes go in its
+    body (review S3). None for a CLR type: its assembly is not something a catalog query can write back."""
     is_table_type, base, max_length, precision, scale, nullable = type_row
     target = f"{q(schema)}.{q(name)}"
     if is_table_type:
         lines = _body_lines([_Column(*row) for row in column_rows], key_rows, check_rows, named=False)
+        lines += [_inline_index(index, parts) for index, parts in _grouped(index_rows).items()
+                  if not (parts[0][7] or parts[0][8])]
         return "CREATE TYPE {} AS TABLE (\n    {}\n);".format(target, ",\n    ".join(lines))
     if base is None:
         logger.debug("SQL Server type {}.{} has no base type (a CLR type): no DDL", schema, name)
@@ -724,11 +780,11 @@ def type_ddl(conn: driver.Connection, schema: str, name: str) -> str | None:
     """One batch: the type, and what a table type's body needs (empty for an alias type). None for a CLR type."""
     ref = name_literal(schema, name)
     body = _TABLE_TYPE_OBJECT.format(ref=ref)
-    type_rows, column_rows, key_rows, check_rows = result_sets(conn, batch(
-        _TYPE.format(ref=ref), _COLUMNS.one(body), _KEYS.one(body), _CHECKS.one(body)))
+    type_rows, column_rows, key_rows, check_rows, index_rows = result_sets(conn, batch(
+        _TYPE.format(ref=ref), _COLUMNS.one(body), _KEYS.one(body), _CHECKS.one(body), _INDEXES.one(body)))
     if not type_rows:
         raise _not_found(NodeKind.TYPE, schema, name)
-    return _type_statement(schema, name, type_rows[0][1:], column_rows, key_rows, check_rows)
+    return _type_statement(schema, name, type_rows[0][1:], column_rows, key_rows, check_rows, index_rows)
 
 
 def types_of(conn: driver.Connection, types: dict[int, tuple[str, str]],
@@ -739,11 +795,11 @@ def types_of(conn: driver.Connection, types: dict[int, tuple[str, str]],
     found: dict[int, str | None] = {}
     for source in id_sources(types, within):
         bodies = _TABLE_TYPE_OBJECTS.format(ids=source)
-        type_rows, table_objects, column_rows, keys, checks = result_sets(conn, batch(
+        type_rows, table_objects, column_rows, keys, checks, indexes = result_sets(conn, batch(
             _TYPES_OF.format(ids=source), _TABLE_TYPE_OF.format(ids=source), _COLUMNS.many(bodies),
-            _KEYS.many(bodies), _CHECKS.many(bodies)))
+            _KEYS.many(bodies), _CHECKS.many(bodies), _INDEXES.many(bodies)))
         body_of = {int(type_id): int(object_id) for object_id, type_id in table_objects}
-        column_rows, keys, checks = by_object(column_rows), by_object(keys), by_object(checks)
+        column_rows, keys, checks, indexes = (by_object(part) for part in (column_rows, keys, checks, indexes))
         for type_id, _, *type_row in type_rows:
             if int(type_id) not in types:
                 continue
@@ -751,7 +807,7 @@ def types_of(conn: driver.Connection, types: dict[int, tuple[str, str]],
             schema, name = types[int(type_id)]
             found[int(type_id)] = _written(NodeKind.TYPE, schema, name, lambda b=body, r=type_row, s=schema, n=name:
                                            _type_statement(s, n, tuple(r), column_rows.get(b, []), keys.get(b, []),
-                                                           checks.get(b, [])))
+                                                           checks.get(b, []), indexes.get(b, [])))
     return found
 
 

@@ -114,7 +114,10 @@ def sa_rows(database: str, sql: str) -> list[tuple]:
 
 
 _USER = "o.is_ms_shipped = 0"
-_SYSTEM_NAMED = "CASE WHEN {t}.is_system_named = 1 THEN N'<system>' ELSE {t}.name END"
+# A name the server made up compares as such: a dump writes the defaults and checks it adds after the views under the
+# source's name (their DROP names them), which the restore then holds as a name someone gave
+_SYSTEM_NAMED = ("CASE WHEN {t}.is_system_named = 1 OR {t}.name LIKE N'{prefix}[_][_]%[_][_]________' THEN N'<system>' "
+                 "ELSE {t}.name END")
 _INVENTORY = {
     "objects": f"""SELECT RTRIM(o.type), SCHEMA_NAME(o.schema_id), o.name,
         COALESCE(OBJECT_SCHEMA_NAME(o.parent_object_id) + N'.' + OBJECT_NAME(o.parent_object_id), N'')
@@ -132,11 +135,11 @@ _INVENTORY = {
         LEFT JOIN sys.masked_columns mc ON mc.object_id = c.object_id AND mc.column_id = c.column_id
         WHERE {_USER} AND o.type IN ('U', 'V', 'TT', 'IF', 'TF')""",
     "defaults": f"""SELECT OBJECT_SCHEMA_NAME(d.parent_object_id) + N'.' + OBJECT_NAME(d.parent_object_id),
-        COL_NAME(d.parent_object_id, d.parent_column_id), d.definition, {_SYSTEM_NAMED.format(t='d')}
+        COL_NAME(d.parent_object_id, d.parent_column_id), d.definition, {_SYSTEM_NAMED.format(t='d', prefix='DF')}
         FROM sys.default_constraints d""",
     "checks": f"""SELECT COALESCE(SCHEMA_NAME(tt.schema_id) + N'.' + tt.name, OBJECT_SCHEMA_NAME(k.parent_object_id)
         + N'.' + OBJECT_NAME(k.parent_object_id)), k.definition, k.is_disabled, k.is_not_trusted,
-        k.is_not_for_replication, {_SYSTEM_NAMED.format(t='k')}
+        k.is_not_for_replication, {_SYSTEM_NAMED.format(t='k', prefix='CK')}
         FROM sys.check_constraints k LEFT JOIN sys.table_types tt ON tt.type_table_object_id = k.parent_object_id""",
     "indexes": f"""SELECT COALESCE(SCHEMA_NAME(tt.schema_id) + N'.' + tt.name, OBJECT_SCHEMA_NAME(i.object_id) + N'.'
         + OBJECT_NAME(i.object_id)), CASE WHEN kc.is_system_named = 1 THEN N'<system>' ELSE i.name END, i.type_desc,

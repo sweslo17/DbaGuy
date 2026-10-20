@@ -8,6 +8,7 @@ through an independent sys.* inventory and a hash of every row (tests/mssql_inve
 
 import pytest
 
+from dbaguy_backend.adapters.base import StatementError
 from dbaguy_backend.adapters.mssql.dump import (
     PER_TABLE, PER_TABLE_WARNING, SNAPSHOT, _module_statements, _reseed, as_named, next_id, unwrapped,
 )
@@ -166,7 +167,7 @@ def test_a_sql_server_dump_orders_its_objects(database):
         "    DBCC CHECKIDENT (N'[app].[parent]', RESEED, 3) WITH NO_INFOMSGS",)
     assert "REFERENCES" not in statements[("table", "app.child")][0]
     [key] = statements[("foreign key", "app.child")]
-    assert key.startswith("ALTER TABLE [app].[child] ADD CONSTRAINT [FK__child__parent") and "FOREIGN KEY" in key
+    assert key.startswith("ALTER TABLE [app].[child] WITH CHECK ADD CONSTRAINT [FK__child__parent") and "FOREIGN KEY" in key
     fk_name = key.split("[")[3].split("]")[0]  # the server's own name, kept so that `drop_first` drops it (H7)
     assert drops[("foreign key", "app.child")] == (
         f"IF OBJECT_ID(N'[app].[{fk_name}]', N'F') IS NOT NULL ALTER TABLE [app].[child] DROP CONSTRAINT [{fk_name}]")
@@ -291,9 +292,11 @@ def test_what_the_login_cannot_read_is_left_out_and_counted(tmp_path):
     assert ("The definition of dbo.made cannot be read (hidden from this login, or a default bound with "
             "sp_bindefault): the table is left out") in limited.warnings
     assert "1 tables whose definition cannot be read" in limited.not_included
-    # the view's text; the procedure it may not execute it does not see at all (what a login cannot see is neither
-    # written nor counted: a known limit)
-    assert "1 modules whose definition cannot be read (encrypted, or no VIEW DEFINITION)" in limited.not_included
+    # the view's and the trigger's text; the procedure it may not execute it does not see at all (what a login cannot
+    # see is neither written nor counted: a known limit)
+    assert "2 modules whose definition cannot be read (encrypted, or no VIEW DEFINITION)" in limited.not_included
+    assert "Not written, their definition cannot be read (encrypted, or no VIEW DEFINITION): dbo.made_ai, dbo.v" in (
+        limited.warnings)
 
 
 # ---- every shape, restored twice ----------------------------------------------------------------------------------------
@@ -456,6 +459,180 @@ def test_a_drop_first_dump_of_every_shape_restores_twice_and_reads_back_the_same
     finally:
         app.close()
         db.close()
+
+
+# ---- review fix round 1: what needs what is left out, defaults and checks after the views, indexed views ------------
+
+_ROUND1 = (
+    "CREATE SCHEMA f",
+    # S1: a check whose function reads a table made after it (547 with the rows), one reading a view (208), a default
+    # through an inline function over a view
+    "CREATE TABLE f.aa_checked (id int PRIMARY KEY, code nvarchar(10))",
+    "CREATE TABLE f.lookup (code nvarchar(10) PRIMARY KEY)",
+    "CREATE VIEW f.v_lookup AS SELECT code FROM f.lookup",
+    "CREATE FUNCTION f.in_lookup (@c nvarchar(10)) RETURNS bit AS BEGIN RETURN CASE WHEN EXISTS "
+    "(SELECT 1 FROM f.lookup WHERE code = @c) THEN 1 ELSE 0 END END",
+    "CREATE FUNCTION f.in_view (@c nvarchar(10)) RETURNS bit AS BEGIN RETURN CASE WHEN EXISTS "
+    "(SELECT 1 FROM f.v_lookup WHERE code = @c) THEN 1 ELSE 0 END END",
+    "CREATE FUNCTION f.codes () RETURNS TABLE AS RETURN SELECT code FROM f.v_lookup",
+    "CREATE FUNCTION f.how_many () RETURNS int AS BEGIN RETURN (SELECT COUNT(*) FROM f.codes()) END",
+    "CREATE TABLE f.checked (id int PRIMARY KEY, code nvarchar(10) CONSTRAINT checked_code CHECK (f.in_view(code) = 1), "
+    "n int DEFAULT f.how_many())",
+    "INSERT INTO f.lookup VALUES (N'a'), (N'b')", "INSERT INTO f.aa_checked VALUES (1, N'a')",
+    "INSERT INTO f.checked (id, code) VALUES (1, N'b')",
+    "ALTER TABLE f.aa_checked ADD CONSTRAINT aa_code CHECK (f.in_lookup(code) = 1)",
+    # S1: a computed column's schema-bound function binds a schema-bound view: both before the table
+    "CREATE TABLE f.rates (k int PRIMARY KEY, r int NOT NULL)",
+    "CREATE VIEW f.v_rates WITH SCHEMABINDING AS SELECT k, r FROM f.rates",
+    "CREATE FUNCTION f.rate_count () RETURNS int WITH SCHEMABINDING AS BEGIN RETURN (SELECT COUNT_BIG(*) FROM f.v_rates) "
+    "END",
+    "CREATE TABLE f.uses_rates (id int PRIMARY KEY, c AS f.rate_count())",
+    # S3: an indexed view (a view after it reads it WITH (NOEXPAND): its index must be there), a table type's index
+    "CREATE TABLE f.sales (id int PRIMARY KEY, region nvarchar(10) NOT NULL, amount money NOT NULL)",
+    "CREATE VIEW f.by_region WITH SCHEMABINDING AS SELECT region, SUM(amount) AS total, COUNT_BIG(*) AS n "
+    "FROM f.sales GROUP BY region",
+    "CREATE UNIQUE CLUSTERED INDEX by_region_cx ON f.by_region (region)",
+    "CREATE INDEX by_region_total ON f.by_region (total)",
+    "CREATE VIEW f.on_by_region AS SELECT region FROM f.by_region WITH (NOEXPAND)",
+    "CREATE TYPE f.tt AS TABLE (a int PRIMARY KEY, b int, INDEX tt_b (b))",
+    "CREATE PROCEDURE f.take @p f.tt READONLY AS SELECT COUNT(*) AS n FROM @p",
+    # S1: what needs a left-out (system-versioned, graph) or hidden (encrypted) object, transitively
+    "CREATE TABLE f.prices (id int PRIMARY KEY, p money, a datetime2 GENERATED ALWAYS AS ROW START, "
+    "b datetime2 GENERATED ALWAYS AS ROW END, PERIOD FOR SYSTEM_TIME (a, b)) "
+    "WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = f.prices_history))",
+    "CREATE VIEW f.current_prices AS SELECT id, p FROM f.prices",
+    "CREATE VIEW f.on_current AS SELECT id FROM f.current_prices",
+    "CREATE TABLE f.person (id int PRIMARY KEY) AS NODE",
+    "CREATE VIEW f.people AS SELECT id FROM f.person",
+    "CREATE VIEW f.secret WITH ENCRYPTION AS SELECT id FROM f.sales",
+    "CREATE VIEW f.on_secret AS SELECT id FROM f.secret",
+    "CREATE FUNCTION f.f_enc (@v int) RETURNS bit WITH ENCRYPTION AS BEGIN RETURN 1 END",
+    "CREATE TABLE f.enc_checked (id int PRIMARY KEY, v int CHECK (f.f_enc(v) = 1))",
+    "CREATE VIEW f.on_enc_checked AS SELECT id FROM f.enc_checked",
+    "CREATE FUNCTION f.price_of (@id int) RETURNS money AS BEGIN RETURN (SELECT p FROM f.prices WHERE id = @id) END",
+    "CREATE TRIGGER f.sales_ai ON f.sales AFTER INSERT AS DECLARE @x money = f.price_of(1)",
+    "CREATE PROCEDURE f.report AS SELECT id FROM f.current_prices",
+    # S2: modules that run as a database user; SELF needs none
+    "CREATE USER zz_06_runner WITHOUT LOGIN",
+    "CREATE PROCEDURE f.as_runner WITH EXECUTE AS 'zz_06_runner' AS SELECT 1 AS one",
+    "CREATE FUNCTION f.f_as_runner () RETURNS int WITH EXECUTE AS 'zz_06_runner' AS BEGIN RETURN 1 END",
+    "CREATE USER zz_06_maker WITHOUT LOGIN", "GRANT CREATE PROCEDURE TO zz_06_maker",
+    "GRANT ALTER ON SCHEMA::f TO zz_06_maker",
+    "INSERT INTO f.sales VALUES (1, N'n', 10), (2, N's', 20)", "INSERT INTO f.rates VALUES (1, 2)",
+    "INSERT INTO f.uses_rates (id) VALUES (1)", "INSERT INTO f.enc_checked VALUES (1, 1)",
+)
+# made by zz_06_maker: its execute_as_principal_id is that user's, as `EXECUTE AS 'zz_06_maker'` would be
+_AS_SELF = ("EXECUTE AS USER = N'zz_06_maker'; EXEC (N'CREATE PROCEDURE f.as_self WITH EXECUTE AS SELF AS SELECT 1 AS "
+            "one'); REVERT")
+_ROUND1_LEFT_OUT = {f"f.{name}" for name in (
+    "prices", "prices_history", "current_prices", "on_current", "person", "people", "secret", "on_secret", "f_enc",
+    "enc_checked", "on_enc_checked", "sales_ai", "as_runner", "f_as_runner")}
+
+
+def _without(found: dict, labels: set[str]) -> dict:
+    """The inventory without the rows of `labels`' objects (an object's row names it in one of its first fields, or
+    as schema and name in two of them)."""
+    def names(row: tuple) -> set[str]:
+        head = [value for value in row[:4] if isinstance(value, str)]
+        return {*head, *(f"{a}.{b}" for a, b in zip(head, head[1:]))}
+    return {part: [row for row in found[part] if not names(row) & labels] for part in found}
+
+
+@requires_mssql
+def test_what_needs_a_left_out_object_is_left_out_and_defaults_and_checks_wait_for_the_views(tmp_path):  # review S1–S3
+    db = scratch_db("mssql", tmp_path)
+    app = DataApp(tmp_path)
+    try:
+        with scratch_database("mssql", "dumpcat") as (source, admin), \
+                scratch_database("mssql", "restore") as (target, _):
+            for statement in _ROUND1:
+                admin.run_in(source, statement)
+            sa_rows(source, _AS_SELF)
+            found = catalog_in(source, DumpScope(kind="database"))
+            listed = kinds(found.pre) + kinds(found.post)
+            assert not {name for _, name in listed} & _ROUND1_LEFT_OUT
+            text = " | ".join(found.warnings)
+            for need in ("f.current_prices (needs f.prices)", "f.on_current (needs f.current_prices)",
+                         "f.people (needs f.person)", "f.on_secret (needs f.secret)",
+                         "f.on_enc_checked (needs f.enc_checked)", "f.sales_ai (needs f.price_of)"):
+                assert need in text, need
+            assert ("Not written, their definition needs what the dump leaves out: f.enc_checked (needs f.f_enc)"
+                    in found.warnings)
+            assert ("Not written, their definition cannot be read (encrypted, or no VIEW DEFINITION): f.secret, f.f_enc"
+                    in found.warnings)
+            assert ("Not written, they run as a database user the file does not create (EXECUTE AS): f.as_runner (as "
+                    "zz_06_runner), f.f_as_runner (as zz_06_runner)") in found.warnings  # S2
+            assert "f.price_of needs f.prices" in text and "f.report needs f.current_prices" in text  # written, named
+            for counted in ("1 tables whose definition cannot be read", "2 modules that run as a database user "
+                            "(EXECUTE AS 'user')", "6 views, functions, synonyms, triggers and security policies that "
+                            "need what the dump leaves out", "2 modules whose definition cannot be read (encrypted, or "
+                            "no VIEW DEFINITION)"):
+                assert counted in found.not_included, (counted, found.not_included)
+            assert ("procedure", "f.as_self") in listed
+            # S1: the bound view and function before the table; the defaults and checks that read after everything
+            pre = kinds(found.pre)
+            assert pre.index(("view", "f.v_rates")) < pre.index(("function", "f.rate_count")) < pre.index(
+                ("table", "f.uses_rates"))
+            post = kinds(found.post)
+            last_module = max(i for i, (kind, _) in enumerate(post) if kind in ("view", "function", "procedure"))
+            constraints = [i for i, (kind, _) in enumerate(post) if kind in ("check constraint", "default")]
+            assert [post[i] for i in constraints] == [("check constraint", "f.aa_checked"),
+                                                      ("check constraint", "f.checked"), ("default", "f.checked")]
+            assert min(constraints) > last_module
+            statements = {(item.kind, item.name): item.statements for item in (*found.pre, *found.post)}
+            assert statements[("check constraint", "f.aa_checked")] == (
+                "ALTER TABLE [f].[aa_checked] WITH CHECK ADD CONSTRAINT [aa_code] CHECK ([f].[in_lookup]([code])=(1))",)
+            assert statements[("default", "f.checked")][0].startswith("ALTER TABLE [f].[checked] ADD CONSTRAINT [DF__")
+            assert "checked_code" not in statements[("table", "f.checked")][0]
+            # S3: the indexed view with its indexes, the unique clustered one first; the table type's own index
+            by_region = statements[("view", "f.by_region")]
+            assert by_region[1:] == ("CREATE UNIQUE CLUSTERED INDEX [by_region_cx] ON [f].[by_region] ([region])",
+                                     "CREATE NONCLUSTERED INDEX [by_region_total] ON [f].[by_region] ([total])")
+            assert "INDEX [tt_b] NONCLUSTERED ([b])" in statements[("type", "f.tt")][0]
+            path = tmp_path / "round1.sql"
+            path.write_text(script(found, copy_rows(found, source)), encoding="utf-8")
+            restore(app, db.profile(database=target), path)  # all or nothing, twice
+            assert differences(_without(inventory(source), _ROUND1_LEFT_OUT), inventory(target)) == {}
+            rows_before = {name: rows for name, rows in data(source).items() if name not in _ROUND1_LEFT_OUT}
+            assert rows_before == data(target)
+            again = catalog_in(target, DumpScope(kind="database"))
+            assert (kinds(again.pre), kinds(again.post)) == (kinds(found.pre), kinds(found.post))
+    finally:
+        app.close()
+        db.close()
+
+
+@requires_mssql
+@pytest.mark.parametrize("snapshot", ["ON", "OFF"])
+def test_a_session_with_implicit_transactions_dumps_and_leaves_none_open(database, snapshot):  # review S5, S6
+    db, name, admin = database
+    admin.run_in("master", f"ALTER DATABASE [{name}] SET ALLOW_SNAPSHOT_ISOLATION {snapshot}")
+    conn = db.open(database=name)
+
+    def trancount() -> int:
+        result = conn.run("SELECT @@TRANCOUNT")
+        try:
+            return result.fetch(1)[0][0]
+        finally:
+            result.close()
+
+    try:
+        conn.run("SET IMPLICIT_TRANSACTIONS ON").close()  # what a login's user options can give it
+        session = conn.dump_session(DumpScope(kind="database"))
+        assert trancount() == 0  # dump_session's own read opened nothing
+        for statement in session.setup:
+            conn.run(statement).close()
+        found = conn.dump_catalog(DumpScope(kind="database"), DumpObjectKinds())
+        assert (found.consistency, trancount()) == (("snapshot", 1) if snapshot == "ON" else ("per_table", 0))
+        if snapshot == "ON":  # S6: another session's DDL fails the snapshot's read (3961) and ends its transaction
+            admin.run_in(name, "ALTER TABLE app.child ADD w int NULL")
+            with pytest.raises(StatementError):
+                conn.run("SELECT COUNT(*) FROM app.child").close()
+        for statement in session.teardown:
+            conn.run(statement).close()
+        assert trancount() == 0
+    finally:
+        conn.close()
 
 
 @requires_mssql

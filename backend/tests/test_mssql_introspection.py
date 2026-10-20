@@ -55,7 +55,8 @@ ORDERS = [*SALES, seg("folder", "tables"), seg("table", "orders")]
 
 
 def test_tree(conn):
-    root = introspection.list_children(conn, [])
+    # a scratch database (`zz_…`, another test's or a probe's, the dev login owns it) may exist meanwhile: not the seed's
+    root = [node for node in introspection.list_children(conn, []) if not node.name.startswith("zz_")]
     assert names(root) == ["analytics", "dbaguy", "master", "msdb", "tempdb"]  # no model, no locked_away
     assert [n.system for n in root] == [False, False, True, True, True] and {n.kind for n in root} == {"database"}
     schemas = introspection.list_children(conn, DB)

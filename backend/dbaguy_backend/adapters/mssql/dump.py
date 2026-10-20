@@ -4,23 +4,26 @@ in its turn at READ COMMITTED (A S9: the dev database, and most others, do not a
 catalog views themselves are not versioned: DDL another session commits during a SNAPSHOT dump fails the dump's read of
 that table (3961). Catalog calls never take the metadata session's READ UNCOMMITTED.
 
-Order. Before the data: schemas, user types (alias and table types), sequences (each at the value it gives next, A
-S11), then the tables (without their foreign keys, non-constraint indexes and the CHECKs they do not enforce) together
-with the functions their computed columns, defaults and checks call (S7), in one dependency order (a schema-bound
-function after the table it reads). After the data: identity counters (RESEED to where the source was, never back:
-S8, pre-flight M8), indexes, foreign keys (named, so `drop_first` can drop them: H7; untrusted ones WITH NOCHECK and
-disabled ones disabled again: L13), CHECKs the table does not enforce, then views, functions and synonyms by
-sys.sql_expression_dependencies (a view binds what it reads when it is created), procedures (deferred name resolution:
-any order), security policies, and triggers on tables and views (a disabled one disabled again, its first / last
-order set again: H6). Each module is its own batch, under the QUOTED_IDENTIFIER and ANSI_NULLS it was created with,
-and under the name it has now (sp_rename leaves the old one in its text: L13).
+Order (the dependency rules are dump_graph.py's). Before the data: schemas, user types (alias and table types, a
+table type's own indexes in its body), sequences (each at the value it gives next, A S11), then the tables (without
+their foreign keys, non-constraint indexes, the CHECKs they do not enforce and the defaults and checks that wait for the
+views) together with the functions their computed columns, defaults and checks call, and the views an inline or
+schema-bound one of those binds (S7, review S1), in one dependency order. After the data: identity counters (RESEED to
+where the source was, never back: S8, pre-flight M8), indexes, foreign keys (named, so `drop_first` can drop them: H7;
+untrusted ones WITH NOCHECK and disabled ones disabled again: L13), then views (an indexed one with its indexes, review
+S3), functions and synonyms by sys.sql_expression_dependencies, procedures (deferred name resolution: any order), the
+CHECKs the tables do not enforce and the defaults and checks whose function reads a table, view or synonym (WITH CHECK,
+with the rows in: review S1), security policies, and triggers on tables and views (a disabled one disabled again, its
+first / last order set again: H6). Each module is its own batch, under the QUOTED_IDENTIFIER and ANSI_NULLS it was
+created with, and under the name it has now (sp_rename leaves the old one in its text: L13).
 
-Left out and counted (H6, S9): system-versioned, graph and ledger tables and tables with a period (a plain copy would
-not be one), CLR types and modules, database triggers, indexes DbaGuy does not write (columnstore, XML, spatial, hash),
-index and table options, partitioning, full-text indexes, statistics, extended properties, XML schema collections and
-the like; modules whose definition is hidden (encrypted, or no VIEW DEFINITION)."""
+Left out, counted and named (H6, S9, review S1, S2): system-versioned, graph and ledger tables and tables with a
+period (a plain copy would not be one), modules whose definition is hidden (encrypted, or no VIEW DEFINITION), modules
+that run as a database user the file does not create (EXECUTE AS 'user'), tables whose definition cannot be read, and
+everything that needs one of those, transitively. Counted: CLR types and modules, database triggers, indexes DbaGuy
+does not write (columnstore, XML, spatial, hash), index and table options, partitioning, full-text indexes,
+statistics, extended properties, XML schema collections and the like."""
 
-from dataclasses import dataclass
 from decimal import Decimal
 from itertools import islice
 
@@ -32,19 +35,21 @@ from ...sql.dialects import Dialect
 from ...sql.lexer import INSIGNIFICANT, Token, TokenKind, scan
 from ...sql.scope import unquote
 from ..columns import TableColumn
-from ..dump import OWNERS_AND_PRIVILEGES, DumpCatalog, DumpObject, DumpSession, DumpTable, Ordering
+from ..dump import OWNERS_AND_PRIVILEGES, DumpCatalog, DumpObject, DumpSession, DumpTable, shown_names
 from . import driver
 from .catalog import batch, by_object, chunks, id_list, id_sources, is_system_schema, literal, q, result_sets, rows
 from .columns import columns_of
+from .dump_graph import FUNCTIONS, Graph, Object, Use
 from .editing import table_flags_of, table_flags_reason
 from .introspection import (
-    EXACT, TableStatements, sequences_at_next_value, synonyms_of, table_statements_of, types_of)
+    EXACT, TableRows, TableStatements, sequences_at_next_value, synonyms_of, table_rows_of, types_of, view_indexes_of)
 
-# L8: a login whose user options turn IMPLICIT_TRANSACTIONS on would leave the per-table reads in a transaction the
-# dump never ends, and nest the snapshot's
+# L8, review S5: a login whose user options turn IMPLICIT_TRANSACTIONS on would open a transaction with the dump's
+# first read, which then nests the snapshot's (3951) or outlives a per-table dump: off before anything is read
 _IMPLICIT_OFF = "SET IMPLICIT_TRANSACTIONS OFF"
 SNAPSHOT = DumpSession(setup=(_IMPLICIT_OFF, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT", "BEGIN TRANSACTION"),
-                       teardown=("ROLLBACK TRANSACTION", "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+                       teardown=("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",  # review S6: 3961 / 3951 end it first
+                                 "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"),
                        consistency="snapshot")
 PER_TABLE = DumpSession(setup=(_IMPLICIT_OFF,), teardown=(), consistency="per_table")
 SNAPSHOT_TEXT = "one consistent snapshot (SNAPSHOT isolation)"
@@ -53,9 +58,11 @@ PER_TABLE_WARNING = ("Not a consistent snapshot: the database does not allow SNA
                      "in its turn")
 TEMPORAL = "system-versioned, graph or ledger tables"
 HIDDEN_MODULES = "modules whose definition cannot be read (encrypted, or no VIEW DEFINITION)"
-_SHOWN = 10  # names a warning lists before "…"
+UNREADABLE_TABLES = "tables whose definition cannot be read"
+RUNS_AS = "modules that run as a database user (EXECUTE AS 'user')"
+NEEDING = "views, functions, synonyms, triggers and security policies that need what the dump leaves out"
 
-_SNAPSHOT_ALLOWED = "SELECT snapshot_isolation_state FROM sys.databases WHERE name = DB_NAME()"
+_SNAPSHOT_ALLOWED = f"{_IMPLICIT_OFF};\nSELECT snapshot_isolation_state FROM sys.databases WHERE name = DB_NAME()"
 _START = f"""
 {_SNAPSHOT_ALLOWED};
 SELECT CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation')), HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'UNMASK');
@@ -65,7 +72,8 @@ SELECT name, schema_id FROM sys.schemas ORDER BY schema_id
 _OBJECTS = """
 SELECT o.object_id, s.name, o.name, RTRIM(o.type), o.parent_object_id,
        CASE WHEN o.type = 'U' AND EXISTS (SELECT 1 FROM sys.columns c WHERE c.object_id = o.object_id
-                                          AND c.generated_always_type <> 0) THEN 1 ELSE 0 END
+                                          AND c.generated_always_type <> 0) THEN 1 ELSE 0 END,
+       CASE WHEN OBJECTPROPERTY(o.object_id, 'IsSchemaBound') = 1 THEN 1 ELSE 0 END
 FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id
 WHERE o.schema_id IN ({schemas}) AND o.is_ms_shipped = 0 AND (o.parent_object_id = 0 OR o.type = 'TR')
 ORDER BY o.create_date, o.object_id
@@ -74,6 +82,7 @@ ORDER BY o.create_date, o.object_id
 # a thousand literal ids takes the server ~0.1 s to compile per statement. No quote in any: dynamic SQL takes them.
 _WITHIN = {
     "tables": "SELECT object_id FROM sys.tables WHERE is_ms_shipped = 0 AND schema_id IN ({schemas})",
+    "views": "SELECT object_id FROM sys.views WHERE schema_id IN ({schemas})",
     "sequences": "SELECT object_id FROM sys.sequences WHERE schema_id IN ({schemas})",
     "synonyms": "SELECT object_id FROM sys.synonyms WHERE schema_id IN ({schemas})",
     "modules": "SELECT m.object_id FROM sys.sql_modules m JOIN sys.objects o ON o.object_id = m.object_id "
@@ -87,12 +96,12 @@ DECLARE @views nvarchar(max) = CASE WHEN COL_LENGTH(N'sys.tables', N'ledger_view
     ELSE N'SELECT ledger_view_id FROM sys.tables WHERE ledger_view_id IS NOT NULL AND schema_id IN ({schemas})' END;
 EXEC (@views)
 """
-# What each object of the scope reads, a default's or check's for its table; classes 1 only (6 is a type, whose id is a
-# user_type_id). A schema-bound module, like a view, binds what it reads when it is created.
+# What each object of the scope reads; a default's or check's row names its table and itself. Classes 1 only (6 is a
+# type, whose id is a user_type_id).
 _DEPENDS = """
-SELECT DISTINCT CASE WHEN o.type IN ('C', 'D') THEN o.parent_object_id ELSE o.object_id END, d.referenced_id,
-       RTRIM(r.type), SCHEMA_NAME(r.schema_id), r.name, r.is_ms_shipped,
-       CASE WHEN o.type IN ('C', 'D') THEN 1 ELSE OBJECTPROPERTY(o.object_id, 'IsSchemaBound') END
+SELECT DISTINCT CASE WHEN o.type IN ('C', 'D') THEN o.parent_object_id ELSE o.object_id END,
+       CASE WHEN o.type IN ('C', 'D') THEN o.name END, CASE WHEN o.type IN ('C', 'D') THEN RTRIM(o.type) END,
+       d.referenced_id, RTRIM(r.type), SCHEMA_NAME(r.schema_id), r.name, r.is_ms_shipped
 FROM sys.sql_expression_dependencies d
 JOIN sys.objects o ON o.object_id = d.referencing_id
 JOIN sys.objects r ON r.object_id = d.referenced_id
@@ -102,6 +111,15 @@ _TYPES = """
 SELECT t.user_type_id, s.name, t.name, t.is_assembly_type FROM sys.types t JOIN sys.schemas s ON s.schema_id = t.schema_id
 WHERE t.is_user_defined = 1 AND t.schema_id IN ({schemas}) ORDER BY t.user_type_id
 """
+# Whether each module's definition can be read, who it runs as (execute_as_principal_id: NULL caller, -2 owner, else a
+# database principal: SELF or a named user), and what each synonym names
+_MODULE_META = """
+SELECT m.object_id, CASE WHEN m.definition IS NULL THEN 1 ELSE 0 END, m.execute_as_principal_id,
+       USER_NAME(m.execute_as_principal_id)
+FROM sys.sql_modules m JOIN sys.objects o ON o.object_id = m.object_id WHERE o.schema_id IN ({schemas});
+SELECT object_id, OBJECT_ID(base_object_name) FROM sys.synonyms WHERE schema_id IN ({schemas})
+"""
+_HEADS = "SELECT object_id, LEFT(definition, 4000) FROM sys.sql_modules WHERE object_id IN ({ids})"
 # The user types the dump's tables, its modules' parameters and their table types' columns use, by user
 _USED_TYPES = """
 SELECT DISTINCT x.object_id, t.user_type_id, SCHEMA_NAME(t.schema_id), t.name FROM (
@@ -189,7 +207,6 @@ SELECT p.object_id, p.is_enabled, p.is_schema_bound, p.is_not_for_replication, p
 FROM sys.security_policies p JOIN sys.security_predicates pr ON pr.object_id = p.object_id
 WHERE p.object_id IN ({ids}) ORDER BY p.object_id, pr.security_predicate_id
 """
-_FUNCTIONS = frozenset({"FN", "IF", "TF"})
 _MODULE_KINDS = {"V": ("view", "VIEW"), "FN": ("function", "FUNCTION"), "IF": ("function", "FUNCTION"),
                  "TF": ("function", "FUNCTION"), "P": ("procedure", "PROCEDURE"), "SN": ("synonym", "SYNONYM"),
                  "TR": ("trigger", "TRIGGER")}
@@ -198,43 +215,11 @@ _CLR_MODULES = "CLR functions, procedures, aggregates and triggers"
 _RULES = "rules and defaults made with CREATE RULE / CREATE DEFAULT"
 _COUNTED_OBJECTS = {"FS": _CLR_MODULES, "FT": _CLR_MODULES, "PC": _CLR_MODULES, "AF": _CLR_MODULES,
                     "TA": _CLR_MODULES, "R": _RULES, "D": _RULES, "ET": "external tables", "SQ": "Service Broker queues"}
+_CLR = frozenset({"FS", "FT", "PC", "AF", "TA"})
 _HEAD_WORDS = frozenset({"VIEW", "PROC", "PROCEDURE", "FUNCTION", "TRIGGER"})
 _HEAD_TOKENS = 64
-
-
-@dataclass(frozen=True, slots=True)
-class _Object:
-    object_id: int
-    schema: str
-    name: str
-    type: str
-    parent: int
-    generated: bool  # a table with GENERATED ALWAYS columns (a period, a ledger's)
-
-    @property
-    def label(self) -> str:
-        return f"{self.schema}.{self.name}"
-
-    @property
-    def qualified(self) -> str:
-        return f"{q(self.schema)}.{q(self.name)}"
-
-
-@dataclass(frozen=True, slots=True)
-class _Use:
-    """One row of _DEPENDS."""
-
-    referencing: int
-    referenced: int
-    type: str
-    schema: str | None
-    name: str
-    shipped: bool
-    binds: bool  # the referencing object needs it to exist when it is created (a table's, a schema-bound module's)
-
-    @property
-    def label(self) -> str:
-        return f"{self.schema}.{self.name}"
+_RUNNERS = frozenset({"CALLER", "SELF", "OWNER"})  # EXECUTE AS that needs no user where the file is run
+_DBO = 1  # the database principal dbo, in every database
 
 
 def session(conn: driver.Connection) -> DumpSession:
@@ -242,8 +227,26 @@ def session(conn: driver.Connection) -> DumpSession:
     return SNAPSHOT if found and found[0][0] == 1 else PER_TABLE
 
 
-def _shown(names: list[str]) -> str:
-    return ", ".join(names[:_SHOWN]) + (" …" if len(names) > _SHOWN else "")
+def _drop(qualified: str, code: str, statement: str) -> str:
+    """`drop_first`'s DROP of one object: `statement` when the object (`qualified`, of sys.objects type `code`) is
+    there."""
+    return f"IF OBJECT_ID({literal(qualified)}, N'{code}') IS NOT NULL {statement}"
+
+
+def runs_as(head: str) -> str | None:
+    """Who a module runs as, from its head (`WITH EXECUTE AS …`): CALLER, SELF, OWNER or the user's name; None when it
+    says nothing. The first `EXEC[UTE] AS` followed by one of those or a string: a body's `EXECUTE AS USER = …` is a
+    statement, not the module's clause."""
+    tokens = [token for token in scan(head, Dialect.TSQL) if token.kind not in INSIGNIFICANT]
+    for i in range(len(tokens) - 2):
+        if tokens[i].upper in ("EXEC", "EXECUTE") and tokens[i + 1].upper == "AS":
+            who = tokens[i + 2]
+            if who.kind == TokenKind.WORD and who.upper in _RUNNERS:
+                return who.upper
+            if who.kind == TokenKind.STRING:
+                text = who.text[1:] if who.text[:1] in "Nn" else who.text
+                return text[1:-1].replace("''", "'")
+    return None
 
 
 def _module_statements(definition: str, ansi_nulls: bool, quoted_identifier: bool) -> tuple[str, ...]:
@@ -348,10 +351,12 @@ class _Reader:
         self.named = scope.kind == "tables"
         self.left_out: dict[str, int] = {}
         self.warnings: list[str] = []
-        self.objects: dict[int, _Object] = {}  # the scope's schemas' objects, in creation order
+        self.objects: dict[int, Object] = {}  # the scope's schemas' objects, in creation order
         self.position: dict[int, int] = {}  # an object's place in that order
-        self.uses: dict[int, list[_Use]] = {}  # what each object of the scope reads
+        self.graph = Graph({}, ())
+        self.hidden: dict[int, str] = {}  # left out for what it is (or, "needs", what it needs): never written
         self.synonyms: dict[int, str] = {}
+        self.view_indexes: dict[int, list[str]] = {}
         self.schema_ids = "NULL"  # the scope's schemas, an id_list
         self.snapshot = False
         self.collation: str | None = None
@@ -361,12 +366,18 @@ class _Reader:
             self.left_out[what] = self.left_out.get(what, 0) + count
 
     def label(self, object_id: int) -> str:
-        return self.objects[object_id].label
+        return self.graph.label(object_id)
 
     def within(self, kind: str, chosen: bool = True) -> str | None:
         """catalog.id_sources' subquery for `kind`: in a schema or database dump that writes all of them (`chosen`);
         a `tables` dump, or one that writes only some, lists its ids."""
         return _WITHIN[kind].format(schemas=self.schema_ids) if chosen and not self.named else None
+
+    def said(self, what: str, why: str, names: list[str]) -> None:
+        """Objects left out, counted (H6) and named (review S1)."""
+        self.leave_out(what, len(names))
+        if names:
+            self.warnings.append(f"Not written, {why}: {shown_names(names)}")
 
     # ---- the read ----
 
@@ -376,36 +387,45 @@ class _Reader:
         self.collation, unmask = settings[0] if settings else (None, 1)
         schemas = self._schemas(schema_rows)
         ids = self.schema_ids = id_list(schemas.values())
-        objects, flags, uses, type_rows, ledger_views = result_sets(self.conn, batch(
+        objects, flags, uses, type_rows, ledger_views, meta, bases = result_sets(self.conn, batch(
             _OBJECTS.format(schemas=ids), table_flags_of(_WITHIN["tables"].format(schemas=ids)),
-            _DEPENDS.format(schemas=ids), _TYPES.format(schemas=ids), _LEDGER_VIEWS.format(schemas=ids)))
+            _DEPENDS.format(schemas=ids), _TYPES.format(schemas=ids), _LEDGER_VIEWS.format(schemas=ids),
+            _MODULE_META.format(schemas=ids)))
         ledger = {int(view) for (view,) in ledger_views}
-        self.objects = {int(row[0]): _Object(int(row[0]), row[1], row[2], row[3], int(row[4]), bool(row[5]))
-                        for row in objects if int(row[0]) not in ledger}
+        self.objects = {int(row[0]): Object(int(row[0]), row[1], row[2], row[3], int(row[4]), bool(row[5]),
+                                            bool(row[6])) for row in objects if int(row[0]) not in ledger}
         self.position = {object_id: i for i, object_id in enumerate(self.objects)}
-        for row in uses:
-            use = _Use(int(row[0]), int(row[1]), row[2], row[3], row[4], bool(row[5]), bool(row[6]))
-            self.uses.setdefault(use.referencing, []).append(use)
+        self.graph = Graph(self.objects, (Use(int(row[0]), int(row[3]), row[4], row[5], row[6], bool(row[7]), row[1],
+                                              row[2]) for row in uses),
+                           {int(synonym): int(base) for synonym, base in bases if base is not None})
+        self.hidden = dict.fromkeys(ledger, "ledger")  # a ledger table's view goes with it
         picked = self._picked()
         if not self.named:
             for obj in picked:
                 if obj.type in _COUNTED_OBJECTS:
                     self.leave_out(_COUNTED_OBJECTS[obj.type])
         flags_of = {int(row[0]): tuple(row[1:]) for row in flags}
-        tables = [obj for obj in picked if obj.type == "U" and self._dumped_table(obj, flags_of.get(obj.object_id))]
+        candidates = [obj for obj in picked if obj.type == "U" and self._dumped_table(obj, flags_of.get(obj.object_id))]
+        self._hide_modules(meta)
+        later = self.graph.later(obj.object_id for obj in candidates)
+        parts = self._table_statements(candidates, type_rows, later)
+        needing = self.graph.spread(self.hidden, {obj.object_id for obj in candidates})
+        self._say_needing(needing)
+        tables = [obj for obj in candidates if obj.object_id not in self.hidden]
         table_ids = {obj.object_id for obj in tables}
-        early = self._closure(table_ids)  # S7: what the tables call comes before them
+        early = self.graph.early(table_ids, later) - self.hidden.keys()
         policies = self._policies(table_ids)
-        views = {obj.object_id for obj in picked if obj.type == "V" and (self.kinds.views or self.named)}
+        views = {obj.object_id for obj in picked if obj.type == "V" and (self.kinds.views or self.named)
+                 and obj.object_id not in self.hidden} | {m for m in early if self.objects[m].type == "V"}
         triggers = self._triggers_of(table_ids | views)
         modules = self._modules(picked, early, policies, triggers)
         sequences = self._sequences_of(table_ids)
         written = table_ids | set(modules) | {obj.object_id for obj in sequences} | {policy for policy, _ in policies}
-        self._outside(table_ids, written)
-        parts, columns, identities, sizes, masked = self._table_parts(tables)
-        tables = [obj for obj in tables if self._readable(obj, parts.get(obj.object_id))]
-        table_ids = {obj.object_id for obj in tables}
-        triggers = [trigger for trigger in triggers if self.objects[trigger].parent in table_ids | views]
+        if needed := self.graph.needs(written, self.hidden, self.position):  # review S1: after _readable
+            self.leave_out("objects the dump's tables, views and functions need (from other schemas, not chosen or "
+                           "left out)", len(needed))
+            self.warnings.append(f"Not in this dump, and needed where it is run: {shown_names(needed)}")
+        columns, identities, sizes, masked = self._table_details(tables)
         types = self._types(type_rows, [*table_ids, *modules])
         if masked and not unmask:
             self.warnings.append(f"{masked:,} masked columns are read masked (this login has no UNMASK permission): "
@@ -418,6 +438,9 @@ class _Reader:
             self.synonyms = synonyms_of(self.conn, {m: (self.objects[m].schema, self.objects[m].name)
                                                     for m in modules if self.objects[m].type == "SN"},
                                         self.within("synonyms", self.kinds.views))
+            self.view_indexes = view_indexes_of(self.conn, {m: (self.objects[m].schema, self.objects[m].name)
+                                                            for m in modules if self.objects[m].type == "V"},
+                                                self.within("views"))
         pre: list[DumpObject] = [self._schema(name) for name in schemas if name != "dbo"]
         pre += types.values()
         pre += self._sequences(sequences)
@@ -427,13 +450,13 @@ class _Reader:
         post += [DumpObject("index", obj.label, (index,) if self.ddl else ())
                  for obj in tables for index in parts[obj.object_id].indexes]
         post += self._foreign_keys(tables, parts)
-        post += [DumpObject("check constraint", obj.label, check.statements if self.ddl else ())
-                 for obj in tables for check in parts[obj.object_id].checks]
         post += [item for module in self._module_order(late) if (item := self._module(module, texts)) is not None]
+        post += self._constraints(tables, parts)
         post += [self._policy(policy, predicates) for policy, predicates in policies]
         post += self._triggers(triggers, texts)
+        by_name = {(obj.schema, obj.name): obj for obj in tables}  # review S4: once, not per table
         data = [self._data(obj, columns.get(obj.object_id, []), sizes.get(obj.object_id), parts[obj.object_id],
-                           table_ids) for obj in tables]
+                           by_name) for obj in tables]
         return pre, data, post
 
     def _schemas(self, schema_rows: list[tuple]) -> dict[str, int]:
@@ -444,7 +467,7 @@ class _Reader:
             raise NotFound(f"Schema {self.scope.schema_name} not found")
         return {self.scope.schema_name: found[self.scope.schema_name]}
 
-    def _picked(self) -> list[_Object]:
+    def _picked(self) -> list[Object]:
         """The objects the scope chooses, in creation order: every one, or (a `tables` scope) the named tables and
         views. What they need (functions, synonyms, sequences, types), their triggers and their security policies
         come from the whole schema."""
@@ -457,100 +480,135 @@ class _Reader:
             raise NotFound(f"Not found in {self.scope.schema_name}: {', '.join(sorted(missing))}")
         return picked
 
-    def _dumped_table(self, obj: _Object, flags: tuple | None) -> bool:
+    def _dumped_table(self, obj: Object, flags: tuple | None) -> bool:
         """System-versioned, graph and ledger tables are left out: a plain table would not be one (G9, S9); so is a
         table with a period whose versioning is off (its GENERATED ALWAYS columns cannot be written back)."""
         temporal, is_node, is_edge, ledger = flags or (0, False, False, 0)
         if table_flags_reason(temporal, is_node, is_edge, ledger) is not None or temporal == 2:
             self.leave_out(TEMPORAL)
             self.warnings.append(f"{obj.label} is left out: system-versioned, graph and ledger tables are not dumped")
-            return False
-        if obj.generated:
+        elif obj.generated:
             self.leave_out("tables with a period (GENERATED ALWAYS columns)")
             self.warnings.append(f"{obj.label} is left out: its GENERATED ALWAYS columns (a period) cannot be written "
                                  "back")
-            return False
-        return True
+        else:
+            return True
+        self.hidden[obj.object_id] = "table"
+        return False
 
-    def _used_by(self, referencing: set[int], object_id: int) -> bool:
-        return any(use.referenced == object_id for r in referencing for use in self.uses.get(r, ()))
+    def _hide_modules(self, meta: list[tuple]) -> None:
+        """What no file can carry is left out (and, through Graph.spread, what needs it): CLR modules (counted where
+        they are), modules whose definition is hidden, and (review S2) modules that run as a database user — the file
+        does not create users, and CREATE fails without one (15151, which also ends the run's transaction)."""
+        for obj in self.objects.values():
+            if obj.type in _CLR:
+                self.hidden[obj.object_id] = "clr"
+        hidden_text, as_user = [], {}
+        for object_id, unreadable, principal, user in meta:
+            obj = self.objects.get(int(object_id))
+            if obj is None:
+                continue
+            if unreadable:
+                self.hidden[obj.object_id] = "definition"
+                hidden_text.append(obj.label)
+            elif principal is not None and int(principal) not in (-2, _DBO):  # owner, dbo: there wherever it runs
+                as_user[obj.object_id] = user or str(principal)
+        heads = {int(object_id): head for source in chunks(as_user) for object_id, head in rows(
+            self.conn, _HEADS.format(ids=source))}
+        runners = []
+        for object_id, user in as_user.items():
+            if runs_as(heads.get(object_id) or "") != "SELF":  # SELF is whoever creates it
+                self.hidden[object_id] = "runs as"
+                runners.append(f"{self.objects[object_id].label} (as {user})")
+        if not self.named:  # a tables dump names only those it needs (Graph.spread)
+            self.said(HIDDEN_MODULES, "their definition cannot be read (encrypted, or no VIEW DEFINITION)", hidden_text)
+            self.said(RUNS_AS, "they run as a database user the file does not create (EXECUTE AS)", runners)
 
-    def _closure(self, roots: set[int], kinds: frozenset[str] = _FUNCTIONS) -> set[int]:
-        """The scope's objects of `kinds` that `roots` read, and what those read, transitively (`roots` excluded)."""
-        found: set[int] = set()
-        todo = list(roots)
-        while todo:
-            for use in self.uses.get(todo.pop(), ()):
-                if use.type in kinds and use.referenced in self.objects and use.referenced not in found | roots:
-                    found.add(use.referenced)
-                    todo.append(use.referenced)
-        return found
+    def _table_statements(self, candidates: list[Object], type_rows: list[tuple],
+                          later: dict[int, frozenset[str]]) -> dict[int, TableStatements]:
+        """Each table's statements, the defaults and checks of `later` added after the views. A table whose definition
+        cannot be read, or that uses a CLR type, is left out (and what needs it, by Graph.spread)."""
+        named = {obj.object_id: (obj.schema, obj.name) for obj in candidates}
+        found_rows: dict[int, TableRows] = table_rows_of(self.conn, named, self.within("tables"))
+        clr = {(schema, name) for _, schema, name, assembly in type_rows if assembly}
+        parts: dict[int, TableStatements] = {}
+        for obj in candidates:
+            table = found_rows.get(obj.object_id)
+            if table is None:  # dropped while the dump read the catalog
+                self.hidden[obj.object_id] = "gone"
+                continue
+            parts[obj.object_id] = table.statements(later.get(obj.object_id, frozenset()))
+            self.leave_out("definitions hidden from this login (indexes, foreign keys, checks, defaults)",
+                           parts[obj.object_id].hidden)
+            if parts[obj.object_id].create is None:
+                self.hidden[obj.object_id] = "unreadable"
+                self.leave_out(UNREADABLE_TABLES)
+                self.warnings.append(f"The definition of {obj.label} cannot be read (hidden from this login, or a "
+                                     "default bound with sp_bindefault): the table is left out")
+            elif used := sorted(f"{schema}.{name}" for schema, name in table.user_types() & clr):
+                self.hidden[obj.object_id] = "unreadable"
+                self.leave_out(UNREADABLE_TABLES)
+                self.warnings.append(f"Not written, their definition needs what the dump leaves out: {obj.label} "
+                                     f"(needs CLR type {', '.join(used)})")
+        return parts
 
-    def _modules(self, picked: list[_Object], early: set[int], policies: list, triggers: list[int]) -> list[int]:
+    def _say_needing(self, needing: dict[int, str]) -> None:
+        """Review S1: what Graph.spread left out, counted and named (a table counts as one whose definition cannot be
+        read)."""
+        tables = [f"{self.label(i)} (needs {need})" for i, need in needing.items() if self.objects[i].type == "U"]
+        others = [f"{self.label(i)} (needs {need})" for i, need in needing.items() if self.objects[i].type != "U"]
+        self.said(UNREADABLE_TABLES, "their definition needs what the dump leaves out", tables)
+        self.said(NEEDING, "they need what the dump leaves out", others)
+
+    def _modules(self, picked: list[Object], early: set[int], policies: list, triggers: list[int]) -> list[int]:
         """The views, functions, synonyms and procedures written, in creation order: those chosen, the ones the tables
         call (S7), and the functions and synonyms the views, security policies, triggers and other modules written
-        call (a `tables` dump brings them too)."""
+        call (a `tables` dump brings them too). Never one the dump leaves out."""
         chosen: set[int] = set(early)
         for obj in picked:
+            if obj.object_id in self.hidden:
+                continue
             if obj.type == "V":
                 wanted = self.kinds.views or self.named
             elif obj.type == "SN":
                 wanted = self.kinds.views and not self.named
-            elif obj.type in _FUNCTIONS or obj.type == "P":
+            elif obj.type in FUNCTIONS or obj.type == "P":
                 wanted = self.kinds.routines and not self.named
             else:
                 continue
             if wanted:
                 chosen.add(obj.object_id)
-        chosen |= self._closure(chosen | {policy for policy, _ in policies} | set(triggers), _FUNCTIONS | {"SN"})
+        roots = chosen | {policy for policy, _ in policies} | set(triggers)
+        chosen |= self.graph.closure(roots, FUNCTIONS | {"SN"}, set(self.hidden))
         if not self.named:
-            for code, what in (("V", "views"), ("SN", "synonyms")):
-                self.leave_out(f"{what} (not chosen)", sum(obj.type == code and obj.object_id not in chosen
-                                                          for obj in picked))
-            self.leave_out("functions and procedures (not chosen)", sum(
-                (obj.type in _FUNCTIONS or obj.type == "P") and obj.object_id not in chosen for obj in picked))
+            def unchosen(kinds: frozenset[str]) -> int:
+                return sum(obj.type in kinds and obj.object_id not in chosen and obj.object_id not in self.hidden
+                           for obj in picked)
+            self.leave_out("views (not chosen)", unchosen(frozenset({"V"})))
+            self.leave_out("synonyms (not chosen)", unchosen(frozenset({"SN"})))
+            self.leave_out("functions and procedures (not chosen)", unchosen(FUNCTIONS | {"P"}))
         return [obj.object_id for obj in self.objects.values() if obj.object_id in chosen]
 
     def _module_order(self, modules: list[int]) -> list[int]:
         """Views, functions and synonyms by their dependencies (creation order otherwise), procedures after them."""
-        ordering = Ordering()
-        for module in modules:
-            ordering.depends[str(module)] = {str(use.referenced) for use in self.uses.get(module, ())}
-        first = [str(m) for m in modules if self.objects[m].type != "P"]
-        last = [str(m) for m in modules if self.objects[m].type == "P"]
-        return [int(key) for key in (*ordering.order(first), *ordering.order(last))]
+        return [*self.graph.order([m for m in modules if self.objects[m].type != "P"]),
+                *self.graph.order([m for m in modules if self.objects[m].type == "P"])]
 
-    def _sequences_of(self, tables: set[int]) -> list[_Object]:
+    def _sequences_of(self, tables: set[int]) -> list[Object]:
         """The sequences the tables' defaults use (always), and the others when chosen."""
         candidates = [obj for obj in self.objects.values() if obj.type == "SO"]
         chosen = not self.named and self.kinds.sequences
-        found = [obj for obj in candidates if chosen or self._used_by(tables, obj.object_id)]
+        used = set() if chosen else self.graph.used_by(tables)  # review S4: once, not per sequence
+        found = [obj for obj in candidates if chosen or obj.object_id in used]
         if not self.named and not chosen:
             self.leave_out("sequences (not chosen)", len(candidates) - len(found))
         return found
 
-    def _outside(self, tables: set[int], written: set[int]) -> None:
-        """What the tables, and the modules that bind what they read (views, inline and schema-bound functions,
-        security policies), need but the dump does not write: the restore fails without it (counted and named)."""
-        needed: list[str] = []
-        for referencing in sorted(tables | written, key=self.position.__getitem__):
-            obj = self.objects[referencing]
-            for use in self.uses.get(referencing, ()):
-                binds = use.binds or obj.type in ("U", "V", "IF", "SP")
-                if binds and not use.shipped and use.referenced not in written:
-                    needed.append(f"{obj.label} needs {use.label}")
-        if needed:
-            self.leave_out("objects the dump's tables, views and functions need (from other schemas, not chosen or "
-                           "left out)", len(needed))
-            self.warnings.append(f"Not in this dump, and needed where it is run: {_shown(needed)}")
-
-    def _table_parts(self, tables: list[_Object]):
-        """Each table's statements, columns, identity, size and what its DDL does not write: one batch each, per
-        ID_CHUNK tables in a `tables` dump. The counts need exactly the dumped tables: the scope's, but those left
-        out."""
+    def _table_details(self, tables: list[Object]):
+        """Each written table's columns, identity, size and what its DDL does not write: one batch each, per ID_CHUNK
+        tables in a `tables` dump. The counts need exactly the written tables: the scope's, but those left out."""
         named = {obj.object_id: (obj.schema, obj.name) for obj in tables}
         within = self.within("tables")
-        parts: dict[int, TableStatements] = table_statements_of(self.conn, named, within)
         found_columns = columns_of(self.conn, list(named), within)
         identities: dict[int, tuple[str, str]] = {}
         sizes: dict[int, tuple] = {}
@@ -568,18 +626,7 @@ class _Reader:
             for what, found in zip(_TABLE_COUNTED, counts, strict=False):
                 self.leave_out(what, int(found[0][0]))
             masked += int(counts[_MASKED][0][0])
-        return parts, found_columns, identities, sizes, masked
-
-    def _readable(self, obj: _Object, parts: TableStatements | None) -> bool:
-        if parts is None:  # dropped while the dump read the catalog
-            return False
-        self.leave_out("definitions hidden from this login (indexes, foreign keys, checks)", parts.hidden)
-        if parts.create is not None:
-            return True
-        self.leave_out("tables whose definition cannot be read")
-        self.warnings.append(f"The definition of {obj.label} cannot be read (hidden from this login, or a default bound "
-                             "with sp_bindefault): the table is left out")
-        return False
+        return found_columns, identities, sizes, masked
 
     def _types(self, type_rows: list[tuple], users: list[int]) -> dict[int, DumpObject]:
         """User types in user_type_id order (an alias type before the table types that use it): those chosen, and
@@ -593,7 +640,8 @@ class _Reader:
         scope = {int(row[0]): row for row in type_rows}
         if missing := [label for type_id, label in used.items() if type_id not in scope]:
             self.leave_out("types from schemas not in the dump", len(missing))
-            self.warnings.append(f"Types from schemas not in this dump, and needed where it is run: {_shown(missing)}")
+            self.warnings.append(f"Types from schemas not in this dump, and needed where it is run: "
+                                 f"{shown_names(missing)}")
         picked: dict[int, tuple[str, str]] = {}
         for type_id, schema, name, assembly in type_rows:
             if type_id not in used and (self.named or not self.kinds.types):
@@ -651,7 +699,7 @@ class _Reader:
         return DumpObject("schema", name, (f"IF SCHEMA_ID({literal(name)}) IS NULL EXEC({literal(create)})",)
                           if self.ddl else ())
 
-    def _sequences(self, sequences: list[_Object]) -> list[DumpObject]:
+    def _sequences(self, sequences: list[Object]) -> list[DumpObject]:
         texts = sequences_at_next_value(self.conn, {obj.object_id: (obj.schema, obj.name) for obj in sequences},
                                         self.within("sequences", self.kinds.sequences)) if self.ddl else {}
         found = []
@@ -665,26 +713,20 @@ class _Reader:
                     self.warnings.append(f"Sequence {obj.label} has given its last value: the one written gives it "
                                          "once more")
             found.append(DumpObject("sequence", obj.label, statements,
-                                    f"IF OBJECT_ID({literal(obj.qualified)}, N'SO') IS NOT NULL "
-                                    f"DROP SEQUENCE {obj.qualified}"))
+                                    _drop(obj.qualified, "SO", f"DROP SEQUENCE {obj.qualified}")))
         return found
 
-    def _tables_and_early(self, tables: list[_Object], early: list[int], parts: dict[int, TableStatements],
+    def _tables_and_early(self, tables: list[Object], early: list[int], parts: dict[int, TableStatements],
                           texts: dict[int, tuple]) -> list[DumpObject]:
-        """The tables and the functions they call, in one dependency order (creation order otherwise): a function
-        before the table whose column calls it, a schema-bound one after the table it reads."""
-        ordering = Ordering()
+        """The tables and what they call, in one dependency order (creation order otherwise): a function before the
+        table whose column calls it, a schema-bound one after the table and the view it reads."""
         keys = {obj.object_id for obj in tables} | set(early)
-        for key in keys:
-            ordering.depends[str(key)] = {str(use.referenced) for use in self.uses.get(key, ())
-                                          if use.referenced in keys}
         found = []
-        for key in ordering.order([str(i) for i in self.objects if i in keys]):
-            obj = self.objects[int(key)]
+        for key in self.graph.order([i for i in self.objects if i in keys]):
+            obj = self.objects[key]
             if obj.type == "U":
                 found.append(DumpObject("table", obj.label, (parts[obj.object_id].create,) if self.ddl else (),
-                                        f"IF OBJECT_ID({literal(obj.qualified)}, N'U') IS NOT NULL "
-                                        f"DROP TABLE {obj.qualified}"))
+                                        _drop(obj.qualified, "U", f"DROP TABLE {obj.qualified}")))
             elif (item := self._module(obj.object_id, texts)) is not None:
                 found.append(item)
         return found
@@ -692,7 +734,7 @@ class _Reader:
     def _module(self, object_id: int, texts: dict[int, tuple]) -> DumpObject | None:
         obj = self.objects[object_id]
         label, word = _MODULE_KINDS[obj.type]
-        drop = f"IF OBJECT_ID({literal(obj.qualified)}, N'{obj.type}') IS NOT NULL DROP {word} {obj.qualified}"
+        drop = _drop(obj.qualified, obj.type, f"DROP {word} {obj.qualified}")
         if obj.type == "SN":
             if self.ddl and object_id not in self.synonyms:  # dropped while the dump read the catalog
                 return None
@@ -700,11 +742,10 @@ class _Reader:
         statements = self._definition(obj, texts)
         if statements is None:
             return None
-        return DumpObject(label, obj.label, statements, drop)
+        return DumpObject(label, obj.label, (*statements, *self.view_indexes.get(object_id, ())), drop)
 
-    def _definition(self, obj: _Object, texts: dict[int, tuple],
-                    parent: _Object | None = None) -> tuple[str, ...] | None:
-        """The module's statements; None when its definition is hidden (counted)."""
+    def _definition(self, obj: Object, texts: dict[int, tuple], parent: Object | None = None) -> tuple[str, ...] | None:
+        """The module's statements; None when its definition went hidden after the catalog said it was readable."""
         definition, ansi_nulls, quoted_identifier = texts.get(obj.object_id, (None, True, True))
         if definition is None:
             self.leave_out(HIDDEN_MODULES)
@@ -718,11 +759,11 @@ class _Reader:
                                  "under the names it has now")
         return _module_statements(definition, ansi_nulls, quoted_identifier)
 
-    def _identity(self, obj: _Object, following: str, increment: str) -> DumpObject:
+    def _identity(self, obj: Object, following: str, increment: str) -> DumpObject:
         return DumpObject("identity value", obj.label,
                           (_reseed(obj.qualified, following, increment),) if self.ddl else (), section="data")
 
-    def _foreign_keys(self, tables: list[_Object], parts: dict[int, TableStatements]) -> list[DumpObject]:
+    def _foreign_keys(self, tables: list[Object], parts: dict[int, TableStatements]) -> list[DumpObject]:
         dumped = {(obj.schema, obj.name) for obj in tables}
         found = []
         for obj in tables:
@@ -733,17 +774,28 @@ class _Reader:
                                          "which is not in this dump")
                     self.leave_out("foreign keys to tables not in the dump")
                     continue
-                name = literal(f"{q(obj.schema)}.{q(key.name)}")
+                name = f"{q(obj.schema)}.{q(key.name)}"
                 found.append(DumpObject("foreign key", obj.label, key.statements if self.ddl else (),
-                                        f"IF OBJECT_ID({name}, N'F') IS NOT NULL "
-                                        f"ALTER TABLE {obj.qualified} DROP CONSTRAINT {q(key.name)}"))
+                                        _drop(name, "F", f"ALTER TABLE {obj.qualified} DROP CONSTRAINT {q(key.name)}")))
         return found
+
+    def _constraints(self, tables: list[Object], parts: dict[int, TableStatements]) -> list[DumpObject]:
+        """The checks the tables do not enforce or trust, and the defaults and checks whose function reads a table,
+        view or synonym: after the views and procedures, with every row in (review S1). Each has its DROP, which a
+        `drop_first` file runs before those of the functions it calls (3729 otherwise)."""
+        return [DumpObject(kind, obj.label, item.statements if self.ddl else (),
+                           _drop(f"{q(obj.schema)}.{q(item.name)}", code,
+                                 f"ALTER TABLE {obj.qualified} DROP CONSTRAINT {q(item.name)}"))
+                for obj in tables for kind, code, items in (("check constraint", "C", parts[obj.object_id].checks),
+                                                            ("default", "D", parts[obj.object_id].defaults))
+                for item in items]
 
     def _policies(self, tables: set[int]) -> list[tuple[int, list[tuple]]]:
         """Security policies (row-level security) whose predicates are all on dumped tables: written, with the
         functions they call; one on a dumped table and another is counted and named (in a schema or database dump,
         any other). A filter predicate also means the dump holds only the rows this login may see."""
-        candidates = [obj.object_id for obj in self.objects.values() if obj.type == "SP"]
+        candidates = [obj.object_id for obj in self.objects.values() if obj.type == "SP"
+                      and obj.object_id not in self.hidden]
         predicates = by_object([row for chunk in chunks(candidates) for row in rows(self.conn, _POLICIES.format(
             ids=chunk))])
         found = []
@@ -774,13 +826,13 @@ class _Reader:
                           f"WITH (STATE = {'ON' if enabled else 'OFF'}, SCHEMABINDING = {'ON' if schema_bound else 'OFF'})"
                           + (" NOT FOR REPLICATION" if not_for_replication else ""),)
         return DumpObject("security policy", obj.label, statements,
-                          f"IF OBJECT_ID({literal(obj.qualified)}, N'SP') IS NOT NULL "
-                          f"DROP SECURITY POLICY {obj.qualified}")
+                          _drop(obj.qualified, "SP", f"DROP SECURITY POLICY {obj.qualified}"))
 
     def _triggers_of(self, parents: set[int]) -> list[int]:
         """The triggers of the dumped tables and views (a view's: INSTEAD OF, pre-flight H6), in creation order. A
-        schema or database dump counts the others: those not chosen, and those of a table or view it leaves out."""
-        every = [obj for obj in self.objects.values() if obj.type == "TR"]
+        schema or database dump counts the others: those not chosen, and those of a table or view it leaves out
+        (one left out for itself is counted for that)."""
+        every = [obj for obj in self.objects.values() if obj.type == "TR" and obj.object_id not in self.hidden]
         found = [obj.object_id for obj in every if obj.parent in parents]
         if not self.named:
             self.leave_out("triggers of tables and views not in the dump", len(every) - len(found))
@@ -800,7 +852,8 @@ class _Reader:
                 orders.setdefault(int(object_id), []).append((event, first))
         found = []
         for trigger in triggers:
-            obj, parent = self.objects[trigger], self.objects[self.objects[trigger].parent]
+            obj = self.objects[trigger]
+            parent = self.objects[obj.parent]
             statements = self._definition(obj, texts, parent)
             if statements is None:
                 continue
@@ -813,12 +866,11 @@ class _Reader:
             found.append(DumpObject("trigger", obj.label, statements))
         return found
 
-    def _data(self, obj: _Object, columns: list[TableColumn], sizes: tuple | None, parts: TableStatements,
-              dumped: set[int]) -> DumpTable:
+    def _data(self, obj: Object, columns: list[TableColumn], sizes: tuple | None, parts: TableStatements,
+              by_name: dict[tuple[str, str], Object]) -> DumpTable:
         estimate, size = sizes if sizes is not None else (None, None)
-        by_name = {(self.objects[i].schema, self.objects[i].name): i for i in dumped}
-        references = {self.objects[by_name[key.references]].label for key in parts.foreign_keys
-                      if key.references in by_name and by_name[key.references] != obj.object_id}
+        references = {by_name[key.references].label for key in parts.foreign_keys
+                      if key.references in by_name and by_name[key.references].object_id != obj.object_id}
         return DumpTable(schema=obj.schema, table=obj.name, name=obj.label, columns=tuple(columns),
                          rows_estimate=int(estimate) if estimate is not None else None,
                          bytes_estimate=int(size) if size is not None else None, references=tuple(sorted(references)))
