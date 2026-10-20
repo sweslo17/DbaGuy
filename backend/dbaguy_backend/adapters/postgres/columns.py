@@ -16,22 +16,22 @@ from .loaders import category_for_type_name
 # the innermost type modifier a domain sets (a domain column's own atttypmod is -1). typtype 'c' is a composite type,
 # 'e' an enum; typcategory 'A' an array.
 _COLUMNS = """
-WITH RECURSIVE base (attnum, typname, typtype, typbasetype, typtypmod, typcategory, typmod) AS (
-    SELECT a.attnum, t.typname, t.typtype, t.typbasetype, t.typtypmod, t.typcategory, a.atttypmod
+WITH RECURSIVE base (attrelid, attnum, typname, typtype, typbasetype, typtypmod, typcategory, typmod) AS (
+    SELECT a.attrelid, a.attnum, t.typname, t.typtype, t.typbasetype, t.typtypmod, t.typcategory, a.atttypmod
     FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
-    WHERE a.attrelid = %(oid)s AND a.attnum > 0 AND NOT a.attisdropped
+    WHERE a.attrelid = ANY(%(oids)s) AND a.attnum > 0 AND NOT a.attisdropped
   UNION ALL
-    SELECT d.attnum, t.typname, t.typtype, t.typbasetype, t.typtypmod, t.typcategory,
+    SELECT d.attrelid, d.attnum, t.typname, t.typtype, t.typbasetype, t.typtypmod, t.typcategory,
            CASE WHEN d.typmod <> -1 THEN d.typmod ELSE d.typtypmod END
     FROM base d JOIN pg_type t ON t.oid = d.typbasetype
     WHERE d.typtype = 'd'
 )
-SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, a.atthasdef, a.attidentity::text,
-       a.attgenerated::text, b.typname::text, b.typtype::text, b.typcategory::text, b.typmod
+SELECT a.attrelid, a.attname::text, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, a.atthasdef,
+       a.attidentity::text, a.attgenerated::text, b.typname::text, b.typtype::text, b.typcategory::text, b.typmod
 FROM pg_attribute a
-JOIN base b ON b.attnum = a.attnum AND b.typtype <> 'd'
-WHERE a.attrelid = %(oid)s AND a.attnum > 0 AND NOT a.attisdropped
-ORDER BY a.attnum
+JOIN base b ON b.attrelid = a.attrelid AND b.attnum = a.attnum AND b.typtype <> 'd'
+WHERE a.attrelid = ANY(%(oids)s) AND a.attnum > 0 AND NOT a.attisdropped
+ORDER BY a.attrelid, a.attnum
 """
 _NOT_EXACT = frozenset({"float4", "float8"})  # loaded as Python floats: their text is not the server's
 # Compared with `=`, not ::text: bpchar, whose ::text drops the padding the loaded value has (`=` ignores it, A4); bytea,
@@ -93,8 +93,17 @@ def column(
     )
 
 
+def read_columns_of(conn: psycopg.Connection, oids: list[int]) -> dict[int, list[TableColumn]]:
+    """The columns of every relation in `oids`, in one query (a dump reads every table's)."""
+    found: dict[int, list[TableColumn]] = {oid: [] for oid in oids}
+    if oids:
+        for oid, *row in conn.execute(_COLUMNS, {"oids": list(oids)}):
+            found[oid].append(column(*row))
+    return found
+
+
 def read_columns(conn: psycopg.Connection, oid: int) -> list[TableColumn]:
-    return [column(*row) for row in conn.execute(_COLUMNS, {"oid": oid})]
+    return read_columns_of(conn, [oid])[oid]
 
 
 def table_columns(conn: psycopg.Connection, path: list[PathSegment]) -> list[TableColumn]:

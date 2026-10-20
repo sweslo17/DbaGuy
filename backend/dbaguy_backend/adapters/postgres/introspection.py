@@ -39,20 +39,25 @@ _TYPE_LABEL = {"e": "enum", "d": "domain", "c": "composite"}
 _HAS_FOLDERS = (NodeKind.TABLE, NodeKind.PARTITION, NodeKind.VIEW, NodeKind.MATERIALIZED_VIEW)
 _CAN_PARTITION = (NodeKind.TABLE, NodeKind.PARTITION)
 
-# The collation only when it is not the type's own (COLLATE "C" on a text column)
+# The collation only when it is not the type's own (COLLATE "C" on a text column); the storage only when it is not the
+# type's; the statistics target and the compression (14+) only when set
 _COLUMNS_SQL = """
-SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, pg_get_expr(d.adbin, d.adrelid),
+SELECT a.attrelid, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, pg_get_expr(d.adbin, d.adrelid),
        a.attidentity::text, a.attgenerated::text, col_description(a.attrelid, a.attnum),
        EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = a.attrelid AND i.indisprimary AND a.attnum = ANY (i.indkey)),
-       cn.nspname::text, co.collname::text
+       cn.nspname::text, co.collname::text,
+       CASE WHEN a.attstattarget >= 0 THEN a.attstattarget END,
+       CASE WHEN a.attstorage <> t.typstorage THEN a.attstorage::text END, {compression}
 FROM pg_attribute a
 LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
 LEFT JOIN pg_type t ON t.oid = a.atttypid
 LEFT JOIN pg_collation co ON co.oid = a.attcollation AND a.attcollation <> t.typcollation
 LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace
-WHERE a.attrelid = %(oid)s AND a.attnum > 0 AND NOT a.attisdropped
-ORDER BY a.attnum
+WHERE a.attrelid = ANY(%(oids)s) AND a.attnum > 0 AND NOT a.attisdropped
+ORDER BY a.attrelid, a.attnum
 """
+_STORAGE = {"p": "PLAIN", "e": "EXTERNAL", "m": "MAIN", "x": "EXTENDED"}
+_COMPRESSION = {"p": "pglz", "l": "lz4"}
 
 
 @dataclass(frozen=True)
@@ -66,6 +71,9 @@ class PgColumn:
     comment: str | None
     is_pk: bool
     collation: str | None = None  # qualified, when it is not the type's own
+    statistics: int | None = None  # SET STATISTICS, when set
+    storage: str | None = None  # SET STORAGE (PLAIN, EXTERNAL…), when it is not the type's
+    compression: str | None = None  # SET COMPRESSION (pglz, lz4), when set
 
     def info(self) -> ColumnInfo:
         return ColumnInfo(
@@ -89,9 +97,22 @@ def relation_oid(conn: psycopg.Connection, qname: str) -> int:
     return int(row[0])
 
 
+def columns_of(conn: psycopg.Connection, oids: list[int]) -> dict[int, list[PgColumn]]:
+    """The columns of every relation in `oids`, in one query (a dump reads thousands)."""
+    found: dict[int, list[PgColumn]] = {oid: [] for oid in oids}
+    if not oids:
+        return found
+    compression = "a.attcompression::text" if conn.info.server_version >= 140000 else "''"
+    for oid, *row in conn.execute(_COLUMNS_SQL.format(compression=compression), {"oids": list(oids)}):
+        collation = qualified_pg(row[8], row[9]) if row[9] is not None else None
+        found[oid].append(PgColumn(*row[:8], collation=collation, statistics=row[10],
+                                   storage=_STORAGE.get(row[11]) if row[11] else None,
+                                   compression=_COMPRESSION.get(row[12]) if row[12] else None))
+    return found
+
+
 def table_columns(conn: psycopg.Connection, oid: int) -> list[PgColumn]:
-    return [PgColumn(*row[:8], collation=qualified_pg(row[8], row[9]) if row[9] is not None else None)
-            for row in conn.execute(_COLUMNS_SQL, {"oid": oid})]
+    return columns_of(conn, [oid])[oid]
 
 
 def _folder(segment: PathSegment) -> Folder:
