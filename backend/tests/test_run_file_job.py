@@ -400,8 +400,9 @@ def test_a_transaction_the_file_leaves_open_is_rolled_back_and_said(env, sql_fil
     e = env()
     done = outcome(e.run(sql_file("rows 1;\ntx;\nrows 3;"), mode="statements"))
     assert (done.outcome, done.statements) == ("completed", 1) and e.conn.rollbacks == 1  # pre-flight H2
-    assert done.warnings == ["The file's transaction from line 2 (statement 2) was still open: it was rolled back, so "
-                             "the statements from there on are not applied; run again from statement 2"]
+    assert done.warnings == [  # 06b L9: a run again ends the same way unless the file is fixed
+        "The file ended with its transaction from line 2 (statement 2) still open (no COMMIT: is it cut short?): it was "
+        "rolled back, so the statements from there on are not applied"]
 
 
 def test_the_search_path_goes_first(env, sql_file):
@@ -526,8 +527,8 @@ def test_skipping_an_error_the_server_rolled_the_files_transaction_back_for(env,
     done = outcome(e.run(sql_file("tx;\nrows 2;\nfailend;\nrows 4;"), mode="statements", on_error="continue"))
     assert (done.outcome, done.statements, done.error_count) == ("completed", 1, 1)  # only `rows 4` is applied
     assert done.warnings == ["The file's transaction from line 1 (statement 1) ended when line 3 failed: the server "
-                             "rolled it back, so the statements from there on are not applied; run again from "
-                             "statement 1"]
+                             "rolled it back, so lines 1–3 are not applied; the statements after it ran on their own, "
+                             "outside a transaction"]  # 06b H1: running again from statement 1 would repeat `rows 4`
 
 
 def test_a_lost_link_inside_the_files_transaction_says_what_the_server_undid(env, sql_file):  # H2
@@ -787,3 +788,78 @@ def test_a_deadlock_victim_whose_table_cannot_roll_back_is_unknown(env, sql_file
         "Some tables cannot roll back (non-transactional): their changes stayed"])
     plain = env(dialect=Dialect.MYSQL)
     assert outcome(plain.run(sql_file("rows 1;\ndeadlock;"))).outcome == "rolled_back"
+
+
+@pytest.mark.parametrize(("text", "fields", "dialect", "expected"), [
+    ("rows 1;\nfail boom;\nrows 3;", {}, Dialect.SQLITE, ("stopped", (2, 2))),
+    ("rows 1;\ntx;\nrows 3;\nfail boom;\nrows 5;", {}, Dialect.SQLITE, ("stopped", (2, 2))),  # its transaction undone
+    ("rows 1;\ntx;\nrows 3;", {}, Dialect.SQLITE, ("completed", (2, 2))),  # left open: rolled back at the end
+    # pre-flight H1: `rows 4` took effect after the server rolled the file's transaction back
+    ("tx;\nrows 2;\nfailend;\nrows 4;", {"on_error": "continue"}, Dialect.SQLITE, ("completed", None)),
+    ("tx;\nrows 2;\nfailend;", {"on_error": "continue"}, Dialect.SQLITE, ("completed", (1, 1))),  # nothing after it
+    ("tx;\nrows 2;\ndeadlock;\nrows 4;\nCOMMIT;\nrows 6;", {"on_error": "continue"}, Dialect.MYSQL,
+     ("completed", None)),
+    ("tx;\nrows 2;\ndeadlock;\nrows 4;\nfail x;", {}, Dialect.MYSQL, ("stopped", (1, 1))),  # stopped at the deadlock
+    ("tx;\nrows 2;\nCALL p();\nrows 4;\ndeadlock;", {}, Dialect.MYSQL, ("unknown", None)),  # N1, then a deadlock
+    ("tx;\nrows 2;\nCALL p();\ndeadlock;", {"on_error": "continue"}, Dialect.MYSQL, ("unknown", None)),
+    ("tx;\nrows 2;\nfail boom;\nrows 4;\nCOMMIT;", {"on_error": "continue"}, Dialect.SQLITE, ("stopped", (1, 1))),
+    ("rows 1;\nlost;\nrows 3;", {"on_error": "continue"}, Dialect.SQLITE, ("unknown", (2, 2))),
+    ("rows 1;\ntx;\nrows 3;\nlost;", {}, Dialect.SQLITE, ("unknown", (2, 2))),  # the server undid its transaction
+    ("rows 1;\nfail boom;\nrows 3;\nfail again;", {"on_error": "continue"}, Dialect.SQLITE, ("completed", None)),
+    ("tx;\nrows 2;\nCALL p();\nrows 4;\nfail boom;", {}, Dialect.MYSQL, ("unknown", None)),  # N1: not known
+    ("rows 1\nrows 2\nGO\n", {}, Dialect.TSQL, ("stopped", None)),  # a batch that may have applied part of it
+    ("rows 1;\nfail boom;", {"mode": "all_or_nothing"}, Dialect.SQLITE, ("rolled_back", None)),
+    ("rows 1;", {"from_statement": 5}, Dialect.SQLITE, ("completed", None)),
+])
+def test_resume_at_is_where_a_run_again_starts_without_skipping_anything(env, sql_file, text, fields, dialect,
+                                                                         expected):  # 06b B1
+    acts = {"rows 1\nrows 2": "fail"} if dialect is Dialect.TSQL else None
+    e = env(dialect=dialect, acts=acts)
+    done = outcome(e.run(sql_file(text), **{"mode": "statements", **fields}))
+    at = (done.resume_at.line, done.resume_at.statement) if done.resume_at is not None else None
+    assert (done.outcome, at) == expected
+
+
+def test_a_go_n_that_failed_midway_has_no_resume_point(env, sql_file):  # 06b B1, pre-flight H1
+    e = env(dialect=Dialect.TSQL, acts={"INSERT INTO t DEFAULT VALUES": "again"})
+    done = outcome(e.run(sql_file("INSERT INTO a VALUES (1)\nGO\nINSERT INTO t DEFAULT VALUES\nGO 3\n"),
+                         mode="statements"))
+    assert (done.outcome, done.stopped_at.statement, done.resume_at) == ("stopped", 2, None)
+
+
+def test_a_transaction_begun_inside_a_statement_that_the_server_rolled_back_has_no_resume_point(env, sql_file):
+    e = env(dialect=Dialect.MYSQL, acts={"CALL p()": "tx"})  # N2: a procedure doing work, then START TRANSACTION
+    done = outcome(e.run(sql_file("CALL p();\nrows 2;\ndeadlock;"), mode="statements"))  # 06b B1
+    assert (done.outcome, done.statements, done.resume_at) == ("stopped", 1, None)
+    assert done.warnings == [
+        "The file's transaction from line 1 (statement 1) ended when line 3 failed: the server rolled it back, so the "
+        "statements after it are not applied",
+        "Line 1 runs several statements and began the transaction inside them: what it did before that may be applied"]
+
+
+class StateUnreadable(RunFake):
+    """The transaction's state cannot be read once `rows 2` ran (SQL Server reads it with a round trip)."""
+
+    def in_transaction(self) -> bool:
+        if "rows 2" in self.runs:
+            raise StatementError("the state could not be read", code="08S01")
+        return super().in_transaction()
+
+
+def test_a_stop_whose_transaction_state_cannot_be_read_has_no_resume_point(env, sql_file):  # 06b B1
+    def gate(sql: str) -> GuardDecision:
+        action = GuardAction.BLOCK if sql == "rows 3" else GuardAction.RUN
+        return GuardDecision(action=action, classification=Classification(kind=StatementKind.WRITE))
+
+    e = env(StateUnreadable(), gate=gate)  # rolled back at the stop: whether that undid `tx` and `rows 2` is not known
+    done = outcome(e.run(sql_file("tx;\nrows 2;\nrows 3;"), mode="statements"))
+    assert (done.outcome, done.stopped_at.statement, done.resume_at, e.conn.rollbacks) == ("stopped", 3, None, 1)
+
+
+def test_a_cancelled_run_resumes_at_the_statement_it_did_not_finish(env, sql_file):  # 06b B1
+    e = env()
+    e.submit(sql_file("rows 1;\nblock;\nrows 3;"), mode="statements")
+    assert e.conn.blocked.wait(5)
+    e.worker.cancel("r")
+    done = outcome(request_events(e.recorder, "r"))
+    assert (done.outcome, done.cancelled, done.resume_at.statement, done.resume_at.line) == ("stopped", True, 2, 2)

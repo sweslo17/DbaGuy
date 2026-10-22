@@ -154,6 +154,12 @@ export type DumpObjectKinds = S["DumpObjectKinds"];
 export type DumpPlan = S["DumpPlan"];
 /** Dump plan: one object the dump writes under its own name (a table with its rows estimate). */
 export type DumpPlanObject = S["DumpPlanObject"];
+/** Dump plan request (POST /data/dump/plan): the dump command's fields, and the profile and database to read. */
+export type DumpPlanRequest = S["DumpPlanRequest"];
+/** Data tools: where a run stopped, or where a run again starts (`resume_at`, 06b B1): a line and a statement number. */
+export type StoppedAt = S["StoppedAt"];
+/** Run SQL file (06b B2): a file's lines around one line, for the error list. */
+export type FileExcerpt = S["FileExcerpt"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

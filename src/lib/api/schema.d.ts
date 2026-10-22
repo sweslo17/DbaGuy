@@ -542,6 +542,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/data/run-file/excerpt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run File Excerpt
+         * @description Run SQL file's error list: the file's lines around one line (06b B2). 404 `file_not_found` for no file.
+         */
+        post: operations["run_file_excerpt_data_run_file_excerpt_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/data/jobs": {
         parameters: {
             query?: never;
@@ -1939,6 +1959,23 @@ export interface components {
             fields: components["schemas"]["FieldPath"][];
         };
         /**
+         * FileExcerpt
+         * @description Lines of a file around one line (POST /data/run-file/excerpt): where an error of Run SQL file is, for its dialog
+         *     (06b B2). Lines are counted at LF, as a run counts them; text that is not UTF-8 is shown replaced.
+         */
+        FileExcerpt: {
+            /** Path */
+            path: string;
+            /** First Line */
+            first_line: number;
+            /** Text */
+            text: string;
+            /** Found */
+            found: boolean;
+            /** Truncated */
+            truncated: boolean;
+        };
+        /**
          * FileInspection
          * @description What Run SQL file's dialog shows of a file before it runs (POST /data/run-file/inspect).
          */
@@ -2286,6 +2323,7 @@ export interface components {
              */
             error_count: number;
             stopped_at?: components["schemas"]["StoppedAt"] | null;
+            resume_at?: components["schemas"]["StoppedAt"] | null;
             error?: components["schemas"]["JobError"] | null;
             /**
              * Warnings
@@ -2800,6 +2838,13 @@ export interface components {
             /** Search Path */
             search_path?: string | null;
             query_context?: components["schemas"]["QueryContext"] | null;
+        };
+        /** RunFileExcerptRequest */
+        RunFileExcerptRequest: {
+            /** Path */
+            path: string;
+            /** Line */
+            line: number;
         };
         /** RunFileInspectRequest */
         RunFileInspectRequest: {
@@ -3411,7 +3456,8 @@ export interface components {
         };
         /**
          * StoppedAt
-         * @description Where a run stopped: the statement that failed, was cancelled or was not sent.
+         * @description A place in a run's file: where it stopped (the statement that failed, was cancelled or was not sent), or where a
+         *     run again starts (`resume_at`, 06b B1).
          */
         StoppedAt: {
             /** Line */
@@ -4574,6 +4620,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["FileInspection"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    run_file_excerpt_data_run_file_excerpt_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RunFileExcerptRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FileExcerpt"];
                 };
             };
             /** @description Validation Error */

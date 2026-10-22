@@ -159,3 +159,60 @@ def test_an_engine_without_the_tool_is_refused(tmp_path):  # pre-flight L4: §4'
     path.write_text("SELECT 1;\n")
     with pytest.raises(NotSupported, match="^SQLite connections cannot run SQL files$"):
         container.data.inspect(profile(container, tmp_path), str(path))
+
+
+def test_an_excerpt_shows_the_lines_around_one_line(container, tmp_path):  # 06b B2
+    path = tmp_path / "e.sql"
+    path.write_text("".join(f"SELECT {n};\n" for n in range(1, 101)))
+    found = container.data.excerpt(str(path), 50)
+    assert (found.first_line, found.found, found.truncated) == (30, True, True)
+    assert found.text.splitlines()[0] == "SELECT 30;" and found.text.splitlines()[20] == "SELECT 50;"
+    assert len(found.text.splitlines()) == 60
+    start = container.data.excerpt(str(path), 3)
+    assert (start.first_line, start.text.splitlines()[0]) == (1, "SELECT 1;")
+    end = container.data.excerpt(str(path), 100)
+    assert (end.first_line, end.found, end.truncated, end.text.splitlines()[-1]) == (80, True, False, "SELECT 100;")
+    beyond = container.data.excerpt(str(path), 101)
+    assert (beyond.found, beyond.text.splitlines()[-1]) == (False, "SELECT 100;")
+    far = container.data.excerpt(str(path), 500)
+    assert (far.found, far.text) == (False, "")
+
+
+def test_an_excerpt_always_shows_its_line_after_long_lines(container, tmp_path):  # 06b B2, pre-flight M1
+    path = tmp_path / "m.sql"
+    path.write_text("\n".join(f"INSERT INTO t VALUES {','.join(['(1)'] * 25_000)};" for _ in range(30)) + "\n")
+    got = container.data.excerpt(str(path), 25)
+    assert (got.first_line, got.found, got.truncated) == (25, True, True) and got.text.startswith("INSERT")
+    assert container.data.excerpt(str(path), 31).found is False
+    short = tmp_path / "s.sql"  # a file that ends inside the window has fewer lines: its tail, never a read again
+    short.write_text("".join(f"SELECT {n};\n" for n in range(1, 101)))
+    tail = container.data.excerpt(str(short), 110)
+    assert (tail.first_line, tail.found, tail.text.splitlines()[-1]) == (90, False, "SELECT 100;")
+
+
+def test_an_excerpt_takes_any_bytes_and_stops_at_its_size(container, tmp_path):  # 06b B2
+    path = tmp_path / "b.sql"
+    path.write_bytes(b"\xef\xbb\xbfSELECT 1;\nSELECT '\xff';\n" + b"x" * 100_000 + b"\nSELECT 3;\n")
+    found = container.data.excerpt(str(path), 2)
+    assert found.text.startswith("SELECT 1;\nSELECT '�';\nxxx") and found.truncated
+    assert len(found.text.encode()) <= 64 * 1024 + 2  # the replacement character is longer than the byte it replaces
+    with pytest.raises(FileNotFound):
+        container.data.excerpt(str(tmp_path / "missing.sql"), 1)
+    with pytest.raises(FileNotFound):
+        container.data.excerpt("relative.sql", 1)
+
+
+def test_the_excerpt_route(container, tmp_path):  # 06b B2
+    path = tmp_path / "r.sql"
+    path.write_text("SELECT 1;\n")
+    auth = {"Authorization": "Bearer t"}
+    with TestClient(create_app(container.settings, container), base_url="http://127.0.0.1") as client:
+        answer = client.post("/data/run-file/excerpt", json={"path": str(path), "line": 1}, headers=auth)
+        assert (answer.status_code, answer.json()["text"], answer.json()["found"]) == (200, "SELECT 1;", True)
+        missing = client.post("/data/run-file/excerpt", json={"path": str(tmp_path / "no.sql"), "line": 1},
+                              headers=auth)
+        assert (missing.status_code, missing.json()["error"]["code"]) == (404, "file_not_found")
+        zero = client.post("/data/run-file/excerpt", json={"path": str(path), "line": 0}, headers=auth)
+        assert zero.status_code == 422
+        huge = client.post("/data/run-file/excerpt", json={"path": str(path), "line": 2**31}, headers=auth)
+        assert huge.status_code == 422  # pre-flight L2: bounded

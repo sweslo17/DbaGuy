@@ -57,7 +57,8 @@ class JobError(BaseModel):
 
 
 class StoppedAt(BaseModel):
-    """Where a run stopped: the statement that failed, was cancelled or was not sent."""
+    """A place in a run's file: where it stopped (the statement that failed, was cancelled or was not sent), or where a
+    run again starts (`resume_at`, 06b B1)."""
 
     line: int
     statement: int
@@ -102,6 +103,12 @@ class JobOutcomeEvent(BaseModel):
     errors: list[JobError] = []  # the first MAX_JOB_ERRORS
     error_count: int = 0
     stopped_at: StoppedAt | None = None
+    # Run SQL file, statement by statement: where a run again starts so that nothing is skipped or run twice — every
+    # statement before it took effect (or failed and was skipped, in `errors`) and none from it on did. The earliest
+    # statement of a file transaction that was rolled back, else where the run stopped (06b B1). None: all or nothing,
+    # read to the end with nothing undone, or what the earlier statements did is not known (the warnings say which; a
+    # statement applied after a file transaction the run rolled back, a `GO n` that stopped after some of its runs)
+    resume_at: StoppedAt | None = None
     # Why it stopped or failed: the `error` event sent right before it, with where the run stopped when it did, so a
     # window that attaches later or lists the jobs (GET /data/jobs) knows it too (06a fix wave F3). None: no error
     error: JobError | None = None
@@ -148,6 +155,17 @@ class FileInspection(BaseModel):
     preview: str  # its first PREVIEW_LINES lines, at most PREVIEW_BYTES
     preview_truncated: bool
     warnings: list[str] = []
+
+
+class FileExcerpt(BaseModel):
+    """Lines of a file around one line (POST /data/run-file/excerpt): where an error of Run SQL file is, for its dialog
+    (06b B2). Lines are counted at LF, as a run counts them; text that is not UTF-8 is shown replaced."""
+
+    path: str
+    first_line: int  # the line `text` starts at
+    text: str  # at most EXCERPT_LINES lines and EXCERPT_BYTES, from first_line on
+    found: bool  # the line asked for is in the file
+    truncated: bool  # the file goes on after `text`
 
 
 MAX_DUMP_NAMES = 500  # relations one `tables` scope may name

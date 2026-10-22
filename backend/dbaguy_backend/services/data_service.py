@@ -1,14 +1,17 @@
 """Data tools' previews (spec ⑥ §3.2): what a dialog shows before a job starts, and Show in Finder for what a dump
 wrote. No job runs here. Run SQL file's inspection opens no connection at all (a read-only profile is refused first,
-R-06-6); a dump's plan reads the catalog on the metadata connection, without definitions (a read-only profile may dump).
+R-06-6), nor does the excerpt of an error's lines (no profile: it shows a file a run already read, 06b B2); a dump's
+plan reads the catalog on the metadata connection, without definitions (a read-only profile may dump).
 
-Logs: INFO the profile and the path of each inspection, plan and reveal; never the file's contents."""
+Logs: INFO the profile and the path of each inspection, plan and reveal, the path and line of an excerpt; never the
+file's contents."""
 
 import re
 import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
+from typing import BinaryIO
 from uuid import UUID
 
 from loguru import logger
@@ -20,7 +23,7 @@ from ..adapters.dump import DumpCatalog
 from ..adapters.registry import AdapterRegistry
 from ..domain.data_jobs import (
     BE_DUMPED, ENGINE_NAMES, RUN_SQL_FILES, DumpContent, DumpHeader, DumpObjectKinds, DumpPlan, DumpPlanObject,
-    DumpScope, FileInspection, cannot, cannot_read,
+    DumpScope, FileExcerpt, FileInspection, cannot, cannot_read,
 )
 from ..domain.errors import FileNotFound, NotFound, NotSupported, QueryFailed, ReadOnlyProfile, StorageError
 from ..domain.profiles import AnyProfile, Engine, SqliteProfile
@@ -34,6 +37,11 @@ from .profile_service import ProfileService
 
 PREVIEW_LINES = 200  # spec §3.2: the first lines of a file Run SQL file shows
 PREVIEW_BYTES = 64 * 1024
+EXCERPT_BEFORE = 20  # lines shown before the one asked for (06b B2)
+EXCERPT_LINES = 60
+EXCERPT_BYTES = 64 * 1024
+_READ_CHUNK = 1 << 20
+_UTF8_BOM = b"\xef\xbb\xbf"
 LOW_DISK_BYTES = 1 << 30  # CR-4: below this much free space a dump's plan warns, whatever its estimate
 _GIB = 1 << 30
 _COPY_FROM_STDIN = re.compile(r"COPY\s.*\sFROM\s+stdin", re.IGNORECASE)
@@ -159,6 +167,70 @@ class DataService:
             raise NotFound(f"{path} is not a file a dump of this run wrote")
         logger.info("Showing {} in Finder", target)
         self._reveal(target)
+
+    def excerpt(self, path: str, line: int) -> FileExcerpt:
+        """The lines of the file at `path` around `line` (06b B2): from EXCERPT_BEFORE lines before it, or from the
+        line itself when those lines fill EXCERPT_BYTES (long INSERT lines: the line asked for is always shown,
+        pre-flight M1), at most EXCERPT_LINES lines and EXCERPT_BYTES. No connection: what Run SQL file's dialog shows
+        of an error's place."""
+        target = Path(path).expanduser()
+        if not target.is_absolute() or not target.is_file():
+            raise FileNotFound(path)
+        first = max(1, line - EXCERPT_BEFORE)
+        try:
+            with target.open("rb") as file:
+                body = self._from_line(file, first)
+                # the window is full and the line asked for does not start inside it (a file that ends inside it has
+                # fewer lines: its tail is shown)
+                if body is not None and len(body) > EXCERPT_BYTES \
+                        and body.count(b"\n", 0, EXCERPT_BYTES - 1) < line - first:
+                    first = line  # the lines before it fill EXCERPT_BYTES (long INSERT lines): start at the line itself
+                    file.seek(0)
+                    body = self._from_line(file, first)
+        except OSError as exc:
+            raise StorageError(cannot_read(path, exc)) from None
+        if body is None:  # the file has fewer lines
+            return FileExcerpt(path=str(target), first_line=first, text="", found=False, truncated=False)
+        more = len(body) > EXCERPT_BYTES
+        body = body[:EXCERPT_BYTES]
+        if first == 1 and body.startswith(_UTF8_BOM):
+            body = body[len(_UTF8_BOM):]
+        lines = body.split(b"\n")
+        if not more and lines[-1] == b"":
+            lines.pop()  # after the file's last line end: no line
+        shown, truncated = (lines[:EXCERPT_LINES], True) if len(lines) > EXCERPT_LINES else (lines, more)
+        logger.info("Excerpt of {} at line {:,}", target, line)
+        return FileExcerpt(path=str(target), first_line=first, text=b"\n".join(shown).decode("utf-8", "replace"),
+                           found=line - first < len(lines), truncated=truncated)
+
+    def _from_line(self, file: BinaryIO, line: int) -> bytes | None:
+        """EXCERPT_BYTES + 1 bytes from the start of `line` on; None when the file has fewer lines before it."""
+        head, skipped = self._skip_lines(file, line - 1)
+        if skipped < line - 1:
+            return None
+        body = head[:EXCERPT_BYTES + 1]
+        if len(body) <= EXCERPT_BYTES:
+            body += file.read(EXCERPT_BYTES + 1 - len(body))
+        return body
+
+    @staticmethod
+    def _skip_lines(file: BinaryIO, count: int) -> tuple[bytes, int]:
+        """Read past `count` line ends: what was read after the last of them, and how many there were (fewer: the file
+        ended first)."""
+        seen = 0
+        while seen < count:
+            chunk = file.read(_READ_CHUNK)
+            if not chunk:
+                return b"", seen
+            ends = chunk.count(b"\n")
+            if seen + ends < count:
+                seen += ends
+                continue
+            at = -1
+            for _ in range(count - seen):
+                at = chunk.index(b"\n", at + 1)
+            return chunk[at + 1:], count
+        return b"", seen
 
     def inspect(self, profile_id: UUID, path: str) -> FileInspection:
         """Run SQL file's look at a file before it runs: its size, its first lines, a DbaGuy dump's header, and what

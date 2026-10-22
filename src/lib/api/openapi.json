@@ -1953,6 +1953,66 @@
         }
       }
     },
+    "/data/run-file/excerpt": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Run File Excerpt",
+        "description": "Run SQL file's error list: the file's lines around one line (06b B2). 404 `file_not_found` for no file.",
+        "operationId": "run_file_excerpt_data_run_file_excerpt_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunFileExcerptRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileExcerpt"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/data/jobs": {
       "get": {
         "tags": [
@@ -5800,6 +5860,40 @@
         "title": "FieldSample",
         "description": "A manual sample of a keyspace (R-04-11): the field paths derived in Python from the documents read."
       },
+      "FileExcerpt": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "first_line": {
+            "type": "integer",
+            "title": "First Line"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "found": {
+            "type": "boolean",
+            "title": "Found"
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "first_line",
+          "text",
+          "found",
+          "truncated"
+        ],
+        "title": "FileExcerpt",
+        "description": "Lines of a file around one line (POST /data/run-file/excerpt): where an error of Run SQL file is, for its dialog\n(06b B2). Lines are counted at LF, as a run counts them; text that is not UTF-8 is shown replaced."
+      },
       "FileInspection": {
         "properties": {
           "path": {
@@ -6625,6 +6719,16 @@
             "default": 0
           },
           "stopped_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StoppedAt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resume_at": {
             "anyOf": [
               {
                 "$ref": "#/components/schemas/StoppedAt"
@@ -7981,6 +8085,29 @@
         ],
         "title": "RunFileCommand",
         "description": "Run a SQL file on this session, a statement at a time (spec \u2465 \u00a73.4): all of it in one transaction, or each\nstatement on its own (stopping at an error, or skipping it). Statements before `from_statement` are read, never\nsent."
+      },
+      "RunFileExcerptRequest": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path"
+          },
+          "line": {
+            "type": "integer",
+            "maximum": 2147483647.0,
+            "minimum": 1.0,
+            "title": "Line"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "path",
+          "line"
+        ],
+        "title": "RunFileExcerptRequest"
       },
       "RunFileInspectRequest": {
         "properties": {
@@ -9400,7 +9527,7 @@
           "statement"
         ],
         "title": "StoppedAt",
-        "description": "Where a run stopped: the statement that failed, was cancelled or was not sent."
+        "description": "A place in a run's file: where it stopped (the statement that failed, was cancelled or was not sent), or where a\nrun again starts (`resume_at`, 06b B1)."
       },
       "TextSelection": {
         "properties": {

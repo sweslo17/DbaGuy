@@ -9,8 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..container import AppContainer
 from ..domain.data_jobs import (
-    DUMP_FILTER_LENGTH, FILTER_ONE_TABLE, DumpContent, DumpObjectKinds, DumpPlan, DumpScope, FileInspection, JobInfo,
-    filter_fits,
+    DUMP_FILTER_LENGTH, FILTER_ONE_TABLE, DumpContent, DumpObjectKinds, DumpPlan, DumpScope, FileExcerpt,
+    FileInspection, JobInfo, filter_fits,
 )
 from ..domain.errors import NotFound
 from .deps import get_container, require_token
@@ -30,6 +30,13 @@ class RunFileInspectRequest(BaseModel):
 
     profile_id: UUID  # the connection the file would run on
     path: str = Field(min_length=1, max_length=4096)
+
+
+class RunFileExcerptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=4096)
+    line: int = Field(ge=1, le=2**31 - 1)  # pre-flight L2: bounded
 
 
 class DumpPlanRequest(BaseModel):
@@ -77,6 +84,12 @@ def reveal(body: RevealRequest, container: AppContainer = Depends(get_container)
 def inspect_run_file(body: RunFileInspectRequest, container: AppContainer = Depends(get_container)) -> FileInspection:
     """Run SQL file's dialog: the file's size, first lines and warnings. A read-only connection is refused (403)."""
     return container.data.inspect(body.profile_id, body.path)
+
+
+@router.post("/run-file/excerpt", response_model=FileExcerpt)
+def run_file_excerpt(body: RunFileExcerptRequest, container: AppContainer = Depends(get_container)) -> FileExcerpt:
+    """Run SQL file's error list: the file's lines around one line (06b B2). 404 `file_not_found` for no file."""
+    return container.data.excerpt(body.path, body.line)
 
 
 @router.get("/jobs", response_model=list[JobInfo])
