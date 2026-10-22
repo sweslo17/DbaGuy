@@ -1,9 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
 import { listJobs } from "@/features/data-tools/jobsApi";
-import { onQuitRequested, onWindowCloseRequested, quitApp } from "@/lib/native";
-import { quitQuestion, runningNow, type QuitHow, type QuitQuestion } from "./quitQuestion";
+import { onQuitRequested, onWindowCloseRequested, quitApp, revealWindow } from "@/lib/native";
+import { quitDecider, runningNow, type QuitQuestion } from "./quitQuestion";
 
 /** How long ⌘Q and closing the window wait for the backend's list (its address included): then nothing runs. */
 const LIST_TIMEOUT_MS = 1_000;
@@ -14,20 +14,25 @@ const LIST_TIMEOUT_MS = 1_000;
  */
 export function QuitGuard() {
   const [asking, setAsking] = useState<{ question: QuitQuestion; answer: (quit: boolean) => void } | null>(null);
-  /** The decision being made: a second ⌘Q or close while it is asked waits for the same answer. */
-  const pending = useRef<Promise<boolean> | null>(null);
   useEffect(() => {
-    const decide = (how: QuitHow): Promise<boolean> => {
-      pending.current ??= (async () => {
-        const question = quitQuestion(await runningNow(() => listJobs(LIST_TIMEOUT_MS), LIST_TIMEOUT_MS), how);
-        if (!question) return true;
-        return new Promise<boolean>((resolve) => setAsking({ question, answer: resolve }));
-      })().finally(() => {
-        pending.current = null;
-        setAsking(null);
-      });
-      return pending.current;
-    };
+    const decide = quitDecider(
+      () => runningNow(() => listJobs(LIST_TIMEOUT_MS), LIST_TIMEOUT_MS),
+      (question) => {
+        // Only when it asks: a ⌘Q with no job quits without unminimizing the window first (06b review K1).
+        revealWindow().catch((error: unknown) =>
+          console.warn("Quit: the window could not be brought to the front", error),
+        );
+        return new Promise<boolean>((resolve) =>
+          setAsking({
+            question,
+            answer: (quit) => {
+              setAsking(null);
+              resolve(quit);
+            },
+          }),
+        );
+      },
+    );
     const stopQuit = onQuitRequested(() => {
       void decide("quit").then((quit) => {
         if (quit) void quitApp();

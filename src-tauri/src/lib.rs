@@ -69,8 +69,10 @@ pub fn run() {
             backend_info,
             restart_backend,
             quit::quit_ack,
+            quit::close_ack,
             quit::quit_app,
-            quit::close_window
+            quit::close_window,
+            quit::reveal_window
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

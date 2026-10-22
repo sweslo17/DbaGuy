@@ -56,9 +56,18 @@ export async function quitApp(): Promise<void> {
 export async function onWindowCloseRequested(allow: () => Promise<boolean>): Promise<() => void> {
   if (!isTauriRuntime()) return () => undefined;
   return listen<number>(CLOSE_REQUESTED, async (event) => {
-    void invoke("quit_ack", { id: event.payload });
+    void invoke("close_ack", { id: event.payload });
     if (await allow()) await invoke("close_window");
   });
+}
+
+/**
+ * Brings this window to the front (unminimized, shown, focused), for a question it is about to ask: a question in a
+ * minimized window is never seen. App only: a no-op in browser mode.
+ */
+export async function revealWindow(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await invoke("reveal_window");
 }
 
 /** A folder picked in the native dialog (app only: null in browser mode or when cancelled). */

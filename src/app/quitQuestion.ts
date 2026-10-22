@@ -1,8 +1,8 @@
 /*
  * What quitting asks while data-tools jobs run (spec ⑥ R-06-15, CR-5, A12): ⌘Q, the menu's Quit and closing the window
  * (which quits the app) stop every job, because the backend goes with the app. Only jobs ask (CR-5): the other close
- * guards stay a 02c carry. Pure (the list of jobs is passed in). Not `quitGuard.ts`: beside `QuitGuard.tsx` the two
- * names are one file on the Mac's case-insensitive disk (06b pre-flight H2).
+ * guards stay a 02c carry. Pure (the list of jobs and the way to ask are passed in). Not `quitGuard.ts`: beside
+ * `QuitGuard.tsx` the two names are one file on the Mac's case-insensitive disk (06b pre-flight H2).
  */
 
 export type QuitHow = "quit" | "close";
@@ -32,11 +32,12 @@ export function quitQuestion(running: readonly RunningJob[], how: QuitHow): Quit
   const them = n === 1 ? "it" : "them";
   return {
     title: how === "quit" ? "Quit DbaGuy?" : "Close the window?",
-    // A stopped run statement by statement keeps what took effect, but not a transaction the file opened and had not
-    // committed: the server rolls it back (06b pre-flight M5).
+    // A run in one transaction is rolled back (not "applies nothing": MySQL's non-transactional tables keep their
+    // changes, and the run reports unknown; 06b review). A stopped run statement by statement keeps what took effect,
+    // but not a transaction the file opened and had not committed: the server rolls it back (06b pre-flight M5).
     message:
       `${subject} still running: ${names.join("; ")}${more}. ${act} stops ${them}: a dump writes no file, a run in ` +
-      "one transaction applies nothing, and a run statement by statement keeps what took effect (a transaction the " +
+      "one transaction is rolled back, and a run statement by statement keeps what took effect (a transaction the " +
       "file opened and did not commit is rolled back).",
     keep: "Keep running",
     confirm: how === "quit" ? "Quit anyway" : "Close anyway",
@@ -63,4 +64,26 @@ export async function runningNow(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Decides a Quit or a window's close: `list` gives the jobs running now (`runningNow`, already bounded), and `ask`
+ * puts the question to the user only when there is one (it brings the window to the front first). No job: allowed
+ * at once, nothing asked. A second request while one is being decided (⌘Q twice, ⌘Q during a close's question) gets
+ * the same answer; once it is settled, the next request decides again.
+ */
+export function quitDecider(
+  list: () => Promise<readonly RunningJob[]>,
+  ask: (question: QuitQuestion) => Promise<boolean>,
+): (how: QuitHow) => Promise<boolean> {
+  let pending: Promise<boolean> | null = null;
+  return (how) => {
+    pending ??= (async () => {
+      const question = quitQuestion(await list(), how);
+      return question ? ask(question) : true;
+    })().finally(() => {
+      pending = null;
+    });
+    return pending;
+  };
 }
