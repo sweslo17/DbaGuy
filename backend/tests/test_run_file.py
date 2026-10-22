@@ -624,10 +624,9 @@ def test_a_commit_that_chains_restarts_the_files_transaction_there(tool_env, tmp
         ran = app.job_session(profile).run(command(path, "statements"))
         commit_at = len(begin) + 2
         assert (ran.outcome.outcome, ran.outcome.statements) == ("stopped", commit_at)
-        # the chained transaction is tracked from its first statement, after the COMMIT (06b review M1)
-        assert ran.outcome.warnings[0].startswith(f"The file's transaction from line {commit_at + 1} (statement "
-                                                  f"{commit_at + 1}) was still open")
-        assert ran.outcome.resume_at.statement == commit_at + 1
+        assert ran.outcome.warnings[0].startswith(f"The file's transaction from line {commit_at} (statement "
+                                                  f"{commit_at}) was still open")
+        assert ran.outcome.resume_at.statement == commit_at + 1  # after the chain (06b review M1, M-a)
         assert ids(db, table) == [1]
 
 
@@ -953,3 +952,24 @@ def test_a_run_again_from_a_line_that_moved_is_refused(tool_env, tmp_path):  # r
         ran = app.job_session(profile).run(command(path, "statements", from_statement=2, from_line=1))
         assert (ran.outcome.outcome, ran.error.code, ids(db, table)) == ("not_started", "file_changed", [])
         assert ran.error.message == "The file changed: statement 2 now starts at line 2"
+
+
+@requires_mysql
+def test_a_mysql_call_first_after_a_start_transaction_inside_the_files_transaction_is_unknown(tool_env,
+                                                                                               tmp_path):  # M-a, N1
+    db, app, profile = tool_env("mysql")
+    with dropping(db, app.close_sessions) as made:
+        table, gate = make_table(db, made), make_table(db, made)
+        db.execute(*inserts(db, gate, 1))
+        proc = scratch_name("again")
+        made.append(("PROCEDURE", proc))
+        db.execute(f"CREATE PROCEDURE {db.table(proc)}() BEGIN {inserts(db, table, 100)[0]}; COMMIT; "
+                   f"START TRANSACTION; {inserts(db, table, 101)[0]}; END")
+        # the second START TRANSACTION commits row 1 and begins the transaction the CALL commits and begins again in
+        path = write(tmp_path, db, ["START TRANSACTION", *inserts(db, table, 1), "START TRANSACTION",
+                                    f"CALL {db.table(proc)}()", *inserts(db, table, 3), *inserts(db, gate, 1)])
+        ran = app.job_session(profile).run(command(path, "statements")).outcome
+        assert (ran.outcome, ran.stopped_at.statement, ran.resume_at) == ("unknown", 6, None)
+        assert ran.warnings == ["Line 4 may have committed or rolled back the file's transaction from line 3 "
+                                "(statement 3): the statements from there on may or may not be applied"]
+        assert ids(db, table) == [1, 100]  # the CALL's COMMIT kept 100: a run again from line 4 would repeat it

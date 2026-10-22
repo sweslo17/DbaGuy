@@ -83,6 +83,9 @@ NON_TRANSACTIONAL = ("SELECT EXISTS (SELECT 1 FROM information_schema.TABLES t L
 _RESHAPES = (["CREATE"], ["ALTER"], ["USE"])  # MySQL: after these (first_words), that answer is read again
 PARTLY_APPLIED = ("Line {:,} may be partly applied (non-transactional tables): a write that fails on a table that "
                   "cannot roll back keeps the rows it wrote before the error")
+# Couchbase: each document changes on its own and nothing rolls back (06b review M-c)
+PARTLY_APPLIED_DOCUMENTS = ("Line {:,} may be partly applied: Couchbase changes each document on its own, so the "
+                            "documents it changed before the error stay changed")
 # psql meta-commands pg_dump 17 writes around its plain output (A P8): skipped, with a message
 _SKIPPED_META = frozenset({"\\restrict", "\\unrestrict"})
 _FATAL = frozenset({UNSUPPORTED_COPY, PSQL_META_COMMAND, READ_ONLY})  # a skip-and-continue run stops at these too
@@ -220,6 +223,11 @@ class _Run:
         # began it ran other statements before its BEGIN (N2: those may be applied)
         self.tx_procedure: FileStatement | None = None
         self.tx_began_inside = False
+        # A chained transaction (COMMIT AND CHAIN, R5) is tracked from the chaining statement, as 06a counts it, but a
+        # run again starts at its first statement after the chain: whether that one is still to come, and which it is
+        # (06b review M1, M-a)
+        self.after_chain = False
+        self.tx_resume: FileStatement | None = None
         # Where a run again starts (06b B1): the earliest file transaction rolled back and counted out, and whether what
         # an earlier statement did is not known (a "may" warning, a statement applied after that rollback, a `GO n`
         # stopped midway), which leaves no such place
@@ -230,6 +238,7 @@ class _Run:
         self.non_transactional: bool | None = None
         self.reshaped = True
         self.partly_said = False
+        self.inexact: FileStatement | None = None  # the place `_at()` made: its line is not a statement's start (M-b)
 
     def go(self, stream: StatementStream) -> JobReport:
         try:
@@ -280,10 +289,10 @@ class _Run:
                 message = exc.message
                 if exc.code == FILE_NOT_UTF8 and message != UTF16_MESSAGE and self.dialect is Dialect.MYSQL:
                     message += f" ({HEX_BLOB_HINT})"
-                raise _Stop(StatementError(message, code=exc.code), self._at(exc.line)) from None
+                raise self._cannot_read_on(StatementError(message, code=exc.code), exc.line) from None
             except OSError as exc:
                 error = StatementError(cannot_read(self.command.path, exc), code=FILE_IO)
-                raise _Stop(error, self._at(self.last_line + 1)) from None
+                raise self._cannot_read_on(error, self.last_line + 1) from None
             self.last_line = statement.line
             if statement.meta:
                 if self.read + 1 >= self.command.from_statement:  # a psql line before the start was dealt with then
@@ -329,8 +338,19 @@ class _Run:
 
     def _at(self, line: int) -> FileStatement:
         """Where a run stops that has no statement of its own (a line that is not text): the statement after the last
-        one read (pre-flight M3)."""
-        return FileStatement(index=self.read + 1, line=line, text="", end_byte=self.bytes)
+        one read (pre-flight M3). Its line is where the run stopped, not that statement's start: the place is not
+        exact (06b review M-b), so a run again from it does not ask for that line."""
+        self.inexact = FileStatement(index=self.read + 1, line=line, text="", end_byte=self.bytes)
+        return self.inexact
+
+    def _cannot_read_on(self, error: StatementError, line: int) -> _Stop:
+        """The file cannot be read on at `line`. Before `from_statement`, none of what the run was asked to run was
+        sent: not started, and a file a run again found changed says so (06b review L-a)."""
+        if self.read + 1 < self.command.from_statement:
+            if self.command.from_line is not None:
+                error = StatementError(f"The file changed: {error.message}", code=FILE_CHANGED)
+            return _Stop(error, None)
+        return _Stop(error, self._at(line))
 
     def _meta(self, statement: FileStatement) -> None:
         word = statement.text.split(None, 1)[0]
@@ -357,6 +377,8 @@ class _Run:
     def _one(self, statement: FileStatement) -> None:
         ctx = self.ctx
         rows_before = self.rows
+        if self.after_chain:  # the first statement of a chained transaction: a run again starts here (M-a)
+            self.after_chain, self.tx_resume = False, statement
         try:
             self._admit(statement)
         except StatementError as exc:
@@ -542,6 +564,13 @@ class _Run:
             self.restarted = True
         return self.restarted
 
+    def _resume_point(self) -> FileStatement | None:
+        """Where a run again starts when the tracked transaction is undone: its first statement, or a chained one's
+        first statement after the chain; None for a chained one nothing ran in yet (the stop is the place)."""
+        if self.tx_resume is not None or self.after_chain:
+            return self.tx_resume
+        return self.tx_from
+
     def _start_tracking(self, statement: FileStatement, done_before: int, rows_before: int, *,
                         counted: bool) -> None:
         """Statement by statement: the file's own transaction is open from `statement` on (H2); SQL Server reads its id
@@ -559,7 +588,8 @@ class _Run:
                 self.cancel_pending = True  # the read took it: the next statement stops
 
     def _stop_tracking(self) -> None:
-        self.tx_from = self.tx_id = self.tx_procedure = None
+        self.tx_from = self.tx_id = self.tx_procedure = self.tx_resume = None
+        self.after_chain = False
         self.tx_began_inside = False
 
     def _note_procedure(self, statement: FileStatement) -> None:
@@ -581,7 +611,9 @@ class _Run:
         if self.tx_from is None:
             self._start_tracking(statement, self.done - 1, rows_before, counted=True)
         elif ends_the_transaction(statement.text, self.dialect):  # COMMIT AND CHAIN: the one before is over (R5)
-            self._stop_tracking()  # the chained one is tracked from its first statement: a run again starts there
+            self._stop_tracking()
+            self.tx_from, self.done_before_tx, self.rows_before_tx = statement, self.done, self.rows
+            self.after_chain = True  # a run again starts after it, not at the chain (PostgreSQL refuses that, M1)
         else:
             self._note_procedure(statement)
 
@@ -600,18 +632,19 @@ class _Run:
         if open_now is None:  # left to the end of the run, which reads the state again
             self.warnings.append(self._may_have_ended(self.tx_from, statement))
             return
-        tx, procedure, began_inside = self.tx_from, self.tx_procedure, self.tx_began_inside
+        tx, procedure, began_inside, start = self.tx_from, self.tx_procedure, self.tx_began_inside, self._resume_point()
         self._stop_tracking()
-        self.warnings += self._ended_in(tx, statement, error, procedure=procedure, began_inside=began_inside,
-                                        going_on=True)
+        self.warnings += self._ended_in(tx, statement, error, start=start, procedure=procedure,
+                                        began_inside=began_inside, going_on=True)
 
     def _ended_in(self, tx: FileStatement, failed: FileStatement, error: StatementError | None, *,
-                  procedure: FileStatement | None = None, began_inside: bool = False,
+                  start: FileStatement | None, procedure: FileStatement | None = None, began_inside: bool = False,
                   going_on: bool = False) -> list[str]:
         """The file's transaction from `tx` was gone after `failed` failed: committed before it (MySQL), maybe
         committed by it, or rolled back by the server (its statements are then not applied). `procedure` and
-        `began_inside` as its tracking had them (N1, N2: what the server rolled back may not be all of it).
-        `going_on`: skip and continue, so the statements after `failed` run on their own (06b B1)."""
+        `began_inside` as its tracking had them (N1, N2: what the server rolled back may not be all of it); `start`:
+        where a run again starts (`_resume_point`). `going_on`: skip and continue, so the statements after `failed`
+        run on their own (06b B1)."""
         if implicit_commit_word(failed.text, self.dialect) is not None:
             return [f"Line {failed.line:,} committed the file's transaction from line {tx.line:,} before it failed "
                     "(MySQL commits around DDL)"]
@@ -630,10 +663,12 @@ class _Run:
         if began_inside:  # N2: the statement that began it stays counted, and what it did before its BEGIN may stand
             self.unclear = True
             return [f"{undone}, so the statements after it are not applied", self._began_inside(tx)]
-        self._undone(tx)
+        self._undone(start)
         if going_on:
-            return [f"{undone}, so lines {tx.line:,}–{failed.line:,} are not applied; the statements after it ran on "
-                    "their own, outside a transaction"]
+            first = (start or tx).line
+            lines = f"line {first:,} is" if first == failed.line else f"lines {first:,}–{failed.line:,} are"
+            return [f"{undone}, so {lines} not applied; the statements after it ran on their own, outside a "
+                    "transaction"]
         return [f"{undone}, so the statements from there on are not applied"]
 
     def _procedure_of(self, failed: FileStatement | None, procedure: FileStatement | None) -> FileStatement | None:
@@ -656,12 +691,13 @@ class _Run:
         its end (`at_end`): a transaction still open is rolled back, never committed on the file's behalf (S14), and the
         statements it held are not counted as applied (H2), unless a table could not roll back (R3)."""
         tx, procedure, began_inside = self.tx_from, self._procedure_of(failed, self.tx_procedure), self.tx_began_inside
+        start = self._resume_point()
         open_now = self._open_after_failure(failed, error) if failed is not None and error is not None else self._open()
         if open_now is False:
             self._stop_tracking()
             if tx is None or failed is None:
                 return []
-            return self._ended_in(tx, failed, error, procedure=procedure, began_inside=began_inside)
+            return self._ended_in(tx, failed, error, start=start, procedure=procedure, began_inside=began_inside)
         restarted = tx is not None and open_now is True and self._note_restart()
         self._stop_tracking()
         kept = self._rollback()  # open, or it cannot tell: never left behind
@@ -689,7 +725,7 @@ class _Run:
             return [f"The file's transaction from line {tx.line:,} (statement {tx.index:,}) was still open: it was "
                     "rolled back, so the statements after it are not applied",
                     self._began_inside(tx)]
-        self._undone(tx)
+        self._undone(start)
         if at_end:  # pre-flight L9: a run again ends the same way unless the file is fixed
             return [f"The file ended with its transaction from line {tx.line:,} (statement {tx.index:,}) still open "
                     "(no COMMIT: is it cut short?): it was rolled back, so the statements from there on are not "
@@ -697,10 +733,11 @@ class _Run:
         return [f"The file's transaction from line {tx.line:,} (statement {tx.index:,}) was still open: it was rolled "
                 "back, so the statements from there on are not applied"]
 
-    def _undone(self, tx: FileStatement) -> None:
-        """The file's transaction from `tx` was rolled back and its statements counted out: a run again starts there."""
-        if self.undone_from is None or tx.index < self.undone_from.index:
-            self.undone_from = tx
+    def _undone(self, start: FileStatement | None) -> None:
+        """The file's transaction was rolled back and its statements counted out: a run again starts at `start`
+        (`_resume_point`; None: nothing of it ran, so where the run stopped is the place)."""
+        if start is not None and (self.undone_from is None or start.index < self.undone_from.index):
+            self.undone_from = start
 
     @staticmethod
     def _began_inside(tx: FileStatement) -> str:
@@ -723,7 +760,7 @@ class _Run:
         if self.settings_sent:
             said.append(f"{self.settings_sent:,} session settings before statement {self.command.from_statement:,} "
                         "were run again (SET, USE, PRAGMA); the other statements before it were skipped")
-        at = StoppedAt(line=stopped.line, statement=stopped.index) if stopped is not None else None
+        at = self._place(stopped) if stopped is not None else None
         return JobReport(
             self.ctx.outcome(outcome, cancelled=cancelled, rows=self.rows, bytes=self.bytes, statements=self.done,
                              path=self.command.path, errors=self.errors, error_count=self.error_count,
@@ -739,7 +776,8 @@ class _Run:
         (R3), a transaction restarted inside the file (R10) or begun inside a statement (N2), a state that could not
         be read, a statement that took effect after a file transaction the run rolled back (skip and continue), or one
         that runs several and was skipped there (review H1), a `GO n` batch that stopped after some of its runs outside
-        the file's transaction (pre-flight H1), a MySQL write that failed where tables cannot roll back (review M2)."""
+        the file's transaction (pre-flight H1), a write that failed where it may have kept part of its work (MySQL
+        tables that cannot roll back, Couchbase documents: review M2, M-c)."""
         if self.all_or_nothing or outcome == "not_started" or self.unclear or self.restarted or self.unsure \
                 or self.kept:
             return None
@@ -747,7 +785,10 @@ class _Run:
         if not points:
             return None
         first = min(points, key=lambda point: point.index)
-        return StoppedAt(line=first.line, statement=first.index)
+        return self._place(first)
+
+    def _place(self, statement: FileStatement) -> StoppedAt:
+        return StoppedAt(line=statement.line, statement=statement.index, exact=statement is not self.inexact)
 
     def _stopped(self, stop: _Stop) -> JobReport:
         error, statement = stop.error, stop.statement
@@ -812,14 +853,14 @@ class _Run:
     def _lost_in_file_transaction(self, statement: FileStatement) -> list[str]:
         """Statement by statement, the link died while `statement` ran inside the file's own transaction: the server
         rolls that back as the connection ends, unless the statement was what committed it."""
-        tx, procedure, began_inside = self.tx_from, self.tx_procedure, self.tx_began_inside
+        tx, procedure, began_inside, start = self.tx_from, self.tx_procedure, self.tx_began_inside, self._resume_point()
         self._stop_tracking()
         if tx is None:
             return []
         if may_commit(statement.text, self.dialect) or procedure is not None:
             return [self._may_have_ended(tx, procedure or statement)]
         self.done, self.rows = self.done_before_tx, self.rows_before_tx
-        self._undone(tx)
+        self._undone(start)
         lost = (f"The connection was lost inside the file's transaction from line {tx.line:,} (statement {tx.index:,}): "
                 "the server rolls it back, so the statements from there on are not applied")
         if began_inside:
@@ -927,18 +968,23 @@ class _Run:
         return any(len(row) > 1 and str(row[1]) == _NOT_ROLLED_BACK for row in rows)
 
     def _partly_applied(self, statement: FileStatement) -> list[str]:
-        """MySQL, statement by statement: a write that failed (or was cancelled) on the server outside the file's
-        transaction, in a database with tables that cannot roll back, may have kept the rows it wrote before the error
-        (06b review M2): no place to run again from is known, and the outcome says so once. Inside the file's
-        transaction the ROLLBACK's 1196 tells (R3)."""
-        if self.dialect is not Dialect.MYSQL or not writes_rows(statement.text, self.dialect) \
-                or not self._non_transactional():
+        """Statement by statement, a write that failed (or was cancelled) on the server outside the file's transaction
+        may have kept part of what it wrote: MySQL in a database with tables that cannot roll back (06b review M2;
+        inside the file's transaction the ROLLBACK's 1196 tells, R3), Couchbase always (M-c). No place to run again
+        from is known, and the outcome says so once."""
+        if not writes_rows(statement.text, self.dialect):
+            return []
+        if self.dialect is Dialect.SQLPP:
+            said = PARTLY_APPLIED_DOCUMENTS
+        elif self._non_transactional():
+            said = PARTLY_APPLIED
+        else:
             return []
         self.unclear = True
         if self.partly_said:
             return []
         self.partly_said = True
-        return [PARTLY_APPLIED.format(statement.line)]
+        return [said.format(statement.line)]
 
     def _non_transactional(self) -> bool:
         """Whether the session's database has a table that cannot roll back: one information_schema query, the first

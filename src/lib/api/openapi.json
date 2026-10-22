@@ -9531,6 +9531,10 @@
           "statement": {
             "type": "integer",
             "title": "Statement"
+          },
+          "exact": {
+            "type": "boolean",
+            "title": "Exact"
           }
         },
         "type": "object",
@@ -9539,7 +9543,7 @@
           "statement"
         ],
         "title": "StoppedAt",
-        "description": "A place in a run's file: where it stopped (the statement that failed, was cancelled or was not sent), or where a\nrun again starts (`resume_at`, 06b B1)."
+        "description": "A place in a run's file: where it stopped (the statement that failed, was cancelled or was not sent), or where a\nrun again starts (`resume_at`, 06b B1). `exact`: `line` is where that statement starts. False for a stop with no\nstatement of its own (a line that is not UTF-8 inside a statement, a psql command, a statement over the limit, a\nread error): the line is where the run stopped, so a run again from it sends no `from_line` (06b review M-b)."
       },
       "TextSelection": {
         "properties": {

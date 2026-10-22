@@ -58,10 +58,15 @@ class JobError(BaseModel):
 
 class StoppedAt(BaseModel):
     """A place in a run's file: where it stopped (the statement that failed, was cancelled or was not sent), or where a
-    run again starts (`resume_at`, 06b B1)."""
+    run again starts (`resume_at`, 06b B1). `exact`: `line` is where that statement starts. False for a stop with no
+    statement of its own (a line that is not UTF-8 inside a statement, a psql command, a statement over the limit, a
+    read error): the line is where the run stopped, so a run again from it sends no `from_line` (06b review M-b)."""
 
     line: int
     statement: int
+    # Always sent. The schema states no default, so the generated type has it optional: a place written by hand (a
+    # test's fixture) is exact, and the frontend omits `from_line` only for `exact === false`
+    exact: bool = Field(default=True, json_schema_extra=lambda schema: schema.pop("default", None))
 
 
 class JobObject(BaseModel):
@@ -110,7 +115,7 @@ class JobOutcomeEvent(BaseModel):
     # effect — check the target first (06b L13, review L5). None: all or nothing, read to the end with nothing
     # undone, or what the earlier statements did is not known (the warnings say which; a statement applied after a
     # file transaction the run rolled back, a `GO n` that stopped after some of its runs, a write that failed where
-    # tables cannot roll back)
+    # tables cannot roll back or on Couchbase's documents). `exact` False: send no `from_line` with it (M-b)
     resume_at: StoppedAt | None = None
     # Why it stopped or failed: the `error` event sent right before it, with where the run stopped when it did, so a
     # window that attaches later or lists the jobs (GET /data/jobs) knows it too (06a fix wave F3). None: no error

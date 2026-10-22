@@ -3460,13 +3460,17 @@ export interface components {
         /**
          * StoppedAt
          * @description A place in a run's file: where it stopped (the statement that failed, was cancelled or was not sent), or where a
-         *     run again starts (`resume_at`, 06b B1).
+         *     run again starts (`resume_at`, 06b B1). `exact`: `line` is where that statement starts. False for a stop with no
+         *     statement of its own (a line that is not UTF-8 inside a statement, a psql command, a statement over the limit, a
+         *     read error): the line is where the run stopped, so a run again from it sends no `from_line` (06b review M-b).
          */
         StoppedAt: {
             /** Line */
             line: number;
             /** Statement */
             statement: number;
+            /** Exact */
+            exact?: boolean;
         };
         /** TextSelection */
         TextSelection: {

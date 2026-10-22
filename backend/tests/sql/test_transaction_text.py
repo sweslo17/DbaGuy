@@ -102,7 +102,14 @@ def test_what_ends_the_transaction_before_it_even_when_one_is_open_after_it(text
     ("WITH a AS (SELECT id FROM t FOR UPDATE) SELECT * FROM a", MYSQL, False),  # the UPDATE is inside the clause
     ("LOAD INDEX INTO CACHE t", MYSQL, False), ("SELECT 1", MYSQL, False), ("CALL p()", MYSQL, False),
     ("CREATE TABLE t (a int)", MYSQL, False), ("", MYSQL, False),
-    ("INSERT INTO t VALUES (1)", PG, False),  # MySQL only: elsewhere every table rolls back
+    ("INSERT INTO t VALUES (1)", PG, False),  # elsewhere every table rolls a failed statement back
+    ("INSERT INTO t VALUES (1)", TSQL, False), ("INSERT INTO t VALUES (1)", SQLITE, False),
+    # SQL++ (06b review M-c): each document on its own
+    ("UPDATE ks SET n = 1 WHERE type = 'a'", SQLPP, True),
+    ("UPSERT INTO ks (KEY, VALUE) VALUES ('k', {})", SQLPP, True),
+    ("MERGE INTO ks USING src ON KEY src.id WHEN MATCHED THEN UPDATE SET ks.a = 1", SQLPP, True),
+    ("DELETE FROM ks WHERE a = 1", SQLPP, True), ("SELECT RAW 1", SQLPP, False),
+    ("REPLACE INTO ks VALUES (1)", SQLPP, False),
 ])
-def test_what_writes_rows_one_at_a_time(text, dialect, writes):  # 06b review M2: what MyISAM may keep part of
+def test_what_writes_rows_one_at_a_time(text, dialect, writes):  # 06b review M2, M-c: what may keep part of its work
     assert writes_rows(text, dialect) is writes

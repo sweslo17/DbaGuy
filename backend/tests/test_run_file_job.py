@@ -19,7 +19,7 @@ from dbaguy_backend.sessions.hooks import SessionHooksFactory
 from dbaguy_backend.sessions.jobs import run_file
 from dbaguy_backend.sessions.jobs.context import JOB_ROLLBACK_FAILED, JobHooks
 from dbaguy_backend.sessions.jobs.run_file import (
-    COPY_HINT, HEX_BLOB_HINT, NON_TRANSACTIONAL, PARTLY_APPLIED, RunFileJob, summary,
+    COPY_HINT, HEX_BLOB_HINT, NON_TRANSACTIONAL, PARTLY_APPLIED, PARTLY_APPLIED_DOCUMENTS, RunFileJob, summary,
 )
 from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks
 from dbaguy_backend.sql.dump_header import CUT_SHORT, complete_line, header_lines
@@ -61,7 +61,7 @@ class RunFake(FakeConnection):
                  non_transactional: bool = False) -> None:
         super().__init__()
         self.non_transactional = non_transactional
-        self.begin, self.end = FRAME[dialect]
+        self.begin, self.end = FRAME.get(dialect, (None, None))  # SQL++: no transactions
         self.commit_error = commit_error
         self.commit_keeps = commit_keeps
         self.acts = acts or {}
@@ -708,10 +708,10 @@ def test_a_commit_that_leaves_a_transaction_open_restarts_it_there(env, sql_file
     e = env(RunFake(dialect, commit_keeps=dialect is Dialect.MYSQL), dialect=dialect)
     done = outcome(e.run(sql_file(f"tx;\nrows 2;\n{chain};\nrows 4;\nfail boom;"), mode="statements"))
     assert (done.outcome, done.statements, done.stopped_at.statement) == ("stopped", 3, 5)
-    # the chained transaction is tracked from its first statement: a run again starts there, not at the COMMIT AND
-    # CHAIN, which PostgreSQL refuses outside a transaction block (06b review M1)
-    assert done.warnings == ["The file's transaction from line 4 (statement 4) was still open: it was rolled back, so "
+    assert done.warnings == ["The file's transaction from line 3 (statement 3) was still open: it was rolled back, so "
                              "the statements from there on are not applied"]
+    # tracked from the chain, as 06a counts it, but a run again starts after it: PostgreSQL refuses a COMMIT AND
+    # CHAIN outside a transaction block (06b review M1, M-a)
     assert (done.resume_at.line, done.resume_at.statement) == (4, 4)
 
 
@@ -982,3 +982,94 @@ def test_a_run_again_from_a_line_is_refused_when_the_file_changed(env, sql_file,
 def test_from_line_is_a_line_number():
     with pytest.raises(ValueError):
         RunFileCommand(request_id="r", path="/x.sql", mode="statements", from_statement=2, from_line=0)
+
+
+# ---- 06b Task 2, fix round 2 (the re-review's M-a, M-b, M-c, L-a) ---------------------------------------------
+
+
+def n1(line: int, tx_line: int) -> str:
+    return (f"Line {line} may have committed or rolled back the file's transaction from line {tx_line} (statement "
+            f"{tx_line}): the statements from there on may or may not be applied")
+
+
+@pytest.mark.parametrize(("text", "acts", "expected"), [
+    # MySQL completion_type=CHAIN (`commit_keeps`): the CALL first in the chained transaction is N1's
+    ("START TRANSACTION;\nrows 2;\nCOMMIT;\nCALL p();\nrows 5;\nfail boom;", None,
+     ("unknown", 5, [n1(4, 3)])),  # not counted out: the CALL may have committed (N1)
+    ("START TRANSACTION;\nrows 2;\nCOMMIT;\nCALL p();\nrows 5;", {"CALL p()": "fail boom"},
+     ("unknown", 3, [n1(4, 3)])),  # and so is that CALL when it fails (review H2)
+])
+def test_a_call_first_in_a_chained_transaction_may_have_committed_it(env, sql_file, text, acts, expected):  # M-a
+    e = env(RunFake(Dialect.MYSQL, commit_keeps=True, acts=acts), dialect=Dialect.MYSQL)
+    done = outcome(e.run(sql_file(text), mode="statements"))
+    assert (done.outcome, done.statements, done.warnings, done.resume_at) == (*expected, None)
+
+
+def test_a_call_after_a_start_transaction_inside_the_files_transaction_may_have_committed_it(env, sql_file):  # M-a
+    e = env(dialect=Dialect.MYSQL)  # START TRANSACTION commits the one before and begins the next (R5)
+    done = outcome(e.run(sql_file("tx;\nrows 2;\nSTART TRANSACTION;\nCALL p();\nrows 5;\nfail boom;"),
+                         mode="statements"))
+    assert (done.outcome, done.statements, done.warnings, done.resume_at) == ("unknown", 5, [n1(4, 3)], None)
+
+
+def test_a_deadlock_right_after_a_start_transaction_is_said_and_leaves_no_resume_point(env, sql_file):  # M-a
+    e = env(dialect=Dialect.MYSQL)  # skip and continue: never a silent `completed`
+    done = outcome(e.run(sql_file("tx;\nrows 2;\nSTART TRANSACTION;\ndeadlock;\nrows 5;"), mode="statements",
+                         on_error="continue"))
+    assert (done.outcome, done.statements, done.error_count, done.resume_at) == ("completed", 4, 1, None)
+    assert done.warnings == ["The file's transaction from line 3 (statement 3) ended when line 4 failed: the server "
+                             "rolled it back, so line 4 is not applied; the statements after it ran on their own, "
+                             "outside a transaction"]
+    alone = env(dialect=Dialect.MYSQL)  # nothing after it: a run again starts at the statement after the chain
+    done = outcome(alone.run(sql_file("tx;\nrows 2;\nSTART TRANSACTION;\ndeadlock;"), mode="statements",
+                             on_error="continue"))
+    assert (done.resume_at.line, done.resume_at.statement) == (4, 4)
+
+
+def test_a_postgres_do_block_first_in_a_chained_transaction_goes_with_its_rollback(env, sql_file):  # M-a
+    e = env(dialect=Dialect.POSTGRES)  # a DO block in a transaction block cannot commit
+    done = outcome(e.run(sql_file("tx;\nrows 2;\nCOMMIT AND CHAIN;\nDO $$ BEGIN NULL; END $$;\nrows 5;\nfail boom;"),
+                         mode="statements"))
+    assert (done.outcome, done.statements, done.resume_at.line, done.resume_at.statement) == ("stopped", 3, 4, 4)
+
+
+@pytest.mark.parametrize(("dialect", "text", "fixed", "stopped"), [
+    # a line that is not UTF-8 inside a statement of several lines: the run stops at that line, not the statement's
+    (Dialect.SQLITE, b"rows 1;\nINSERT INTO t VALUES\n('a'),\n('\xff');\nrows 5;\n",
+     b"rows 1;\nINSERT INTO t VALUES\n('a'),\n('b');\nrows 5;\n", (4, 2)),
+    (Dialect.POSTGRES, b"rows 1;\n\\connect other\nrows 3;\n", b"rows 1;\n-- \\connect other\nrows 3;\n", (2, 2)),
+])
+def test_a_stop_with_no_statement_of_its_own_is_not_an_exact_place(env, sql_file, dialect, text, fixed, stopped):
+    done = outcome(env(dialect=dialect).run(sql_file(text), mode="statements"))  # 06b review M-b
+    assert ((done.stopped_at.line, done.stopped_at.statement), done.stopped_at.exact, done.resume_at.exact) == (
+        stopped, False, False)
+    # the frontend sends no from_line for it: the fixed file runs again from that statement
+    again = outcome(env(dialect=dialect).run(sql_file(fixed, name="fixed.sql"), mode="statements",
+                                             from_statement=done.resume_at.statement))
+    assert again.outcome == "completed"
+    plain = outcome(env().run(sql_file("rows 1;\nfail boom;", name="plain.sql"), mode="statements"))
+    assert (plain.stopped_at.exact, plain.resume_at.exact) == (True, True)
+
+
+@pytest.mark.parametrize(("on_error", "expected"), [("stop", "stopped"), ("continue", "completed")])
+def test_a_failed_couchbase_write_may_be_partly_applied(env, sql_file, on_error, expected):  # 06b review M-c
+    write = "UPDATE ks SET n = n + 1 WHERE type = 'a'"
+    e = env(dialect=Dialect.SQLPP, acts={write: "fail boom"}, transactions=False)
+    done = outcome(e.run(sql_file(f"rows 1;\n{write};\nrows 3;"), mode="statements", on_error=on_error))
+    assert (done.outcome, done.resume_at, done.warnings) == (expected, None, [PARTLY_APPLIED_DOCUMENTS.format(2)])
+    read = env(dialect=Dialect.SQLPP, acts={"SELECT 2": "fail boom"}, transactions=False)
+    done = outcome(read.run(sql_file("rows 1;\nSELECT 2;\nrows 3;"), mode="statements"))
+    assert (done.resume_at.statement, done.warnings) == (2, [])  # a read changes nothing
+
+
+@pytest.mark.parametrize(("from_line", "code", "message"), [
+    (None, "file_not_utf8", "Line 1 is not UTF-8 text"),
+    (3, "file_changed", "The file changed: Line 1 is not UTF-8 text"),
+])
+def test_a_file_that_cannot_be_read_before_the_start_never_started(env, sql_file, from_line, code, message):  # L-a
+    e = env()  # nothing the run was asked to run was sent: never a `stopped` with a place before from_statement
+    events = e.run(sql_file(b"rows 1; -- caf\xe9\nrows 2;\nrows 3;\nrows 4;\n"), mode="statements", from_statement=3,
+                   from_line=from_line)
+    done = outcome(events)
+    assert (done.outcome, done.resume_at, error(events).code, error(events).message, e.conn.runs) == (
+        "not_started", None, code, message, [])

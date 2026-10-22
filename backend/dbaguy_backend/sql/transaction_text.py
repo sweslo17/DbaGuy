@@ -41,9 +41,11 @@ _ENDS = {Dialect.POSTGRES: frozenset({"COMMIT", "END", "ROLLBACK", "ABORT"}),
 _TSQL_TRANSACTION = re.compile(r"\b(?:COMMIT|ROLLBACK)\b|\b(?:BEGIN|SAVE)\s+(?:TRAN|TRANSACTION|DISTRIBUTED)\b",
                                re.IGNORECASE)
 _TSQL_OPENS = {"BEGIN": frozenset({"TRAN", "TRANSACTION", "DISTRIBUTED"}), "SAVE": frozenset({"TRAN", "TRANSACTION"})}
-# MySQL: the statements that write rows one at a time (writes_rows), and the verbs a WITH clause can lead to
-_ROW_WRITES = frozenset({"INSERT", "REPLACE", "UPDATE", "DELETE"})
-_MAIN_VERBS = _ROW_WRITES | {"SELECT", "TABLE", "VALUES"}
+# The statements that write rows (documents) one at a time where a failed one keeps part of its work (writes_rows),
+# and the reads a WITH clause can lead to instead
+_WRITES = {Dialect.MYSQL: frozenset({"INSERT", "REPLACE", "UPDATE", "DELETE"}),
+           Dialect.SQLPP: frozenset({"INSERT", "UPSERT", "UPDATE", "DELETE", "MERGE"})}
+_READ_VERBS = frozenset({"SELECT", "TABLE", "VALUES"})
 _MAY_COMMIT = re.compile(r"\b(?:COMMIT|CALL|EXEC|EXECUTE)\b", re.IGNORECASE)
 _TSQL_MAY_COMMIT = re.compile(r"\b(?:COMMIT|EXEC|EXECUTE)\b", re.IGNORECASE)  # data saying "call" is not lexed
 _VERSION = re.compile(r"/\*M?!\d*")  # the opening of a version comment (lexer.VERSION_COMMENT_STARTS) and its version
@@ -161,15 +163,17 @@ def may_commit(text: str, dialect: Dialect) -> bool:
 
 
 def writes_rows(text: str, dialect: Dialect) -> bool:
-    """MySQL: whether the statement writes rows one at a time (INSERT, REPLACE, UPDATE, DELETE, LOAD DATA or XML, and
-    WITH … UPDATE / DELETE), so that a table that cannot roll back (MyISAM) keeps the rows it wrote before it failed
-    (06b review M2). Every other dialect: False."""
-    if dialect is not Dialect.MYSQL:
+    """Whether the statement writes rows (documents) one at a time, so that what it wrote before it failed may stay:
+    MySQL's INSERT, REPLACE, UPDATE, DELETE, LOAD DATA or XML and WITH … UPDATE / DELETE, on a table that cannot roll
+    back (MyISAM, 06b review M2); SQL++'s INSERT, UPSERT, UPDATE, DELETE and MERGE, each document on its own (M-c).
+    Every other dialect: False (every table rolls a failed statement back)."""
+    writes = _WRITES.get(dialect)
+    if writes is None:
         return False
     words = first_words(text, dialect)
     if not words:
         return False
-    if words[0] in _ROW_WRITES or words[:2] in (["LOAD", "DATA"], ["LOAD", "XML"]):
+    if words[0] in writes or (dialect is Dialect.MYSQL and words[:2] in (["LOAD", "DATA"], ["LOAD", "XML"])):
         return True
     if words[0] != "WITH":
         return False
@@ -179,8 +183,8 @@ def writes_rows(text: str, dialect: Dialect) -> bool:
             depth += 1
         elif token.kind == TokenKind.RPAREN:
             depth -= 1
-        elif depth == 0 and token.kind == TokenKind.WORD and token.upper in _MAIN_VERBS:
-            return token.upper in _ROW_WRITES
+        elif depth == 0 and token.kind == TokenKind.WORD and (token.upper in writes or token.upper in _READ_VERBS):
+            return token.upper in writes
     return False
 
 
