@@ -1,7 +1,8 @@
-//! The macOS app menu (ruling R-02c-17): Tauri's default menu, except Close Window. The default binds Close Window to
-//! ⌘W, and the native menu takes the shortcut before the page sees it; ⌘W belongs to the page (it closes a tab), so
-//! Close Window is ⌘⇧W here. The Edit items stay the predefined ones: WKWebView needs them for the clipboard and text
-//! editing.
+//! The macOS app menu (ruling R-02c-17): Tauri's default menu, except Close Window and Quit. The default binds Close
+//! Window to ⌘W, and the native menu takes the shortcut before the page sees it; ⌘W belongs to the page (it closes a
+//! tab), so Close Window is ⌘⇧W here. Quit (⌘Q) is our own item (spec ⑥ CR-5): the predefined one terminates the app
+//! without any event that could keep it open, and the page must first ask while data-tools jobs run (`quit.rs`). The
+//! Edit items stay the predefined ones: WKWebView needs them for the clipboard and text editing.
 
 use tauri::menu::{
     AboutMetadata, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID, WINDOW_SUBMENU_ID,
@@ -9,10 +10,17 @@ use tauri::menu::{
 use tauri::{AppHandle, Manager, Runtime};
 
 const CLOSE_WINDOW_ID: &str = "close-window";
+const QUIT_ID: &str = "quit";
 
 /// Close Window, in the File and the Window menu.
 fn close_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<MenuItem<R>> {
     MenuItem::with_id(app, CLOSE_WINDOW_ID, "Close Window", true, Some("CmdOrCtrl+Shift+W"))
+}
+
+/// Quit, in the app menu: ⌘Q, as the predefined item, but the page is asked first (`quit::request`).
+fn quit<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<MenuItem<R>> {
+    let label = format!("Quit {}", app.package_info().name);
+    MenuItem::with_id(app, QUIT_ID, label, true, Some("CmdOrCtrl+Q"))
 }
 
 /// The menu, item for item as `tauri::menu::Menu::default` builds it on macOS (tauri 2.12).
@@ -41,7 +49,7 @@ pub fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
                     &PredefinedMenuItem::hide(app, None)?,
                     &PredefinedMenuItem::hide_others(app, None)?,
                     &PredefinedMenuItem::separator(app)?,
-                    &PredefinedMenuItem::quit(app, None)?,
+                    &quit(app)?,
                 ],
             )?,
             &Submenu::with_items(app, "File", true, &[&close_window(app)?])?,
@@ -77,11 +85,17 @@ pub fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     )
 }
 
-/// Close Window closes the focused window, as the predefined item does.
+/// Close Window closes the focused window, as the predefined item does (the page is asked first: `quit::request_close`
+/// on its `CloseRequested`); Quit asks the page.
 pub fn on_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
-    if event.id() != CLOSE_WINDOW_ID {
-        return;
+    match event.id().as_ref() {
+        CLOSE_WINDOW_ID => close_focused_window(app),
+        QUIT_ID => crate::quit::request(app),
+        _ => {}
     }
+}
+
+fn close_focused_window<R: Runtime>(app: &AppHandle<R>) {
     let focused = app.webview_windows().into_values().find(|window| window.is_focused().unwrap_or(false));
     match focused {
         Some(window) => {
