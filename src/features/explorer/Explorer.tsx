@@ -20,6 +20,7 @@ import { joinUnlockPrompt } from "../connections/unlockPrompts";
 import { openDumpDialog, openRunDialog } from "../data-tools/dataDialogs";
 import { dumpEntryForNode, runEntryForNode, type RunEntry } from "../data-tools/entryPoints";
 import { runningJobs, useJobs } from "../data-tools/jobsStore";
+import { READ_ONLY_RUN } from "../data-tools/runForm";
 import { askOpenDocument } from "../documents/openDocument";
 import { applyTreeContext } from "../query/queryContext";
 import { requestCloseTab, requestDisconnectTab } from "../workspace/closeGuards";
@@ -44,13 +45,12 @@ const CONTEXT_CLICK_DELAY_MS = 250;
 type ErrorRow = Extract<TreeRow, { type: "error" }>;
 
 /** A read-only connection's Run SQL file… is greyed with why: the backend refuses it before anything is sent (06a). */
-const RUN_READ_ONLY = "This connection is read-only: it cannot run files";
 
 /** Run SQL file… for a node (or the connection's row): greyed on a read-only connection. */
 const runItem = (entry: RunEntry, readOnly: boolean): MenuItem => ({
   label: "Run SQL file…",
   onSelect: () => openRunDialog(entry),
-  ...(readOnly ? { disabled: true, title: RUN_READ_ONLY } : {}),
+  ...(readOnly ? { disabled: true, title: READ_ONLY_RUN } : {}),
 });
 
 const isExpandable = (row: TreeRow) =>
