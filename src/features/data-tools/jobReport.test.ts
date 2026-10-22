@@ -217,17 +217,23 @@ describe("a run's outcome in words", () => {
     expect(said.actions.map((a) => a.label)).toEqual(["Run again from line 90"]);
   });
 
-  it("does not promise a count it cannot stand behind: counted as applied, see the notes (fix 2)", () => {
+  it("does not promise a stopped run's count when it cannot place what ran: counted as applied, see the notes (fix 2)", () => {
     const notes = ["Line 4 may have committed or rolled back the file's transaction from line 2: the statements from there on may or may not be applied"];
     const stopped = outcome({ outcome: "stopped", statements: 12, stopped_at: { line: 9, statement: 6 }, resume_at: null, warnings: notes });
     expect(report(stopped).detail).toBe("12 statements counted as applied; see the notes");
     expect(report(stopped).notes).toEqual(notes);
-    const completed = outcome({ statements: 12, rows: 5, resume_at: null, warnings: notes });
-    expect(report(completed).detail).toBe("12 statements counted as applied; see the notes · 5 rows affected");
     // without notes, in one transaction, or with a place to run again from, the plain count stands
     expect(report(outcome({ outcome: "stopped", statements: 12, resume_at: null, stopped_at: { line: 9, statement: 6 } })).detail).toBe("12 statements applied");
-    expect(report(completed, run({ mode: "all_or_nothing" })).detail).toBe("12 statements applied · 5 rows affected");
-    expect(report(outcome({ statements: 12, resume_at: { line: 2, statement: 2 }, warnings: notes })).detail).toBe("12 statements applied · 0 rows affected");
+    expect(report(stopped, run({ mode: "all_or_nothing" })).detail).toBe("12 statements applied");
+    expect(report(outcome({ outcome: "stopped", statements: 12, stopped_at: { line: 9, statement: 6 }, resume_at: { line: 9, statement: 6 }, warnings: notes })).detail).toBe("12 statements applied");
+  });
+
+  it("always says applied of a completed run: its notes show beside the count, benign or not (06b ruling)", () => {
+    for (const note of ["psql's \\restrict was skipped: it has no meaning here", "Sent 2 session settings before statement 40", "Line 4 may have committed the file's transaction"]) {
+      const completed = report(outcome({ statements: 12, rows: 5, resume_at: null, warnings: [note] }));
+      expect([completed.tone, completed.title, completed.detail, completed.notes]).toEqual(["warning", "Ran x.sql", "12 statements applied · 5 rows affected", [note]]);
+    }
+    expect(report(outcome({ statements: 12, resume_at: { line: 2, statement: 2 }, warnings: ["x"] })).detail).toBe("12 statements applied · 0 rows affected");
   });
 
   it("names the line a lost connection's rolled-back file transaction began at, not the line that was running (fix 12)", () => {

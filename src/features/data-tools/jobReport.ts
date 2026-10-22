@@ -265,10 +265,12 @@ function runReport(outcome: JobOutcomeEvent, command: JobCommand | null, error: 
   const resume = outcome.resume_at ?? null;
   const actions = runActions(outcome, command, error?.code ?? null);
   const where = at ? ` at line ${at.line.toLocaleString()}` : "";
-  // Statement by statement, a run that cannot place what it did (no `resume_at`) and says why in its notes counts
-  // statements it may not have applied: the count is not promised (pre-flight M5, D1)
+  // A run that stopped statement by statement and cannot place what it did (no `resume_at`) says why in its notes: it
+  // counts statements it may not have applied, so the count is not promised (pre-flight M5, D1). A completed run
+  // always says "applied": the backend takes a rolled-back tail out of its count, and its notes show beside it.
   const doubtful = run?.mode === "statements" && resume === null && notes.length > 0;
-  const applied = (count: number) => (doubtful ? `${plural(count, "statement")} counted as applied; see the notes` : statementsApplied(count));
+  const stoppedApplied = (count: number) =>
+    doubtful ? `${plural(count, "statement")} counted as applied; see the notes` : statementsApplied(count);
   switch (outcome.outcome) {
     case "completed": {
       const undone = resume !== null;
@@ -281,7 +283,7 @@ function runReport(outcome: JobOutcomeEvent, command: JobCommand | null, error: 
       return {
         tone: undone || skipped || notes.length ? "warning" : "success",
         title,
-        detail: `${applied(outcome.statements)} · ${plural(outcome.rows, "row")} affected`,
+        detail: `${statementsApplied(outcome.statements)} · ${plural(outcome.rows, "row")} affected`,
         notes,
         actions,
       };
@@ -306,7 +308,7 @@ function runReport(outcome: JobOutcomeEvent, command: JobCommand | null, error: 
       return {
         tone: outcome.cancelled ? "warning" : "danger",
         title: `${outcome.cancelled ? "Cancelled" : "Stopped"}${where}`,
-        detail: applied(outcome.statements),
+        detail: stoppedApplied(outcome.statements),
         notes,
         actions,
       };
