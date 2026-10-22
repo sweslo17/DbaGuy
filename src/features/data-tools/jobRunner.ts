@@ -126,6 +126,11 @@ export class JobRunner {
       this.report({ type: "open_failed", error: error instanceof Error ? error : new Error(String(error)), at: this.transport.now() });
       return;
     }
+    if (this.done) {
+      // Stopped while the session opened (only a test reset reaches this): close it, nothing was sent (Task 5 re-review)
+      void this.transport.closeSession(info.session_id);
+      return;
+    }
     this.sessionId = info.session_id;
     this.onSession(info.session_id);
     if (this.withheld) {

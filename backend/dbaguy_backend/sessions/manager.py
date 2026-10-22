@@ -96,7 +96,10 @@ class SessionManager:
             entry.attached += 1
         # A reloaded window gets the last progress or the outcome of the session's job first (D-06-10, pre-flight M2)
         entry.worker.attach_emitter(emit)
-        entry.worker.replay_state()  # a client attaching mid-transaction learns the state before any `finished`
+        # A client attaching mid-transaction learns the state before any `finished`; the frontend's job runner also
+        # sends a job's command only on this first state (06b Task 5 L2), so every attach must replay one
+        # (tests/test_api.py pins it)
+        entry.worker.replay_state()
         return entry.worker
 
     def detach(self, session_id: str, emit: Emitter) -> None:
