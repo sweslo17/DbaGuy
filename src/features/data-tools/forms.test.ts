@@ -31,8 +31,10 @@ import {
   pickMode,
   pickOnError,
   presetPicksMode,
+  previewNote,
   queryContextLabel,
   queryContextOf,
+  READ_ONLY_RUN,
   RED_CONFIRM,
   retargeted,
   runChoices,
@@ -42,6 +44,7 @@ import {
   settledMode,
   withDatabase,
   withPath,
+  withSearchPath,
 } from "./runForm";
 
 /* The two dialogs' forms (spec ⑥ §3.6): what is offered, greyed and why, and what is sent. */
@@ -194,7 +197,8 @@ describe("the run form", () => {
     expect(runGate(profile(), engine("postgres"), form, true)).toEqual({ red: false, blocked: null });
     expect(runGate(profile({ color: "red" }), engine("postgres"), form, true)).toEqual({ red: true, blocked: `Check “${RED_CONFIRM}” first` });
     expect(runGate(profile({ color: "red" }), engine("postgres"), { ...form, confirmed: true }, true).blocked).toBeNull();
-    expect(runGate(profile({ read_only: true }), engine("postgres"), form, true).blocked).toBe("This connection is read-only: it cannot run files");
+    expect(runGate(profile({ read_only: true }), engine("postgres"), form, true).blocked).toBe(READ_ONLY_RUN);
+    expect(READ_ONLY_RUN).toBe("This connection is read-only: it cannot run files");
     expect(runGate(profile(), engine("postgres"), form, false).blocked).toBe("The file has not been read yet");
     expect(runGate(profile(), engine("postgres"), { ...form, fromStatement: "0" }, true).blocked).toBe("A statement number, 1 or more");
     expect(EVERY_STATEMENT_RUNS).toContain("DROP and TRUNCATE");
@@ -293,7 +297,7 @@ describe("the run form", () => {
     expect(retargeted(green, "B", onA)).toMatchObject({ profileId: "B", database: null, searchPath: "" });
   });
 
-  it("asks the box again in another database of the same red connection, or for another file (CR-3)", () => {
+  it("asks the box again in another database or search path of the same red connection, or for another file (CR-3)", () => {
     const checked = { ...initialRunForm({ ...entry, database: "dbA" }, engine("postgres")), confirmed: true };
     expect(withDatabase(checked, "dbB")).toMatchObject({ database: "dbB", confirmed: false });
     expect(withDatabase(checked, null)).toMatchObject({ database: null, confirmed: false });
@@ -302,6 +306,9 @@ describe("the run form", () => {
     // another file: the box was for the file too
     expect(withPath(checked, "/tmp/other.sql")).toMatchObject({ path: "/tmp/other.sql", confirmed: false });
     expect(withPath(checked, checked.path)).toBe(checked);
+    // another search path: the file's unqualified names land elsewhere
+    expect(withSearchPath(checked, "billing")).toMatchObject({ searchPath: "billing", confirmed: false });
+    expect(withSearchPath(checked, checked.searchPath)).toBe(checked);
   });
 
   it("moves a greyed mode to statement by statement, and follows the engine while unchosen (06b T4 re-review)", () => {
@@ -321,12 +328,15 @@ describe("the run form", () => {
   });
 
   it("picks statement by statement with Skip it and continue: the engine never turns it into a stop", () => {
-    const loading = initialRunForm(entry, null);
-    const skipping = pickOnError(loading, "continue");
+    // all or nothing followed from PostgreSQL, unchosen: skipping errors moves it to statement by statement, chosen
+    const followed = initialRunForm(entry, engine("postgres"));
+    expect([followed.mode, followed.modePicked]).toEqual(["all_or_nothing", false]);
+    const skipping = pickOnError(followed, "continue");
     expect(skipping).toMatchObject({ onError: "continue", modePicked: true, mode: "statements" });
     expect(followEngineMode(skipping, engine("postgres"))).toBe(skipping);
-    // stopping at the error is either mode's: it picks nothing
-    expect(pickOnError(loading, "stop").modePicked).toBe(false);
+    expect(runCommand(skipping, engine("postgres"), null, "r")).toMatchObject({ mode: "statements", on_error: "continue" });
+    // stopping at the error is either mode's: it picks nothing and keeps the mode
+    expect(pickOnError(followed, "stop")).toMatchObject({ mode: "all_or_nothing", modePicked: false, onError: "stop" });
   });
 
   it("sends a run again's line while the form starts there in the same file, and never otherwise (06b review M3)", () => {
@@ -339,8 +349,16 @@ describe("the run form", () => {
     expect(runCommand({ ...form, fromStatement: "5" }, pg, null, "r")).not.toHaveProperty("from_line");
     expect(runCommand({ ...form, fromStatement: " 4 " }, pg, null, "r").from_line).toBe(3);
     expect(runCommand({ ...form, path: "/tmp/y.sql" }, pg, null, "r")).not.toHaveProperty("from_line");
-    // another connection keeps it: the file is the same
-    expect(runCommand(retargeted(form, "p2"), pg, null, "r").from_line).toBe(3);
+    // another connection: the statements before 4 ran on p1, not there: it starts at 1, with no line to check
+    const elsewhere = retargeted(form, "p2", again);
+    expect([elsewhere.fromStatement, elsewhere.fromLine]).toEqual(["1", null]);
+    expect(runCommand(elsewhere, pg, null, "r")).not.toHaveProperty("from_line");
+    expect(retargeted(elsewhere, "p3", again).fromStatement).toBe("1");
+    // back on its own connection, the run again's start comes back
+    expect(runCommand(retargeted(elsewhere, "p1", again), pg, null, "r")).toMatchObject({ from_statement: 4, from_line: 3 });
+    // a start the user typed stays wherever the run goes
+    expect(retargeted({ ...form, fromStatement: "9" }, "p2", again).fromStatement).toBe("9");
+    expect(retargeted({ ...elsewhere, fromStatement: "7" }, "p1", again).fromStatement).toBe("7");
     // a fresh form, or a patch without a line, sends none
     expect(runCommand(initialRunForm(entry, pg), pg, null, "r")).not.toHaveProperty("from_line");
     expect(patchedForm(form, { mode: "statements", on_error: "stop", from_statement: 5 }).fromLine).toBeNull();
@@ -431,6 +449,8 @@ describe("the forms' helpers", () => {
       preset: { mode: "statements", on_error: "stop", from_statement: 9 },
     });
     expect(againEntry(job, null).preset).toEqual({ mode: "statements", on_error: "stop", from_statement: 1 });
+    // a plain run had no place to check: neither has running it again
+    expect(againEntry(job, null).preset).not.toHaveProperty("from_line");
   });
 
   it("runs again in the same Couchbase query context: the default stays the default, none stays none", () => {
@@ -441,6 +461,16 @@ describe("the forms' helpers", () => {
     expect(again(undefined)).toBeUndefined();
     expect(again(null)).toBeNull();
     expect(again({ bucket: "b", scope: "s" })).toEqual({ bucket: "b", scope: "s" });
+  });
+
+  it("says how much of the file the preview shows: the first lines, and where the 64 KiB read cut them", () => {
+    const preview = (lines: number, truncated: boolean) =>
+      ({ ...inspection([]), preview: "x\n".repeat(lines), preview_truncated: truncated }) as FileInspection;
+    expect(previewNote(preview(12, false))).toBeNull();
+    expect(previewNote(preview(200, true))).toBe("The first 200 lines");
+    expect(previewNote(preview(37, true))).toBe("The first 37 lines (the first 64 KiB)");
+    expect(previewNote(preview(1, true))).toBe("The first line (the first 64 KiB)");
+    expect(previewNote(preview(0, true))).toBeNull();
   });
 
   it("numbers a file's lines from where they start, without their CR", () => {

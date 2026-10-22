@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { memo, useEffect, useMemo, useRef } from "react";
 import { cn } from "@/lib/cn";
 import { numberedLines } from "./runForm";
 
@@ -7,7 +7,7 @@ import { numberedLines } from "./runForm";
  * lines, or an error's place (`mark`: its line, tinted and scrolled to the middle as it shows). A fixed-height box that
  * scrolls both ways (long INSERT lines stay one line each), with room kept for the scrollbars.
  */
-export function FileLines({
+export const FileLines = memo(function FileLines({
   text,
   firstLine,
   mark,
@@ -57,4 +57,4 @@ export function FileLines({
       </div>
     </div>
   );
-}
+});

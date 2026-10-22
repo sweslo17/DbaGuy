@@ -9,11 +9,11 @@ import { cn } from "@/lib/cn";
 import { ENGINE_LABELS } from "@/lib/engines";
 import { buildFolderTree, type FolderNode } from "../connections/folders";
 import { useEngineInfo, useProfiles } from "../connections/hooks";
-import { profileColor } from "../connections/profileColors";
 import { childrenQuery } from "../explorer/useTreeRows";
 import type { SessionPhase } from "../session/SessionController";
 import { ContextPicker, type ContextPickerProps } from "./ContextPicker";
 import { PickerTrigger } from "./PickerTrigger";
+import { ProfileChip } from "./ProfileChip";
 
 const PHASE_DOT: Record<SessionPhase, string> = {
   opening: "bg-warning",
@@ -140,8 +140,6 @@ export function ConnectionPicker(props: ConnectionPickerProps) {
   const items = entries.length
     ? profileItems(buildFolderTree(entries), profileId, pickProfile)
     : [{ label: profiles.isPending ? "Loading…" : "No connections", disabled: true }];
-  const red = profile?.color === "red";
-  const tint = profileColor(profile?.color);
   const currentDatabase =
     database ?? session?.database ?? (profile && "database" in profile ? (profile.database ?? null) : null);
   const detail = session ? session.server.version : sessionFailed ? "Not connected" : profileId ? "Connecting…" : null;
@@ -154,21 +152,13 @@ export function ConnectionPicker(props: ConnectionPickerProps) {
         <span className={cn("h-2 w-2 shrink-0 rounded-full", PHASE_DOT[phase])} title={`Session ${phase}`} />
       )}
       <DropdownMenu items={items} align="end" className="max-h-[60vh] max-w-[360px] overflow-y-auto">
-        <PickerTrigger
+        <ProfileChip
+          profile={profile}
+          profileId={profileId}
           disabled={!!blockedReason}
           title={blockedReason ?? (profile ? `Connection: ${profile.name}` : "Connection")}
-          className={cn(
-            "max-w-[180px]",
-            // A red profile keeps its red chip, also while disabled.
-            red ? "bg-danger font-medium text-accent-fg enabled:hover:brightness-110" : "enabled:hover:bg-hover",
-          )}
-        >
-          {profile && <EngineIcon engine={profile.engine} size={12} />}
-          {!red && tint && <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: tint }} />}
-          <span className={cn("truncate", profile ? "font-medium" : "text-muted")}>
-            {profile?.name ?? (profileId ? "…" : "Choose a connection")}
-          </span>
-        </PickerTrigger>
+          className="max-w-[180px]"
+        />
       </DropdownMenu>
       {profileId !== null && engine?.per_database_connection && (
         <DatabasePicker

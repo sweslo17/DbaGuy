@@ -23,8 +23,10 @@ import {
   inspectionNotes,
   pickMode,
   pickOnError,
+  previewNote,
   queryContextLabel,
   queryContextOf,
+  READ_ONLY_RUN,
   RED_CONFIRM,
   retargeted,
   runChoices,
@@ -34,6 +36,7 @@ import {
   settledMode,
   withDatabase,
   withPath,
+  withSearchPath,
   type OnError,
   type RunForm,
 } from "./runForm";
@@ -44,19 +47,24 @@ type Inspection =
   | { status: "idle" }
   | { status: "reading"; profileId: string; path: string }
   | { status: "read"; profileId: string; path: string; file: FileInspection }
-  | { status: "failed"; profileId: string; path: string; message: string };
+  /** `retry`: reading again may help (not for a read-only connection, which refuses every read). */
+  | { status: "failed"; profileId: string; path: string; message: string; retry: boolean };
 
 const IDLE: Inspection = { status: "idle" };
-const READ_ONLY = "This connection is read-only: it cannot run files";
 const FROM_STATEMENT_HINT = "Statements before it are read, not sent; their SET, USE and PRAGMA settings still are";
 const ON_ERROR: { value: OnError; label: string }[] = [
   { value: "stop", label: "Stop at the error" },
   { value: "continue", label: "Skip it and continue" },
 ];
 
-/** Why the file could not be read: a read-only connection is said as the dialog says it; else the backend's words (404: "<path> is not a file"). */
-function readFailure(error: unknown): string {
-  return error instanceof ApiError && error.status === 403 ? READ_ONLY : errorMessage(error);
+/**
+ * Why the file could not be read: a read-only connection is said as the dialog says it (and reading again cannot
+ * help); else the backend's words (404: "<path> is not a file").
+ */
+function readFailure(error: unknown): { message: string; retry: boolean } {
+  return error instanceof ApiError && error.status === 403
+    ? { message: READ_ONLY_RUN, retry: false }
+    : { message: errorMessage(error), retry: true };
 }
 
 /** The inspection is of this form's file on this form's connection. */
@@ -121,7 +129,7 @@ export function RunFileDialog({ entry }: { entry: RunEntry }) {
       },
       (error: unknown) => {
         if (seq !== reads.current) return;
-        setInspection({ status: "failed", profileId, path: target, message: readFailure(error) });
+        setInspection({ status: "failed", profileId, path: target, ...readFailure(error) });
       },
     );
   };
@@ -238,7 +246,8 @@ export function RunFileDialog({ entry }: { entry: RunEntry }) {
             <Input
               id={searchPathId}
               value={form.searchPath}
-              onChange={(e) => setForm((current) => ({ ...current, searchPath: e.target.value }))}
+              // another search path: a red connection's box is asked again (CR-3: the file's names land there)
+              onChange={(e) => setForm((current) => withSearchPath(current, e.target.value))}
               placeholder="the connection's default"
               className="font-mono"
             />
@@ -371,13 +380,16 @@ function fileSummary(
           <span className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]" data-selectable>
             {inspection.message}
           </span>
-          <Button size="sm" onClick={retry}>
-            Read again
-          </Button>
+          {inspection.retry && (
+            <Button size="sm" onClick={retry}>
+              Read again
+            </Button>
+          )}
         </div>
       );
     case "read": {
       const { file } = inspection;
+      const shown = previewNote(file);
       return (
         <div className="flex flex-col gap-1.5 text-[12px]">
           <p className="text-muted tabular-nums">{formatSize(file.size)}</p>
@@ -389,7 +401,7 @@ function fileSummary(
           {notes.prominent.map((warning, i) => (
             <p
               key={i}
-              className="rounded-md border border-danger/40 bg-danger/10 p-2 font-medium whitespace-pre-wrap text-danger"
+              className="rounded-md border border-danger/40 bg-danger/10 p-2 font-medium whitespace-pre-wrap text-danger [overflow-wrap:anywhere]"
               data-selectable
             >
               {warning}
@@ -405,7 +417,7 @@ function fileSummary(
             </ul>
           )}
           {file.preview && <FileLines text={file.preview} firstLine={1} label="The file's first lines" />}
-          {file.preview_truncated && <p className="text-[11px] text-muted">The first 200 lines</p>}
+          {shown && <p className="text-[11px] text-muted">{shown}</p>}
         </div>
       );
     }
