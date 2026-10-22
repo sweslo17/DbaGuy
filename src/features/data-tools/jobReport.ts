@@ -125,7 +125,8 @@ export function codeLabel(code: string | null | undefined): string | null {
 function connectionLostHint(kind: JobKind, outcome: JobOutcomeKind): string | null {
   if (kind === "run_file") {
     return outcome === "unknown"
-      ? "Check the target before running anything again: the statement that was running may or may not have taken effect."
+      ? // the detail says what is known (a line that may or may not have run, or a transaction the server rolled back)
+        "Check the target before running anything again."
       : null; // rolled back (or not started): the server undid what was open, nothing to check
   }
   return outcome === "failed" || outcome === "not_started"
@@ -268,7 +269,8 @@ function runReport(outcome: JobOutcomeEvent, command: JobCommand | null, error: 
   // A run that stopped statement by statement and cannot place what it did (no `resume_at`) says why in its notes: it
   // counts statements it may not have applied, so the count is not promised (pre-flight M5, D1). A completed run
   // always says "applied": the backend takes a rolled-back tail out of its count, and its notes show beside it.
-  const doubtful = run?.mode === "statements" && resume === null && notes.length > 0;
+  // Only statement by statement stops (`stopped`); a job listed after a reload has no command and reads the same.
+  const doubtful = run?.mode !== "all_or_nothing" && resume === null && notes.length > 0;
   const stoppedApplied = (count: number) =>
     doubtful ? `${plural(count, "statement")} counted as applied; see the notes` : statementsApplied(count);
   switch (outcome.outcome) {
