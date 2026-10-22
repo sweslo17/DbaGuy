@@ -1,4 +1,4 @@
-import type { JobOutcomeEvent, JobProgressEvent } from "@/lib/api/types";
+import type { JobError, JobOutcomeEvent, JobOutcomeKind, JobProgressEvent, StoppedAt } from "@/lib/api/types";
 import { formatElapsed, formatSize, plural } from "@/lib/format";
 import { isSqliteBusy, sqliteBusyNote } from "@/lib/sqliteBusy";
 import { FILTER_RULE } from "../table-data/filterValue";
@@ -83,15 +83,13 @@ export const CODE_LABELS = {
   connection_lost: "Connection lost",
   cancelled: "Cancelled",
   invalid_command: "Refused by the backend",
-  session_busy: "The job's session was busy",
+  session_busy: "The job's session had closed",
 } as const;
 export type JobErrorCode = keyof typeof CODE_LABELS;
 
 const SQLITE_BUSY_LABEL = "SQLite file in use";
-/** What to do, where the backend's own text does not say it. */
+/** What to do, where the backend's own text does not say it (a lost connection's depends on the job: `connectionLostHint`). */
 const CODE_HINTS: Partial<Record<JobErrorCode, string>> = {
-  connection_lost:
-    "Check the target before running anything again: the statement that was running may or may not have taken effect.",
   transaction_open:
     "The connection had a transaction open before the job began (SQL Server: a login whose user options turn IMPLICIT_TRANSACTIONS on). Nothing was sent.",
   invalid_filter: FILTER_RULE,
@@ -114,26 +112,55 @@ const NEEDS_STATEMENTS: ReadonlySet<string> = new Set([
   "SQLITE_CONSTRAINT_FOREIGNKEY",
 ]);
 
+/** Own properties only: "constructor" and "__proto__" are not codes (the K2 rule). */
+const has = <T extends object>(table: T, key: string): key is Extract<keyof T, string> => Object.hasOwn(table, key);
+
 export function codeLabel(code: string | null | undefined): string | null {
   if (!code) return null;
   if (isSqliteBusy(code)) return SQLITE_BUSY_LABEL;
-  return code in CODE_LABELS ? CODE_LABELS[code as JobErrorCode] : null;
+  return has(CODE_LABELS, code) ? CODE_LABELS[code] : null;
 }
 
-function codeHint(code: string | null, kind: JobKind): string | null {
+/** What a lost connection means for what to do next: a run that is unknown must be checked, a dump wrote nothing. */
+function connectionLostHint(kind: JobKind, outcome: JobOutcomeKind): string | null {
+  if (kind === "run_file") {
+    return outcome === "unknown"
+      ? "Check the target before running anything again: the statement that was running may or may not have taken effect."
+      : null; // rolled back (or not started): the server undid what was open, nothing to check
+  }
+  return outcome === "failed" || outcome === "not_started"
+    ? "The connection was lost: nothing was written. Dump again when it is back."
+    : null;
+}
+
+function codeHint(code: string | null, kind: JobKind, outcome: JobOutcomeKind): string | null {
   if (isSqliteBusy(code)) return sqliteBusyNote(kind === "dump" ? "dump again" : "run the file again");
-  return code && code in CODE_HINTS ? (CODE_HINTS[code as JobErrorCode] ?? null) : null;
+  if (code === "connection_lost") return connectionLostHint(kind, outcome);
+  return code && has(CODE_HINTS, code) ? (CODE_HINTS[code] ?? null) : null;
 }
 
 const fileName = (path: string | null | undefined) => (path ? (path.split("/").pop() ?? path) : "the file");
 const runCommand = (command: JobCommand | null) => (command?.type === "run_file" ? command : null);
 const statementsApplied = (count: number) => `${plural(count, "statement")} applied`;
 
-function errorLine(outcome: JobOutcomeEvent | null, state: JobState): ErrorLine | null {
-  const error = outcome?.error ?? (state.error ? { ...state.error, line: null, statement: null } : null);
-  if (!error) return null;
+/** An error of a job (the one that ended it, or one a run skipped) with its label. */
+function toErrorLine(error: JobError): ErrorLine {
   const code = error.code ?? null;
   return { line: error.line ?? null, statement: error.statement ?? null, code, label: codeLabel(code), message: error.message };
+}
+
+/** The error that ended the job: the outcome's, or the live one before an ending without an outcome. */
+function endingError(outcome: JobOutcomeEvent | null, state: JobState): ErrorLine | null {
+  const error = outcome?.error ?? state.error;
+  return error ? toErrorLine(error) : null;
+}
+
+/**
+ * Starting the same job again from its form. Only a job this page started can be (a listed one has no command here:
+ * a dump's, a lost run's or any other).
+ */
+function againAction(kind: JobKind, command: JobCommand | null): JobAction[] {
+  return command ? [{ kind: "again", label: kind === "dump" ? "Dump again…" : "Run again…", patch: null }] : [];
 }
 
 const NOTHING_WRITTEN_NOTE = "A file that was already at that path is as it was.";
@@ -142,8 +169,7 @@ const NOT_KNOWN_NOTE = "What was applied is not known: check the target.";
 type Words = Omit<JobReport, "error" | "skipped" | "moreSkipped" | "hint">;
 
 function dumpReport(outcome: JobOutcomeEvent, command: JobCommand | null, error: ErrorLine | null): Words {
-  // Only a dump this page started can be started again from its form (a listed one has no command here, L4).
-  const again: JobAction[] = command ? [{ kind: "again", label: "Dump again…", patch: null }] : [];
+  const again = againAction("dump", command);
   const notes = outcome.warnings;
   switch (outcome.outcome) {
     case "completed": {
@@ -200,7 +226,8 @@ function runActions(outcome: JobOutcomeEvent, command: JobCommand | null, code: 
         patch: { mode: "statements", on_error: onError, from_statement: resume.statement },
       },
     ];
-    if (at && resume.statement === at.statement && !(code && NOT_SKIPPABLE.has(code))) {
+    // Not after a Cancel: the user stopped it, there is no failure to skip (running it again from there stays)
+    if (at && resume.statement === at.statement && !outcome.cancelled && !(code && NOT_SKIPPABLE.has(code))) {
       actions.push({
         kind: "again",
         label: "Skip it and continue",
@@ -227,9 +254,7 @@ function runActions(outcome: JobOutcomeEvent, command: JobCommand | null, code: 
       },
     ];
   }
-  if (outcome.outcome !== "completed" && outcome.outcome !== "unknown") {
-    return [{ kind: "again", label: "Run again…", patch: null }];
-  }
+  if (outcome.outcome !== "completed" && outcome.outcome !== "unknown") return againAction("run_file", command);
   return [];
 }
 
@@ -240,6 +265,10 @@ function runReport(outcome: JobOutcomeEvent, command: JobCommand | null, error: 
   const resume = outcome.resume_at ?? null;
   const actions = runActions(outcome, command, error?.code ?? null);
   const where = at ? ` at line ${at.line.toLocaleString()}` : "";
+  // Statement by statement, a run that cannot place what it did (no `resume_at`) and says why in its notes counts
+  // statements it may not have applied: the count is not promised (pre-flight M5, D1)
+  const doubtful = run?.mode === "statements" && resume === null && notes.length > 0;
+  const applied = (count: number) => (doubtful ? `${plural(count, "statement")} counted as applied; see the notes` : statementsApplied(count));
   switch (outcome.outcome) {
     case "completed": {
       const undone = resume !== null;
@@ -252,7 +281,7 @@ function runReport(outcome: JobOutcomeEvent, command: JobCommand | null, error: 
       return {
         tone: undone || skipped || notes.length ? "warning" : "success",
         title,
-        detail: `${statementsApplied(outcome.statements)} · ${plural(outcome.rows, "row")} affected`,
+        detail: `${applied(outcome.statements)} · ${plural(outcome.rows, "row")} affected`,
         notes,
         actions,
       };
@@ -277,7 +306,7 @@ function runReport(outcome: JobOutcomeEvent, command: JobCommand | null, error: 
       return {
         tone: outcome.cancelled ? "warning" : "danger",
         title: `${outcome.cancelled ? "Cancelled" : "Stopped"}${where}`,
-        detail: statementsApplied(outcome.statements),
+        detail: applied(outcome.statements),
         notes,
         actions,
       };
@@ -295,22 +324,38 @@ function runReport(outcome: JobOutcomeEvent, command: JobCommand | null, error: 
         title: `Outcome unknown${where}`,
         // Statement by statement and the backend can place the stop (it gave `resume_at`), the statements before it
         // took effect; in one transaction, or when what ran before it is not known, nothing can be said
-        detail:
-          run?.mode === "statements" && at && resume
-            ? `${statementsApplied(outcome.statements)} before line ${at.line.toLocaleString()}; that line may or may not have taken effect.`
-            : NOT_KNOWN_NOTE,
+        detail: run?.mode === "statements" && at && resume ? lostAt(outcome.statements, at, resume) : NOT_KNOWN_NOTE,
         notes,
         actions,
       };
   }
 }
 
+/**
+ * A statement-by-statement run whose link died at `at`. When the file's own transaction was open, the server rolled
+ * it back as the connection ended: `resume` (where a run again starts) is then the transaction's first statement, and
+ * what was applied is what came before that one, not before the line that was running.
+ */
+function lostAt(statements: number, at: StoppedAt, resume: StoppedAt): string {
+  const count = statementsApplied(statements);
+  if (resume.statement >= at.statement) {
+    return `${count} before line ${at.line.toLocaleString()}; that line may or may not have taken effect.`;
+  }
+  return `${count} before line ${resume.line.toLocaleString()}; the file's transaction from there was rolled back by the server when the connection was lost at line ${at.line.toLocaleString()}.`;
+}
+
+/** The title of a job the backend could not report on. */
+const LOSS_TITLES: Partial<Record<NonNullable<JobState["loss"]>, string>> = {
+  not_listed: "The backend has no record of this job: it restarted, or never got the command",
+  no_outcome: "The job finished without reporting an outcome",
+  session_gone: "The backend stopped before the job reported its outcome",
+};
+
 /** The frontend's own ending (no outcome from the backend): what is known, and nothing more. */
 function lossReport(view: JobView): JobReport {
   const { state, kind } = view;
   const base = { error: null, hint: null, notes: [], skipped: [], moreSkipped: 0 };
-  const again: JobAction = { kind: "again", label: kind === "dump" ? "Dump again…" : "Run again…", patch: null };
-  const canAgain = view.command ? [again] : [];
+  const canAgain = againAction(kind, view.command);
   switch (state.loss) {
     case "open_failed":
       return { ...base, tone: "danger", title: "Could not connect: nothing was sent", detail: state.openError?.message ?? null, actions: [] };
@@ -323,10 +368,7 @@ function lossReport(view: JobView): JobReport {
         actions: canAgain,
       };
     default: {
-      const notListed = state.loss === "not_listed";
-      const title = notListed
-        ? "The backend has no record of this job: it restarted, or never got the command"
-        : "The backend stopped before the job reported its outcome";
+      const title = LOSS_TITLES[state.loss ?? "session_gone"] ?? "The backend stopped before the job reported its outcome";
       if (kind === "dump") {
         return {
           ...base,
@@ -358,19 +400,13 @@ export function jobReport(view: JobView): JobReport | null {
   if (state.phase !== "ended") return null;
   const outcome = state.outcome;
   if (!outcome) return lossReport(view);
-  const error = errorLine(outcome, state);
+  const error = endingError(outcome, state);
   const words = kind === "dump" ? dumpReport(outcome, command, error) : runReport(outcome, command, error);
-  const skipped = outcome.errors.map((item) => ({
-    line: item.line ?? null,
-    statement: item.statement ?? null,
-    code: item.code ?? null,
-    label: codeLabel(item.code),
-    message: item.message,
-  }));
+  const skipped = outcome.errors.map(toErrorLine);
   return {
     ...words,
     error,
-    hint: codeHint(error?.code ?? null, kind),
+    hint: codeHint(error?.code ?? null, kind, outcome.outcome),
     skipped,
     moreSkipped: Math.max(0, outcome.error_count - skipped.length),
   };
@@ -458,7 +494,8 @@ export function jobNotification(
   const { state } = view;
   const report = jobReport(view);
   if (!report || focused || thresholdS <= 0 || state.endedAt === null) return null;
-  if (state.cancelRequestedAt !== null || state.loss === "open_failed" || state.loss === "not_sent") return null;
+  // A job the user cancelled (here, or in another window: the outcome says so) or one that never started
+  if (state.cancelRequestedAt !== null || state.outcome?.cancelled || state.loss === "open_failed" || state.loss === "not_sent") return null;
   const took = state.endedAt - state.startedAt;
   if (took < thresholdS * 1000) return null;
   const what = view.kind === "dump" ? "Dump" : "SQL file run";

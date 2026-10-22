@@ -135,6 +135,13 @@ describe("a job's state", () => {
     expect([state.reconnecting, state.cancelRequestedAt]).toEqual([true, 7]);
     expect(run([{ type: "socket", open: true }], state).reconnecting).toBe(false);
   });
+
+  it("keeps the first Cancel's time when a second is sent: the dialog escalates from it", () => {
+    const state = run([sent, { type: "cancel_sent", at: 7 }, { type: "cancel_sent", at: 12 }]);
+    expect(state.cancelRequestedAt).toBe(7);
+    const done = run([server(outcome(), 20), { type: "cancel_sent", at: 25 }], state);
+    expect(done.cancelRequestedAt).toBe(7); // an ended job takes no more
+  });
 });
 
 describe("when the command was sent (pre-flight M2)", () => {

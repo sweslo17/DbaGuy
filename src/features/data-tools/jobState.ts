@@ -47,6 +47,7 @@ export interface JobState {
   error: { message: string; code: string | null } | null;
   /** The job's server messages and warnings, as they came (the backend sends at most MAX_JOB_MESSAGES). */
   messages: { severity: string; text: string }[];
+  /** When the first Cancel was sent (a second one keeps it: the dialog escalates from it). */
   cancelRequestedAt: number | null;
   /** The socket is closed and trying again: events may be late, never lost (the backend replays its last ones). */
   reconnecting: boolean;
@@ -190,7 +191,7 @@ export function jobReducer(state: JobState, event: JobEvent): JobState {
     case "not_listed":
       return state.phase === "ended" || !state.sent ? state : ended(state, event.at, "not_listed");
     case "cancel_sent":
-      return state.phase === "ended" ? state : { ...state, cancelRequestedAt: event.at };
+      return state.phase === "ended" ? state : { ...state, cancelRequestedAt: state.cancelRequestedAt ?? event.at }; // the first Cancel's time stays
     case "listed":
       return onListed(state, event.info, event.at);
     case "retry":

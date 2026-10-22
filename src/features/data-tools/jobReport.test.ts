@@ -158,6 +158,25 @@ describe("a run's outcome in words", () => {
     const busy = outcome({ outcome: "rolled_back", error: { code: "SQLITE_BUSY", message: "database is locked" } });
     const said = report(busy, run({ mode: "all_or_nothing" }));
     expect([said.error?.label, said.hint]).toEqual(["SQLite file in use", sqliteBusyNote("run the file again")]);
+    expect(said.hint).toBe(
+      "Another tab still has an open result of this database file, or another program is using it: finish or close that result, then run the file again.",
+    );
+  });
+
+  it("gives the lost-connection hint only where it is true: an unknown run must be checked, a rolled-back one need not", () => {
+    const lost = { code: "connection_lost", message: "Connection to the server was lost" };
+    const rolledBack = report(outcome({ outcome: "rolled_back", error: lost }), run({ mode: "all_or_nothing" }));
+    expect([rolledBack.title, rolledBack.hint]).toEqual(["Nothing was applied: the transaction was rolled back", null]);
+    const unknown = report(outcome({ outcome: "unknown", error: lost }), run({ mode: "all_or_nothing" }));
+    expect(unknown.hint).toContain("Check the target");
+  });
+
+  it("looks codes up as own properties only: constructor and __proto__ are no codes", () => {
+    for (const code of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+      expect(codeLabel(code), code).toBeNull();
+      const said = report(outcome({ outcome: "rolled_back", error: { code, message: "x" } }), run({ mode: "all_or_nothing" }));
+      expect([said.error?.label, said.hint], code).toEqual([null, null]);
+    }
   });
 
   it("calls a partial run partly applied and offers the rest statement by statement", () => {
@@ -182,6 +201,57 @@ describe("a run's outcome in words", () => {
     expect([skipped.tone, skipped.title, skipped.moreSkipped, skipped.skipped[0].line]).toEqual(["warning", "Ran x.sql with 102 errors skipped", 101, 2]);
     const undone = report(outcome({ resume_at: { line: 2, statement: 2 } }));
     expect([undone.title, undone.actions.map((a) => a.label)]).toEqual(["Read to the end, but some statements were rolled back", ["Run again from line 2"]]);
+  });
+
+  it("offers no skip after a Cancel: there is no failure to skip, running it again from there stays (fix 6)", () => {
+    const cancelled = outcome({
+      outcome: "stopped",
+      cancelled: true,
+      statements: 40,
+      stopped_at: { line: 90, statement: 41 },
+      resume_at: { line: 90, statement: 41 },
+      error: { line: 90, statement: 41, code: "cancelled", message: "Cancelled" },
+    });
+    const said = report(cancelled);
+    expect([said.tone, said.title, said.detail]).toEqual(["warning", "Cancelled at line 90", "40 statements applied"]);
+    expect(said.actions.map((a) => a.label)).toEqual(["Run again from line 90"]);
+  });
+
+  it("does not promise a count it cannot stand behind: counted as applied, see the notes (fix 2)", () => {
+    const notes = ["Line 4 may have committed or rolled back the file's transaction from line 2: the statements from there on may or may not be applied"];
+    const stopped = outcome({ outcome: "stopped", statements: 12, stopped_at: { line: 9, statement: 6 }, resume_at: null, warnings: notes });
+    expect(report(stopped).detail).toBe("12 statements counted as applied; see the notes");
+    expect(report(stopped).notes).toEqual(notes);
+    const completed = outcome({ statements: 12, rows: 5, resume_at: null, warnings: notes });
+    expect(report(completed).detail).toBe("12 statements counted as applied; see the notes · 5 rows affected");
+    // without notes, in one transaction, or with a place to run again from, the plain count stands
+    expect(report(outcome({ outcome: "stopped", statements: 12, resume_at: null, stopped_at: { line: 9, statement: 6 } })).detail).toBe("12 statements applied");
+    expect(report(completed, run({ mode: "all_or_nothing" })).detail).toBe("12 statements applied · 5 rows affected");
+    expect(report(outcome({ statements: 12, resume_at: { line: 2, statement: 2 }, warnings: notes })).detail).toBe("12 statements applied · 0 rows affected");
+  });
+
+  it("names the line a lost connection's rolled-back file transaction began at, not the line that was running (fix 12)", () => {
+    const lost = outcome({
+      outcome: "unknown",
+      statements: 1,
+      stopped_at: { line: 40, statement: 30 },
+      resume_at: { line: 2, statement: 2 },
+      error: { line: 40, statement: 30, code: "connection_lost", message: "Connection to the server was lost" },
+    });
+    const said = report(lost);
+    expect(said.detail).toBe("1 statement applied before line 2; the file's transaction from there was rolled back by the server when the connection was lost at line 40.");
+    expect(said.actions.map((a) => a.label)).toEqual(["Run again from line 2"]);
+  });
+
+  it("tells a run that did not start: cancelled, or refused", () => {
+    expect(report(outcome({ outcome: "not_started", cancelled: true })).title).toBe("Cancelled before anything ran");
+    const refused = report(outcome({ outcome: "not_started", error: { code: "read_only", message: "This connection is read-only" } }));
+    expect([refused.tone, refused.title, refused.error?.label, refused.actions.map((a) => a.label)]).toEqual([
+      "danger",
+      "Not started: nothing was run",
+      "Read-only connection",
+      ["Run again…"],
+    ]);
   });
 
   it("offers nothing to run again for a job listed after a reload (its command is not here)", () => {
@@ -209,6 +279,23 @@ describe("a dump's outcome in words", () => {
     expect(report(dumped({ outcome: "failed", cancelled: true }), dump).title).toBe("Dump cancelled: nothing was written");
     const filter = report(dumped({ outcome: "not_started", error: { code: "invalid_filter", message: "The filter must be a condition on the table's rows (what follows WHERE), and nothing else" } }), dump);
     expect([filter.title, filter.hint]).toEqual(["The dump did not start", FILTER_RULE]);
+  });
+
+  it("says a dump whose outcome is unknown must be checked, and offers to dump again", () => {
+    const unknown = report(dumped({ outcome: "unknown" }), dump);
+    expect([unknown.tone, unknown.title, unknown.detail, unknown.actions.map((a) => a.label)]).toEqual([
+      "danger",
+      "The dump's outcome is unknown",
+      "Check whether /tmp/d.sql was written.",
+      ["Dump again…"],
+    ]);
+  });
+
+  it("says a lost connection wrote nothing, for a dump; not the run's check-the-target hint", () => {
+    const lost = { code: "connection_lost", message: "Connection to the server was lost" };
+    expect(report(dumped({ outcome: "failed", error: lost }), dump).hint).toBe("The connection was lost: nothing was written. Dump again when it is back.");
+    expect(report(dumped({ outcome: "not_started", error: lost }), dump).hint).toContain("nothing was written");
+    expect(report(dumped({ outcome: "unknown", error: lost }), dump).hint).toBeNull();
   });
 
   it("offers no dump again for a job listed after a reload (its command is not here; pre-flight L4)", () => {
@@ -242,6 +329,17 @@ describe("a job the backend could not report on", () => {
     expect(lost(sentState({ statements: 40 }), run()).detail).toBe(
       "About 40 statements had run by then (the last progress); any in a transaction the file had open are rolled back by the server, and the statement running may or may not have taken effect.",
     );
+  });
+
+  it("says a request that finished without an outcome did exactly that", () => {
+    const finished = jobReducer(jobReducer(openingJob(0), { type: "sent", at: 1 }), {
+      type: "server",
+      at: 2,
+      event: { type: "finished", request_id: "r1", elapsed_ms: 5, in_transaction: false, transaction_failed: false, cancelled: false, timed_out: false, skipped: false },
+    });
+    const said = lost(finished, run());
+    expect([said.tone, said.title]).toEqual(["danger", "The job finished without reporting an outcome"]);
+    expect(said.title).not.toBe(lost(sentState(), run()).title);
   });
 
   it("says a dump that did not finish wrote no file", () => {
@@ -280,6 +378,10 @@ describe("the error codes", () => {
       expect(codeLabel(code), code).toBeTruthy();
     }
     expect([codeLabel("42P01"), codeLabel("SQLITE_BUSY_SNAPSHOT"), codeLabel(null)]).toEqual([null, "SQLite file in use", null]);
+  });
+
+  it("calls a busy session what the backend raises it for: a closed one", () => {
+    expect(codeLabel("session_busy")).toBe("The job's session had closed");
   });
 });
 
@@ -344,5 +446,10 @@ describe("the notification of a long job", () => {
     expect(jobNotification(titled(long(outcome(), 10_000)), 15, false)).toBeNull();
     expect(jobNotification(titled(done), 0, false)).toBeNull();
     expect(jobNotification(titled({ ...long(outcome({ outcome: "rolled_back", cancelled: true })), cancelRequestedAt: 5 }), 15, false)).toBeNull();
+  });
+
+  it("stays quiet for a job that was cancelled elsewhere: the outcome says so (fix 7)", () => {
+    expect(jobNotification(titled(long(outcome({ outcome: "rolled_back", cancelled: true }))), 15, false)).toBeNull();
+    expect(jobNotification(titled(long(outcome({ job: "dump", outcome: "failed", cancelled: true })), dump), 15, false)).toBeNull();
   });
 });
