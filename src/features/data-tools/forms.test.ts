@@ -10,9 +10,12 @@ import {
   dumpScope,
   dumpTitle,
   initialDumpForm,
+  kindCount,
   MAX_DUMP_TABLES,
+  planLineText,
   planSummary,
   planTables,
+  planWarnings,
 } from "./dumpForm";
 import type { DumpEntry, RunEntry } from "./entryPoints";
 import {
@@ -310,6 +313,23 @@ describe("the forms' helpers", () => {
       { kind: "view", count: 1, rows: null },
     ]);
     expect(planTables([{ kind: "table", name: "a", notes: [] }, { kind: "view", name: "v", notes: [] }])).toEqual(["a"]);
+  });
+
+  it("says the plan's lines in English, the rows only when known", () => {
+    expect(planLineText({ kind: "table", count: 12, rows: 1_234_567 })).toBe("12 tables · ≈ 1,234,567 rows");
+    expect(planLineText({ kind: "table", count: 1, rows: 0 })).toBe("1 table · ≈ 0 rows");
+    expect(planLineText({ kind: "view", count: 2, rows: null })).toBe("2 views");
+    expect(["policy", "security policy", "statistics", "refresh", "materialized view", "alias type"].map((kind) => kindCount(2, kind)))
+      .toEqual(["2 policies", "2 security policies", "2 statistics", "2 refreshes", "2 materialized views", "2 alias types"]);
+    expect(kindCount(1, "policy")).toBe("1 policy");
+  });
+
+  it("puts a filtered dump's warning first, in red, and keeps the rest in order", () => {
+    const filtered = "The file holds only the rows of public.t that match a filter: restoring it drops the table and replaces it with those rows";
+    expect(planWarnings(["Disk almost full", filtered, "Not a consistent snapshot"])).toEqual({
+      prominent: [filtered],
+      other: ["Disk almost full", "Not a consistent snapshot"],
+    });
   });
 
   it("dumps again with the job's own choices", () => {

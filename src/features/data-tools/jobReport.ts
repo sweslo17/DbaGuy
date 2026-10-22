@@ -485,6 +485,22 @@ export function progressView(view: JobView, now: number, tables: readonly string
   };
 }
 
+/**
+ * What Cancel does to a running job, said beside the button (spec ⑥ §3.6): a dump writes no file; a run in one
+ * transaction is rolled back; a run statement by statement keeps what took effect, except a transaction the file opened
+ * and did not commit, which is rolled back (pre-flight M5). Nothing for a job listed after a reload (its mode is not
+ * known here), nor during a run's COMMIT, which Cancel no longer stops.
+ */
+export function cancelNote(view: JobView): string | null {
+  const { command, state } = view;
+  if (!command || state.phase === "ended") return null;
+  if (command.type === "dump") return "Cancel writes no file";
+  if (state.progress?.stage === "commit") return null;
+  return command.mode === "all_or_nothing"
+    ? "Cancel rolls the whole run back"
+    : "Cancel stops the run: what took effect stays, except a transaction the file opened and did not commit (rolled back)";
+}
+
 /** One line for the Jobs list: the progress while it runs, the outcome's title once it ended. */
 export function jobSummary(view: JobView, now: number): { text: string; tone: Tone | null } {
   const report = jobReport(view);

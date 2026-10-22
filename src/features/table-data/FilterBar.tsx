@@ -3,6 +3,7 @@ import { useState, type KeyboardEvent } from "react";
 import { DropdownMenu, type MenuItem } from "@/components/ui/ContextMenu";
 import { cn } from "@/lib/cn";
 import { isImeKeyEvent } from "@/lib/ime";
+import { FILTER_RULE } from "./filterValue";
 
 interface FilterBarProps {
   /** The applied filter: the input shows it again whenever it changes, and Escape brings it back. */
@@ -80,7 +81,8 @@ export function FilterBar(props: FilterBarProps) {
         disabled={disabled}
         aria-label="Filter (WHERE)"
         aria-invalid={invalid}
-        placeholder="e.g. id > 100 AND name LIKE 'A%'  (Enter to apply)"
+        placeholder="e.g. id > 100 AND name LIKE 'A%'  (one condition; Enter to apply)"
+        title={FILTER_RULE}
         className="h-full min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted/70"
       />
       {rejected && (

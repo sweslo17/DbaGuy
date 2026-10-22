@@ -25,6 +25,11 @@ export interface DumpEntry {
   target: DumpTarget;
   /** The table-data tab's filter: "Only rows matching the filter" (one table). */
   filter: string | null;
+  /**
+   * The table-data tab it was opened from: while that tab has staged changes, the dialog says the dump does not carry
+   * them (it reads what the server holds; 06b pre-flight L8).
+   */
+  tabId?: string;
 }
 
 export interface RunEntry {

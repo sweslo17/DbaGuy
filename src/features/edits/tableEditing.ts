@@ -54,6 +54,8 @@ export const NOTHING_SELECTED = "Select cells in the grid first";
 export const CLOSE_WHILE_COMMITTING = "A commit is running: wait for it to end, or cancel it in its dialog";
 /** The export dialog's line while changes are staged (spec ⑤ §3.6.6): it writes what the server holds. */
 export const NOT_IN_EXPORT = "Staged changes are not committed and are not in the export";
+/** The dump dialog's line while the table tab it came from has staged changes (06b pre-flight L8). */
+export const NOT_IN_DUMP = "Staged changes are not in the dump: it reads what the server holds";
 
 export const COPY_TEXT = "Copy text";
 export const COPY_FAILED = "Could not copy the text";

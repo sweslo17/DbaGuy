@@ -1,0 +1,141 @@
+import { Loader2 } from "lucide-react";
+import { EngineIcon } from "@/components/EngineIcon";
+import { Button } from "@/components/ui/Button";
+import { cn } from "@/lib/cn";
+import { useNow } from "@/lib/useNow";
+import { useProfiles } from "../connections/hooks";
+import { profileColor } from "../connections/profileColors";
+import { jobReport, progressView, type ErrorLine, type JobReport, type Tone } from "./jobReport";
+import type { JobRecord } from "./jobsStore";
+
+/*
+ * A data-tools job's view (spec ⑥ §3.6): the connection it runs on, its progress while it runs, its outcome once it
+ * ended. Every word about what happened comes from `jobReport` (never made up here). Each view reads only the record
+ * it is given: the dialog that shows it subscribes to that one job (Q1).
+ */
+
+export const TONE_CLASS: Record<Tone, string> = {
+  success: "text-success",
+  warning: "text-warning",
+  danger: "text-danger",
+  muted: "text-muted",
+};
+
+/** The connection a dialog works on: its engine, its colour and name (red, a production one, in red) and the database. */
+export function ConnectionLine({ profileId, database }: { profileId: string; database?: string | null }) {
+  const profiles = useProfiles();
+  const profile = profiles.data?.find((entry) => entry.profile.id === profileId)?.profile ?? null;
+  if (!profile) return null;
+  const red = profile.color === "red";
+  const tint = profileColor(profile.color);
+  return (
+    <p className="flex min-w-0 items-center gap-1.5 text-[12px]" data-selectable>
+      <EngineIcon engine={profile.engine} size={12} className="shrink-0 text-muted" />
+      {tint && <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: tint }} />}
+      <span className={cn("truncate", red ? "font-medium text-danger" : "font-medium")}>{profile.name}</span>
+      {database && <span className="shrink-0 text-muted">· database {database}</span>}
+    </p>
+  );
+}
+
+/** A running job: what it is doing, how far it is, and a warning it gave (SQL Server: what another Cancel does). */
+export function JobProgressView({ record }: { record: JobRecord }) {
+  const now = useNow(500);
+  const { kind, command, state } = record;
+  const progress = progressView({ kind, command, state }, now, record.tables);
+  const warning = state.messages.findLast((message) => message.severity === "warning")?.text ?? null;
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex min-w-0 items-center gap-2 text-[13px]">
+        <Loader2 size={14} className="shrink-0 animate-spin text-muted" />
+        <span className="min-w-0 [overflow-wrap:anywhere]" data-selectable>
+          {progress.headline}
+        </span>
+      </div>
+      {progress.percent !== null && (
+        <div
+          className="h-1 overflow-hidden rounded bg-border"
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.round(progress.percent)}
+        >
+          <div className="h-full rounded bg-accent" style={{ width: `${progress.percent}%` }} />
+        </div>
+      )}
+      {progress.detail && <p className="text-[12px] text-muted tabular-nums">{progress.detail}</p>}
+      {progress.eta && <p className="text-[12px] text-muted">{progress.eta}</p>}
+      {/* Said only while the socket is down: whether the backend comes back is the banner's to say (pre-flight L10). */}
+      {state.reconnecting && <p className="text-[12px] text-warning">Reconnecting to the backend…</p>}
+      {warning && (
+        <p className="text-[12px] whitespace-pre-wrap text-warning" data-selectable>
+          {warning}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** The outcome's title, in its tone. */
+export function ReportTitle({ report }: { report: JobReport }) {
+  return (
+    <p className={cn("text-[13px] font-semibold [overflow-wrap:anywhere]", TONE_CLASS[report.tone])} data-selectable>
+      {report.title}
+    </p>
+  );
+}
+
+function ErrorBox({ error, onShowLine }: { error: ErrorLine; onShowLine?: (line: number) => void }) {
+  const line = error.line;
+  return (
+    <div className="flex flex-col gap-1 rounded-md border border-danger/40 bg-danger/10 p-2 text-[12px]">
+      {(error.label || error.code) && (
+        <p className="flex flex-wrap items-baseline gap-x-2">
+          {error.label && <span className="font-medium text-danger">{error.label}</span>}
+          {error.code && (
+            <span className="font-mono text-[11px] text-muted" data-selectable>
+              {error.code}
+            </span>
+          )}
+        </p>
+      )}
+      <p className="whitespace-pre-wrap [overflow-wrap:anywhere]" data-selectable>
+        {error.message}
+      </p>
+      {onShowLine && line !== null && (
+        <div>
+          <Button size="sm" onClick={() => onShowLine(line)}>
+            Show line {line.toLocaleString()}
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** How the job ended (`jobReport`): its title, the facts, the error with its label, what to do, and the notes. */
+export function JobReportView({ record, onShowLine }: { record: JobRecord; onShowLine?: (line: number) => void }) {
+  const report = jobReport(record);
+  if (!report) return null;
+  return (
+    <div className="flex flex-col gap-2 text-[12px]">
+      <ReportTitle report={report} />
+      {report.detail && (
+        <p className="whitespace-pre-wrap [overflow-wrap:anywhere]" data-selectable>
+          {report.detail}
+        </p>
+      )}
+      {report.error && <ErrorBox error={report.error} onShowLine={onShowLine} />}
+      {report.hint && <p className="text-muted">{report.hint}</p>}
+      {report.notes.length > 0 && (
+        <ul className="flex list-disc flex-col gap-1 pl-4 text-warning">
+          {report.notes.map((note, i) => (
+            <li key={i} className="whitespace-pre-wrap [overflow-wrap:anywhere]" data-selectable>
+              {note}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}

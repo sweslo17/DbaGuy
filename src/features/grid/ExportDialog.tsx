@@ -1,16 +1,17 @@
 import { Loader2 } from "lucide-react";
-import { useEffect, useEffectEvent, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import { useStore } from "zustand";
 import { Button } from "@/components/ui/Button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Dialog } from "@/components/ui/Dialog";
 import { Checkbox, FieldRow, Input, Select } from "@/components/ui/Field";
+import { FilePathField } from "@/components/ui/FilePathField";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
 import type { FormatKind, RowFormatOptions } from "@/lib/api/types";
-import { plural } from "@/lib/format";
-import { isImeKeyEvent } from "@/lib/ime";
-import { canChooseFiles, chooseSavePath } from "@/lib/native";
+import { BROWSER_PATH_HINT, pathProblem as typedPathProblem, safeFileStem } from "@/lib/filePaths";
+import { formatElapsed, plural } from "@/lib/format";
+import { chooseSavePath } from "@/lib/native";
 import { useNow } from "@/lib/useNow";
 import { useEngineInfo } from "../connections/hooks";
 import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
@@ -61,7 +62,6 @@ const NULL_TEXTS = [
   { value: "", label: "Empty" },
   { value: "NULL", label: "NULL" },
 ];
-const BROWSER_PATH_HINT = "An absolute path on this Mac, in an existing folder; an existing file is replaced";
 /** The backend's own placeholder when no INSERT target is known. */
 const TABLE_PLACEHOLDER = "table_name";
 /**
@@ -72,11 +72,8 @@ const CANCEL_AGAIN_MS = 1000;
 
 type Outcome = { kind: "error"; message: string; code?: string | null } | { kind: "cancelled" };
 
-/** `<title>.<ext>` without the characters macOS does not allow in a file name (`/` and `:`). */
-function defaultFileName(title: string, ext: string): string {
-  const stem = title.replace(/[/:]/g, "").trim();
-  return `${stem || "export"}.${ext}`;
-}
+/** `<title>.<ext>` without what macOS does not take in a file name (`safeFileStem`). */
+const defaultFileName = (title: string, ext: string) => `${safeFileStem(title, "export")}.${ext}`;
 
 const qualified = (table: TableName) => (table.schema ? `${table.schema}.${table.name}` : table.name);
 
@@ -96,12 +93,6 @@ function tableTarget(text: string, prefill: TableName | null): Pick<RowFormatOpt
 function successMessage(done: ExecutionState, path: string): string {
   const reported = done.messages.findLast((message) => message.severity === "info")?.text;
   return reported ?? `Exported ${plural(done.progressRows ?? 0, "row")} to ${path}`;
-}
-
-function formatElapsed(ms: number): string {
-  const seconds = Math.max(0, Math.floor(ms / 1000));
-  if (seconds < 60) return `${seconds} s`;
-  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
 function ExportProgress({ path, rows, startedAt }: { path: string; rows: number; startedAt: number }) {
@@ -192,9 +183,8 @@ export function ExportDialog({
   }, [outcome]);
 
   const spec = FORMATS[format];
-  const choosable = canChooseFiles();
   const target = path.trim();
-  const pathProblem = target && !target.startsWith("/") ? "Enter an absolute path (starting with /)" : null;
+  const pathProblem = typedPathProblem(target);
   const canStart = !running && !!target && !pathProblem;
 
   /** A file name ending in the old format's extension follows the format. */
@@ -213,13 +203,13 @@ export function ExportDialog({
     dropUnsupportedFormat();
   }, [formats, format]);
 
-  const choose = async () => {
+  const choose = async (): Promise<string | null> => {
     try {
       const filters = [{ name: spec.label, extensions: [spec.ext] }];
-      const chosen = await chooseSavePath(defaultFileName(title, spec.ext), filters);
-      if (chosen) setPath(chosen); // null: the user cancelled the save panel
+      return await chooseSavePath(defaultFileName(title, spec.ext), filters); // null: the user cancelled the panel
     } catch (error) {
       setOutcome({ kind: "error", message: `Could not open the save panel: ${errorMessage(error)}` });
+      return null;
     }
   };
 
@@ -277,13 +267,6 @@ export function ExportDialog({
     if (running && connected) return;
     if (!next) setOutcome(null);
     onOpenChange(next);
-  };
-
-  const onPathKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter" && !isImeKeyEvent(e)) {
-      e.preventDefault();
-      start();
-    }
   };
 
   // Export keeps its slot (disabled while running), so a double click on it never lands on Cancel.
@@ -373,26 +356,16 @@ export function ExportDialog({
               />
             </FieldRow>
           )}
-          <FieldRow label="File" hint={choosable || pathProblem ? undefined : BROWSER_PATH_HINT}>
-            <div className="flex gap-2">
-              <Input
-                ref={pathInput}
-                value={path}
-                onChange={(e) => setPath(e.target.value)}
-                onKeyDown={onPathKeyDown}
-                placeholder={choosable ? "Choose a file…" : `/path/to/${defaultFileName(title, spec.ext)}`}
-                aria-label="File path"
-                aria-invalid={!!pathProblem}
-                className="font-mono"
-              />
-              {choosable && (
-                <Button className="shrink-0" onClick={() => void choose()}>
-                  Choose…
-                </Button>
-              )}
-            </div>
-            {pathProblem && <p className="mt-1 text-[11px] text-danger">{pathProblem}</p>}
-          </FieldRow>
+          <FilePathField
+            inputRef={pathInput}
+            value={path}
+            onChange={setPath}
+            onEnter={start}
+            choose={choose}
+            placeholder={`/path/to/${defaultFileName(title, spec.ext)}`}
+            browserHint={BROWSER_PATH_HINT}
+            error={pathProblem}
+          />
           {outcome && <OutcomeNote outcome={outcome} />}
         </div>
       )}

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { DumpCommand, JobOutcomeEvent, JobProgressEvent, RunFileCommand } from "@/lib/api/types";
 import { sqliteBusyNote } from "@/lib/sqliteBusy";
 import { FILTER_RULE } from "../table-data/filterValue";
-import { CODE_LABELS, codeLabel, etaText, jobNotification, jobReport, jobSummary, progressView, type JobView } from "./jobReport";
+import { cancelNote, CODE_LABELS, codeLabel, etaText, jobNotification, jobReport, jobSummary, progressView, type JobView } from "./jobReport";
 import { jobReducer, openingJob, type JobState } from "./jobState";
 
 /* A job in words (spec ⑥ §3.6, §4): every outcome and loss, the actions that are safe now, the progress and its ETA. */
@@ -430,6 +430,33 @@ describe("a running job's progress", () => {
       text: "Cancelled: nothing was applied",
       tone: "muted",
     });
+  });
+});
+
+describe("what Cancel does, beside the button", () => {
+  const runningState = (stage: JobProgressEvent["stage"] = "statements"): JobState => ({
+    ...openingJob(0),
+    phase: "running",
+    sent: true,
+    sentAt: 1,
+    progress: { type: "job_progress", request_id: "r1", stage, rows: 0, bytes: 0, statements: 0, errors: 0 },
+  });
+
+  it("says a dump writes no file and a run in one transaction rolls back", () => {
+    expect(cancelNote(view(runningState("data"), dump))).toBe("Cancel writes no file");
+    expect(cancelNote(view(runningState(), run({ mode: "all_or_nothing" })))).toBe("Cancel rolls the whole run back");
+  });
+
+  it("says statement by statement that the file's own open transaction is rolled back (M5)", () => {
+    expect(cancelNote(view(runningState(), run()))).toBe(
+      "Cancel stops the run: what took effect stays, except a transaction the file opened and did not commit (rolled back)",
+    );
+  });
+
+  it("says nothing for a listed job, during COMMIT, or once it ended", () => {
+    expect(cancelNote(view(runningState(), null))).toBeNull();
+    expect(cancelNote(view(runningState("commit"), run({ mode: "all_or_nothing" })))).toBeNull();
+    expect(cancelNote(view(ended(outcome()), run()))).toBeNull();
   });
 });
 

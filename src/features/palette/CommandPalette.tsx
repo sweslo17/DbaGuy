@@ -10,6 +10,7 @@ import { useWorkspace } from "@/stores/workspace";
 import { readTableEditActions } from "../edits/editActions";
 import { readQueryTabActions } from "../query/tabActions";
 import { openSettings } from "../settings/SettingsDialog";
+import { readTableTabActions } from "../table-data/tableTabActions";
 import { COMMANDS, SHORTCUTS, type CommandContext } from "./commands";
 import { closePalette, usePalette } from "./paletteStore";
 import { PaletteInput, PaletteItem, PaletteList, PaletteRoot, type Choose } from "./parts";
@@ -26,6 +27,7 @@ function CommandList({ choose }: { choose: Choose }) {
     activeTab,
     tabActions: activeTab?.kind === "query" ? readQueryTabActions(activeTab.id) : null,
     editActions: activeTab?.kind === "table" ? readTableEditActions(activeTab.id) : null,
+    tableActions: activeTab?.kind === "table" ? readTableTabActions(activeTab.id) : null,
     settings: { loaded: settings.loaded, current: settings.settings, save: settings.save },
     queryClient,
   };

@@ -40,10 +40,26 @@ export function Select({ className, children, ...props }: SelectHTMLAttributes<H
   );
 }
 
+/** A checkbox's or a radio's label: a disabled control greys its label too. */
+const choice = "inline-flex items-center gap-2 text-[13px] has-[:disabled]:text-muted";
+
 export function Checkbox({ label, ...props }: InputHTMLAttributes<HTMLInputElement> & { label: ReactNode }) {
   return (
-    <label className="inline-flex items-center gap-2 text-[13px]">
+    <label className={choice}>
       <input type="checkbox" className="accent-[var(--accent)]" {...props} />
+      {label}
+    </label>
+  );
+}
+
+/**
+ * One choice of a group (give the group's radios one `name`). As with `Checkbox`, a `title` lands on the input only:
+ * a disabled choice's reason belongs in text beside the group as well.
+ */
+export function Radio({ label, ...props }: InputHTMLAttributes<HTMLInputElement> & { label: ReactNode }) {
+  return (
+    <label className={choice}>
+      <input type="radio" className="accent-[var(--accent)]" {...props} />
       {label}
     </label>
   );

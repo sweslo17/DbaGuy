@@ -215,6 +215,35 @@ export function planSummary(objects: readonly DumpPlanObject[]): PlanLine[] {
   return [...lines.values()];
 }
 
+/** A count of objects of a kind, as the catalog names it: "12 tables", "1 view", "2 policies", "3 statistics". */
+export function kindCount(count: number, kind: string): string {
+  if (count === 1) return `1 ${kind}`;
+  const many = kind.endsWith("statistics")
+    ? kind
+    : /(?:s|sh|ch|x)$/.test(kind)
+      ? `${kind}es`
+      : /[^aeiou]y$/.test(kind)
+        ? `${kind.slice(0, -1)}ies`
+        : `${kind}s`;
+  return `${count.toLocaleString()} ${many}`;
+}
+
+/** One line of the plan's summary: "12 tables · ≈ 1,234,567 rows", "2 views". */
+export const planLineText = (line: PlanLine): string =>
+  line.rows === null ? kindCount(line.count, line.kind) : `${kindCount(line.count, line.kind)} · ≈ ${line.rows.toLocaleString()} rows`;
+
+/**
+ * The backend's warning that a filtered dump drops its table and so replaces it with only the matching rows (06a F2,
+ * `filter_warnings`); an inspection of such a file starts the same way (`dump_header.FILTERED_ROWS`).
+ */
+export const FILTERED_ROWS = "The file holds only the rows of ";
+
+/** The plan's warnings, those that change what restoring the file does first (F2: shown in red, above the others). */
+export function planWarnings(warnings: readonly string[]): { prominent: string[]; other: string[] } {
+  const prominent = warnings.filter((warning) => warning.startsWith(FILTERED_ROWS));
+  return { prominent, other: warnings.filter((warning) => !warning.startsWith(FILTERED_ROWS)) };
+}
+
 /** The dump's tables in the plan's order: the job's "table k of n". */
 export const planTables = (objects: readonly DumpPlanObject[]): string[] =>
   objects.filter((object) => object.kind === "table").map((object) => object.name);

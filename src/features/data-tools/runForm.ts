@@ -1,5 +1,6 @@
 import type { EngineInfo, FileInspection, Profile, QueryContext, RunFileCommand } from "@/lib/api/types";
 import { fileNameOf, pathProblem } from "@/lib/filePaths";
+import { FILTERED_ROWS } from "./dumpForm";
 import type { RunEntry } from "./entryPoints";
 import type { RunPatch } from "./jobReport";
 
@@ -37,7 +38,6 @@ export const EVERY_STATEMENT_RUNS =
 export const RED_CONFIRM = "I've checked the file and the connection";
 
 /** The backend's texts the dialog looks for in an inspection (sql/dump_header.py, services/data_service.py). */
-const FILTERED_ROWS = "The file holds only the rows of ";
 const DROPS_FIRST = "This dump drops and recreates its objects";
 const OTHER_ENGINE = "Written for ";
 const CUT_SHORT = "The file does not end with its 'Dump complete' line: it was cut short";

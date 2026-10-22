@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type Reac
 import { EngineIcon } from "@/components/EngineIcon";
 import { Button } from "@/components/ui/Button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
-import { ContextMenu } from "@/components/ui/ContextMenu";
+import { ContextMenu, type MenuItem } from "@/components/ui/ContextMenu";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
 import type { ObjectNode, ProfileEntry } from "@/lib/api/types";
@@ -17,6 +17,8 @@ import { findEngineInfo, isReadOnlyProfile, useDeleteProfile, useEngines, usePro
 import { profileColor } from "../connections/profileColors";
 import { secretsNeeded } from "../connections/UnlockDialog";
 import { joinUnlockPrompt } from "../connections/unlockPrompts";
+import { openDumpDialog } from "../data-tools/dataDialogs";
+import { dumpEntryForNode } from "../data-tools/entryPoints";
 import { askOpenDocument } from "../documents/openDocument";
 import { applyTreeContext } from "../query/queryContext";
 import { requestCloseTab, requestDisconnectTab } from "../workspace/closeGuards";
@@ -272,6 +274,27 @@ export function Explorer() {
     }
   };
 
+  /** A Couchbase collection's items: its documents, its detail and its fields. */
+  const collectionItems = (row: Extract<TreeRow, { type: "node" }>, opensDocuments: boolean): MenuItem[] => {
+    // The dialog asks for the document's ID in this collection: to open it, or to create it (never on a read-only one).
+    const askDocument = (mode: "open" | "new") =>
+      askOpenDocument({ profileId: row.profileId, mode, keyspace: keyspaceOfPath(row.node.path) ?? {} });
+    return [
+      { label: "Browse documents", onSelect: () => void openBrowseTab(row.profileId, row.node.path) },
+      ...(opensDocuments ? [{ label: "Open document by ID…", onSelect: () => askDocument("open") }] : []),
+      ...(opensDocuments && !isReadOnlyProfile(entries, row.profileId)
+        ? [{ label: "New document…", onSelect: () => askDocument("new") }]
+        : []),
+      { label: "Details", onSelect: () => openObject(row.profileId, row.node) },
+      {
+        label: "Sample fields…",
+        title: "Read some of its documents and list their fields (completion offers them)",
+        disabled: keyspaceOfPath(row.node.path) === null,
+        onSelect: () => setSampling({ profileId: row.profileId, node: row.node }),
+      },
+    ];
+  };
+
   const renderRow = (row: TreeRow): ReactNode => {
     const pad = { paddingLeft: 8 + row.depth * 14 };
     const open = expanded.has(row.key);
@@ -344,28 +367,14 @@ export function Explorer() {
             {row.node.detail && <span className="ml-auto shrink-[100] truncate pl-2 text-[11px] text-muted">{row.node.detail}</span>}
           </div>
         );
-        if (row.node.kind !== BROWSABLE_KIND) return content;
-        const opensDocuments = findEngineInfo(entries, engines, row.profileId)?.documents === true;
-        // The dialog asks for the document's ID in this collection: to open it, or to create it (never on a read-only one).
-        const askDocument = (mode: "open" | "new") =>
-          askOpenDocument({ profileId: row.profileId, mode, keyspace: keyspaceOfPath(row.node.path) ?? {} });
+        const engine = findEngineInfo(entries, engines, row.profileId);
+        // The data tools first (spec ⑥ §3.6: what the engine can do decides, D-06-13), then a collection's own items
+        const dumpEntry = dumpEntryForNode(row.profileId, engine, row.node);
+        const dataItems: MenuItem[] = dumpEntry ? [{ label: "Dump…", onSelect: () => openDumpDialog(dumpEntry) }] : [];
+        const items = [...dataItems, ...(row.node.kind === BROWSABLE_KIND ? collectionItems(row, engine?.documents === true) : [])];
+        if (items.length === 0) return content;
         return (
-          <ContextMenu
-            items={[
-              { label: "Browse documents", onSelect: () => void openBrowseTab(row.profileId, row.node.path) },
-              ...(opensDocuments ? [{ label: "Open document by ID…", onSelect: () => askDocument("open") }] : []),
-              ...(opensDocuments && !isReadOnlyProfile(entries, row.profileId)
-                ? [{ label: "New document…", onSelect: () => askDocument("new") }]
-                : []),
-              { label: "Details", onSelect: () => openObject(row.profileId, row.node) },
-              {
-                label: "Sample fields…",
-                title: "Read some of its documents and list their fields (completion offers them)",
-                disabled: keyspaceOfPath(row.node.path) === null,
-                onSelect: () => setSampling({ profileId: row.profileId, node: row.node }),
-              },
-            ]}
-          >
+          <ContextMenu items={items} onContextMenu={() => selectByClick(row)}>
             {content}
           </ContextMenu>
         );
