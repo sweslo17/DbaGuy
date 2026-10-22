@@ -26,6 +26,11 @@ export function isTabBusy(tabId: string): boolean {
   return (useStatuses.getState()[tabId] ?? IDLE).busy;
 }
 
+/** Whether the tab reports unsaved changes (a script's text); for code outside React (the Scripts panel's menu). */
+export function isTabDirty(tabId: string): boolean {
+  return (useStatuses.getState()[tabId] ?? IDLE).dirty;
+}
+
 /**
  * Sets the given fields of a tab's status (undefined ones keep their value). Cheap when nothing changes, so it may be
  * called on every keystroke. Only for a mounted tab: the entry goes when it unmounts (`useReportTabStatus`).
