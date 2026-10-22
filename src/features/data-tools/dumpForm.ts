@@ -111,20 +111,29 @@ export function dumpScope(entry: DumpEntry, form: DumpForm): DumpScope | null {
 const sentFilter = (entry: DumpEntry, form: DumpForm) =>
   entry.filter !== null && form.onlyFiltered && form.content !== "schema" ? entry.filter : null;
 
+/** Why the Tables folder's checked tables cannot be dumped (none, or more than a dump names); null when they can. */
+export function tablesProblem(entry: DumpEntry, form: DumpForm): string | null {
+  if (entry.target.kind !== "tables") return null;
+  if (!form.checked?.length) return "Check at least one table";
+  if (form.checked.length > MAX_DUMP_TABLES) return `A dump of chosen tables names at most ${MAX_DUMP_TABLES}: dump the schema instead`;
+  return null;
+}
+
 /** Why Dump cannot start yet; null when it can. */
 export function dumpProblem(entry: DumpEntry, form: DumpForm): string | null {
-  if (entry.target.kind === "tables") {
-    if (!form.checked?.length) return "Check at least one table";
-    if (form.checked.length > MAX_DUMP_TABLES) return `A dump of chosen tables names at most ${MAX_DUMP_TABLES}: dump the schema instead`;
-  }
+  const tables = tablesProblem(entry, form);
+  if (tables) return tables;
   if (!form.path.trim()) return "Choose a file to dump into";
   return pathProblem(form.path);
 }
 
-/** The plan's request (the same fields as the command); null while there is no scope. */
+/**
+ * The plan's request (the same fields as the command); null while there is no scope, or more tables are checked than a
+ * dump names (the backend would refuse the request: nothing is asked).
+ */
 export function dumpPlanRequest(entry: DumpEntry, form: DumpForm): DumpPlanRequest | null {
   const scope = dumpScope(entry, form);
-  if (!scope) return null;
+  if (!scope || tablesProblem(entry, form)) return null;
   const path = form.path.trim();
   return {
     profile_id: entry.profileId,

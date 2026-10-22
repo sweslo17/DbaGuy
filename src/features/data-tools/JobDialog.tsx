@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import type { KeyboardEvent } from "react";
 import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
 import { toast } from "@/components/ui/Toast";
 import { ApiError, errorMessage } from "@/lib/api/client";
+import { useCancelAgain } from "@/lib/useCancelAgain";
 import { RecoverableError } from "../connections/RecoverableError";
 import { closeDataDialog, openDumpDialog } from "./dataDialogs";
 import { dumpFormFromCommand } from "./dumpForm";
@@ -12,19 +13,20 @@ import { revealFile } from "./jobsApi";
 import { cancelJob, isRunning, retryJob, type JobRecord } from "./jobsStore";
 import { ConnectionLine, JobProgressView, JobReportView, ReportTitle } from "./JobViews";
 
-/**
- * Cancel comes back this long after a click, or as soon as the job gives a new warning (SQL Server: that the cancel
- * cannot stop it safely, and what another Cancel does), as the export's does: a second Cancel within it would be read
- * as a double click.
- */
-const CANCEL_AGAIN_MS = 1_000;
-
 const KEEPS_RUNNING = {
   dump: "The dump keeps running: open it again from Jobs, at the bottom of the sidebar",
   run_file: "The SQL file keeps running: open it again from Jobs, at the bottom of the sidebar",
 } as const;
 /** The jobs whose dialog was closed while they ran and that were told so (once each). */
 const toldKeepsRunning = new Set<string>();
+
+/**
+ * A held Return's repeats never press Close: the Return that started a job (Dump, in the form) is still down as its view
+ * opens with Close focused, and must not close it at once.
+ */
+function ignoreHeldReturn(e: KeyboardEvent<HTMLButtonElement>) {
+  if (e.key === "Enter" && e.repeat) e.preventDefault();
+}
 
 const isDumpEntry = (entry: DumpEntry | RunEntry | null): entry is DumpEntry => entry !== null && "target" in entry;
 
@@ -69,14 +71,10 @@ export function JobDialog({ record }: { record: JobRecord }) {
   const running = isRunning(record);
   const report = running ? null : jobReport(record);
   const warnings = state.messages.filter((message) => message.severity === "warning").length;
-  // The last Cancel click and how many warnings the job had then: "Cancelling…" until CANCEL_AGAIN_MS or a new warning
-  const [cancelSent, setCancelSent] = useState<{ warnings: number } | null>(null);
-  useEffect(() => {
-    if (!cancelSent) return;
-    const timer = window.setTimeout(() => setCancelSent(null), CANCEL_AGAIN_MS);
-    return () => window.clearTimeout(timer);
-  }, [cancelSent]);
-  const cancelling = cancelSent !== null && cancelSent.warnings === warnings;
+  // "Cancelling…" for a second after a click or until a new warning, as the export's; a view opened again right after
+  // its job's Cancel keeps it for the rest of that second (the job's own cancel time)
+  const cancelAgain = useCancelAgain(warnings, state.cancelRequestedAt);
+  const cancelling = cancelAgain.cancelling;
 
   const close = () => {
     if (running && !toldKeepsRunning.has(requestId)) {
@@ -87,7 +85,7 @@ export function JobDialog({ record }: { record: JobRecord }) {
   };
   const cancel = () => {
     cancelJob(requestId);
-    setCancelSent({ warnings });
+    cancelAgain.sent();
   };
 
   const note = cancelNote(record);
@@ -102,14 +100,14 @@ export function JobDialog({ record }: { record: JobRecord }) {
           {cancelling ? "Cancelling…" : "Cancel"}
         </Button>
       )}
-      <Button key="close-running" variant="primary" onClick={close} autoFocus>
+      <Button key="close-running" variant="primary" onClick={close} onKeyDown={ignoreHeldReturn} autoFocus>
         Close
       </Button>
     </>
   ) : (
     <>
       {report?.actions.map((action, i) => actionButton(record, action, i))}
-      <Button key="close-ended" variant="primary" onClick={close} autoFocus>
+      <Button key="close-ended" variant="primary" onClick={close} onKeyDown={ignoreHeldReturn} autoFocus>
         Close
       </Button>
     </>

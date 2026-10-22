@@ -32,6 +32,7 @@ import {
   planSummary,
   planTables,
   planWarnings,
+  tablesProblem,
   type Choice,
   type DumpForm,
 } from "./dumpForm";
@@ -41,8 +42,11 @@ import { fetchDumpPlan } from "./jobsApi";
 import { startJob } from "./jobsStore";
 import { ConnectionLine } from "./JobViews";
 
-/** The plan is read again once the typed path has stayed the same this long (its warnings are about the target). */
-const PLAN_PATH_DEBOUNCE_MS = 400;
+/**
+ * The plan is read again once the choices have stayed the same this long: a run of clicks on the tables or a path being
+ * typed is one catalog read on the metadata connection, not one per change.
+ */
+const PLAN_DEBOUNCE_MS = 400;
 
 const DROP_FIRST_HINT = "A DROP … IF EXISTS before each object the file creates; nothing else is dropped";
 const FILTER_TITLE_PREFIX = "WHERE ";
@@ -66,14 +70,19 @@ function ReadProblem({ profileId, error, retry }: { profileId: string; error: Er
   );
 }
 
-/** The Tables folder's tables, every one checked the first time they arrive (§3.3.1); All, None and the count. */
+/**
+ * The Tables folder's tables, every one checked the first time they arrive (§3.3.1); All, None and the count, and beside
+ * it what is wrong with the checks (none, or more than a dump names): said here, not only on Dump's tooltip.
+ */
 function TablePicker({
   tables,
   checked,
+  problem,
   onChange,
 }: {
   tables: readonly ObjectNode[];
   checked: readonly string[];
+  problem: string | null;
   onChange: (names: string[]) => void;
 }) {
   const on = new Set(checked);
@@ -82,15 +91,21 @@ function TablePicker({
     onChange(tables.map((table) => table.name).filter((n) => (n === name ? value : on.has(n))));
   return (
     <div className="flex flex-col gap-1">
-      <div className="flex items-center gap-1 text-[12px]">
+      <div className="flex items-start gap-1 text-[12px]">
         <Button size="sm" variant="ghost" onClick={() => onChange(tables.map((table) => table.name))}>
           All
         </Button>
         <Button size="sm" variant="ghost" onClick={() => onChange([])}>
           None
         </Button>
-        <span className="ml-auto text-muted tabular-nums">
-          {checked.length.toLocaleString()} of {tables.length.toLocaleString()} checked
+        <span className="ml-auto min-w-0 pt-1 text-right">
+          <span className="text-muted tabular-nums">
+            {checked.length.toLocaleString()} of {tables.length.toLocaleString()} checked
+          </span>
+          {problem && (
+            // none checked: what to do; too many: what the dump cannot take
+            <span className={cn("block", checked.length > 0 ? "text-danger" : "text-muted")}>{problem}</span>
+          )}
         </span>
       </div>
       <div className="flex max-h-48 flex-col gap-0.5 overflow-y-auto rounded-md border border-border px-2 py-1 [scrollbar-gutter:stable]">
@@ -149,10 +164,14 @@ function PlanSummary({ plan, stale }: { plan: DumpPlan; stale: boolean }) {
           )}
         </div>
       )}
+      {/* Which tables are outside one snapshot is the engine's to say (MySQL: those not InnoDB; SQL Server: each table
+          in its turn): its warning, below */}
       <p className={plan.consistency === "snapshot" ? undefined : "text-warning"}>
         {plan.consistency === "snapshot"
           ? "One consistent snapshot"
-          : "Not one consistent snapshot: each table is read in its turn"}
+          : plan.warnings.length > 0
+            ? "Not one consistent snapshot: see the warnings below"
+            : "Not one consistent snapshot"}
       </p>
       {plan.not_included.length > 0 && (
         <p className="text-muted [overflow-wrap:anywhere]" data-selectable>
@@ -163,12 +182,15 @@ function PlanSummary({ plan, stale }: { plan: DumpPlan; stale: boolean }) {
   );
 }
 
-/** The plan's warnings: a filtered dump that drops its table first, in red (06a F2); the backend's others below it. */
-function PlanWarnings({ warnings }: { warnings: readonly string[] }) {
+/**
+ * The plan's warnings: a filtered dump that drops its table first, in red (06a F2); the backend's others below it.
+ * `stale`: they are the plan of the choices before, dimmed with it until the next one arrives.
+ */
+function PlanWarnings({ warnings, stale }: { warnings: readonly string[]; stale: boolean }) {
   const { prominent, other } = planWarnings(warnings);
   if (warnings.length === 0) return null;
   return (
-    <div className="flex flex-col gap-1.5 text-[12px]">
+    <div className={cn("flex flex-col gap-1.5 text-[12px] transition-opacity", stale && "opacity-60")}>
       {prominent.map((warning, i) => (
         <p
           key={i}
@@ -215,9 +237,9 @@ export function DumpDialog({ entry, form: preset }: { entry: DumpEntry; form: Du
     setForm((current) => ({ ...current, checked: tables.map((table) => table.name) }));
   }
 
-  // The plan: the same fields as the command, the path once typing pauses (the warnings about the target follow it)
-  const settledPath = useDebouncedValue(form.path, PLAN_PATH_DEBOUNCE_MS);
-  const body = useMemo(() => dumpPlanRequest(entry, { ...form, path: settledPath }), [entry, form, settledPath]);
+  // The plan: the same fields as the command, asked once the choices settle (memoised: the same form, the same request)
+  const request = useMemo(() => dumpPlanRequest(entry, form), [entry, form]);
+  const body = useDebouncedValue(request, PLAN_DEBOUNCE_MS);
   const plan = useQuery({
     queryKey: ["dumpPlan", body],
     queryFn: ({ signal }) => fetchDumpPlan(body!, signal),
@@ -227,9 +249,12 @@ export function DumpDialog({ entry, form: preset }: { entry: DumpEntry; form: Du
     // The plan of the choices before stays (dimmed) while the new one is read: the dialog does not jump at each click
     placeholderData: keepPreviousData,
   });
-  // A disabled query (no scope: no table checked) still hands back the previous plan as its placeholder: not shown
-  const shownPlan = body !== null && !plan.isError ? (plan.data ?? null) : null;
-  const readPlan = plan.isPlaceholderData ? null : shownPlan;
+  // None while no plan can be asked (no table checked, or too many): a disabled query still hands back the previous
+  // plan as its placeholder. The plan shown is behind while it is for other choices than these (they are settling, or
+  // being read): dimmed, and its tables never go with the job.
+  const shownPlan = request !== null && !plan.isError ? (plan.data ?? null) : null;
+  const behind = body !== request || plan.isPlaceholderData;
+  const readPlan = behind ? null : shownPlan;
 
   const staged = useStagedEdits(entry.tabId ?? "");
   const stagedNote = staged && changeCount(staged) > 0 ? NOT_IN_DUMP : null;
@@ -329,12 +354,12 @@ export function DumpDialog({ entry, form: preset }: { entry: DumpEntry; form: Du
             }
           />
         )}
-        {body !== null && (
+        {request !== null && (
           <FieldRow label="Writes">
             {plan.error ? (
               <ReadProblem profileId={entry.profileId} error={plan.error} retry={() => void plan.refetch()} />
             ) : shownPlan ? (
-              <PlanSummary plan={shownPlan} stale={plan.isPlaceholderData} />
+              <PlanSummary plan={shownPlan} stale={behind} />
             ) : (
               <p className="animate-delayed-show text-[12px] text-muted">Reading the catalog…</p>
             )}
@@ -342,7 +367,7 @@ export function DumpDialog({ entry, form: preset }: { entry: DumpEntry; form: Du
         )}
         {shownPlan && shownPlan.warnings.length > 0 && (
           <FieldRow label="">
-            <PlanWarnings warnings={shownPlan.warnings} />
+            <PlanWarnings warnings={shownPlan.warnings} stale={behind} />
           </FieldRow>
         )}
         <FilePathField
@@ -386,7 +411,12 @@ function DumpChoices({
       {tables && (
         <FieldRow label="Tables">
           {tables.nodes ? (
-            <TablePicker tables={tables.nodes} checked={form.checked ?? []} onChange={(checked) => patch({ checked })} />
+            <TablePicker
+              tables={tables.nodes}
+              checked={form.checked ?? []}
+              problem={tablesProblem(entry, form)}
+              onChange={(checked) => patch({ checked })}
+            />
           ) : tables.error ? (
             <ReadProblem profileId={entry.profileId} error={tables.error} retry={tables.retry} />
           ) : (

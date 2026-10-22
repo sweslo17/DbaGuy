@@ -12,6 +12,7 @@ import type { FormatKind, RowFormatOptions } from "@/lib/api/types";
 import { BROWSER_PATH_HINT, pathProblem as typedPathProblem, safeFileStem } from "@/lib/filePaths";
 import { formatElapsed, plural } from "@/lib/format";
 import { chooseSavePath } from "@/lib/native";
+import { useCancelAgain } from "@/lib/useCancelAgain";
 import { useNow } from "@/lib/useNow";
 import { useEngineInfo } from "../connections/hooks";
 import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
@@ -64,11 +65,6 @@ const NULL_TEXTS = [
 ];
 /** The backend's own placeholder when no INSERT target is known. */
 const TABLE_PLACEHOLDER = "table_name";
-/**
- * Cancel comes back this long after a click, or as soon as the export gets a warning (e.g. that it cannot be stopped
- * safely and what another Cancel does): the backend takes a repeated Cancel for a double click within a second.
- */
-const CANCEL_AGAIN_MS = 1000;
 
 type Outcome = { kind: "error"; message: string; code?: string | null } | { kind: "cancelled" };
 
@@ -160,8 +156,6 @@ export function ExportDialog({
   const [table, setTable] = useState(() => (prefill ? qualified(prefill) : TABLE_PLACEHOLDER));
   const [path, setPath] = useState("");
   const [running, setRunning] = useState<{ requestId: string; path: string; startedAt: number } | null>(null);
-  // When Cancel was last clicked, and how many warnings the export had then.
-  const [cancelSent, setCancelSent] = useState<{ at: number; warnings: number } | null>(null);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const execution = useStore(controller.store, (s) => (running ? s.executions[running.requestId] : undefined));
@@ -169,9 +163,9 @@ export function ExportDialog({
   const inTransaction = useStore(controller.store, (s) => !!s.state?.inTransaction && !s.state.transactionFailed);
   const abortsTransaction = inTransaction && cancelAbortsTransaction(engine);
   const warnings = execution?.messages.filter((message) => message.severity === "warning") ?? [];
-  const now = useNow(250, cancelSent !== null);
-  const cancelling =
-    cancelSent !== null && warnings.length === cancelSent.warnings && now - cancelSent.at < CANCEL_AGAIN_MS;
+  // Cancel comes back a second after a click, or as soon as the export gets a warning (`useCancelAgain`)
+  const cancelAgain = useCancelAgain(warnings.length);
+  const cancelling = cancelAgain.cancelling;
   const pathInput = useRef<HTMLInputElement>(null);
   const isOpen = useRef(open);
   useEffect(() => {
@@ -222,12 +216,12 @@ export function ExportDialog({
     };
     const requestId = controller.exportResult(sql, format, target, options, request);
     setRunning({ requestId, path: target, startedAt: Date.now() });
-    setCancelSent(null);
+    cancelAgain.reset();
     setOutcome(null);
     const settle = (next: Outcome | null) => {
       controller.forget(requestId);
       setRunning(null);
-      setCancelSent(null);
+      cancelAgain.reset();
       setConfirmCancel(false);
       if (next?.kind === "error" && !isOpen.current) {
         // Closed while disconnected: say how it ended now, not in a note waiting for the next opening.
@@ -255,7 +249,7 @@ export function ExportDialog({
     setConfirmCancel(false);
     if (!running) return;
     controller.cancel(running.requestId);
-    setCancelSent({ at: Date.now(), warnings: warnings.length });
+    cancelAgain.sent();
   };
   const askCancel = () => (abortsTransaction ? setConfirmCancel(true) : cancel());
 

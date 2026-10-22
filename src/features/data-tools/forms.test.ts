@@ -16,6 +16,7 @@ import {
   planSummary,
   planTables,
   planWarnings,
+  tablesProblem,
 } from "./dumpForm";
 import type { DumpEntry, RunEntry } from "./entryPoints";
 import {
@@ -93,6 +94,21 @@ describe("the dump form", () => {
     expect(dumpScope(folder, { ...form, checked: [] })).toBeNull();
     const many = Array.from({ length: MAX_DUMP_TABLES + 1 }, (_, i) => `t${i}`);
     expect(dumpProblem(folder, { ...form, checked: many })).toBe("A dump of chosen tables names at most 500: dump the schema instead");
+  });
+
+  it("says what is wrong with the checked tables beside them, and asks no plan for more than 500", () => {
+    const form = initialDumpForm(folder, "", ["a"]);
+    const many = Array.from({ length: MAX_DUMP_TABLES + 1 }, (_, i) => `t${i}`);
+    const exactly = many.slice(0, MAX_DUMP_TABLES);
+    // only the tables' own problem: the path's is the Dump button's
+    expect([tablesProblem(folder, form), tablesProblem(folder, { ...form, checked: [] }), tablesProblem(pg, initialDumpForm(pg, ""))]).toEqual([
+      null,
+      "Check at least one table",
+      null,
+    ]);
+    expect(tablesProblem(folder, { ...form, checked: many })).toBe("A dump of chosen tables names at most 500: dump the schema instead");
+    expect(dumpPlanRequest(folder, { ...form, checked: many })).toBeNull();
+    expect(dumpPlanRequest(folder, { ...form, checked: exactly })?.scope.names).toHaveLength(MAX_DUMP_TABLES);
   });
 
   it("makes no plan request for an empty Tables folder, and no command for an incomplete form", () => {

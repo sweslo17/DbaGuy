@@ -92,7 +92,8 @@ export function FieldRow({
       <Label htmlFor={htmlFor} className="text-right">
         {label}
       </Label>
-      <div>{children}</div>
+      {/* min-w-0: a long value (a filter, a path) truncates or wraps in the cell, never widening the dialog */}
+      <div className="min-w-0">{children}</div>
       {note && (
         <span className={cn("col-start-2 text-[11px] [overflow-wrap:anywhere]", error ? "text-danger" : "text-muted")}>
           {note}

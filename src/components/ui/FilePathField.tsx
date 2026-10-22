@@ -7,7 +7,7 @@ import { FieldRow, Input } from "./Field";
 /**
  * A file path: the system panel's Choose… in the app, a typed absolute path in browser mode (the backend reads or writes
  * it on this Mac). The export, the dump and Run SQL file share it. `onEnter`: Return in the field (never during an
- * input method's composition); `onChosen`: the panel gave a path (null: cancelled, nothing changes), after `onChange`.
+ * input method's composition, once for a held Return); `onChosen`: the panel gave a path (null: cancelled, nothing changes), after `onChange`.
  * `autoFocus`: the field takes the focus as it mounts: the input in browser mode, Choose… in the app (there the panel is
  * how a path is given).
  */
@@ -42,7 +42,7 @@ export function FilePathField({
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key !== "Enter" || isImeKeyEvent(e)) return;
     e.preventDefault();
-    onEnter?.();
+    if (!e.repeat) onEnter?.(); // a held Return acts once
   };
   const pick = async () => {
     const chosen = await choose();
