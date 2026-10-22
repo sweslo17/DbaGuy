@@ -6,6 +6,8 @@ import symbol from "@/assets/symbol-64.png";
 import { PanelHandle } from "@/components/ui/PanelHandle";
 import { Toaster } from "@/components/ui/Toast";
 import { DataToolsHost } from "@/features/data-tools/DataToolsHost";
+import { syncJobs } from "@/features/data-tools/jobsStore";
+import { useJobEndings } from "@/features/data-tools/useJobEndings";
 import { OpenDocumentDialogHost } from "@/features/documents/OpenDocumentDialog";
 import { openSettings, SettingsDialogHost } from "@/features/settings/SettingsDialog";
 import { saveWorkspaceNow, useWorkspaceSaveFailing } from "@/features/workspace/workspaceSync";
@@ -28,6 +30,11 @@ export function AppShell({ sidebar, workspace }: { sidebar: ReactNode; workspace
     wasUnreachable.current = unreachable;
   }, [unreachable]);
   const saveFailing = useWorkspaceSaveFailing();
+  // A reloaded window lists the backend's data-tools jobs and attaches to the running ones (R-06-15)
+  useEffect(() => {
+    void syncJobs();
+  }, []);
+  useJobEndings();
   // Persists the sidebar width in localStorage (react-resizable-panels v4 has no autoSaveId).
   const { defaultLayout, onLayoutChanged } = useDefaultLayout({ id: LAYOUT_ID });
 

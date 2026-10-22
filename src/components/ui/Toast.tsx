@@ -16,6 +16,8 @@ interface ToastItem {
   kind: ToastKind;
   text: string;
   action?: ToastAction;
+  /** What it is about: a newer toast with the same key takes its place while it is shown. */
+  key?: string;
 }
 
 const MAX_VISIBLE = 4;
@@ -32,11 +34,16 @@ let nextId = 1;
 
 /**
  * Shows a toast in the bottom-right corner (app-wide; the oldest goes once more than MAX_VISIBLE are shown). One with an
- * `action` stays as long as an error does: there is something to do with it.
+ * `action` stays as long as an error does: there is something to do with it. `key`: a toast about the same thing as
+ * one still shown takes its place, with its time anew (a job's ending that the backend's word corrected).
  */
-export function toast(kind: ToastKind, text: string, action?: ToastAction): void {
-  const item: ToastItem = { id: nextId++, kind, text, action };
-  useToasts.setState((s) => ({ items: [...s.items, item].slice(-MAX_VISIBLE) }));
+export function toast(kind: ToastKind, text: string, action?: ToastAction, key?: string): void {
+  const item: ToastItem = { id: nextId++, kind, text, action, key };
+  useToasts.setState((s) =>
+    key !== undefined && s.items.some((shown) => shown.key === key)
+      ? { items: s.items.map((shown) => (shown.key === key ? item : shown)) }
+      : { items: [...s.items, item].slice(-MAX_VISIBLE) },
+  );
 }
 
 function dismiss(id: number): void {

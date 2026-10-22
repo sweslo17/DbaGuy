@@ -19,6 +19,7 @@ import { secretsNeeded } from "../connections/UnlockDialog";
 import { joinUnlockPrompt } from "../connections/unlockPrompts";
 import { openDumpDialog, openRunDialog } from "../data-tools/dataDialogs";
 import { dumpEntryForNode, runEntryForNode, type RunEntry } from "../data-tools/entryPoints";
+import { runningJobs, useJobs } from "../data-tools/jobsStore";
 import { askOpenDocument } from "../documents/openDocument";
 import { applyTreeContext } from "../query/queryContext";
 import { requestCloseTab, requestDisconnectTab } from "../workspace/closeGuards";
@@ -215,9 +216,16 @@ export function Explorer() {
 
   /**
    * Before a profile is deleted, each of its tabs is asked in turn (a running export, a run, an open transaction):
-   * table and object tabs close, query tabs agree to lose their session. Any "no" keeps the profile.
+   * table and object tabs close, query tabs agree to lose their session. Any "no" keeps the profile. First, a
+   * data-tools job running on it keeps it, before any tab is asked: the delete closes every session of the profile,
+   * the jobs' too (B13).
    */
   const releaseTabs = async (profileId: string): Promise<boolean> => {
+    const jobs = runningJobs(useJobs.getState()).filter((job) => job.profileId === profileId).length;
+    if (jobs > 0) {
+      toast("warning", `Profile not deleted — ${jobs === 1 ? "a job is" : `${jobs} jobs are`} still running on it`);
+      return false;
+    }
     for (const tab of useWorkspace.getState().tabs.filter((t) => t.profileId === profileId)) {
       const agreed = tab.kind === "query" ? await requestDisconnectTab(tab.id) : await requestCloseTab(tab.id);
       if (!agreed && useWorkspace.getState().tabs.some((t) => t.id === tab.id)) {

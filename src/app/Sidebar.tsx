@@ -2,6 +2,7 @@ import { useState, type ReactNode } from "react";
 import { Tabs } from "@/components/ui/Tabs";
 import { cn } from "@/lib/cn";
 import { useWorkspace } from "@/stores/workspace";
+import { JobsButton } from "../features/data-tools/JobsButton";
 import { Explorer } from "../features/explorer/Explorer";
 import { HistoryPanel } from "../features/history/HistoryPanel";
 import { HISTORY_VIEW } from "../features/history/useHistory";
@@ -21,7 +22,8 @@ const isView = (value: string | null): value is SidebarView => VIEWS.some((view)
 /**
  * The sidebar: Connections | Scripts | History. The open view is part of the workspace (`sidebar_tab`); a missing or
  * unknown one shows the connections, and only a click changes it, so a workspace that failed to load is never
- * overwritten with a default. A view stays mounted once opened, keeping its tree's state while another is shown.
+ * overwritten with a default. A view stays mounted once opened, keeping its tree's state while another is shown. At
+ * the bottom, the data-tools Jobs while this window has any (it subscribes itself: a job's progress never renders this).
  */
 export function Sidebar() {
   const stored = useWorkspace((s) => s.sidebarTab);
@@ -46,6 +48,7 @@ export function Sidebar() {
             </div>
           ),
       )}
+      <JobsButton />
     </div>
   );
 }
