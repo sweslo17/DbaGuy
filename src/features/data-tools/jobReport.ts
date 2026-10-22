@@ -535,8 +535,19 @@ export function jobSummary(view: JobView, now: number): { text: string; tone: To
 }
 
 /**
+ * Whether a job's ending is news, for its notification and its toast (R-06-15, V11): not when it ended cancelled (the
+ * outcome says so, whoever asked: its user here, or in another window) nor when its command never left (`not_sent`).
+ * A Cancel that lost the race (the job completed, or ended otherwise first) is news. The two differ in one case: the
+ * notification also says nothing of `open_failed` (nothing ran: no long job ended), while the toast tells it (its view
+ * asks for the password or offers Retry).
+ */
+export const endingIsNews = (state: JobState): boolean =>
+  state.phase === "ended" && !state.outcome?.cancelled && state.loss !== "not_sent";
+
+/**
  * The notification for a job that ended after at least `thresholdS` seconds (S8's `notifications.long_query_seconds`,
- * 0: never) while DbaGuy was in the background (R-06-15); none for a job the user cancelled or one that never started.
+ * 0: never) while DbaGuy was in the background (R-06-15); none for an ending that is not news (`endingIsNews`) or a
+ * job that never connected.
  */
 export function jobNotification(
   view: JobView & { title: string },
@@ -546,8 +557,7 @@ export function jobNotification(
   const { state } = view;
   const report = jobReport(view);
   if (!report || focused || thresholdS <= 0 || state.endedAt === null) return null;
-  // A job the user cancelled (here, or in another window: the outcome says so) or one that never started
-  if (state.cancelRequestedAt !== null || state.outcome?.cancelled || state.loss === "open_failed" || state.loss === "not_sent") return null;
+  if (!endingIsNews(state) || state.loss === "open_failed") return null;
   const took = state.endedAt - state.startedAt;
   if (took < thresholdS * 1000) return null;
   const what = view.kind === "dump" ? "Dump" : "SQL file run";

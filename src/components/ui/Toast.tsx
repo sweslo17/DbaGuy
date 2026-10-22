@@ -2,25 +2,10 @@ import { X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { create } from "zustand";
 import { cn } from "@/lib/cn";
+import { withToast, type ToastAction, type ToastItem, type ToastKind } from "./toastItems";
 
-export type ToastKind = "info" | "success" | "warning" | "error";
+export type { ToastAction, ToastKind } from "./toastItems";
 
-/** A button on a toast: running it dismisses the toast. */
-export interface ToastAction {
-  label: string;
-  run: () => void;
-}
-
-interface ToastItem {
-  id: number;
-  kind: ToastKind;
-  text: string;
-  action?: ToastAction;
-  /** What it is about: a newer toast with the same key takes its place while it is shown. */
-  key?: string;
-}
-
-const MAX_VISIBLE = 4;
 const DURATION_MS: Record<ToastKind, number> = { info: 4000, success: 4000, warning: 4000, error: 8000 };
 const STRIPE: Record<ToastKind, string> = {
   info: "bg-accent",
@@ -39,15 +24,16 @@ let nextId = 1;
  */
 export function toast(kind: ToastKind, text: string, action?: ToastAction, key?: string): void {
   const item: ToastItem = { id: nextId++, kind, text, action, key };
-  useToasts.setState((s) =>
-    key !== undefined && s.items.some((shown) => shown.key === key)
-      ? { items: s.items.map((shown) => (shown.key === key ? item : shown)) }
-      : { items: [...s.items, item].slice(-MAX_VISIBLE) },
-  );
+  useToasts.setState((s) => ({ items: withToast(s.items, item) }));
 }
 
 function dismiss(id: number): void {
   useToasts.setState((s) => ({ items: s.items.filter((item) => item.id !== id) }));
+}
+
+/** Dismisses the toast shown with `key`, if any (what it said is no longer so: a job's guessed ending, corrected). */
+export function dismissToast(key: string): void {
+  useToasts.setState((s) => (s.items.some((item) => item.key === key) ? { items: s.items.filter((item) => item.key !== key) } : s));
 }
 
 /** One toast: dismisses itself after its kind's duration, counted only while the stack is not hovered. */

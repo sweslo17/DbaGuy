@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { DumpCommand, JobOutcomeEvent, JobProgressEvent, RunFileCommand } from "@/lib/api/types";
 import { sqliteBusyNote } from "@/lib/sqliteBusy";
 import { FILTER_RULE } from "../table-data/filterValue";
-import { cancelNote, CODE_LABELS, codeLabel, etaText, jobNotification, jobReport, jobSummary, progressView, type JobView } from "./jobReport";
+import { cancelNote, CODE_LABELS, codeLabel, endingIsNews, etaText, jobNotification, jobReport, jobSummary, progressView, type JobView } from "./jobReport";
 import { jobReducer, openingJob, type JobState } from "./jobState";
 
 const CODE_LABELS_HINT_FILE_CHANGED =
@@ -525,5 +525,24 @@ describe("the notification of a long job", () => {
   it("stays quiet for a job that was cancelled elsewhere: the outcome says so (fix 7)", () => {
     expect(jobNotification(titled(long(outcome({ outcome: "rolled_back", cancelled: true }))), 15, false)).toBeNull();
     expect(jobNotification(titled(long(outcome({ job: "dump", outcome: "failed", cancelled: true })), dump), 15, false)).toBeNull();
+  });
+
+  it("tells of a job whose Cancel lost the race, and never of one that did not connect (06b T8 fix M3, M4)", () => {
+    expect(jobNotification(titled({ ...long(outcome()), cancelRequestedAt: 5 }), 15, false)?.title).toBe(
+      "SQL file run finished after 2 min 00 s",
+    );
+    const failed = jobReducer(openingJob(0), { type: "open_failed", error: new Error("password"), at: 120_000 });
+    expect(jobNotification(titled(failed), 15, false)).toBeNull();
+  });
+});
+
+describe("whether a job's ending is news (its notification and its toast)", () => {
+  it("is not for one that ended cancelled, whoever asked, nor one never sent; a Cancel that lost the race is", () => {
+    expect(endingIsNews(ended(outcome()))).toBe(true);
+    expect(endingIsNews({ ...ended(outcome()), cancelRequestedAt: 1 })).toBe(true);
+    expect(endingIsNews(ended(outcome({ outcome: "stopped", cancelled: true })))).toBe(false);
+    expect(endingIsNews(jobReducer(openingJob(0), { type: "not_sent", at: 1 }))).toBe(false);
+    expect(endingIsNews(jobReducer(openingJob(0), { type: "open_failed", error: new Error("x"), at: 1 }))).toBe(true);
+    expect(endingIsNews(openingJob(0))).toBe(false);
   });
 });

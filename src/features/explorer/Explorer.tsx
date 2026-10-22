@@ -19,7 +19,7 @@ import { secretsNeeded } from "../connections/UnlockDialog";
 import { joinUnlockPrompt } from "../connections/unlockPrompts";
 import { openDumpDialog, openRunDialog } from "../data-tools/dataDialogs";
 import { dumpEntryForNode, runEntryForNode, type RunEntry } from "../data-tools/entryPoints";
-import { runningJobs, useJobs } from "../data-tools/jobsStore";
+import { runningJobs, syncJobs, useJobs } from "../data-tools/jobsStore";
 import { READ_ONLY_RUN } from "../data-tools/runForm";
 import { askOpenDocument } from "../documents/openDocument";
 import { applyTreeContext } from "../query/queryContext";
@@ -218,9 +218,11 @@ export function Explorer() {
    * Before a profile is deleted, each of its tabs is asked in turn (a running export, a run, an open transaction):
    * table and object tabs close, query tabs agree to lose their session. Any "no" keeps the profile. First, a
    * data-tools job running on it keeps it, before any tab is asked: the delete closes every session of the profile,
-   * the jobs' too (B13).
+   * the jobs' too (B13). The backend's list is read first: a job wrongly guessed lost (`not_listed`) that it has
+   * running counts again, and one it does not have never blocks the delete.
    */
   const releaseTabs = async (profileId: string): Promise<boolean> => {
+    await syncJobs(); // a list that fails is logged, and the jobs stay as this window knows them
     const jobs = runningJobs(useJobs.getState()).filter((job) => job.profileId === profileId).length;
     if (jobs > 0) {
       toast("warning", `Profile not deleted — ${jobs === 1 ? "a job is" : `${jobs} jobs are`} still running on it`);

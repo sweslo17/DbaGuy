@@ -1,15 +1,16 @@
-import type { ToastKind } from "@/components/ui/Toast";
-import { jobNotification, jobReport, type Tone } from "./jobReport";
+import type { ToastKind } from "@/components/ui/toastItems";
+import { endingIsNews, jobNotification, jobReport, type Tone } from "./jobReport";
 import type { JobState } from "./jobState";
-import { isRunning, jobList, runningJobs, type JobRecord, type JobsSnapshot } from "./jobsStore";
+import type { JobRecord } from "./jobsStore";
 
 /*
  * When a data-tools job ends, and what is said then (spec ⑥ R-06-15, ruling V11): a system notification per S8 and,
  * when the job's view is not open, a toast with Open. Pure, but for the teller's timer. Each ending of a job is told at
  * most once; an ending this window had to guess waits a moment first, because the backend's word often follows at once
  * (pre-flight M2: a session gone, then the list's outcome; a job not listed whose socket then speaks), and a word that
- * replaces an ending already told takes its toast's place. A job first seen already ended (listed after a reload) is
- * never told: `jobsStore` reports no ending for it.
+ * replaces an ending already told takes its toast's place, or dismisses it when it is not news. A job first seen
+ * already ended (listed after a reload) is never told: `jobsStore` reports no ending for it. No store here: the
+ * teller reads the job through what it is given.
  */
 
 /** How long a guessed ending waits before it is told: the backend's word that replaces it comes in that time. */
@@ -32,12 +33,14 @@ export function endingKey(state: JobState): string | null {
 
 /**
  * Whether this window saw the job end as it ended: the backend's outcome on the job's socket, or an ending of this
- * window's own (it is its own time). An outcome read from the backend's list (a job listed after a reload, or one whose
- * loss the list replaced) has the time the list came: `JobInfo` has no end time.
+ * window's own (it is its own time). Not an outcome read from the backend's list (a job listed after a reload, or one
+ * whose loss the list replaced: `JobInfo` has no end time), nor `not_listed` (the time of the sync that missed it: the
+ * job went at some moment before).
  */
 export function endTimeKnown(state: JobState): boolean {
   if (state.phase !== "ended" || state.endedAt === null) return false;
-  return state.outcome === null || state.lastEventAt === state.endedAt;
+  if (state.outcome === null) return state.loss !== "not_listed";
+  return state.lastEventAt === state.endedAt;
 }
 
 /** The time beside a job in the Jobs list: how long it has run so far, or how long it ran; null when its end is not known. */
@@ -64,21 +67,25 @@ export interface EndingNotice {
 }
 
 /**
- * What is said as a job ends (V11): the notification `jobNotification` gives (in the background, after the threshold;
- * none for a job its user cancelled or one never sent), only when this window saw it end (its time says how long the
- * job took); and a toast "<outcome> — <job>" when its view is not open, its own user did not cancel it and it was sent.
+ * What is said as a job ends (V11), for an ending that is news (`endingIsNews`: not one that ended cancelled, nor one
+ * never sent; a Cancel that lost the race is news): the notification `jobNotification` gives (in the background, after
+ * the threshold; not for `open_failed`), only when this window saw the job end (its time says how long it took); and a
+ * toast "<outcome> — <job>" when its view is not open (`open_failed` too: its view asks for the password).
  */
 export function endingNotice(record: JobRecord, context: EndingContext): EndingNotice {
   const report = jobReport(record);
   if (!report) return { notification: null, toast: null };
   const { state } = record;
   const notification = endTimeKnown(state) ? jobNotification(record, context.thresholdS, context.focused) : null;
-  const quiet = context.shown === record.requestId || state.cancelRequestedAt !== null || state.loss === "not_sent";
+  const quiet = context.shown === record.requestId || !endingIsNews(state);
   return {
     notification,
     toast: quiet ? null : { kind: TOAST_KINDS[report.tone], text: `${report.title} — ${record.title}` },
   };
 }
+
+/** The key of a job's ending toast: a corrected ending takes its place, or dismisses it when it is not news. */
+export const endingToastKey = (requestId: string): string => `job:${requestId}`;
 
 export interface EndingTeller {
   /** A job ended, or its ending changed (`onJobEnded`). */
@@ -128,9 +135,3 @@ export function endingTeller(
     },
   };
 }
-
-/** How many jobs run (the Jobs button's count): a number, so the button renders only when it changes (Q1). */
-export const runningCount = (snapshot: JobsSnapshot): number => runningJobs(snapshot).length;
-
-/** Whether a job has ended (Clear finished has something to clear): a boolean, for the same reason. */
-export const hasEndedJob = (snapshot: JobsSnapshot): boolean => jobList(snapshot).some((record) => !isRunning(record));

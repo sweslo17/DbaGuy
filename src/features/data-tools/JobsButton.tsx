@@ -8,9 +8,9 @@ import { cn } from "@/lib/cn";
 import { formatElapsed } from "@/lib/format";
 import { useNow } from "@/lib/useNow";
 import { openJobDialog, setJobsPopoverOpen, useJobsPopoverOpen } from "./dataDialogs";
-import { hasEndedJob, runningCount, shownElapsed } from "./jobEndings";
+import { shownElapsed } from "./jobEndings";
 import { jobSummary } from "./jobReport";
-import { clearFinishedJobs, isRunning, syncJobs, useJobs } from "./jobsStore";
+import { clearFinishedJobs, hasEndedJob, isRunning, runningCount, syncJobs, useJobs } from "./jobsStore";
 import { TONE_CLASS } from "./JobViews";
 
 /*

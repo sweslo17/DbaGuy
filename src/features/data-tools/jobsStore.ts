@@ -349,3 +349,7 @@ export function resetJobsForTests(): void {
 /** The jobs, newest first. */
 export const jobList = ({ jobs, order }: JobsSnapshot): JobRecord[] => order.map((id) => jobs[id]);
 export const runningJobs = (snapshot: JobsSnapshot): JobRecord[] => jobList(snapshot).filter(isRunning);
+/** How many jobs run (the Jobs button's count): a number, so a selector of it renders only when it changes (Q1). */
+export const runningCount = (snapshot: JobsSnapshot): number => runningJobs(snapshot).length;
+/** Whether a job has ended (Clear finished has something to clear): a boolean, for the same reason. */
+export const hasEndedJob = (snapshot: JobsSnapshot): boolean => jobList(snapshot).some((record) => !isRunning(record));

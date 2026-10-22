@@ -6,6 +6,7 @@ import type { JobTransport } from "./jobRunner";
 import { openingJob, type JobLoss } from "./jobState";
 import {
   clearFinishedJobs,
+  hasEndedJob,
   jobList,
   MAX_JOBS_KEPT,
   NOT_LISTED_AFTER_MS,
@@ -13,6 +14,7 @@ import {
   reconcile,
   resetJobsForTests,
   retryJob,
+  runningCount,
   runningJobs,
   setJobListing,
   setJobTransport,
@@ -274,5 +276,19 @@ describe("following the backend", () => {
     answers[2]([listedEnded("r8"), listedEnded("r6"), info({ request_id: "r7", session_id: "s-r7", outcome: outcome({ request_id: "r7" }) }), listedEnded("u")]);
     await again;
     expect([useJobs.getState().order, state("r7")?.outcome?.outcome, sockets.length, closedSessions]).toEqual([["r7"], "completed", 0, []]);
+  });
+});
+
+describe("the Jobs button's counts", () => {
+  it("counts the running jobs (opening ones too) and knows whether one has ended", () => {
+    const snapshot = (records: JobRecord[]) => ({
+      jobs: Object.fromEntries(records.map((r) => [r.requestId, r])),
+      order: records.map((r) => r.requestId),
+    });
+    const running = [record({ requestId: "a", state: openingJob(0) }), record({ requestId: "b" })];
+    expect([runningCount(snapshot(running)), hasEndedJob(snapshot(running))]).toEqual([2, false]);
+    const ended = record({ requestId: "c", state: { ...openingJob(0), phase: "ended", sent: true, sentAt: 0, loss: "not_listed", endedAt: 1 } });
+    const some = snapshot([...running, ended]);
+    expect([runningCount(some), hasEndedJob(some)]).toEqual([2, true]);
   });
 });

@@ -5,14 +5,13 @@ import {
   endingNotice,
   endingTeller,
   endTimeKnown,
-  hasEndedJob,
-  runningCount,
   SETTLE_MS,
   shownElapsed,
+  TOAST_KINDS,
   type EndingContext,
 } from "./jobEndings";
 import { jobReducer, listedJob, openingJob, type JobEvent, type JobState } from "./jobState";
-import type { JobRecord, JobsSnapshot } from "./jobsStore";
+import type { JobRecord } from "./jobsStore";
 
 /* When a job ends (spec ⑥ R-06-15, V11): the notification and the toast, each ending told once, a guessed ending only
    if the backend's word does not replace it at once, and the time beside a job in the Jobs list only when it is known. */
@@ -90,6 +89,15 @@ describe("the time beside a job in the Jobs list", () => {
     const replaced = fold([{ type: "session_gone", at: 30_000 }, { type: "listed", info: info({ outcome: outcome() }), at: 31_000 }]);
     expect([replaced.phase, replaced.outcome?.outcome, shownElapsed(replaced, 40_000)]).toEqual(["ended", "completed", null]);
   });
+
+  it("says nothing for a job guessed not listed: its time is the sync's that missed it (fix M2)", () => {
+    const lost = fold([{ type: "not_listed", at: 70_000 }]);
+    expect([endTimeKnown(lost), shownElapsed(lost, 80_000)]).toEqual([false, null]);
+    expect(endingNotice(record(lost), away)).toEqual({
+      notification: null,
+      toast: { kind: "error", text: "The backend has no record of this job: it restarted, or never got the command — Dump public.big of dev pg to big.sql" },
+    });
+  });
 });
 
 describe("what is said as a job ends", () => {
@@ -107,16 +115,35 @@ describe("what is said as a job ends", () => {
     expect(kind([ended(5, { warnings: ["Not included: 1 view"] })])).toBe("warning");
     expect(kind([ended(5, { outcome: "failed" })])).toBe("error");
     expect(kind([{ type: "session_gone", at: 5 }])).toBe("error");
-    // cancelled in another window (the outcome says so; this window's user did not ask): muted
-    expect(kind([ended(5, { outcome: "failed", cancelled: true })])).toBe("info");
+    // muted: only cancelled and never-sent jobs are, and those are not news
+    expect(TOAST_KINDS.muted).toBe("info");
   });
 
-  it("does not toast a job whose view is open, one its own user cancelled, or one never sent", () => {
+  it("does not toast a job whose view is open, one that ended cancelled, or one never sent", () => {
     expect(endingNotice(record(fold([ended(5)])), { ...away, shown: "r1" }).toast).toBeNull();
-    const cancelled = fold([{ type: "cancel_sent", at: 3 }, ended(5, { outcome: "failed", cancelled: true })]);
+    const cancelled = fold([{ type: "cancel_sent", at: 3 }, ended(65_000, { outcome: "failed", cancelled: true })]);
     expect(endingNotice(record(cancelled), away)).toEqual({ notification: null, toast: null });
+    // cancelled in another window: the outcome says so, and someone asked for it
+    expect(endingNotice(record(fold([ended(65_000, { outcome: "failed", cancelled: true })])), away)).toEqual({ notification: null, toast: null });
     const notSent = [{ type: "not_sent", at: 5 } as JobEvent].reduce(jobReducer, openingJob(0));
     expect(endingNotice(record(notSent), away)).toEqual({ notification: null, toast: null });
+  });
+
+  it("tells a job whose Cancel lost the race: it ended otherwise first (fix M3)", () => {
+    const raced = record(fold([{ type: "cancel_sent", at: 64_000 }, ended(65_000)]));
+    const notice = endingNotice(raced, away);
+    expect([notice.toast?.kind, notice.notification?.title]).toEqual(["success", "Dump finished after 1 min 05 s"]);
+    const lost = record(fold([{ type: "cancel_sent", at: 64_000 }, { type: "session_gone", at: 65_000 }]));
+    expect(endingNotice(lost, away).toast?.kind).toBe("error");
+  });
+
+  it("toasts a job that could not connect, with its view closed, and does not notify it (fix M4)", () => {
+    const failed = [{ type: "open_failed", error: new Error("password"), at: 65_000 } as JobEvent].reduce(jobReducer, openingJob(0));
+    expect(endingNotice(record(failed), away)).toEqual({
+      notification: null,
+      toast: { kind: "error", text: "Could not connect: nothing was sent — Dump public.big of dev pg to big.sql" },
+    });
+    expect(endingNotice(record(failed), { ...away, shown: "r1" }).toast).toBeNull();
   });
 
   it("notifies only in the background, after the threshold, and only for an end this window saw", () => {
@@ -217,18 +244,5 @@ describe("each ending told once", () => {
     expect(endingKey(fold([]))).toBeNull();
     expect(endingKey(fold([ended(5, { outcome: "failed", cancelled: true })]))).toBe("0|outcome:failed:cancelled");
     expect(endingKey(fold([{ type: "session_gone", at: 5 }]))).toBe("0|loss:session_gone");
-  });
-});
-
-describe("the Jobs button's counts", () => {
-  it("counts the running jobs and knows whether one has ended", () => {
-    const snapshot = (states: JobState[]): JobsSnapshot => ({
-      jobs: Object.fromEntries(states.map((state, i) => [`r${i}`, record(state, { requestId: `r${i}` })])),
-      order: states.map((_, i) => `r${i}`),
-    });
-    const running = [openingJob(0), fold([])];
-    expect([runningCount(snapshot(running)), hasEndedJob(snapshot(running))]).toEqual([2, false]);
-    const some = snapshot([...running, fold([ended(5)])]);
-    expect([runningCount(some), hasEndedJob(some)]).toEqual([2, true]);
   });
 });
