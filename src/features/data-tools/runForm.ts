@@ -50,8 +50,13 @@ export const EVERY_STATEMENT_RUNS =
 export const RED_CONFIRM = "I've checked the file and the connection";
 /** A read-only connection's refusal, as the form, its inspection and the tree say it (06a: refused before anything is sent). */
 export const READ_ONLY_RUN = "This connection is read-only: it cannot run files";
-/** The inspection's first lines at most (`PREVIEW_LINES` in services/data_service.py; also cut at 64 KiB). */
-const PREVIEW_LINES = 200;
+/**
+ * The inspection reads the file's first 64 KiB (`PREVIEW_BYTES` in services/data_service.py) and shows at most its first
+ * 200 lines; a character cut at the read's end is left out (at most 3 bytes).
+ */
+const PREVIEW_BYTES = 64 * 1024;
+const PREVIEW_CUT_CHARACTER = 3;
+const utf8 = new TextEncoder();
 
 /** The backend's texts the dialog looks for in an inspection (sql/dump_header.py, services/data_service.py). */
 const DROPS_FIRST = "This dump drops and recreates its objects";
@@ -157,52 +162,63 @@ const samePlace = (a: FromLine | null, b: FromLine | null) =>
 const startsAt = (form: RunForm, start: Start) =>
   form.fromStatement === start.fromStatement && samePlace(form.fromLine, start.fromLine);
 
+/** The form runs where the entry's run again ran: on its connection, in its database and search path, its file. */
+const atEntryPlace = (form: RunForm, entry: RunEntry) =>
+  form.profileId === entry.profileId &&
+  form.database === entry.database &&
+  form.searchPath.trim() === (entry.searchPath ?? "").trim() &&
+  form.path.trim() === entry.path.trim();
+
+/**
+ * A run again's start belongs to where it ran (06b T7 fix round 1): its statements before N ran there, so anywhere
+ * else (another connection, database, search path or file) a form that still has the preset's start starts at
+ * statement 1, with no line to check; back where the run ran, a form that still starts at 1 gets the preset's start
+ * and its line again. A start the user typed stays (`form` itself when nothing moves).
+ */
+function placedStart(form: RunForm, entry: RunEntry | null): RunForm {
+  if (!entry) return form;
+  const preset = presetStart(entry);
+  const [from, to] = atEntryPlace(form, entry) ? [FIRST_STATEMENT, preset] : [preset, FIRST_STATEMENT];
+  return startsAt(form, from) && !startsAt(form, to) ? { ...form, ...to } : form;
+}
+
 /**
  * The form on another connection (the target picker): what belonged to the old one goes: the confirmation (CR-3: it
- * was for that connection), the database and the search path, and a run again's start while the form still has it
- * (its statements before N ran on its own connection, not on this one: it starts at statement 1, with no line to
- * check). Going back to the entry's own connection restores the entry's database and search path, and the run again's
- * start while the form still starts at statement 1. A start the user typed stays. The same form object when the
- * connection is the same.
+ * was for that connection), the database and the search path, and a run again's start (`placedStart`). Going back to
+ * the entry's own connection restores the entry's database and search path, and the run again's start when the file
+ * is the entry's too. The same form object when the connection is the same.
  */
 export function retargeted(form: RunForm, profileId: string | null, entry: RunEntry | null = null): RunForm {
   if (profileId === form.profileId) return form;
   const own = entry && profileId === entry.profileId ? entry : null;
-  let start: Start = { fromStatement: form.fromStatement, fromLine: form.fromLine };
-  if (entry && !own && form.profileId === entry.profileId && startsAt(form, presetStart(entry))) start = FIRST_STATEMENT;
-  else if (own && startsAt(form, FIRST_STATEMENT)) start = presetStart(own);
-  return {
-    ...form,
-    ...start,
-    profileId,
-    database: own?.database ?? null,
-    searchPath: own?.searchPath ?? "",
-    confirmed: false,
-  };
+  const next = { ...form, profileId, database: own?.database ?? null, searchPath: own?.searchPath ?? "", confirmed: false };
+  return placedStart(next, entry);
 }
 
 /**
  * Another database of the same connection (the target picker): the confirmation goes (CR-3 is for the connection and
- * the database it runs in). The same form object when the database is the same.
+ * the database it runs in), and so does a run again's start (`placedStart`). The same form object when the database is
+ * the same.
  */
-export function withDatabase(form: RunForm, database: string | null): RunForm {
-  return database === form.database ? form : { ...form, database, confirmed: false };
+export function withDatabase(form: RunForm, database: string | null, entry: RunEntry | null = null): RunForm {
+  return database === form.database ? form : placedStart({ ...form, database, confirmed: false }, entry);
 }
 
 /**
  * Another file (typed or chosen): the confirmation goes, as for another target (CR-3: "I've checked the file and the
- * connection"). The same form object when the path is the same.
+ * connection"), and so does a run again's start (`placedStart`). The same form object when the path is the same.
  */
-export function withPath(form: RunForm, path: string): RunForm {
-  return path === form.path ? form : { ...form, path, confirmed: false };
+export function withPath(form: RunForm, path: string, entry: RunEntry | null = null): RunForm {
+  return path === form.path ? form : placedStart({ ...form, path, confirmed: false }, entry);
 }
 
 /**
  * Another search path (PostgreSQL): the confirmation goes, as for another database (the unqualified names of the
- * file's statements land there). The same form object when it is the same.
+ * file's statements land there), and so does a run again's start (`placedStart`). The same form object when it is the
+ * same.
  */
-export function withSearchPath(form: RunForm, searchPath: string): RunForm {
-  return searchPath === form.searchPath ? form : { ...form, searchPath, confirmed: false };
+export function withSearchPath(form: RunForm, searchPath: string, entry: RunEntry | null = null): RunForm {
+  return searchPath === form.searchPath ? form : placedStart({ ...form, searchPath, confirmed: false }, entry);
 }
 
 /** A "run again" action's changes on the form (`RunPatch`): its mode counts as chosen; the confirmation is asked again. */
@@ -360,15 +376,18 @@ export function againEntry(
 }
 
 /**
- * What the inspection's preview shows of a file it does not show whole: the first N lines it holds, and that the read
- * stopped at 64 KiB when that cut it before PREVIEW_LINES (long lines). Null for a whole file.
+ * What the inspection's preview shows of a file it does not show whole: the first N lines it holds (as the dialog
+ * numbers them: at LF), and that the read stopped at 64 KiB when that cut it (long lines). Which cap cut it is told by
+ * the preview's size, not its line count: the backend counts its 200 lines as Python's `splitlines` does (CR, U+2028…
+ * end lines there), so a file of CR-only lines is one line here and short of 200. Null for a whole file.
  */
 export function previewNote(inspection: FileInspection): string | null {
   if (!inspection.preview_truncated) return null;
   const shown = numberedLines(inspection.preview, 1).length;
   if (shown === 0) return null;
   const lines = shown === 1 ? "The first line" : `The first ${shown.toLocaleString()} lines`;
-  return shown < PREVIEW_LINES ? `${lines} (the first 64 KiB)` : lines;
+  const bytes = utf8.encode(inspection.preview).length;
+  return bytes >= PREVIEW_BYTES - PREVIEW_CUT_CHARACTER ? `${lines} (the first 64 KiB)` : lines;
 }
 
 /** A file's lines, numbered from `firstLine` (an excerpt, or the inspection's first lines). */

@@ -1,4 +1,4 @@
-import { useEffect, useEffectEvent, useId, useRef, useState, type ReactNode } from "react";
+import { useEffect, useEffectEvent, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
 import { Checkbox, FieldRow, Input, Radio } from "@/components/ui/Field";
@@ -96,6 +96,8 @@ export function RunFileDialog({ entry }: { entry: RunEntry }) {
 
   const choices = runChoices(engine, inspected, form);
   const notes = inspectionNotes(inspected);
+  // Once per read (it measures up to 64 KiB of text), not on every keystroke in the form
+  const previewShown = useMemo(() => (inspected ? previewNote(inspected) : null), [inspected]);
   const gate = runGate(profile, engine, form, inspected !== null);
   const queryContext = queryContextOf(entry, form);
   const modeGroup = useId();
@@ -139,7 +141,8 @@ export function RunFileDialog({ entry }: { entry: RunEntry }) {
     pathChanged.current = true;
     reads.current++;
     setInspection(IDLE);
-    setForm((current) => withPath(current, path)); // another file: a red connection's box is asked again (CR-3)
+    // another file: a red connection's box is asked again (CR-3), and a run again's start stays with its own file
+    setForm((current) => withPath(current, path, entry));
   };
 
   const focusNext = useEffectEvent(() => {
@@ -169,7 +172,7 @@ export function RunFileDialog({ entry }: { entry: RunEntry }) {
       setForm(next);
       if (next.path.trim()) read(profileId, next.path, false); // the inspection says what this target makes of the file
     } else {
-      setForm(withDatabase(form, database)); // another database of the same connection: the box is asked again too
+      setForm(withDatabase(form, database, entry)); // another database of the same connection: the box is asked again too
     }
   };
 
@@ -204,7 +207,7 @@ export function RunFileDialog({ entry }: { entry: RunEntry }) {
     openJobDialog(requestId);
   };
 
-  const summary = fileSummary(isOf(inspection, form) ? inspection : IDLE, form, notes, () =>
+  const summary = fileSummary(isOf(inspection, form) ? inspection : IDLE, form, notes, previewShown, () =>
     read(form.profileId, form.path, false),
   );
 
@@ -247,7 +250,7 @@ export function RunFileDialog({ entry }: { entry: RunEntry }) {
               id={searchPathId}
               value={form.searchPath}
               // another search path: a red connection's box is asked again (CR-3: the file's names land there)
-              onChange={(e) => setForm((current) => withSearchPath(current, e.target.value))}
+              onChange={(e) => setForm((current) => withSearchPath(current, e.target.value, entry))}
               placeholder="the connection's default"
               className="font-mono"
             />
@@ -362,6 +365,7 @@ function fileSummary(
   inspection: Inspection,
   form: RunForm,
   notes: { prominent: string[]; other: string[] },
+  shown: string | null,
   retry: () => void,
 ): ReactNode {
   switch (inspection.status) {
@@ -389,7 +393,6 @@ function fileSummary(
       );
     case "read": {
       const { file } = inspection;
-      const shown = previewNote(file);
       return (
         <div className="flex flex-col gap-1.5 text-[12px]">
           <p className="text-muted tabular-nums">{formatSize(file.size)}</p>

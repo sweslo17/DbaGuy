@@ -359,6 +359,9 @@ describe("the run form", () => {
     // a start the user typed stays wherever the run goes
     expect(retargeted({ ...form, fromStatement: "9" }, "p2", again).fromStatement).toBe("9");
     expect(retargeted({ ...elsewhere, fromStatement: "7" }, "p1", again).fromStatement).toBe("7");
+    // came back with another file: statement 4 of that file is not where the run stopped
+    const otherFile = retargeted(withPath(elsewhere, "/tmp/y.sql", again), "p1", again);
+    expect([otherFile.fromStatement, otherFile.fromLine]).toEqual(["1", null]);
     // a fresh form, or a patch without a line, sends none
     expect(runCommand(initialRunForm(entry, pg), pg, null, "r")).not.toHaveProperty("from_line");
     expect(patchedForm(form, { mode: "statements", on_error: "stop", from_statement: 5 }).fromLine).toBeNull();
@@ -366,6 +369,33 @@ describe("the run form", () => {
     // "run again as it was" of a run again keeps its line; of a plain run, none
     const sent = runCommand(form, pg, null, "r");
     expect(againEntry({ profileId: "p1", database: null, command: sent }, null).preset).toEqual({ mode: "statements", on_error: "stop", from_statement: 4, from_line: 3 });
+  });
+
+  it("keeps a run again's start only where it ran: another file, database or search path starts at 1 (06b T7 fix 1)", () => {
+    const pg = engine("postgres");
+    const again: RunEntry = { ...entry, database: "dbA", preset: { mode: "statements", on_error: "stop", from_statement: 4, from_line: 3 } };
+    const form = initialRunForm(again, pg);
+    const start = (f: typeof form) => [f.fromStatement, f.fromLine?.line ?? null];
+    // another file on the same connection: statements 1–3 ran from the other one
+    const file = withPath(form, "/tmp/y.sql", again);
+    expect(start(file)).toEqual(["1", null]);
+    expect(runCommand(file, pg, null, "r")).toMatchObject({ from_statement: 1 });
+    // the same file again (a typo undone): the start and its line come back
+    expect(start(withPath(file, "/tmp/x.sql", again))).toEqual(["4", 3]);
+    // another database, and back
+    const database = withDatabase(form, "dbB", again);
+    expect(start(database)).toEqual(["1", null]);
+    expect(start(withDatabase(database, "dbA", again))).toEqual(["4", 3]);
+    // another search path, and back
+    const schema = withSearchPath(form, "billing", again);
+    expect(start(schema)).toEqual(["1", null]);
+    expect(start(withSearchPath(schema, "sales", again))).toEqual(["4", 3]);
+    // a start the user typed is theirs: it stays, and nothing comes back over it
+    expect(start(withPath({ ...form, fromStatement: "9" }, "/tmp/y.sql", again))).toEqual(["9", 3]);
+    expect(withPath({ ...file, fromStatement: "2" }, "/tmp/x.sql", again).fromStatement).toBe("2");
+    // a plain run (no preset) never moves its start
+    const plain = initialRunForm(entry, pg);
+    expect(withPath({ ...plain, fromStatement: "5" }, "/tmp/y.sql", entry).fromStatement).toBe("5");
   });
 
   it("lists the target's databases where the engine has them: MySQL's are its schemas", () => {
@@ -463,14 +493,19 @@ describe("the forms' helpers", () => {
     expect(again({ bucket: "b", scope: "s" })).toEqual({ bucket: "b", scope: "s" });
   });
 
-  it("says how much of the file the preview shows: the first lines, and where the 64 KiB read cut them", () => {
-    const preview = (lines: number, truncated: boolean) =>
-      ({ ...inspection([]), preview: "x\n".repeat(lines), preview_truncated: truncated }) as FileInspection;
-    expect(previewNote(preview(12, false))).toBeNull();
-    expect(previewNote(preview(200, true))).toBe("The first 200 lines");
-    expect(previewNote(preview(37, true))).toBe("The first 37 lines (the first 64 KiB)");
-    expect(previewNote(preview(1, true))).toBe("The first line (the first 64 KiB)");
-    expect(previewNote(preview(0, true))).toBeNull();
+  it("says how much of the file the preview shows: the first lines, and the 64 KiB read by the preview's size", () => {
+    const preview = (text: string, truncated = true) =>
+      ({ ...inspection([]), preview: text, preview_truncated: truncated }) as FileInspection;
+    const long = (lines: number) => `${"x".repeat(Math.ceil(65_536 / lines) - 1)}\n`.repeat(lines); // ≥ 64 KiB in all
+    expect(previewNote(preview("x\n".repeat(12), false))).toBeNull();
+    expect(previewNote(preview("x\n".repeat(200)))).toBe("The first 200 lines");
+    expect(previewNote(preview(long(37)))).toBe("The first 37 lines (the first 64 KiB)");
+    expect(previewNote(preview(long(1)))).toBe("The first line (the first 64 KiB)");
+    // the 64 KiB read, less a character cut at its end (3 bytes of UTF-8: "é" is 2, "中" is 3)
+    expect(previewNote(preview("中".repeat(21_845)))).toBe("The first line (the first 64 KiB)");
+    // CR-only lines: the backend's 200 lines (splitlines) are one line here, and far short of 64 KiB
+    expect(previewNote(preview("SELECT 1;\r".repeat(200)))).toBe("The first line");
+    expect(previewNote(preview(""))).toBeNull();
   });
 
   it("numbers a file's lines from where they start, without their CR", () => {
