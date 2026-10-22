@@ -17,8 +17,8 @@ import { findEngineInfo, isReadOnlyProfile, useDeleteProfile, useEngines, usePro
 import { profileColor } from "../connections/profileColors";
 import { secretsNeeded } from "../connections/UnlockDialog";
 import { joinUnlockPrompt } from "../connections/unlockPrompts";
-import { openDumpDialog } from "../data-tools/dataDialogs";
-import { dumpEntryForNode } from "../data-tools/entryPoints";
+import { openDumpDialog, openRunDialog } from "../data-tools/dataDialogs";
+import { dumpEntryForNode, runEntryForNode, type RunEntry } from "../data-tools/entryPoints";
 import { askOpenDocument } from "../documents/openDocument";
 import { applyTreeContext } from "../query/queryContext";
 import { requestCloseTab, requestDisconnectTab } from "../workspace/closeGuards";
@@ -41,6 +41,16 @@ const BROWSABLE_KIND = "collection";
 const CONTEXT_CLICK_DELAY_MS = 250;
 
 type ErrorRow = Extract<TreeRow, { type: "error" }>;
+
+/** A read-only connection's Run SQL file… is greyed with why: the backend refuses it before anything is sent (06a). */
+const RUN_READ_ONLY = "This connection is read-only: it cannot run files";
+
+/** Run SQL file… for a node (or the connection's row): greyed on a read-only connection. */
+const runItem = (entry: RunEntry, readOnly: boolean): MenuItem => ({
+  label: "Run SQL file…",
+  onSelect: () => openRunDialog(entry),
+  ...(readOnly ? { disabled: true, title: RUN_READ_ONLY } : {}),
+});
 
 const isExpandable = (row: TreeRow) =>
   row.type === "folder" || row.type === "profile" || (row.type === "node" && row.node.has_children);
@@ -319,6 +329,7 @@ export function Explorer() {
       }
       case "profile": {
         const p = row.entry.profile;
+        const runEntry = runEntryForNode(p.id, findEngineInfo(entries, engines, p.id), null);
         const content = (
           <div
             {...aria}
@@ -339,6 +350,7 @@ export function Explorer() {
         return (
           <ContextMenu
             items={[
+              ...(runEntry ? [runItem(runEntry, p.read_only)] : []),
               { label: "New Query", onSelect: () => openQuery(p.id, null) },
               { label: "Edit…", onSelect: () => setDialog({ open: true, entry: row.entry }) },
               { label: "Refresh", onSelect: () => void qc.invalidateQueries({ queryKey: ["children", p.id] }) },
@@ -370,7 +382,11 @@ export function Explorer() {
         const engine = findEngineInfo(entries, engines, row.profileId);
         // The data tools first (spec ⑥ §3.6: what the engine can do decides, D-06-13), then a collection's own items
         const dumpEntry = dumpEntryForNode(row.profileId, engine, row.node);
-        const dataItems: MenuItem[] = dumpEntry ? [{ label: "Dump…", onSelect: () => openDumpDialog(dumpEntry) }] : [];
+        const runEntry = runEntryForNode(row.profileId, engine, row.node);
+        const dataItems: MenuItem[] = [
+          ...(dumpEntry ? [{ label: "Dump…", onSelect: () => openDumpDialog(dumpEntry) }] : []),
+          ...(runEntry ? [runItem(runEntry, isReadOnlyProfile(entries, row.profileId))] : []),
+        ];
         const items = [...dataItems, ...(row.node.kind === BROWSABLE_KIND ? collectionItems(row, engine?.documents === true) : [])];
         if (items.length === 0) return content;
         return (

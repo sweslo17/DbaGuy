@@ -4,7 +4,7 @@ import { useState } from "react";
 import { EngineIcon } from "@/components/EngineIcon";
 import { DropdownMenu, type MenuItem } from "@/components/ui/ContextMenu";
 import { errorMessage } from "@/lib/api/client";
-import type { ProfileEntry, SessionInfo } from "@/lib/api/types";
+import type { Profile, ProfileEntry, SessionInfo } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { ENGINE_LABELS } from "@/lib/engines";
 import { buildFolderTree, type FolderNode } from "../connections/folders";
@@ -39,60 +39,84 @@ export interface ConnectionPickerProps {
   context?: ContextPickerProps;
 }
 
-/** The connections as menu items: folders become submenus, like the explorer's tree. */
-function profileItems(folder: FolderNode, current: string | null, pick: (id: string) => void): MenuItem[] {
+/**
+ * The connections as menu items: folders become submenus, like the explorer's tree. `disabled`: why a connection cannot
+ * be picked here (null: it can); the reason greys its item and is its tooltip.
+ */
+export function profileItems(
+  folder: FolderNode,
+  current: string | null,
+  pick: (id: string) => void,
+  disabled?: (profile: Profile) => string | null,
+): MenuItem[] {
   return [
-    ...folder.folders.map((sub) => ({ label: sub.name, children: profileItems(sub, current, pick) })),
-    ...folder.profiles.map(({ profile }) => ({
-      label: profile.name,
-      // The engine's name is the row's shortcut text.
-      icon: <EngineIcon engine={profile.engine} decorative />,
-      shortcut: ENGINE_LABELS[profile.engine],
-      checked: profile.id === current,
-      onSelect: () => pick(profile.id),
-    })),
+    ...folder.folders.map((sub) => ({ label: sub.name, children: profileItems(sub, current, pick, disabled) })),
+    ...folder.profiles.map(({ profile }) => {
+      const reason = disabled?.(profile) ?? null;
+      return {
+        label: profile.name,
+        // The engine's name is the row's shortcut text.
+        icon: <EngineIcon engine={profile.engine} decorative />,
+        shortcut: ENGINE_LABELS[profile.engine],
+        checked: profile.id === current,
+        onSelect: () => pick(profile.id),
+        ...(reason ? { disabled: true, title: reason } : {}),
+      };
+    }),
   ];
 }
 
+/** What the database picker lists: the root's database nodes, or MySQL's schema nodes (its databases). */
+export type DatabaseNodeKind = "database" | "schema";
+
+const NODE_WORDS: Record<DatabaseNodeKind, { name: string; none: string; fallback: string }> = {
+  database: { name: "Database", none: "No databases", fallback: "Default database" },
+  schema: { name: "Schema", none: "No schemas", fallback: "Default schema" },
+};
+
 /**
- * For engines with one connection per database (PostgreSQL): the databases of the connection, from the explorer's root
- * children (loaded when the menu opens).
+ * The databases of the connection, from the explorer's root children (loaded when the menu opens): for engines with
+ * one connection per database (PostgreSQL) in the query tab, and for a data tool's target (`nodeKind` "schema": MySQL's
+ * schema nodes). `current` null: the connection's default.
  */
-function DatabasePicker({
+export function DatabasePicker({
   profileId,
   current,
   blockedReason,
   onPick,
+  nodeKind = "database",
 }: {
   profileId: string;
   current: string | null;
   blockedReason?: string;
   onPick: (database: string) => void;
+  nodeKind?: DatabaseNodeKind;
 }) {
+  const words = NODE_WORDS[nodeKind];
   const [open, setOpen] = useState(false);
   const children = useQuery({ ...childrenQuery(profileId, []), enabled: open });
   let items: MenuItem[];
   if (children.isPending) items = [{ label: "Loading…", disabled: true }];
   else if (children.isError) items = [{ label: errorMessage(children.error), disabled: true }];
   else {
-    const databases = children.data.filter((node) => node.kind === "database");
+    const databases = children.data.filter((node) => node.kind === nodeKind);
     items = databases.length
       ? databases.map((node) => ({
           label: node.name,
           checked: node.name === current,
           onSelect: () => onPick(node.name),
         }))
-      : [{ label: "No databases", disabled: true }];
+      : [{ label: words.none, disabled: true }];
   }
   return (
     <DropdownMenu items={items} onOpenChange={setOpen} className="max-h-[60vh] max-w-[320px] overflow-y-auto">
       <PickerTrigger
         disabled={!!blockedReason}
-        title={blockedReason ?? `Database: ${current ?? "the connection's default"}`}
+        title={blockedReason ?? `${words.name}: ${current ?? "the connection's default"}`}
         className="max-w-[160px] enabled:hover:bg-hover"
       >
         <Database size={12} className="shrink-0 text-muted" />
-        <span className="truncate">{current ?? "Default database"}</span>
+        <span className="truncate">{current ?? words.fallback}</span>
       </PickerTrigger>
     </DropdownMenu>
   );

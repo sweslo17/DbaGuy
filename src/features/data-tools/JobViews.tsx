@@ -1,7 +1,9 @@
 import { Loader2 } from "lucide-react";
+import type { KeyboardEvent } from "react";
 import { EngineIcon } from "@/components/EngineIcon";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
+import { plural } from "@/lib/format";
 import { useNow } from "@/lib/useNow";
 import { useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
@@ -13,6 +15,15 @@ import type { JobRecord } from "./jobsStore";
  * ended. Every word about what happened comes from `jobReport` (never made up here). Each view reads only the record
  * it is given: the dialog that shows it subscribes to that one job (Q1).
  */
+
+/**
+ * A held Return's repeats never press the button that has the focus now: the Return that started a job (Run, Dump) is
+ * still down as its view opens with Close focused, and the Return that read a file is still down as the focus lands
+ * on Run (`RunFileDialog`).
+ */
+export function ignoreHeldReturn(e: KeyboardEvent<HTMLButtonElement>) {
+  if (e.key === "Enter" && e.repeat) e.preventDefault();
+}
 
 export const TONE_CLASS: Record<Tone, string> = {
   success: "text-success",
@@ -113,7 +124,48 @@ function ErrorBox({ error, onShowLine }: { error: ErrorLine; onShowLine?: (line:
   );
 }
 
-/** How the job ended (`jobReport`): its title, the facts, the error with its label, what to do, and the notes. */
+/** One skipped error's row: "Line N · <label, code or "error">: <the message's first line>" (the whole message on hover). */
+function skippedText(error: ErrorLine): string {
+  const where = error.line !== null ? `Line ${error.line.toLocaleString()} · ` : "";
+  return `${where}${error.label ?? error.code ?? "error"}: ${error.message.split("\n", 1)[0]}`;
+}
+
+/** The errors a run skipped (the first ones the backend keeps), each with Show when it has a line; how many more. */
+function SkippedErrors({ report, onShowLine }: { report: JobReport; onShowLine?: (line: number) => void }) {
+  if (report.skipped.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-1">
+      <p className="text-muted">Errors skipped</p>
+      <ul className="max-h-40 overflow-y-auto rounded-md border border-border py-0.5 [scrollbar-gutter:stable]">
+        {report.skipped.map((error, i) => {
+          const line = error.line;
+          return (
+            <li key={i} className="flex min-w-0 items-center gap-2 px-2 py-0.5" title={error.message}>
+              <span className="min-w-0 flex-1 truncate" data-selectable>
+                {skippedText(error)}
+              </span>
+              {onShowLine && line !== null && (
+                <Button size="sm" variant="ghost" className="shrink-0" onClick={() => onShowLine(line)}>
+                  Show
+                </Button>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+      {report.moreSkipped > 0 && (
+        <p className="text-muted">
+          and {plural(report.moreSkipped, "more error")} (only the first {report.skipped.length.toLocaleString()} are kept)
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * How the job ended (`jobReport`): its title, the facts, the error with its label, what to do, the notes and the errors
+ * a run skipped. `onShowLine`: an error's line can be shown (a run whose file is known).
+ */
 export function JobReportView({ record, onShowLine }: { record: JobRecord; onShowLine?: (line: number) => void }) {
   const report = jobReport(record);
   if (!report) return null;
@@ -136,6 +188,7 @@ export function JobReportView({ record, onShowLine }: { record: JobRecord; onSho
           ))}
         </ul>
       )}
+      <SkippedErrors report={report} onShowLine={onShowLine} />
     </div>
   );
 }

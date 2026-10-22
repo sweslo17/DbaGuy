@@ -32,6 +32,12 @@ export interface RunPatch {
   mode: RunFileCommand["mode"];
   on_error: NonNullable<RunFileCommand["on_error"]>;
   from_statement: number;
+  /**
+   * The line `from_statement` starts at, as the run before placed it (`resume_at`, when exact): the run again sends it
+   * (`RunFileCommand.from_line`), so a file edited in between is refused (`file_changed`) instead of skipping or
+   * repeating a statement (06b Task 2 review M3, M-b). Absent: nothing is checked.
+   */
+  from_line?: number;
 }
 
 export type JobAction =
@@ -91,6 +97,7 @@ export const CODE_LABELS = {
   cancelled: "Cancelled",
   invalid_command: "Refused by the backend",
   session_busy: "The job's session had closed",
+  file_changed: "The file changed since the run before",
 } as const;
 export type JobErrorCode = keyof typeof CODE_LABELS;
 
@@ -100,6 +107,8 @@ const CODE_HINTS: Partial<Record<JobErrorCode, string>> = {
   transaction_open:
     "The connection had a transaction open before the job began (SQL Server: a login whose user options turn IMPLICIT_TRANSACTIONS on). Nothing was sent.",
   invalid_filter: FILTER_RULE,
+  file_changed:
+    "The file was edited after the run that gave this place, so its statement numbers are not the ones they were. Look at the file, then set where to start again.",
 };
 /** Codes after which "Skip it and continue" cannot help: the file cannot be read past them, or nothing can run. */
 const NOT_SKIPPABLE: ReadonlySet<string> = new Set([
@@ -118,6 +127,8 @@ const NEEDS_STATEMENTS: ReadonlySet<string> = new Set([
   "file_truncated",
   "SQLITE_CONSTRAINT_FOREIGNKEY",
 ]);
+/** A run again whose statement no longer starts at the line the run before gave (`RunFileCommand.from_line`). */
+const FILE_CHANGED = "file_changed";
 
 /** Own properties only: "constructor" and "__proto__" are not codes (the K2 rule). */
 const has = <T extends object>(table: T, key: string): key is Extract<keyof T, string> => Object.hasOwn(table, key);
@@ -227,11 +238,14 @@ function runActions(outcome: JobOutcomeEvent, command: JobCommand | null, code: 
   const resume = outcome.resume_at ?? null;
   const onError = run.on_error;
   if (resume) {
+    // The line goes with it only when it is where that statement starts (`exact`): then a file edited since is refused
+    // instead of run from another statement (M3); a stop inside a statement (not UTF-8 text…) gives no line to check (M-b)
+    const line = resume.exact === false ? {} : { from_line: resume.line };
     const actions: JobAction[] = [
       {
         kind: "again",
         label: `Run again from line ${resume.line.toLocaleString()}`,
-        patch: { mode: "statements", on_error: onError, from_statement: resume.statement },
+        patch: { mode: "statements", on_error: onError, from_statement: resume.statement, ...line },
       },
     ];
     // Not after a Cancel: the user stopped it, there is no failure to skip (running it again from there stays)
@@ -250,6 +264,17 @@ function runActions(outcome: JobOutcomeEvent, command: JobCommand | null, code: 
         kind: "again",
         label: "Run the rest statement by statement…",
         patch: { mode: "statements", on_error: "stop", from_statement: at.statement + 1 },
+      },
+    ];
+  }
+  if (code === FILE_CHANGED) {
+    // The place the run before gave is not that statement's any more: the form again as it was, without the line to
+    // check (it would be refused again), for the user to set where to start in the file as it is now
+    return [
+      {
+        kind: "again",
+        label: "Run again…",
+        patch: { mode: run.mode, on_error: run.on_error, from_statement: run.from_statement },
       },
     ];
   }

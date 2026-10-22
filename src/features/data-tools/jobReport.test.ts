@@ -5,6 +5,9 @@ import { FILTER_RULE } from "../table-data/filterValue";
 import { cancelNote, CODE_LABELS, codeLabel, etaText, jobNotification, jobReport, jobSummary, progressView, type JobView } from "./jobReport";
 import { jobReducer, openingJob, type JobState } from "./jobState";
 
+const CODE_LABELS_HINT_FILE_CHANGED =
+  "The file was edited after the run that gave this place, so its statement numbers are not the ones they were. Look at the file, then set where to start again.";
+
 /* A job in words (spec ⑥ §3.6, §4): every outcome and loss, the actions that are safe now, the progress and its ETA. */
 
 const run = (fields: Partial<RunFileCommand> = {}): RunFileCommand => ({
@@ -66,7 +69,7 @@ describe("a run's outcome in words", () => {
     expect([said.tone, said.title, said.detail]).toEqual(["danger", "Stopped at line 5,001", "1,233 statements applied"]);
     expect(said.error).toEqual({ line: 5001, statement: 1234, code: "23505", label: null, message: "duplicate key" });
     expect(said.actions).toEqual([
-      { kind: "again", label: "Run again from line 5,001", patch: { mode: "statements", on_error: "stop", from_statement: 1234 } },
+      { kind: "again", label: "Run again from line 5,001", patch: { mode: "statements", on_error: "stop", from_statement: 1234, from_line: 5001 } },
       { kind: "again", label: "Skip it and continue", patch: { mode: "statements", on_error: "stop", from_statement: 1235 } },
     ]);
   });
@@ -79,7 +82,7 @@ describe("a run's outcome in words", () => {
       error: { line: 40, statement: 30, code: "42000", message: "boom" },
     });
     expect(report(stopped).actions).toEqual([
-      { kind: "again", label: "Run again from line 2", patch: { mode: "statements", on_error: "stop", from_statement: 2 } },
+      { kind: "again", label: "Run again from line 2", patch: { mode: "statements", on_error: "stop", from_statement: 2, from_line: 2 } },
     ]);
   });
 
@@ -249,6 +252,43 @@ describe("a run's outcome in words", () => {
     expect(said.actions.map((a) => a.label)).toEqual(["Run again from line 2"]);
   });
 
+  it("sends the line with a run again only where the place is a statement's start (06b review M3, M-b)", () => {
+    // not UTF-8 text inside a statement: the line is where the run stopped, not where the statement starts
+    const inexact = outcome({
+      outcome: "stopped",
+      statements: 1,
+      stopped_at: { line: 2, statement: 2, exact: false },
+      resume_at: { line: 2, statement: 2, exact: false },
+      error: { line: 2, statement: 2, code: "file_not_utf8", message: "Line 2 is not UTF-8 text" },
+    });
+    expect(report(inexact).actions).toEqual([
+      { kind: "again", label: "Run again from line 2", patch: { mode: "statements", on_error: "stop", from_statement: 2 } },
+    ]);
+    // an exact place (said so, or left out as the schema allows) goes with its line; a skip never has one
+    const exact = outcome({ outcome: "stopped", stopped_at: { line: 7, statement: 3, exact: true }, resume_at: { line: 7, statement: 3, exact: true }, error: { line: 7, statement: 3, code: "23505", message: "dup" } });
+    expect(report(exact).actions.map((a) => a.kind === "again" && a.patch)).toEqual([
+      { mode: "statements", on_error: "stop", from_statement: 3, from_line: 7 },
+      { mode: "statements", on_error: "stop", from_statement: 4 },
+    ]);
+  });
+
+  it("says a file edited between runs changed, and goes back to the form without the line to check", () => {
+    const changed = outcome({
+      outcome: "not_started",
+      error: { code: "file_changed", message: "The file changed: statement 4 now starts at line 5" },
+    });
+    const said = report(changed, run({ from_statement: 4, from_line: 4, on_error: "continue" }));
+    expect([said.title, said.error?.label, said.hint]).toEqual([
+      "Not started: nothing was run",
+      "The file changed since the run before",
+      CODE_LABELS_HINT_FILE_CHANGED,
+    ]);
+    // the same settings, from the same statement, but no from_line: it would be refused again
+    expect(said.actions).toEqual([
+      { kind: "again", label: "Run again…", patch: { mode: "statements", on_error: "continue", from_statement: 4 } },
+    ]);
+  });
+
   it("tells a run that did not start: cancelled, or refused", () => {
     expect(report(outcome({ outcome: "not_started", cancelled: true })).title).toBe("Cancelled before anything ran");
     const refused = report(outcome({ outcome: "not_started", error: { code: "read_only", message: "This connection is read-only" } }));
@@ -380,6 +420,7 @@ describe("the error codes", () => {
       "transaction_ended", "psql_meta_command", "unsupported_copy", "file_io", "dump_io", "invalid_path", "invalid_filter",
       "invalid_text", "not_supported", "read_only", "transaction_open", "connection_lost", "commit_unconfirmed",
       "file_not_found", "unsupported_option", "transaction_failed", "cancelled", "invalid_command", "session_busy",
+      "file_changed",
     ]) {
       expect(codeLabel(code), code).toBeTruthy();
     }

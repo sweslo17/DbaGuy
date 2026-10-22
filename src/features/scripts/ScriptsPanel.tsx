@@ -8,8 +8,11 @@ import { errorMessage } from "@/lib/api/client";
 import type { ScriptNode } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { isImeKeyEvent } from "@/lib/ime";
-import { isWithin, movedPath, parentPath, stemLength } from "@/lib/scriptPaths";
-import { useWorkspace } from "@/stores/workspace";
+import { isWithin, joinPath, movedPath, parentPath, stemLength } from "@/lib/scriptPaths";
+import { isTabDirty } from "@/stores/tabStatus";
+import { scriptTab, useWorkspace } from "@/stores/workspace";
+import { openRunDialog } from "../data-tools/dataDialogs";
+import { runEntryForScript } from "../data-tools/entryPoints";
 import { useScriptActions, useScriptTree } from "./useScripts";
 
 const ROW_HEIGHT = 22;
@@ -35,6 +38,18 @@ function flatten(items: ScriptNode[], expanded: ReadonlySet<string>, editing: Ed
   };
   walk(items, 0, "");
   return rows;
+}
+
+/**
+ * Run on connection… for a script: the file as saved, on the connection selected in the tree (else the active tab's);
+ * the dialog says so when the script's tab holds changes not saved to it.
+ */
+function runScript(root: string, path: string): void {
+  const { selectedProfileId, tabs, activeTabId } = useWorkspace.getState();
+  const tab = scriptTab(path);
+  const unsaved = tab && isTabDirty(tab.id) ? tab.title : null;
+  const profileId = selectedProfileId ?? tabs.find((t) => t.id === activeTabId)?.profileId ?? null;
+  openRunDialog(runEntryForScript(joinPath(root, path), profileId, unsaved));
 }
 
 /** Where a new file or folder goes: into the folder, beside the file, or at the top. */
@@ -235,8 +250,21 @@ export function ScriptsPanel() {
 
   const menuFor = (node: ScriptNode): MenuItem[] => {
     const folder = folderFor(node);
+    const root = tree.data?.root;
     return [
-      ...(node.kind === "file" ? [{ label: "Open", onSelect: () => void actions.open(node.path) }] : []),
+      ...(node.kind === "file"
+        ? [
+            { label: "Open", onSelect: () => void actions.open(node.path) },
+            {
+              label: "Run on connection…",
+              onSelect: () => {
+                if (root) runScript(root, node.path);
+              },
+              // the file's absolute path is the scripts folder's and its own: not known until the tree has loaded
+              ...(root ? {} : { disabled: true, title: "The scripts folder is not known yet" }),
+            },
+          ]
+        : []),
       { label: "New File…", onSelect: () => startNew("file", folder, true), separatorBefore: node.kind === "file" },
       { label: "New Folder…", onSelect: () => startNew("folder", folder, true) },
       { label: "Rename…", shortcut: "F2", onSelect: () => startRename(node, true), separatorBefore: true },

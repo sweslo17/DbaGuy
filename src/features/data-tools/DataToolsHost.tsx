@@ -3,6 +3,7 @@ import { closeDataDialog, shownJob, useDataDialogAsk } from "./dataDialogs";
 import { DumpDialog } from "./DumpDialog";
 import { JobDialog } from "./JobDialog";
 import { useJobs } from "./jobsStore";
+import { RunFileDialog } from "./RunFileDialog";
 
 /** A job's dialog, subscribed to that one job (Q1: another job's progress never renders it). */
 function JobAsk({ requestId }: { requestId: string }) {
@@ -23,9 +24,11 @@ export function DataToolsHost() {
   switch (ask?.kind) {
     case "dump":
       return <DumpDialog key={ask.serial} entry={ask.entry} form={ask.form} />;
+    case "run":
+      return <RunFileDialog key={ask.serial} entry={ask.entry} />;
     case "job":
       return <JobAsk key={ask.serial} requestId={ask.requestId} />;
     default:
-      return null; // none, or a run's form (Task 7 hosts RunFileDialog)
+      return null;
   }
 }

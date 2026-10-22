@@ -1,17 +1,21 @@
-import type { KeyboardEvent } from "react";
+import { useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
 import { toast } from "@/components/ui/Toast";
 import { ApiError, errorMessage } from "@/lib/api/client";
+import type { FileExcerpt } from "@/lib/api/types";
+import { fileNameOf } from "@/lib/filePaths";
 import { useCancelAgain } from "@/lib/useCancelAgain";
 import { RecoverableError } from "../connections/RecoverableError";
-import { closeDataDialog, openDumpDialog } from "./dataDialogs";
+import { closeDataDialog, openDumpDialog, openRunDialog } from "./dataDialogs";
 import { dumpFormFromCommand } from "./dumpForm";
 import type { DumpEntry, RunEntry } from "./entryPoints";
 import { cancelNote, jobReport, type JobAction } from "./jobReport";
-import { revealFile } from "./jobsApi";
+import { FileLines } from "./FileLines";
+import { fileExcerpt, revealFile } from "./jobsApi";
 import { cancelJob, isRunning, retryJob, type JobRecord } from "./jobsStore";
-import { ConnectionLine, JobProgressView, JobReportView, ReportTitle } from "./JobViews";
+import { ConnectionLine, ignoreHeldReturn, JobProgressView, JobReportView, ReportTitle } from "./JobViews";
+import { againEntry } from "./runForm";
 
 const KEEPS_RUNNING = {
   dump: "The dump keeps running: open it again from Jobs, at the bottom of the sidebar",
@@ -19,14 +23,6 @@ const KEEPS_RUNNING = {
 } as const;
 /** The jobs whose dialog was closed while they ran and that were told so (once each). */
 const toldKeepsRunning = new Set<string>();
-
-/**
- * A held Return's repeats never press Close: the Return that started a job (Dump, in the form) is still down as its view
- * opens with Close focused, and must not close it at once.
- */
-function ignoreHeldReturn(e: KeyboardEvent<HTMLButtonElement>) {
-  if (e.key === "Enter" && e.repeat) e.preventDefault();
-}
 
 const isDumpEntry = (entry: DumpEntry | RunEntry | null): entry is DumpEntry => entry !== null && "target" in entry;
 
@@ -42,7 +38,10 @@ async function reveal(path: string): Promise<void> {
   }
 }
 
-/** One outcome action as a button; null for those this dialog does not offer yet (a run's again: Task 7). */
+/**
+ * One outcome action as a button. Every "again" goes back to the form, prefilled, never straight to a run (V2): the
+ * form reads the file again and asks a red connection's box again; only a job this page started has its command (V6).
+ */
 function actionButton(record: JobRecord, action: JobAction, key: number) {
   if (action.kind === "show_in_finder") {
     return (
@@ -51,13 +50,88 @@ function actionButton(record: JobRecord, action: JobAction, key: number) {
       </Button>
     );
   }
-  // Dump again…: back to the form with the job's own choices; only a job this page started has them (V2, V6)
   const { entry, command } = record;
+  if (record.kind === "run_file" && command?.type === "run_file") {
+    // From where the outcome says (its resume point, with its line when exact), or as it was
+    const again = againEntry({ profileId: record.profileId, database: record.database, command }, action.patch);
+    return (
+      <Button key={key} onClick={() => openRunDialog(again)}>
+        {action.label}
+      </Button>
+    );
+  }
+  // Dump again…: back to the form with the job's own choices
   if (record.kind !== "dump" || !isDumpEntry(entry) || command?.type !== "dump") return null;
   return (
     <Button key={key} onClick={() => openDumpDialog(entry, dumpFormFromCommand(entry, command))}>
       {action.label}
     </Button>
+  );
+}
+
+/** An error's place in the run's file: being read, shown, or why it cannot be. */
+type Excerpt =
+  | { status: "reading"; line: number }
+  | { status: "shown"; line: number; excerpt: FileExcerpt }
+  | { status: "failed"; line: number; text: string };
+
+/** The lines around an error of a run (`POST /data/run-file/excerpt`, at most 60 lines / 64 KiB): one at a time. */
+function useExcerpt(path: string | null) {
+  const [excerpt, setExcerpt] = useState<Excerpt | null>(null);
+  const reads = useRef(0);
+  const show = (line: number) => {
+    if (!path) return;
+    const seq = ++reads.current; // a click on another line drops the answer for this one
+    setExcerpt({ status: "reading", line });
+    fileExcerpt(path, line).then(
+      (got) => {
+        if (seq !== reads.current) return;
+        setExcerpt(
+          got.found
+            ? { status: "shown", line, excerpt: got }
+            : { status: "failed", line, text: "The file has fewer lines now" },
+        );
+      },
+      (error: unknown) => {
+        if (seq !== reads.current) return;
+        const gone = error instanceof ApiError && error.status === 404;
+        setExcerpt({ status: "failed", line, text: gone ? "The file is no longer there" : errorMessage(error) });
+      },
+    );
+  };
+  const hide = () => {
+    reads.current++;
+    setExcerpt(null);
+  };
+  return { excerpt, show: path ? show : undefined, hide };
+}
+
+function ExcerptView({ excerpt, path, hide }: { excerpt: Excerpt; path: string; hide: () => void }) {
+  return (
+    <div className="flex flex-col gap-1 text-[12px]">
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="min-w-0 flex-1 truncate text-muted" title={path}>
+          Line {excerpt.line.toLocaleString()} of {fileNameOf(path)}
+        </span>
+        <Button size="sm" variant="ghost" className="shrink-0" onClick={hide}>
+          Hide
+        </Button>
+      </div>
+      {excerpt.status === "reading" ? (
+        <p className="animate-delayed-show text-muted">Reading the file…</p>
+      ) : excerpt.status === "failed" ? (
+        <p className="text-warning" data-selectable>
+          {excerpt.text}
+        </p>
+      ) : (
+        <FileLines
+          text={excerpt.excerpt.text}
+          firstLine={excerpt.excerpt.first_line}
+          mark={excerpt.line}
+          label={`The file's lines around line ${excerpt.line.toLocaleString()}`}
+        />
+      )}
+    </div>
   );
 }
 
@@ -87,6 +161,13 @@ export function JobDialog({ record }: { record: JobRecord }) {
     cancelJob(requestId);
     cancelAgain.sent();
   };
+
+  // A run's error is shown in its file: the file the backend read (the outcome's), else the one sent
+  const runPath =
+    record.kind === "run_file"
+      ? (state.outcome?.path ?? (record.command?.type === "run_file" ? record.command.path : null))
+      : null;
+  const lines = useExcerpt(runPath);
 
   const note = cancelNote(record);
   // Each Close has its own key: the one shown once the job ended mounts anew and takes the focus (Return closes)
@@ -132,7 +213,10 @@ export function JobDialog({ record }: { record: JobRecord }) {
             <RecoverableError profileId={record.profileId} error={state.openError} onRetry={() => retryJob(requestId)} />
           </div>
         ) : (
-          <JobReportView record={record} />
+          <>
+            <JobReportView record={record} onShowLine={lines.show} />
+            {lines.excerpt && runPath && <ExcerptView excerpt={lines.excerpt} path={runPath} hide={lines.hide} />}
+          </>
         )}
       </div>
     </Dialog>

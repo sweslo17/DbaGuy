@@ -21,6 +21,7 @@ import {
 import type { DumpEntry, RunEntry } from "./entryPoints";
 import {
   againEntry,
+  databaseNodes,
   EVERY_STATEMENT_RUNS,
   followEngineMode,
   numberedLines,
@@ -28,6 +29,7 @@ import {
   inspectionNotes,
   patchedForm,
   pickMode,
+  pickOnError,
   presetPicksMode,
   queryContextLabel,
   queryContextOf,
@@ -37,6 +39,9 @@ import {
   runCommand,
   runGate,
   runTitle,
+  settledMode,
+  withDatabase,
+  withPath,
 } from "./runForm";
 
 /* The two dialogs' forms (spec ⑥ §3.6): what is offered, greyed and why, and what is sent. */
@@ -286,6 +291,68 @@ describe("the run form", () => {
     // back on the entry's own connection, the node's database and search path come back
     expect(retargeted(green, "A", onA)).toMatchObject({ profileId: "A", database: "dbA", searchPath: "sales", confirmed: false });
     expect(retargeted(green, "B", onA)).toMatchObject({ profileId: "B", database: null, searchPath: "" });
+  });
+
+  it("asks the box again in another database of the same red connection, or for another file (CR-3)", () => {
+    const checked = { ...initialRunForm({ ...entry, database: "dbA" }, engine("postgres")), confirmed: true };
+    expect(withDatabase(checked, "dbB")).toMatchObject({ database: "dbB", confirmed: false });
+    expect(withDatabase(checked, null)).toMatchObject({ database: null, confirmed: false });
+    // the same database again: nothing changes
+    expect(withDatabase(checked, "dbA")).toBe(checked);
+    // another file: the box was for the file too
+    expect(withPath(checked, "/tmp/other.sql")).toMatchObject({ path: "/tmp/other.sql", confirmed: false });
+    expect(withPath(checked, checked.path)).toBe(checked);
+  });
+
+  it("moves a greyed mode to statement by statement, and follows the engine while unchosen (06b T4 re-review)", () => {
+    // picked all or nothing on PostgreSQL, then the target is a Couchbase connection: no transactions
+    const picked = pickMode(initialRunForm(entry, engine("postgres")), "all_or_nothing");
+    expect(settledMode(picked, engine("couchbase"), null)).toMatchObject({ mode: "statements", modePicked: true });
+    // a DbaGuy dump cut short: all or nothing refuses it, even where it is the engine's default; settled once, it stays
+    const cut = inspection(["The file does not end with its 'Dump complete' line: it was cut short"], true);
+    const fresh = initialRunForm(entry, engine("postgres"));
+    const settled = settledMode(fresh, engine("postgres"), cut);
+    expect(settled.mode).toBe("statements");
+    expect(settledMode(settled, engine("postgres"), cut)).toBe(settled);
+    // an unchosen mode follows the engine as it loads; nothing to change gives the same form
+    const loading = initialRunForm(entry, null);
+    expect(settledMode(loading, engine("postgres"), null).mode).toBe("all_or_nothing");
+    expect(settledMode(fresh, engine("postgres"), null)).toBe(fresh);
+  });
+
+  it("picks statement by statement with Skip it and continue: the engine never turns it into a stop", () => {
+    const loading = initialRunForm(entry, null);
+    const skipping = pickOnError(loading, "continue");
+    expect(skipping).toMatchObject({ onError: "continue", modePicked: true, mode: "statements" });
+    expect(followEngineMode(skipping, engine("postgres"))).toBe(skipping);
+    // stopping at the error is either mode's: it picks nothing
+    expect(pickOnError(loading, "stop").modePicked).toBe(false);
+  });
+
+  it("sends a run again's line while the form starts there in the same file, and never otherwise (06b review M3)", () => {
+    const pg = engine("postgres");
+    const again: RunEntry = { ...entry, preset: { mode: "statements", on_error: "stop", from_statement: 4, from_line: 3 } };
+    const form = initialRunForm(again, pg);
+    expect(form.fromLine).toEqual({ statement: 4, line: 3, path: "/tmp/x.sql" });
+    expect(runCommand(form, pg, null, "r")).toMatchObject({ from_statement: 4, from_line: 3 });
+    // another statement typed, or another file: no line to check
+    expect(runCommand({ ...form, fromStatement: "5" }, pg, null, "r")).not.toHaveProperty("from_line");
+    expect(runCommand({ ...form, fromStatement: " 4 " }, pg, null, "r").from_line).toBe(3);
+    expect(runCommand({ ...form, path: "/tmp/y.sql" }, pg, null, "r")).not.toHaveProperty("from_line");
+    // another connection keeps it: the file is the same
+    expect(runCommand(retargeted(form, "p2"), pg, null, "r").from_line).toBe(3);
+    // a fresh form, or a patch without a line, sends none
+    expect(runCommand(initialRunForm(entry, pg), pg, null, "r")).not.toHaveProperty("from_line");
+    expect(patchedForm(form, { mode: "statements", on_error: "stop", from_statement: 5 }).fromLine).toBeNull();
+    expect(patchedForm(form, { mode: "statements", on_error: "stop", from_statement: 5, from_line: 9 }).fromLine).toEqual({ statement: 5, line: 9, path: "/tmp/x.sql" });
+    // "run again as it was" of a run again keeps its line; of a plain run, none
+    const sent = runCommand(form, pg, null, "r");
+    expect(againEntry({ profileId: "p1", database: null, command: sent }, null).preset).toEqual({ mode: "statements", on_error: "stop", from_statement: 4, from_line: 3 });
+  });
+
+  it("lists the target's databases where the engine has them: MySQL's are its schemas", () => {
+    expect([databaseNodes(engine("postgres")), databaseNodes(engine("mssql")), databaseNodes(engine("mysql")), databaseNodes(engine("sqlite")), databaseNodes(engine("couchbase")), databaseNodes(null)])
+      .toEqual(["database", "database", "schema", null, null, null]);
   });
 
   it("sends the query context in its three states, Couchbase only", () => {

@@ -13,6 +13,13 @@ import type { RunPatch } from "./jobReport";
 export type RunMode = RunFileCommand["mode"];
 export type OnError = NonNullable<RunFileCommand["on_error"]>;
 
+/** Where a statement of a file started, as a run before found it (`resume_at`). */
+export interface FromLine {
+  statement: number;
+  line: number;
+  path: string;
+}
+
 export interface RunForm {
   profileId: string | null;
   database: string | null;
@@ -23,6 +30,11 @@ export interface RunForm {
   onError: OnError;
   /** "Start at statement N", as typed. */
   fromStatement: string;
+  /**
+   * A run again's place (`RunPatch.from_line`): statement `statement` of the file at `path` starts at `line`. Sent while
+   * the form still starts there in that file; another statement or another file is not checked (`runCommand`).
+   */
+  fromLine: FromLine | null;
   /** CR-3: a red connection's run waits for this box. */
   confirmed: boolean;
   /**
@@ -55,6 +67,10 @@ export function defaultMode(engine: EngineInfo | null): RunMode {
  */
 export const presetPicksMode = (entry: RunEntry): boolean => entry.preset?.mode !== undefined;
 
+/** A run again's place in the file at `path`; null when the patch gives no line. */
+const placeOf = (patch: Partial<RunPatch>, path: string): FromLine | null =>
+  patch.from_line ? { statement: patch.from_statement ?? 1, line: patch.from_line, path: path.trim() } : null;
+
 export function initialRunForm(entry: RunEntry, engine: EngineInfo | null): RunForm {
   const preset = entry.preset ?? {};
   return {
@@ -65,6 +81,7 @@ export function initialRunForm(entry: RunEntry, engine: EngineInfo | null): RunF
     mode: preset.mode ?? defaultMode(engine),
     onError: preset.on_error ?? "stop",
     fromStatement: String(preset.from_statement ?? 1),
+    fromLine: placeOf(preset, entry.path),
     confirmed: false,
     modePicked: presetPicksMode(entry),
   };
@@ -82,6 +99,26 @@ export function followEngineMode(form: RunForm, engine: EngineInfo | null): RunF
 /** The user chose a mode: it stays, whatever the engine. An all-or-nothing run stops at the first error. */
 export function pickMode(form: RunForm, mode: RunMode): RunForm {
   return { ...form, mode, modePicked: true, onError: mode === "all_or_nothing" ? "stop" : form.onError };
+}
+
+/**
+ * The user chose what an error does. Skipping errors is a statement-by-statement choice: it picks that mode too, so the
+ * engine's info arriving later never turns it into an all-or-nothing run that stops at the first error.
+ */
+export function pickOnError(form: RunForm, onError: OnError): RunForm {
+  return { ...form, onError, modePicked: form.modePicked || onError === "continue" };
+}
+
+/**
+ * The form's mode as the engine and the file allow it: an unchosen mode follows the engine (`followEngineMode`), and
+ * a mode that is greyed here (all or nothing on a connection without transactions, or for a dump cut short) moves to
+ * statement by statement, as the backend would refuse it. The same form object when the mode stays.
+ */
+export function settledMode(form: RunForm, engine: EngineInfo | null, inspection: FileInspection | null): RunForm {
+  const followed = followEngineMode(form, engine);
+  const greyed = runChoices(engine, inspection, followed).modes.find((choice) => choice.value === followed.mode)?.disabled;
+  const mode: RunMode = greyed ? "statements" : followed.mode;
+  return mode === form.mode ? form : { ...form, mode };
 }
 
 /**
@@ -111,6 +148,22 @@ export function retargeted(form: RunForm, profileId: string | null, entry: RunEn
   return { ...form, profileId, database: own?.database ?? null, searchPath: own?.searchPath ?? "", confirmed: false };
 }
 
+/**
+ * Another database of the same connection (the target picker): the confirmation goes (CR-3 is for the connection and
+ * the database it runs in). The same form object when the database is the same.
+ */
+export function withDatabase(form: RunForm, database: string | null): RunForm {
+  return database === form.database ? form : { ...form, database, confirmed: false };
+}
+
+/**
+ * Another file (typed or chosen): the confirmation goes, as for another target (CR-3: "I've checked the file and the
+ * connection"). The same form object when the path is the same.
+ */
+export function withPath(form: RunForm, path: string): RunForm {
+  return path === form.path ? form : { ...form, path, confirmed: false };
+}
+
 /** A "run again" action's changes on the form (`RunPatch`): its mode counts as chosen; the confirmation is asked again. */
 export function patchedForm(form: RunForm, patch: RunPatch | null): RunForm {
   if (!patch) return { ...form, confirmed: false };
@@ -120,6 +173,7 @@ export function patchedForm(form: RunForm, patch: RunPatch | null): RunForm {
     modePicked: true,
     onError: patch.on_error,
     fromStatement: String(patch.from_statement),
+    fromLine: placeOf(patch, form.path),
     confirmed: false,
   };
 }
@@ -140,6 +194,12 @@ export interface RunChoices {
   searchPath: boolean;
   /** Which nodes the database picker lists: database (PostgreSQL, SQL Server), schema (MySQL), none. */
   databases: "database" | "schema" | null;
+}
+
+/** Which nodes the target's database picker lists: database (PostgreSQL, SQL Server), schema (MySQL), none. */
+export function databaseNodes(engine: EngineInfo | null): RunChoices["databases"] {
+  if (engine?.engine === "postgres" || engine?.engine === "mssql") return "database";
+  return engine?.engine === "mysql" ? "schema" : null;
 }
 
 export function runChoices(engine: EngineInfo | null, inspection: FileInspection | null, form: RunForm): RunChoices {
@@ -164,7 +224,7 @@ export function runChoices(engine: EngineInfo | null, inspection: FileInspection
     ],
     skip: form.mode === "all_or_nothing" ? "All or nothing stops at the first error" : null,
     searchPath: engine?.engine === "postgres",
-    databases: engine?.engine === "postgres" || engine?.engine === "mssql" ? "database" : engine?.engine === "mysql" ? "schema" : null,
+    databases: databaseNodes(engine),
   };
 }
 
@@ -207,7 +267,8 @@ export function runGate(profile: Profile | null, engine: EngineInfo | null, form
 /**
  * The command the form sends. `queryContext` (Couchbase only; `queryContextOf`) keeps its three states on the wire:
  * undefined is left out (the job runner fills in the connection's default once the job's session is open), null is sent
- * (no context), an object as it is; any other engine sends null.
+ * (no context), an object as it is; any other engine sends null. `from_line` goes only while the form starts at the
+ * statement of the run again's place in that same file (`form.fromLine`): the backend then refuses a file edited since.
  */
 export function runCommand(
   form: RunForm,
@@ -215,13 +276,18 @@ export function runCommand(
   queryContext: QueryContext | null | undefined,
   requestId: string,
 ): RunFileCommand {
+  const path = form.path.trim();
+  const fromStatement = Number(form.fromStatement.trim());
+  const place = form.fromLine;
+  const checked = place && place.statement === fromStatement && place.path === path ? { from_line: place.line } : {};
   return {
     type: "run_file",
     request_id: requestId,
-    path: form.path.trim(),
+    path,
     mode: form.mode,
     on_error: form.mode === "statements" ? form.onError : "stop",
-    from_statement: Number(form.fromStatement.trim()),
+    from_statement: fromStatement,
+    ...checked,
     search_path: engine.engine === "postgres" && form.searchPath.trim() ? form.searchPath.trim() : null,
     query_context: engine.query_context ? queryContext : null,
   };
@@ -242,7 +308,13 @@ export function againEntry(
     searchPath: command.search_path ?? null,
     queryContext: command.query_context, // undefined: the connection's default, null: none, as it was sent
     path: command.path,
-    preset: patch ?? { mode: command.mode, on_error: command.on_error ?? "stop", from_statement: command.from_statement ?? 1 },
+    // as it was: its place in the file too, when it had one (a run again of a run again checks the file again)
+    preset: patch ?? {
+      mode: command.mode,
+      on_error: command.on_error ?? "stop",
+      from_statement: command.from_statement ?? 1,
+      ...(command.from_line ? { from_line: command.from_line } : {}),
+    },
   };
 }
 
