@@ -46,3 +46,22 @@ export function formatTimeUntil(at: number, now: number): string {
   }
   return relativeTime.format(Math.max(1, Math.floor(remaining / 1000)), "second");
 }
+
+/**
+ * "42 s", "2 min 05 s" from a minute on and "2 h 05 min" from an hour on: whole seconds, for elapsed times and
+ * notifications (a notification has no use for hundredths, and a long dump no use for "125 min 00 s").
+ */
+export function formatElapsed(ms: number): string {
+  const whole = Math.max(0, Math.round(ms / 1000));
+  if (whole < 60) return `${whole} s`;
+  if (whole < 3600) return `${Math.floor(whole / 60)} min ${String(whole % 60).padStart(2, "0")} s`;
+  return `${Math.floor(whole / 3600)} h ${String(Math.floor((whole % 3600) / 60)).padStart(2, "0")} min`;
+}
+
+const MIB = 1_048_576;
+/** A file's size as the backend's own texts write it (binary units, "MB"): "512 KB", "148.2 MB", "2.31 GB". */
+export function formatSize(bytes: number): string {
+  if (bytes < MIB) return `${Math.ceil(bytes / 1024).toLocaleString()} KB`;
+  if (bytes < 1024 * MIB) return `${(bytes / MIB).toFixed(1)} MB`;
+  return `${(bytes / (1024 * MIB)).toFixed(2)} GB`;
+}

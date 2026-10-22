@@ -1,6 +1,13 @@
 import { api, unwrap } from "@/lib/api/client";
 import type { ColumnMeta, Dialect, PathSegment } from "@/lib/api/types";
 
+/**
+ * What a filter may be (06a ruling U3: the backend refuses anything else, `invalid_filter`): the table-data tab's filter
+ * bar and a filtered dump say it.
+ */
+export const FILTER_RULE =
+  "A filter is one condition on the rows, as after WHERE: no ORDER BY, LIMIT or second statement (sort with the column headers).";
+
 /** Tree object kinds that hold rows: they open as a table data tab (keep in sync with select_builder.py). */
 export const RELATION_KINDS: ReadonlySet<string> = new Set(["table", "view", "materialized_view", "partition"]);
 
