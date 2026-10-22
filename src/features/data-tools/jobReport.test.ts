@@ -541,6 +541,9 @@ describe("whether a job's ending is news (its notification and its toast)", () =
     expect(endingIsNews(ended(outcome()))).toBe(true);
     expect(endingIsNews({ ...ended(outcome()), cancelRequestedAt: 1 })).toBe(true);
     expect(endingIsNews(ended(outcome({ outcome: "stopped", cancelled: true })))).toBe(false);
+    // cancelled, yet the target must be checked: told (Task 8 re-review)
+    expect(endingIsNews(ended(outcome({ outcome: "unknown", cancelled: true })))).toBe(true);
+    expect(endingIsNews(ended(outcome({ outcome: "partial", cancelled: true })))).toBe(true);
     expect(endingIsNews(jobReducer(openingJob(0), { type: "not_sent", at: 1 }))).toBe(false);
     expect(endingIsNews(jobReducer(openingJob(0), { type: "open_failed", error: new Error("x"), at: 1 }))).toBe(true);
     expect(endingIsNews(openingJob(0))).toBe(false);

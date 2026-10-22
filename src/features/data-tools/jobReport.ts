@@ -537,12 +537,16 @@ export function jobSummary(view: JobView, now: number): { text: string; tone: To
 /**
  * Whether a job's ending is news, for its notification and its toast (R-06-15, V11): not when it ended cancelled (the
  * outcome says so, whoever asked: its user here, or in another window) nor when its command never left (`not_sent`).
- * A Cancel that lost the race (the job completed, or ended otherwise first) is news. The two differ in one case: the
+ * A Cancel that lost the race (the job completed, or ended otherwise first) is news, and so is a cancelled run whose
+ * outcome still asks the user to check the target (`partial`, `unknown`: what stood is not what was asked for). The two differ in one case: the
  * notification also says nothing of `open_failed` (nothing ran: no long job ended), while the toast tells it (its view
  * asks for the password or offers Retry).
  */
 export const endingIsNews = (state: JobState): boolean =>
-  state.phase === "ended" && !state.outcome?.cancelled && state.loss !== "not_sent";
+  state.phase === "ended" && !quietlyCancelled(state) && state.loss !== "not_sent";
+
+const quietlyCancelled = (state: JobState): boolean =>
+  state.outcome?.cancelled === true && state.outcome.outcome !== "partial" && state.outcome.outcome !== "unknown";
 
 /**
  * The notification for a job that ended after at least `thresholdS` seconds (S8's `notifications.long_query_seconds`,
