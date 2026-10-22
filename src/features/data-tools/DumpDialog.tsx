@@ -7,7 +7,7 @@ import { Checkbox, FieldRow, Radio } from "@/components/ui/Field";
 import { FilePathField } from "@/components/ui/FilePathField";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
-import type { DumpObjectKinds, DumpPlan, Engine, ObjectNode } from "@/lib/api/types";
+import type { DumpObjectKinds, DumpPlan, DumpPlanRequest, Engine, ObjectNode } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { BROWSER_PATH_HINT, pathProblem } from "@/lib/filePaths";
 import { chooseSavePath } from "@/lib/native";
@@ -151,7 +151,7 @@ function PlanSummary({ plan, stale }: { plan: DumpPlan; stale: boolean }) {
           {listed && (
             <ul className="mt-1 max-h-48 overflow-y-auto rounded-md border border-border px-2 py-1 [scrollbar-gutter:stable]">
               {plan.objects.map((object, i) => (
-                <li key={i} className="py-0.5" data-selectable>
+                <li key={i} className="py-0.5 [overflow-wrap:anywhere]" data-selectable>
                   <span className="text-muted">{object.kind}</span> <span className="font-mono">{object.name}</span>
                   {object.notes.map((note, j) => (
                     <span key={j} className="block pl-3 text-[11px] text-muted">
@@ -238,7 +238,13 @@ export function DumpDialog({ entry, form: preset }: { entry: DumpEntry; form: Du
   }
 
   // The plan: the same fields as the command, asked once the choices settle (memoised: the same form, the same request)
-  const request = useMemo(() => dumpPlanRequest(entry, form), [entry, form]);
+  // keyed by its content: a form change the plan does not read (a path still being typed) keeps the same request, so
+  // nothing dims or waits for it (Task 6 re-review)
+  const requestKey = useMemo(() => {
+    const fresh = dumpPlanRequest(entry, form);
+    return fresh === null ? null : JSON.stringify(fresh);
+  }, [entry, form]);
+  const request = useMemo(() => (requestKey === null ? null : (JSON.parse(requestKey) as DumpPlanRequest)), [requestKey]);
   const body = useDebouncedValue(request, PLAN_DEBOUNCE_MS);
   const plan = useQuery({
     queryKey: ["dumpPlan", body],
