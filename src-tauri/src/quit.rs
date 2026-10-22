@@ -124,7 +124,7 @@ pub fn close_ack(gate: tauri::State<'_, QuitGate>, id: u64) {
 pub fn reveal_window(window: tauri::Window) {
     let shown = window.unminimize().and_then(|()| window.show()).and_then(|()| window.set_focus());
     if let Err(error) = shown {
-        log::warn!("Quit: could not bring the window {} to the front: {error}", window.label());
+        log::warn!("Ask: could not bring the window {} to the front: {error}", window.label());
     }
 }
 

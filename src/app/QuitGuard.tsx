@@ -26,7 +26,8 @@ export function QuitGuard() {
           setAsking({
             question,
             answer: (quit) => {
-              setAsking(null);
+              // Clears only this question: a stale answer never closes another one (Task 1 re-review).
+              setAsking((current) => (current?.question === question ? null : current));
               resolve(quit);
             },
           }),
