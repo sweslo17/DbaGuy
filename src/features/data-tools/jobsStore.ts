@@ -124,9 +124,13 @@ function putAll(records: readonly JobRecord[]): void {
   }));
 }
 
+/** How many times this window forgot jobs: a list asked for before then may still have them (06b T5 L1). */
+let forgettings = 0;
+
 /** Forgets jobs (Clear finished, the oldest beyond MAX_JOBS_KEPT): one update; a runner still listening detaches. */
 function forget(requestIds: readonly string[]): void {
   if (requestIds.length === 0) return;
+  forgettings++;
   const gone = new Set(requestIds);
   for (const requestId of gone) {
     runners.get(requestId)?.detach();
@@ -290,18 +294,37 @@ async function closeSessions(sessionIds: readonly string[]): Promise<void> {
   }
 }
 
-/** Brings the list in line with the backend's (on start, whenever the Jobs list opens, and after a session is gone). */
+/** A sync asks at most this often when jobs were forgotten while it waited (the first list, and once more). */
+const SYNC_ASKS = 2;
+
+/**
+ * Brings the list in line with the backend's (on start, whenever the Jobs list opens, and after a session is gone). A
+ * list asked for before this window forgot jobs (Clear finished, the oldest beyond MAX_JOBS_KEPT) may still have them:
+ * it is asked again, and a list that is stale again only updates the jobs this window still has (L1).
+ */
 export async function syncJobs(): Promise<void> {
-  let listed: JobInfo[];
-  try {
-    listed = await listing.list();
-  } catch (error) {
-    console.warn(`Could not list the jobs: ${errorMessage(error)}`);
+  for (let asked = 1; ; asked++) {
+    const before = forgettings;
+    let listed: JobInfo[];
+    try {
+      listed = await listing.list();
+    } catch (error) {
+      console.warn(`Could not list the jobs: ${errorMessage(error)}`);
+      return;
+    }
+    const stale = forgettings !== before;
+    if (stale && asked < SYNC_ASKS) continue;
+    await applyListed(listed, !stale);
     return;
   }
+}
+
+/** The backend's list, applied; `whole` false (a list older than what this window forgot): only its known jobs' events. */
+async function applyListed(listed: readonly JobInfo[], whole: boolean): Promise<void> {
   const { added, events, attach, close, dropped } = reconcile(useJobs.getState().jobs, listed, transport.now());
-  putAll(added);
+  if (whole) putAll(added);
   for (const [requestId, event] of events) dispatch(requestId, event);
+  if (!whole) return;
   forget(dropped);
   for (const [requestId, sessionId] of attach) {
     if (!runners.has(requestId)) listenTo(requestId).attach(sessionId);
@@ -314,6 +337,13 @@ export async function clearFinishedJobs(): Promise<void> {
   await listing.clearFinished();
   const { jobs, order } = useJobs.getState();
   forget(order.filter((requestId) => !isRunning(jobs[requestId])));
+}
+
+/** Tests only: a fresh window (every runner detached, no job, no runner). */
+export function resetJobsForTests(): void {
+  for (const runner of runners.values()) runner.detach();
+  runners.clear();
+  useJobs.setState({ jobs: {}, order: [] });
 }
 
 /** The jobs, newest first. */

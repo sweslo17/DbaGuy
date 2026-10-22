@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import type { SocketStatus } from "@/lib/api/session-socket";
-import type { ClientCommand, JobInfo, JobOutcomeEvent, RunFileCommand, ServerEvent, SessionInfo } from "@/lib/api/types";
+import type { JobInfo, JobOutcomeEvent, RunFileCommand } from "@/lib/api/types";
 import type { RunEntry } from "./entryPoints";
-import type { JobSocket, JobTransport } from "./jobRunner";
+import { FakeSocket, sessionInfo } from "./jobFakes";
+import type { JobTransport } from "./jobRunner";
 import { openingJob, type JobLoss } from "./jobState";
 import {
   clearFinishedJobs,
@@ -11,6 +11,7 @@ import {
   NOT_LISTED_AFTER_MS,
   onJobEnded,
   reconcile,
+  resetJobsForTests,
   retryJob,
   runningJobs,
   setJobListing,
@@ -81,15 +82,6 @@ describe("reconciling with the backend's list", () => {
   });
 });
 
-class QuietSocket implements JobSocket {
-  isRejected = false;
-  connect = async () => undefined;
-  trySend = () => false;
-  subscribe = () => () => undefined;
-  onStatus = () => () => undefined;
-  close = () => undefined;
-}
-
 const command: RunFileCommand = { type: "run_file", request_id: "r1", path: "/x.sql", mode: "statements", on_error: "stop", from_statement: 1 };
 const entry: RunEntry = { profileId: "p1", database: null, searchPath: null, queryContext: null, path: "/x.sql" };
 const noListing = { list: async () => [], clearFinished: async () => undefined };
@@ -99,11 +91,11 @@ describe("starting a job", () => {
   const transport: JobTransport = {
     openSession: async () => {
       if (fail) throw fail;
-      return { session_id: "s1", profile_id: "p1", database: null, server: {} as SessionInfo["server"] };
+      return sessionInfo();
     },
     closeSession: async () => undefined,
     cancel: async () => undefined,
-    socket: () => new QuietSocket(),
+    socket: () => new FakeSocket(), // never opened: quiet
     now: () => 7,
   };
 
@@ -111,7 +103,7 @@ describe("starting a job", () => {
     fail = null;
     setJobTransport(transport);
     setJobListing(noListing);
-    useJobs.setState({ jobs: {}, order: [] });
+    resetJobsForTests();
   });
 
   it("lists it at once, and tells of its end once", async () => {
@@ -138,54 +130,18 @@ describe("starting a job", () => {
   });
 });
 
-/** A socket the test drives: it opens, closes, is refused and speaks when told. */
-class ScriptedSocket implements JobSocket {
-  isRejected = false;
-  open = false;
-  closed = false;
-  sent: ClientCommand[] = [];
-  private events = new Set<(event: ServerEvent) => void>();
-  private statuses = new Set<(status: SocketStatus) => void>();
-  constructor(readonly sessionId: string) {}
-  connect = async () => undefined;
-  trySend(command: ClientCommand): boolean {
-    if (!this.open) return false;
-    this.sent.push(command);
-    return true;
-  }
-  subscribe(listener: (event: ServerEvent) => void) {
-    this.events.add(listener);
-    return () => this.events.delete(listener);
-  }
-  onStatus(listener: (status: SocketStatus) => void) {
-    this.statuses.add(listener);
-    return () => this.statuses.delete(listener);
-  }
-  close() {
-    this.closed = true;
-  }
-  status(status: SocketStatus, rejected = false) {
-    this.open = status === "open";
-    this.isRejected = rejected;
-    this.statuses.forEach((listener) => listener(status));
-  }
-  emit(event: ServerEvent) {
-    this.events.forEach((listener) => listener(event));
-  }
-}
-
 describe("following the backend", () => {
   let clock: number;
   let listed: JobInfo[];
   let cleared: number;
-  let sockets: ScriptedSocket[];
+  let sockets: FakeSocket[];
   let closedSessions: string[];
   let closing: number;
   let mostClosingAtOnce: number;
   let ends: string[];
   let stopListening: () => void;
   const transport: JobTransport = {
-    openSession: async () => ({ session_id: "s1", profile_id: "p1", database: null, server: {} as SessionInfo["server"] }),
+    openSession: async () => sessionInfo(),
     closeSession: async (sessionId) => {
       mostClosingAtOnce = Math.max(mostClosingAtOnce, ++closing);
       await flush();
@@ -194,7 +150,7 @@ describe("following the backend", () => {
     },
     cancel: async () => undefined,
     socket: (sessionId) => {
-      const socket = new ScriptedSocket(sessionId);
+      const socket = new FakeSocket(sessionId);
       sockets.push(socket);
       return socket;
     },
@@ -204,7 +160,7 @@ describe("following the backend", () => {
   const started = async () => {
     startJob({ kind: "run_file", profileId: "p1", database: null, title: "t", command, entry });
     await flush();
-    sockets[0].status("open");
+    sockets[0].accept();
     return sockets[0];
   };
 
@@ -224,7 +180,7 @@ describe("following the backend", () => {
         cleared++;
       },
     });
-    useJobs.setState({ jobs: {}, order: [] });
+    resetJobsForTests();
     stopListening?.();
     stopListening = onJobEnded((job) => ends.push(job.state.outcome?.outcome ?? job.state.loss ?? "?"));
   });
@@ -240,7 +196,7 @@ describe("following the backend", () => {
     expect([sockets.map((socket) => socket.sessionId), closedSessions, mostClosingAtOnce]).toEqual([["sa"], ["sb", "sc"], 1]);
     await syncJobs();
     expect([sockets.length, closedSessions]).toEqual([1, ["sb", "sc"]]);
-    sockets[0].status("open");
+    sockets[0].accept();
     sockets[0].emit(outcome({ request_id: "a" }));
     await flush();
     expect([sockets[0].sent, state("a")?.outcome?.outcome, closedSessions]).toEqual([[], "completed", ["sb", "sc", "sa"]]);
@@ -279,5 +235,44 @@ describe("following the backend", () => {
     socket.emit(outcome());
     await flush();
     expect([socket.closed, closedSessions, ends]).toEqual([true, [], ["not_listed"]]);
+  });
+
+  it("calls a job whose session went before its socket was attached not sent, and lets it start again (L2)", async () => {
+    startJob({ kind: "run_file", profileId: "p1", database: null, title: "t", command, entry });
+    await flush();
+    sockets[0].status("open");
+    sockets[0].status("closed", true);
+    expect([state()?.loss, sockets[0].sent, ends]).toEqual(["not_sent", [], ["not_sent"]]);
+    expect(retryJob("r1")).toBe(true);
+    await flush();
+    sockets[1].accept();
+    expect([sockets[1].sent, state()?.sent]).toEqual([[command], true]);
+  });
+
+  it("never brings back what Clear finished forgot while a sync waited for the list: it asks again, once (L1)", async () => {
+    const ended = (requestId: string) => record({ requestId, sessionId: `s-${requestId}`, state: { ...openingJob(0), phase: "ended" } });
+    const listedEnded = (requestId: string) => info({ request_id: requestId, session_id: `s-${requestId}`, outcome: outcome({ request_id: requestId }) });
+    const answers: ((jobs: JobInfo[]) => void)[] = [];
+    const ask = () => new Promise<JobInfo[]>((resolve) => answers.push(resolve));
+    setJobListing({ list: () => (answers.length === 0 ? ask() : Promise.resolve([])), clearFinished: async () => undefined });
+    useJobs.setState({ jobs: { r9: ended("r9") }, order: ["r9"] });
+    const sync = syncJobs();
+    await clearFinishedJobs();
+    answers[0]([listedEnded("r9"), listedEnded("u"), info({ request_id: "v", session_id: "s-v" })]);
+    await sync;
+    expect([answers.length, useJobs.getState().order, sockets.length, closedSessions]).toEqual([1, [], 0, []]);
+
+    // Forgotten again while it asked again: that list only updates the jobs this window still has
+    setJobListing({ list: ask, clearFinished: async () => undefined });
+    useJobs.setState({ jobs: { r8: ended("r8"), r7: record({ requestId: "r7", state: openingJob(0) }) }, order: ["r8", "r7"] });
+    const again = syncJobs();
+    await clearFinishedJobs();
+    answers[1]([listedEnded("r8")]);
+    await flush();
+    useJobs.setState(({ jobs, order }) => ({ jobs: { ...jobs, r6: ended("r6") }, order: ["r6", ...order] }));
+    await clearFinishedJobs();
+    answers[2]([listedEnded("r8"), listedEnded("r6"), info({ request_id: "r7", session_id: "s-r7", outcome: outcome({ request_id: "r7" }) }), listedEnded("u")]);
+    await again;
+    expect([useJobs.getState().order, state("r7")?.outcome?.outcome, sockets.length, closedSessions]).toEqual([["r7"], "completed", 0, []]);
   });
 });

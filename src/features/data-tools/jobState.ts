@@ -184,8 +184,8 @@ export function jobReducer(state: JobState, event: JobEvent): JobState {
       return state.phase === "ended" || state.sent ? state : ended(state, event.at, "not_sent");
     case "server":
       return onServerEvent(state, event.event, event.at);
-    case "socket":
-      return state.phase === "ended" ? state : { ...state, reconnecting: !event.open };
+    case "socket": // the same state when nothing changes: a backoff's every attempt re-renders nothing (06b T5 L4)
+      return state.phase === "ended" || state.reconnecting === !event.open ? state : { ...state, reconnecting: !event.open };
     case "session_gone":
       return state.phase === "ended" ? state : ended(state, event.at, state.sent ? "session_gone" : "not_sent");
     case "not_listed":

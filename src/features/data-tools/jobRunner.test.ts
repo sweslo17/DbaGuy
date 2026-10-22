@@ -1,45 +1,11 @@
-import { describe, expect, it } from "vitest";
-import type { SocketStatus } from "@/lib/api/session-socket";
-import type { ClientCommand, RunFileCommand, ServerEvent, SessionInfo } from "@/lib/api/types";
-import { JobRunner, type JobSocket, type JobTransport } from "./jobRunner";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { RunFileCommand, ServerEvent, SessionInfo } from "@/lib/api/types";
+import { FakeSocket, SESSION_STATE, sessionInfo } from "./jobFakes";
+import { JobRunner, type JobTransport } from "./jobRunner";
 import type { JobEvent } from "./jobState";
 
 /* A job's session and socket (spec ⑥ D-06-10): the command goes once, the session closes after the outcome and is
    never reused, a refused socket ends the job, a cancel before the command left keeps it from ever leaving. */
-
-class FakeSocket implements JobSocket {
-  isRejected = false;
-  open = false;
-  sent: ClientCommand[] = [];
-  closed = false;
-  private events = new Set<(event: ServerEvent) => void>();
-  private statuses = new Set<(status: SocketStatus) => void>();
-  connect = async () => undefined;
-  trySend(command: ClientCommand): boolean {
-    if (!this.open) return false;
-    this.sent.push(command);
-    return true;
-  }
-  subscribe(listener: (event: ServerEvent) => void) {
-    this.events.add(listener);
-    return () => this.events.delete(listener);
-  }
-  onStatus(listener: (status: SocketStatus) => void) {
-    this.statuses.add(listener);
-    return () => this.statuses.delete(listener);
-  }
-  close() {
-    this.closed = true;
-  }
-  status(status: SocketStatus, rejected = false) {
-    this.open = status === "open";
-    this.isRejected = rejected;
-    this.statuses.forEach((listener) => listener(status));
-  }
-  emit(event: ServerEvent) {
-    this.events.forEach((listener) => listener(event));
-  }
-}
 
 class FakeTransport implements JobTransport {
   sockets: FakeSocket[] = [];
@@ -49,10 +15,12 @@ class FakeTransport implements JobTransport {
   private resolveOpen: (() => void) | null = null;
   holdOpen = false;
   server = {} as SessionInfo["server"];
+  /** How many first connects each new socket fails. */
+  failingConnects = 0;
   async openSession(): Promise<SessionInfo> {
     if (this.fail) throw this.fail;
     if (this.holdOpen) await new Promise<void>((resolve) => (this.resolveOpen = resolve));
-    return { session_id: "s1", profile_id: "p1", database: null, server: this.server };
+    return sessionInfo(this.server);
   }
   release() {
     this.resolveOpen?.();
@@ -63,8 +31,8 @@ class FakeTransport implements JobTransport {
   async cancel(sessionId: string, requestId: string) {
     this.cancels.push([sessionId, requestId]);
   }
-  socket(): JobSocket {
-    const socket = new FakeSocket();
+  socket(sessionId: string): FakeSocket {
+    const socket = new FakeSocket(sessionId, this.failingConnects);
     this.sockets.push(socket);
     return socket;
   }
@@ -82,22 +50,31 @@ const finished: ServerEvent = {
 };
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-function started() {
+function started(report: (event: JobEvent) => void = () => undefined) {
   const transport = new FakeTransport();
   const events: JobEvent[] = [];
-  const runner = new JobRunner("r1", transport, (event) => events.push(event));
+  const runner = new JobRunner("r1", transport, (event) => {
+    events.push(event);
+    report(event);
+  });
   return { transport, events, runner, types: () => events.map((event) => event.type) };
 }
 
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 describe("a job's runner", () => {
-  it("sends the command once, the first time the socket opens, never on a reconnect", async () => {
+  it("sends the command once, when the backend first gives the socket its session's state, never on a reconnect", async () => {
     const { transport, runner, types } = started();
     runner.start("p1", null, command);
     await flush();
     const socket = transport.sockets[0];
     socket.status("open");
+    expect(socket.sent).toEqual([]);
+    socket.emit(SESSION_STATE);
     socket.status("closed");
-    socket.status("open");
+    socket.accept();
     expect(socket.sent).toEqual([command]);
     expect(types()).toEqual(["socket", "sent", "socket", "socket"]);
   });
@@ -107,7 +84,7 @@ describe("a job's runner", () => {
     runner.start("p1", null, command);
     await flush();
     const socket = transport.sockets[0];
-    socket.status("open");
+    socket.accept();
     socket.emit({ type: "started", request_id: "r1" });
     socket.emit({ type: "message", request_id: "", severity: "warning", text: "idle transaction" });
     socket.emit({ type: "started", request_id: "other" });
@@ -122,10 +99,20 @@ describe("a job's runner", () => {
     runner.start("p1", null, command);
     await flush();
     const socket = transport.sockets[0];
-    socket.status("open");
+    socket.accept();
     socket.status("closed", true);
     expect(types()).toEqual(["socket", "sent", "session_gone"]);
     expect(transport.closedSessions).toEqual([]);
+  });
+
+  it("sends nothing to a session gone before its socket was attached: the backend accepts the socket, then refuses it", async () => {
+    const { transport, runner, types } = started();
+    runner.start("p1", null, command);
+    await flush();
+    const socket = transport.sockets[0];
+    socket.status("open");
+    socket.status("closed", true);
+    expect([types(), socket.sent, transport.closedSessions]).toEqual([["socket", "session_gone"], [], []]);
   });
 
   it("reports a session that could not open, and sends nothing", async () => {
@@ -149,12 +136,34 @@ describe("a job's runner", () => {
     expect([transport.sockets.length, transport.closedSessions]).toEqual([0, ["s1"]]);
   });
 
+  it("ends at once a job cancelled while its socket waits for the session, and never sends it", async () => {
+    const { transport, runner, types } = started();
+    runner.start("p1", null, command);
+    await flush();
+    const socket = transport.sockets[0];
+    socket.status("open");
+    runner.cancel();
+    socket.emit(SESSION_STATE);
+    expect([types(), socket.sent, socket.closed, transport.closedSessions]).toEqual([["socket", "cancel_sent", "not_sent"], [], true, ["s1"]]);
+  });
+
+  it("closes the session even when telling that nothing was sent fails", async () => {
+    const { transport, runner } = started((event) => {
+      if (event.type === "not_sent") throw new Error("a listener's bug");
+    });
+    runner.start("p1", null, command);
+    await flush();
+    transport.sockets[0].status("open");
+    expect(() => runner.cancel()).toThrow("a listener's bug");
+    expect(transport.closedSessions).toEqual(["s1"]);
+  });
+
   it("cancels on the open socket, else through REST", async () => {
     const { transport, runner } = started();
     runner.start("p1", null, command);
     await flush();
     const socket = transport.sockets[0];
-    socket.status("open");
+    socket.accept();
     runner.cancel();
     expect(socket.sent).toEqual([command, { type: "cancel", request_id: "r1" }]);
     socket.status("closed");
@@ -166,7 +175,7 @@ describe("a job's runner", () => {
     const { transport, runner, types } = started();
     runner.attach("s9");
     const socket = transport.sockets[0];
-    socket.status("open");
+    socket.accept();
     socket.emit({ type: "job_progress", request_id: "r1", stage: "statements", rows: 0, bytes: 1, statements: 1, errors: 0 });
     socket.emit(outcome);
     expect(socket.sent).toEqual([]);
@@ -174,12 +183,38 @@ describe("a job's runner", () => {
     expect(transport.closedSessions).toEqual(["s9"]);
   });
 
+  it("tries a listed job's socket again, with a closed socket's backoff, while its first connects fail; detached, it stops", async () => {
+    vi.useFakeTimers();
+    const { transport, runner, types } = started();
+    transport.failingConnects = 2;
+    runner.attach("s9");
+    const socket = transport.sockets[0];
+    await vi.advanceTimersByTimeAsync(0);
+    expect(socket.connects).toBe(1);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(socket.connects).toBe(2);
+    await vi.advanceTimersByTimeAsync(499);
+    expect(socket.connects).toBe(2);
+    await vi.advanceTimersByTimeAsync(1);
+    socket.accept();
+    socket.emit(outcome);
+    expect([socket.connects, types(), transport.closedSessions]).toEqual([3, ["socket", "socket", "socket", "server"], ["s9"]]);
+
+    const other = started();
+    other.transport.failingConnects = 5;
+    other.runner.attach("s8");
+    await vi.advanceTimersByTimeAsync(0);
+    other.runner.detach();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(other.transport.sockets[0].connects).toBe(1);
+  });
+
   it("closes the session of a request that finished without an outcome (the contract says it never does)", async () => {
     const { transport, runner, types } = started();
     runner.start("p1", null, command);
     await flush();
     const socket = transport.sockets[0];
-    socket.status("open");
+    socket.accept();
     socket.emit(finished);
     socket.emit(outcome);
     expect(types()).toEqual(["socket", "sent", "server"]);
@@ -192,7 +227,7 @@ describe("a job's runner", () => {
       transport.server = { engine: "couchbase", version: "7.6.12", ...server };
       runner.start("p1", null, queryContext === undefined ? command : { ...command, query_context: queryContext });
       await flush();
-      transport.sockets[0].status("open");
+      transport.sockets[0].accept();
       return transport.sockets[0].sent[0];
     };
     const fallback = { bucket: "dbaguy", scope: "app" };
@@ -209,7 +244,7 @@ describe("a job's runner", () => {
     runner.start("p1", null, command);
     await flush();
     const socket = transport.sockets[0];
-    socket.status("open");
+    socket.accept();
     runner.detach();
     socket.emit(outcome);
     runner.cancel();

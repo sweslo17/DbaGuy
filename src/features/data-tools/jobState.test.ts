@@ -136,6 +136,13 @@ describe("a job's state", () => {
     expect(run([{ type: "socket", open: true }], state).reconnecting).toBe(false);
   });
 
+  it("stays the same state for a socket event that changes nothing: a backoff re-renders nothing", () => {
+    const reconnecting = run([sent, { type: "socket", open: false }]);
+    expect(jobReducer(reconnecting, { type: "socket", open: false })).toBe(reconnecting);
+    const open = run([sent, { type: "socket", open: true }]);
+    expect(jobReducer(open, { type: "socket", open: true })).toBe(open);
+  });
+
   it("keeps the first Cancel's time when a second is sent: the dialog escalates from it", () => {
     const state = run([sent, { type: "cancel_sent", at: 7 }, { type: "cancel_sent", at: 12 }]);
     expect(state.cancelRequestedAt).toBe(7);

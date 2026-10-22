@@ -1,14 +1,18 @@
+import { reconnectDelay } from "@/lib/api/backoff";
 import type { SocketStatus } from "@/lib/api/session-socket";
 import type { ClientCommand, ServerEvent, SessionInfo } from "@/lib/api/types";
 import type { JobCommand, JobEvent } from "./jobState";
 
 /*
  * One job's session and socket (spec ⑥ D-06-10, R-06-15), outside React: a job outlives its dialog. A new job opens a
- * session of its own and sends its command once, the first time the socket opens, never again (a reconnect gets the
- * backend's replay of its last events instead). A job listed after a reload only listens. Once the job's request is
- * over (its outcome, live or replayed), the socket and the session close (a job's session is never reused: a dump
- * leaves its settings on it, 06a carry). A socket the backend refuses (the session is gone: the backend stopped or
- * restarted) ends the job here with a loss. Everything it learns goes to `report` as a `JobEvent`.
+ * session of its own and sends its command once, when the backend first tells the socket the session's state (it does
+ * so first on every socket it attaches to a live session; a socket it refuses gets none: a session gone before the
+ * command left ends the job honestly not sent), never again (a reconnect gets the backend's replay of its last events
+ * instead). A job listed after a reload only listens. Once the job's request is over (its outcome, live or replayed),
+ * the socket and the session close (a job's session is never reused: a dump leaves its settings on it, 06a carry). A
+ * socket the backend refuses (the session is gone: the backend stopped or restarted) ends the job here with a loss.
+ * Everything it learns goes to `report` as a `JobEvent`. Its only runtime import is the pure backoff: its tests run it
+ * on fakes.
  */
 
 /** What the runner needs of a session's WebSocket (`SessionSocket`). */
@@ -60,6 +64,9 @@ export class JobRunner {
   /** A Cancel before the command left: it is never sent. */
   private withheld = false;
   private readonly unsubscribe: (() => void)[] = [];
+  /** First connects that failed in a row (an attached job tries again, with a closed socket's backoff). */
+  private failedConnects = 0;
+  private retry: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     readonly requestId: string,
@@ -69,7 +76,7 @@ export class JobRunner {
     private readonly onSession: (sessionId: string) => void = () => undefined,
   ) {}
 
-  /** A new job: its own session, then `command` once the socket first opens. */
+  /** A new job: its own session, then `command` once the backend has attached the socket to it. */
   start(profileId: string, database: string | null, command: JobCommand): void {
     void this.open(profileId, database, command);
   }
@@ -81,12 +88,16 @@ export class JobRunner {
     this.listen(sessionId, null);
   }
 
-  /** Cancel: on the socket while it is open, else through REST; before the command left, it is never sent. */
+  /**
+   * Cancel: on the socket while it is open, else through REST. Before the command left it is never sent: the job ends
+   * not sent at once when its socket is already waiting for the session, else as soon as its session has opened.
+   */
   cancel(): void {
     if (this.done) return;
     this.report({ type: "cancel_sent", at: this.transport.now() });
     if (!this.sent) {
       this.withheld = true;
+      if (this.socket) this.notSent();
       return;
     }
     if (this.socket?.trySend({ type: "cancel", request_id: this.requestId })) return;
@@ -129,7 +140,13 @@ export class JobRunner {
     this.socket = socket;
     this.unsubscribe.push(
       socket.subscribe((event) => {
-        if (this.done || !hasRequestId(event) || event.request_id !== this.requestId) return;
+        if (this.done) return;
+        if (event.type === "session_state") {
+          // The backend attached this socket to the live session (its state comes first; a refused socket gets none)
+          if (command && !this.sent) this.send(socket, command);
+          return;
+        }
+        if (!hasRequestId(event) || event.request_id !== this.requestId) return;
         const ends = endsRequest(event);
         if (ends) this.done = true;
         try {
@@ -142,21 +159,40 @@ export class JobRunner {
         if (this.done) return;
         if (status === "open") {
           this.report({ type: "socket", open: true });
-          if (command && !this.sent) this.send(socket, command);
         } else if (status === "closed") {
           if (!socket.isRejected) {
             this.report({ type: "socket", open: false });
             return;
           }
-          // The backend refused the socket for good: the session is gone, and the job's outcome with it
+          // The backend refused the socket for good: the session is gone, and the job's outcome with it (before the
+          // command left: nothing of it ran, `jobState` reads it as not sent)
           this.stop();
           this.report({ type: "session_gone", at: this.transport.now() });
         }
       }),
     );
+    this.connect(socket);
+  }
+
+  /**
+   * The socket's first connect (later ones are its own, with backoff). It fails only before there is a WebSocket (the
+   * backend's address cannot be read while the shell restarts it): a new job that never sent its command ends not sent;
+   * one that runs (listed after a reload) tries again with a closed socket's backoff, until it connects or is stopped.
+   */
+  private connect(socket: JobSocket): void {
     socket.connect().catch((error: unknown) => {
-      console.warn(`Job ${this.requestId}: the socket could not connect: ${errorMessage(error)}`);
-      if (!this.sent && !this.done) this.notSent();
+      if (this.done) return;
+      if (!this.sent) {
+        console.warn(`Job ${this.requestId}: the socket could not connect: ${errorMessage(error)}`);
+        this.notSent();
+        return;
+      }
+      if (this.failedConnects === 0) console.warn(`Job ${this.requestId}: the socket could not connect, trying again: ${errorMessage(error)}`);
+      this.report({ type: "socket", open: false });
+      this.retry = setTimeout(() => {
+        this.retry = null;
+        if (!this.done) this.connect(socket);
+      }, reconnectDelay(this.failedConnects++));
     });
   }
 
@@ -172,13 +208,18 @@ export class JobRunner {
   /** Nothing left: the session is closed (it never ran anything of this job). */
   private notSent(): void {
     this.done = true;
-    this.report({ type: "not_sent", at: this.transport.now() });
-    this.finish();
+    try {
+      this.report({ type: "not_sent", at: this.transport.now() });
+    } finally {
+      this.finish();
+    }
   }
 
-  /** Listens no more: its listeners go and its socket closes (a refused one stops reconnecting with it). */
+  /** Listens no more: its listeners go, a pending retry with them, and its socket closes (a refused one stops too). */
   private stop(): void {
     this.done = true;
+    if (this.retry) clearTimeout(this.retry);
+    this.retry = null;
     this.unsubscribe.splice(0).forEach((unsubscribe) => unsubscribe());
     this.socket?.close();
   }
