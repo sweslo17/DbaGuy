@@ -23,9 +23,12 @@ import {
   initialRunForm,
   inspectionNotes,
   patchedForm,
+  pickMode,
   presetPicksMode,
+  queryContextLabel,
   queryContextOf,
   RED_CONFIRM,
+  retargeted,
   runChoices,
   runCommand,
   runGate,
@@ -89,6 +92,16 @@ describe("the dump form", () => {
     expect(dumpProblem(folder, { ...form, checked: many })).toBe("A dump of chosen tables names at most 500: dump the schema instead");
   });
 
+  it("makes no plan request for an empty Tables folder, and no command for an incomplete form", () => {
+    const empty = initialDumpForm(folder, "/tmp/s.sql");
+    expect(dumpPlanRequest(folder, empty)).toBeNull();
+    expect(dumpPlanRequest(folder, { ...empty, checked: ["a"] })?.scope).toEqual({ kind: "tables", schema_name: "shop", names: ["a"] });
+    expect(() => dumpCommand(folder, empty, "r")).toThrow("The dump's form is not complete");
+    expect(() => dumpCommand(pg, initialDumpForm(pg, ""), "r")).toThrow("The dump's form is not complete");
+    expect(() => dumpCommand(pg, initialDumpForm(pg, "a.sql"), "r")).toThrow("The dump's form is not complete");
+    expect(dumpCommand(pg, initialDumpForm(pg, " /tmp/a.sql "), "r").path).toBe("/tmp/a.sql");
+  });
+
   it("needs an absolute file, and sends a path to the plan only once it is one", () => {
     expect(dumpProblem(pg, initialDumpForm(pg, ""))).toBe("Choose a file to dump into");
     expect(dumpProblem(pg, initialDumpForm(pg, "a.sql"))).toBe("Enter an absolute path (starting with /)");
@@ -116,7 +129,7 @@ describe("the dump form", () => {
 
 const engine = (name: EngineInfo["engine"], fields: Partial<EngineInfo> = {}) =>
   ({ engine: name, transactions: name !== "couchbase", query_context: name === "couchbase", run_file: true, ...fields }) as EngineInfo;
-const entry: RunEntry = { profileId: "p1", database: null, searchPath: "sales", queryContext: null, path: "/tmp/x.sql" };
+const entry: RunEntry = { profileId: "p1", database: null, searchPath: "sales", path: "/tmp/x.sql" };
 const profile = (fields: Partial<Profile> = {}) => ({ id: "p1", name: "Local PG", color: "none", read_only: false, ...fields }) as Profile;
 const inspection = (warnings: string[], header = false): FileInspection =>
   ({ path: "/tmp/x.sql", size: 10, preview: "", preview_truncated: false, warnings, header: header ? ({ format: 1, engine: "postgres", lines: [] } as never) : null }) as FileInspection;
@@ -163,6 +176,19 @@ describe("the run form", () => {
     expect(EVERY_STATEMENT_RUNS).toContain("DROP and TRUNCATE");
   });
 
+  it("says what is missing before Run can be pressed: a connection, the engine's details, a file, an absolute path", () => {
+    const form = initialRunForm(entry, engine("postgres"));
+    expect(runGate(null, engine("postgres"), form, true).blocked).toBe("Choose a connection");
+    // the engines have not loaded yet: that is waiting, not "cannot run files"
+    expect(runGate(profile(), null, form, true).blocked).toBe("Reading the connection's details…");
+    expect(runGate(profile(), engine("postgres", { run_file: false }), form, true).blocked).toBe("This connection cannot run SQL files");
+    expect(runGate(profile(), engine("postgres"), { ...form, path: "  " }, true).blocked).toBe("Choose a file");
+    expect(runGate(profile(), engine("postgres"), { ...form, path: "x.sql" }, true).blocked).toBe("Enter an absolute path (starting with /)");
+    expect(runGate(profile(), engine("postgres"), { ...form, fromStatement: "1.5" }, true).blocked).toBe("A statement number, 1 or more");
+    // the red box comes last: only a form that could run is asked to be confirmed
+    expect(runGate(profile({ color: "red" }), engine("postgres"), { ...form, path: "" }, true).blocked).toBe("Choose a file");
+  });
+
   it("asks for the box again after a run-again action", () => {
     const form = { ...initialRunForm(entry, engine("postgres")), confirmed: true };
     expect(patchedForm(form, { mode: "statements", on_error: "stop", from_statement: 7 })).toMatchObject({ mode: "statements", fromStatement: "7", confirmed: false });
@@ -172,29 +198,90 @@ describe("the run form", () => {
 
   it("keeps a run-again's mode: only an unchosen mode follows the engine as it loads (06b L7)", () => {
     const fresh = initialRunForm(entry, null);
-    expect([presetPicksMode(entry), fresh.mode]).toEqual([false, "statements"]);
+    expect([presetPicksMode(entry), fresh.modePicked, fresh.mode]).toEqual([false, false, "statements"]);
     // the engine's info arrives: all or nothing on PostgreSQL, still statement by statement on MySQL
-    expect(followEngineMode(fresh, engine("postgres"), presetPicksMode(entry)).mode).toBe("all_or_nothing");
-    expect(followEngineMode(fresh, engine("mysql"), false)).toBe(fresh);
-    expect(followEngineMode(initialRunForm(entry, engine("postgres")), engine("couchbase"), false).mode).toBe("statements");
+    expect(followEngineMode(fresh, engine("postgres")).mode).toBe("all_or_nothing");
+    expect(followEngineMode(fresh, engine("mysql"))).toBe(fresh);
+    expect(followEngineMode(initialRunForm(entry, engine("postgres")), engine("couchbase")).mode).toBe("statements");
     // a run again from line 7 (statements) stays so on PostgreSQL, however late the engine's info comes
     const again: RunEntry = { ...entry, preset: { mode: "statements", on_error: "stop", from_statement: 7 } };
     const form = initialRunForm(again, null);
-    expect(presetPicksMode(again)).toBe(true);
-    expect(followEngineMode(form, engine("postgres"), presetPicksMode(again))).toBe(form);
-    // a mode the user chose is never moved
-    expect(followEngineMode({ ...fresh, mode: "statements" }, engine("postgres"), true).mode).toBe("statements");
+    expect([presetPicksMode(again), form.modePicked]).toEqual([true, true]);
+    expect(followEngineMode(form, engine("postgres"))).toBe(form);
     // a preset that sets only the other fields does not pick the mode
     expect(presetPicksMode({ ...entry, preset: { from_statement: 3 } })).toBe(false);
+  });
+
+  it("never lets the engine undo a mode the user or a run-again patch chose", () => {
+    const fresh = initialRunForm(entry, engine("postgres"));
+    // the user picks statement by statement on PostgreSQL, then the target changes to another PostgreSQL connection
+    const picked = pickMode(fresh, "statements");
+    expect(picked).toMatchObject({ mode: "statements", modePicked: true });
+    expect(followEngineMode(picked, engine("postgres"))).toBe(picked);
+    // a patch that sets a mode picks it, even on a form that had followed the engine
+    const patched = patchedForm(fresh, { mode: "statements", on_error: "continue", from_statement: 7 });
+    expect(patched).toMatchObject({ mode: "statements", modePicked: true, onError: "continue", fromStatement: "7" });
+    expect(followEngineMode(patched, engine("postgres"))).toBe(patched);
+    // a patch back to all or nothing is picked as well
+    expect(followEngineMode(patchedForm(initialRunForm(entry, engine("mysql")), { mode: "all_or_nothing", on_error: "stop", from_statement: 1 }), engine("mysql")).mode).toBe("all_or_nothing");
+    // an all-or-nothing run stops at the first error: picking it drops "skip errors"
+    expect(pickMode({ ...picked, onError: "continue" }, "all_or_nothing")).toMatchObject({ mode: "all_or_nothing", onError: "stop" });
+    expect(pickMode({ ...picked, onError: "continue" }, "statements").onError).toBe("continue");
   });
 
   it("sends the entry's query context only while the run is on the entry's own connection (06b L6)", () => {
     const bucket: RunEntry = { ...entry, queryContext: { bucket: "b", scope: "s" } };
     const form = initialRunForm(bucket, engine("couchbase"));
     expect(queryContextOf(bucket, form)).toEqual({ bucket: "b", scope: "s" });
-    expect(queryContextOf(bucket, { ...form, profileId: "p2" })).toBeNull();
-    expect(queryContextOf(bucket, { ...form, profileId: null })).toBeNull();
-    expect(runCommand({ ...form, profileId: "p2" }, engine("couchbase"), queryContextOf(bucket, { ...form, profileId: "p2" }), "r").query_context).toBeNull();
+    // another connection has its own default: undefined, never the entry's and never "none"
+    expect(queryContextOf(bucket, { ...form, profileId: "p2" })).toBeUndefined();
+    expect(queryContextOf(bucket, { ...form, profileId: null })).toBeUndefined();
+    const none: RunEntry = { ...entry, queryContext: null };
+    expect(queryContextOf(none, { ...initialRunForm(none, engine("couchbase")), profileId: "p2" })).toBeUndefined();
+    expect(queryContextOf(none, initialRunForm(none, engine("couchbase")))).toBeNull();
+    expect(queryContextOf(entry, initialRunForm(entry, engine("couchbase")))).toBeUndefined();
+  });
+
+  it("says a query context in words, the three states apart", () => {
+    expect(queryContextLabel(undefined)).toBe("the connection's default");
+    expect(queryContextLabel(null)).toBe("none: names must be qualified");
+    expect(queryContextLabel({ bucket: "b" })).toBe("bucket b");
+    expect(queryContextLabel({ bucket: "b", scope: "s" })).toBe("bucket b · scope s");
+    expect(queryContextLabel({ bucket: "b", scope: null })).toBe("bucket b");
+  });
+
+  it("asks the box again on another connection: red A checked, then green, then red B (CR-3)", () => {
+    const onA: RunEntry = { ...entry, profileId: "A", database: "dbA", searchPath: "sales" };
+    const checkedOnA = { ...initialRunForm(onA, engine("postgres")), confirmed: true };
+    const green = retargeted(checkedOnA, "green");
+    expect(green).toMatchObject({ profileId: "green", confirmed: false, database: null, searchPath: "" });
+    const redB = retargeted({ ...green, confirmed: true }, "B");
+    expect(redB.confirmed).toBe(false);
+    // red A, checked, to green and straight back: still asked (the box was for the file and the connection as they were)
+    expect(retargeted(green, "A").confirmed).toBe(false);
+    // the same connection again: nothing changes, the box stays checked
+    expect(retargeted(checkedOnA, "A")).toBe(checkedOnA);
+    // what the user typed for the run is kept: the file, the statement to start at and the mode
+    const typed = { ...checkedOnA, path: "/tmp/y.sql", fromStatement: "9", modePicked: true };
+    expect(retargeted(typed, "B")).toMatchObject({ path: "/tmp/y.sql", fromStatement: "9", modePicked: true });
+    // back on the entry's own connection, the node's database and search path come back
+    expect(retargeted(green, "A", onA)).toMatchObject({ profileId: "A", database: "dbA", searchPath: "sales", confirmed: false });
+    expect(retargeted(green, "B", onA)).toMatchObject({ profileId: "B", database: null, searchPath: "" });
+  });
+
+  it("sends the query context in its three states, Couchbase only", () => {
+    const form = initialRunForm(entry, engine("couchbase"));
+    const sent = (context: Parameters<typeof runCommand>[2], eng = engine("couchbase")) => runCommand(form, eng, context, "r");
+    // undefined: the connection's default, left to the job runner (it knows the session's own): not on the wire here
+    expect(sent(undefined).query_context).toBeUndefined();
+    expect(JSON.stringify(sent(undefined))).not.toContain("query_context");
+    // null: no context, sent as such
+    expect(sent(null).query_context).toBeNull();
+    expect(JSON.stringify(sent(null))).toContain('"query_context":null');
+    expect(sent({ bucket: "b", scope: "s" }).query_context).toEqual({ bucket: "b", scope: "s" });
+    // another engine sends none, whatever it was handed
+    expect(sent(undefined, engine("postgres")).query_context).toBeNull();
+    expect(sent({ bucket: "b" }, engine("postgres")).query_context).toBeNull();
   });
 
   it("sends the search path to PostgreSQL only, and the context to Couchbase only", () => {
@@ -241,6 +328,16 @@ describe("the forms' helpers", () => {
       preset: { mode: "statements", on_error: "stop", from_statement: 9 },
     });
     expect(againEntry(job, null).preset).toEqual({ mode: "statements", on_error: "stop", from_statement: 1 });
+  });
+
+  it("runs again in the same Couchbase query context: the default stays the default, none stays none", () => {
+    const cb = engine("couchbase");
+    const form = initialRunForm({ ...entry, searchPath: null }, cb);
+    const again = (context: Parameters<typeof runCommand>[2]) =>
+      againEntry({ profileId: "p1", database: null, command: runCommand(form, cb, context, "r") }, null).queryContext;
+    expect(again(undefined)).toBeUndefined();
+    expect(again(null)).toBeNull();
+    expect(again({ bucket: "b", scope: "s" })).toEqual({ bucket: "b", scope: "s" });
   });
 
   it("numbers a file's lines from where they start, without their CR", () => {

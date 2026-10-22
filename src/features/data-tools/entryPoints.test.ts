@@ -71,6 +71,24 @@ describe("Dump… on the tree", () => {
     expect(dumpEntryForNode(P, SQLITE, node([seg("schema", "aux")]))).toBeNull();
   });
 
+  it("gates SQLite's other databases in the Tables folder, the relation branch and a table tab (main only)", () => {
+    const main = [seg("schema", "main"), seg("folder", "tables")];
+    const aux = [seg("schema", "aux"), seg("folder", "tables")];
+    expect(dumpEntryForNode(P, SQLITE, node(main))?.target).toEqual({ kind: "tables", schema: "main", folder: main });
+    expect(dumpEntryForNode(P, SQLITE, node(aux))).toBeNull();
+    expect(dumpEntryForNode(P, SQLITE, node([...main, seg("table", "t")]))?.target).toMatchObject({ kind: "relation", schema: "main", name: "t" });
+    expect(dumpEntryForNode(P, SQLITE, node([...aux, seg("table", "t")]))).toBeNull();
+    expect(dumpEntryForTable(P, SQLITE, [...main, seg("table", "t")], "a = 1")?.filter).toBe("a = 1");
+    expect(dumpEntryForTable(P, SQLITE, [...aux, seg("table", "t")], "a = 1")).toBeNull();
+  });
+
+  it("offers no dump from a table tab on an engine without dumps, or for something that is not a relation", () => {
+    const path = [seg("database", "d"), seg("schema", "s"), seg("folder", "tables"), seg("table", "t")];
+    expect(dumpEntryForTable(P, engine("postgres", { dump: false }), path, "")).toBeNull();
+    expect(dumpEntryForTable(P, null, path, "")).toBeNull();
+    expect(dumpEntryForTable(P, PG, [...path, seg("folder", "columns")], "")).toBeNull();
+  });
+
   it("offers nothing on objects that are not dumped alone, nor on an engine without dumps", () => {
     const table = [seg("database", "d"), seg("schema", "s"), seg("folder", "tables"), seg("table", "t")];
     expect(dumpEntryForNode(P, PG, node([...table, seg("folder", "columns")]))).toBeNull();
@@ -91,16 +109,25 @@ describe("Dump… on the tree", () => {
 describe("Run SQL file… on the tree", () => {
   it("runs on the node's database, PostgreSQL's schema as the search path", () => {
     expect(runEntryForNode(P, PG, node([seg("database", "dbaguy"), seg("schema", "sales")]))).toEqual({
-      profileId: P, database: "dbaguy", searchPath: "sales", queryContext: null, path: "",
+      profileId: P, database: "dbaguy", searchPath: "sales", path: "",
     });
     expect(runEntryForNode(P, MYSQL, node([seg("schema", "shop")]))?.database).toBe("shop");
     expect(runEntryForNode(P, MSSQL, node([seg("database", "app"), seg("schema", "dbo")]))).toMatchObject({ database: "app", searchPath: null });
-    expect(runEntryForNode(P, PG, null)).toEqual({ profileId: P, database: null, searchPath: null, queryContext: null, path: "" });
+    expect(runEntryForNode(P, PG, null)).toEqual({ profileId: P, database: null, searchPath: null, path: "" });
   });
 
-  it("runs on Couchbase in the bucket's or scope's context", () => {
+  it("runs on SQLite's schema node as on the connection itself: no database, no search path", () => {
+    const entry = runEntryForNode(P, SQLITE, node([seg("schema", "main")]));
+    expect(entry).toEqual({ profileId: P, database: null, searchPath: null, path: "" });
+    expect(entry?.queryContext).toBeUndefined();
+  });
+
+  it("runs on Couchbase in the bucket's or scope's context, and on the connection's own default from its row", () => {
     expect(runEntryForNode(P, COUCHBASE, node([seg("bucket", "b")]))?.queryContext).toEqual({ bucket: "b" });
     expect(runEntryForNode(P, COUCHBASE, node([seg("bucket", "b"), seg("scope", "s")]))?.queryContext).toEqual({ bucket: "b", scope: "s" });
+    // undefined is the default context; null would mean none (names must be qualified): the row says neither
+    expect(runEntryForNode(P, COUCHBASE, null)?.queryContext).toBeUndefined();
+    expect(runEntryForNode(P, PG, node([seg("database", "d"), seg("schema", "s")]))?.queryContext).toBeUndefined();
   });
 
   it("offers nothing on other nodes or engines without the tool", () => {
@@ -109,7 +136,8 @@ describe("Run SQL file… on the tree", () => {
   });
 
   it("runs a script on the connection chosen in the tree", () => {
-    expect(runEntryForScript("/u/scripts/a.sql", null)).toEqual({ profileId: null, database: null, searchPath: null, queryContext: null, path: "/u/scripts/a.sql", note: null });
+    expect(runEntryForScript("/u/scripts/a.sql", null)).toEqual({ profileId: null, database: null, searchPath: null, path: "/u/scripts/a.sql", note: null });
+    expect(runEntryForScript("/u/scripts/a.sql", "p1").queryContext).toBeUndefined();
     expect(runEntryForScript("/u/scripts/a.sql", "p1", "a.sql").note).toBe("a.sql has changes not saved to this file: the file as saved runs");
   });
 });
@@ -129,11 +157,60 @@ describe("the palette's entries", () => {
     expect(paletteDumpEntry(null, profile, PG, "")).toBeNull();
   });
 
+  it("dumps a MySQL query tab's database as its schema, with no database of the session's own", () => {
+    const mysql = { id: P, name: "Local MySQL", engine: "mysql", database: "shop" } as never;
+    expect(paletteDumpEntry(query({ database: "analytics" }), mysql, MYSQL, "")).toEqual({
+      profileId: P, database: null, target: { kind: "schema", schema: "analytics" }, filter: null,
+    });
+    // a tab with no database of its own takes the connection's
+    expect(paletteDumpEntry(query(), mysql, MYSQL, "")?.target).toEqual({ kind: "schema", schema: "shop" });
+    // neither: nothing to dump
+    expect(paletteDumpEntry(query(), { id: P, name: "M", engine: "mysql", database: null } as never, MYSQL, "")).toBeNull();
+  });
+
+  it("dumps a SQLite query tab's main database, whatever its tab says", () => {
+    const sqlite = { id: P, name: "App", engine: "sqlite", path: "/x/app.sqlite3" } as never;
+    expect(paletteDumpEntry(query(), sqlite, SQLITE, "")).toEqual({
+      profileId: P, database: null, target: { kind: "schema", schema: "main" }, filter: null,
+    });
+    expect(paletteDumpEntry(query({ database: "aux" }), sqlite, SQLITE, "")?.target).toEqual({ kind: "schema", schema: "main" });
+  });
+
+  it("dumps a SQL Server query tab's database, from the tab or the connection", () => {
+    const mssql = { id: P, name: "Local MSSQL", engine: "mssql", database: "app" } as never;
+    expect(paletteDumpEntry(query(), mssql, MSSQL, "")).toEqual({
+      profileId: P, database: "app", target: { kind: "database", database: "app" }, filter: null,
+    });
+    expect(paletteDumpEntry(query({ database: "analytics" }), mssql, MSSQL, "")?.database).toBe("analytics");
+    expect(paletteDumpEntry(query(), { id: P, name: "M", engine: "mssql", database: null } as never, MSSQL, "")).toBeNull();
+  });
+
+  it("offers no palette dump for another connection's tab, an engine without dumps or a tab that is not a query or table", () => {
+    expect(paletteDumpEntry(query({ profileId: "other" }), profile, PG, "")).toBeNull();
+    expect(paletteDumpEntry(query(), profile, COUCHBASE, "")).toBeNull();
+    expect(paletteDumpEntry(query(), profile, null, "")).toBeNull();
+    expect(paletteDumpEntry(query(), null, PG, "")).toBeNull();
+    const fn: ObjectTabState = {
+      id: "t3", kind: "object", profileId: P, title: "f",
+      path: [seg("database", "d"), seg("schema", "s"), seg("folder", "functions"), seg("function", "f()")],
+    };
+    expect(paletteDumpEntry(fn, profile, PG, "")).toBeNull();
+  });
+
   it("runs on the active tab's connection, else the tree's", () => {
     expect(paletteRunEntry(query({ database: "analytics" }), "other", PG)).toMatchObject({ profileId: P, database: "analytics" });
     expect(paletteRunEntry(table, null, PG)).toMatchObject({ profileId: P, database: "d" });
     expect(paletteRunEntry(null, "other", PG).profileId).toBe("other");
     expect(paletteRunEntry(query({ queryContext: { bucket: "b" } }), null, COUCHBASE).queryContext).toEqual({ bucket: "b" });
+  });
+
+  it("keeps a query tab's three context states: the default, none, a chosen one", () => {
+    expect(paletteRunEntry(query(), null, COUCHBASE).queryContext).toBeUndefined();
+    expect(paletteRunEntry(query({ queryContext: "none" }), null, COUCHBASE).queryContext).toBeNull();
+    expect(paletteRunEntry(query({ queryContext: { bucket: "b", scope: "s" } }), null, COUCHBASE).queryContext).toEqual({ bucket: "b", scope: "s" });
+    // a tab that is not a query tab says nothing of a context
+    expect(paletteRunEntry(table, null, COUCHBASE).queryContext).toBeUndefined();
+    expect(paletteRunEntry(null, "other", COUCHBASE).queryContext).toBeUndefined();
   });
 
   it("runs a MySQL table tab on the table's schema, which is its database there (06b L5), as the tree does", () => {
@@ -177,5 +254,13 @@ describe("a dump's file name", () => {
     const odd = dumpEntryForNode(P, MYSQL, node([seg("schema", "a\nb")]))!;
     expect(dumpFileName(odd, "mysql", null, 0, at)).toBe("a b_20261023-1405.sql");
     expect(sqliteStem("/x/.hidden")).toBe(".hidden");
+  });
+
+  it("stays within APFS's 255 bytes for a long CJK name, cut between characters", () => {
+    const long = dumpEntryForNode(P, MYSQL, node([seg("schema", "資".repeat(100))]))!;
+    const name = dumpFileName(long, "mysql", null, 0, at);
+    expect(new TextEncoder().encode(name).length).toBeLessThanOrEqual(255);
+    expect(name).toMatch(/^資+_20261023-1405\.sql$/);
+    expect([...name.split("_")[0]].length).toBe(66);
   });
 });

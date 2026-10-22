@@ -24,6 +24,11 @@ export interface RunForm {
   fromStatement: string;
   /** CR-3: a red connection's run waits for this box. */
   confirmed: boolean;
+  /**
+   * The mode was chosen (by the user, or by a "run again" preset or patch): until then it follows the engine's default
+   * as the engine's info loads or the target changes (`followEngineMode`).
+   */
+  modePicked: boolean;
 }
 
 /** CR-3: always said, because a run is not checked statement by statement (R-06-6). */
@@ -44,6 +49,12 @@ export function defaultMode(engine: EngineInfo | null): RunMode {
   return !engine || STATEMENTS_FIRST.has(engine.engine) || !engine.transactions ? "statements" : "all_or_nothing";
 }
 
+/**
+ * Whether the entry already chose the mode: a "run again" preset counts as chosen (06b pre-flight L7), so the engine's
+ * info arriving a render later never turns its "statement by statement" into the engine's default.
+ */
+export const presetPicksMode = (entry: RunEntry): boolean => entry.preset?.mode !== undefined;
+
 export function initialRunForm(entry: RunEntry, engine: EngineInfo | null): RunForm {
   const preset = entry.preset ?? {};
   return {
@@ -55,36 +66,62 @@ export function initialRunForm(entry: RunEntry, engine: EngineInfo | null): RunF
     onError: preset.on_error ?? "stop",
     fromStatement: String(preset.from_statement ?? 1),
     confirmed: false,
+    modePicked: presetPicksMode(entry),
   };
 }
 
 /**
- * Whether the entry already chose the mode: a "run again" preset counts as chosen (06b pre-flight L7), so the engine's
- * info arriving a render later never turns its "statement by statement" into the engine's default.
+ * The form with its mode following the engine's default while nobody has chosen one (`form.modePicked` false: the
+ * engine's info loads, or the target changes). The same form object when nothing changes.
  */
-export const presetPicksMode = (entry: RunEntry): boolean => entry.preset?.mode !== undefined;
-
-/**
- * The form with its mode following the engine's default while nobody has chosen one (`picked` false: the engine's info
- * loads, or the target changes). The same form object when nothing changes.
- */
-export function followEngineMode(form: RunForm, engine: EngineInfo | null, picked: boolean): RunForm {
+export function followEngineMode(form: RunForm, engine: EngineInfo | null): RunForm {
   const mode = defaultMode(engine);
-  return picked || mode === form.mode ? form : { ...form, mode };
+  return form.modePicked || mode === form.mode ? form : { ...form, mode };
+}
+
+/** The user chose a mode: it stays, whatever the engine. An all-or-nothing run stops at the first error. */
+export function pickMode(form: RunForm, mode: RunMode): RunForm {
+  return { ...form, mode, modePicked: true, onError: mode === "all_or_nothing" ? "stop" : form.onError };
 }
 
 /**
- * The Couchbase query context a run is sent in: the entry's (the bucket or scope node), only while the form still runs
- * on the entry's own connection: another connection's context means nothing there (06b pre-flight L6); null: the
- * connection's default.
+ * The query context a Couchbase run is sent in, with the three states of a query tab's: undefined is the connection's
+ * own default (the job runner fills it in from the job's session), null is none (names must be qualified), an object is
+ * explicit. The entry's (its bucket or scope node) only while the form still runs on the entry's own connection: another
+ * connection's context means nothing there, so it gets its own default (06b pre-flight L6).
  */
-export const queryContextOf = (entry: RunEntry, form: RunForm): QueryContext | null =>
-  form.profileId === entry.profileId ? entry.queryContext : null;
+export const queryContextOf = (entry: RunEntry, form: RunForm): QueryContext | null | undefined =>
+  form.profileId === entry.profileId ? entry.queryContext : undefined;
 
-/** A "run again" action's changes on the form (`RunPatch`); the confirmation is asked again. */
+/** A query context in words, for the dialog: "bucket B · scope S", "the connection's default" or "none". */
+export function queryContextLabel(context: QueryContext | null | undefined): string {
+  if (context === undefined) return "the connection's default";
+  if (context === null) return "none: names must be qualified";
+  return context.scope ? `bucket ${context.bucket} · scope ${context.scope}` : `bucket ${context.bucket}`;
+}
+
+/**
+ * The form on another connection (the target picker): what belonged to the old one goes: the confirmation (CR-3: it
+ * was for that connection), the database and the search path. Going back to the entry's own connection restores the
+ * entry's database and search path. The same form object when the connection is the same.
+ */
+export function retargeted(form: RunForm, profileId: string | null, entry: RunEntry | null = null): RunForm {
+  if (profileId === form.profileId) return form;
+  const own = entry && profileId === entry.profileId ? entry : null;
+  return { ...form, profileId, database: own?.database ?? null, searchPath: own?.searchPath ?? "", confirmed: false };
+}
+
+/** A "run again" action's changes on the form (`RunPatch`): its mode counts as chosen; the confirmation is asked again. */
 export function patchedForm(form: RunForm, patch: RunPatch | null): RunForm {
   if (!patch) return { ...form, confirmed: false };
-  return { ...form, mode: patch.mode, onError: patch.on_error, fromStatement: String(patch.from_statement), confirmed: false };
+  return {
+    ...form,
+    mode: patch.mode,
+    modePicked: true,
+    onError: patch.on_error,
+    fromStatement: String(patch.from_statement),
+    confirmed: false,
+  };
 }
 
 export interface ModeChoice {
@@ -151,23 +188,33 @@ export interface RunGate {
 
 export function runGate(profile: Profile | null, engine: EngineInfo | null, form: RunForm, inspected: boolean): RunGate {
   const red = profile?.color === "red";
-  const blocked = !profile
-    ? "Choose a connection"
-    : profile.read_only
-      ? "This connection is read-only: it cannot run files"
-      : !engine?.run_file
-        ? "This connection cannot run SQL files"
-        : !form.path.trim()
-          ? "Choose a file"
-          : (pathProblem(form.path) ??
-            (!inspected
-              ? "The file has not been read yet"
-              : (fromStatementProblem(form.fromStatement) ?? (red && !form.confirmed ? `Check “${RED_CONFIRM}” first` : null))));
-  return { red, blocked };
+  const problem = (): string | null => {
+    if (!profile) return "Choose a connection";
+    if (profile.read_only) return "This connection is read-only: it cannot run files";
+    if (!engine) return "Reading the connection's details…"; // the engines are still loading: waiting, not refusing
+    if (!engine.run_file) return "This connection cannot run SQL files";
+    if (!form.path.trim()) return "Choose a file";
+    const path = pathProblem(form.path);
+    if (path) return path;
+    if (!inspected) return "The file has not been read yet";
+    const from = fromStatementProblem(form.fromStatement);
+    if (from) return from;
+    return red && !form.confirmed ? `Check “${RED_CONFIRM}” first` : null;
+  };
+  return { red, blocked: problem() };
 }
 
-/** The command the form sends; `queryContext` is the entry's (Couchbase: `queryContextOf`), else the connection's default. */
-export function runCommand(form: RunForm, engine: EngineInfo, queryContext: QueryContext | null, requestId: string): RunFileCommand {
+/**
+ * The command the form sends. `queryContext` (Couchbase only; `queryContextOf`) keeps its three states on the wire:
+ * undefined is left out (the job runner fills in the connection's default once the job's session is open), null is sent
+ * (no context), an object as it is; any other engine sends null.
+ */
+export function runCommand(
+  form: RunForm,
+  engine: EngineInfo,
+  queryContext: QueryContext | null | undefined,
+  requestId: string,
+): RunFileCommand {
   return {
     type: "run_file",
     request_id: requestId,
@@ -193,7 +240,7 @@ export function againEntry(
     profileId: job.profileId,
     database: job.database,
     searchPath: command.search_path ?? null,
-    queryContext: command.query_context ?? null,
+    queryContext: command.query_context, // undefined: the connection's default, null: none, as it was sent
     path: command.path,
     preset: patch ?? { mode: command.mode, on_error: command.on_error ?? "stop", from_statement: command.from_statement ?? 1 },
   };

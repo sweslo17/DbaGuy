@@ -19,13 +19,17 @@ export interface Relation {
   kind: string;
 }
 
+/** The database a tree path sits in (its first segment, PostgreSQL and SQL Server); null when the engine has none. */
+export const databaseOf = (path: PathSegment[]): string | null => (path[0]?.kind === "database" ? path[0].name : null);
+
+/** The innermost schema a tree path sits in (MySQL's database is its schema node); null when it is in none. */
+export const schemaOf = (path: PathSegment[]): string | null => path.findLast((segment) => segment.kind === "schema")?.name ?? null;
+
 /** The relation a tree path points at, or null when its last segment is not a relation (a function, an index, …). */
 export function relationOf(path: PathSegment[]): Relation | null {
   const last = path.at(-1);
   if (!last || !RELATION_KINDS.has(last.kind)) return null;
-  const database = path[0]?.kind === "database" ? path[0].name : null;
-  const schema = path.findLast((segment) => segment.kind === "schema")?.name ?? null;
-  return { database, schema, name: last.name, kind: last.kind };
+  return { database: databaseOf(path), schema: schemaOf(path), name: last.name, kind: last.kind };
 }
 
 /**

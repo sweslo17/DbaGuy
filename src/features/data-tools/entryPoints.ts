@@ -1,6 +1,7 @@
 import type { EngineInfo, ObjectNode, PathSegment, Profile, QueryContext } from "@/lib/api/types";
 import type { Tab } from "@/stores/workspace";
-import { relationOf } from "../table-data/filterValue";
+import { databaseOf, relationOf, schemaOf } from "../table-data/filterValue";
+import type { RunPatch } from "./jobReport";
 
 /*
  * Where Dump… and Run SQL file… start (spec ⑥ §3.6 入口, D-06-13): a tree node, the table-data tab, a script, the
@@ -33,12 +34,16 @@ export interface RunEntry {
   database: string | null;
   /** PostgreSQL: the schema node's name, sent as the run's search path. */
   searchPath: string | null;
-  /** Couchbase: the bucket or scope node; null: the connection's default. */
-  queryContext: QueryContext | null;
+  /**
+   * Couchbase: where unqualified names resolve, as a query tab's is (three states): undefined is the connection's own
+   * default context (the job runner fills it in from the job's session), null is no context (names must be qualified),
+   * an object is the bucket or scope node chosen.
+   */
+  queryContext?: QueryContext | null;
   /** The file; "" until chosen. */
   path: string;
   /** "Run again…": the form starts with these. */
-  preset?: { mode?: "all_or_nothing" | "statements"; on_error?: "stop" | "continue"; from_statement?: number };
+  preset?: Partial<RunPatch>;
   /** Said above the file (a script's tab with changes not saved to it). */
   note?: string | null;
 }
@@ -47,9 +52,6 @@ const RELATION_DATA: ReadonlySet<string> = new Set(["table", "partition"]);
 
 /** Whether a relation kind has rows a dump writes (a view, a materialized view: only its definition, spec §3.3.1). */
 export const relationHasRows = (relationKind: string): boolean => RELATION_DATA.has(relationKind);
-
-const schemaOf = (path: PathSegment[]) => path.findLast((segment) => segment.kind === "schema")?.name ?? null;
-const databaseOf = (path: PathSegment[]) => (path[0]?.kind === "database" ? path[0].name : null);
 
 /** Dump… on a tree node: a database, schema, Tables folder or relation of an engine that dumps; else null. */
 export function dumpEntryForNode(profileId: string, engine: EngineInfo | null, node: ObjectNode): DumpEntry | null {
@@ -100,7 +102,6 @@ export function runEntryForNode(profileId: string, engine: EngineInfo | null, no
     profileId,
     database: null,
     searchPath: null,
-    queryContext: null,
     path: "",
     ...fields,
   });
@@ -128,7 +129,7 @@ export function runEntryForNode(profileId: string, engine: EngineInfo | null, no
  */
 export function runEntryForScript(absolutePath: string, profileId: string | null, unsavedTab: string | null = null): RunEntry {
   const note = unsavedTab ? `${unsavedTab} has changes not saved to this file: the file as saved runs` : null;
-  return { profileId, database: null, searchPath: null, queryContext: null, path: absolutePath, note };
+  return { profileId, database: null, searchPath: null, path: absolutePath, note };
 }
 
 /** ⌘⇧P Dump…: the active table tab's table (with its filter), else the active tab's connection as a whole. */
@@ -167,6 +168,7 @@ export function paletteRunEntry(tab: Tab | null, selectedProfileId: string | nul
           ? schemaOf(fromTab.path)
           : databaseOf(fromTab.path)
         : null;
-  const context = fromTab?.kind === "query" && typeof fromTab.queryContext === "object" ? fromTab.queryContext : null;
+  // a query tab's context keeps its three states: undefined (the connection's default), "none" (no context), a context
+  const context = fromTab?.kind === "query" ? (fromTab.queryContext === "none" ? null : fromTab.queryContext) : undefined;
   return { profileId: fromTab?.profileId ?? selectedProfileId, database, searchPath: null, queryContext: context, path: "" };
 }

@@ -1,4 +1,11 @@
-import type { JobError, JobOutcomeEvent, JobOutcomeKind, JobProgressEvent, StoppedAt } from "@/lib/api/types";
+import type {
+  JobError,
+  JobOutcomeEvent,
+  JobOutcomeKind,
+  JobProgressEvent,
+  RunFileCommand,
+  StoppedAt,
+} from "@/lib/api/types";
 import { formatElapsed, formatSize, plural } from "@/lib/format";
 import { isSqliteBusy, sqliteBusyNote } from "@/lib/sqliteBusy";
 import { FILTER_RULE } from "../table-data/filterValue";
@@ -22,8 +29,8 @@ export type Tone = "success" | "warning" | "danger" | "muted";
 
 /** The form's fields a "run again" action changes. */
 export interface RunPatch {
-  mode: "all_or_nothing" | "statements";
-  on_error: "stop" | "continue";
+  mode: RunFileCommand["mode"];
+  on_error: NonNullable<RunFileCommand["on_error"]>;
   from_statement: number;
 }
 
