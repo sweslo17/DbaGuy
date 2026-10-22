@@ -18,7 +18,9 @@ from dbaguy_backend.services.safety import GuardAction, GuardDecision
 from dbaguy_backend.sessions.hooks import SessionHooksFactory
 from dbaguy_backend.sessions.jobs import run_file
 from dbaguy_backend.sessions.jobs.context import JOB_ROLLBACK_FAILED, JobHooks
-from dbaguy_backend.sessions.jobs.run_file import COPY_HINT, HEX_BLOB_HINT, RunFileJob, summary
+from dbaguy_backend.sessions.jobs.run_file import (
+    COPY_HINT, HEX_BLOB_HINT, NON_TRANSACTIONAL, PARTLY_APPLIED, RunFileJob, summary,
+)
 from dbaguy_backend.sessions.worker import SessionWorker, WorkerHooks
 from dbaguy_backend.sql.dump_header import CUT_SHORT, complete_line, header_lines
 from dbaguy_backend.sql.statement_stream import UTF16_MESSAGE
@@ -51,11 +53,14 @@ class RunFake(FakeConnection):
     its second run on), `reopen` (commits and begins another: a new CURRENT_TRANSACTION_ID()), `slept` (waits for a
     cancel, then finishes anyway: MySQL's SLEEP() that swallowed the KILL), `copy` (the adapter's COPY refusal), `tx`
     (opens one), anything else: done. `acts` gives a whole text one of those words' behaviour (`CALL p()`). `kept`: a
-    ROLLBACK leaves MySQL's warning 1196 (a MyISAM table)."""
+    ROLLBACK leaves MySQL's warning 1196 (a MyISAM table). `non_transactional`: MySQL's database has a table that
+    cannot roll back (the run asks with NON_TRANSACTIONAL, recorded in `runs`)."""
 
     def __init__(self, dialect: Dialect = Dialect.SQLITE, commit_error: StatementError | None = None,
-                 commit_keeps: bool = False, acts: dict[str, str] | None = None, kept: bool = False) -> None:
+                 commit_keeps: bool = False, acts: dict[str, str] | None = None, kept: bool = False,
+                 non_transactional: bool = False) -> None:
         super().__init__()
+        self.non_transactional = non_transactional
         self.begin, self.end = FRAME[dialect]
         self.commit_error = commit_error
         self.commit_keeps = commit_keeps
@@ -75,6 +80,9 @@ class RunFake(FakeConnection):
         if sql == "SELECT CURRENT_TRANSACTION_ID()":
             self.id_reads += 1
             return RowsResult([[self.txid]])
+        if sql == NON_TRANSACTIONAL:
+            self.runs.append(sql)
+            return RowsResult([[1 if self.non_transactional else 0]])
         if sql == "SHOW WARNINGS":
             self.runs.append(sql)
             kept = [["Warning", 1196, "Some non-transactional changed tables couldn't be rolled back"]]
@@ -163,7 +171,8 @@ def env():
 
     def make(conn: RunFake | None = None, **fields) -> Env:
         made.append(Env(conn or RunFake(fields.get("dialect", Dialect.SQLITE), acts=fields.pop("acts", None),
-                                        kept=fields.pop("kept", False)), **fields))
+                                        kept=fields.pop("kept", False),
+                                        non_transactional=fields.pop("non_transactional", False)), **fields))
         return made[-1]
 
     yield make
@@ -509,7 +518,8 @@ def test_a_stop_inside_the_files_own_transaction_rolls_it_back_and_counts_it_out
     done = outcome(events)
     assert (done.outcome, done.stopped_at.statement, done.statements, e.conn.rollbacks) == ("stopped", 4, 1, 1)
     assert done.warnings == ["The file's transaction from line 2 (statement 2) was still open: it was rolled back, so "
-                             "the statements from there on are not applied; run again from statement 2"]
+                             "the statements from there on are not applied"]  # where to run again: resume_at (L4)
+    assert (done.resume_at.line, done.resume_at.statement) == (2, 2)
 
 
 def test_skipping_an_error_that_aborted_the_files_transaction_stops(env, sql_file):  # H2 (PostgreSQL's 25P02)
@@ -698,8 +708,11 @@ def test_a_commit_that_leaves_a_transaction_open_restarts_it_there(env, sql_file
     e = env(RunFake(dialect, commit_keeps=dialect is Dialect.MYSQL), dialect=dialect)
     done = outcome(e.run(sql_file(f"tx;\nrows 2;\n{chain};\nrows 4;\nfail boom;"), mode="statements"))
     assert (done.outcome, done.statements, done.stopped_at.statement) == ("stopped", 3, 5)
-    assert done.warnings == ["The file's transaction from line 3 (statement 3) was still open: it was rolled back, so "
-                             "the statements from there on are not applied; run again from statement 3"]
+    # the chained transaction is tracked from its first statement: a run again starts there, not at the COMMIT AND
+    # CHAIN, which PostgreSQL refuses outside a transaction block (06b review M1)
+    assert done.warnings == ["The file's transaction from line 4 (statement 4) was still open: it was rolled back, so "
+                             "the statements from there on are not applied"]
+    assert (done.resume_at.line, done.resume_at.statement) == (4, 4)
 
 
 def test_a_do_block_that_fails_may_have_applied_part_of_its_work(env, sql_file):  # R6
@@ -863,3 +876,109 @@ def test_a_cancelled_run_resumes_at_the_statement_it_did_not_finish(env, sql_fil
     e.worker.cancel("r")
     done = outcome(request_events(e.recorder, "r"))
     assert (done.outcome, done.cancelled, done.resume_at.statement, done.resume_at.line) == ("stopped", True, 2, 2)
+
+
+# ---- 06b Task 2, fix round 1 (the live review's H1–M3, L4) ----------------------------------------------------
+
+
+@pytest.mark.parametrize(("dialect", "text", "acts"), [
+    # SQL Server: XACT_ABORT rolls the file's transaction back at line 5, then a batch applies two INSERTs in
+    # autocommit and fails on its third (skipped): a run again from the BEGIN would repeat them (review H1)
+    (Dialect.TSQL, "BEGIN TRANSACTION\nGO\nINSERT INTO t VALUES (1)\nGO\nINSERT INTO g VALUES (1)\nGO\n"
+     "INSERT INTO t VALUES (2)\nINSERT INTO t VALUES (3)\nINSERT INTO g VALUES (2)\nGO\n",
+     {"BEGIN TRANSACTION": "tx", "INSERT INTO g VALUES (1)": "failend",
+      "INSERT INTO t VALUES (2)\nINSERT INTO t VALUES (3)\nINSERT INTO g VALUES (2)": "fail boom"}),
+    (Dialect.MYSQL, "tx;\nrows 2;\ndeadlock;\nCALL p();\n", {"CALL p()": "fail boom"}),  # a skipped CALL
+])
+def test_a_skipped_statement_that_runs_several_after_a_rolled_back_transaction_has_no_resume_point(
+        env, sql_file, dialect, text, acts):
+    done = outcome(env(dialect=dialect, acts=acts).run(sql_file(text), mode="statements", on_error="continue"))
+    assert (done.outcome, done.error_count, done.resume_at) == ("completed", 2, None)
+
+
+def test_a_failing_mysql_call_inside_the_files_transaction_may_have_committed_it(env, sql_file):  # review H2, N1
+    e = env(dialect=Dialect.MYSQL, acts={"CALL p()": "fail boom"})  # the CALL committed, began again, then failed
+    done = outcome(e.run(sql_file("rows 1;\nSTART TRANSACTION;\nrows 3;\nCALL p();\nrows 5;\nCOMMIT;"),
+                         mode="statements"))
+    assert (done.outcome, done.stopped_at.statement, done.statements, done.resume_at) == ("unknown", 4, 3, None)
+    assert done.warnings == ["Line 4 may have committed or rolled back the file's transaction from line 2 (statement "
+                             "2): the statements from there on may or may not be applied"]
+
+
+def test_a_go_n_that_failed_midway_inside_the_files_transaction_resumes_at_its_begin(env, sql_file):  # review L4
+    e = env(dialect=Dialect.TSQL, acts={"BEGIN TRANSACTION": "tx", "INSERT INTO t DEFAULT VALUES": "again"})
+    done = outcome(e.run(sql_file("BEGIN TRANSACTION\nGO\nINSERT INTO t DEFAULT VALUES\nGO 3\n"), mode="statements"))
+    # its one run that stood went with the transaction's rollback
+    assert (done.outcome, done.stopped_at.statement, done.statements, e.conn.rollbacks) == ("stopped", 2, 0, 1)
+    assert (done.resume_at.line, done.resume_at.statement) == (1, 1)
+
+
+WRITE = "INSERT INTO t VALUES (1), (2), (3)"
+
+
+@pytest.mark.parametrize(("non_transactional", "on_error", "expected"), [
+    (True, "stop", ("stopped", None)),  # MyISAM may keep the rows before the error: no place is known (review M2)
+    (False, "stop", ("stopped", (2, 2))),
+    (True, "continue", ("completed", None)),
+    (False, "continue", ("completed", None)),  # read to its end, nothing undone
+])
+def test_a_mysql_write_that_fails_where_tables_cannot_roll_back_may_be_partly_applied(env, sql_file,
+                                                                                      non_transactional, on_error,
+                                                                                      expected):
+    e = env(dialect=Dialect.MYSQL, acts={WRITE: "fail boom"}, non_transactional=non_transactional)
+    done = outcome(e.run(sql_file(f"rows 1;\n{WRITE};\nrows 3;"), mode="statements", on_error=on_error))
+    at = (done.resume_at.line, done.resume_at.statement) if done.resume_at is not None else None
+    assert (done.outcome, at) == expected
+    assert done.warnings == ([PARTLY_APPLIED.format(2)] if non_transactional else [])
+    assert e.conn.runs.count(NON_TRANSACTIONAL) == 1
+
+
+def test_which_mysql_failures_ask_whether_tables_can_roll_back(env, sql_file):  # review M2: once, again after DDL
+    e = env(dialect=Dialect.MYSQL, acts={WRITE: "fail boom", "UPDATE t SET a = 1": "fail boom"})
+    text = f"{WRITE};\nfail x;\nUPDATE t SET a = 1;\nCREATE TABLE m (a int) ENGINE=MyISAM;\n{WRITE};\n"
+    done = outcome(e.run(sql_file(text), mode="statements", on_error="continue"))
+    assert (done.outcome, done.error_count) == ("completed", 4)
+    assert e.conn.runs.count(NON_TRANSACTIONAL) == 2  # the first failed write, and the first after the CREATE
+    other = env(dialect=Dialect.POSTGRES, acts={WRITE: "fail boom"})
+    other.run(sql_file(f"rows 1;\n{WRITE};"), mode="statements")
+    assert NON_TRANSACTIONAL not in other.conn.runs  # MySQL only; and all or nothing has its rollback's 1196 (R3)
+    whole = env(dialect=Dialect.MYSQL, acts={WRITE: "fail boom"}, non_transactional=True)
+    whole.run(sql_file(f"rows 1;\n{WRITE};"))
+    assert NON_TRANSACTIONAL not in whole.conn.runs
+    inside = env(dialect=Dialect.MYSQL, acts={WRITE: "fail boom"}, non_transactional=True)
+    done = outcome(inside.run(sql_file(f"START TRANSACTION;\n{WRITE};"), mode="statements"))
+    assert NON_TRANSACTIONAL not in inside.conn.runs  # inside the file's transaction, the ROLLBACK's 1196 tells (R3)
+    assert (done.outcome, done.resume_at.statement) == ("stopped", 1)
+
+
+def test_a_cancelled_mysql_write_where_tables_cannot_roll_back_has_no_resume_point(env, sql_file):  # review M2
+    e = env(dialect=Dialect.MYSQL, acts={WRITE: "block"}, non_transactional=True)
+    e.submit(sql_file(f"rows 1;\n{WRITE};\nrows 3;"), mode="statements")
+    assert e.conn.blocked.wait(5)
+    e.worker.cancel("r")
+    done = outcome(request_events(e.recorder, "r"))
+    assert (done.outcome, done.cancelled, done.resume_at, done.warnings) == (
+        "stopped", True, None, [PARTLY_APPLIED.format(2)])
+
+
+@pytest.mark.parametrize(("mode", "from_line", "expected", "sent"), [
+    ("statements", 3, ("completed", None), ["rows 3", "rows 4"]),  # statement 3 still starts at line 3
+    ("statements", 2, ("not_started", "file_changed"), []),
+    ("all_or_nothing", 2, ("not_started", "file_changed"), ["BEGIN IMMEDIATE"]),  # rolled back, nothing of the file
+])
+def test_a_run_again_from_a_line_is_refused_when_the_file_changed(env, sql_file, mode, from_line, expected, sent):
+    e = env()  # review M3: Run again from line N sends that line with the statement's number
+    events = e.run(sql_file("rows 1;\nrows 2;\nrows 3;\nrows 4;"), mode=mode, from_statement=3, from_line=from_line)
+    done = outcome(events)
+    assert (done.outcome, error(events).code if error(events) else None) == expected and e.conn.runs == sent
+    if expected[0] == "not_started":
+        assert error(events).message == "The file changed: statement 3 now starts at line 3"
+    short = env()
+    events = short.run(sql_file("rows 1;", name="short.sql"), mode="statements", from_statement=3, from_line=3)
+    assert (outcome(events).outcome, error(events).message) == (
+        "not_started", "The file changed: it has 1 statements now, fewer than 3")
+
+
+def test_from_line_is_a_line_number():
+    with pytest.raises(ValueError):
+        RunFileCommand(request_id="r", path="/x.sql", mode="statements", from_statement=2, from_line=0)

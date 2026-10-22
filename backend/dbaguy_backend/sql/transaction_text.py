@@ -41,6 +41,9 @@ _ENDS = {Dialect.POSTGRES: frozenset({"COMMIT", "END", "ROLLBACK", "ABORT"}),
 _TSQL_TRANSACTION = re.compile(r"\b(?:COMMIT|ROLLBACK)\b|\b(?:BEGIN|SAVE)\s+(?:TRAN|TRANSACTION|DISTRIBUTED)\b",
                                re.IGNORECASE)
 _TSQL_OPENS = {"BEGIN": frozenset({"TRAN", "TRANSACTION", "DISTRIBUTED"}), "SAVE": frozenset({"TRAN", "TRANSACTION"})}
+# MySQL: the statements that write rows one at a time (writes_rows), and the verbs a WITH clause can lead to
+_ROW_WRITES = frozenset({"INSERT", "REPLACE", "UPDATE", "DELETE"})
+_MAIN_VERBS = _ROW_WRITES | {"SELECT", "TABLE", "VALUES"}
 _MAY_COMMIT = re.compile(r"\b(?:COMMIT|CALL|EXEC|EXECUTE)\b", re.IGNORECASE)
 _TSQL_MAY_COMMIT = re.compile(r"\b(?:COMMIT|EXEC|EXECUTE)\b", re.IGNORECASE)  # data saying "call" is not lexed
 _VERSION = re.compile(r"/\*M?!\d*")  # the opening of a version comment (lexer.VERSION_COMMENT_STARTS) and its version
@@ -155,6 +158,30 @@ def may_commit(text: str, dialect: Dialect) -> bool:
     words = (token.upper for token in scan(text, dialect) if token.kind == TokenKind.WORD)
     tsql = dialect is Dialect.TSQL
     return any(word == "COMMIT" or (tsql and word in ("EXEC", "EXECUTE")) for word in words)
+
+
+def writes_rows(text: str, dialect: Dialect) -> bool:
+    """MySQL: whether the statement writes rows one at a time (INSERT, REPLACE, UPDATE, DELETE, LOAD DATA or XML, and
+    WITH … UPDATE / DELETE), so that a table that cannot roll back (MyISAM) keeps the rows it wrote before it failed
+    (06b review M2). Every other dialect: False."""
+    if dialect is not Dialect.MYSQL:
+        return False
+    words = first_words(text, dialect)
+    if not words:
+        return False
+    if words[0] in _ROW_WRITES or words[:2] in (["LOAD", "DATA"], ["LOAD", "XML"]):
+        return True
+    if words[0] != "WITH":
+        return False
+    depth = 0  # the verb after the WITH clause: the first of them outside its parentheses
+    for token in scan(statement_head(text, dialect), dialect):
+        if token.kind == TokenKind.LPAREN:
+            depth += 1
+        elif token.kind == TokenKind.RPAREN:
+            depth -= 1
+        elif depth == 0 and token.kind == TokenKind.WORD and token.upper in _MAIN_VERBS:
+            return token.upper in _ROW_WRITES
+    return False
 
 
 def runs_several(text: str, dialect: Dialect) -> bool:

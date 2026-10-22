@@ -105,9 +105,12 @@ class JobOutcomeEvent(BaseModel):
     stopped_at: StoppedAt | None = None
     # Run SQL file, statement by statement: where a run again starts so that nothing is skipped or run twice — every
     # statement before it took effect (or failed and was skipped, in `errors`) and none from it on did. The earliest
-    # statement of a file transaction that was rolled back, else where the run stopped (06b B1). None: all or nothing,
-    # read to the end with nothing undone, or what the earlier statements did is not known (the warnings say which; a
-    # statement applied after a file transaction the run rolled back, a `GO n` that stopped after some of its runs)
+    # statement of a file transaction that was rolled back, else where the run stopped (06b B1). One exception: an
+    # `unknown` outcome with a `resume_at` lost the connection while a statement ran, and that statement may have taken
+    # effect — check the target first (06b L13, review L5). None: all or nothing, read to the end with nothing
+    # undone, or what the earlier statements did is not known (the warnings say which; a statement applied after a
+    # file transaction the run rolled back, a `GO n` that stopped after some of its runs, a write that failed where
+    # tables cannot roll back)
     resume_at: StoppedAt | None = None
     # Why it stopped or failed: the `error` event sent right before it, with where the run stopped when it did, so a
     # window that attaches later or lists the jobs (GET /data/jobs) knows it too (06a fix wave F3). None: no error

@@ -2807,7 +2807,8 @@ export interface components {
          * RunFileCommand
          * @description Run a SQL file on this session, a statement at a time (spec ⑥ §3.4): all of it in one transaction, or each
          *     statement on its own (stopping at an error, or skipping it). Statements before `from_statement` are read, never
-         *     sent.
+         *     sent. `from_line`: the line that statement started at when a run before gave the place (`resume_at`): a file whose
+         *     statement starts elsewhere now changed, and the run is refused before any of it is sent (06b review M3).
          */
         RunFileCommand: {
             /** Request Id */
@@ -2835,6 +2836,8 @@ export interface components {
              * @default 1
              */
             from_statement: number;
+            /** From Line */
+            from_line?: number | null;
             /** Search Path */
             search_path?: string | null;
             query_context?: components["schemas"]["QueryContext"] | null;

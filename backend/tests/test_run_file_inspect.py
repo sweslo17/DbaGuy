@@ -216,3 +216,38 @@ def test_the_excerpt_route(container, tmp_path):  # 06b B2
         assert zero.status_code == 422
         huge = client.post("/data/run-file/excerpt", json={"path": str(path), "line": 2**31}, headers=auth)
         assert huge.status_code == 422  # pre-flight L2: bounded
+
+
+def test_an_excerpt_shows_crlf_lines_without_their_cr_and_a_lone_cr_in_its_line(container, tmp_path):  # review L1
+    path = tmp_path / "crlf.sql"
+    path.write_bytes(b"SELECT 1;\r\nSELECT 2;\r\n")
+    assert container.data.excerpt(str(path), 2).text == "SELECT 1;\nSELECT 2;"
+    old_mac = tmp_path / "cr.sql"  # only CR: one line, as a run counts it
+    old_mac.write_bytes(b"SELECT 1;\rSELECT 2;\r")
+    got = container.data.excerpt(str(old_mac), 1)
+    assert (got.text, got.found) == ("SELECT 1;\rSELECT 2;\r", True)
+    assert container.data.excerpt(str(old_mac), 2).found is False
+
+
+def test_an_excerpt_starts_at_the_line_when_the_lines_before_fill_half_the_window(container, tmp_path):  # review L2
+    path = tmp_path / "half.sql"
+    path.write_bytes(b"".join(b"-- " + b"x" * 2_000 + b"\n" for _ in range(20)) + b"SELECT 21;\n" * 5_000)
+    got = container.data.excerpt(str(path), 21)  # 20 lines of 2 KB: the line starts 40 KB into the window
+    assert (got.first_line, got.found, got.text.splitlines()[0]) == (21, True, "SELECT 21;")
+    near = container.data.excerpt(str(path), 25)  # starts within the first half: 20 lines before it
+    assert (near.first_line, near.text.splitlines()[20]) == (5, "SELECT 21;")
+
+
+def test_an_excerpt_cut_at_its_size_ends_on_a_whole_character(container, tmp_path):  # review L3
+    path = tmp_path / "cut.sql"
+    path.write_bytes(b"SELECT '" + "中".encode() * 30_000 + b"';\n")
+    got = container.data.excerpt(str(path), 1)
+    assert got.truncated and got.text.endswith("中") and "�" not in got.text
+    assert len(got.text.encode()) <= 64 * 1024
+
+
+def test_an_excerpt_of_a_utf16_file_reads_it_as_inspect_does(container, tmp_path):  # review L3
+    path = tmp_path / "u16.sql"
+    path.write_bytes("SELECT 1;\r\nSELECT 'é';\r\n".encode("utf-16"))
+    got = container.data.excerpt(str(path), 1)
+    assert (got.first_line, got.text, got.found, got.truncated) == (1, "SELECT 1;\nSELECT 'é';", True, False)

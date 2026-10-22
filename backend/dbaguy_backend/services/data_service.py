@@ -67,6 +67,16 @@ def _open_in_finder(path: Path) -> None:
     subprocess.run(["/usr/bin/open", "-R", str(path)], check=False, timeout=10)
 
 
+def _whole_characters(data: bytes) -> bytes:
+    """`data` without a UTF-8 character that its end cuts in two (bytes that are not UTF-8 are left as they are)."""
+    for back in range(1, min(4, len(data)) + 1):
+        byte = data[-back]
+        if byte & 0xC0 != 0x80:  # the last byte that is not a continuation: ASCII, or a character's first byte
+            need = 2 if 0xC2 <= byte <= 0xDF else 3 if 0xE0 <= byte <= 0xEF else 4 if 0xF0 <= byte <= 0xF4 else 1
+            return data[:-back] if need > back else data
+    return data
+
+
 def _decoded(head: bytes) -> tuple[str, int | None]:
     """The head as text, and the 1-based line of its first byte that is not UTF-8 (None: it all is). A character cut
     at the end of the head is not an error."""
@@ -170,38 +180,67 @@ class DataService:
 
     def excerpt(self, path: str, line: int) -> FileExcerpt:
         """The lines of the file at `path` around `line` (06b B2): from EXCERPT_BEFORE lines before it, or from the
-        line itself when those lines fill EXCERPT_BYTES (long INSERT lines: the line asked for is always shown,
-        pre-flight M1), at most EXCERPT_LINES lines and EXCERPT_BYTES. No connection: what Run SQL file's dialog shows
-        of an error's place."""
+        line itself when those lines fill more than half of EXCERPT_BYTES (long INSERT lines: the line asked for is
+        always shown, with room, pre-flight M1 and review L2), at most EXCERPT_LINES lines and EXCERPT_BYTES. Lines end
+        at LF as a run counts them; a CR before it is not shown (review L1). A UTF-16 file is read as inspect reads it.
+        No connection: what Run SQL file's dialog shows of an error's place."""
         target = Path(path).expanduser()
         if not target.is_absolute() or not target.is_file():
             raise FileNotFound(path)
         first = max(1, line - EXCERPT_BEFORE)
         try:
             with target.open("rb") as file:
+                if starts_with_utf16_bom(file.read(2)):
+                    file.seek(0)
+                    head = file.read(EXCERPT_BYTES + 1)
+                    lines = head[:EXCERPT_BYTES].decode("utf-16", "replace").split("\n")[first - 1:]
+                    found = self._window(target, lines, first, line, more=len(head) > EXCERPT_BYTES)
+                    logger.info("Excerpt of {} (UTF-16) at line {:,}", target, line)
+                    return found
+                file.seek(0)
                 body = self._from_line(file, first)
-                # the window is full and the line asked for does not start inside it (a file that ends inside it has
-                # fewer lines: its tail is shown)
-                if body is not None and len(body) > EXCERPT_BYTES \
-                        and body.count(b"\n", 0, EXCERPT_BYTES - 1) < line - first:
-                    first = line  # the lines before it fill EXCERPT_BYTES (long INSERT lines): start at the line itself
+                # the window is full and the line asked for starts late in it (a file that ends inside it has fewer
+                # lines: its tail is shown)
+                if body is not None and len(body) > EXCERPT_BYTES and self._starts_late(body, line - first):
+                    first = line  # the lines before it are long (INSERT lines): start at the line itself
                     file.seek(0)
                     body = self._from_line(file, first)
         except OSError as exc:
             raise StorageError(cannot_read(path, exc)) from None
+        logger.info("Excerpt of {} at line {:,}", target, line)
         if body is None:  # the file has fewer lines
             return FileExcerpt(path=str(target), first_line=first, text="", found=False, truncated=False)
         more = len(body) > EXCERPT_BYTES
         body = body[:EXCERPT_BYTES]
         if first == 1 and body.startswith(_UTF8_BOM):
             body = body[len(_UTF8_BOM):]
-        lines = body.split(b"\n")
-        if not more and lines[-1] == b"":
+        if more:
+            body = _whole_characters(body)  # review L3: not a character cut in two at the window's end
+        return self._window(target, body.decode("utf-8", "replace").split("\n"), first, line, more=more)
+
+    @staticmethod
+    def _window(target: Path, lines: list[str], first: int, line: int, *, more: bool) -> FileExcerpt:
+        """The excerpt of `lines` (the file's text from line `first` on, split at LF; `more`: the file goes on after
+        them). A CR right before an LF is not shown (CRLF); any other CR stays in its line, as the run reads it."""
+        ended = len(lines) - 1  # the lines an LF ended
+        if not more and lines and lines[-1] == "":
             lines.pop()  # after the file's last line end: no line
+            ended = len(lines)
         shown, truncated = (lines[:EXCERPT_LINES], True) if len(lines) > EXCERPT_LINES else (lines, more)
-        logger.info("Excerpt of {} at line {:,}", target, line)
-        return FileExcerpt(path=str(target), first_line=first, text=b"\n".join(shown).decode("utf-8", "replace"),
-                           found=line - first < len(lines), truncated=truncated)
+        text = "\n".join(piece[:-1] if index < ended and piece.endswith("\r") else piece
+                         for index, piece in enumerate(shown))
+        return FileExcerpt(path=str(target), first_line=first, text=text, found=line - first < len(lines),
+                           truncated=truncated)
+
+    @staticmethod
+    def _starts_late(body: bytes, ends: int) -> bool:
+        """Whether the line after the first `ends` LFs of `body` starts past half of EXCERPT_BYTES, or not in it."""
+        at = -1
+        for _ in range(ends):
+            at = body.find(b"\n", at + 1, EXCERPT_BYTES)
+            if at < 0:
+                return True
+        return at + 1 > EXCERPT_BYTES // 2
 
     def _from_line(self, file: BinaryIO, line: int) -> bytes | None:
         """EXCERPT_BYTES + 1 bytes from the start of `line` on; None when the file has fewer lines before it."""

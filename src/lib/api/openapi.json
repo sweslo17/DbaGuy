@@ -8053,6 +8053,18 @@
             "title": "From Statement",
             "default": 1
           },
+          "from_line": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From Line"
+          },
           "search_path": {
             "anyOf": [
               {
@@ -8084,7 +8096,7 @@
           "mode"
         ],
         "title": "RunFileCommand",
-        "description": "Run a SQL file on this session, a statement at a time (spec \u2465 \u00a73.4): all of it in one transaction, or each\nstatement on its own (stopping at an error, or skipping it). Statements before `from_statement` are read, never\nsent."
+        "description": "Run a SQL file on this session, a statement at a time (spec \u2465 \u00a73.4): all of it in one transaction, or each\nstatement on its own (stopping at an error, or skipping it). Statements before `from_statement` are read, never\nsent. `from_line`: the line that statement started at when a run before gave the place (`resume_at`): a file whose\nstatement starts elsewhere now changed, and the run is refused before any of it is sent (06b review M3)."
       },
       "RunFileExcerptRequest": {
         "properties": {

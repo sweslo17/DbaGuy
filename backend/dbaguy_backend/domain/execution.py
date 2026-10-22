@@ -217,7 +217,8 @@ class ApplyEditsCommand(BaseModel):
 class RunFileCommand(JobCommand):
     """Run a SQL file on this session, a statement at a time (spec ⑥ §3.4): all of it in one transaction, or each
     statement on its own (stopping at an error, or skipping it). Statements before `from_statement` are read, never
-    sent."""
+    sent. `from_line`: the line that statement started at when a run before gave the place (`resume_at`): a file whose
+    statement starts elsewhere now changed, and the run is refused before any of it is sent (06b review M3)."""
 
     job_kind = "run_file"
     type: Literal["run_file"] = "run_file"
@@ -225,6 +226,7 @@ class RunFileCommand(JobCommand):
     mode: Literal["all_or_nothing", "statements"]
     on_error: Literal["stop", "continue"] = "stop"  # continue: statement by statement only (R-06-7)
     from_statement: int = Field(default=1, ge=1)
+    from_line: int | None = Field(default=None, ge=1)
     search_path: str | None = Field(default=None, min_length=1, max_length=1024)  # PostgreSQL: one schema
     query_context: QueryContext | None = None  # Couchbase
 

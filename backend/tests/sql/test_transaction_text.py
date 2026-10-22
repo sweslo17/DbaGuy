@@ -6,7 +6,7 @@ import pytest
 from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.transaction_text import (
     calls_a_procedure, ends_the_transaction, first_words, implicit_commit_word, may_commit, runs_several,
-    sets_autocommit, statement_head, transaction_word,
+    sets_autocommit, statement_head, transaction_word, writes_rows,
 )
 
 PG, MYSQL, TSQL, SQLITE, SQLPP = Dialect.POSTGRES, Dialect.MYSQL, Dialect.TSQL, Dialect.SQLITE, Dialect.SQLPP
@@ -92,3 +92,17 @@ def test_what_sets_autocommit(text, sets):  # MySQL: its own refusal all or noth
 ])
 def test_what_ends_the_transaction_before_it_even_when_one_is_open_after_it(text, dialect, ends):  # R5
     assert ends_the_transaction(text, dialect) is ends
+
+
+@pytest.mark.parametrize(("text", "dialect", "writes"), [
+    ("INSERT INTO t VALUES (1), (2)", MYSQL, True), ("/*!40000 INSERT INTO t VALUES (1) */", MYSQL, True),
+    ("REPLACE INTO t VALUES (1)", MYSQL, True), ("update t set a = 1", MYSQL, True), ("DELETE FROM t", MYSQL, True),
+    ("LOAD DATA INFILE 'x' INTO TABLE t", MYSQL, True), ("LOAD XML INFILE 'x' INTO TABLE t", MYSQL, True),
+    ("WITH a AS (SELECT 1) UPDATE t JOIN a SET t.x = 1", MYSQL, True),
+    ("WITH a AS (SELECT id FROM t FOR UPDATE) SELECT * FROM a", MYSQL, False),  # the UPDATE is inside the clause
+    ("LOAD INDEX INTO CACHE t", MYSQL, False), ("SELECT 1", MYSQL, False), ("CALL p()", MYSQL, False),
+    ("CREATE TABLE t (a int)", MYSQL, False), ("", MYSQL, False),
+    ("INSERT INTO t VALUES (1)", PG, False),  # MySQL only: elsewhere every table rolls back
+])
+def test_what_writes_rows_one_at_a_time(text, dialect, writes):  # 06b review M2: what MyISAM may keep part of
+    assert writes_rows(text, dialect) is writes

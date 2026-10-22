@@ -12,6 +12,7 @@ import pytest
 
 from dbaguy_backend.domain.errors import ReadOnlyProfile
 from dbaguy_backend.domain.execution import QueryContext, RunFileCommand
+from dbaguy_backend.sessions.jobs.run_file import PARTLY_APPLIED
 from dbaguy_backend.sql.dialects import Dialect, script_text
 from tests.data_support import DataApp, dropping, scratch_name
 from tests.edit_support import ENGINES, ScratchDb, scratch_db
@@ -623,9 +624,30 @@ def test_a_commit_that_chains_restarts_the_files_transaction_there(tool_env, tmp
         ran = app.job_session(profile).run(command(path, "statements"))
         commit_at = len(begin) + 2
         assert (ran.outcome.outcome, ran.outcome.statements) == ("stopped", commit_at)
-        assert ran.outcome.warnings[0].startswith(f"The file's transaction from line {commit_at} (statement "
-                                                  f"{commit_at}) was still open")
+        # the chained transaction is tracked from its first statement, after the COMMIT (06b review M1)
+        assert ran.outcome.warnings[0].startswith(f"The file's transaction from line {commit_at + 1} (statement "
+                                                  f"{commit_at + 1}) was still open")
+        assert ran.outcome.resume_at.statement == commit_at + 1
         assert ids(db, table) == [1]
+
+
+@pytest.mark.parametrize("engine", [pytest.param("postgres", marks=requires_pg),
+                                    pytest.param("mysql", marks=requires_mysql)])
+def test_a_run_again_after_commit_and_chain_starts_after_it_and_lands_once(tool_env, tmp_path, engine):  # review M1
+    db, app, profile = tool_env(engine)
+    with dropping(db, app.close_sessions) as made:
+        table, gate = make_table(db, made), make_table(db, made)
+        db.execute(*inserts(db, gate, 1))
+        begin = "START TRANSACTION" if engine == "mysql" else "BEGIN"
+        path = write(tmp_path, db, [begin, *inserts(db, table, 1), "COMMIT AND CHAIN", *inserts(db, table, 2),
+                                    *inserts(db, gate, 1), *inserts(db, table, 3), "COMMIT"])
+        first = app.job_session(profile).run(command(path, "statements")).outcome
+        assert (first.outcome, first.resume_at.line, first.resume_at.statement, ids(db, table)) == (
+            "stopped", 4, 4, [1])
+        db.execute(f"DELETE FROM {db.table(gate)}")
+        again = app.job_session(profile).run(command(path, "statements", from_statement=first.resume_at.statement,
+                                                     from_line=first.resume_at.line)).outcome
+        assert (again.outcome, ids(db, table)) == ("completed", [1, 2, 3])  # PostgreSQL refused a COMMIT AND CHAIN
 
 
 @requires_pg
@@ -858,3 +880,76 @@ def test_a_rollback_and_begin_inside_the_file_says_ended_not_committed(tool_env,
         ran = app.job_session(profile).run(command(path, "statements"))
         assert (ran.outcome.outcome, ran.outcome.warnings[-1]) == ("unknown", RESTARTED)
         assert ids(db, table) == []
+
+
+# ---- 06b Task 2, fix round 1: where a run again starts, on the servers that decide it -------------------------------
+
+
+@requires_mssql
+def test_a_batch_skipped_after_xact_abort_rolled_the_files_transaction_back_has_no_resume_point(tool_env,
+                                                                                               tmp_path):  # review H1
+    db, app, profile = tool_env("mssql")
+    with dropping(db, app.close_sessions) as made:
+        table, gate, gate2 = make_table(db, made), make_table(db, made), make_table(db, made)
+        db.execute(*inserts(db, gate, 1), *inserts(db, gate2, 1))
+        batch = "\n".join([*inserts(db, table, 2, 3), *inserts(db, gate2, 1)])  # two INSERTs stand, the third fails
+        path = write(tmp_path, db, ["SET XACT_ABORT ON", "BEGIN TRANSACTION", *inserts(db, table, 1),
+                                    *inserts(db, gate, 1), "COMMIT TRANSACTION", batch])
+        ran = app.job_session(profile).run(command(path, "statements", on_error="continue")).outcome
+        # a run again from the BEGIN would add 2 and 3 twice
+        assert (ran.outcome, ran.error_count, ran.resume_at, ids(db, table)) == ("completed", 3, None, [2, 3])
+
+
+@requires_mysql
+def test_a_mysql_call_that_commits_begins_again_and_fails_is_unknown(tool_env, tmp_path):  # review H2, N1
+    db, app, profile = tool_env("mysql")
+    with dropping(db, app.close_sessions) as made:
+        table, gate = make_table(db, made), make_table(db, made)
+        db.execute(*inserts(db, gate, 1))
+        proc = scratch_name("again")
+        made.append(("PROCEDURE", proc))
+        db.execute(f"CREATE PROCEDURE {db.table(proc)}() BEGIN {inserts(db, table, 100)[0]}; COMMIT; "
+                   f"START TRANSACTION; {inserts(db, table, 101)[0]}; {inserts(db, gate, 1)[0]}; END")
+        path = write(tmp_path, db, [*inserts(db, table, 1), "START TRANSACTION", *inserts(db, table, 2),
+                                    f"CALL {db.table(proc)}()", *inserts(db, table, 3), "COMMIT"])
+        ran = app.job_session(profile).run(command(path, "statements")).outcome
+        assert (ran.outcome, ran.stopped_at.statement, ran.resume_at) == ("unknown", 4, None)
+        assert ran.warnings == ["Line 4 may have committed or rolled back the file's transaction from line 2 "
+                                "(statement 2): the statements from there on may or may not be applied"]
+        assert ids(db, table) == [1, 2, 100]  # the CALL's COMMIT kept line 3's row: a run again from 2 would repeat it
+
+
+@requires_mysql
+def test_a_mysql_write_that_fails_midway_on_myisam_has_no_resume_point(tool_env, tmp_path):  # review M2
+    db, app, profile = tool_env("mysql")
+    with dropping(db, app.close_sessions) as made:
+        myisam = scratch_name("myisam")
+        made.append(("TABLE", myisam))
+        db.execute(f"CREATE TABLE {db.table(myisam)} (id INT, k INT UNIQUE) ENGINE=MyISAM",
+                   f"INSERT INTO {db.table(myisam)} VALUES (0, 99)")
+        path = write(tmp_path, db, [f"INSERT INTO {db.table(myisam)} VALUES (1, NULL), (2, 99), (3, NULL)"])
+        ran = app.job_session(profile).run(command(path, "statements")).outcome
+        assert (ran.outcome, ran.resume_at, ran.warnings) == ("stopped", None, [PARTLY_APPLIED.format(1)])
+        assert ids(db, myisam) == [0, 1]  # the row before the error stayed: a run again would write it twice
+        innodb = make_table(db, made)  # the database still has the MyISAM table: any failed write there says so
+        db.execute(*inserts(db, innodb, 1))
+        path = write(tmp_path, db, inserts(db, innodb, 2, 1), name="innodb.sql")
+        ran = app.job_session(profile).run(command(path, "statements")).outcome
+        assert (ran.outcome, ran.resume_at) == ("stopped", None)
+    with dropping(db, app.close_sessions) as made:  # without it: the place to run again from
+        innodb = make_table(db, made)
+        db.execute(*inserts(db, innodb, 1))
+        path = write(tmp_path, db, inserts(db, innodb, 2, 1), name="clean.sql")
+        ran = app.job_session(profile).run(command(path, "statements")).outcome
+        assert (ran.outcome, ran.resume_at.statement, ran.warnings) == ("stopped", 2, [])
+
+
+@requires_pg
+def test_a_run_again_from_a_line_that_moved_is_refused(tool_env, tmp_path):  # review M3
+    db, app, profile = tool_env("postgres")
+    with dropping(db, app.close_sessions) as made:
+        table = make_table(db, made)
+        path = write(tmp_path, db, inserts(db, table, 1, 2, 3))
+        ran = app.job_session(profile).run(command(path, "statements", from_statement=2, from_line=1))
+        assert (ran.outcome.outcome, ran.error.code, ids(db, table)) == ("not_started", "file_changed", [])
+        assert ran.error.message == "The file changed: statement 2 now starts at line 2"
