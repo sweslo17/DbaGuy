@@ -31,7 +31,7 @@ from dbaguy_backend.sql.dialects import Dialect, qualified, quote_ident
 from dbaguy_backend.sql.dump_script import RESTORE_SQL_MODE, RESTORE_TIME_ZONE, DumpScript, insert_text, table_sql
 from dbaguy_backend.sql.select_builder import build_copy_select
 from tests import mysql_inventory, sqlite_inventory
-from tests.data_support import DataApp, scratch_database
+from tests.data_support import SCRATCH_06B, DataApp, scratch_database
 from tests.edit_support import ScratchDb, scratch_db
 from tests.support import requires_mysql
 
@@ -473,7 +473,42 @@ def test_a_mysql_catalog_reads_every_tables_columns_in_one_query(tmp_path):
                     conn.close()
                 assert len(found.tables) == 40 and all(table.columns for table in found.tables)
             objects = 40 + 4 + 4 + 1
-            assert sent[False] <= 12 and sent[True] <= sent[False] + objects, sent
+            # a plan's TABLES read sets the statistics cache off and back (06b F-e): two more, whatever the objects
+            assert sent[False] <= 12 + 2 and sent[True] <= sent[False] + objects, sent
+    finally:
+        db.close()
+
+
+@requires_mysql
+def test_a_mysql_plan_and_dump_read_the_tables_statistics_as_they_are_now(tmp_path):
+    """06b F-e: 8.x caches TABLES' TABLE_ROWS and DATA_LENGTH for information_schema_stats_expiry (a day): a table
+    read at 3 rows said "≈ 3" with 2,000 in it. The plan reads them fresh and leaves the metadata connection's cache
+    setting as it was; the dump's session reads them fresh too."""
+    db = scratch_db("mysql", tmp_path)
+    try:
+        with scratch_database("mysql", "stats", prefix=SCRATCH_06B) as (name, admin):
+            admin.run_in(name, "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v VARCHAR(10))",
+                         "INSERT INTO t (v) VALUES ('a'), ('b'), ('c')")
+            assert admin.rows(name, f"SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{name}' "
+                                    "AND TABLE_NAME = 't'") == [(3,)]  # cached now
+            admin.run_in(name, "SET SESSION cte_max_recursion_depth = 5000",
+                         "INSERT INTO t (v) WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n "
+                         "WHERE i < 1997) SELECT 'x' FROM n")
+            scope = DumpScope(kind="schema", schema_name=name)
+            for ddl in (False, True):
+                conn = db.open(database=name)
+                try:
+                    for statement in conn.dump_session(scope).setup if ddl else ():
+                        conn.run(statement).close()
+                    [table] = conn.dump_catalog(scope, DumpObjectKinds(), ddl=ddl).tables
+                    assert 1500 <= (table.rows_estimate or 0) <= 2500, (ddl, table.rows_estimate)
+                    if not ddl:
+                        result = conn.run("SELECT @@session.information_schema_stats_expiry = "
+                                          "@@global.information_schema_stats_expiry")
+                        assert result.fetch(1) == [[1]]  # back to DEFAULT on the shared connection
+                        result.close()
+                finally:
+                    conn.close()
     finally:
         db.close()
 

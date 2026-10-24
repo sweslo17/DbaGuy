@@ -299,3 +299,45 @@ SELECT (SELECT count(*) FROM pg_event_trigger o WHERE {not_extension("pg_event_t
           AND NOT EXISTS (SELECT 1 FROM pg_depend i WHERE i.classid = 'pg_cast'::regclass AND i.objid = o.oid
                           AND i.deptype = 'i'))  -- not a range's own cast to its multirange
 """
+# What would stop a `drop_first` file's DROP … IF EXISTS of a relation, routine, type or collation the dump writes
+# (06b I2: no dump writes CASCADE, 2BP01): every object that depends on it (deptype n), wherever it is, with what its
+# own DROP goes with — the relation it is part of (a column, an index, a view's or another rule, a default, a
+# constraint, a trigger, a policy, statistics), a composite's or a domain constraint's type, or itself (a type, a
+# routine) — so that the dump tells apart those it drops itself. Named as pg_identify_object names it (a view's
+# _RETURN rule and columns as the view); a foreign key and a column default in words of their own. A partition's copy of a foreign
+# key or a trigger goes with its parent's.
+DROP_BLOCKERS = """
+SELECT DISTINCT
+       CASE WHEN d.refclassid = 'pg_class'::regclass THEN 'r' WHEN d.refclassid = 'pg_proc'::regclass THEN 'f'
+            WHEN d.refclassid = 'pg_type'::regclass THEN 't' ELSE 'k' END,
+       d.refobjid,
+       CASE WHEN c.relkind = 'c' THEN NULL WHEN c.relkind IN ('i', 'I') THEN i.indrelid WHEN c.oid IS NOT NULL THEN c.oid
+            WHEN w.oid IS NOT NULL THEN w.ev_class WHEN a.oid IS NOT NULL THEN a.adrelid
+            WHEN k.oid IS NOT NULL THEN NULLIF(k.conrelid, 0) WHEN g.oid IS NOT NULL THEN g.tgrelid
+            WHEN p.oid IS NOT NULL THEN p.polrelid WHEN s.oid IS NOT NULL THEN s.stxrelid END,
+       CASE WHEN c.relkind = 'c' THEN c.reltype WHEN k.contypid <> 0 THEN k.contypid
+            WHEN d.classid = 'pg_type'::regclass THEN d.objid END,
+       CASE WHEN d.classid = 'pg_proc'::regclass THEN d.objid END,
+       CASE WHEN k.contype = 'f' THEN 'foreign key' WHEN a.oid IS NOT NULL THEN 'column default' ELSE o.type END,
+       CASE WHEN a.oid IS NOT NULL THEN regexp_replace(o.identity, '^for ', '') ELSE o.identity END
+FROM pg_depend d
+LEFT JOIN pg_class c ON d.classid = 'pg_class'::regclass AND c.oid = d.objid
+LEFT JOIN pg_index i ON c.relkind IN ('i', 'I') AND i.indexrelid = c.oid
+LEFT JOIN pg_rewrite w ON d.classid = 'pg_rewrite'::regclass AND w.oid = d.objid
+LEFT JOIN pg_attrdef a ON d.classid = 'pg_attrdef'::regclass AND a.oid = d.objid
+LEFT JOIN pg_constraint k ON d.classid = 'pg_constraint'::regclass AND k.oid = d.objid
+LEFT JOIN pg_trigger g ON d.classid = 'pg_trigger'::regclass AND g.oid = d.objid
+LEFT JOIN pg_policy p ON d.classid = 'pg_policy'::regclass AND p.oid = d.objid
+LEFT JOIN pg_statistic_ext s ON d.classid = 'pg_statistic_ext'::regclass AND s.oid = d.objid
+CROSS JOIN LATERAL pg_identify_object(CASE WHEN w.rulename = '_RETURN' THEN 'pg_class'::regclass ELSE d.classid END,
+                                      CASE WHEN w.rulename = '_RETURN' THEN w.ev_class ELSE d.objid END,
+                                      CASE WHEN w.rulename = '_RETURN' OR c.relkind IN ('v', 'm') THEN 0
+                                           ELSE d.objsubid END) o
+WHERE d.deptype = 'n'
+  AND ((d.refclassid = 'pg_class'::regclass AND d.refobjid = ANY(%(relations)s))
+    OR (d.refclassid = 'pg_proc'::regclass AND d.refobjid = ANY(%(routines)s))
+    OR (d.refclassid = 'pg_type'::regclass AND d.refobjid = ANY(%(types)s))
+    OR (d.refclassid = 'pg_collation'::regclass AND d.refobjid = ANY(%(collations)s)))
+  AND (k.oid IS NULL OR k.conparentid = 0){triggers}
+"""
+TRIGGER_NOT_CLONED = " AND (g.oid IS NULL OR g.tgparentid = 0)"  # 13+: a partition's copy of its parent's trigger

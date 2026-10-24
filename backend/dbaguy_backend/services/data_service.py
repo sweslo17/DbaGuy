@@ -30,7 +30,7 @@ from ..domain.profiles import AnyProfile, Engine, SqliteProfile
 from ..sessions.jobs.dump import data_order, target_problem
 from ..sessions.jobs.registry import JobRegistry
 from ..sql.dump_header import CUT_SHORT, END_BYTES, cut_short, filtered_rows, parse_header
-from ..sql.dump_script import filter_warnings, not_included
+from ..sql.dump_script import not_included, restore_warnings
 from ..sql.statement_stream import UTF16_MESSAGE, starts_with_utf16_bom
 from .metadata_service import MetadataService
 from .profile_service import ProfileService
@@ -105,9 +105,10 @@ class DataService:
     ) -> DumpPlan:
         """What a dump of `scope` would write (the objects under their own names, DumpPlan), what its header says is
         left out, its consistency and its warnings: a filtered file that drops and recreates its table (fix wave F2),
-        the catalog's, a data-only dump's foreign-key cycle, and for `path` a file the dump would refuse (M13) or
-        little free disk where it goes (CR-4: never a refusal). The filter is only looked at for that warning: the
-        dump checks it before anything is sent."""
+        a `drop_first` file whose DROPs objects outside it block (06b I2), the catalog's, a data-only dump's
+        foreign-key cycle, and for `path` a file the dump would refuse (M13) or little free disk where it goes (CR-4:
+        never a refusal). The filter and `drop_first` are only looked at for those warnings: the dump checks the
+        filter before anything is sent."""
         profile, _ = self._admit(profile_id, BE_DUMPED, "dump")
 
         def read(connection: DatabaseConnection) -> DumpCatalog:
@@ -124,7 +125,7 @@ class DataService:
 
         catalog = self._metadata.with_connection(profile_id, database, read)
         estimates = {table.name: table.rows_estimate for table in catalog.tables}
-        warnings = [*filter_warnings(catalog, content, drop_first, filter), *catalog.warnings]
+        warnings = [*restore_warnings(catalog, content, drop_first, filter), *catalog.warnings]
         if content == "data":
             tables, said = data_order(self._registry.get(profile.engine).dialect, catalog.tables)
             objects = [DumpPlanObject(kind="table", name=table.name, rows_estimate=table.rows_estimate)

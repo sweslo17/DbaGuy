@@ -53,7 +53,9 @@ class DumpObject:
     for it, and which part of the dump it belongs to — `schema` objects need the structure, `data` ones (PostgreSQL's
     setval) the rows."""
 
-    kind: str  # schema, extension, type, sequence, function, procedure, table, view, materialized_view, index, …
+    # schema, extension, type, sequence, function, procedure, table, partition (PostgreSQL: one whose rows are read
+    # through its dumped parent, which its DROP goes with), view, materialized view, index, …
+    kind: str
     name: str  # as the file names it: schema.name (MySQL, SQLite: name)
     statements: tuple[str, ...]
     drop: str | None = None
@@ -79,6 +81,19 @@ class DumpTable:
 
 
 @dataclass(frozen=True)
+class DumpDependent:
+    """An object the dump does not write that depends on one it does, so that the DROP … IF EXISTS a `drop_first`
+    file writes for that one fails where this one exists (a dump never writes CASCADE): PostgreSQL's views,
+    materialized views, rules and foreign keys (2BP01), SQL Server's foreign keys (3726) and what is schema-bound to
+    it (3729). Out of the scope, or of a kind the dump leaves out (views not chosen). `sql/dump_script.drop_warnings`
+    says it."""
+
+    target: str  # the DumpObject.name of what it depends on: the object whose DROP it blocks
+    kind: str  # view, materialized view, rule, foreign key, function, table, …
+    name: str  # as a dump would name it: schema.name (a rule or a foreign key: schema.table.name)
+
+
+@dataclass(frozen=True)
 class DumpCatalog:
     server: str  # `PostgreSQL 17.11`, as ServerInfo writes it
     scope: str  # `database dbaguy · schema public`: the header's text
@@ -92,6 +107,8 @@ class DumpCatalog:
     # The longest statement the server dumped takes (MySQL's max_allowed_packet): a restore on such a server refuses
     # a longer INSERT, so the dump warns of it (R-06-11, pre-flight M11); None: the dialect's default limit
     max_statement_bytes: int | None = None
+    # What depends on the objects the dump writes and is not in it (06b I2): a `drop_first` file's DROP fails there
+    dependents: tuple[DumpDependent, ...] = ()
 
 
 @dataclass(frozen=True)

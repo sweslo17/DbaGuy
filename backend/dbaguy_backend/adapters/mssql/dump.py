@@ -17,6 +17,11 @@ with the rows in: review S1), security policies, and triggers on tables and view
 first / last order set again: H6). Each module is its own batch, under the QUOTED_IDENTIFIER and ANSI_NULLS it was
 created with, and under the name it has now (sp_rename leaves the old one in its text: L13).
 
+A foreign key of a table the dump does not write that references one it does, and what it does not write that is
+schema-bound to an object it writes (a view, a function, a table's computed column, check or default), are read in
+the catalog's first batch (06b I2): a `drop_first` file's DROP stops there (3726, 3729), which the plan and the outcome
+say (`sql/dump_script.drop_warnings`).
+
 Left out, counted and named (H6, S9, review S1, S2): system-versioned, graph and ledger tables and tables with a
 period (a plain copy would not be one), modules whose definition is hidden (encrypted, or no VIEW DEFINITION), modules
 that run as a database user the file does not create (EXECUTE AS 'user'), tables whose definition cannot be read, and
@@ -35,7 +40,7 @@ from ...sql.dialects import Dialect
 from ...sql.lexer import INSIGNIFICANT, Token, TokenKind, scan
 from ...sql.scope import unquote
 from ..columns import TableColumn
-from ..dump import OWNERS_AND_PRIVILEGES, DumpCatalog, DumpObject, DumpSession, DumpTable, shown_names
+from ..dump import OWNERS_AND_PRIVILEGES, DumpCatalog, DumpDependent, DumpObject, DumpSession, DumpTable, shown_names
 from . import driver
 from .catalog import batch, by_object, chunks, id_list, id_sources, is_system_schema, literal, q, result_sets, rows
 from .columns import columns_of
@@ -106,6 +111,21 @@ FROM sys.sql_expression_dependencies d
 JOIN sys.objects o ON o.object_id = d.referencing_id
 JOIN sys.objects r ON r.object_id = d.referenced_id
 WHERE d.referencing_class = 1 AND d.referenced_class = 1 AND o.schema_id IN ({schemas})
+"""
+# What would stop a `drop_first` file's DROP of an object of the scope (06b I2; no dump writes CASCADE), from any
+# schema: a foreign key that references a table (3726), and what is bound to an object (3729: SCHEMABINDING — a view,
+# a function, a security policy; a table whose computed column, check or default calls a function bound to it, the
+# row of a check or a default being its table's). A view that is not schema-bound does not stop it.
+_DROP_BLOCKERS = """
+SELECT k.referenced_object_id, k.parent_object_id, SCHEMA_NAME(p.schema_id), p.name, k.name
+FROM sys.foreign_keys k JOIN sys.objects p ON p.object_id = k.parent_object_id
+WHERE k.referenced_object_id IN (SELECT object_id FROM sys.objects WHERE schema_id IN ({schemas}));
+SELECT DISTINCT d.referenced_id, COALESCE(t.object_id, o.object_id), SCHEMA_NAME(COALESCE(t.schema_id, o.schema_id)),
+       COALESCE(t.name, o.name), RTRIM(COALESCE(t.type, o.type))
+FROM sys.sql_expression_dependencies d JOIN sys.objects o ON o.object_id = d.referencing_id
+LEFT JOIN sys.objects t ON o.type IN ('C', 'D') AND t.object_id = o.parent_object_id
+WHERE d.is_schema_bound_reference = 1 AND d.referencing_class = 1 AND d.referenced_class = 1
+  AND d.referenced_id IN (SELECT object_id FROM sys.objects WHERE schema_id IN ({schemas}))
 """
 _TYPES = """
 SELECT t.user_type_id, s.name, t.name, t.is_assembly_type FROM sys.types t JOIN sys.schemas s ON s.schema_id = t.schema_id
@@ -216,6 +236,7 @@ _RULES = "rules and defaults made with CREATE RULE / CREATE DEFAULT"
 _COUNTED_OBJECTS = {"FS": _CLR_MODULES, "FT": _CLR_MODULES, "PC": _CLR_MODULES, "AF": _CLR_MODULES,
                     "TA": _CLR_MODULES, "R": _RULES, "D": _RULES, "ET": "external tables", "SQ": "Service Broker queues"}
 _CLR = frozenset({"FS", "FT", "PC", "AF", "TA"})
+_BOUND_KINDS = {"U": "table", "SP": "security policy", **{code: kind for code, (kind, _) in _MODULE_KINDS.items()}}
 _HEAD_WORDS = frozenset({"VIEW", "PROC", "PROCEDURE", "FUNCTION", "TRIGGER"})
 _HEAD_TOKENS = 64
 _RUNNERS = frozenset({"CALLER", "SELF", "OWNER"})  # EXECUTE AS that needs no user where the file is run
@@ -360,6 +381,7 @@ class _Reader:
         self.schema_ids = "NULL"  # the scope's schemas, an id_list
         self.snapshot = False
         self.collation: str | None = None
+        self.dependents: list[DumpDependent] = []  # what blocks a `drop_first` file's DROPs (06b I2)
 
     def leave_out(self, what: str, count: int = 1) -> None:
         if count:
@@ -387,10 +409,10 @@ class _Reader:
         self.collation, unmask = settings[0] if settings else (None, 1)
         schemas = self._schemas(schema_rows)
         ids = self.schema_ids = id_list(schemas.values())
-        objects, flags, uses, type_rows, ledger_views, meta, bases = result_sets(self.conn, batch(
+        objects, flags, uses, type_rows, ledger_views, meta, bases, keys, bound = result_sets(self.conn, batch(
             _OBJECTS.format(schemas=ids), table_flags_of(_WITHIN["tables"].format(schemas=ids)),
             _DEPENDS.format(schemas=ids), _TYPES.format(schemas=ids), _LEDGER_VIEWS.format(schemas=ids),
-            _MODULE_META.format(schemas=ids)))
+            _MODULE_META.format(schemas=ids), _DROP_BLOCKERS.format(schemas=ids)))
         ledger = {int(view) for (view,) in ledger_views}
         self.objects = {int(row[0]): Object(int(row[0]), row[1], row[2], row[3], int(row[4]), bool(row[5]),
                                             bool(row[6])) for row in objects if int(row[0]) not in ledger}
@@ -421,6 +443,7 @@ class _Reader:
         modules = self._modules(picked, early, policies, triggers)
         sequences = self._sequences_of(table_ids)
         written = table_ids | set(modules) | {obj.object_id for obj in sequences} | {policy for policy, _ in policies}
+        self.dependents = self._dependents(written, table_ids, keys, bound)
         if needed := self.graph.needs(written, self.hidden, self.position):  # review S1: after _readable
             self.leave_out("objects the dump's tables, views and functions need (from other schemas, not chosen or "
                            "left out)", len(needed))
@@ -458,6 +481,20 @@ class _Reader:
         data = [self._data(obj, columns.get(obj.object_id, []), sizes.get(obj.object_id), parts[obj.object_id],
                            by_name) for obj in tables]
         return pre, data, post
+
+    def _dependents(self, written: set[int], tables: set[int], keys: list[tuple], bound: list[tuple]
+                    ) -> list[DumpDependent]:
+        """06b I2: the foreign keys of tables the dump does not write that reference one it does, and what the dump
+        does not write that is schema-bound to an object it does: a `drop_first` file's DROP of that object fails where
+        they exist (3726, 3729)."""
+        found = [DumpDependent(target=self.objects[int(target)].label, kind="foreign key",
+                               name=f"{schema}.{table}.{key}")
+                 for target, parent, schema, table, key in keys if int(target) in tables and int(parent) not in tables]
+        found += [DumpDependent(target=self.objects[int(target)].label, kind=_BOUND_KINDS.get(code, "object"),
+                                name=f"{schema}.{name}")
+                  for target, referencing, schema, name, code in bound
+                  if int(target) in written and int(referencing) not in written]
+        return sorted(found, key=lambda d: (d.target, d.kind, d.name))
 
     def _schemas(self, schema_rows: list[tuple]) -> dict[str, int]:
         found = {name: int(schema_id) for name, schema_id in schema_rows if not is_system_schema(name, schema_id)}
@@ -895,4 +932,5 @@ def dump_catalog(
                  len(tables), len(post))
     return DumpCatalog(server=server, scope=where, consistency=consistency, pre=tuple(pre), tables=tuple(tables),
                        post=tuple(post), not_included=tuple(left_out), warnings=tuple(warnings),
-                       snapshot_text=SNAPSHOT_TEXT if consistency == "snapshot" else PER_TABLE_TEXT)
+                       snapshot_text=SNAPSHOT_TEXT if consistency == "snapshot" else PER_TABLE_TEXT,
+                       dependents=tuple(reader.dependents))

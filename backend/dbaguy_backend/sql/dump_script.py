@@ -9,7 +9,7 @@ from collections import Counter
 from collections.abc import Iterable, Iterator
 
 from ..adapters.columns import SQL_VARIANT
-from ..adapters.dump import DumpCatalog, DumpObject, DumpTable, plural
+from ..adapters.dump import DumpCatalog, DumpDependent, DumpObject, DumpTable, plural, shown_names
 from ..domain.data_jobs import DumpContent
 from ..domain.profiles import Engine
 from .dialects import RULES, ClientCommand, Dialect, identity_insert, qualified, quote_ident, quote_literal
@@ -50,8 +50,8 @@ RESET_SETTINGS: dict[Dialect, tuple[str, ...]] = {
 }
 # The kinds the Content line counts (what a reader looks for); the others (indexes, constraints, policies, …) are in
 # the file, not in the count
-_COUNTED = ("table", "view", "materialized view", "sequence", "type", "domain", "function", "aggregate", "procedure",
-            "trigger", "event", "synonym")
+_COUNTED = ("table", "partition", "view", "materialized view", "sequence", "type", "domain", "function", "aggregate",
+            "procedure", "trigger", "event", "synonym")
 _COMMENTS = frozenset({TokenKind.COMMENT, TokenKind.EXEC_COMMENT})
 MAX_DEFAULT_ROWS = 1000  # rows of defaults a statement (MySQL) or a piece of text (SQLite) holds
 
@@ -152,6 +152,39 @@ def filter_warnings(catalog: DumpCatalog, content: DumpContent, drop_first: bool
     if table is None or not drops_objects(content, drop_first):
         return []
     return [filtered_rows(table, replaces=True)]
+
+
+DROP_BLOCKED = "Drop objects first: "  # how drop_warnings' texts start (the dump dialog shows them first, in red)
+
+
+def _blocked(target: str, dependents: list[DumpDependent]) -> str:
+    if len(dependents) == 1:
+        dependent = dependents[0]
+        return (f"{DROP_BLOCKED}{dependent.name} ({dependent.kind}, not in this dump) depends on {target}, so restoring "
+                "where it exists fails at that DROP. Dump it too, or turn Drop objects first off.")
+    named = shown_names([f"{dependent.name} ({dependent.kind})" for dependent in dependents])
+    return (f"{DROP_BLOCKED}{named}, not in this dump, depend on {target}, so restoring where they exist fails at that "
+            "DROP. Dump them too, or turn Drop objects first off.")
+
+
+def drop_warnings(catalog: DumpCatalog, content: DumpContent, drop_first: bool) -> list[str]:
+    """What a `drop_first` file's DROPs run into (06b I2): one warning per object it drops that something it does not
+    drop depends on (`catalog.dependents`: out of the scope, or of a kind left out) — restoring where that exists fails
+    at the DROP, since no dump writes CASCADE. The dump's plan and its outcome say it."""
+    if not drops_objects(content, drop_first):
+        return []
+    dropped = {item.name for item in (*catalog.pre, *catalog.post) if item.drop}
+    blocking: dict[str, list[DumpDependent]] = {}
+    for dependent in dict.fromkeys(catalog.dependents):
+        if dependent.target in dropped:
+            blocking.setdefault(dependent.target, []).append(dependent)
+    return [_blocked(target, dependents) for target, dependents in blocking.items()]
+
+
+def restore_warnings(catalog: DumpCatalog, content: DumpContent, drop_first: bool, filter: str | None) -> list[str]:
+    """What restoring the file does that its reader must know first: it replaces a filtered table's rows (F2), or its
+    DROPs fail (I2). The dump's plan and its outcome put them before the catalog's own warnings."""
+    return [*filter_warnings(catalog, content, drop_first, filter), *drop_warnings(catalog, content, drop_first)]
 
 
 def default_rows_text(dialect: Dialect, table: DumpTable, count: int) -> Iterator[str]:

@@ -17,7 +17,7 @@ from dbaguy_backend.domain.execution import DumpCommand, RunFileCommand
 from dbaguy_backend.sessions.jobs.context import NO_DESCRIBE
 from dbaguy_backend.sql.dump_header import comment_safe, parse_header
 from tests import mssql_inventory, mysql_inventory, pg_inventory, sqlite_inventory
-from tests.data_support import DataApp, Ran, scratch_database, scratch_name
+from tests.data_support import SCRATCH_06B, DataApp, Ran, scratch_database, scratch_name
 from tests.edit_support import scratch_db
 from tests.support import requires_mssql, requires_mysql, requires_pg
 
@@ -753,6 +753,35 @@ def test_a_number_glued_to_a_keyword_cannot_run_a_second_statement(tmp_path):  #
             events = request_events(tab.recorder, "q", 30)
             assert [e.code for e in events if e.type == "error"] == ["read_only"]
             assert admin.rows(source, "SELECT COUNT(*) FROM dbo.t") == [(2,)]
+            app.close_sessions()
+    finally:
+        app.close()
+        db.close()
+
+
+@requires_pg
+def test_a_drop_first_dump_and_its_plan_say_what_outside_it_its_drops_run_into(tmp_path):  # 06b I2
+    """The plan and the dump's outcome put the warning first (the dialog shows it in red); restoring the file where the
+    view outside it exists stops at the DROP, rolled back, as the warning says. Without Drop objects first: nothing."""
+    db = scratch_db("postgres", tmp_path)
+    app = DataApp(tmp_path)
+    try:
+        with scratch_database("postgres", "drops", prefix=SCRATCH_06B) as (database, admin):
+            admin.run_in(database, "CREATE SCHEMA s", "CREATE TABLE s.t (id int PRIMARY KEY)",
+                         "INSERT INTO s.t VALUES (1)", "CREATE VIEW s.v AS SELECT id FROM s.t")
+            profile = app.add_profile(db.profile(database=database))
+            one = DumpScope(kind="tables", schema_name="s", names=["t"])
+            said = ("Drop objects first: s.v (view, not in this dump) depends on s.t, so restoring where it exists "
+                    "fails at that DROP. Dump it too, or turn Drop objects first off.")
+            plan = app.container.data.dump_plan(profile, database, one, "both", DumpObjectKinds(), None, drop_first=True)
+            assert plan.warnings == [said]
+            assert app.container.data.dump_plan(profile, database, one, "both", DumpObjectKinds(), None).warnings == []
+            path = tmp_path / "t.sql"
+            dumped = dump(app, profile, database, path, one, drop_first=True)
+            assert (dumped.outcome.outcome, dumped.outcome.warnings) == ("completed", [said])
+            ran = restore(app, profile, database, path, "all_or_nothing")
+            assert (ran.outcome.outcome, ran.error.code) == ("rolled_back", "2BP01")
+            assert admin.rows(database, "SELECT count(*) FROM s.v") == [(1,)]
             app.close_sessions()
     finally:
         app.close()

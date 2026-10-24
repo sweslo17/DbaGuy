@@ -110,6 +110,12 @@ def test_what_ends_the_transaction_before_it_even_when_one_is_open_after_it(text
     ("MERGE INTO ks USING src ON KEY src.id WHEN MATCHED THEN UPDATE SET ks.a = 1", SQLPP, True),
     ("DELETE FROM ks WHERE a = 1", SQLPP, True), ("SELECT RAW 1", SQLPP, False),
     ("REPLACE INTO ks VALUES (1)", SQLPP, False),
+    # 06b fix wave: a JavaScript function may write documents; optimizer statistics are no documents
+    ("EXECUTE FUNCTION app.f(1)", SQLPP, True), ("execute function f()", SQLPP, True),
+    ("UPDATE STATISTICS FOR ks(a, b)", SQLPP, False), ("update statistics ks(a)", SQLPP, False),
+    ("ANALYZE KEYSPACE ks", SQLPP, False), ("ANALYZE ks(a)", SQLPP, False),
+    ("UPDATE `statistics` SET n = 1", SQLPP, True),  # a keyspace of that name is quoted: a document write
+    ("EXECUTE FUNCTION f()", MYSQL, False), ("LOAD XML INFILE 'x' INTO TABLE t", SQLPP, False),
 ])
 def test_what_writes_rows_one_at_a_time(text, dialect, writes):  # 06b review M2, M-c: what may keep part of its work
     assert writes_rows(text, dialect) is writes

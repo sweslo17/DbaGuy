@@ -45,6 +45,11 @@ _TSQL_OPENS = {"BEGIN": frozenset({"TRAN", "TRANSACTION", "DISTRIBUTED"}), "SAVE
 # and the reads a WITH clause can lead to instead
 _WRITES = {Dialect.MYSQL: frozenset({"INSERT", "REPLACE", "UPDATE", "DELETE"}),
            Dialect.SQLPP: frozenset({"INSERT", "UPSERT", "UPDATE", "DELETE", "MERGE"})}
+# The first two words that make a statement such a write, or not one, whatever its first word says (06b fix wave):
+# MySQL's LOAD DATA and LOAD XML; SQL++'s EXECUTE FUNCTION (a JavaScript function may write documents), and its
+# UPDATE STATISTICS, which writes optimizer statistics, not documents (its ANALYZE spelling starts with no write)
+_WRITE_PAIRS = {Dialect.MYSQL: {("LOAD", "DATA"): True, ("LOAD", "XML"): True},
+                Dialect.SQLPP: {("EXECUTE", "FUNCTION"): True, ("UPDATE", "STATISTICS"): False}}
 _READ_VERBS = frozenset({"SELECT", "TABLE", "VALUES"})
 _MAY_COMMIT = re.compile(r"\b(?:COMMIT|CALL|EXEC|EXECUTE)\b", re.IGNORECASE)
 _TSQL_MAY_COMMIT = re.compile(r"\b(?:COMMIT|EXEC|EXECUTE)\b", re.IGNORECASE)  # data saying "call" is not lexed
@@ -165,15 +170,17 @@ def may_commit(text: str, dialect: Dialect) -> bool:
 def writes_rows(text: str, dialect: Dialect) -> bool:
     """Whether the statement writes rows (documents) one at a time, so that what it wrote before it failed may stay:
     MySQL's INSERT, REPLACE, UPDATE, DELETE, LOAD DATA or XML and WITH … UPDATE / DELETE, on a table that cannot roll
-    back (MyISAM, 06b review M2); SQL++'s INSERT, UPSERT, UPDATE, DELETE and MERGE, each document on its own (M-c).
-    Every other dialect: False (every table rolls a failed statement back)."""
+    back (MyISAM, 06b review M2); SQL++'s INSERT, UPSERT, UPDATE, DELETE, MERGE and EXECUTE FUNCTION, each document on
+    its own (M-c), but not UPDATE STATISTICS. Every other dialect: False (every table rolls a failed statement back)."""
     writes = _WRITES.get(dialect)
     if writes is None:
         return False
     words = first_words(text, dialect)
     if not words:
         return False
-    if words[0] in writes or (dialect is Dialect.MYSQL and words[:2] in (["LOAD", "DATA"], ["LOAD", "XML"])):
+    if (pair := _WRITE_PAIRS[dialect].get(tuple(words[:2]))) is not None:
+        return pair
+    if words[0] in writes:
         return True
     if words[0] != "WITH":
         return False

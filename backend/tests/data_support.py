@@ -33,11 +33,14 @@ from tests.support import (
 from tests.test_sessions import Recorder, request_events
 
 SCRATCH_PREFIX = "zz_06_"
+SCRATCH_06B = "zz_06b_"  # 06b's own (its fix wave's tests)
+_SCRATCH = (SCRATCH_PREFIX, SCRATCH_06B)
 _ROW_TUPLE = _mssql.ROW_FORMAT_TUPLE
 
 
-def scratch_name(kind: str) -> str:
-    return unique_name(SCRATCH_PREFIX + kind)
+def scratch_name(kind: str, prefix: str = SCRATCH_PREFIX) -> str:
+    assert prefix in _SCRATCH, f"{prefix!r} is not a scratch prefix"
+    return unique_name(prefix + kind)
 
 
 def drop_statement(db: ScratchDb, kind: str, name: str) -> str:
@@ -97,7 +100,7 @@ class _Admin:
         }[self.engine])
 
     def drop(self, name: str) -> None:
-        assert name.startswith(SCRATCH_PREFIX), f"{name!r} is not a scratch database: never dropped here"
+        assert name.startswith(_SCRATCH), f"{name!r} is not a scratch database: never dropped here"
         self._run(*{
             "postgres": [f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'],
             # the grant create() gave goes with it (a grant outlives its database)
@@ -150,11 +153,11 @@ class _Admin:
 
 
 @contextmanager
-def scratch_database(engine: str, kind: str = "db") -> Iterator[tuple[str, "_Admin"]]:
-    """A database `zz_06_<kind>_<random>` the dev login may use (PostgreSQL, MySQL, SQL Server), dropped by its exact
-    name when the block ends, whatever happened."""
+def scratch_database(engine: str, kind: str = "db", prefix: str = SCRATCH_PREFIX) -> Iterator[tuple[str, "_Admin"]]:
+    """A database `zz_06_<kind>_<random>` (`prefix`: 06b's `zz_06b_`) the dev login may use (PostgreSQL, MySQL, SQL
+    Server), dropped by its exact name when the block ends, whatever happened."""
     admin = _Admin(engine)
-    name = scratch_name(kind)
+    name = scratch_name(kind, prefix)
     admin.create(name)
     try:
         yield name, admin

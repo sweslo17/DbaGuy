@@ -7,6 +7,7 @@ through an independent sys.* inventory and a hash of every row (tests/mssql_inve
 `zz_06_dumpcat_*` and `zz_06_restore_*` (sa makes them; the dev login owns them); the seed is only read."""
 
 import pytest
+from pymssql import _mssql
 
 from dbaguy_backend.adapters.base import StatementError
 from dbaguy_backend.adapters.mssql.dump import (
@@ -14,7 +15,8 @@ from dbaguy_backend.adapters.mssql.dump import (
 )
 from dbaguy_backend.adapters.mssql.introspection import _next_value
 from dbaguy_backend.domain.data_jobs import DumpObjectKinds, DumpScope
-from tests.data_support import DataApp, scratch_database
+from dbaguy_backend.sql.dump_script import drop_warnings
+from tests.data_support import SCRATCH_06B, DataApp, scratch_database
 from tests.edit_support import scratch_db
 from tests.mssql_inventory import catalog_in, copy_rows, data, differences, inventory, restore, sa_rows, script
 from tests.support import requires_mssql
@@ -729,3 +731,53 @@ END
     assert big[0] == small[0] and big[0] <= 16 and planned[0] <= big[0], (small, big, planned)
     print(f"\nqueries: 3 tables {small[0]} ({small[1]:.2f} s), 1,000 tables {big[0]} ({big[1]:.2f} s), "
           f"plan {planned[0]} ({planned[1]:.2f} s)")
+
+
+def _drop_errors(database: str, drops: list[str]) -> list[int | str]:
+    """The error each DROP stops at, in a transaction rolled back (06b I2: what the warning promises). Only `number`
+    is read of the driver's own exception."""
+    found: list[int | str] = []
+    for drop in drops:
+        try:
+            sa_rows(database, f"BEGIN TRANSACTION; {drop}; ROLLBACK TRANSACTION")
+            found.append("dropped")
+        except _mssql.MSSQLDatabaseException as exc:
+            found.append(exc.number)
+    return found
+
+
+@requires_mssql
+def test_a_drop_first_dump_names_what_outside_it_its_drops_run_into():
+    """06b I2: a foreign key of another schema's table (3726) and what is schema-bound to what a schema dump writes —
+    another schema's view, a table whose computed column calls its function, and its own schema-bound view when views
+    are not chosen (3729) — are named; a view that is not schema-bound blocks nothing and is not. Each named DROP stops
+    where they exist. The plan's read and the dump's say the same."""
+    with scratch_database("mssql", "drops", prefix=SCRATCH_06B) as (database, admin):
+        for batch in (
+            "CREATE SCHEMA app", "CREATE SCHEMA other", "CREATE TABLE app.t (id int PRIMARY KEY)",
+            "CREATE FUNCTION app.f (@v int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN @v * 2 END",
+            "CREATE TABLE other.child (id int PRIMARY KEY, t_id int CONSTRAINT child_t REFERENCES app.t (id))",
+            "CREATE VIEW other.bound WITH SCHEMABINDING AS SELECT id FROM app.t",
+            "CREATE VIEW other.loose AS SELECT id FROM app.t",
+            "CREATE TABLE other.calc (id int, twice AS app.f(id))",
+            "CREATE VIEW app.v_bound WITH SCHEMABINDING AS SELECT id FROM app.t",
+        ):
+            admin.run_in(database, batch)
+        schema = DumpScope(kind="schema", schema_name="app")
+        for ddl in (True, False):
+            found = catalog_in(database, schema, DumpObjectKinds(views=False), ddl=ddl)
+            assert [(d.target, d.kind, d.name) for d in found.dependents] == [
+                ("app.f", "table", "other.calc"), ("app.t", "foreign key", "other.child.child_t"),
+                ("app.t", "view", "app.v_bound"), ("app.t", "view", "other.bound")], ddl
+        found = catalog_in(database, schema)  # with its views: its own is dropped by the file first
+        assert [(d.target, d.name) for d in found.dependents] == [
+            ("app.f", "other.calc"), ("app.t", "other.child.child_t"), ("app.t", "other.bound")]
+        assert drop_warnings(found, "both", True) == [
+            "Drop objects first: other.calc (table, not in this dump) depends on app.f, so restoring where it exists "
+            "fails at that DROP. Dump it too, or turn Drop objects first off.",
+            "Drop objects first: other.child.child_t (foreign key), other.bound (view), not in this dump, depend on "
+            "app.t, so restoring where they exist fails at that DROP. Dump them too, or turn Drop objects first off."]
+        drops = {item.name: item.drop for item in (*found.pre, *found.post) if item.drop and item.kind != "foreign key"}
+        assert _drop_errors(database, [drops["app.f"], drops["app.t"]]) == [3729, 3726]
+        tables = catalog_in(database, DumpScope(kind="tables", schema_name="app", names=["t"]))
+        assert [d.name for d in tables.dependents] == ["other.child.child_t", "app.v_bound", "other.bound"]

@@ -8,7 +8,7 @@ from decimal import Decimal
 import pytest
 
 from dbaguy_backend.adapters.columns import SQL_VARIANT, TableColumn
-from dbaguy_backend.adapters.dump import DumpCatalog, DumpObject, DumpTable
+from dbaguy_backend.adapters.dump import DumpCatalog, DumpDependent, DumpObject, DumpTable
 from dbaguy_backend.domain.errors import ValidationFailed
 from dbaguy_backend.domain.profiles import Engine
 from dbaguy_backend.sql import bulk_insert
@@ -16,7 +16,8 @@ from dbaguy_backend.sql.bulk_insert import MYSQL_PACKET_BYTES, InsertBatcher, si
 from dbaguy_backend.sql.dialects import Dialect, datetime_literal, float_literal, identity_insert, non_finite_literal
 from dbaguy_backend.sql.dump_header import comment_safe, filtered_rows, parse_header
 from dbaguy_backend.sql.dump_script import (
-    DumpScript, filter_warnings, insert_text, lost_columns, object_text, statement_text, table_sql,
+    DumpScript, drop_warnings, filter_warnings, insert_text, lost_columns, object_text, restore_warnings,
+    statement_text, table_sql,
 )
 from dbaguy_backend.sql.select_builder import build_copy_select
 from dbaguy_backend.sql.splitter import split
@@ -305,6 +306,56 @@ def test_a_filtered_file_that_drops_its_table_is_said_to_replace_it():  # fix wa
         assert filter_warnings(catalog(), content, drop_first, where) == []
     assert filter_warnings(catalog(tables=()), "both", True, "id < 3") == []  # a view's: no rows written
     assert filtered_rows("public.t", replaces=False) == "The file holds only the rows of public.t that match a filter"
+
+
+def blocked(target: str, kind: str, name: str) -> str:
+    return (f"Drop objects first: {name} ({kind}, not in this dump) depends on {target}, so restoring where it exists "
+            "fails at that DROP. Dump it too, or turn Drop objects first off.")
+
+
+def test_a_drop_first_file_says_what_its_drops_run_into():  # 06b I2: the plan's and the outcome's
+    view = DumpDependent(target="public.t", kind="view", name="other.v_t")
+    assert drop_warnings(catalog(), "both", True) == []  # nothing depends on what it drops
+    assert drop_warnings(catalog(dependents=(view,)), "both", True) == [blocked("public.t", "view", "other.v_t")]
+    # only a file that drops: not without the option, nor a data-only file (it creates and drops nothing)
+    for content, drop_first in [("both", False), ("data", True), ("schema", False)]:
+        assert drop_warnings(catalog(dependents=(view,)), content, drop_first) == []
+    assert drop_warnings(catalog(dependents=(view,)), "schema", True) == [blocked("public.t", "view", "other.v_t")]
+    # a view of the scope the dump leaves out (views not chosen) is one like any other; one per object dropped, in the
+    # catalog's order; an object the file writes without a DROP of its own (an index goes with its table) is no target
+    left_out = DumpDependent(target="public.v", kind="view", name="public.w")
+    key = DumpDependent(target="public.t", kind="foreign key", name="orders_t_fkey on other.orders")
+    index = DumpDependent(target="public.t_i", kind="view", name="other.x")
+    assert drop_warnings(catalog(dependents=(view, left_out, key, index, view)), "both", True) == [
+        "Drop objects first: other.v_t (view), orders_t_fkey on other.orders (foreign key), not in this dump, depend "
+        "on public.t, so restoring where they exist fails at that DROP. Dump them too, or turn Drop objects first off.",
+        blocked("public.v", "view", "public.w")]
+
+
+def test_the_drops_warning_names_its_dependents_up_to_the_cap():
+    many = tuple(DumpDependent(target="public.t", kind="view", name=f"s.v{i:02}") for i in range(12))
+    [said] = drop_warnings(catalog(dependents=many), "both", True)
+    shown = ", ".join(f"s.v{i:02} (view)" for i in range(10))
+    assert said == (f"Drop objects first: {shown} …, not in this dump, depend on public.t, so restoring where they "
+                    "exist fails at that DROP. Dump them too, or turn Drop objects first off.")
+
+
+def test_restoring_warnings_put_the_filter_first_then_the_drops():
+    view = DumpDependent(target="public.t", kind="view", name="other.v_t")
+    assert restore_warnings(catalog(dependents=(view,)), "both", True, "id < 3") == [
+        REPLACES, blocked("public.t", "view", "other.v_t")]
+    assert restore_warnings(catalog(dependents=(view,)), "both", False, "id < 3") == []
+
+
+def test_a_partition_is_counted_apart_from_the_tables():  # F-a: its rows are read through its parent
+    partition = DumpObject("partition", "public.t_1", ("CREATE TABLE public.t_1 PARTITION OF public.t FOR VALUES IN (1)",))
+    script = DumpScript(PG, Engine.POSTGRES, catalog(pre=(*catalog().pre, partition)), content="both", drop_first=True,
+                        created="x")
+    text = whole(script)
+    assert "-- Content: schema and data · 1 table, 1 partition, 1 view" in text
+    assert "-- partition: public.t_1" in text and "DROP TABLE IF EXISTS public.t_1" not in text
+    assert text.rstrip().endswith("-- Dump complete: 2 rows in 1 tables")
+    assert parse_header(text).lines[3] == "-- Content: schema and data · 1 table, 1 partition, 1 view"
 
 
 def test_a_table_with_no_column_to_write_gets_rows_of_defaults():  # 06a Task 7 review, Task 9

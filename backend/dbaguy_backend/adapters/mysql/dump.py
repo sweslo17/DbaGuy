@@ -63,6 +63,12 @@ SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME,
         AND IS_DEFAULT = 'Yes'), @@max_allowed_packet
 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s
 """
+# F-e: TABLES' TABLE_ROWS and DATA_LENGTH (the plan's row estimates and CR-4's free-space check) as they are now, not
+# as information_schema_stats_expiry (8.0.3+; 86400 s by default) cached them: "≈ 41 rows" for 100,000. 5.7 has no
+# such cache and skips the version comment. The dump's own session keeps it; the plan's read on the shared metadata
+# connection sets it back to DEFAULT
+STATISTICS_NOW = "/*!80003 SET SESSION information_schema_stats_expiry = 0 */"
+STATISTICS_DEFAULT = "/*!80003 SET SESSION information_schema_stats_expiry = DEFAULT */"
 _RELATIONS = """
 SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS, DATA_LENGTH + INDEX_LENGTH, ENGINE, TABLE_COMMENT
 FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s ORDER BY TABLE_NAME
@@ -120,7 +126,7 @@ def session(database: str) -> DumpSession:
     return DumpSession(
         setup=(f"USE {quote_ident(Dialect.MYSQL, database)}", f"SET NAMES {RESTORE_CHARSET}",
                f"SET SESSION sql_mode = {quote_literal(Dialect.MYSQL, RESTORE_SQL_MODE)}",  # pre-flight M5
-               f"SET time_zone = {quote_literal(Dialect.MYSQL, RESTORE_TIME_ZONE)}",
+               f"SET time_zone = {quote_literal(Dialect.MYSQL, RESTORE_TIME_ZONE)}", STATISTICS_NOW,
                "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"),
         teardown=("ROLLBACK",), consistency="snapshot", changed_codes=frozenset({TABLE_CHANGED}),
     )
@@ -241,8 +247,19 @@ class _Reader:
             return None
         return row
 
+    def _relations(self) -> list[tuple]:
+        """The scope's tables and views with their statistics as they are now (F-e): the dump's session reads them so
+        (`session`); a plan, on the metadata connection others share, only for this query."""
+        if self.ddl:
+            return self.rows(_RELATIONS, self.database)
+        self.rows(STATISTICS_NOW)
+        try:
+            return self.rows(_RELATIONS, self.database)
+        finally:
+            self.rows(STATISTICS_DEFAULT)
+
     def read(self) -> tuple[list[DumpObject], list[DumpTable], list[DumpObject]]:
-        relations = self.rows(_RELATIONS, self.database)
+        relations = self._relations()
         if self.named:
             wanted = set(self.scope.names)
             if missing := wanted - {row[0] for row in relations}:

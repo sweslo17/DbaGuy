@@ -19,7 +19,10 @@ follows in creation order (oid).
 
 Every object that another can depend on, or that can depend on a view or a routine (a foreign key, a trigger, a rule,
 a policy, statistics), has its DROP … IF EXISTS: a `drop_first` file drops the objects after the data first, newest
-first, then the others (H7). A `tables` scope brings each table's partitions, the sequences its columns own or use,
+first, then the others (H7). A partition whose parent the dump writes is a `partition` (F-a): its rows are read
+through that parent, and its DROP goes with the parent's. What the dump does not write and depends on what it drops
+(a view outside it or not chosen, a foreign key, a trigger, a column of another table; 06b I2) is read in one query:
+its DROP stops there (2BP01), which the plan and the outcome say (`sql/dump_script.drop_warnings`). A `tables` scope brings each table's partitions, the sequences its columns own or use,
 the collations, types and routines its columns, defaults, checks, indexes and triggers use, and its triggers. Every
 object of the scope that is not written is counted in `not_included` — operators, operator classes and text search
 objects with the object that uses each (P1) — and so is what the dump uses and does not create (an extension's or
@@ -35,7 +38,9 @@ from ...domain.data_jobs import DumpObjectKinds, DumpScope
 from ...domain.errors import NotFound
 from ...sql.dialects import Dialect, qualified, quote_ident, quote_literal
 from ..columns import TableColumn
-from ..dump import OWNERS_AND_PRIVILEGES, DumpCatalog, DumpObject, DumpSession, DumpTable, Ordering
+from ..dump import (
+    OWNERS_AND_PRIVILEGES, DumpCatalog, DumpDependent, DumpObject, DumpSession, DumpTable, Ordering,
+)
 from . import columns as pg_columns
 from . import dump_queries as q
 from .ddl import NOTHING_HELD, Held, TableParts, TypeParts, sequence_ddl_of, storage_options, table_parts_of, \
@@ -114,6 +119,12 @@ class _Relation:
     @property
     def only(self) -> str:
         return "" if self.relkind == "p" else "ONLY "  # a partitioned table's goes to its partitions (H5)
+
+
+def _routine_label(row: tuple) -> str:
+    """A routine (a q.ROUTINES row) as the file names it: `app.f(integer)`."""
+    _, schema, name, _, arguments = row
+    return f"{schema}.{name}({arguments})"
 
 
 def _collation_ddl(qname: str, row: dict) -> str:
@@ -208,6 +219,7 @@ class _Reader:
         self.view_defaults: dict[int, list[tuple[str, str]]] = defaultdict(list)
         self.sequence_values: dict[int, tuple[int, bool]] = {}
         self.constraint_indexes: dict[int, list[tuple[int, str, str]]] = defaultdict(list)
+        self.dependents: list[DumpDependent] = []  # what blocks a `drop_first` file's DROPs (06b I2)
 
     # -- reading helpers
 
@@ -253,8 +265,7 @@ class _Reader:
             schema, name, typtype = self.types[oid]
             return f"{_TYPE_WORDS.get(typtype, 'type')} {schema}.{name}"
         if key[0] == "f" and oid in self.routines:
-            _, schema, name, kind, arguments = self.routines[oid]
-            return f"{_ROUTINE_KIND[kind]} {schema}.{name}({arguments})"
+            return f"{_ROUTINE_KIND[self.routines[oid][3]]} {_routine_label(self.routines[oid])}"
         return f"trigger {self.triggers_by_oid.get(oid, oid)}" if key[0] == "g" else key
 
     # -- the read
@@ -316,6 +327,7 @@ class _Reader:
                 *self._row_security(tables)]
         self._uses_of_others(written, types, routines, triggers)
         self._others(schema_oids)
+        self.dependents = self._dependents(views, sequences, routines, types, collations)
         return pre, self._data(tables), post
 
     def _schemas(self) -> list[tuple[int, str]]:
@@ -659,8 +671,7 @@ class _Reader:
             definition = _aggregate_ddl(signature, self.aggregates[oid]) if kind == "a" else \
                 self.functions[oid].rstrip().rstrip(";")
             statements = (definition, *self.comment("pg_proc", oid, f"{word} {signature}"))
-        return DumpObject(_ROUTINE_KIND[kind], f"{schema}.{name}({arguments})", statements,
-                          f"DROP {word} IF EXISTS {signature}")
+        return DumpObject(_ROUTINE_KIND[kind], _routine_label(row), statements, f"DROP {word} IF EXISTS {signature}")
 
     def _table(self, relation: _Relation) -> DumpObject:
         statements: tuple[str, ...] = ()
@@ -680,8 +691,9 @@ class _Reader:
         if parent is not None and parent not in self.dumped:
             self.warnings.append(f"{relation.label} is a partition of {self.label_of(parent)}, which is not in this "
                                  "dump: the file restores it only where that table exists")
-        drop = None if parent in self.dumped else f"DROP TABLE IF EXISTS {relation.sql}"  # a partition goes with it
-        return DumpObject("table", relation.label, statements, drop)
+        if parent in self.dumped:  # F-a: its rows are read through its parent, and its DROP goes with that one's
+            return DumpObject("partition", relation.label, statements)
+        return DumpObject("table", relation.label, statements, f"DROP TABLE IF EXISTS {relation.sql}")
 
     # -- after the data
 
@@ -946,6 +958,34 @@ class _Reader:
                               "the file is run")
         return found
 
+    def _dependents(self, views: list[_Relation], sequences: list[int], routines: list[int], types: list[int],
+                    collations: list[int]) -> list[DumpDependent]:
+        """06b I2: what depends on a relation, routine, type or collation the dump writes and is not dropped by the
+        file with it — out of the scope, of a kind left out (views not chosen), or of a kind no dump writes (an
+        operator, an event trigger): a `drop_first` file's DROP of that object fails where it exists. One query (P5)."""
+        written = {*self.dumped, *(r.oid for r in views), *sequences}
+        targets = {("r", oid): self.relations[self._root(oid)].label for oid in self.dumped}  # a partition: its root's
+        targets |= {("r", oid): self.relations[oid].label for oid in written - self.dumped}
+        targets |= {("f", oid): _routine_label(self.routines[oid]) for oid in routines}
+        targets |= {("t", oid): f"{self.types[oid][0]}.{self.types[oid][1]}" for oid in types}
+        targets |= {("k", oid): f"{self.collations[oid][0]}.{self.collations[oid][1]}" for oid in collations}
+        if not targets:
+            return []
+        sql = q.DROP_BLOCKERS.format(triggers=q.TRIGGER_NOT_CLONED if self.version >= 130000 else "")
+        own_types, own_routines = set(types), set(routines)
+        found = []
+        for ref_kind, ref, relation, of_type, routine, kind, name in self.rows(
+                sql, relations=sorted(written), routines=routines, types=types, collations=collations):
+            if relation is not None:  # the relation it is part of: the file drops it with that one
+                dropped = relation in written
+            elif of_type is not None:
+                dropped = of_type in own_types
+            else:
+                dropped = routine in own_routines
+            if not dropped and (ref_kind, ref) in targets:
+                found.append(DumpDependent(target=targets[(ref_kind, ref)], kind=kind, name=name))
+        return sorted(found, key=lambda d: (d.target, d.kind, d.name))
+
     # -- what is left out, and the data
 
     def _others(self, schema_oids: list[int]) -> None:
@@ -1006,4 +1046,4 @@ def dump_catalog(
     snapshot = SNAPSHOT_TEXT + (RLS_SNAPSHOT if any(item.kind == "row-level security" for item in post) else "")
     return DumpCatalog(server=server, scope=where, consistency="snapshot", pre=tuple(pre), tables=tuple(tables),
                        post=tuple(post), not_included=tuple(left_out), warnings=tuple(reader.warnings),
-                       snapshot_text=snapshot)
+                       snapshot_text=snapshot, dependents=tuple(reader.dependents))

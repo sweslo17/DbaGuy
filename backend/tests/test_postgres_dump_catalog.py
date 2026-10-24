@@ -6,16 +6,18 @@ inventory and the rows' md5 (tests/pg_inventory.py, P6) — the review's cases a
 (tests/pg_dump_cases.py) included. The INSERT round trip is test_dump.py's. Scratch: `zz_06_dumpcat_*` schemas,
 dropped with what is in them, and `zz_06_restore_*` / `zz_06_dumpcat_*` databases, dropped by name."""
 
+import psycopg
 import pytest
 
 from dbaguy_backend.adapters.postgres.dump import RLS_SNAPSHOT, SESSION, SNAPSHOT_TEXT
 from dbaguy_backend.domain.data_jobs import DumpObjectKinds, DumpScope
 from dbaguy_backend.domain.errors import NotFound
-from tests.data_support import dropping, scratch_database, scratch_name
+from dbaguy_backend.sql.dump_script import drop_warnings
+from tests.data_support import SCRATCH_06B, dropping, scratch_database, scratch_name
 from tests.edit_support import scratch_db
 from tests.pg_dump_cases import CASES, NASTY
 from tests.pg_inventory import catalog_in, differences, inventory, restore
-from tests.support import PG_USER, requires_pg
+from tests.support import PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, requires_pg
 
 pytestmark = requires_pg
 
@@ -93,7 +95,7 @@ def test_a_schema_dump_orders_every_object_by_its_dependencies(schema):
         ("schema", name), ("type", "mood"), ("domain", "pos"), ("type", "pair"), ("sequence", "counter"),
         ("sequence", "parent_id_seq"), ("function", "add1(i integer)"), ("function", "twice(i integer)"),
         ("function", "touch()"), ("aggregate", "total(integer)"), ("table", "parent"), ("table", "Child Rows"),
-        ("table", "events"), ("table", "events_2026"),
+        ("table", "events"), ("partition", "events_2026"),  # F-a: its rows and its DROP go with its parent's
     ]
     # H4: the routines that read a relation come with the views, merged by creation order: parents() and n_parents()
     # are older than every view, v_top waits for v_base, v_n for n_parents()
@@ -121,7 +123,7 @@ def test_a_schema_dump_orders_every_object_by_its_dependencies(schema):
         f"""SELECT pg_catalog.setval(pg_catalog.pg_get_serial_sequence('{name}."Child Rows"', 'id'), 1, false)""",)
     assert "REFERENCES" not in statements[("table", "Child Rows")][0]  # foreign keys come after the data
     assert statements[("index", "events_v")] == (f"CREATE INDEX events_v ON {name}.events USING btree (v)",)  # not ONLY
-    assert statements[("table", "events_2026")][0].startswith(f"CREATE TABLE {name}.events_2026 PARTITION OF {name}.events")
+    assert statements[("partition", "events_2026")][0].startswith(f"CREATE TABLE {name}.events_2026 PARTITION OF {name}.events")
     assert "BEGIN ATOMIC" in statements[("function", "n_parents()")][0]
     assert statements[("aggregate", "total(integer)")] == (
         f"CREATE AGGREGATE {name}.total(integer) (\n    SFUNC = int4pl,\n    STYPE = integer\n)",)
@@ -139,7 +141,7 @@ def test_a_tables_dump_brings_what_its_tables_need_and_leaves_out_foreign_keys_t
     db, name = schema
     found = catalog(db, DumpScope(kind="tables", schema_name=name, names=["Child Rows", "events"]))
     assert names(found.pre, name) == [("schema", name), ("type", "pair"), ("table", "Child Rows"), ("table", "events"),
-                                      ("table", "events_2026")]
+                                      ("partition", "events_2026")]
     assert names(found.post, name) == [("sequence value", "Child Rows_id_seq"), ("index", "child_note"),
                                        ("index", "events_v")]
     assert found.warnings == (f"Foreign key Child Rows_parent_id_fkey of {name}.Child Rows is left out: it references "
@@ -261,7 +263,7 @@ def test_a_drop_first_dump_restores_twice_and_reads_back_the_same():
             ("schema", "app"), ("type", "kind"), ("domain", "qty"), ("type", "labelled"), ("sequence", "counter"),
             ("function", "is_even(i integer)"), ("domain", "even"), ("function", "stamp()"),
             ("table", "kid"), ("table", "mom"), ("function", "moms()"), ("table", "numbered"), ("table", "acct"),
-            ("table", "pt"), ("table", "pt_1"), ("table", "late")]
+            ("table", "pt"), ("partition", "pt_1"), ("table", "late")]
         assert names(found.post, "app") == [
             ("sequence value", "counter"), ("sequence value", "acct_id_seq"), ("index", "acct_owner"),
             ("foreign key", "kid.kid_mom"), ("foreign key", "pt.pt_acct_id_fkey"),
@@ -279,7 +281,7 @@ def test_a_drop_first_dump_restores_twice_and_reads_back_the_same():
             "    n integer,\n    CONSTRAINT acct_pkey PRIMARY KEY (id)\n) WITH (fillfactor=70)")
         assert text[("table", "acct")][1:] == ("ALTER TABLE ONLY app.acct ALTER COLUMN n SET STATISTICS 400",
                                                "COMMENT ON CONSTRAINT acct_pkey ON app.acct IS 'the key'")
-        assert text[("table", "pt_1")] == (
+        assert text[("partition", "pt_1")] == (
             "CREATE TABLE app.pt_1 PARTITION OF app.pt\n    FOR VALUES FROM (0) TO (100)",
             "ALTER TABLE ONLY app.pt_1 ADD CONSTRAINT pt_1_small CHECK ((id < 50))",
             "ALTER TABLE ONLY app.pt_1 ALTER COLUMN v SET NOT NULL",
@@ -466,3 +468,65 @@ def test_what_no_dump_writes_is_counted_in_its_header():
                                            "inheritance (1 child tables come back as tables of their own)")
         assert not [what for what in whole.not_included if "extension types" in what or "schemas not" in what]
         assert ("type", "other.mood") in [(item.kind, item.name) for item in whole.pre]
+
+
+def _blocked_drops(database: str, drops: list[str]) -> list[str]:
+    """The SQLSTATE each DROP stops at, run in a transaction rolled back (06b I2: what the warning promises)."""
+    found = []
+    with psycopg.connect(host=PG_HOST, port=PG_PORT, user=PG_USER, password=PG_PASSWORD, dbname=database) as conn:
+        for drop in drops:
+            try:
+                conn.execute(drop)
+                found.append("dropped")
+            except psycopg.Error as exc:
+                found.append(exc.sqlstate or "")
+            conn.rollback()
+    return found
+
+
+def test_a_drop_first_dump_names_what_outside_it_its_drops_run_into():
+    """06b I2: a `tables` dump of a table that a view and a foreign key of another schema depend on, and a view of its
+    own schema (not in the scope); the type and the trigger function the dump writes for it are also used by a table
+    it does not write. A schema dump that leaves its views out (not chosen) names the view that reads its table. Each
+    such DROP stops at 2BP01 where they exist; what the file drops itself (the table's own trigger, its column) is
+    never named. The plan's read (no definitions) and the dump's say the same."""
+    with scratch_database("postgres", "drops", prefix=SCRATCH_06B) as (database, admin):
+        admin.run_in(
+            database, "CREATE SCHEMA s", "CREATE SCHEMA other", "CREATE TYPE s.mood AS ENUM ('a', 'b')",
+            "CREATE FUNCTION s.stamp() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$",
+            "CREATE TABLE s.t (id int PRIMARY KEY, m s.mood)",
+            "CREATE TRIGGER t_stamp BEFORE INSERT ON s.t FOR EACH ROW EXECUTE FUNCTION s.stamp()",
+            "CREATE TABLE s.u (id int PRIMARY KEY, m s.mood)",
+            "CREATE TRIGGER u_stamp BEFORE INSERT ON s.u FOR EACH ROW EXECUTE FUNCTION s.stamp()",
+            "CREATE VIEW other.v_t AS SELECT id FROM s.t", "CREATE VIEW s.v_in AS SELECT m FROM s.t",
+            "CREATE TABLE other.child (id int PRIMARY KEY, t_id int REFERENCES s.t (id))",
+        )
+        tables = DumpScope(kind="tables", schema_name="s", names=["t"])
+        schema = DumpScope(kind="schema", schema_name="s")
+        no_views = DumpObjectKinds(views=False)
+        for ddl in (True, False):
+            found = catalog_in(database, tables, ddl=ddl)
+            assert [(d.target, d.kind, d.name) for d in found.dependents] == [
+                ("s.mood", "table column", "s.u.m"), ("s.mood", "view", "s.v_in"),  # a view's column: the view
+                ("s.stamp()", "trigger", "u_stamp on s.u"),
+                ("s.t", "foreign key", "child_t_id_fkey on other.child"), ("s.t", "view", "other.v_t"),
+                ("s.t", "view", "s.v_in")], ddl
+            assert [(d.target, d.name) for d in catalog_in(database, schema, no_views, ddl=ddl).dependents] == [
+                ("s.mood", "s.v_in"), ("s.t", "child_t_id_fkey on other.child"), ("s.t", "other.v_t"),
+                ("s.t", "s.v_in")], ddl
+        # with views chosen, the schema's own view is dropped by the file first: only what is outside is left
+        assert [d.name for d in catalog_in(database, schema).dependents] == [
+            "child_t_id_fkey on other.child", "other.v_t"]
+        found = catalog_in(database, tables)
+        said = drop_warnings(found, "both", True)
+        assert said[0] == ("Drop objects first: s.u.m (table column), s.v_in (view), not in this dump, depend on s.mood, "
+                           "so restoring where they exist fails at that DROP. Dump them too, or turn Drop objects first "
+                           "off.")
+        assert said[1] == ("Drop objects first: u_stamp on s.u (trigger, not in this dump) depends on s.stamp(), so "
+                           "restoring where it exists fails at that DROP. Dump it too, or turn Drop objects first off.")
+        assert said[2] == ("Drop objects first: child_t_id_fkey on other.child (foreign key), other.v_t (view), s.v_in "
+                           "(view), not in this dump, depend on s.t, so restoring where they exist fails at that DROP. "
+                           "Dump them too, or turn Drop objects first off.")
+        assert len(said) == 3 and drop_warnings(found, "both", False) == []
+        drops = {item.name: item.drop for item in (*found.pre, *found.post) if item.drop}
+        assert _blocked_drops(database, [drops[name] for name in ("s.mood", "s.stamp()", "s.t")]) == ["2BP01"] * 3

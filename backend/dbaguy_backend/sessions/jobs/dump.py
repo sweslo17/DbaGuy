@@ -41,7 +41,7 @@ from ...services.safety import GuardAction, is_plain_read
 from ...sql.bulk_insert import InsertBatcher, size_warning
 from ...sql.dialects import Dialect
 from ...sql.dump_script import (
-    RESTORE_BACKSLASH_ESCAPES, RESTORE_CHECKS_FOREIGN_KEYS, DumpScript, default_rows_text, filter_warnings,
+    RESTORE_BACKSLASH_ESCAPES, RESTORE_CHECKS_FOREIGN_KEYS, DumpScript, default_rows_text, restore_warnings,
     statement_end, table_sql,
 )
 from ...sql.select_builder import FILTER_NOT_A_CONDITION, build_copy_select, build_count_select, check_filter
@@ -217,7 +217,7 @@ class DumpJob(Job):
                                 drop_first=command.drop_first, filter=command.filter,
                                 created=datetime.now().astimezone().isoformat("T", "seconds"))
             tables, said = data_order(ctx.dialect, catalog.tables) if not script.schema else (list(catalog.tables), [])
-            warnings = [*filter_warnings(catalog, command.content, command.drop_first, command.filter),
+            warnings = [*restore_warnings(catalog, command.content, command.drop_first, command.filter),
                         *catalog.warnings, *said]
             self._log_start(catalog, target)
             with atomic_text_file(target) as file:
