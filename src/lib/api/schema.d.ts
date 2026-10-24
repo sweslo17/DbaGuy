@@ -3713,7 +3713,7 @@ export interface components {
              * Code
              * @enum {string}
              */
-            code: "target_exists" | "target_missing" | "target_not_writable" | "unmappable_type" | "invalid_type" | "same_table" | "same_sqlite_file" | "source_missing" | "missing_column" | "unconvertible" | "query_not_select" | "no_columns" | "duplicate_column" | "invalid_filter" | "duplicate_target";
+            code: "target_exists" | "target_missing" | "target_not_writable" | "unmappable_type" | "invalid_type" | "same_table" | "same_sqlite_file" | "source_missing" | "missing_column" | "unconvertible" | "query_not_select" | "no_columns" | "duplicate_column" | "invalid_filter" | "duplicate_target" | "cascade_loop";
             /** Message */
             message: string;
             /** Column */
