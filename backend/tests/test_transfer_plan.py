@@ -16,7 +16,9 @@ from dbaguy_backend.services.transfer_service import (
     CREATED_STAYS, FK_NOT_ENFORCED, FK_UNCHECKED, KEY_NOT_CREATED, NON_TRANSACTIONAL, NON_TRANSACTIONAL_REPLACE,
     QUERY_RUNS_AGAIN, foreign_key_warnings, referenced_tables,
 )
-from dbaguy_backend.sql.type_map import FRACTION_NOTE, MYSQL_JSON_NOTE, conversion, planned_column, primary_key
+from dbaguy_backend.sql.type_map import (
+    FRACTION_NOTE, MYSQL_JSON_NOTE, KeyPlan, conversion, planned_column, primary_key,
+)
 from tests.data_support import DataApp, dropping
 from tests.edit_support import ENGINES, scratch_db
 from tests.support import requires_mssql, requires_mysql, requires_pg
@@ -402,59 +404,102 @@ def _source_column(name: str, family: str, type_name: str = "text") -> TableColu
                        compare="none", writable=True)
 
 
-def test_a_new_tables_key_columns_get_types_the_target_can_key() -> None:  # fix I2, pure
+def test_a_new_tables_key_columns_get_types_the_target_can_key() -> None:  # fix I2 and fix round 2, pure
     code, doc, blob = _source_column("code", "text"), _source_column("doc", "json"), _source_column("b", "binary")
+    a, b, n = _source_column("a", "text"), _source_column("b", "text"), _source_column("n", "int64")
     my, ms = Dialect.MYSQL, Dialect.TSQL
-    assert primary_key([(code, "longtext", False)], my).types == ("varchar(768)",)
-    assert primary_key([(code, "longtext", False)], my).notes == (
-        "Key column: varchar(768) because MySQL can't key longtext; longer values fail their row",)
+
+    def bounded(name: str, type_sql: str, dialect: Dialect) -> str:
+        limit = "MySQL keys at most 3,072" if dialect is my else "SQL Server keys at most 900"
+        return f"Key column {name} becomes {type_sql}: {limit} bytes; longer values fail their row"  # N4
+
+    assert primary_key([(code, "longtext", False)], my) == KeyPlan(("varchar(768)",),
+                                                                   (bounded("code", "varchar(768)", my),))
     assert primary_key([(code, "varchar(100)", False)], my).notes == (None,)  # its declared length fits: kept
     assert primary_key([(code, "varchar(1000)", False)], my).types == ("varchar(768)",)  # 4,000 bytes do not
-    assert primary_key([(code, "nvarchar(max)", False)], ms).types == ("nvarchar(450)",)
+    assert primary_key([(code, "nvarchar(max)", False)], ms) == KeyPlan(("nvarchar(450)",),
+                                                                        (bounded("code", "nvarchar(450)", ms),))
     assert primary_key([(_source_column("c", "varchar"), "varchar(max)", False)], ms).types == ("varchar(900)",)
     assert primary_key([(blob, "longblob", False)], my).types == ("varbinary(3072)",)
     assert primary_key([(blob, "varbinary(max)", False)], ms).types == ("varbinary(900)",)
     assert primary_key([(doc, "json", False)], my).reason == "doc would be json, which MySQL can't key"
     assert primary_key([(code, "longtext", True)], my).reason == "code would be longtext, which MySQL can't key"
-    assert primary_key([(code, "longtext", False), (code, "longtext", False)], my).reason == (
-        "its columns would take 6,144 bytes, and MySQL keys at most 3,072")
-    assert primary_key([(code, "nvarchar(400)", False), (_source_column("n", "int64"), "bigint", False)],
-                       ms).types == ("nvarchar(400)", "bigint")  # 808 bytes
     assert primary_key([(code, "text", False)], Dialect.POSTGRES).types == ("text",)  # PostgreSQL keys it as it is
+    # N3: MySQL's text key columns share what the other key columns leave of its 3,072 bytes
+    assert primary_key([(code, "longtext", False), (n, "bigint", False)], my).types == ("varchar(766)", "bigint")
+    assert primary_key([(a, "longtext", False), (b, "longtext", False), (_source_column("i", "int32"), "int", False)],
+                       my).types == ("varchar(383)", "varchar(383)", "int")
+    assert primary_key([(a, "varchar(100)", False), (b, "longtext", False)], my) == KeyPlan(
+        ("varchar(100)", "varchar(384)"), (None, bounded("b", "varchar(384)", my)))
+    assert primary_key([(a, "varchar(1000)", True), (n, "bigint", False)], my).reason == (
+        "its columns would take more than the 3,072 bytes MySQL keys")  # the user's type: never shortened
+    # N2: SQL Server creates a key declared wider than 900 bytes; only a longer row fails
+    wide = [(_source_column(name, "varchar"), "nvarchar(400)", False) for name in "abc"]
+    assert primary_key(wide, ms) == KeyPlan(("nvarchar(400)",) * 3, (None,) * 3)
+    assert primary_key([(a, "nvarchar(max)", False), (b, "nvarchar(max)", False)], ms).types == (
+        "nvarchar(450)", "nvarchar(450)")
+    # N4: a key whose type does not change says nothing
+    assert primary_key([(_source_column("v", "varchar"), "varchar(255)", False)], my).notes == (None,)
+    assert primary_key([(_source_column("v", "varchar"), "nvarchar(510)", False)], ms).notes == (None,)
+    # N1: a type no rule reads keeps its key, with no note: the server decides at CREATE
+    for type_sql, dialect, chosen in (("nvarchar(100) COLLATE Latin1_General_BIN", ms, True),
+                                      ("varchar(255) CHARACTER SET ascii", my, True), ("[nvarchar](100)", ms, True),
+                                      ("int(10) unsigned zerofill", my, False)):
+        assert primary_key([(code, type_sql, chosen)], dialect) == KeyPlan((type_sql,), (None,)), type_sql
 
 
-def _key_tables(pg, made: list) -> tuple[str, str, str]:
-    text_key, pair, json_key = table_name("k"), table_name("p"), table_name("j")
-    pg.execute(f"CREATE TABLE {pg.table(text_key)} (code text PRIMARY KEY, v int)",
-               f"CREATE TABLE {pg.table(pair)} (a text, b text, PRIMARY KEY (a, b))",
-               f"CREATE TABLE {pg.table(json_key)} (doc jsonb PRIMARY KEY)")
-    made += [("TABLE", text_key), ("TABLE", pair), ("TABLE", json_key)]
-    return text_key, pair, json_key
+def _key_tables(pg, made: list) -> dict[str, str]:
+    """PostgreSQL tables with the key shapes of fix I2 and fix round 2, by shape."""
+    shapes = {
+        "text": "(code text PRIMARY KEY, v int)",
+        "pair": "(a text, b text, PRIMARY KEY (a, b))",
+        "json": "(doc jsonb PRIMARY KEY)",
+        "tenant": "(tenant text, id bigint, PRIMARY KEY (tenant, id))",
+        "triple": "(a text, b text, n int, PRIMARY KEY (a, b, n))",
+        "wide": "(a varchar(200), b varchar(200), c varchar(200), PRIMARY KEY (a, b, c))",
+    }
+    names = {shape: table_name(shape[0]) for shape in shapes}
+    for shape, columns in shapes.items():
+        made.append(("TABLE", names[shape]))
+        pg.execute(f"CREATE TABLE {pg.table(names[shape])} {columns}")
+    return names
+
+
+def _keys_planned(plan) -> dict[str, tuple[list[str | None], list[str]]]:
+    """Each previewed table's target types and table warnings, by source name."""
+    return {table.source: ([c.target_type for c in table.columns], table.warnings) for table in plan.tables}
 
 
 @requires_pg
 @requires_mysql
 def test_a_text_key_into_mysql_is_bounded_and_a_key_it_cannot_make_is_left_out(app: DataApp, tmp_path: Path) -> None:
-    pg, my = scratch_db("postgres", tmp_path), scratch_db("mysql", tmp_path)  # fix I2, the CREATE run live
+    pg, my = scratch_db("postgres", tmp_path), scratch_db("mysql", tmp_path)  # fix I2 and round 2, CREATE run live
     try:
         with dropping(pg) as pg_made, dropping(my, before_drop=app.close_sessions) as my_made:
-            text_key, pair, json_key = _key_tables(pg, pg_made)
+            names = _key_tables(pg, pg_made)
             src, dst = profile(app, pg, "pg"), profile(app, my, "my")
-            plan = app.container.transfers.plan(tables_request(pg, src, [text_key, pair, json_key], my, dst))
-            chosen = {f"public.{text_key}": {"code": "longtext"}}
-            typed = app.container.transfers.plan(tables_request(pg, src, [text_key], my, dst, overrides=chosen))
+            plan = app.container.transfers.plan(tables_request(pg, src, list(names.values()), my, dst))
+            chosen = {f"public.{names['text']}": {"code": "longtext"}}
+            typed = app.container.transfers.plan(tables_request(pg, src, [names["text"]], my, dst, overrides=chosen))
             assert plan.plan_id is not None
             for table in plan.tables:  # each CREATE TABLE the preview shows is one MySQL takes
                 my_made.append(("TABLE", table.target))
                 my.execute(table.before[0])
-        coded, paired, keyed_json = plan.tables
+        by = {shape: _keys_planned(plan)[f"public.{name}"] for shape, name in names.items()}
+        made = {table.source: table.before[0] for table in plan.tables}
+        coded = next(table for table in plan.tables if table.source == f"public.{names['text']}")
         assert (coded.columns[0].target_type, coded.columns[0].conversion) == (
-            "varchar(768)", "Key column: varchar(768) because MySQL can't key longtext; longer values fail their row")
-        assert coded.before[0].endswith("PRIMARY KEY (code)\n)")
-        assert [c.target_type for c in paired.columns] == ["longtext", "longtext"]  # no key: nothing to bound
-        assert KEY_NOT_CREATED.format("its columns would take 6,144 bytes, and MySQL keys at most 3,072") in \
-            paired.warnings and "PRIMARY KEY" not in paired.before[0]
-        assert KEY_NOT_CREATED.format("doc would be json, which MySQL can't key") in keyed_json.warnings
+            "varchar(768)", "Key column code becomes varchar(768): MySQL keys at most 3,072 bytes; longer values fail "
+                            "their row")
+        assert by["pair"][0] == ["varchar(384)", "varchar(384)"]  # N3: the two share the key's bytes
+        assert by["tenant"][0] == ["varchar(766)", "bigint"]
+        assert by["triple"][0] == ["varchar(383)", "varchar(383)", "int"]
+        assert by["wide"][0] == ["varchar(200)"] * 3  # 2,400 bytes fit: kept
+        for shape in ("text", "pair", "tenant", "triple", "wide"):
+            assert "PRIMARY KEY (" in made[f"public.{names[shape]}"] and not any(
+                "primary key is not created" in said for said in by[shape][1]), shape
+        assert KEY_NOT_CREATED.format("doc would be json, which MySQL can't key") in by["json"][1]
+        assert "PRIMARY KEY" not in made[f"public.{names['json']}"]
         assert KEY_NOT_CREATED.format("code would be longtext, which MySQL can't key") in typed.tables[0].warnings
         assert typed.tables[0].columns[0].target_type == "longtext"  # the user's type wins
     finally:
@@ -466,25 +511,30 @@ def test_a_text_key_into_mysql_is_bounded_and_a_key_it_cannot_make_is_left_out(a
 @requires_mssql
 def test_a_text_key_into_sql_server_is_bounded_and_a_key_it_cannot_make_is_left_out(app: DataApp,
                                                                                     tmp_path: Path) -> None:
-    pg, ms = scratch_db("postgres", tmp_path), scratch_db("mssql", tmp_path)  # fix I2, the CREATE run live
+    pg, ms = scratch_db("postgres", tmp_path), scratch_db("mssql", tmp_path)  # fix I2 and round 2, CREATE run live
     try:
         with dropping(pg) as pg_made, dropping(ms, before_drop=app.close_sessions) as ms_made:
-            text_key, pair, json_key = _key_tables(pg, pg_made)
+            names = _key_tables(pg, pg_made)
             src, dst = profile(app, pg, "pg"), profile(app, ms, "ms")
-            plan = app.container.transfers.plan(tables_request(pg, src, [text_key, pair, json_key], ms, dst))
+            plan = app.container.transfers.plan(tables_request(pg, src, list(names.values()), ms, dst))
             assert plan.plan_id is not None
-            for table, name in zip(plan.tables, (text_key, pair, json_key), strict=True):
-                ms_made.append(("TABLE", name))
+            for table in plan.tables:  # a key declared wider than 900 bytes too: SQL Server warns and creates it
+                ms_made.append(("TABLE", table.source.removeprefix("public.")))
                 ms.execute(table.before[0])
-        coded, paired, keyed_json = plan.tables
+        by = {shape: _keys_planned(plan)[f"public.{name}"] for shape, name in names.items()}
+        made = {table.source: table.before[0] for table in plan.tables}
+        coded = next(table for table in plan.tables if table.source == f"public.{names['text']}")
         assert (coded.columns[0].target_type, coded.columns[0].conversion) == (
-            "nvarchar(450)", "Key column: nvarchar(450) because SQL Server can't key nvarchar(max); longer values fail "
-                             "their row")
-        assert coded.before[0].endswith("PRIMARY KEY (code)\n)")
-        assert [c.target_type for c in paired.columns] == ["nvarchar(max)", "nvarchar(max)"]
-        assert KEY_NOT_CREATED.format("its columns would take 1,800 bytes, and SQL Server keys at most 900") in \
-            paired.warnings
-        assert KEY_NOT_CREATED.format("doc would be nvarchar(max), which SQL Server can't key") in keyed_json.warnings
+            "nvarchar(450)", "Key column code becomes nvarchar(450): SQL Server keys at most 900 bytes; longer values "
+                             "fail their row")
+        assert by["pair"][0] == ["nvarchar(450)", "nvarchar(450)"]  # N2: 1,800 bytes declared, the key is kept
+        assert by["tenant"][0] == ["nvarchar(450)", "bigint"]
+        assert by["triple"][0] == ["nvarchar(450)", "nvarchar(450)", "int"]
+        assert by["wide"][0] == ["nvarchar(400)"] * 3  # not a max type: as mapped, no key note
+        for shape in ("text", "pair", "tenant", "triple", "wide"):
+            assert "PRIMARY KEY (" in made[f"public.{names[shape]}"] and not any(
+                "primary key is not created" in said for said in by[shape][1]), shape
+        assert KEY_NOT_CREATED.format("doc would be nvarchar(max), which SQL Server can't key") in by["json"][1]
     finally:
         pg.close()
         ms.close()

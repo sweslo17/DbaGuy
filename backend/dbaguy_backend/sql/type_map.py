@@ -16,7 +16,7 @@ from decimal import Decimal
 from typing import Any
 
 from ..adapters.columns import TableColumn, TypeFamily
-from ..adapters.families import of_name
+from ..adapters.families import NamedType, of_name
 from ..domain.data_jobs import ENGINE_NAMES
 from ..domain.dialect import Dialect
 from ..domain.edits import EditKind
@@ -323,16 +323,13 @@ def type_problem(dialect: Dialect, text: str) -> str | None:
 
 # ---- a new table's primary key ----
 
-# The most bytes a primary key's columns take together (06c fix I2): MySQL's InnoDB index (a utf8mb4 character takes 4),
-# SQL Server's clustered index, which PRIMARY KEY makes (an nvarchar character takes 2). PostgreSQL and SQLite key every
-# type a copy gives a key column.
+# The bytes a primary key's columns take together (06c Task 2 fix I2, fix round 2). MySQL's InnoDB index is a hard
+# limit (utf8mb4: 4 bytes a character): a wider CREATE TABLE is refused (1071). SQL Server's clustered index keys 900
+# bytes of each row: a key declared wider is created (with a warning) and only a row whose key is longer fails (N2), so
+# there only a type it cannot key at all is replaced. PostgreSQL and SQLite key every type a copy gives a key column.
 KEY_BYTES: dict[Dialect, int] = {Dialect.MYSQL: 3_072, Dialect.TSQL: 900}
-# The bounded type a text or binary key column gets when its own is too wide to key: Unicode text, other text, binary
-_KEY_TYPES: dict[Dialect, tuple[str, str, str]] = {
-    Dialect.MYSQL: ("varchar(768)", "varchar(768)", "varbinary(3072)"),
-    Dialect.TSQL: ("nvarchar(450)", "varchar(900)", "varbinary(900)"),
-}
-# The bytes a key takes of a fixed-size type's column (the larger of MySQL's and SQL Server's; decimal by its digits)
+_MSSQL_KEY_TYPES = ("nvarchar(450)", "varchar(900)", "varbinary(900)")  # Unicode text, other text, binary: 900 bytes
+# The bytes MySQL's key takes of a fixed-size type's column, at most (decimal by its digits): only MySQL's limit is a sum
 _KEY_WIDTHS: dict[TypeFamily, int] = {
     "bool": 1, "int16": 2, "int32": 4, "int64": 8, "uint64": 8, "year": 2, "money": 8, "float32": 4, "float64": 8,
     "date": 3, "time": 6, "duration": 6, "time_tz": 6, "timestamp": 8, "timestamp_tz": 10, "uuid": 16, "enum": 2,
@@ -340,32 +337,34 @@ _KEY_WIDTHS: dict[TypeFamily, int] = {
 }
 _DECIMAL_LEFTOVER = (0, 1, 1, 2, 2, 3, 3, 4, 4)  # MySQL: the bytes of 0–8 digits beyond each 9 (which take 4)
 _STRING = frozenset({"char", "varchar", "text"})
+_MYSQL_CHAR_BYTES = 4  # utf8mb4
 
 
-def _decimal_bytes(dialect: Dialect, precision: int | None, scale: int | None) -> int:
-    if dialect is Dialect.TSQL:
-        digits = precision or 38
-        return 5 if digits <= 9 else 9 if digits <= 19 else 13 if digits <= 28 else 17
+def _decimal_bytes(precision: int | None, scale: int | None) -> int:
     if precision is None:
         return 30  # decimal(65,30), MySQL's widest
     whole, fraction = precision - (scale or 0), scale or 0
     return sum(part // 9 * 4 + _DECIMAL_LEFTOVER[part % 9] for part in (whole, fraction))
 
 
-def _key_width(dialect: Dialect, type_sql: str) -> int | None:
-    """The bytes a key takes of a column of `type_sql` on MySQL or SQL Server, or None: that engine cannot key it (an
-    unbounded text or binary type, json, xml, a type no rule knows)."""
-    named = of_name(dialect, type_sql)
+def _unkeyable(dialect: Dialect, named: NamedType) -> bool:
+    """A type of a family the engine never keys (fix round 2, N1): MySQL's text, blob and json; SQL Server's max types,
+    text, ntext, image and xml. A type no rule reads (`other`: a COLLATE, a CHARACTER SET, brackets, zerofill) is not
+    one: the server decides at CREATE."""
+    if named.family == "text" or (named.family == "binary" and named.length is None):
+        return True
+    return named.family == ("json" if dialect is Dialect.MYSQL else "xml")
+
+
+def _mysql_key_width(named: NamedType) -> int:
+    """The bytes MySQL's key takes of a keyable column: 0 for a type no rule reads (the server decides)."""
     if named.family in ("char", "varchar"):
-        if named.length is None:
-            return None
-        unit = 4 if dialect is Dialect.MYSQL else 2 if type_sql.strip().lower().startswith("n") else 1
-        return unit * named.length
+        return _MYSQL_CHAR_BYTES * (named.length or 0)
     if named.family == "binary":
-        return named.length
+        return named.length or 0
     if named.family == "decimal":
-        return _decimal_bytes(dialect, named.precision, named.scale)
-    return _KEY_WIDTHS.get(named.family)
+        return _decimal_bytes(named.precision, named.scale)
+    return _KEY_WIDTHS.get(named.family, 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,40 +377,62 @@ class KeyPlan:
     reason: str | None = None
 
 
+def _bounded_note(column: TableColumn, type_sql: str, dialect: Dialect) -> str:
+    return (f"Key column {column.name} becomes {type_sql}: {engine_name(dialect)} keys at most "
+            f"{KEY_BYTES[dialect]:,} bytes; longer values fail their row")
+
+
 def primary_key(columns: Sequence[tuple[TableColumn, str, bool]], dialect: Dialect) -> KeyPlan:
     """The source's primary key as a new table on `dialect` can have it: `columns` are the key's source columns, each
-    with the type the new table gives it and whether the user chose that type. MySQL and SQL Server key a bounded
-    width only (KEY_BYTES): a text column too wide to key (MySQL's longtext, SQL Server's nvarchar(max), a varchar wider
-    than the limit) becomes varchar(768) / nvarchar(450) (varchar(900) for non-Unicode text), a binary one
-    varbinary(3072) / varbinary(900), each with a note, and its declared length is kept when it fits. A type the user
-    chose is never replaced; a column of any other type (json, xml, PostgreSQL's text of a value) the engine cannot
-    key, or columns wider together than the limit, give no key: `reason` says why."""
+    with the type the new table gives it and whether the user chose that type, which is never replaced.
+
+    - SQL Server: a text column of a type it cannot key (nvarchar(max), varchar(max)) becomes nvarchar(450) or
+      varchar(900), a binary one varbinary(900), each with a note; every other type stays as it is (N2).
+    - MySQL: its text columns (char, varchar, text) share the bytes the other key columns leave (N3): each keeps its
+      declared length when it fits in floor((3,072 − the others' bytes) / (4 × their number)) characters, else becomes
+      a varchar of that many, with a note; an unbounded binary column takes the same share of bytes as a varbinary.
+    - A column of a type the engine never keys that is neither (json, xml, PostgreSQL's text of a value, a type the user
+      chose), or a MySQL key with no room left for a text column, gives no key: `reason` says why. A type no rule reads
+      keeps its key, with no note (N1)."""
     limit = KEY_BYTES.get(dialect)
     if limit is None:
         return KeyPlan(tuple(type_sql for _, type_sql, _ in columns), (None,) * len(columns))
     name = engine_name(dialect)
     types: list[str] = []
     notes: list[str | None] = []
-    total = 0
+    shared: list[tuple[int, TableColumn, NamedType]] = []  # MySQL: its place, the column, its type as read
+    fixed = 0
     for column, type_sql, chosen in columns:
-        width, kept, note = _key_width(dialect, type_sql), type_sql, None
-        if (width is None or width > limit) and not chosen:
-            unicode, other, binary = _KEY_TYPES[dialect]
-            into = of_name(dialect, type_sql).family
-            if column.family in _STRING and into in _STRING:
-                kept = unicode if type_sql.strip().lower().startswith("n") else other  # MySQL's are one type
-            elif column.family == "binary" and into == "binary":
-                kept = binary
-            if kept != type_sql:
-                width = _key_width(dialect, kept)
-                note = f"Key column: {kept} because {name} can't key {type_sql}; longer values fail their row"
-        if width is None or width > limit:
+        named = of_name(dialect, type_sql)
+        string = column.family in _STRING and named.family in _STRING
+        bounds = not chosen and (string or (column.family == "binary" and named.family == "binary"))
+        if _unkeyable(dialect, named) and not bounds:
             return KeyPlan(reason=f"{column.name} would be {type_sql}, which {name} can't key")
-        types.append(kept)
-        notes.append(note)
-        total += width
-    if total > limit:
-        return KeyPlan(reason=f"its columns would take {total:,} bytes, and {name} keys at most {limit:,}")
+        types.append(type_sql)
+        notes.append(None)
+        if dialect is Dialect.TSQL:
+            if _unkeyable(dialect, named):  # a max type: the bounded type of its kind
+                unicode, other, binary = _MSSQL_KEY_TYPES
+                kept = binary if named.family == "binary" else unicode if type_sql.strip().lower().startswith("n") \
+                    else other
+                types[-1], notes[-1] = kept, _bounded_note(column, kept, dialect)
+        elif bounds and (string or _unkeyable(dialect, named)):  # MySQL: shares the bytes left (N3)
+            shared.append((len(types) - 1, column, named))
+        else:
+            fixed += _mysql_key_width(named)
+    if dialect is Dialect.TSQL or not shared and fixed <= limit:
+        return KeyPlan(tuple(types), tuple(notes))
+    share = (limit - fixed) // len(shared) if shared and fixed < limit else 0
+    if fixed > limit or share < (_MYSQL_CHAR_BYTES if any(n.family in _STRING for _, _, n in shared) else 1):
+        return KeyPlan(reason=f"its columns would take more than the {limit:,} bytes {name} keys")
+    for at, column, named in shared:
+        if named.family == "binary":
+            kept = f"varbinary({share})"
+        elif named.length is not None and named.length <= share // _MYSQL_CHAR_BYTES:
+            continue  # its declared length fits: kept, no note
+        else:
+            kept = f"varchar({share // _MYSQL_CHAR_BYTES})"
+        types[at], notes[at] = kept, _bounded_note(column, kept, dialect)
     return KeyPlan(tuple(types), tuple(notes))
 
 
