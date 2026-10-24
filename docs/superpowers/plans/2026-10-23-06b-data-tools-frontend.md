@@ -4955,7 +4955,7 @@ Each open decision the spec left, with why and what it costs. Labels V (05b used
 | V13 | Couchbase's query context comes from the tree node (bucket, scope) or the connection's default; no picker in the dialog. | Run SQL file on Couchbase is rare; the context picker needs its own lists. | Change the context by starting from another node. |
 | V14 | Object kinds: a schema or database gets the engine's kinds; a table, a partition or the Tables folder gets Triggers only; a view none. Per-object checkboxes only in the Tables folder. | `DumpScope` names tables of one schema; a table's sequences and column types always come with it (06a); §3.3.1's 勾選的表 is the Tables folder. | No dump of "these views only" (dump each, or the schema). |
 | V15 | The dump's "table k of n" comes from the plan's table order, kept on the job when it starts. | The progress event names only the current object (06a D-06-11). | A listed job shows the name without "k of n". |
-| V16 | The dump plan is a `useQuery` (`retry: false`, `gcTime: 0`), its path debounced 400 ms; the inspection and the excerpt are plain calls with a sequence number. | A plan is a read the dialog keeps current; a PG plan can wait 5 s on a lock (06a M3): no automatic retry. | None. |
+| V16 | The dump plan is a `useQuery` (`retry: false`, `gcTime: 0`), its path debounced 400 ms; the inspection and the excerpt are plain calls with a sequence number. 〔As built (Task 6 fix round 1): the whole plan request is debounced 400 ms (`PLAN_DEBOUNCE_MS`, `DumpDialog`), not only its path; the first render asks at once.〕 | A plan is a read the dialog keeps current; a PG plan can wait 5 s on a lock (06a M3): no automatic retry. | None. |
 | V17 | ⌘⇧P: "Dump…" (listed for engines that dump; a table tab through its own handler with its filter, a query tab: its database, MySQL's schema, SQLite's main), "Run SQL file…" (always), "Show jobs". | M3; the table tab knows its filter, so the palette asks it (as for the edit commands, 05b H11). | Three more commands. |
 | V18 | Cancel in a job's view: clickable again 1 s after a click (SQL Server's second Cancel drops a stuck connection, as the export); disabled at the COMMIT stage. | After COMMIT is sent a Cancel cannot reach the driver (06a). | None. |
 | V19 | The export dialog moves onto `FilePathField`, `safeFileStem`, `pathProblem` and `formatElapsed` (its elapsed time reads "2 min 05 s" instead of "2:05"). | DRY: three dialogs, one path row. | A small visual change in the export. |
@@ -4974,7 +4974,7 @@ Each open decision the spec left, with why and what it costs. Labels V (05b used
 | B7 | §3.6 DumpDialog progress: 「目前的物件、第幾個」. | `JobProgressEvent` names the object only. | V15. |
 | B8 | §3.6 Jobs: 「重開它的對話框（進度、結果、取消）」 after a reload. | `JobInfo` has no command: the result and Cancel work, a run-again needs the command. | V6. |
 | B9 | §3.6: "SQLite busy uses ⑤'s SQLITE_BUSY_NOTE" (06a F4 carry). | ⑤'s note ends "then commit again". | `lib/sqliteBusy.ts`'s `sqliteBusyNote(retry)`: ⑤ keeps its exact text, a run says "run the file again", a dump "dump again". |
-| B10 | §3.3.4: `<database>_<schema 或表>_<yyyyMMdd-HHmm>.sql`. | MySQL's schema is its database; SQLite has a file and `main`; the Tables folder is several tables. | `dumpFileName`: MySQL not twice, SQLite the file's stem, "main" left out, the folder `<schema>_<n>-tables`; `/`, `:` and control characters removed; 120 characters at most. |
+| B10 | §3.3.4: `<database>_<schema 或表>_<yyyyMMdd-HHmm>.sql`. | MySQL's schema is its database; SQLite has a file and `main`; the Tables folder is several tables. | `dumpFileName`: MySQL not twice, SQLite the file's stem, "main" left out, the folder `<schema>_<n>-tables`; `/`, `:` and control characters removed; 120 characters at most. 〔As built: the stem is at most 200 bytes of UTF-8 (`safeFileStem`, `src/lib/filePaths.ts`: APFS's 255 bytes with room for the stamp and `.sql`); the 06b fix wave leaves `<n>-tables` out when no table is checked (F-f).〕 |
 | B11 | §3.6 RunFileDialog target: 「連線、database；PG 的 search path」. | Couchbase takes a query context instead (`RunFileCommand.query_context`). | V13. |
 | B12 | §3.6 入口: 「表格資料 tab 的選單」. | The table tab has no menu. | V4. |
 | B13 | R-06-15 (a job survives its dialog and the window). | `DELETE /profiles/{id}` calls `close_for_profile`, which closes the profile's job sessions too: deleting a connection would end its running jobs as unknown. | The tree refuses to delete a connection while its jobs run (Task 8). |
@@ -4982,7 +4982,7 @@ Each open decision the spec left, with why and what it costs. Labels V (05b used
 
 ## Appendix A: the user's final test list (06b), for the coordinator's follow-ups note
 
-The 06a note's company database checklist stays; its UI items are reachable now (item 11). 〔Updated in Task 9 against what Tasks 1–8 built: the shell holds every window close (no `allow-destroy`), the window comes to the front before the question (`reveal_window`), `from_line` / `file_changed`, the inexact place (`StoppedAt.exact`), the three-state Couchbase context, the Jobs popover's `data-non-modal`, `endingIsNews`, B13's sync. Items 1–5 are packaged-app only and were not tested in 06b: nobody drove the native app; the coordinator's manual pass ran in web mode.〕
+The 06a note's company database checklist stays; its UI items are reachable now (item 11). 〔Updated in Task 9 against what Tasks 1–8 built: the shell holds every window close (no `allow-destroy`), the window comes to the front before the question (`reveal_window`), `from_line` / `file_changed`, the inexact place (`StoppedAt.exact`), the three-state Couchbase context, the Jobs popover's `data-non-modal`, `endingIsNews`, B13's sync. Items 1–5 are packaged-app only and were not tested in 06b: nobody drove the native app; the coordinator's manual pass ran in web mode.〕 〔Updated in the 06b final fix wave (2026-10-25): item 3's second check (Clear finished makes the job unreachable through the UI), items 4 and 9 (an own Cancel that ended partial or unknown is told; a crash loses the jobs), and the checks the wave added (items 8, 12–14: no run again for a stop it cannot place, the file-changed note, the red Drop objects first warning, partitions, MySQL's estimate, the muted Cancel box, the focus after a modal over Jobs).〕
 
 ### 06b 測試清單（資料工具：dump 與 Run SQL file）
 
@@ -4999,15 +4999,18 @@ The 06a note's company database checklist stays; its UI items are reachable now 
    - ⌘W 仍只關目前的 tab；結束或關視窗前打的字照樣存進 workspace（重開後都在）。
    - 從 Dock 的 Quit、登出或關機結束：不會問（已知，系統直接結束 app）。
 2. **檔案對話框（打包版）。** Dump 的 Choose… 是存檔面板，預設檔名像 `dbaguy_public_20261023-1405.sql`；選好之後焦點在 Dump，按 Return 就開始（不會再開一次面板）。Run SQL file 的 Choose… 是開檔面板，選了就讀檔、顯示前 200 行，焦點到 Run（紅色連線是到勾選框）。
-3. **Show in Finder（打包版）。** Dump 完成後按 Show in Finder，Finder 選到那個檔；在 Jobs 裡 Clear finished 之後再開不到（會說檔案或 job 已不在）。
-4. **通知（打包版）。** 設定裡的 long_query_seconds 設小一點，開始 dump 或 run 後切到別的 app：結束時有系統通知（第一次會問權限）；app 在前景、對話框關著時，右下角有提示，可以按 Open 回到結果；對話框開著時沒有提示；自己按 Cancel 取消的不通知也不提示。
+3. **Show in Finder（打包版）。** Dump 完成後按 Show in Finder，Finder 選到那個檔；Dump 完成後在 Finder 刪掉那個檔，再按 Show in Finder：toast 說檔案已不在。
+4. **通知（打包版）。** 設定裡的 long_query_seconds 設小一點，開始 dump 或 run 後切到別的 app：結束時有系統通知（第一次會問權限）；app 在前景、對話框關著時，右下角有提示，可以按 Open 回到結果；對話框開著時沒有提示；自己按 Cancel 取消的不通知也不提示（例外：取消之後結果是 partial 或 unknown 的 run 照樣提示，因為要你去看目標）。
 5. **注音（打包版）。** 在 Dump／Run 對話框的路徑欄、search path、Start at statement 用注音輸入：組字中按 Enter 選字，不會開始 dump、不會讀檔、不會執行。
 6. **四個 engine 的 dump → run（你的真實 schema，在可以亂改的 database 上）。** PostgreSQL、SQL Server、SQLite 用 All or nothing；MySQL 用 Statement by statement（MySQL 的 DDL 會自動 commit，All or nothing 在第一個 DDL 前就會被拒絕）。
 7. **紅色連線（CR-3）。** production 色的連線：Run 是紅色按鈕，要先勾「I've checked the file and the connection」；勾了之後換 database、改 search path 或換檔案都要再勾；從結果按 Run again… 回到表單時也要再勾一次。唯讀的連線在目標清單裡是灰的，樹上的 Run SQL file… 也是灰的。
-8. **出錯之後。** 逐句執行停在某一行：Show line N 顯示那一段（那一行上色）；Run again from line N 與 Skip it and continue 都回到表單、預先填好（不會直接執行）；檔案自己的 BEGIN…COMMIT 裡出錯時只有 Run again from line N（從那個 BEGIN 開始，前面被 rollback 的不會漏掉）。在兩次之間改了檔案（例如在最前面加一行）再按 Run again from line N：結果是「Not started」與「The file changed: statement N now starts at line M」，什麼都沒執行。
-9. **大檔與 Jobs。** 一個 1 GB 的檔：進度、ETA、Cancel；關掉對話框後側欄底部的 Jobs 還在（跑著時是 spinner 與「1 running」），重新開回來有進度；Jobs 開著時 ⌘⇧P、⌘W 照常；重新載入視窗（或 app 當掉後回來）Jobs 仍列出它（之後列出的 job 結果旁沒有時間）。
+8. **出錯之後。** 逐句執行停在某一行：Show line N 顯示那一段（那一行上色）；Run again from line N 與 Skip it and continue 都回到表單、預先填好（不會直接執行）；檔案自己的 BEGIN…COMMIT 裡出錯時只有 Run again from line N（從那個 BEGIN 開始，前面被 rollback 的不會漏掉）。在兩次之間改了檔案（例如在最前面加一行）再按 Run again from line N：結果是「Not started」與「The file changed: statement N now starts at line M」，什麼都沒執行；這時的 Run again… 回到表單，檔案上方說「The file changed since the last run: check where to start.」。停下的地方前面做了什麼說不準時（例如 MySQL 有 MyISAM 表的 database 裡一個寫入失敗，結果說「counted as applied; see the notes」）：沒有任何 Run again，只提示「Check the target, then choose where to start in a new run (Run SQL file… from the tree).」。自己按 Cancel 停下的 dump 或 run：錯誤框是灰的（不是紅的）、沒有重複的「Query cancelled」，run 的 Show line N 還在。
+9. **大檔與 Jobs。** 一個 1 GB 的檔：進度、ETA、Cancel；關掉對話框後側欄底部的 Jobs 還在（跑著時是 spinner 與「1 running」），重新開回來有進度；Jobs 開著時 ⌘⇧P、⌘W 照常；重新載入視窗（⌘R 或錯誤畫面的 Reload）後 Jobs 仍列出它（之後列出的 job 結果旁沒有時間）；app 整個當掉或 backend 重啟後不會（backend 跟著結束，History 那筆是 Interrupted）。Jobs 開著時按 ⌘⇧P 再按 Esc：焦點回到 Jobs 按鈕（不是落在頁面上）。
 10. **刪除連線。** 有 job 在跑的連線按 Delete：說「Profile not deleted — a job is still running on it」，等 job 結束再刪就可以。
 11. **公司資料庫（06a 清單的 UI 項目）。** SQL Server 的 snapshot 設定（「Not one consistent snapshot」與 SQL Server 的說明）、MySQL 的 DEFINER 與 sql_mode、PG 的 extension 與 `money[]`、大表的 dump 與 run 時間。
+12. **Drop objects first 被擋（PG、SQL Server）。** 只 dump 一張表（從表或 Tables 資料夾）並勾 Drop objects first，而範圍外有 view（SQL Server 是 schema-bound 的 view）或 FK 依賴那張表、或 trigger function 被別的表的 trigger 共用：預覽最上面有紅色的「Drop objects first: … (view, not in this dump) depends on …, so restoring where it exists fails at that DROP. Dump it too, or turn Drop objects first off.」，dump 完成的結果裡也有；取消勾選 Drop objects first 就沒有。schema 範圍把 Views 取消勾選時，自己 schema 的 view 也會被點名。MySQL、SQLite 不會出現（還原時不會失敗）。
+13. **Partition 與列數估計。** PG 有 partitioned 表的 database 或 schema：預覽寫「N tables」與「1 partition」，dump 完成的「rows in N tables」與檔頭的 Content 是同一個 N。MySQL 剛灌了很多列的表：預覽的 ≈ 列數接近實際（以前顯示快取的舊值，例如 10 萬列的表「≈ 41 rows」）。
+14. **大小與檔名。** 不到 1 KiB 的 dump（例如一張空表、只 dump 結構）結果的大小寫 bytes（像「840 bytes」），不是「1 KB」；Tables 資料夾一張都沒勾時，save panel 的預設檔名沒有「0-tables」。
 
 已知的限制，不要當成 bug 回報：
 - Dock 的 Quit、登出、關機不會問；有 job 在跑時，畫面卡住 2 秒以上或 job 清單 1 秒內查不到，⌘Q／關視窗也不會問就結束。
@@ -5018,6 +5021,7 @@ The 06a note's company database checklist stays; its UI items are reachable now 
 - Couchbase 的 Run SQL file 只能逐句，query context 來自你點的 bucket／scope（或連線的預設）。
 - 刪除有 job 在跑的連線會被擋下，等 job 結束再刪。
 - 連線的 database 選單沒有「Default database」（同 query tab）：要回到預設就換一條連線再換回來。
+- Drop objects first 的紅色警告：SQL Server 只看 FK 與 schema-bound 的參照（範圍外的表用了檔案會 DROP 的 alias type 等不會說）；PG 不看檔案自己的 DROP 順序。
 
 ## Self-review
 
