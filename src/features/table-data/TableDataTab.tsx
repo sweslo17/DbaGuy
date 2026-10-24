@@ -17,8 +17,8 @@ import { useReportTabStatus } from "@/stores/tabStatus";
 import { useWorkspace, type TableTabState } from "@/stores/workspace";
 import { useEngineInfo, useProfiles } from "../connections/hooks";
 import { RecoverableError } from "../connections/RecoverableError";
-import { openDumpDialog } from "../data-tools/dataDialogs";
-import { dumpEntryForTable } from "../data-tools/entryPoints";
+import { openCopyDialog, openDumpDialog } from "../data-tools/dataDialogs";
+import { copyEntryForTable, dumpEntryForTable } from "../data-tools/entryPoints";
 import { COMMIT_RUNNING } from "../edits/commitDialog";
 import { tableEditActions, useTableEditActions } from "../edits/editActions";
 import { EditBar } from "../edits/EditBar";
@@ -53,9 +53,11 @@ import { useTableData, type TableDataState } from "./useTableData";
 type View = "data" | "columns" | "ddl";
 const FILTER_BY_VALUE = "Filter by this value";
 const CUT_VALUE_MESSAGE = "This value cannot be matched exactly: the grid holds only its beginning";
-/** Dump table…'s tooltip while a filter is applied: the dialog offers its rows only, or all of them. */
-const DUMP_WITH_FILTER = "With the rows matching the filter, or all of them";
+/** Dump table…'s and Copy rows to…'s tooltip while a filter is applied: the dialog offers its rows only, or all of
+ * them. */
+const WITH_FILTER = "With the rows matching the filter, or all of them";
 const NO_DUMP = "This table cannot be dumped from here";
+const NO_COPY = "This table cannot be copied from here"; // an engine that does not copy (06c)
 const VIEWS: { value: View; label: string }[] = [
   { value: "data", label: "Data" },
   { value: "columns", label: "Columns" },
@@ -337,7 +339,18 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
   const openDump = useCallback(() => {
     if (dumpEntry) openDumpDialog(dumpEntry);
   }, [dumpEntry]);
-  useTableTabActions(tab.id, { dumpTable: { enabled: dumpEntry !== null, run: openDump } });
+  // Copy rows to… (spec ⑥ §3.6, 06c), with the filter applied now; the dialog says when the tab has staged changes
+  const copyEntry = useMemo(
+    () => copyEntryForTable(tab.profileId, engine, tab.path, state.filter, tab.id),
+    [tab.profileId, tab.id, tab.path, engine, state.filter],
+  );
+  const openCopy = useCallback(() => {
+    if (copyEntry) openCopyDialog(copyEntry);
+  }, [copyEntry]);
+  useTableTabActions(tab.id, {
+    dumpTable: { enabled: dumpEntry !== null, run: openDump },
+    copyRows: { enabled: copyEntry !== null, run: openCopy },
+  });
   const moreItems: MenuItem[] = [
     {
       label: "Dump table…",
@@ -347,9 +360,21 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
           ? NO_DUMP
           : "Reading the connection's details…"
         : dumpEntry.filter !== null
-          ? DUMP_WITH_FILTER
+          ? WITH_FILTER
           : undefined,
       onSelect: openDump,
+    },
+    {
+      label: "Copy rows to…",
+      disabled: !copyEntry,
+      title: !copyEntry
+        ? engine
+          ? NO_COPY
+          : "Reading the connection's details…"
+        : copyEntry.source.kind === "relation" && copyEntry.source.filter !== null
+          ? WITH_FILTER
+          : undefined,
+      onSelect: openCopy,
     },
   ];
   // ⌘S while this tab's Data view is shown, wherever the focus is in it (an editor stages first and asks itself):

@@ -5,8 +5,8 @@ import type { AppSettings, EngineInfo, Profile, ProfileEntry } from "@/lib/api/t
 import type { TabAction } from "@/lib/tabActions";
 import { openNewQuery, useWorkspace, type Tab } from "@/stores/workspace";
 import { enginesKey, findEngineInfo, profilesKey } from "../connections/hooks";
-import { openDumpDialog, openRunDialog, setJobsPopoverOpen } from "../data-tools/dataDialogs";
-import { paletteDumpEntry, paletteRunEntry } from "../data-tools/entryPoints";
+import { openCopyDialog, openDumpDialog, openRunDialog, setJobsPopoverOpen } from "../data-tools/dataDialogs";
+import { paletteCopyEntry, paletteDumpEntry, paletteRunEntry } from "../data-tools/entryPoints";
 import { useJobs } from "../data-tools/jobsStore";
 import { readTableEditActions, type TableEditActionId, type TableEditActions } from "../edits/editActions";
 import { refreshSchema } from "../explorer/refreshSchema";
@@ -153,6 +153,28 @@ const dumpCommand: PaletteCommand = {
   },
 };
 
+/**
+ * ⌘⇧P Copy data to… (spec ⑥ §3.6, 06c): a table tab copies its rows through its own handler (it knows its filter); a
+ * query tab its schema's tables (its database's default schema; MySQL: its database). Listed for engines that copy.
+ */
+const copyCommand: PaletteCommand = {
+  id: "dataTools.copy",
+  label: "Copy data to…",
+  visible: (ctx) => activeEngine(ctx)?.copy_data === true,
+  enabled: (ctx) =>
+    ctx.activeTab?.kind === "table"
+      ? (ctx.tableActions?.copyRows.enabled ?? false)
+      : paletteCopyEntry(ctx.activeTab, activeProfile(ctx), activeEngine(ctx), "") !== null,
+  run: (ctx) => {
+    if (ctx.activeTab?.kind === "table") {
+      runTabAction(readTableTabActions(ctx.activeTab.id)?.copyRows, "Copy data to…");
+      return;
+    }
+    const entry = paletteCopyEntry(ctx.activeTab, activeProfile(ctx), activeEngine(ctx), "");
+    if (entry) openCopyDialog(entry);
+  },
+};
+
 /** Couchbase: its plans (Explain). */
 const takesPlans = (ctx: CommandContext) => activeEngine(ctx)?.plan_format === "couchbase";
 /** Couchbase: the plan a statement ran with (Run with profile). */
@@ -219,6 +241,7 @@ export const COMMANDS: readonly PaletteCommand[] = [
     },
   },
   dumpCommand,
+  copyCommand,
   {
     id: "dataTools.runFile",
     label: "Run SQL file…",

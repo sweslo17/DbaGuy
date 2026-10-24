@@ -7,6 +7,7 @@ import type { JobTransport } from "./jobRunner";
 import { openingJob, type JobLoss } from "./jobState";
 import {
   clearFinishedJobs,
+  copyReadsSession,
   hasEndedJob,
   jobList,
   MAX_JOBS_KEPT,
@@ -330,5 +331,26 @@ describe("a copy's source connection (06c B13)", () => {
     expect(runningOn({ jobs, order: ["r1"] }, "src").map((job) => job.requestId)).toEqual(["r1"]);
     expect(runningOn({ jobs, order: ["r1"] }, "p1")).toHaveLength(1);
     expect(runningOn({ jobs, order: ["r1"] }, "other")).toHaveLength(0);
+  });
+});
+
+describe("a query tab's session a copy reads from (06c L-f)", () => {
+  const copy = (fields: Partial<CopyDataCommand>): JobRecord["command"] => ({ type: "copy_data", request_id: "c1", plan_id: "p", source_session_id: null, ...fields });
+
+  it("is read while the copy runs, by that session only, and not once it has ended", () => {
+    const running = { c1: record({ requestId: "c1", kind: "copy_data", command: copy({ source_session_id: "tab-1" }) }) };
+    const reading = { jobs: running, order: ["c1"] };
+    expect([copyReadsSession(reading, "tab-1"), copyReadsSession(reading, "tab-2")]).toEqual([true, false]);
+    const ended = { c1: { ...running.c1, state: { ...running.c1.state, phase: "ended" as const } } };
+    expect(copyReadsSession({ jobs: ended, order: ["c1"] }, "tab-1")).toBe(false);
+  });
+
+  it("is not read by a copy of tables, a run, or a job listed after a reload (no command)", () => {
+    const jobs = {
+      a: record({ requestId: "a", kind: "copy_data", command: copy({ source_session_id: null }) }),
+      b: record({ requestId: "b", kind: "copy_data", command: null }),
+      c: record({ requestId: "c", kind: "run_file", command }),
+    };
+    expect(copyReadsSession({ jobs, order: ["a", "b", "c"] }, "tab-1")).toBe(false);
   });
 });

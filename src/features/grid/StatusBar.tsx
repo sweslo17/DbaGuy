@@ -1,5 +1,6 @@
-import { Download } from "lucide-react";
+import { ArrowRightLeft, Download } from "lucide-react";
 import { memo } from "react";
+import { cn } from "@/lib/cn";
 import { plural } from "@/lib/format";
 import type { Aggregates } from "./aggregate";
 
@@ -13,6 +14,8 @@ interface StatusBarProps {
   aggregates: Aggregates | null;
   /** Opens the export dialog (shown only when set). */
   onExport?: () => void;
+  /** Opens the copy dialog for the whole result (shown only when set; 06c). */
+  onCopyToTable?: () => void;
 }
 
 /** Up to 15 significant digits: a double's precision, without float noise such as 0.30000000000000004. */
@@ -47,7 +50,7 @@ function Figures({ aggregates: a }: { aggregates: Aggregates }) {
 
 /** Under the grid: the size of the result, the selected cell count with its numeric figures, and Export. */
 export const StatusBar = memo(function StatusBar(props: StatusBarProps) {
-  const { rowCount, columnCount, hasMore, partial, aggregates, onExport } = props;
+  const { rowCount, columnCount, hasMore, partial, aggregates, onExport, onCopyToTable } = props;
   return (
     <div className="flex h-6 shrink-0 items-center gap-4 border-y border-border px-3 text-[12px] whitespace-nowrap text-muted">
       <span className="shrink-0">
@@ -64,12 +67,24 @@ export const StatusBar = memo(function StatusBar(props: StatusBarProps) {
         {onExport && (
           <button
             type="button"
-            className="-mr-2 flex h-5 shrink-0 items-center gap-1 rounded px-1.5 hover:bg-hover hover:text-fg"
+            // the last button reaches the bar's edge (-mr-2); Copy to table… is last when it is there
+            className={cn("flex h-5 shrink-0 items-center gap-1 rounded px-1.5 hover:bg-hover hover:text-fg", !onCopyToTable && "-mr-2")}
             title="Export the whole result to a file"
             onClick={onExport}
           >
             <Download size={12} />
             Export…
+          </button>
+        )}
+        {onCopyToTable && (
+          <button
+            type="button"
+            className="-mr-2 flex h-5 shrink-0 items-center gap-1 rounded px-1.5 hover:bg-hover hover:text-fg"
+            title="Copy the whole result into a table of any connection"
+            onClick={onCopyToTable}
+          >
+            <ArrowRightLeft size={12} />
+            Copy to table…
           </button>
         )}
       </span>

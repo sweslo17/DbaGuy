@@ -5,7 +5,7 @@ import { Group, Panel } from "react-resizable-panels";
 import { PanelHandle } from "@/components/ui/PanelHandle";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
-import type { Dialect } from "@/lib/api/types";
+import type { ColumnMeta, Dialect } from "@/lib/api/types";
 import { isImeKeyEvent } from "@/lib/ime";
 import { isCommandKey } from "@/lib/shortcuts";
 import { markEdited, readEditorBuffer, registerEditor, rememberEditorBuffer } from "@/stores/editorBuffers";
@@ -15,6 +15,9 @@ import { startSelection, useWorkspace, type QueryTabState } from "@/stores/works
 import { useEngineInfo, useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
 import { RecoverableError } from "../connections/RecoverableError";
+import { openCopyDialog } from "../data-tools/dataDialogs";
+import { copyEntryForResult } from "../data-tools/entryPoints";
+import { copyReadsSession, useJobs } from "../data-tools/jobsStore";
 import { CodeEditor, type CodeEditorHandle } from "../editor/CodeEditor";
 import { sqlCompletion, type CompletionTarget } from "../editor/completion";
 import { describeOnDemand } from "../editor/describe";
@@ -45,6 +48,10 @@ const NO_EXECUTIONS: Record<string, ExecutionState> = {};
 const NO_FIELDS: string[] = [];
 const NO_DRAFTS: Record<string, string> = {};
 
+/** What the tab says when a copy reading its result keeps it from closing or from switching its connection (06c L-f). */
+const copyReadsThisTab = (then: "close the tab" | "switch the connection") =>
+  `A copy is reading this tab's result: wait for it, or cancel it in Jobs, then ${then}`;
+
 /**
  * The keys that run: ⌘↵ by the `run.default` setting, ⌘⇧↵ every statement. The editor's keymap (`cm`, CodeMirror's
  * spelling) and the parameter fields (`shift`, for `isCommandKey`) both read this, so they never differ.
@@ -60,7 +67,8 @@ const RUN_KEYS: readonly { cm: string; shift: boolean; mode: RunMode }[] = [
  * as the tab, so undo history survives tab switches. ⌘↵ runs the selection or (by `run.default`) the statement under
  * the cursor; ⌘⇧↵ runs every statement; ⌘⇧F formats. ⌘S saves the tab to its script file (⌘⇧S: Save As). Closing the
  * tab or switching its connection first stops a running export and ends an open transaction, asking each time;
- * closing also asks about unsaved script changes. The tab hosts the export dialog, so it outlives the result grids. A
+ * closing also asks about unsaved script changes. Neither happens while a copy reads the tab's result (it runs on the
+ * tab's session): the tab says so and stays. The tab hosts the export dialog, so it outlives the result grids. A
  * long run that ends while DbaGuy is in the background notifies. For Couchbase the tab has a query context (picked in
  * the toolbar, or by a click on the tree, or the one a browse tab or History entry opened with), which every run, export
  * and completion request carries; without a choice it follows the profile's default. For an engine that takes
@@ -200,9 +208,18 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
       : undefined;
   const autocommitBlockedReason = inTransaction ? "Commit or roll back first" : runningReason;
 
-  // Closing the tab: the unsaved script first (registered by the script binding below), then a running export, then
-  // the run (nothing more is sent), then an open transaction.
+  // Closing the tab: a copy reading its result first (it refuses), then the unsaved script (registered by the script
+  // binding below), then a running export, then the run (nothing more is sent), then an open transaction.
   const guards = useSessionGuards(controller, subject);
+  // A copy reading this tab's result runs on its session (06c L-f): closing the tab or switching its connection would
+  // end both, so it waits; only closing asks (deleting its profile waits for the copy, B13)
+  const sessionId = snapshot?.info?.session_id ?? null;
+  const copyReadsTab = () => sessionId !== null && copyReadsSession(useJobs.getState(), sessionId);
+  useCloseGuard(tab.id, CLOSE_GUARD_ORDER.copy, () => {
+    if (!copyReadsTab()) return true;
+    toast("warning", copyReadsThisTab("close the tab"));
+    return false;
+  });
   useCloseGuard(tab.id, CLOSE_GUARD_ORDER.export, (intent) => guards.exportStep(intent));
   useCloseGuard(tab.id, CLOSE_GUARD_ORDER.run, () => {
     runner.stop();
@@ -217,6 +234,10 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
     if (switching.current) return;
     switching.current = true;
     try {
+      if (copyReadsTab()) {
+        toast("warning", copyReadsThisTab("switch the connection"));
+        return;
+      }
       if (!(await guards.exportStep("switch")) || !(await guards.transactionStep("switch"))) return;
       // useSession closes the old session and opens the new one; the new profile's own default context applies.
       updateTab(tab.id, "query", { profileId, database, queryContext: undefined });
@@ -232,6 +253,20 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
   const openExport = useCallback(
     (sql: string, request: RequestOptions) => setExportRequest({ sql, request, open: true }),
     [],
+  );
+  // Copy result to a table… (spec ⑥ §3.6, 06c): the statement runs again on this tab's session, as an export does; a
+  // session that is gone (the result stays on screen) has nothing to run it on, so the tab says so
+  const copyToTable = useCallback(
+    (sql: string, columns: ColumnMeta[]) => {
+      if (!tab.profileId || !sessionId) return;
+      if (phase !== "open") {
+        toast("warning", "This tab is not connected: reconnect it to copy its result");
+        return;
+      }
+      const entry = copyEntryForResult(tab.profileId, engine, tab.database, sessionId, sql, columns, tab.title);
+      if (entry) openCopyDialog(entry);
+    },
+    [tab.profileId, tab.database, tab.title, sessionId, phase, engine],
   );
 
   /** A run that cannot start for want of a parameter's value: says which, and opens the panel on its field. */
@@ -557,6 +592,7 @@ export function QueryTab({ tab, active }: { tab: QueryTabState; active: boolean 
               plans={plans}
               documentsProfileId={engine?.documents && tab.profileId !== null ? tab.profileId : null}
               onExport={openExport}
+              onCopyToTable={engine?.copy_data ? copyToTable : undefined}
               locate={locate}
               onJump={jump}
               onReconnect={retry}

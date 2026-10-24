@@ -373,6 +373,13 @@ export const runningJobs = (snapshot: JobsSnapshot): JobRecord[] => jobList(snap
  */
 export const runningOn = (snapshot: JobsSnapshot, profileId: string): JobRecord[] =>
   runningJobs(snapshot).filter((job) => job.profileId === profileId || job.sourceProfileId === profileId);
+/**
+ * Whether a running copy reads a query tab's result through this session (06c pre-flight L-f): the statement runs on the
+ * tab's own session, so closing the tab or switching its connection would end the session and the copy with it. A job
+ * listed after a reload has no command: the session it read is one the window no longer holds.
+ */
+export const copyReadsSession = (snapshot: JobsSnapshot, sessionId: string): boolean =>
+  runningJobs(snapshot).some((job) => job.command?.type === "copy_data" && job.command.source_session_id === sessionId);
 /** How many jobs run (the Jobs button's count): a number, so a selector of it renders only when it changes (Q1). */
 export const runningCount = (snapshot: JobsSnapshot): number => runningJobs(snapshot).length;
 /** Whether a job has ended (Clear finished has something to clear): a boolean, for the same reason. */

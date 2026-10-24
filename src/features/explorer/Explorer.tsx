@@ -17,9 +17,9 @@ import { findEngineInfo, isReadOnlyProfile, useDeleteProfile, useEngines, usePro
 import { profileColor } from "../connections/profileColors";
 import { secretsNeeded } from "../connections/UnlockDialog";
 import { joinUnlockPrompt } from "../connections/unlockPrompts";
-import { openDumpDialog, openRunDialog } from "../data-tools/dataDialogs";
-import { dumpEntryForNode, runEntryForNode, type RunEntry } from "../data-tools/entryPoints";
-import { runningJobs, syncJobs, useJobs } from "../data-tools/jobsStore";
+import { openCopyDialog, openDumpDialog, openRunDialog } from "../data-tools/dataDialogs";
+import { copyEntryForNode, dumpEntryForNode, runEntryForNode, type RunEntry } from "../data-tools/entryPoints";
+import { runningOn, syncJobs, useJobs } from "../data-tools/jobsStore";
 import { READ_ONLY_RUN } from "../data-tools/runForm";
 import { askOpenDocument } from "../documents/openDocument";
 import { applyTreeContext } from "../query/queryContext";
@@ -219,12 +219,13 @@ export function Explorer() {
    * Before a profile is deleted, each of its tabs is asked in turn (a running export, a run, an open transaction):
    * table and object tabs close, query tabs agree to lose their session. Any "no" keeps the profile. First, a
    * data-tools job running on it keeps it, before any tab is asked: the delete closes every session of the profile,
-   * the jobs' too (B13). The backend's list is read first: a job wrongly guessed lost (`not_listed`) that it has
-   * running counts again, and one it does not have never blocks the delete.
+   * the jobs' too (B13), and a copy reading from it as well (its source's session, 06c). The backend's list is read
+   * first: a job wrongly guessed lost (`not_listed`) that it has running counts again, and one it does not have never
+   * blocks the delete.
    */
   const releaseTabs = async (profileId: string): Promise<boolean> => {
     await syncJobs(); // a list that fails is logged, and the jobs stay as this window knows them
-    const jobs = runningJobs(useJobs.getState()).filter((job) => job.profileId === profileId).length;
+    const jobs = runningOn(useJobs.getState(), profileId).length;
     if (jobs > 0) {
       toast("warning", `Profile not deleted — ${jobs === 1 ? "a job is" : `${jobs} jobs are`} still running on it`);
       return false;
@@ -393,9 +394,11 @@ export function Explorer() {
         const engine = findEngineInfo(entries, engines, row.profileId);
         // The data tools first (spec ⑥ §3.6: what the engine can do decides, D-06-13), then a collection's own items
         const dumpEntry = dumpEntryForNode(row.profileId, engine, row.node);
+        const copyEntry = copyEntryForNode(row.profileId, engine, row.node);
         const runEntry = runEntryForNode(row.profileId, engine, row.node);
         const dataItems: MenuItem[] = [
           ...(dumpEntry ? [{ label: "Dump…", onSelect: () => openDumpDialog(dumpEntry) }] : []),
+          ...(copyEntry ? [{ label: "Copy data to…", onSelect: () => openCopyDialog(copyEntry) }] : []),
           ...(runEntry ? [runItem(runEntry, isReadOnlyProfile(entries, row.profileId))] : []),
         ];
         const items = [...dataItems, ...(row.node.kind === BROWSABLE_KIND ? collectionItems(row, engine?.documents === true) : [])];

@@ -10,9 +10,10 @@ import { COMMANDS, type CommandContext } from "./commands";
 /* ⌘⇧P's data-tools commands (spec ⑥ §3.6): Dump… where the engine dumps, Run SQL file… always, Show jobs once there
    are jobs; a table tab's Dump runs its own handler (it knows its filter). */
 
-const opened = vi.hoisted(() => ({ dump: [] as unknown[], run: [] as unknown[], jobs: [] as boolean[] }));
+const opened = vi.hoisted(() => ({ dump: [] as unknown[], run: [] as unknown[], copy: [] as unknown[], jobs: [] as boolean[] }));
 vi.mock("../data-tools/dataDialogs", () => ({
   openDumpDialog: (entry: unknown) => opened.dump.push(entry),
+  openCopyDialog: (entry: unknown) => opened.copy.push(entry),
   openRunDialog: (entry: unknown) => opened.run.push(entry),
   setJobsPopoverOpen: (open: boolean) => opened.jobs.push(open),
 }));
@@ -23,10 +24,12 @@ const P = "p1";
 const TABLE: Tab = { id: "table:1", kind: "table", profileId: P, path: [{ kind: "database", name: "d" }, { kind: "schema", name: "s" }, { kind: "folder", name: "tables" }, { kind: "table", name: "t" }], title: "t" };
 const QUERY = { id: "query:1", kind: "query", profileId: P, database: null, title: "Q" } as unknown as Tab;
 
-function context(activeTab: Tab | null, dump = true, tableActions: TableTabActions | null = null): CommandContext {
+function context(activeTab: Tab | null, dump = true, tableActions: TableTabActions | null = null, copy = true): CommandContext {
   const queryClient = new QueryClient();
   queryClient.setQueryData<ProfileEntry[]>(profilesKey, [{ profile: { id: P, engine: "postgres", name: "Local PG", database: "dbaguy" } } as ProfileEntry]);
-  queryClient.setQueryData<EngineInfo[]>(enginesKey, [{ engine: "postgres", dump, run_file: true } as EngineInfo]);
+  queryClient.setQueryData<EngineInfo[]>(enginesKey, [
+    { engine: "postgres", dump, run_file: true, copy_data: copy, per_database_connection: true } as EngineInfo,
+  ]);
   return { activeTab, tabActions: null, editActions: null, tableActions, settings: { loaded: true, current: {} as AppSettings, save: async (n) => n }, queryClient };
 }
 const command = (id: string) => COMMANDS.find((c) => c.id === id)!;
@@ -35,6 +38,7 @@ describe("the palette's data-tools commands", () => {
   beforeEach(() => {
     opened.dump = [];
     opened.run = [];
+    opened.copy = [];
     opened.jobs = [];
     useJobs.setState({ jobs: {}, order: [] });
   });
@@ -49,7 +53,7 @@ describe("the palette's data-tools commands", () => {
 
   it("run a table tab's own Dump table…, as it is when it runs", () => {
     const run = vi.fn();
-    mounted.actions = { dumpTable: { enabled: true, run } };
+    mounted.actions = { dumpTable: { enabled: true, run }, copyRows: { enabled: true, run: vi.fn() } };
     const ctx = context(TABLE, true, mounted.actions);
     expect(command("dataTools.dump").enabled(ctx)).toBe(true);
     command("dataTools.dump").run(ctx);
@@ -58,7 +62,7 @@ describe("the palette's data-tools commands", () => {
 
   it("grey a table tab's Dump… while its own action cannot run, and run nothing then", () => {
     const run = vi.fn();
-    mounted.actions = { dumpTable: { enabled: false, run } };
+    mounted.actions = { dumpTable: { enabled: false, run }, copyRows: { enabled: false, run: vi.fn() } };
     const ctx = context(TABLE, true, mounted.actions);
     expect(command("dataTools.dump").enabled(ctx)).toBe(false);
     command("dataTools.dump").run(ctx);
@@ -77,5 +81,19 @@ describe("the palette's data-tools commands", () => {
     expect(command("dataTools.jobs").enabled(context(null))).toBe(true);
     command("dataTools.jobs").run(context(null));
     expect(opened.jobs).toEqual([true]);
+  });
+
+  it("list Copy data to… where the engine copies: a table tab's own Copy rows to…, a query tab's schema", () => {
+    expect(command("dataTools.copy").visible!(context(QUERY, true, null, false))).toBe(false);
+    const copyRows = vi.fn();
+    mounted.actions = { dumpTable: { enabled: true, run: vi.fn() }, copyRows: { enabled: true, run: copyRows } };
+    command("dataTools.copy").run(context(TABLE, true, mounted.actions));
+    expect([copyRows.mock.calls.length, opened.copy]).toEqual([1, []]);
+    command("dataTools.copy").run(context(QUERY));
+    expect(opened.copy).toEqual([{
+      profileId: P,
+      database: "dbaguy",
+      source: { kind: "tables", schema: "public", folder: [{ kind: "database", name: "dbaguy" }, { kind: "schema", name: "public" }, { kind: "folder", name: "tables" }] },
+    }]);
   });
 });

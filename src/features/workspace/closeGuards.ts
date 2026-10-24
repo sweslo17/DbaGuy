@@ -14,12 +14,18 @@ export type CloseGuard = (intent: CloseIntent) => Promise<boolean> | boolean;
  * been done yet (its Cancel must never follow a side effect), then a running export, then the run (no further
  * statement is sent), then an open transaction. A disconnect asks only the session's guards (the tab, and so its
  * script, stays). A document tab's unsaved text (`document`, ruling C20) and a table tab's staged grid edits (`edits`,
- * spec ⑤ R-05-11) are asked first too: a tab has at most one of a script, a document and staged edits.
+ * spec ⑤ R-05-11) are asked first too: a tab has at most one of a script, a document and staged edits. A copy reading
+ * the tab's result (`copy`, 06c pre-flight L-f) comes before them all: it only refuses, and a refusal must never
+ * follow a side effect or an answered question.
  */
-export const CLOSE_GUARD_ORDER = { script: 5, document: 5, edits: 5, export: 10, run: 15, transaction: 20 } as const;
+export const CLOSE_GUARD_ORDER = { copy: 1, script: 5, document: 5, edits: 5, export: 10, run: 15, transaction: 20 } as const;
 
-/** The guards that only closing asks: losing the connection keeps the tab, its text and its staged edits. */
+/**
+ * The guards that only closing asks: losing the connection keeps the tab, its text and its staged edits (and a copy
+ * reading the tab already keeps the connection: deleting a profile waits for it, B13).
+ */
 const CLOSE_ONLY: ReadonlySet<number> = new Set([
+  CLOSE_GUARD_ORDER.copy,
   CLOSE_GUARD_ORDER.script,
   CLOSE_GUARD_ORDER.document,
   CLOSE_GUARD_ORDER.edits,
