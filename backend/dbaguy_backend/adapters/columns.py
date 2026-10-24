@@ -47,6 +47,9 @@ class TableColumn:
     # numeric); SQL Server time(7): CONVERT(varchar(16), {}, 126)); None: the column itself
     read_as: str | None = None
     literal: EditKind | None = None  # how a value read that way is written; None: as `kind`
+    # The column's type is the database's own (PostgreSQL: a domain, enum, row or extension type; SQL Server: an alias
+    # type): a copy to another database cannot count on it, and maps it by its family (spec ⑥ R-06-10, 06c)
+    custom_type: bool = False
 
     @property
     def value_kind(self) -> EditKind:

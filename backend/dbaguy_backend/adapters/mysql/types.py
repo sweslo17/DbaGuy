@@ -10,6 +10,7 @@ from mysql.connector.constants import FieldFlag, FieldType
 
 from ...domain.column_category import ColumnCategory
 from ...domain.execution import ColumnMeta
+from ..families import SPATIAL_TYPES  # the spatial types' names in information_schema.COLUMNS.DATA_TYPE
 
 BINARY_CHARSET = 63  # MySQL's `binary` character set: BLOB/BINARY/VARBINARY hold bytes, not text
 
@@ -67,11 +68,6 @@ _STRINGS: dict[int, tuple[str, str]] = {  # (text name, binary name)
     FieldType.LONG_BLOB: ("text", "blob"), FieldType.BLOB: ("text", "blob"),
 }
 
-# The spatial types' names in information_schema.COLUMNS.DATA_TYPE (the protocol calls them all GEOMETRY)
-SPATIAL_TYPES = frozenset({
-    "geometry", "point", "linestring", "polygon", "multipoint", "multilinestring", "multipolygon", "geometrycollection",
-    "geomcollection",
-})
 _BY_DATA_TYPE: dict[str, ColumnCategory] = {
     **{kind.name: kind.category for kind in _FIXED.values()},
     **{text: ColumnCategory.TEXT for text, _ in _STRINGS.values()},

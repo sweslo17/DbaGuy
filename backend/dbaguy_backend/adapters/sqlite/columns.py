@@ -2,7 +2,6 @@
 E6; ANY in a STRICT table has none). Grid editing's kind and compare rules (spec ⑤ §3.2.2) are made here, once, for
 editing and data tools alike. The rowid is never a column: `SELECT *` does not return it."""
 
-import re
 import sqlite3
 from dataclasses import dataclass
 
@@ -10,7 +9,8 @@ from ...domain.edits import Compare, EditKind
 from ...domain.errors import NotFound
 from ...domain.metadata import PathSegment
 from ...sql.select_builder import relation_from_path
-from ..columns import GENERATED, TableColumn, TypeFamily, not_copied
+from ..columns import GENERATED, TableColumn, not_copied
+from ..families import sqlite_affinity, sqlite_family
 
 # The pragma takes the name only (a second argument raises); it matches the name without case, as SQLite does
 _TABLE = "SELECT type, strict FROM pragma_table_list(?) WHERE schema = ?"
@@ -18,8 +18,6 @@ _COLUMNS = 'SELECT name, type, "notnull", dflt_value, pk, hidden FROM pragma_tab
 _INDEXES = 'SELECT name, "unique", origin, partial FROM pragma_index_list(?, ?)'
 _GENERATED = frozenset({2, 3})  # pragma_table_xinfo.hidden: a VIRTUAL or STORED generated column
 _HIDDEN = 1  # pragma_table_xinfo.hidden: a virtual table's hidden column
-# At most 9 digits: SQLite takes any declared size, and int() refuses a text of 4,300 digits or more (no size then)
-_SIZES = re.compile(r"\(\s*(\d{1,9})\s*(?:,\s*(\d{1,9})\s*)?\)")
 
 
 @dataclass(frozen=True)
@@ -51,32 +49,6 @@ def read_relation(
                           conn.execute(_INDEXES, (name, schema)).fetchall())
 
 
-def _affinity(upper: str, strict: bool) -> str:
-    """What a declared type (upper case) is, by SQLite's affinity rules in their order — INT; CHAR, CLOB, TEXT;
-    BLOB; no type; REAL, FLOA, DOUB; else NUMERIC — and inside NUMERIC by what its name says: DATE / TIME, BOOL, JSON
-    (ruling E6). In a STRICT table ANY keeps every value as given, like no type. The one ladder `affinity_kind` and
-    `_family` both read."""
-    if strict and upper == "ANY":
-        return "none"
-    if "INT" in upper:
-        return "integer"
-    if any(word in upper for word in ("CHAR", "CLOB", "TEXT")):
-        return "text"
-    if "BLOB" in upper:
-        return "blob"
-    if not upper.strip():
-        return "none"
-    if any(word in upper for word in ("REAL", "FLOA", "DOUB")):
-        return "real"
-    if "DATE" in upper or "TIME" in upper:
-        return "datetime"
-    if "BOOL" in upper:
-        return "bool"
-    if "JSON" in upper:
-        return "json"
-    return "numeric"
-
-
 # REAL affinity holds floating point, which is not compared. Outside a STRICT table ANY is NUMERIC ('007' is stored as
 # 7); in one it keeps every value as given, like no type ('007' stays text)
 _EDIT_KINDS: dict[str, tuple[EditKind, Compare]] = {
@@ -84,33 +56,11 @@ _EDIT_KINDS: dict[str, tuple[EditKind, Compare]] = {
     "blob": ("binary", "equals"), "real": ("number", "none"), "datetime": ("datetime", "equals"),
     "bool": ("bool", "equals"), "json": ("json", "equals"), "numeric": ("number", "equals"),
 }
-_FAMILIES: dict[str, TypeFamily] = {"none": "other", "integer": "int64", "blob": "binary", "real": "float64",
-                                    "bool": "bool", "json": "json"}
 
 
 def affinity_kind(declared: str, strict: bool = False) -> tuple[EditKind, Compare]:
-    """Grid editing's kind and compare rule for a declared type (`_affinity`)."""
-    return _EDIT_KINDS[_affinity(declared.upper(), strict)]
-
-
-def _family(declared: str, strict: bool) -> tuple[TypeFamily, dict]:
-    """The family a declared type names (`_affinity`), with its sizes."""
-    upper = declared.upper()
-    affinity = _affinity(upper, strict)
-    if affinity in _FAMILIES:
-        return _FAMILIES[affinity], {}
-    sizes = _SIZES.search(upper)
-    first = int(sizes.group(1)) if sizes else None
-    second = int(sizes.group(2)) if sizes and sizes.group(2) else None
-    if affinity == "text":
-        if "CHAR" in upper and first is not None:
-            return ("varchar" if "VAR" in upper else "char"), {"length": first}
-        return "text", {}
-    if affinity == "datetime":
-        if "DATE" in upper and "TIME" in upper or "TIMESTAMP" in upper:
-            return "timestamp", {}
-        return ("date" if "DATE" in upper else "time"), {}
-    return "decimal", ({"precision": first, "scale": second if second is not None else 0} if first else {})
+    """Grid editing's kind and compare rule for a declared type (`families.sqlite_affinity`)."""
+    return _EDIT_KINDS[sqlite_affinity(declared.upper(), strict)]
 
 
 def rowid_alias(relation: SqliteRelation) -> str | None:
@@ -130,7 +80,7 @@ def columns_of(relation: SqliteRelation) -> list[TableColumn]:
         if hidden == _HIDDEN:
             continue
         kind, compare = affinity_kind(declared or "", strict=relation.strict)
-        family, sizes = _family(declared or "", relation.strict)
+        family, sizes = sqlite_family(declared or "", relation.strict)
         generated = hidden in _GENERATED
         found.append(TableColumn(
             name=name, type_name=declared or "", family=family, nullable=not notnull and name != rowid,

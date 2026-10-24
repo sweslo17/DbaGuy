@@ -6,7 +6,8 @@ from ...domain.edits import edit_kind
 from ...domain.errors import NotFound
 from ...domain.metadata import PathSegment
 from ...sql.select_builder import relation_from_path
-from ..columns import GENERATED, PERIOD, ROWVERSION, SQL_VARIANT, TableColumn, TypeFamily, not_copied
+from ..columns import GENERATED, PERIOD, ROWVERSION, SQL_VARIANT, TableColumn, not_copied
+from ..families import mssql_family
 from . import driver
 from .catalog import (
     CHARS, FRACTION, NCHARS, PerObject, by_object, char_length, id_sources, object_id_sql, rows, type_sql)
@@ -32,25 +33,6 @@ _NON_UNICODE = frozenset({"char", "varchar", "text"})
 # with a `T` (241, A15), and without it a datetime would read by the login's DATEFORMAT (F1)
 _SEVENTH_DIGIT = {"datetime2": "CONVERT(varchar(27), {}, 126)", "datetimeoffset": "CONVERT(varchar(34), {}, 126)",
                   "time": "CONVERT(varchar(16), {}, 126)"}
-_FAMILIES: dict[str, TypeFamily] = {
-    "bit": "bool", "tinyint": "int16", "smallint": "int16", "int": "int32", "bigint": "int64", "decimal": "decimal",
-    "numeric": "decimal", "money": "money", "smallmoney": "money", "real": "float32", "char": "char", "nchar": "char",
-    "varchar": "varchar", "nvarchar": "varchar", "text": "text", "ntext": "text", "binary": "binary",
-    "varbinary": "binary", "image": "binary", "date": "date", "time": "time", "datetime": "timestamp",
-    "smalldatetime": "timestamp", "datetime2": "timestamp", "datetimeoffset": "timestamp_tz",
-    "uniqueidentifier": "uuid", "xml": "xml", "json": "json", "timestamp": "rowversion", "sql_variant": "variant",
-    "hierarchyid": "variant", "geometry": "spatial", "geography": "spatial",
-}
-
-
-def _family(base: str, max_length: int, precision: int) -> TypeFamily:
-    if base == "float":
-        return "float64" if precision > 24 else "float32"
-    if base in ("varchar", "nvarchar") and max_length == -1:
-        return "text"  # (max)
-    return _FAMILIES.get(base, "other")
-
-
 def _sizes(base: str, max_length: int, precision: int, scale: int) -> dict:
     if base in ("decimal", "numeric"):
         return {"precision": precision, "scale": scale}
@@ -88,7 +70,7 @@ def column(
         read_as, literal = "CAST({} AS varbinary(max))", "binary"  # A S6: written back as 0x… (A1: hierarchyid too)
     else:
         read_as, literal = None, None
-    family = _family(base, max_length, precision)
+    family = mssql_family(base, max_length, precision)
     return TableColumn(
         name=name, type_name=type_sql(type_name, max_length, precision, scale), family=family, nullable=bool(nullable),
         has_default=bool(default or identity or computed or generated_always) or base == "timestamp",
@@ -96,6 +78,7 @@ def column(
         read_only_reason=reason, unicode=base not in _NON_UNICODE, **_sizes(base, max_length, precision, scale),
         identity="always" if identity else None, generated=bool(computed or generated_always),
         **(not_copied(skipped) if skipped else {}), read_as=read_as, literal=literal,
+        custom_type=type_name != base,  # an alias type, which another database may not have (06c)
     )
 
 

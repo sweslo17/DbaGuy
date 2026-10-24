@@ -8,13 +8,15 @@ from ...domain.edits import Compare, EditKind, edit_kind
 from ...domain.metadata import PathSegment
 from ...sql.dialects import Dialect, qualified
 from ...sql.select_builder import relation_from_path
-from ..columns import GENERATED, TableColumn, TypeFamily, not_copied
+from ..columns import GENERATED, TableColumn, not_copied
+from ..families import pg_family
 from .introspection import relation_oid
 from .loaders import category_for_type_name
 
 # `base` follows typbasetype from each column's type until a type that is not a domain, one row per column, carrying
 # the innermost type modifier a domain sets (a domain column's own atttypmod is -1). typtype 'c' is a composite type,
-# 'e' an enum; typcategory 'A' an array.
+# 'e' an enum; typcategory 'A' an array. The last column: the column's own type is the database's (a domain, an enum, a
+# row type, an extension's type, an array of one), which another database may not have (a copy, 06c).
 _COLUMNS = """
 WITH RECURSIVE base (attrelid, attnum, typname, typtype, typbasetype, typtypmod, typcategory, typmod) AS (
     SELECT a.attrelid, a.attnum, t.typname, t.typtype, t.typbasetype, t.typtypmod, t.typcategory, a.atttypmod
@@ -27,8 +29,10 @@ WITH RECURSIVE base (attrelid, attnum, typname, typtype, typbasetype, typtypmod,
     WHERE d.typtype = 'd'
 )
 SELECT a.attrelid, a.attname::text, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, a.atthasdef,
-       a.attidentity::text, a.attgenerated::text, b.typname::text, b.typtype::text, b.typcategory::text, b.typmod
+       a.attidentity::text, a.attgenerated::text, b.typname::text, b.typtype::text, b.typcategory::text, b.typmod,
+       own.typtype IN ('d', 'e', 'c') OR own.typnamespace <> 'pg_catalog'::regnamespace
 FROM pg_attribute a
+JOIN pg_type own ON own.oid = a.atttypid
 JOIN base b ON b.attrelid = a.attrelid AND b.attnum = a.attnum AND b.typtype <> 'd'
 WHERE a.attrelid = ANY(%(oids)s) AND a.attnum > 0 AND NOT a.attisdropped
 ORDER BY a.attrelid, a.attnum
@@ -37,28 +41,11 @@ _NOT_EXACT = frozenset({"float4", "float8"})  # loaded as Python floats: their t
 # Compared with `=`, not ::text: bpchar, whose ::text drops the padding the loaded value has (`=` ignores it, A4); bytea,
 # whose ::text follows bytea_output (escape: every original would differ) while `= '\x…'::bytea` is exact (05a review M3)
 _EQUALS = frozenset({"bpchar", "bytea"})
-_FAMILIES: dict[str, TypeFamily] = {
-    "bool": "bool", "int2": "int16", "int4": "int32", "int8": "int64", "numeric": "decimal", "money": "money",
-    "float4": "float32", "float8": "float64", "bpchar": "char", "varchar": "varchar", "text": "text", "citext": "text",
-    "name": "text", "bytea": "binary", "date": "date", "time": "time", "timetz": "time_tz", "timestamp": "timestamp",
-    "timestamptz": "timestamp_tz", "interval": "interval", "uuid": "uuid", "json": "json", "jsonb": "json",
-    "xml": "xml", "geometry": "spatial", "geography": "spatial",
-}
 _LENGTHS = frozenset({"bpchar", "varchar"})
 _FRACTIONS = frozenset({"time", "timetz", "timestamp", "timestamptz"})
 # money's text follows lc_monetary (`$1,234.56`): a dump or copy reads it as numeric, exact, and writes the number (P10;
 # A13: an array of money and a domain over money too)
 _MONEY_READ = {"money": ("CAST({} AS numeric)", "number"), "_money": ("CAST({} AS numeric[])", "other")}
-
-
-def _family(base: str, typtype: str, category: str) -> TypeFamily:
-    if typtype == "e":
-        return "enum"
-    if typtype == "c":
-        return "composite"
-    if category == "A":
-        return "other"  # an array: PostgreSQL's text
-    return _FAMILIES.get(base, "other")
 
 
 def _sizes(base: str, typmod: int) -> dict:
@@ -77,7 +64,7 @@ def _sizes(base: str, typmod: int) -> dict:
 
 def column(
     name: str, type_name: str, nullable: bool, has_default: bool, identity: str, generated: str, base: str,
-    typtype: str, category: str, typmod: int,
+    typtype: str, category: str, typmod: int, custom: bool = False,
 ) -> TableColumn:
     """One row of _COLUMNS."""
     kind: EditKind = "other" if base == "money" else edit_kind(category_for_type_name(base))  # money: lc_monetary
@@ -85,11 +72,12 @@ def column(
     reason = GENERATED if generated else "identity column (GENERATED ALWAYS)" if identity == "a" else None
     read_as, literal = _MONEY_READ.get(base, (None, None))
     return TableColumn(
-        name=name, type_name=type_name, family=_family(base, typtype, category), nullable=nullable,
+        name=name, type_name=type_name, family=pg_family(base, typtype, category), nullable=nullable,
         has_default=has_default or bool(identity) or bool(generated), kind=kind, compare=compare,
         writable=reason is None, read_only_reason=reason, **_sizes(base, typmod),
         identity="always" if identity == "a" else "by_default" if identity == "d" else None,
         generated=bool(generated), **(not_copied(GENERATED) if generated else {}), read_as=read_as, literal=literal,
+        custom_type=custom,
     )
 
 
