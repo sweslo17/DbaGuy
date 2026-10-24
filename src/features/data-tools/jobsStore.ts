@@ -2,7 +2,8 @@ import { create } from "zustand";
 import { errorMessage } from "@/lib/api/client";
 import { SessionSocket } from "@/lib/api/session-socket";
 import type { JobInfo } from "@/lib/api/types";
-import type { DumpEntry, RunEntry } from "./entryPoints";
+import type { CopyForm } from "./copyForm";
+import type { CopyEntry, DumpEntry, RunEntry } from "./entryPoints";
 import { JobRunner, type JobTransport } from "./jobRunner";
 import {
   cancelJobByRest,
@@ -35,14 +36,19 @@ export interface JobRecord {
   requestId: string;
   sessionId: string | null;
   kind: JobKind;
+  /** The connection the job's session is on (a copy's: its target). */
   profileId: string;
+  /** A copy's source connection (06c): its sessions close when it is deleted, so it waits for the copy too (B13). */
+  sourceProfileId: string | null;
   database: string | null;
   title: string;
   /** What was sent, and the dialog entry it came from: null for a job listed after a reload. */
   command: JobCommand | null;
-  entry: DumpEntry | RunEntry | null;
-  /** A dump's tables in the file's order (its plan), for "table k of n"; null when not known. */
+  entry: DumpEntry | RunEntry | CopyEntry | null;
+  /** A dump's tables in the file's order (its plan), a copy's target tables in its order: "table k of n". */
   tables: readonly string[] | null;
+  /** A copy started here: its form ("Copy again…") and its source tables' names in the copy's order ("Copy the rest…"). */
+  copy: { form: CopyForm; sources: readonly string[] } | null;
   state: JobState;
 }
 
@@ -197,16 +203,26 @@ function run(record: JobRecord): void {
 export interface NewJob {
   kind: JobKind;
   profileId: string;
+  sourceProfileId?: string | null;
   database: string | null;
   title: string;
   command: JobCommand;
-  entry: DumpEntry | RunEntry;
+  entry: DumpEntry | RunEntry | CopyEntry;
   tables?: readonly string[] | null;
+  copy?: { form: CopyForm; sources: readonly string[] } | null;
 }
 
 /** Starts a job on a session of its own; returns its request id (the command's). */
 export function startJob(job: NewJob): string {
-  const record: JobRecord = { ...job, requestId: job.command.request_id, sessionId: null, tables: job.tables ?? null, state: openingJob(transport.now()) };
+  const record: JobRecord = {
+    ...job,
+    requestId: job.command.request_id,
+    sessionId: null,
+    sourceProfileId: job.sourceProfileId ?? null,
+    tables: job.tables ?? null,
+    copy: job.copy ?? null,
+    state: openingJob(transport.now()),
+  };
   put(record, true);
   run(record);
   return record.requestId;
@@ -254,11 +270,13 @@ export function reconcile(jobs: Readonly<Record<string, JobRecord>>, listed: rea
       sessionId: info.session_id,
       kind: info.job,
       profileId: info.profile_id,
+      sourceProfileId: info.source_profile_id ?? null,
       database: null,
       title: info.title,
       command: null,
       entry: null,
       tables: null,
+      copy: null,
       state: listedJob(info, now),
     });
     if (info.outcome) result.close.push(info.session_id);
@@ -349,6 +367,12 @@ export function resetJobsForTests(): void {
 /** The jobs, newest first. */
 export const jobList = ({ jobs, order }: JobsSnapshot): JobRecord[] => order.map((id) => jobs[id]);
 export const runningJobs = (snapshot: JobsSnapshot): JobRecord[] => jobList(snapshot).filter(isRunning);
+/**
+ * The running jobs a connection's deletion would stop (B13): those on its sessions, and the copies reading from it (06c:
+ * `DELETE /profiles/{id}` closes the source's session too).
+ */
+export const runningOn = (snapshot: JobsSnapshot, profileId: string): JobRecord[] =>
+  runningJobs(snapshot).filter((job) => job.profileId === profileId || job.sourceProfileId === profileId);
 /** How many jobs run (the Jobs button's count): a number, so a selector of it renders only when it changes (Q1). */
 export const runningCount = (snapshot: JobsSnapshot): number => runningJobs(snapshot).length;
 /** Whether a job has ended (Clear finished has something to clear): a boolean, for the same reason. */

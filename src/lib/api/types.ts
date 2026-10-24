@@ -160,6 +160,10 @@ export type DumpPlanRequest = S["DumpPlanRequest"];
 export type StoppedAt = S["StoppedAt"];
 /** Run SQL file (06b B2): a file's lines around one line, for the error list. */
 export type FileExcerpt = S["FileExcerpt"];
+/** Copy data (spec ⑥ §3.5.5): run a previewed copy (its plan id, once) on the target's job session. */
+export type CopyDataCommand = S["CopyDataCommand"];
+/** Data tools: one object of a dump, or one table of a copy with its outcome (`copied`, `rolled_back`, …). */
+export type JobObject = S["JobObject"];
 /** Copy data (spec ⑥ §3.5.1, POST /data/transfer/plan): the source, the target and how. */
 export type TransferRequest = S["TransferRequest"];
 /** Copy data: tables (tree paths) of one connection, or a query tab's result; a filter for one table. */

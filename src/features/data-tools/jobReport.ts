@@ -1,5 +1,6 @@
 import type {
   JobError,
+  JobObject,
   JobOutcomeEvent,
   JobOutcomeKind,
   JobProgressEvent,
@@ -14,8 +15,8 @@ import type { JobCommand, JobKind, JobState } from "./jobState";
 /*
  * What a job's dialog and the Jobs list say about it (spec ⑥ §3.6, §4 "結果的說明由前端依 job_outcome 組成"): its
  * progress while it runs and, once it ended, its outcome in words, the error with a label and what to do, the skipped
- * errors and the actions that make sense now. Pure. Every action that would run something again goes back to the form,
- * prefilled, so a run is always started (and, on a red connection, confirmed) from the form (ruling B6).
+ * errors, a copy's tables, and the actions that make sense now. Pure. Every action that would run something again goes
+ * back to the form, prefilled, so a job is always started (and, on a red connection, confirmed) from the form (B6).
  */
 
 export interface JobView {
@@ -23,6 +24,8 @@ export interface JobView {
   /** What was sent; null for a job listed after a reload (it was started by another page load). */
   command: JobCommand | null;
   state: JobState;
+  /** A copy started here: its source tables' names in the copy's order, for "Copy the rest…" (06c; a JobRecord's). */
+  copy?: { sources: readonly string[] } | null;
 }
 
 export type Tone = "success" | "warning" | "danger" | "muted";
@@ -43,6 +46,11 @@ export interface RunPatch {
 export type JobAction =
   | { kind: "show_in_finder"; label: string; path: string }
   /**
+   * A copy back to its form with its own choices (06c): `tables` null as it was; else only these source tables
+   * checked ("Copy the rest…": the ones not copied, so none is copied twice).
+   */
+  | { kind: "copy_again"; label: string; tables: readonly string[] | null }
+  /**
    * Back to the form with the job's own settings, changed by `patch` (null: as they were); `note`: said above the
    * form's file (a run again after `file_changed`, whose start is the refused statement's number).
    */
@@ -54,6 +62,15 @@ export interface ErrorLine {
   code: string | null;
   label: string | null;
   message: string;
+}
+
+/** One table of a copy and how it ended (06c, R-06-12). */
+export interface TableLine {
+  source: string | null;
+  target: string;
+  outcome: string;
+  rows: number;
+  tone: Tone;
 }
 
 export interface JobReport {
@@ -70,6 +87,8 @@ export interface JobReport {
   /** The errors a run skipped (the first ones), and how many more there were. */
   skipped: ErrorLine[];
   moreSkipped: number;
+  /** A copy's tables, in its order, each with how it ended (empty for a dump or a run). */
+  tables: TableLine[];
   actions: JobAction[];
 }
 
@@ -106,10 +125,28 @@ export const CODE_LABELS = {
   transactions_unsupported: "Couchbase runs no transactions",
   protocol_error: "An answer DbaGuy cannot read",
   tls_failed: "TLS failed",
+  // Copy data (06c, spec §4)
+  plan_expired: "The preview expired",
+  plan_mismatch: "Not this connection's preview",
+  source_failed: "Reading the source failed",
+  row_count_mismatch: "A trigger skipped or added rows",
+  row_count_unknown: "The rows written were not confirmed",
+  columns_changed: "The columns changed since the preview",
+  value_not_copyable: "A value the target cannot hold",
+  query_not_select: "Not a query that only reads",
+  password_required: "The source connection needs its password",
+  connection_failed: "The source connection could not be opened",
+  session_not_found: "The query's tab was closed",
+  // The source connection was deleted since the preview (`SOURCE_UNAVAILABLE` carries the code of what failed)
+  profile_not_found: "The source connection was deleted",
 } as const;
 export type JobErrorCode = keyof typeof CODE_LABELS;
 
 const SQLITE_BUSY_LABEL = "SQLite file in use";
+/** A copy's own words for a code a run has too: a run's "file" is not a copy's table. */
+const COPY_LABELS: Partial<Record<string, string>> = {
+  transaction_ended: "The table's transaction ended before its COMMIT",
+};
 /** What to do, where the backend's own text does not say it (a lost connection's depends on the job: `connectionLostHint`). */
 const CODE_HINTS: Partial<Record<JobErrorCode, string>> = {
   transaction_open:
@@ -117,6 +154,12 @@ const CODE_HINTS: Partial<Record<JobErrorCode, string>> = {
   invalid_filter: FILTER_RULE,
   file_changed:
     "The file was edited after the run that gave this place, so its statement numbers are not the ones they were. Look at the file, then set where to start again.",
+  plan_expired: "Copy again: the preview is read once more.",
+  value_not_copyable: "Leave that row out with a filter, or give the column a text type, then copy again.",
+  row_count_mismatch: "A trigger on the target changed what was written: copy into a table without it.",
+  session_not_found: "Copy again from the result of a tab that is open.",
+  // The preview read the source with its password; the backend has forgotten it since (a restart): ask for it again
+  password_required: "Unlock that connection (opening it in the tree asks for its password), then copy again.",
 };
 /** Codes after which "Skip it and continue" cannot help: the file cannot be read past them, or nothing can run. */
 const NOT_SKIPPABLE: ReadonlySet<string> = new Set([
@@ -143,10 +186,25 @@ export const FILE_CHANGED_NOTE = "The file changed since the last run: check whe
 /** Own properties only: "constructor" and "__proto__" are not codes (the K2 rule). */
 const has = <T extends object>(table: T, key: string): key is Extract<keyof T, string> => Object.hasOwn(table, key);
 
-export function codeLabel(code: string | null | undefined): string | null {
+export function codeLabel(code: string | null | undefined, kind?: JobKind): string | null {
   if (!code) return null;
   if (isSqliteBusy(code)) return SQLITE_BUSY_LABEL;
+  if (kind === "copy_data" && Object.hasOwn(COPY_LABELS, code)) return COPY_LABELS[code] ?? null;
   return has(CODE_LABELS, code) ? CODE_LABELS[code] : null;
+}
+
+/**
+ * What a lost connection (the target's: a source that is lost is `source_failed`) means for a copy: each table is a
+ * transaction of its own, which the server rolls back as the connection ends, so the tables before it stay.
+ */
+function copyLostHint(outcome: JobOutcomeEvent): string {
+  if (outcome.outcome === "unknown") return "Check the target before copying again.";
+  if (outcome.objects.every((table) => table.outcome === "not_started")) {
+    return "The connection was lost before the first table started: nothing was copied.";
+  }
+  return outcome.outcome === "partial"
+    ? "The table being copied was rolled back by the server as the connection ended; the tables before it stay copied."
+    : "The table being copied was rolled back by the server as the connection ended: nothing was copied.";
 }
 
 /** What a lost connection means for what to do next: a run that is unknown must be checked, a dump wrote nothing. */
@@ -162,9 +220,11 @@ function connectionLostHint(kind: JobKind, outcome: JobOutcomeKind): string | nu
     : null;
 }
 
-function codeHint(code: string | null, kind: JobKind, outcome: JobOutcomeKind): string | null {
-  if (isSqliteBusy(code)) return sqliteBusyNote(kind === "dump" ? "dump again" : "run the file again");
-  if (code === "connection_lost") return connectionLostHint(kind, outcome);
+function codeHint(code: string | null, kind: JobKind, outcome: JobOutcomeEvent): string | null {
+  if (isSqliteBusy(code)) {
+    return sqliteBusyNote(kind === "dump" ? "dump again" : kind === "copy_data" ? "copy again" : "run the file again");
+  }
+  if (code === "connection_lost") return kind === "copy_data" ? copyLostHint(outcome) : connectionLostHint(kind, outcome.outcome);
   return code && has(CODE_HINTS, code) ? (CODE_HINTS[code] ?? null) : null;
 }
 
@@ -173,15 +233,15 @@ const runCommand = (command: JobCommand | null) => (command?.type === "run_file"
 const statementsApplied = (count: number) => `${plural(count, "statement")} applied`;
 
 /** An error of a job (the one that ended it, or one a run skipped) with its label. */
-function toErrorLine(error: JobError): ErrorLine {
+function toErrorLine(error: JobError, kind: JobKind): ErrorLine {
   const code = error.code ?? null;
-  return { line: error.line ?? null, statement: error.statement ?? null, code, label: codeLabel(code), message: error.message };
+  return { line: error.line ?? null, statement: error.statement ?? null, code, label: codeLabel(code, kind), message: error.message };
 }
 
 /** The error that ended the job: the outcome's, or the live one before an ending without an outcome. */
-function endingError(outcome: JobOutcomeEvent | null, state: JobState): ErrorLine | null {
+function endingError(outcome: JobOutcomeEvent | null, state: JobState, kind: JobKind): ErrorLine | null {
   const error = outcome?.error ?? state.error;
-  return error ? toErrorLine(error) : null;
+  return error ? toErrorLine(error, kind) : null;
 }
 
 /**
@@ -189,7 +249,9 @@ function endingError(outcome: JobOutcomeEvent | null, state: JobState): ErrorLin
  * a dump's, a lost run's or any other).
  */
 function againAction(kind: JobKind, command: JobCommand | null): JobAction[] {
-  return command ? [{ kind: "again", label: kind === "dump" ? "Dump again…" : "Run again…", patch: null }] : [];
+  if (!command) return [];
+  if (kind === "copy_data") return [{ kind: "copy_again", label: "Copy again…", tables: null }];
+  return [{ kind: "again", label: kind === "dump" ? "Dump again…" : "Run again…", patch: null }];
 }
 
 const NOTHING_WRITTEN_NOTE = "A file that was already at that path is as it was.";
@@ -200,7 +262,7 @@ const NOT_KNOWN_NOTE = "What was applied is not known: check the target.";
  */
 export const NO_RESUME_HINT = "Check the target, then choose where to start in a new run (Run SQL file… from the tree).";
 
-type Words = Omit<JobReport, "error" | "skipped" | "moreSkipped" | "hint">;
+type Words = Omit<JobReport, "error" | "skipped" | "moreSkipped" | "hint" | "tables">;
 
 function dumpReport(outcome: JobOutcomeEvent, command: JobCommand | null, error: ErrorLine | null): Words {
   const again = againAction("dump", command);
@@ -241,6 +303,95 @@ function dumpReport(outcome: JobOutcomeEvent, command: JobCommand | null, error:
         notes,
         actions: again,
       };
+  }
+}
+
+const TABLE_WORDS: Record<NonNullable<JobObject["outcome"]>, { text: string; tone: Tone }> = {
+  copied: { text: "copied", tone: "success" },
+  rolled_back: { text: "rolled back", tone: "danger" },
+  not_started: { text: "not copied", tone: "muted" },
+  unknown: { text: "unknown: check it", tone: "danger" },
+};
+
+/** A copy's tables as the view lists them (R-06-12: each table's own outcome). */
+function tableLines(objects: readonly JobObject[]): TableLine[] {
+  return objects.map((object) => {
+    const words = TABLE_WORDS[object.outcome ?? "unknown"];
+    return { source: object.source ?? null, target: object.name, outcome: words.text, rows: object.rows ?? 0, tone: words.tone };
+  });
+}
+
+/**
+ * What a copy offers to do again (06c): nothing applied (rolled back, not started) — the form as it was; stopped part
+ * way — the tables not copied only ("Copy the rest…", so none is copied twice); copied, or not known (check the target
+ * first) — nothing.
+ */
+function copyActions(outcome: JobOutcomeEvent, command: JobCommand | null, sources: readonly string[] | null): JobAction[] {
+  if (outcome.outcome === "rolled_back" || outcome.outcome === "not_started") return againAction("copy_data", command);
+  if (outcome.outcome !== "partial" || !command || !sources || sources.length !== outcome.objects.length) return [];
+  const rest = sources.filter((_, i) => outcome.objects[i].outcome !== "copied");
+  return rest.length ? [{ kind: "copy_again", label: "Copy the rest…", tables: rest }] : [];
+}
+
+/**
+ * A copy that stopped part way: what became of the table it stopped at. A Cancel between two tables, or a connection made
+ * read-only meanwhile, stops it with no table rolled back (the next one never started).
+ */
+function partialDetail(tables: readonly JobObject[]): string {
+  const undone = tables.find((table) => table.outcome === "rolled_back");
+  if (!undone) return "The tables copied stay; the rest were not started.";
+  const rest = tables.some((table) => table.outcome === "not_started") ? "; the rest were not started" : "";
+  return `The tables copied stay. ${undone.name} was rolled back${rest}.`;
+}
+
+/** A copy that is not known: the table whose COMMIT or rollback could not be told, when the backend names one. */
+const copyUnknownDetail = (tables: readonly JobObject[]): string =>
+  tables.some((table) => table.outcome === "unknown")
+    ? "The tables marked unknown may or may not hold their rows: check the target before copying again."
+    : NOT_KNOWN_NOTE;
+
+function copyReport(outcome: JobOutcomeEvent, command: JobCommand | null, sources: readonly string[] | null): Words {
+  const notes = outcome.warnings;
+  const tables = outcome.objects;
+  const copied = tables.filter((table) => table.outcome === "copied").length;
+  const actions = copyActions(outcome, command, sources);
+  const into = tables.length === 1 ? ` to ${tables[0].name}` : ` in ${plural(tables.length, "table")}`;
+  // Nothing of any table was sent: the target's setup failed, or a Cancel came before the first table (no table "was
+  // rolled back"; the backend says `not_started` when it had sent nothing at all)
+  const noTableStarted = tables.every((table) => table.outcome === "not_started");
+  switch (outcome.outcome) {
+    case "completed":
+      return { tone: notes.length ? "warning" : "success", title: `Copied ${plural(outcome.rows, "row")}${into}`, detail: null, notes, actions };
+    case "partial":
+      return {
+        tone: outcome.cancelled ? "warning" : "danger",
+        title: `${outcome.cancelled ? "Cancelled" : "Stopped"}: ${copied.toLocaleString()} of ${plural(tables.length, "table")} copied`,
+        detail: partialDetail(tables),
+        notes,
+        actions,
+      };
+    case "rolled_back":
+      return {
+        tone: outcome.cancelled ? "muted" : "danger",
+        title: outcome.cancelled
+          ? "Cancelled: nothing was copied"
+          : noTableStarted
+            ? "Nothing was copied"
+            : "Nothing was copied: the table was rolled back",
+        detail: null,
+        notes,
+        actions,
+      };
+    case "not_started":
+      return {
+        tone: outcome.cancelled ? "muted" : "danger",
+        title: outcome.cancelled ? "Cancelled before anything was copied" : "The copy did not start",
+        detail: "Nothing was copied.",
+        notes,
+        actions,
+      };
+    default: // unknown
+      return { tone: "danger", title: "What was copied is not known", detail: copyUnknownDetail(tables), notes, actions };
   }
 }
 
@@ -409,7 +560,7 @@ const LOSS_TITLES: Partial<Record<NonNullable<JobState["loss"]>, string>> = {
 /** The frontend's own ending (no outcome from the backend): what is known, and nothing more. */
 function lossReport(view: JobView): JobReport {
   const { state, kind } = view;
-  const base = { error: null, hint: null, notes: [], skipped: [], moreSkipped: 0 };
+  const base = { error: null, hint: null, notes: [], skipped: [], moreSkipped: 0, tables: [] };
   const canAgain = againAction(kind, view.command);
   switch (state.loss) {
     case "open_failed":
@@ -431,6 +582,18 @@ function lossReport(view: JobView): JobReport {
           title,
           detail: "A dump that does not finish writes no file (at most a hidden .part file beside it, which can be deleted).",
           actions: canAgain,
+        };
+      }
+      if (kind === "copy_data") {
+        return {
+          ...base,
+          tone: "danger",
+          title,
+          // each table is a transaction of its own: the server rolled back the one open, except during its COMMIT
+          detail: state.progress?.stage === "commit"
+            ? "It stopped during a table's COMMIT: whether that table is copied is not known. Check the target."
+            : "The table being copied was rolled back by the server as its connection ended; the tables before it stay copied. Check the target.",
+          actions: [],
         };
       }
       const run = runCommand(view.command);
@@ -459,16 +622,22 @@ export function jobReport(view: JobView): JobReport | null {
   if (state.phase !== "ended") return null;
   const outcome = state.outcome;
   if (!outcome) return lossReport(view);
-  const error = endingError(outcome, state);
-  const words = kind === "dump" ? dumpReport(outcome, command, error) : runReport(outcome, command, error);
-  const skipped = outcome.errors.map(toErrorLine);
-  const hints = [codeHint(error?.code ?? null, kind, outcome.outcome), stoppedUnplaced(kind, outcome) ? NO_RESUME_HINT : null];
+  const error = endingError(outcome, state, kind);
+  const words =
+    kind === "dump"
+      ? dumpReport(outcome, command, error)
+      : kind === "copy_data"
+        ? copyReport(outcome, command, view.copy?.sources ?? null)
+        : runReport(outcome, command, error);
+  const skipped = outcome.errors.map((skippedError) => toErrorLine(skippedError, kind));
+  const hints = [codeHint(error?.code ?? null, kind, outcome), stoppedUnplaced(kind, outcome) ? NO_RESUME_HINT : null];
   return {
     ...words,
     error,
     hint: hints.filter((hint) => hint !== null).join(" ") || null,
     skipped,
     moreSkipped: Math.max(0, outcome.error_count - skipped.length),
+    tables: kind === "copy_data" ? tableLines(outcome.objects) : [],
   };
 }
 
@@ -505,6 +674,14 @@ export function progressView(view: JobView, now: number, tables: readonly string
   if (state.phase === "opening") return { headline: "Connecting…", detail: null, percent: null, eta: null };
   const progress = state.progress;
   if (!progress) return { headline: "Starting…", detail: elapsed, percent: null, eta: null };
+  if (kind === "copy_data") {
+    const object = progress.object ?? null;
+    const index = object && tables ? tables.indexOf(object) : -1;
+    const which = index >= 0 && tables && tables.length > 1 ? ` (${index + 1} of ${tables.length})` : "";
+    const headline = !object ? "Starting…" : progress.stage === "commit" ? `Committing ${object}${which}` : `Copying ${object}${which}`;
+    // rows read so far: the table being copied commits (and counts as copied) only at its end, so none is "copied" yet
+    return { headline, detail: `${plural(progress.rows, "row")} read · ${elapsed}`, percent: null, eta: null };
+  }
   if (kind === "dump") {
     let headline = DUMP_STAGES[progress.stage] ?? "Writing the rows";
     if (progress.stage === "data" && progress.object) {
@@ -544,6 +721,9 @@ export function cancelNote(view: JobView): string | null {
   const { command, state } = view;
   if (!command || state.phase === "ended") return null;
   if (command.type === "dump") return "Cancel writes no file";
+  if (command.type === "copy_data") {
+    return state.progress?.stage === "commit" ? null : "Cancel rolls back the table being copied; the tables before it stay";
+  }
   if (state.progress?.stage === "commit") return null;
   return command.mode === "all_or_nothing"
     ? "Cancel rolls the whole run back"
@@ -588,7 +768,7 @@ export function jobNotification(
   if (!endingIsNews(state) || state.loss === "open_failed") return null;
   const took = state.endedAt - state.startedAt;
   if (took < thresholdS * 1000) return null;
-  const what = view.kind === "dump" ? "Dump" : "SQL file run";
+  const what = view.kind === "dump" ? "Dump" : view.kind === "copy_data" ? "Copy" : "SQL file run";
   const verdict = report.tone === "success" ? "finished" : "ended";
   return { title: `${what} ${verdict} after ${formatElapsed(took)}`, body: `${report.title} · ${view.title}` };
 }

@@ -14,8 +14,9 @@ describe("the quit question", () => {
     expect([asked.title, asked.keep, asked.confirm]).toEqual(["Quit DbaGuy?", "Keep running", "Quit anyway"]);
     expect(asked.message).toBe(
       "A job is still running: Dump public of Local PG to a.sql. Quitting stops it: a dump writes no file, a run " +
-        "in one transaction is rolled back, and a run statement by statement keeps what took effect (a transaction " +
-        "the file opened and did not commit is rolled back).",
+        "in one transaction is rolled back, a run statement by statement keeps what took effect (a transaction the " +
+        "file opened and did not commit is rolled back), and a copy rolls back the table it is copying (the tables " +
+        "before it stay).",
     );
   });
 
@@ -25,8 +26,9 @@ describe("the quit question", () => {
     expect([asked.title, asked.confirm]).toEqual(["Close the window?", "Close anyway"]);
     expect(asked.message).toBe(
       "5 jobs are still running: a; b; c, and 2 more. Closing the window quits DbaGuy, which stops them: a dump " +
-        "writes no file, a run in one transaction is rolled back, and a run statement by statement keeps what took " +
-        "effect (a transaction the file opened and did not commit is rolled back).",
+        "writes no file, a run in one transaction is rolled back, a run statement by statement keeps what took " +
+        "effect (a transaction the file opened and did not commit is rolled back), and a copy rolls back the table " +
+        "it is copying (the tables before it stay).",
     );
   });
 });

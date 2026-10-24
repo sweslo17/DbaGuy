@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
-import type { DumpCommand, JobOutcomeEvent, JobProgressEvent, RunFileCommand } from "@/lib/api/types";
+import type { CopyDataCommand, DumpCommand, JobOutcomeEvent, JobProgressEvent, RunFileCommand } from "@/lib/api/types";
 import { sqliteBusyNote } from "@/lib/sqliteBusy";
 import { FILTER_RULE } from "../table-data/filterValue";
 import { cancelNote, CODE_LABELS, codeLabel, endingIsNews, etaText, jobNotification, jobReport, jobSummary, NO_RESUME_HINT, progressView, type JobView } from "./jobReport";
 import { jobReducer, openingJob, type JobState } from "./jobState";
 
+/** The hints a copy's codes carry (06c): said here once, so a reworded hint is one edit. */
+const CODE_HINTS_COPY = {
+  plan_expired: "Copy again: the preview is read once more.",
+  password_required: "Unlock that connection (opening it in the tree asks for its password), then copy again.",
+};
 const CODE_LABELS_HINT_FILE_CHANGED =
   "The file was edited after the run that gave this place, so its statement numbers are not the ones they were. Look at the file, then set where to start again.";
 
@@ -569,5 +574,120 @@ describe("whether a job's ending is news (its notification and its toast)", () =
     expect(endingIsNews(jobReducer(openingJob(0), { type: "not_sent", at: 1 }))).toBe(false);
     expect(endingIsNews(jobReducer(openingJob(0), { type: "open_failed", error: new Error("x"), at: 1 }))).toBe(true);
     expect(endingIsNews(openingJob(0))).toBe(false);
+  });
+});
+
+describe("a copy in words (06c)", () => {
+  const copy: CopyDataCommand = { type: "copy_data", request_id: "r1", plan_id: "p1", source_session_id: null };
+  const copied = (fields: Partial<JobOutcomeEvent> = {}) =>
+    outcome({ job: "copy_data", path: null, objects: [
+      { kind: "table", name: "a", source: "public.a", rows: 2, outcome: "copied" },
+      { kind: "table", name: "b", source: "public.b", rows: 0, outcome: "rolled_back" },
+      { kind: "table", name: "c", source: "public.c", rows: 0, outcome: "not_started" },
+    ], ...fields });
+  const said = (event: JobOutcomeEvent, command: CopyDataCommand | null = copy, sources: string[] | null = ["a", "b", "c"]) =>
+    jobReport({ kind: "copy_data", command, state: ended(event), copy: sources ? { sources } : null })!;
+
+  it("says what was copied, table by table", () => {
+    const one = said(outcome({ job: "copy_data", rows: 1200, objects: [{ kind: "table", name: "orders", source: "public.orders", rows: 1200, outcome: "copied" }] }));
+    expect([one.tone, one.title, one.actions]).toEqual(["success", "Copied 1,200 rows to orders", []]);
+    expect(one.tables).toEqual([{ source: "public.orders", target: "orders", outcome: "copied", rows: 1200, tone: "success" }]);
+    const partial = said(copied({ outcome: "partial", rows: 2 }));
+    expect([partial.tone, partial.title]).toEqual(["danger", "Stopped: 1 of 3 tables copied"]);
+    expect(partial.tables.map((line) => line.outcome)).toEqual(["copied", "rolled back", "not copied"]);
+  });
+
+  it("offers the rest of a copy that stopped part way, and the whole of one that applied nothing", () => {
+    expect(said(copied({ outcome: "partial" })).actions).toEqual([{ kind: "copy_again", label: "Copy the rest…", tables: ["b", "c"] }]);
+    expect(said(copied({ outcome: "partial" }), copy, null).actions).toEqual([]);  // listed after a reload: not known
+    expect(said(copied({ outcome: "rolled_back" })).actions).toEqual([{ kind: "copy_again", label: "Copy again…", tables: null }]);
+    expect(said(copied({ outcome: "unknown" })).actions).toEqual([]);  // check the target first
+    expect(said(copied({ outcome: "rolled_back" }), null).actions).toEqual([]);
+  });
+
+  it("labels a copy's own codes and says what a lost connection left", () => {
+    const failed = said(copied({ outcome: "rolled_back", error: { code: "value_not_copyable", message: "Row 2 of public.a, column at: …" } }));
+    expect([failed.error?.label, failed.hint]).toEqual([
+      CODE_LABELS.value_not_copyable,
+      "Leave that row out with a filter, or give the column a text type, then copy again.",
+    ]);
+    expect(codeLabel("source_failed")).toBe("Reading the source failed");
+    const lost = said(copied({ outcome: "partial", error: { code: "connection_lost", message: "gone" } }));
+    expect(lost.hint).toContain("tables before it stay copied");
+  });
+
+  it("shows which table is being copied, and what Cancel does", () => {
+    const progress: JobProgressEvent = { type: "job_progress", request_id: "r1", stage: "data", object: "b", rows: 1500, bytes: 0, statements: 2, errors: 0 };
+    const state = jobReducer(jobReducer(openingJob(0), { type: "sent", at: 1 }), { type: "server", event: progress, at: 2 });
+    const view = { kind: "copy_data" as const, command: copy, state };
+    expect(progressView(view, 2_000, ["a", "b", "c"]).headline).toBe("Copying b (2 of 3)");
+    // rows read so far, not "copied": the table being copied counts as copied only when it commits
+    expect(progressView(view, 2_000, ["a", "b", "c"]).detail).toContain("1,500 rows read");
+    const commit = jobReducer(state, { type: "server", event: { ...progress, stage: "commit" }, at: 3 });
+    expect(progressView({ ...view, state: commit }, 3_000, ["a", "b", "c"]).headline).toBe("Committing b (2 of 3)");
+    expect(cancelNote({ ...view, state: commit })).toBeNull();
+    expect(progressView(view, 2_000, ["b"]).headline).toBe("Copying b");
+    expect(cancelNote(view)).toBe("Cancel rolls back the table being copied; the tables before it stay");
+  });
+
+  it("says what happened to the table a copy stopped at, and does not invent one (pre-flight L-k)", () => {
+    const none = [
+      { kind: "table", name: "a", source: "public.a", rows: 0, outcome: "not_started" as const },
+      { kind: "table", name: "b", source: "public.b", rows: 0, outcome: "not_started" as const },
+    ];
+    // the target's setup failed after something was sent: rolled back overall, yet no table started
+    const setup = said(outcome({ job: "copy_data", path: null, outcome: "rolled_back", objects: none, error: { code: "23505", message: "no" } }), copy, ["a", "b"]);
+    expect([setup.tone, setup.title, setup.actions.map((action) => action.label)]).toEqual(["danger", "Nothing was copied", ["Copy again…"]]);
+    // nothing was sent at all (refused first, or a Cancel before the first statement): not started
+    const refused = said(outcome({ job: "copy_data", path: null, outcome: "not_started", objects: none, error: { code: "plan_expired", message: "The preview has expired: preview the copy again" } }), copy, ["a", "b"]);
+    expect([refused.tone, refused.title, refused.hint, refused.actions.map((action) => action.label)]).toEqual([
+      "danger",
+      "The copy did not start",
+      CODE_HINTS_COPY.plan_expired,
+      ["Copy again…"],
+    ]);
+    const held = said(outcome({ job: "copy_data", path: null, outcome: "not_started", cancelled: true, objects: none }), copy, ["a", "b"]);
+    expect([held.tone, held.title]).toEqual(["muted", "Cancelled before anything was copied"]);
+    // a table that was rolled back is said so; the first table's rollback is not "nothing started"
+    expect(said(copied({ outcome: "rolled_back" })).title).toBe("Nothing was copied: the table was rolled back");
+    // a Cancel between two tables, or a connection made read-only meanwhile: stopped, and none was rolled back
+    const between = [
+      { kind: "table", name: "a", source: "public.a", rows: 2, outcome: "copied" as const },
+      { kind: "table", name: "b", source: "public.b", rows: 0, outcome: "not_started" as const },
+    ];
+    const gap = said(outcome({ job: "copy_data", path: null, outcome: "partial", cancelled: true, objects: between }), copy, ["a", "b"]);
+    expect([gap.tone, gap.title, gap.detail]).toEqual(["warning", "Cancelled: 1 of 2 tables copied", "The tables copied stay; the rest were not started."]);
+    expect(gap.actions).toEqual([{ kind: "copy_again", label: "Copy the rest…", tables: ["b"] }]);
+    expect(said(copied({ outcome: "partial" })).detail).toBe("The tables copied stay. b was rolled back; the rest were not started.");
+  });
+
+  it("says a connection lost for what it left, and never offers to copy what may be there (unknown)", () => {
+    const lost = (event: Partial<JobOutcomeEvent>) => said(copied({ error: { code: "connection_lost", message: "gone" }, ...event }));
+    expect(lost({ outcome: "partial" }).hint).toBe(
+      "The table being copied was rolled back by the server as the connection ended; the tables before it stay copied.",
+    );
+    expect(lost({ outcome: "rolled_back" }).hint).toBe(
+      "The table being copied was rolled back by the server as the connection ended: nothing was copied.",
+    );
+    expect(lost({ outcome: "rolled_back", objects: [{ kind: "table", name: "a", source: "public.a", rows: 0, outcome: "not_started" }] }).hint).toBe(
+      "The connection was lost before the first table started: nothing was copied.",
+    );
+    const unknown = lost({ outcome: "unknown", objects: [{ kind: "table", name: "a", source: "public.a", rows: 0, outcome: "unknown" }] });
+    expect([unknown.title, unknown.hint, unknown.actions]).toEqual(["What was copied is not known", "Check the target before copying again.", []]);
+    expect(unknown.detail).toBe("The tables marked unknown may or may not hold their rows: check the target before copying again.");
+    expect(said(copied({ outcome: "unknown", objects: [] })).detail).toBe("What was applied is not known: check the target.");
+  });
+
+  it("labels what a copy's source and target can fail with, in a copy's words (the backend's codes)", () => {
+    expect(codeLabel("profile_not_found")).toBe("The source connection was deleted");
+    expect(codeLabel("transaction_ended")).toBe("The transaction ended inside the file"); // a run's
+    expect(codeLabel("transaction_ended", "copy_data")).toBe("The table's transaction ended before its COMMIT");
+    expect(codeLabel("transaction_ended", "run_file")).toBe("The transaction ended inside the file");
+    const ended = said(copied({ outcome: "unknown", error: { code: "transaction_ended", message: "The transaction of b ended before its COMMIT" } }));
+    expect(ended.error?.label).toBe("The table's transaction ended before its COMMIT");
+    const locked = said(outcome({ job: "copy_data", path: null, outcome: "not_started", error: { code: "password_required", message: "x" } }));
+    expect([locked.error?.label, locked.hint]).toEqual([CODE_LABELS.password_required, CODE_HINTS_COPY.password_required]);
+    // an unlabelled code is shown by its message alone
+    expect(said(copied({ outcome: "rolled_back", error: { code: "23505", message: "dup" } })).error).toMatchObject({ label: null, message: "dup" });
   });
 });

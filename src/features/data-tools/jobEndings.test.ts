@@ -64,11 +64,13 @@ const record = (state: JobState, fields: Partial<JobRecord> = {}): JobRecord => 
   sessionId: "s1",
   kind: "dump",
   profileId: "p1",
+  sourceProfileId: null,
   database: null,
   title: "Dump public.big of dev pg to big.sql",
   command: dump,
   entry: null,
   tables: null,
+  copy: null,
   state,
   ...fields,
 });

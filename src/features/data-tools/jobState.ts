@@ -1,4 +1,5 @@
 import type {
+  CopyDataCommand,
   DumpCommand,
   JobInfo,
   JobOutcomeEvent,
@@ -16,7 +17,7 @@ import type {
  */
 
 export type JobKind = JobOutcomeEvent["job"];
-export type JobCommand = DumpCommand | RunFileCommand;
+export type JobCommand = DumpCommand | RunFileCommand | CopyDataCommand;
 
 /** How a job ended without the backend's outcome: only what the frontend knows. */
 export type JobLoss =

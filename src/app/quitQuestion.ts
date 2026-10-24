@@ -36,11 +36,13 @@ export function quitQuestion(running: readonly RunningJob[], how: QuitHow): Quit
     title: how === "quit" ? "Quit DbaGuy?" : "Close the window?",
     // A run in one transaction is rolled back (not "applies nothing": MySQL's non-transactional tables keep their
     // changes, and the run reports unknown; 06b review). A stopped run statement by statement keeps what took effect,
-    // but not a transaction the file opened and had not committed: the server rolls it back (06b pre-flight M5).
+    // but not a transaction the file opened and had not committed: the server rolls it back (06b pre-flight M5). A
+    // copy's tables are each a transaction of their own: the one being copied is rolled back (06c).
     message:
       `${subject} still running: ${names.join("; ")}${more}. ${act} stops ${them}: a dump writes no file, a run in ` +
-      "one transaction is rolled back, and a run statement by statement keeps what took effect (a transaction the " +
-      "file opened and did not commit is rolled back).",
+      "one transaction is rolled back, a run statement by statement keeps what took effect (a transaction the file " +
+      "opened and did not commit is rolled back), and a copy rolls back the table it is copying (the tables before " +
+      "it stay).",
     keep: "Keep running",
     confirm: how === "quit" ? "Quit anyway" : "Close anyway",
   };

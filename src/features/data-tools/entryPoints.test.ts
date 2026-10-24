@@ -1,9 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { EngineInfo, ObjectNode, PathSegment } from "@/lib/api/types";
 import type { ObjectTabState, QueryTabState, TableTabState } from "@/stores/workspace";
+import { defaultSchema as copyFormDefaultSchema } from "./copyForm";
 import {
+  copyEntryForNode,
+  copyEntryForResult,
+  copyEntryForTable,
+  defaultSchema,
   dumpEntryForNode,
   dumpEntryForTable,
+  paletteCopyEntry,
   paletteDumpEntry,
   paletteRunEntry,
   runEntryForNode,
@@ -265,5 +271,63 @@ describe("a dump's file name", () => {
     expect(new TextEncoder().encode(name).length).toBeLessThanOrEqual(255);
     expect(name).toMatch(/^資+_20261023-1405\.sql$/);
     expect([...name.split("_")[0]].length).toBe(66);
+  });
+});
+
+describe("Copy data to… (06c)", () => {
+  const db = [seg("database", "dbaguy")];
+  const schema = [...db, seg("schema", "public")];
+  const folder = [...schema, seg("folder", "tables")];
+  const orders = [...folder, seg("table", "orders")];
+
+  it("copies a schema's tables, its Tables folder's, or one relation, on the database's own session", () => {
+    expect(copyEntryForNode(P, PG, node(schema))).toEqual({ profileId: P, database: "dbaguy", source: { kind: "tables", schema: "public", folder } });
+    expect(copyEntryForNode(P, PG, node(folder))?.source).toEqual({ kind: "tables", schema: "public", folder });
+    expect(copyEntryForNode(P, PG, node(orders))?.source).toEqual({
+      kind: "relation", path: orders, schema: "public", name: "orders", relationKind: "table", filter: null,
+    });
+    const view = [...schema, seg("folder", "views"), seg("view", "v")];
+    expect(copyEntryForNode(P, PG, node(view))?.source).toMatchObject({ kind: "relation", relationKind: "view" });
+  });
+
+  it("offers nothing on a database node, another SQLite schema, or an engine that does not copy", () => {
+    expect(copyEntryForNode(P, PG, node(db))).toBeNull();
+    expect(copyEntryForNode(P, SQLITE, node([seg("schema", "aux")]))).toBeNull();
+    expect(copyEntryForNode(P, SQLITE, node([seg("schema", "main")]))?.source).toMatchObject({ kind: "tables", schema: "main" });
+    expect(copyEntryForNode(P, COUCHBASE, node([seg("bucket", "b")]))).toBeNull();
+    expect(copyEntryForNode(P, engine("postgres", { copy_data: false }), node(orders))).toBeNull();
+  });
+
+  it("copies a table tab's rows with its filter, a view's too (06c pre-flight L-d), and a query's result on its session", () => {
+    expect(copyEntryForTable(P, PG, orders, " id > 5 ", "tab-1")).toMatchObject({ tabId: "tab-1", source: { filter: "id > 5" } });
+    expect(copyEntryForTable(P, PG, orders, "  ")?.source).toMatchObject({ filter: null });
+    const view = [...schema, seg("folder", "views"), seg("view", "v")];
+    expect(copyEntryForTable(P, PG, view, "x = 1")?.source).toMatchObject({ filter: "x = 1" });
+    const columns = [{ name: "a", type_name: "int4", category: "number" as const }];
+    expect(copyEntryForResult(P, PG, "dbaguy", "s1", "SELECT 1 AS a", columns, "Q")).toEqual({
+      profileId: P, database: "dbaguy", source: { kind: "query", sessionId: "s1", sql: "SELECT 1 AS a", columns, title: "Q" },
+    });
+    expect(copyEntryForResult(P, PG, null, "s1", "SELECT", [], "Q")).toBeNull();
+  });
+
+  it("starts a connection in its default schema, one rule for the palette's tables and a copy's target (L-e)", () => {
+    expect([defaultSchema("postgres", "dw"), defaultSchema("mssql", null), defaultSchema("sqlite", null)]).toEqual(["public", "dbo", "main"]);
+    expect([defaultSchema("mysql", "shop"), defaultSchema("mysql", null), defaultSchema("couchbase", "b")]).toEqual(["shop", null, null]);
+    expect(copyFormDefaultSchema).toBe(defaultSchema);
+  });
+
+  it("from the palette: the table tab's table, else the query tab's default schema's tables", () => {
+    const profile = { id: P, name: "Local PG", engine: "postgres", database: "dbaguy" } as never;
+    const tab = { id: "t2", kind: "table" as const, profileId: P, title: "t", path: orders };
+    expect(paletteCopyEntry(tab, profile, PG, "a > 1")?.source).toMatchObject({ kind: "relation", filter: "a > 1" });
+    const query = { id: "t1", kind: "query" as const, title: "Q", profileId: P, database: null, scriptPath: null,
+      savedText: null, textFromFile: false, initialText: "", autocommit: true };
+    expect(paletteCopyEntry(query, profile, PG, "")).toEqual({
+      profileId: P, database: "dbaguy", source: { kind: "tables", schema: "public", folder },
+    });
+    const mysqlProfile = { id: P, name: "My", engine: "mysql", database: "shop" } as never;
+    expect(paletteCopyEntry(query, mysqlProfile, MYSQL, "")?.source).toEqual({
+      kind: "tables", schema: "shop", folder: [seg("schema", "shop"), seg("folder", "tables")],
+    });
   });
 });

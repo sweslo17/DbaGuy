@@ -1,16 +1,18 @@
 import { create } from "zustand";
+import type { CopyForm } from "./copyForm";
 import type { DumpForm } from "./dumpForm";
-import type { DumpEntry, RunEntry } from "./entryPoints";
+import type { CopyEntry, DumpEntry, RunEntry } from "./entryPoints";
 
 /*
  * Which data-tools dialog is open (one at a time, hosted by `DataToolsHost` in the app shell, so a tab that closes never
- * takes a job's dialog with it): a dump's or a run's form, or a job's view (progress, then its outcome). Starting a job
- * turns its form into the job's view; the Jobs list and a toast open a job's view again.
+ * takes a job's dialog with it): a dump's, a run's or a copy's form, or a job's view (progress, then its outcome).
+ * Starting a job turns its form into the job's view; the Jobs list and a toast open a job's view again.
  */
 
 export type DataDialogAsk =
   | { kind: "dump"; entry: DumpEntry; form: DumpForm | null; serial: number }
   | { kind: "run"; entry: RunEntry; serial: number }
+  | { kind: "copy"; entry: CopyEntry; form: CopyForm | null; serial: number }
   | { kind: "job"; requestId: string; serial: number };
 
 let serial = 0;
@@ -23,6 +25,11 @@ export function openDumpDialog(entry: DumpEntry, form: DumpForm | null = null): 
 
 export function openRunDialog(entry: RunEntry): void {
   useAsk.setState({ ask: { kind: "run", entry, serial: ++serial } });
+}
+
+/** `form`: "Copy again…" and "Copy the rest…" start from the job's own choices. */
+export function openCopyDialog(entry: CopyEntry, form: CopyForm | null = null): void {
+  useAsk.setState({ ask: { kind: "copy", entry, form, serial: ++serial } });
 }
 
 export function openJobDialog(requestId: string): void {

@@ -16,6 +16,7 @@ import {
   retryJob,
   runningCount,
   runningJobs,
+  runningOn,
   setJobListing,
   setJobTransport,
   startJob,
@@ -36,8 +37,8 @@ const info = (fields: Partial<JobInfo> = {}): JobInfo => ({
   profile_id: "00000000-0000-0000-0000-000000000001", started_at: "2026-10-23T01:00:00Z", ...fields,
 });
 const record = (fields: Partial<JobRecord> = {}): JobRecord => ({
-  requestId: "r1", sessionId: "s1", kind: "run_file", profileId: "p1", database: null, title: "t", command: null,
-  entry: null, tables: null, state: { ...openingJob(0), phase: "running", sent: true, sentAt: 0 }, ...fields,
+  requestId: "r1", sessionId: "s1", kind: "run_file", profileId: "p1", sourceProfileId: null, database: null, title: "t",
+  command: null, entry: null, tables: null, copy: null, state: { ...openingJob(0), phase: "running", sent: true, sentAt: 0 }, ...fields,
 });
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -290,5 +291,17 @@ describe("the Jobs button's counts", () => {
     const ended = record({ requestId: "c", state: { ...openingJob(0), phase: "ended", sent: true, sentAt: 0, loss: "not_listed", endedAt: 1 } });
     const some = snapshot([...running, ended]);
     expect([runningCount(some), hasEndedJob(some)]).toEqual([2, true]);
+  });
+});
+
+describe("a copy's source connection (06c B13)", () => {
+  it("comes with a listed copy, and its deletion waits for the copy as the target's does", () => {
+    const source = "00000000-0000-0000-0000-000000000002";
+    const { added } = reconcile({}, [info({ job: "copy_data", source_profile_id: source })], 0);
+    expect(added[0].sourceProfileId).toBe(source);
+    const jobs = { r1: record({ kind: "copy_data", sourceProfileId: "src" }) };
+    expect(runningOn({ jobs, order: ["r1"] }, "src").map((job) => job.requestId)).toEqual(["r1"]);
+    expect(runningOn({ jobs, order: ["r1"] }, "p1")).toHaveLength(1);
+    expect(runningOn({ jobs, order: ["r1"] }, "other")).toHaveLength(0);
   });
 });

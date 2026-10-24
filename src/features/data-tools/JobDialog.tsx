@@ -7,9 +7,10 @@ import type { FileExcerpt } from "@/lib/api/types";
 import { fileNameOf } from "@/lib/filePaths";
 import { useCancelAgain } from "@/lib/useCancelAgain";
 import { RecoverableError } from "../connections/RecoverableError";
-import { closeDataDialog, openDumpDialog, openRunDialog } from "./dataDialogs";
+import { restForm } from "./copyForm";
+import { closeDataDialog, openCopyDialog, openDumpDialog, openRunDialog } from "./dataDialogs";
 import { dumpFormFromCommand } from "./dumpForm";
-import type { DumpEntry, RunEntry } from "./entryPoints";
+import type { CopyEntry, DumpEntry, RunEntry } from "./entryPoints";
 import { cancelNote, jobReport, type JobAction } from "./jobReport";
 import { FileLines } from "./FileLines";
 import { fileExcerpt, revealFile } from "./jobsApi";
@@ -25,7 +26,10 @@ const KEEPS_RUNNING = {
 /** The jobs whose dialog was closed while they ran and that were told so (once each). */
 const toldKeepsRunning = new Set<string>();
 
-const isDumpEntry = (entry: DumpEntry | RunEntry | null): entry is DumpEntry => entry !== null && "target" in entry;
+const isDumpEntry = (entry: DumpEntry | RunEntry | CopyEntry | null): entry is DumpEntry =>
+  entry !== null && "target" in entry;
+const isCopyEntry = (entry: DumpEntry | RunEntry | CopyEntry | null): entry is CopyEntry =>
+  entry !== null && "source" in entry;
 
 async function reveal(path: string): Promise<void> {
   try {
@@ -52,6 +56,16 @@ function actionButton(record: JobRecord, action: JobAction, key: number) {
     );
   }
   const { entry, command } = record;
+  if (action.kind === "copy_again") {
+    // Back to the copy's form with its own choices; "Copy the rest…": only the tables not copied checked (06c)
+    if (record.kind !== "copy_data" || !isCopyEntry(entry) || !record.copy) return null;
+    const form = action.tables ? restForm(record.copy.form, action.tables) : record.copy.form;
+    return (
+      <Button key={key} onClick={() => openCopyDialog(entry, form)}>
+        {action.label}
+      </Button>
+    );
+  }
   if (record.kind === "run_file" && command?.type === "run_file") {
     // From where the outcome says (its resume point, with its line when exact), or as it was
     const again = againEntry({ profileId: record.profileId, database: record.database, command }, action.patch, action.note);
