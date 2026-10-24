@@ -22,6 +22,11 @@ IdentityChoice = Literal["keep", "generate"]
 COPY_DATA = "copy data"  # what a connection without `copy_data` cannot (spec §4)
 ONE_TABLE_FILTER = "a filter applies to a copy of one table"
 COPY_PLAN_EXPIRED = "The preview has expired: preview the copy again"  # spec §4: plan_expired and plan_mismatch
+# A query result whose statement does not only read, or returns no rows: refused by the preview and again by the copy's
+# read (the same code and words in both)
+QUERY_NOT_SELECT = "query_not_select"
+QUERY_NOT_SELECT_MESSAGE = ("Only a statement that returns rows (SELECT, WITH, VALUES…) can be copied, and one that "
+                            "only reads")
 
 
 class QuerySource(BaseModel):

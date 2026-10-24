@@ -316,6 +316,11 @@ def test_a_client_that_attaches_after_a_job_stopped_learns_why(env):  # fix wave
      ("error", "Stopped at line 12: boom")),
     (dict(outcome="partial", stopped_at=StoppedAt(line=1_200, statement=40)), None, ("error", "Partly applied at line 1,200")),
     (dict(outcome="unknown"), StatementError("lost"), ("error", "Outcome unknown: lost")),
+    # A Cancel that left something applied, or not known, says that first (06c Task 4 review M-1)
+    (dict(outcome="partial", cancelled=True), StatementCancelled(),
+     ("error", "Partly applied (cancelled): Query cancelled")),
+    (dict(outcome="unknown", cancelled=True, stopped_at=StoppedAt(line=9, statement=2)), StatementCancelled(),
+     ("error", "Outcome unknown at line 9 (cancelled): Query cancelled")),
 ])
 def test_history_status_of_each_outcome(event, error, expected):  # D-06-9
     assert history_status(JobOutcomeEvent(request_id="j", job="run_file", **event), error) == expected

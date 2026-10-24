@@ -1,24 +1,35 @@
 """Copy data's job (spec ⑥ §3.5.5, R-06-12, 06c Task 4) on the dev databases: append and replace in one transaction per
 table, a key conflict rolled back, identities and their sequences, a trigger that skips rows, a table that cannot roll
 back, MySQL's CREATE TABLE that stays, several tables stopping at the first failure, a Cancel, a failing source, a
-query tab's own session, a plan run once, and History. Scratch tables `zz_06c_*`, dropped by exact name."""
+query tab's own session, a plan run once, and History. Scratch tables `zz_06c_*`, dropped by exact name. Then every way
+a table ends on a fake target (Task 4 review M-6), where each branch is reached for sure."""
 
 import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
+from dbaguy_backend.adapters.base import CONNECTION_LOST, StatementError
 from dbaguy_backend.adapters.columns import TableColumn
 from dbaguy_backend.domain.execution import CopyDataCommand, ExecuteCommand
-from dbaguy_backend.sessions.jobs.transfer import CREATED_EMPTY, DELETED_STAY, NOT_ROLLED_BACK
+from dbaguy_backend.services.transfer_plans import PlannedColumn, PlannedTable, StoredTransfer
+from dbaguy_backend.sessions.jobs.context import JOB_ROLLBACK_FAILED, SourceLease
+from dbaguy_backend.sessions.jobs.kept_changes import KEPT, SHOW_WARNINGS
+from dbaguy_backend.sessions.jobs.transfer import (
+    CREATED_CHECK, CREATED_EMPTY, CREATED_KEPT, DELETE_STOPPED, DELETED_STAY, MAY_STAND, NOT_ROLLED_BACK, TRIGGER_ENDED,
+    TransferSink,
+)
 from dbaguy_backend.sql.bulk_insert import InsertBatcher
 from dbaguy_backend.sql.dialects import Dialect
 from tests.data_support import DataApp, JobTab, Ran, dropping
 from tests.edit_support import scratch_db
+from tests.fake_db import FakeConnection, FakeResult
 from tests.support import requires_mssql, requires_mysql, requires_pg
+from tests.test_copy_framework import CopyEnv
+from tests.test_job_framework import Env, outcome
 from tests.test_sessions import request_events
 from tests.transfer_support import profile, query_request, table_name, tables_request
 
@@ -495,3 +506,351 @@ def test_a_copys_insert_aborts_on_a_conflict_and_says_how_many_rows_it_holds() -
     pg = InsertBatcher(Dialect.POSTGRES, '"t"', [column], abort_on_conflict=True)
     pg.add([1])
     assert pg.flush() == 'INSERT INTO "t" (id) VALUES\n(1)'
+
+
+# ---- 06c Task 4 review I-1: a MySQL table that cannot roll back, whatever the plan said ----
+
+
+@requires_pg
+@requires_mysql
+def test_a_table_created_with_an_engine_that_cannot_roll_back_keeps_its_rows_and_says_so(app: DataApp,
+                                                                                          tmp_path: Path) -> None:
+    pg, my = scratch_db("postgres", tmp_path), scratch_db("mysql", tmp_path)
+    try:
+        with dropping(pg) as pg_made, dropping(my, before_drop=app.close_sessions) as my_made:
+            source, target = table_name("s"), table_name("t")
+            pg.execute(f"CREATE TABLE {pg.table(source)} (id int PRIMARY KEY, at timestamp)",
+                       f"INSERT INTO {pg.table(source)} SELECT g, CASE WHEN g = 1200 THEN 'infinity'::timestamp "
+                       "ELSE '2026-10-05'::timestamp END FROM generate_series(1, 1500) g")
+            pg_made.append(("TABLE", source))
+            my_made.append(("TABLE", target))
+            src, dst = profile(app, pg, "pg"), profile(app, my, "my")
+            plan = app.container.transfers.plan(tables_request(pg, src, [source], my, dst, table=target))
+            tab = app.job_session(dst)
+            # The server's default engine for its CREATE TABLE (a server configured so, as some are)
+            tab.run(lambda rid: ExecuteCommand(request_id=rid, sql="SET SESSION default_storage_engine = MyISAM"))
+            ran = tab.run(lambda rid: CopyDataCommand(request_id=rid, plan_id=plan.plan_id))
+            rows = my.rows(f"SELECT COUNT(*) FROM {my.table(target)}")
+            engine = my.rows("SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND "
+                             f"TABLE_NAME = '{target}'")
+        assert (ran.outcome.outcome, ran.outcome.objects[0].outcome, ran.error.code) == (
+            "unknown", "unknown", "value_not_copyable")  # the first INSERT of 1,000 rows went out; row 1,200 failed
+        assert ran.outcome.warnings[:2] == [CREATED_KEPT.format(target), MAY_STAND.format(1000, target)]
+        assert not [said for said in ran.outcome.warnings if "empty" in said or "rolled back" in said]
+        assert (engine, rows) == ([("MyISAM",)], [(1000,)])  # what the outcome says may stand, stands
+    finally:
+        pg.close()
+        my.close()
+
+
+@requires_mysql
+def test_an_append_into_a_table_that_cannot_roll_back_any_more_is_unknown(app: DataApp, tmp_path: Path) -> None:
+    lite, my = scratch_db("sqlite", tmp_path), scratch_db("mysql", tmp_path)
+    try:
+        with dropping(my, before_drop=app.close_sessions) as made:
+            source, target = table_name("s"), table_name("t")
+            lite.execute(f"CREATE TABLE {lite.table(source)} (id INTEGER PRIMARY KEY)",
+                         f"INSERT INTO {lite.table(source)} VALUES (1), (2), (3)")
+            my.execute(f"CREATE TABLE {my.table(target)} (id int PRIMARY KEY) ENGINE=InnoDB",
+                       f"INSERT INTO {my.table(target)} VALUES (3)")
+            made.append(("TABLE", target))
+            src, dst = profile(app, lite, "lite"), profile(app, my, "my")
+            plan = app.container.transfers.plan(tables_request(lite, src, [source], my, dst, "append", table=target))
+            my.execute(f"ALTER TABLE {my.table(target)} ENGINE=MyISAM")  # after the preview, which said InnoDB
+            ran = app.job_session(dst).run(lambda rid: CopyDataCommand(request_id=rid, plan_id=plan.plan_id))
+            rows = my.rows(f"SELECT id FROM {my.table(target)} ORDER BY id")
+        assert (ran.outcome.outcome, ran.error.code) == ("unknown", "1062")
+        assert NOT_ROLLED_BACK.format(target) in ran.outcome.warnings  # its engine read when the table started
+        assert rows == [(1,), (2,), (3,)]
+    finally:
+        lite.close()
+        my.close()
+
+
+@requires_mysql
+def test_a_rollback_that_left_a_triggers_changes_is_unknown(app: DataApp, tmp_path: Path) -> None:  # 1196, R3
+    lite, my = scratch_db("sqlite", tmp_path), scratch_db("mysql", tmp_path)
+    try:
+        with dropping(my, before_drop=app.close_sessions) as made:
+            source, target, log, trigger = table_name("s"), table_name("t"), table_name("l"), table_name("g")
+            lite.execute(f"CREATE TABLE {lite.table(source)} (id INTEGER PRIMARY KEY)",
+                         f"WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 1001) "
+                         f"INSERT INTO {lite.table(source)} SELECT n FROM s")
+            my.execute(f"CREATE TABLE {my.table(log)} (id int) ENGINE=MyISAM",
+                       f"CREATE TABLE {my.table(target)} (id int PRIMARY KEY) ENGINE=InnoDB",
+                       f"INSERT INTO {my.table(target)} VALUES (1001)",
+                       f"CREATE TRIGGER {my.table(trigger)} AFTER INSERT ON {my.table(target)} FOR EACH ROW "
+                       f"INSERT INTO {my.table(log)} VALUES (NEW.id)")
+            made += [("TABLE", log), ("TABLE", target)]  # the trigger goes with its table
+            src, dst = profile(app, lite, "lite"), profile(app, my, "my")
+            # The first INSERT (1,000 rows) goes in and its trigger writes the MyISAM log; the second meets 1001
+            ran = copy(app, tables_request(lite, src, [source], my, dst, "append", table=target), dst, None)
+            counts = [my.rows(f"SELECT COUNT(*) FROM {my.table(name)}")[0][0] for name in (target, log)]
+        assert (ran.outcome.outcome, ran.error.code) == ("unknown", "1062")
+        assert KEPT in ran.outcome.warnings and counts == [1, 1000]  # the table rolled back; the trigger's rows stayed
+    finally:
+        lite.close()
+        my.close()
+
+
+# ---- every way a table ends, on a fake target (Task 4 review M-6) ----
+
+
+def _number(name: str) -> TableColumn:
+    return TableColumn(name=name, type_name="int", family="int64", nullable=True, has_default=False, kind="number",
+                       compare="equals", writable=True)
+
+
+class _Answer(FakeResult):
+    """A statement's answer on the fakes: its rows as they are, and the rows it matched."""
+
+    def __init__(self, rows: list[list] | None = None, matched: int | None = None) -> None:
+        super().__init__(0)
+        self._answer = list(rows or [])
+        self._matched = matched
+
+    def fetch(self, n: int) -> list[list]:
+        taken, self._answer = self._answer[:n], self._answer[n:]
+        return taken
+
+    def matched_rows(self) -> int | None:
+        return self._matched
+
+
+class _Target(FakeConnection):
+    """A copy's target: BEGIN opens a transaction and an INSERT matches its rows. `fail`: a statement's first word →
+    what it raises (a StatementError, or a function of the connection that returns one); `commit`: what COMMIT does
+    (ok, lost, left_open, crash); `engine`: whether MySQL says the table rolls back (YES, NO); `warnings`: what SHOW
+    WARNINGS holds; `ends`: an INSERT ends the transaction; `rollback_fails`; `check_crashes`: the check before COMMIT
+    raises a bug's exception once; `hold`: COMMIT waits (reached, go)."""
+
+    def __init__(self, *, fail: dict | None = None, commit: str = "ok", engine: str = "YES", warnings: tuple = (),
+                 ends: bool = False, rollback_fails: bool = False, check_crashes: bool = False,
+                 hold: tuple[threading.Event, threading.Event] | None = None) -> None:
+        super().__init__()
+        self.fail = fail or {}
+        self.commit_does = commit
+        self.engine = engine
+        self.warnings = warnings
+        self.ends = ends
+        self.rollback_fails = rollback_fails
+        self.check_crashes = check_crashes
+        self.hold = hold
+
+    def table_columns(self, path: list) -> list[TableColumn]:
+        return [_number("n")]
+
+    def statement(self, sql: str, options) -> _Answer:
+        self.runs.append(sql)
+        word = sql.split()[0].upper()
+        if word in self.fail:
+            failure = self.fail[word]
+            raise failure(self) if callable(failure) else failure
+        if "BEGIN" in sql or sql.startswith("START TRANSACTION"):
+            self.tx = True
+        elif word == "INSERT":
+            if self.ends:
+                self.tx = False
+            return _Answer(matched=sql.count("\n("))
+        elif word == "COMMIT":
+            return self._commit()
+        elif sql == SHOW_WARNINGS:
+            return _Answer([list(warning) for warning in self.warnings])
+        elif "information_schema.TABLES" in sql:
+            return _Answer([[self.engine]])
+        return _Answer()
+
+    def _commit(self) -> _Answer:
+        if self.hold is not None:
+            reached, go = self.hold
+            reached.set()
+            assert go.wait(5)
+        if self.commit_does == "lost":
+            self.tx = False
+            raise StatementError("Connection to the server was lost", code=CONNECTION_LOST)
+        if self.commit_does == "crash":
+            raise RuntimeError("a driver bug")
+        if self.commit_does != "left_open":
+            self.tx = False
+        return _Answer()
+
+    def transaction_failed(self) -> bool:
+        if self.check_crashes and self.tx:
+            self.check_crashes = False
+            raise RuntimeError("a driver bug")
+        return super().transaction_failed()
+
+    def rollback(self) -> None:
+        if self.rollback_fails:
+            raise StatementError("The rollback failed", code="2013")
+        super().rollback()
+
+
+def _lost(target: _Target) -> StatementError:
+    target.tx = False  # the server ended the transaction with the connection
+    return StatementError("Connection to the server was lost", code=CONNECTION_LOST)
+
+
+def _trigger_commit(target: _Target) -> StatementError:
+    target.tx = False
+    return StatementError("The transaction ended in the trigger", code="3609")
+
+
+def _planned(name: str, **fields) -> PlannedTable:
+    return PlannedTable(**{
+        "source_name": f"s.{name}", "target_name": name, "target_schema": None, "target_table": name,
+        "target_path": (), "select": "rows 3", "columns": (_number("n"),), "written": (PlannedColumn(0, "n"),),
+        "before": (), "after": (), "created": False, **fields})
+
+
+class _Copying:
+    """A copy on fakes: the target's worker runs TransferSink on `target`; its source is another worker whose `rows 3`
+    gives three rows."""
+
+    def __init__(self, target: _Target, dialect: Dialect, *tables: PlannedTable) -> None:
+        self.target = target
+        self.plan = StoredTransfer(plan_id="p", profile_id=uuid4(), database=None, source_profile_id=uuid4(),
+                                   source_database=None, query=False, tables=tables, summary="-- Copy data",
+                                   title="Copy")
+        self.source = CopyEnv()
+        self.sink = Env(conn=target)
+        hooks = self.sink.worker._hooks
+        jobs = replace(hooks.jobs, build=lambda command: TransferSink(command, self.plan, dialect),
+                       source=lambda *_: SourceLease(self.source.worker, lambda: None))
+        self.sink.worker.configure(replace(hooks, dialect=dialect, jobs=jobs))
+
+    def run(self) -> list:
+        self.submit()
+        return self.events()
+
+    def submit(self) -> None:
+        self.sink.worker.submit(CopyDataCommand(request_id="c", plan_id="p"))
+
+    def events(self) -> list:
+        return request_events(self.sink.recorder, "c")
+
+    def close(self) -> None:
+        self.sink.worker.close()
+        self.source.worker.close()
+
+
+@pytest.fixture
+def fakes():
+    made: list[_Copying] = []
+
+    def make(target: _Target, dialect: Dialect = Dialect.SQLITE, *tables: PlannedTable) -> _Copying:
+        made.append(_Copying(target, dialect, *(tables or (_planned("t"),))))
+        return made[-1]
+
+    yield make
+    for each in made:
+        each.close()
+
+
+def _ended(events: list) -> tuple:
+    done = outcome(events)
+    return done.outcome, [item.outcome for item in done.objects], done.error.code if done.error else None
+
+
+def test_a_commit_whose_answer_was_lost_is_unknown_and_says_what_may_stand(fakes) -> None:
+    events = fakes(_Target(commit="lost")).run()
+    assert _ended(events) == ("unknown", ["unknown"], CONNECTION_LOST)
+    assert outcome(events).warnings == [MAY_STAND.format(3, "t")]
+
+
+def test_a_commit_that_left_a_transaction_open_is_rolled_back_and_unknown(fakes) -> None:
+    copying = fakes(_Target(commit="left_open"))
+    events = copying.run()
+    assert _ended(events) == ("unknown", ["unknown"], "commit_unconfirmed")
+    assert (copying.target.rollbacks, copying.target.tx) == (1, False)
+
+
+def test_a_transaction_that_ended_before_its_commit_is_unknown(fakes) -> None:
+    copying = fakes(_Target(ends=True))
+    events = copying.run()
+    assert _ended(events) == ("unknown", ["unknown"], "transaction_ended")
+    assert not [sql for sql in copying.target.runs if sql.startswith("COMMIT")]  # no COMMIT for it
+
+
+def test_a_connection_lost_before_the_commit_rolled_the_table_back(fakes) -> None:  # the server ends it
+    copying = fakes(_Target(fail={"INSERT": _lost}))
+    events = copying.run()
+    assert _ended(events) == ("rolled_back", ["rolled_back"], CONNECTION_LOST)
+    assert copying.target.rollbacks == 0 and outcome(events).warnings == []
+
+
+def test_a_triggers_commit_is_unknown(fakes) -> None:  # SQL Server 3609
+    events = fakes(_Target(fail={"INSERT": _trigger_commit}), Dialect.TSQL).run()
+    assert _ended(events) == ("unknown", ["unknown"], "3609")
+    assert outcome(events).warnings == [TRIGGER_ENDED.format("t"), MAY_STAND.format(3, "t")]
+
+
+def test_a_cancel_during_a_commit_stops_the_next_table_and_history_says_part_was_copied(fakes) -> None:
+    reached, go = threading.Event(), threading.Event()
+    copying = fakes(_Target(hold=(reached, go)), Dialect.SQLITE, _planned("a"), _planned("b"))
+    copying.submit()
+    assert reached.wait(5)
+    copying.sink.worker.cancel("c")  # the COMMIT cannot be cancelled: held for the next table
+    go.set()
+    events = copying.events()
+    assert _ended(events) == ("partial", ["copied", "not_started"], "cancelled") and outcome(events).cancelled
+    assert [sql for sql in copying.target.runs if "BEGIN" in sql] == ["BEGIN IMMEDIATE"]
+    [finished] = [record for record in copying.sink.records if record[0] == "finish"]
+    assert finished[2:] == ("error", finished[3], 3, "Partly applied (cancelled): Query cancelled")  # review M-1
+
+
+def test_a_cancel_before_a_tables_first_statement_leaves_it_not_started(fakes) -> None:  # review M-4
+    copying = fakes(_Target(), Dialect.SQLITE, _planned("a"), _planned("b"))
+    asked: list[int] = []
+
+    def read_only() -> bool:  # the copy asks it right after the next table may be cancelled again
+        asked.append(1)
+        if len(asked) == 2:
+            copying.sink.worker.cancel("c")
+        return False
+
+    hooks = copying.sink.worker._hooks
+    copying.sink.worker.configure(replace(hooks, jobs=replace(hooks.jobs, read_only=read_only)))
+    events = copying.run()
+    assert _ended(events) == ("partial", ["copied", "not_started"], "cancelled")
+    assert [sql for sql in copying.target.runs if "BEGIN" in sql] == ["BEGIN IMMEDIATE"]  # b's BEGIN never went out
+
+
+def test_a_bug_around_the_commit_ends_its_table_not_the_copy(fakes) -> None:  # review M-3
+    checked = fakes(_Target(check_crashes=True)).run()
+    assert _ended(checked)[:2] == ("rolled_back", ["rolled_back"])
+    assert outcome(checked).error.message.startswith("Internal error")
+    committed = fakes(_Target(commit="crash")).run()  # the COMMIT may have gone out
+    assert _ended(committed)[:2] == ("unknown", ["unknown"])
+    assert outcome(committed).error.message.startswith("Internal error")
+
+
+def _duplicate(target: _Target) -> StatementError:
+    return StatementError("Duplicate entry", code="1062")
+
+
+def test_a_mysql_table_is_what_the_server_says_when_it_starts(fakes) -> None:  # review I-1
+    created = _planned("t", create_first="CREATE TABLE t (n int)", created=True)
+    kept = fakes(_Target(fail={"INSERT": _duplicate}, engine="NO"), Dialect.MYSQL, created).run()
+    assert _ended(kept) == ("unknown", ["unknown"], "1062")
+    assert outcome(kept).warnings == [CREATED_KEPT.format("t"), MAY_STAND.format(3, "t")]
+    warned = fakes(_Target(fail={"INSERT": _duplicate}, warnings=(("Warning", 1196, "…"),)), Dialect.MYSQL,
+                   created).run()  # InnoDB, but its ROLLBACK left another table's changes (a trigger's: R3)
+    assert _ended(warned) == ("unknown", ["unknown"], "1062")
+    assert outcome(warned).warnings == [KEPT, CREATED_CHECK.format("t"), MAY_STAND.format(3, "t")]
+    undone = fakes(_Target(fail={"INSERT": _duplicate}), Dialect.MYSQL, created).run()
+    assert _ended(undone) == ("rolled_back", ["rolled_back"], "1062")
+    assert outcome(undone).warnings == [CREATED_EMPTY.format("t")]  # empty: only once it rolled back
+
+
+def test_a_delete_that_stopped_part_way_is_said_as_such(fakes) -> None:  # review M-5
+    replacing = _planned("t", before=("DELETE FROM t",))
+    stopped = fakes(_Target(fail={"DELETE": _duplicate}, engine="NO"), Dialect.MYSQL, replacing).run()
+    assert outcome(stopped).outcome == "unknown" and outcome(stopped).warnings == [DELETE_STOPPED.format("t")]
+    deleted = fakes(_Target(fail={"INSERT": _duplicate}, engine="NO"), Dialect.MYSQL, replacing).run()
+    assert outcome(deleted).warnings == [DELETED_STAY.format("t"), MAY_STAND.format(3, "t")]
+
+
+def test_a_rollback_that_failed_is_said_where_the_table_is_unknown(fakes) -> None:  # review M-10
+    events = fakes(_Target(fail={"INSERT": _duplicate}, engine="NO", rollback_fails=True), Dialect.MYSQL).run()
+    assert outcome(events).warnings == [NOT_ROLLED_BACK.format("t"), JOB_ROLLBACK_FAILED, MAY_STAND.format(3, "t")]

@@ -11,9 +11,12 @@ for, A16).
 Outcomes (R-06-12), per table: copied, rolled_back, not_started, unknown; for the copy: completed, partial (some tables
 copied, then one failed or a Cancel stopped it), rolled_back (none copied), unknown (a COMMIT whose answer was lost, a
 table that cannot roll back after a write went out — replace's DELETE included (pre-flight H3) — a SQL Server trigger's
-COMMIT). A copy stops at the first table that does not copy. A Cancel stops the table being copied (rolled back) and
-every table after it; one that comes during a COMMIT stops the next table; so does a profile made read-only meanwhile
-(pre-flight L-b). Nothing is ever sent again.
+COMMIT, a MySQL ROLLBACK that left changes, 1196). Whether a MySQL table can roll back is what the server says when the
+table starts, never the plan's word alone: a table the copy created took the server's default engine, and another may
+have changed since the preview (Task 4 review I-1). A copy stops at the first table that does not copy. A Cancel stops
+the table being copied (rolled back; not_started when it came before the table's first statement) and every table after
+it; one that comes during a COMMIT stops the next table; so does a profile made read-only meanwhile (pre-flight L-b).
+Nothing is ever sent again. An unknown table counts no rows: its warning says how many may stand (review M-2).
 
 The source: when the sink stops first it closes the pipe. It cancels a read on a session of the copy's own; a query
 tab's read it never cancels (on PostgreSQL that aborts the tab's open transaction, pre-flight H2), and only withdraws it
@@ -31,6 +34,7 @@ from loguru import logger
 
 from ...adapters.base import CONNECTION_LOST, StatementCancelled, StatementError
 from ...adapters.columns import TableColumn
+from ...adapters.dump import plural
 from ...domain.data_jobs import JobObject, JobOutcomeKind, TableOutcome
 from ...domain.edits import PlanUnavailable
 from ...domain.errors import READ_ONLY_MESSAGE, DomainError, NotFound
@@ -43,18 +47,28 @@ from ...sql.transfer_sql import TARGET_RESET, TARGET_SETUP
 from ...sql.type_map import Convert, RowFailure, conversion
 from ..edit_apply import ROW_COUNT_UNKNOWN, TRANSACTION_ENDED
 from .context import JOB_ROLLBACK_FAILED, Job, JobContext, JobReport, PreparedJob, SourceLease
+from .kept_changes import KEPT, kept_changes, table_rolls_back
 from .pipe import RowPipe, SourceFailed
 from .run_file import TRANSACTION_ENDED as ENDED_BEFORE_COMMIT
 from .transfer_source import TransferSource
 
 ROW_COUNT_MISMATCH = "row_count_mismatch"
 VALUE_NOT_COPYABLE = "value_not_copyable"
+# A MySQL table the copy created: it stays whatever happens next. Empty only once it rolled back (I-1)
 CREATED_EMPTY = ("{} was created (MySQL commits a CREATE TABLE at once) and stays, empty: drop it, or copy again "
                  "into it")
+CREATED_KEPT = ("{} was created (MySQL commits a CREATE TABLE at once) and cannot roll back (non-transactional): it "
+                "stays, with the rows written before the failure")
+CREATED_CHECK = "{} was created (MySQL commits a CREATE TABLE at once) and stays: check it before copying into it again"
+# A table that cannot roll back, once a write went out (⑤ G10, pre-flight H3; review M-5: the DELETE's own words)
 NOT_ROLLED_BACK = "{} cannot roll back (non-transactional): the rows written before the failure stay"
 DELETED_STAY = ("{} cannot roll back (non-transactional): the DELETE of its rows and the rows written before the "
                 "failure stay")
-NOT_STARTED = "{} were not copied"
+DELETE_STOPPED = ("{} cannot roll back (non-transactional): its DELETE stopped part way, and the rows it removed "
+                  "before that stay removed")
+TRIGGER_ENDED = "A trigger ended the transaction of {}: what it committed stays"
+MAY_STAND = "Up to {:,} rows written to {} may stand"  # an unknown table's (review M-2: its object counts none)
+NOT_STARTED = "{} not copied: {}"  # `1 table` or `n tables`, then their names (review M-8)
 SOURCE_UNAVAILABLE = "The source connection could not be opened: {}"
 SOURCE_END_WAIT_S = 10.0  # how long a session the copy opened may take to end its last read before it is closed
 
@@ -67,6 +81,23 @@ class _Table:
     rows: int = 0
     error: StatementError | None = None
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _Writing:
+    """What one table's copy did so far: how it ends follows from it."""
+
+    transactional: bool  # it rolls back: the plan's word, and on MySQL the server's when the table starts (I-1)
+    began: bool = False  # its first statement ran (MySQL's CREATE TABLE, or BEGIN): before it a Cancel starts nothing
+    created: bool = False  # MySQL's CREATE TABLE ran: the table stays, whatever comes next
+    sent: bool = False  # a write went out: replace's DELETE, an INSERT
+    deleted: bool = False  # replace's DELETE ran to its end (M-5)
+    rows: int = 0  # taken from the source
+    written: int = 0  # the rows of the INSERTs that went out, the failing one's included: what may stand (M-2)
+
+
+def _internal(exc: Exception) -> StatementError:
+    return StatementError(f"Internal error: {exc}")
 
 
 class TransferSink(Job):
@@ -99,13 +130,16 @@ class TransferSink(Job):
             raise StatementError(exc.message, code=exc.code) from None
         except DomainError as exc:  # a password, a server down, the tab's session gone: nothing was sent
             raise StatementError(SOURCE_UNAVAILABLE.format(exc.message), code=exc.code) from None
-        copy = _Copy(ctx, plan, lease, self._source_dialect)
-        try:
+        copy: _Copy | None = None
+        try:  # the lease is released whatever happens from here (review M-9)
+            copy = _Copy(ctx, plan, lease, self._source_dialect)
             ctx.begin_record(plan.summary)
             logger.info("[copy] {} table(s): {}", len(plan.tables), plan.title)
             return copy.go()
         finally:
-            copy.release()
+            if copy is not None:
+                copy.settle()
+            lease.release()
 
 
 class _Copy:
@@ -147,14 +181,13 @@ class _Copy:
         self._reset()
         return self._report(ended)
 
-    def release(self) -> None:
-        """End the source's lease: a session the copy opened is closed once its last read is over (its settings set
-        back), within SOURCE_END_WAIT_S; a query tab's is the tab's again at once (a read it still runs ends at its
-        next chunk, H2)."""
+    def settle(self) -> None:
+        """Before the source's lease ends: a session the copy opened is closed only once its last read is over (its
+        settings set back), within SOURCE_END_WAIT_S; a query tab's is the tab's again at once (a read it still runs
+        ends at its next chunk, H2)."""
         if not self.plan.query and self.source is not None and not self.source.wait_ended(SOURCE_END_WAIT_S):
             logger.warning("[copy] the source's last read had not ended after {:g} s: closing its session",
                            SOURCE_END_WAIT_S)
-        self.lease.release()
 
     # ---- one table ----
 
@@ -162,20 +195,23 @@ class _Copy:
         ctx = self.ctx
         ctx.progress.stage, ctx.progress.object = "data", table.target_name
         ctx.tick(force=True)
-        created = sent = False
-        rows = 0
+        state = _Writing(transactional=table.transactional)
         try:
             self.created = self.created or table.created
             if table.create_first:  # MySQL: it commits at once, before the table's transaction
                 ctx.drain(ctx.run(table.create_first))
-                created = True
+                state.began = state.created = True
+            if self.dialect is Dialect.MYSQL:  # its engine as the server has it now, not as the plan said (I-1)
+                state.transactional = self._rolls_back(table, state.transactional)
             ctx.drain(ctx.run(self.frame.begin))
+            state.began = True
             escapes = ctx.connection.backslash_escapes() if self.dialect is Dialect.MYSQL else None
             for sql in table.before:
                 # Replace's DELETE is a write: a table that cannot roll back keeps what it did, even when an error or a
                 # Cancel stops it part way (pre-flight H3)
-                sent = True
+                state.sent = True
                 ctx.drain(ctx.run(sql))
+            state.deleted = bool(table.before)
             batcher, converts = self._writer(table, escapes)
             pipe = RowPipe(table.source_name)
             source_id = f"{ctx.request_id}:source:{index + 1}"
@@ -188,15 +224,13 @@ class _Copy:
             try:
                 while (chunk := pipe.take(ctx.raise_if_cancelled)) is not None:
                     for row in chunk:
-                        rows += 1
-                        if (statement := batcher.add(self._values(table, converts, row, rows))) is not None:
-                            sent = True
-                            self._insert(statement, batcher.flushed_rows)
+                        state.rows += 1
+                        if (statement := batcher.add(self._values(table, converts, row, state.rows))) is not None:
+                            self._insert(statement, batcher.flushed_rows, state)
                     ctx.progress.rows += len(chunk)
                     ctx.tick()
                 if (statement := batcher.flush()) is not None:
-                    sent = True
-                    self._insert(statement, batcher.flushed_rows)
+                    self._insert(statement, batcher.flushed_rows, state)
             except BaseException:
                 pipe.close()  # the source's next chunk stops it
                 self._stop_source(source_id)
@@ -204,11 +238,18 @@ class _Copy:
             for sql in table.after:
                 ctx.drain(ctx.run(sql))
         except StatementError as exc:
-            return self._failed(table, exc, created=created, sent=sent)
+            return self._failed(table, exc, state)
         except Exception as exc:  # a bug: still the table's end as it is, not the whole copy's unknown
             logger.exception("[copy] copying {} failed", table.target_name)
-            return self._failed(table, StatementError(f"Internal error: {exc}"), created=created, sent=sent)
-        return self._commit(table, rows, created, sent)
+            return self._failed(table, _internal(exc), state)
+        return self._commit(table, state)
+
+    def _rolls_back(self, table: PlannedTable, assumed: bool) -> bool:
+        """MySQL: whether the table's engine rolls back, as the server says when the table starts. A table the copy
+        created took the server's default engine (MyISAM on some servers), and another may have changed engines since
+        the preview (review I-1). One it does not find: as the plan said (the columns' read then says it is gone)."""
+        found = table_rolls_back(self.ctx, table.target_schema, table.target_table)
+        return assumed if found is None else found
 
     def _stop_source(self, source_id: str) -> None:
         """A read on the copy's own session is cancelled; a query tab's only withdrawn while it waits in the tab's
@@ -254,11 +295,13 @@ class _Copy:
             values.append(value)
         return values
 
-    def _insert(self, sql: str, rows: int) -> None:
+    def _insert(self, sql: str, rows: int, state: _Writing) -> None:
         """One INSERT: through the session's gate, and it must report the rows it was given (⑤ D-05-5, A16)."""
         ctx = self.ctx
         if ctx.hooks.gate(sql).action != GuardAction.RUN:
             raise StatementError(READ_ONLY_MESSAGE, code="read_only")
+        state.sent = True
+        state.written += rows
         matched = ctx.matched(sql)
         if matched is None:
             raise StatementError("Could not confirm how many rows an INSERT wrote (a trigger returned rows?): the "
@@ -269,67 +312,96 @@ class _Copy:
         self.statements += 1
         ctx.progress.statements = self.statements
 
-    def _commit(self, table: PlannedTable, rows: int, created: bool, sent: bool) -> _Table:
+    def _commit(self, table: PlannedTable, state: _Writing) -> _Table:
         """COMMIT, once nothing stopped the table (⑤ §3.5 step 7): no Cancel reaches it. Only a COMMIT that went out
-        and whose answer was lost is unknown; whatever stops the table before it is `_failed`'s."""
+        and whose answer was lost (or that left a transaction open) is unknown; whatever stops the table before it is
+        `_failed`'s, an unexpected exception included (review M-3)."""
         ctx, connection = self.ctx, self.ctx.connection
         ctx.progress.stage = "commit"
         ctx.tick(force=True)
         cancelled = ctx.stop_cancels()
         try:
             if cancelled:
-                return self._failed(table, StatementCancelled(), created=created, sent=sent)
+                return self._failed(table, StatementCancelled(), state)
             if connection.transaction_failed():
                 return self._failed(table, StatementError("The transaction had failed", code="transaction_failed"),
-                                    created=created, sent=sent)
+                                    state)
             open_now = connection.in_transaction()
         except StatementError as exc:  # nothing of the COMMIT went out
-            return self._failed(table, exc, created=created, sent=sent)
+            return self._failed(table, exc, state)
+        except Exception as exc:
+            logger.exception("[copy] checking {} before its COMMIT failed", table.target_name)
+            return self._failed(table, _internal(exc), state)
         if not open_now:
-            return _Table("unknown", error=StatementError(
+            return self._unknown(table, state, StatementError(
                 f"The transaction of {table.target_name} ended before its COMMIT: what was written may or may not "
                 "stay", code=ENDED_BEFORE_COMMIT))
         try:
             ctx.drain(ctx.run(self.frame.commit))
         except StatementError as exc:
             if exc.code == CONNECTION_LOST:
-                return _Table("unknown", error=exc)
-            return self._failed(table, exc, created=created, sent=sent)
+                return self._unknown(table, state, exc)
+            return self._failed(table, exc, state)
+        except Exception as exc:  # the COMMIT may have gone out: what it did is not known
+            logger.exception("[copy] the COMMIT of {} failed", table.target_name)
+            return self._unknown(table, state, _internal(exc), rollback=True)
         try:
             left_open = connection.in_transaction()
-        except StatementError as exc:
-            return _Table("unknown", error=exc)
+        except Exception as exc:
+            return self._unknown(table, state, exc if isinstance(exc, StatementError) else _internal(exc))
         if left_open:  # nested @@TRANCOUNT, or MySQL completion_type=CHAIN: what COMMIT did cannot be told (⑤ G11)
-            self._rollback()
-            return _Table("unknown", error=StatementError(
+            return self._unknown(table, state, StatementError(
                 "COMMIT returned but a transaction is still open: it was rolled back; what was copied is unknown",
-                code="commit_unconfirmed"))
-        return _Table("copied", rows=rows)
+                code="commit_unconfirmed"), rollback=True)
+        return _Table("copied", rows=state.rows)
 
-    def _failed(self, table: PlannedTable, error: StatementError, *, created: bool, sent: bool) -> _Table:
-        """A table that stopped before its COMMIT: rolled back, unless it cannot be (a table that is not
-        transactional, once a write went out — replace's DELETE included: ⑤ G10, pre-flight H3) or the server ended
-        its transaction itself (a SQL Server trigger's COMMIT, 3609)."""
+    def _failed(self, table: PlannedTable, error: StatementError, state: _Writing) -> _Table:
+        """A table that stopped before its COMMIT went out: rolled back, unless
+        - a Cancel came before its first statement ran: not_started (review M-4);
+        - the server ended its transaction itself (a SQL Server trigger's COMMIT, 3609): unknown;
+        - it cannot roll back and a write went out (⑤ G10, pre-flight H3, review I-1): unknown;
+        - MySQL's ROLLBACK says some changes stayed (1196: a table a trigger wrote, R3): unknown."""
         self.ctx.stop_cancels()
-        ended = error.code in TRANSACTION_ENDED.get(self.dialect, frozenset())
-        if (sent and not table.transactional) or ended:
-            self._rollback()
-            said = [(DELETED_STAY if table.before else NOT_ROLLED_BACK).format(table.target_name)] if not ended else [
-                f"A trigger ended the transaction of {table.target_name}: what it committed stays"]
-            return _Table("unknown", error=error, warnings=said)
+        name = table.target_name
+        if isinstance(error, StatementCancelled) and not state.began:
+            return _Table("not_started", error=error)
+        if error.code in TRANSACTION_ENDED.get(self.dialect, frozenset()):
+            return self._unknown(table, state, error, said=[TRIGGER_ENDED.format(name)], rollback=True)
+        if state.sent and not state.transactional:
+            return self._unknown(table, state, error, said=[self._kept(table, state)], rollback=True)
         if error.code == CONNECTION_LOST:  # the server rolls the open transaction back as the connection ends
-            return _Table("rolled_back", error=error, warnings=self._created(table, created))
-        return self._undone(table, error, created=created)
-
-    def _undone(self, table: PlannedTable, error: StatementError, *, created: bool) -> _Table:
-        warnings = self._created(table, created)
+            return _Table("rolled_back", error=error, warnings=self._created(table, state))
         if not self._rollback():
-            warnings.append(JOB_ROLLBACK_FAILED)
-        return _Table("rolled_back", error=error, warnings=warnings)
+            return _Table("rolled_back", error=error, warnings=[*self._created(table, state), JOB_ROLLBACK_FAILED])
+        if self.dialect is Dialect.MYSQL and kept_changes(self.ctx, "copy"):
+            said = [KEPT, *([CREATED_CHECK.format(name)] if state.created else [])]
+            return self._unknown(table, state, error, said=said)
+        return _Table("rolled_back", error=error, warnings=self._created(table, state))
 
     @staticmethod
-    def _created(table: PlannedTable, created: bool) -> list[str]:
-        return [CREATED_EMPTY.format(table.target_name)] if created and table.create_first else []
+    def _kept(table: PlannedTable, state: _Writing) -> str:
+        """What a table that cannot roll back keeps, by what went out."""
+        if state.created:
+            return CREATED_KEPT.format(table.target_name)
+        if table.before:  # replace's DELETE: done, or stopped part way (review M-5)
+            return (DELETED_STAY if state.deleted else DELETE_STOPPED).format(table.target_name)
+        return NOT_ROLLED_BACK.format(table.target_name)
+
+    def _unknown(self, table: PlannedTable, state: _Writing, error: StatementError, *, said: list[str] | None = None,
+                 rollback: bool = False) -> _Table:
+        """A table whose rows may or may not stand: why, its transaction ended first when `rollback` (and said when
+        that failed, review M-10), and how many rows may stand at most (its object counts none, review M-2)."""
+        warnings = list(said or [])
+        if rollback and not self._rollback():
+            warnings.append(JOB_ROLLBACK_FAILED)
+        if state.written:
+            warnings.append(MAY_STAND.format(state.written, table.target_name))
+        return _Table("unknown", error=error, warnings=warnings)
+
+    @staticmethod
+    def _created(table: PlannedTable, state: _Writing) -> list[str]:
+        """A created table that rolled back: it stays, and nothing was written to it that stands."""
+        return [CREATED_EMPTY.format(table.target_name)] if state.created else []
 
     def _rollback(self) -> bool:
         """End the table's transaction; whether it is ended (a connection that is gone has none)."""
@@ -382,7 +454,8 @@ class _Copy:
         warnings = [warning for done in ended for warning in done.warnings]
         left = [item.name for item in objects if item.outcome == "not_started"]
         if left and len(left) < len(objects):
-            warnings.append(NOT_STARTED.format(", ".join(left[:10]) + (" …" if len(left) > 10 else "")))
+            names = ", ".join(left[:10]) + (" …" if len(left) > 10 else "")
+            warnings.append(NOT_STARTED.format(plural("table", len(left)), names))
         rows = sum(item.rows for item in objects if item.outcome == "copied")
         outcome = ctx.outcome(overall, rows=rows, statements=self.statements, objects=objects, warnings=warnings,
                               cancelled=isinstance(error, StatementCancelled))

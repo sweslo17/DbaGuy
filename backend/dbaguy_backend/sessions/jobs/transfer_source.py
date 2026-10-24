@@ -22,20 +22,18 @@ from typing import Any
 from loguru import logger
 
 from ...adapters.base import StatementCancelled, StatementError
+from ...domain.data_jobs import INVALID_FILTER
 from ...domain.execution import ColumnMeta
-from ...services.safety import GuardAction, is_plain_read
+from ...domain.transfer import QUERY_NOT_SELECT, QUERY_NOT_SELECT_MESSAGE
 from ...services.transfer_plans import PlannedTable
 from ...sql.select_builder import FILTER_NOT_A_CONDITION
 from ...sql.transfer_sql import SOURCE_SETTINGS, read_settings, set_setting
-from .context import FIRST_FETCH, Job, JobContext, JobReport, fetch_size
-from .dump import INVALID_FILTER
+from .context import FIRST_FETCH, Job, JobContext, JobReport, fetch_size, plain_read
 from .pipe import PipeClosed, RowPipe
 
 PIPE_CHUNK_CHARS = 4 * 1_048_576  # R-06-13: a chunk's values hold about this much text at most
 COLUMNS_CHANGED = "columns_changed"
 COLUMNS_CHANGED_MESSAGE = "The query's columns changed since the preview: preview the copy again"
-NOT_A_READ = "query_not_select"
-NOT_A_READ_MESSAGE = "Only a statement that returns rows, and only reads, can be copied"
 MANY_RESULTS = "The statement returns more than one result: copy one statement's result at a time"
 _OTHER_CHARS = 8  # what a value that is not text or bytes counts for in a chunk's size
 
@@ -89,7 +87,7 @@ class TransferSource(Job):
                     self._pipe.put(chunk, ctx.raise_if_cancelled)
                     size = fetch_size(largest, PIPE_CHUNK_CHARS)
                 if self._query and result.next_result():  # a T-SQL batch: its first result was read, maybe not the
-                    raise StatementError(MANY_RESULTS, code=NOT_A_READ)  # one shown (the table rolls back, M4)
+                    raise StatementError(MANY_RESULTS, code=QUERY_NOT_SELECT)  # one shown (the table rolls back, M4)
             finally:
                 ctx.close(result)
             self._pipe.finish()
@@ -122,16 +120,13 @@ class TransferSource(Job):
     def _checked(self, ctx: JobContext) -> str:
         """The SELECT, when it may run: a statement the user wrote, or a filter of theirs in DbaGuy's, must only read
         (on any profile), and every statement passes the session's gate."""
-        sql = self._table.select
-        if (self._query or self._table.filtered) and not is_plain_read(sql, ctx.dialect):
-            if self._query:
-                raise StatementError(NOT_A_READ_MESSAGE, code=NOT_A_READ)
-            # The user typed a filter, not a statement: the dump's words for the same check (Task 3 review M-4)
-            raise StatementError(FILTER_NOT_A_CONDITION, code=INVALID_FILTER)
-        if ctx.hooks.gate(sql).action != GuardAction.RUN:
-            raise StatementError("This connection is read-only, and the statement is not a plain read",
-                                 code="read_only")
-        return sql
+        refusal = None
+        if self._query:
+            refusal = StatementError(QUERY_NOT_SELECT_MESSAGE, code=QUERY_NOT_SELECT)  # the preview's words
+        elif self._table.filtered:  # the user typed a filter, not a statement: the dump's words (Task 3 review M-4)
+            refusal = StatementError(FILTER_NOT_A_CONDITION, code=INVALID_FILTER)
+        return plain_read(ctx, self._table.select, not_a_read=refusal,
+                          read_only="This connection is read-only, and the statement is not a plain read")
 
     def _compare(self, columns: list[ColumnMeta] | None) -> None:
         """A query runs again: its columns must be the ones the preview mapped (spec §3.5.5 step 2)."""

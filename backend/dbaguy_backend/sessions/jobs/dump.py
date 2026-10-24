@@ -33,11 +33,10 @@ from loguru import logger
 from ...adapters.base import INVALID_TEXT, Dumping, InvalidText, StatementCancelled, StatementError
 from ...adapters.columns import TableColumn
 from ...adapters.dump import DumpCatalog, DumpSession, DumpTable, parents_first
-from ...domain.data_jobs import BE_DUMPED, JobObject, cannot
+from ...domain.data_jobs import BE_DUMPED, INVALID_FILTER, JobObject, cannot
 from ...domain.errors import DomainError
 from ...domain.execution import DumpCommand
 from ...domain.profiles import Engine
-from ...services.safety import GuardAction, is_plain_read
 from ...sql.bulk_insert import InsertBatcher, size_warning
 from ...sql.dialects import Dialect
 from ...sql.dump_script import (
@@ -46,7 +45,7 @@ from ...sql.dump_script import (
 )
 from ...sql.select_builder import FILTER_NOT_A_CONDITION, build_copy_select, build_count_select, check_filter
 from ...storage.atomic_file import atomic_text_file
-from .context import FIRST_FETCH, Job, JobContext, JobReport, fetch_size
+from .context import FIRST_FETCH, Job, JobContext, JobReport, fetch_size, plain_read
 
 DUMP_IO = "dump_io"
 FETCH_CHARS = 32 * 1_048_576  # about this much row text a read takes, at most FETCH_ROWS rows (pre-flight M12)
@@ -63,7 +62,6 @@ NOT_UNICODE = ("holds text that is not valid Unicode (half of a surrogate pair),
                "Nothing was written")
 NOT_UTF8 = "holds text that is not valid UTF-8, which a UTF-8 file cannot hold. Nothing was written"  # fix L2
 CATALOG_NOT_UTF8 = f"A name or definition in this database {NOT_UTF8}"
-INVALID_FILTER = "invalid_filter"  # Task 9 fix M2; its text is select_builder's FILTER_NOT_A_CONDITION, never the value
 
 
 def scope_text(command: DumpCommand) -> str:
@@ -191,11 +189,8 @@ class DumpJob(Job):
         it is sent. Without a filter every SELECT is DbaGuy's own."""
         if self._command.filter is None:
             return sql
-        if not is_plain_read(sql, ctx.dialect):
-            raise StatementError(FILTER_NOT_A_CONDITION, code=INVALID_FILTER)
-        if ctx.hooks.gate(sql).action != GuardAction.RUN:
-            raise StatementError(f"This connection is read-only: {FILTER_NOT_A_CONDITION}", code="read_only")
-        return sql
+        return plain_read(ctx, sql, not_a_read=StatementError(FILTER_NOT_A_CONDITION, code=INVALID_FILTER),
+                          read_only=f"This connection is read-only: {FILTER_NOT_A_CONDITION}")
 
     def broke(self, ctx: JobContext, exc: Exception) -> JobReport:
         """A dump only reads: whatever broke, nothing was written (the temporary file is gone)."""

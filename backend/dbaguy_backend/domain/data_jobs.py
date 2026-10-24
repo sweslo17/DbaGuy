@@ -29,6 +29,9 @@ ENGINE_NAMES: dict[Engine, str] = {  # what messages call an engine (the UI's EN
 }
 RUN_SQL_FILES = "run SQL files"  # what a connection without `run_file` cannot do (spec §4)
 BE_DUMPED = "be dumped"  # what a connection without `dump` cannot (spec §4)
+# A dump's or a copy's filter that is not one condition on the rows (06a Task 9 fix M2): its text is select_builder's
+# FILTER_NOT_A_CONDITION, never the value
+INVALID_FILTER = "invalid_filter"
 
 
 def cannot_read(path: str, exc: OSError) -> str:

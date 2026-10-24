@@ -24,7 +24,7 @@ from ...domain.data_jobs import (
 )
 from ...domain.execution import MessageEvent, MessageSeverity, ServerMessage
 from ...domain.history import HistoryStatus
-from ...services.safety import GuardAction, GuardDecision
+from ...services.safety import GuardAction, GuardDecision, is_plain_read
 from ...sql.dialects import Dialect
 
 NO_DESCRIBE = RunOptions(describe=False)  # a job shows no result set: SQL Server skips the describe (⑤ M1)
@@ -45,6 +45,18 @@ def read_matched(result: StatementResult, forward: Callable[[StatementResult], N
     while result.next_result():
         forward(result)
     return rows
+
+
+def plain_read(ctx: "JobContext", sql: str, *, not_a_read: StatementError | None, read_only: str) -> str:
+    """`sql`, when it may run on the job's session: a plain read by the classifier (the read-only allow-list's) on any
+    profile, when it holds the user's text (`not_a_read`: what refuses it otherwise; None: DbaGuy's own SELECT), and
+    let through by the session's gate, so a read-only profile never sends more (`read_only`: its refusal's text).
+    Otherwise nothing of it is sent. A dump's filtered SELECT and a copy's read (06c Task 4 review M-7)."""
+    if not_a_read is not None and not is_plain_read(sql, ctx.dialect):
+        raise not_a_read
+    if ctx.hooks.gate(sql).action != GuardAction.RUN:
+        raise StatementError(read_only, code="read_only")
+    return sql
 
 
 def fetch_size(largest: int, budget: int) -> int:
@@ -322,9 +334,11 @@ class Job(ABC):
 
 
 def history_status(outcome: JobOutcomeEvent, error: StatementError | None) -> tuple[HistoryStatus, str | None]:
-    """How a job's History record ends (D-06-9): ok, cancelled, or error with what happened in front of the error."""
+    """How a job's History record ends (D-06-9): ok, cancelled, or error with what happened in front of the error. A
+    Cancel that left something applied (partial) or something not known (unknown) is never only "cancelled": History
+    says that first, cancelled after it (06c Task 4 review M-1)."""
     text = error.message if error is not None else None
-    if outcome.cancelled:
+    if outcome.cancelled and outcome.outcome not in ("partial", "unknown"):
         return "cancelled", text
     if outcome.outcome == "completed":
         skipped = f"{outcome.error_count:,} error(s) skipped" if outcome.error_count else None
@@ -333,7 +347,7 @@ def history_status(outcome: JobOutcomeEvent, error: StatementError | None) -> tu
     prefix = {
         "rolled_back": "Rolled back", "stopped": f"Stopped{where}", "partial": f"Partly applied{where}",
         "unknown": f"Outcome unknown{where}", "failed": "Failed", "not_started": "Not started",
-    }[outcome.outcome]
+    }[outcome.outcome] + (" (cancelled)" if outcome.cancelled else "")
     return "error", f"{prefix}: {text}" if text else prefix
 
 

@@ -28,8 +28,8 @@ from ..domain.metadata import PathSegment
 from ..domain.profiles import AnyProfile, SqliteProfile
 from ..domain.schema import SchemaSnapshot, SnapshotRelation
 from ..domain.transfer import (
-    COPY_DATA, ColumnMapping, IdentityChoice, TableTransfer, TargetSpec, TransferPlan, TransferProblem,
-    TransferRequest,
+    COPY_DATA, QUERY_NOT_SELECT, QUERY_NOT_SELECT_MESSAGE, ColumnMapping, IdentityChoice, TableTransfer, TargetSpec,
+    TransferPlan, TransferProblem, TransferRequest,
 )
 from ..sql.dialects import Dialect, qualified
 from ..sql.dump_script import RESTORE_CHECKS_FOREIGN_KEYS, self_reference_warnings
@@ -48,7 +48,10 @@ DEFAULT_SCHEMAS: dict[Dialect, str] = {Dialect.POSTGRES: "public", Dialect.TSQL:
 QUERY_RUNS_AGAIN = "The query runs again when the copy starts, as an export does: its rows may differ from those shown"
 FK_CYCLE = ("Foreign keys between these tables form a cycle: {} checks them as rows load, so a table may fail to "
             "copy")
-CREATED_STAYS = ("MySQL commits a CREATE TABLE at once: if the copy of {} fails, the new table stays, empty")
+# Empty only when the table can roll back: a server whose default engine cannot (MyISAM) keeps the rows written before
+# the failure, and the copy then says so (06c Task 4 review I-1)
+CREATED_STAYS = ("MySQL commits a CREATE TABLE at once: if the copy of {} fails, the new table stays (empty, unless "
+                 "the server's default engine cannot roll back)")
 NON_TRANSACTIONAL = ("{} cannot roll back (non-transactional): if the copy fails, the rows written before stay, and "
                      "what happened to the table is not known")
 NON_TRANSACTIONAL_REPLACE = ("{} cannot roll back (non-transactional): its rows are deleted at once, and if the copy "
@@ -274,8 +277,7 @@ class TransferService:
         if source.query is not None:
             query = source.query
             if not is_plain_read(query.sql, dialect):
-                problems.append(_problem("query_not_select", "Only a statement that returns rows (SELECT, WITH, "
-                                                             "VALUES…) can be copied, and one that only reads"))
+                problems.append(_problem(QUERY_NOT_SELECT, QUERY_NOT_SELECT_MESSAGE))
             names = [meta.name for meta in query.columns]
             if len(set(names)) != len(names):
                 twice = next(name for name in names if names.count(name) > 1)

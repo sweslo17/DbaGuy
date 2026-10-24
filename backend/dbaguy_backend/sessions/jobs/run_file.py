@@ -44,6 +44,7 @@ from ...sql.transaction_text import (
 )
 from ..edit_apply import TRANSACTION_ENDED as ENDED_INSIDE  # SQL Server 3609, as ⑤ reads it
 from .context import JOB_ROLLBACK_FAILED, Job, JobContext, JobReport
+from .kept_changes import KEPT, kept_changes
 
 READ_ONLY = "read_only"
 UNSUPPORTED_COPY = "unsupported_copy"
@@ -63,7 +64,6 @@ ROLLED_BACK = "The transaction was rolled back: nothing was applied"
 _SQLITE_FOREIGN_KEY = "SQLITE_CONSTRAINT_FOREIGNKEY"
 FOREIGN_KEYS_OFF_HINT = ("Line {:,} turns foreign key checks off, which SQLite ignores inside a transaction: run the "
                          "file statement by statement to load its rows as they are")
-KEPT = "Some tables cannot roll back (non-transactional): their changes stayed"  # ruling R3
 # Rulings R10, N6: a trigger's or a procedure's COMMIT (or ROLLBACK) and BEGIN TRANSACTION, which neither text tells
 RESTARTED = ("The transaction was ended and restarted inside the file (a trigger or a procedure): some changes may "
              "stand")
@@ -71,9 +71,7 @@ RESTARTED = ("The transaction was ended and restarted inside the file (a trigger
 # by statement open one, and an all-or-nothing BEGIN nest (pre-flight L8)
 _NO_IMPLICIT_TRANSACTIONS = "SET IMPLICIT_TRANSACTIONS OFF"
 _TRANSACTION_ID = "SELECT CURRENT_TRANSACTION_ID()"  # SQL Server 2016+: another id = another transaction (R10)
-_SHOW_WARNINGS = "SHOW WARNINGS"
 _UNLOCK_TABLES = "UNLOCK TABLES"
-_NOT_ROLLED_BACK = "1196"  # MySQL: "Some non-transactional changed tables couldn't be rolled back"
 _DEADLOCK = "1213"  # MySQL: InnoDB rolled the whole transaction back (R1: the one failure that ends it known undone)
 # MySQL: whether the session's database has a table whose engine cannot roll back (MyISAM, MEMORY, …; an engine the
 # server does not list counts as one), so that a write that fails midway may keep part of its rows (06b review M2)
@@ -939,7 +937,7 @@ class _Run:
                 if JOB_ROLLBACK_FAILED not in self.warnings:  # and in the outcome, for a later window (F3)
                     self.warnings.append(JOB_ROLLBACK_FAILED)
             return False
-        if self.dialect is Dialect.MYSQL and self._warnings_kept_changes():
+        if self.dialect is Dialect.MYSQL and kept_changes(self.ctx, "run"):
             self.kept = True
             return True
         return False
@@ -950,22 +948,9 @@ class _Run:
         if self.dialect is not Dialect.MYSQL or error.code != _DEADLOCK:
             return False
         self.ctx.stop_cancels()
-        if self._warnings_kept_changes():
+        if kept_changes(self.ctx, "run"):
             self.kept = True
         return self.kept
-
-    def _warnings_kept_changes(self) -> bool:
-        """MySQL: the warnings of the last statement (a ROLLBACK, or a deadlock's victim) hold 1196."""
-        try:
-            result = self.ctx.run(_SHOW_WARNINGS)
-            try:
-                rows = result.fetch(MAX_JOB_ERRORS)
-            finally:
-                self.ctx.close(result)
-        except StatementError as exc:
-            logger.info("[run] the warnings of the rollback could not be read ({})", exc.code)
-            return False
-        return any(len(row) > 1 and str(row[1]) == _NOT_ROLLED_BACK for row in rows)
 
     def _partly_applied(self, statement: FileStatement) -> list[str]:
         """Statement by statement, a write that failed (or was cancelled) on the server outside the file's transaction

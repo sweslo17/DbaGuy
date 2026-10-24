@@ -12,14 +12,14 @@ import pytest
 
 from dbaguy_backend.adapters.base import StatementError
 from dbaguy_backend.adapters.columns import TableColumn
+from dbaguy_backend.domain.data_jobs import INVALID_FILTER
 from dbaguy_backend.domain.edits import PLAN_MISMATCH, PlanUnavailable
 from dbaguy_backend.domain.execution import ExecuteCommand
-from dbaguy_backend.domain.transfer import COPY_PLAN_EXPIRED
+from dbaguy_backend.domain.transfer import COPY_PLAN_EXPIRED, QUERY_NOT_SELECT
 from dbaguy_backend.sessions.jobs.context import Job, JobContext, JobReport, PreparedJob
-from dbaguy_backend.sessions.jobs.dump import INVALID_FILTER
 from dbaguy_backend.sessions.jobs.pipe import RowPipe, SourceFailed
 from dbaguy_backend.sessions.jobs.registry import JobRegistry
-from dbaguy_backend.sessions.jobs.transfer_source import MANY_RESULTS, NOT_A_READ, TransferSource
+from dbaguy_backend.sessions.jobs.transfer_source import MANY_RESULTS, TransferSource
 from dbaguy_backend.sessions.manager import SessionCreateRequest
 from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.sql.select_builder import FILTER_NOT_A_CONDITION
@@ -299,7 +299,7 @@ def test_a_query_with_more_than_one_result_is_never_copied(env) -> None:  # M4: 
     e.worker.submit(PreparedJob(request_id="q", job=_source(pipe, query=True)))
     with pytest.raises(SourceFailed) as failed:
         _drain(pipe, within_s=10)
-    assert (failed.value.cause.code, failed.value.cause.message) == (NOT_A_READ, MANY_RESULTS)
+    assert (failed.value.cause.code, failed.value.cause.message) == (QUERY_NOT_SELECT, MANY_RESULTS)
     assert outcome(request_events(e.recorder, "q")).outcome == "failed"
 
 
@@ -362,7 +362,7 @@ def test_a_query_that_may_not_run_leaves_the_tabs_settings_untouched(env) -> Non
     e.worker.submit(PreparedJob(request_id="q", job=_source(pipe, "DELETE FROM t RETURNING n", query=True)))
     with pytest.raises(SourceFailed) as failed:
         _drain(pipe, within_s=10)
-    assert (failed.value.cause.code, e.conn.runs) == (NOT_A_READ, [])
+    assert (failed.value.cause.code, e.conn.runs) == (QUERY_NOT_SELECT, [])
     assert outcome(request_events(e.recorder, "q")).outcome == "not_started"
 
 
