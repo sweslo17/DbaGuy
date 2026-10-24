@@ -51,6 +51,7 @@ class AdapterCapabilities:
     orders_browse_by_key: bool = False
     run_file: bool = False  # Run SQL file (spec ⑥ R-06-1, D-06-13)
     dump: bool = False  # a native SQL dump (spec ⑥ R-06-1): the connection is Dumping
+    copy_data: bool = False  # copy rows between connections (spec ⑥ R-06-1, G3): the connection is DataTools
 
 
 @dataclass(frozen=True)
@@ -417,7 +418,7 @@ class DatabaseAdapter(ABC):
             transactions=caps.transactions, query_context=caps.query_context, parameters=caps.parameters,
             documents=caps.documents, executed_plan=caps.executed_plan, plan_format=caps.plan_format,
             row_editing=caps.row_editing, orders_browse_by_key=caps.orders_browse_by_key, run_file=caps.run_file,
-            dump=caps.dump,
+            dump=caps.dump, copy_data=caps.copy_data,
         )
 
     def relation_path(self, database: str | None, schema: str, name: str, kind: RelationKind) -> list[PathSegment]:

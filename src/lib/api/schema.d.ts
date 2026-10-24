@@ -502,6 +502,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/data/transfer/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Transfer Plan
+         * @description Copy data's preview (spec ⑥ §3.5.1): each table's column mapping, types and conversions, the statements the copy
+         *     adds, its warnings and problems, and the plan id the copy command takes once (null while there is a problem). A
+         *     read-only target is refused (403) and an engine without copies 422 `not_supported`, before any connection.
+         */
+        post: operations["transfer_plan_data_transfer_plan_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/data/reveal": {
         parameters: {
             query?: never;
@@ -1091,6 +1113,40 @@ export interface components {
             is_primary_key: boolean;
             /** Comment */
             comment?: string | null;
+        };
+        /**
+         * ColumnMapping
+         * @description One source column and where it goes (spec §3.5.1).
+         */
+        ColumnMapping: {
+            /** Source Name */
+            source_name: string;
+            /** Source Type */
+            source_type: string;
+            /** Family */
+            family: string;
+            /** Target Name */
+            target_name?: string | null;
+            /** Target Type */
+            target_type?: string | null;
+            /**
+             * Type Editable
+             * @default false
+             */
+            type_editable: boolean;
+            /**
+             * Overridden
+             * @default false
+             */
+            overridden: boolean;
+            /** Conversion */
+            conversion?: string | null;
+            /** Skipped */
+            skipped?: string | null;
+            /** Identity */
+            identity?: ("keep" | "generate") | null;
+            /** Problem */
+            problem?: string | null;
         };
         /** ColumnMeta */
         ColumnMeta: {
@@ -1800,6 +1856,11 @@ export interface components {
              * @default false
              */
             dump: boolean;
+            /**
+             * Copy Data
+             * @default false
+             */
+            copy_data: boolean;
         };
         /** ErrorEvent */
         ErrorEvent: {
@@ -2670,6 +2731,22 @@ export interface components {
             /** Scope */
             scope?: string | null;
         };
+        /**
+         * QuerySource
+         * @description A query tab's result (spec §3.5.1): its statement, run again on the tab's own session as an export is (the same
+         *     transaction, its temporary tables), and the columns the tab already has, which the preview maps without running it.
+         */
+        QuerySource: {
+            /** Sql */
+            sql: string;
+            /** Columns */
+            columns: components["schemas"]["ColumnMeta"][];
+            /**
+             * Title
+             * @default the query
+             */
+            title: string;
+        };
         /** RemoveDocumentRequest */
         RemoveDocumentRequest: {
             /**
@@ -3209,6 +3286,24 @@ export interface components {
              */
             descending: boolean;
         };
+        /**
+         * SourceSpec
+         * @description Tables, views and materialized views of one connection, or a query tab's result.
+         */
+        SourceSpec: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Database */
+            database?: string | null;
+            /** Tables */
+            tables?: components["schemas"]["PathSegment"][][] | null;
+            query?: components["schemas"]["QuerySource"] | null;
+            /** Filter */
+            filter?: string | null;
+        };
         /** SplitRequest */
         SplitRequest: {
             /** Text */
@@ -3472,12 +3567,137 @@ export interface components {
             /** Exact */
             exact?: boolean;
         };
+        /**
+         * TableTransfer
+         * @description One table of the copy, in the order the copy runs (spec §3.5.1).
+         */
+        TableTransfer: {
+            /** Source */
+            source: string;
+            /** Target */
+            target: string;
+            /** Source Key */
+            source_key: string;
+            /** Source Path */
+            source_path?: components["schemas"]["PathSegment"][] | null;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "create" | "append" | "replace_rows";
+            /** Columns */
+            columns: components["schemas"]["ColumnMapping"][];
+            /**
+             * Before
+             * @default []
+             */
+            before: string[];
+            /**
+             * After
+             * @default []
+             */
+            after: string[];
+            /**
+             * Warnings
+             * @default []
+             */
+            warnings: string[];
+            /**
+             * Problems
+             * @default []
+             */
+            problems: components["schemas"]["TransferProblem"][];
+        };
+        /**
+         * TargetSpec
+         * @description Where the rows go (spec §3.5.1). `overrides`, `identity` and `left_out` are by the source table's name (a
+         *     query's: its `title`) and then the source column's.
+         */
+        TargetSpec: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Database */
+            database?: string | null;
+            /** Schema Name */
+            schema_name?: string | null;
+            /** Table */
+            table?: string | null;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "create" | "append" | "replace_rows";
+            /** Overrides */
+            overrides?: {
+                [key: string]: {
+                    [key: string]: string;
+                };
+            };
+            /** Identity */
+            identity?: {
+                [key: string]: {
+                    [key: string]: "keep" | "generate";
+                };
+            };
+            /** Left Out */
+            left_out?: {
+                [key: string]: string[];
+            };
+        };
         /** TextSelection */
         TextSelection: {
             /** Anchor */
             anchor: number;
             /** Head */
             head: number;
+        };
+        /**
+         * TransferPlan
+         * @description The preview (POST /data/transfer/plan). `plan_id` is null while any table or the copy has a problem (⑤ E8).
+         */
+        TransferPlan: {
+            /** Plan Id */
+            plan_id?: string | null;
+            /**
+             * Source Profile Id
+             * Format: uuid
+             */
+            source_profile_id: string;
+            /** Tables */
+            tables: components["schemas"]["TableTransfer"][];
+            /**
+             * Warnings
+             * @default []
+             */
+            warnings: string[];
+            /**
+             * Problems
+             * @default []
+             */
+            problems: components["schemas"]["TransferProblem"][];
+        };
+        /**
+         * TransferProblem
+         * @description Why the copy cannot run as asked (spec §4): the preview has no plan id while there is one.
+         */
+        TransferProblem: {
+            /**
+             * Code
+             * @enum {string}
+             */
+            code: "target_exists" | "target_missing" | "target_not_writable" | "unmappable_type" | "invalid_type" | "same_table" | "same_sqlite_file" | "source_missing" | "missing_column" | "unconvertible" | "query_not_select" | "no_columns" | "duplicate_column" | "invalid_filter";
+            /** Message */
+            message: string;
+            /** Column */
+            column?: string | null;
+        };
+        /** TransferRequest */
+        TransferRequest: {
+            source: components["schemas"]["SourceSpec"];
+            target: components["schemas"]["TargetSpec"];
         };
         /** UncheckedColumn */
         UncheckedColumn: {
@@ -4559,6 +4779,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DumpPlan"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    transfer_plan_data_transfer_plan_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TransferRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TransferPlan"];
                 };
             };
             /** @description Validation Error */

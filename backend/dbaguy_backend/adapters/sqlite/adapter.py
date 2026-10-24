@@ -309,7 +309,7 @@ class SqliteAdapter(DatabaseAdapter):
     url_schemes = ("sqlite",)
     default_port = None
     dialect = Dialect.SQLITE
-    capabilities = AdapterCapabilities(row_editing=True, run_file=True, dump=True)
+    capabilities = AdapterCapabilities(row_editing=True, run_file=True, dump=True, copy_data=True)
 
     def parse_url(self, url: str) -> ParsedUrl:
         """`sqlite:///abs/path` and `sqlite:////abs/path` (SQLAlchemy's absolute form) are absolute paths, `sqlite://rel`

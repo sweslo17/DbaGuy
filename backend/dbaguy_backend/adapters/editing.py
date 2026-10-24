@@ -25,6 +25,13 @@ def read_only_relation(path: Sequence[PathSegment], reason: str) -> EditTarget:
     return EditTarget(path=list(path), editable=False, reason=reason)
 
 
+def not_writable_reason(target: EditTarget) -> str | None:
+    """Why no row can be written into the relation at all (⑥ 06c: a copy's existing target), or None: what
+    `read_only_relation` said (a view, a foreign or shadow table, a history or ledger table, PostgreSQL without
+    standard strings). A table that has no usable key is editable by no grid, yet a copy appends to it."""
+    return None if target.editable or target.columns else target.reason
+
+
 def build_target(
     path: Sequence[PathSegment], columns: Sequence[EditColumn], candidates: Sequence[KeyCandidate], *,
     transactional: bool = True, backslash_escapes: bool = True,

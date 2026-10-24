@@ -31,6 +31,7 @@ const engine = (name: EngineInfo["engine"], fields: Partial<EngineInfo> = {}): E
   orders_browse_by_key: name === "postgres",
   run_file: true,
   dump: name !== "couchbase",
+  copy_data: name !== "couchbase",
   ...fields,
 });
 const seg = (kind: string, name: string): PathSegment => ({ kind, name });

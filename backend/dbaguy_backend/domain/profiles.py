@@ -149,3 +149,4 @@ class EngineInfo(BaseModel):
     orders_browse_by_key: bool
     run_file: bool = False  # Run SQL file (spec ⑥ D-06-13)
     dump: bool = False  # a native SQL dump (spec ⑥ D-06-13)
+    copy_data: bool = False  # copy rows between connections (spec ⑥ D-06-13; 06c)

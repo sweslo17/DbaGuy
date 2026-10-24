@@ -160,6 +160,22 @@ export type DumpPlanRequest = S["DumpPlanRequest"];
 export type StoppedAt = S["StoppedAt"];
 /** Run SQL file (06b B2): a file's lines around one line, for the error list. */
 export type FileExcerpt = S["FileExcerpt"];
+/** Copy data (spec ⑥ §3.5.1, POST /data/transfer/plan): the source, the target and how. */
+export type TransferRequest = S["TransferRequest"];
+/** Copy data: tables (tree paths) of one connection, or a query tab's result; a filter for one table. */
+export type SourceSpec = S["SourceSpec"];
+/** Copy data: where the rows go, the mode, and per table and column the types, identities and columns left out. */
+export type TargetSpec = S["TargetSpec"];
+/** Copy data: a query tab's statement (run again on its session) and the result's columns the tab already has. */
+export type QuerySource = S["QuerySource"];
+/** Copy data's preview: each table's mapping, statements, warnings and problems; `plan_id` null while any problem. */
+export type TransferPlan = S["TransferPlan"];
+/** Copy data's preview: one table, in the order the copy runs. */
+export type TableTransfer = S["TableTransfer"];
+/** Copy data's preview: one source column and where it goes. */
+export type ColumnMapping = S["ColumnMapping"];
+/** Copy data's preview: why it cannot run as asked (spec §4). */
+export type TransferProblem = S["TransferProblem"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

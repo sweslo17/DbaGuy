@@ -34,7 +34,8 @@ from tests.test_sessions import Recorder, request_events
 
 SCRATCH_PREFIX = "zz_06_"
 SCRATCH_06B = "zz_06b_"  # 06b's own (its fix wave's tests)
-_SCRATCH = (SCRATCH_PREFIX, SCRATCH_06B)
+SCRATCH_06C = "zz_06c_"  # 06c's own (copy data)
+_SCRATCH = (SCRATCH_PREFIX, SCRATCH_06B, SCRATCH_06C)
 _ROW_TUPLE = _mssql.ROW_FORMAT_TUPLE
 
 
@@ -66,7 +67,7 @@ def dropping(db: ScratchDb, before_drop: Callable[[], None] | None = None) -> It
             except Exception as exc:
                 failures.append(f"before_drop: {exc}")
         for kind, name in reversed(made):
-            assert name.startswith(SCRATCH_PREFIX), f"{name!r} is not a scratch object: never dropped here"
+            assert name.startswith(_SCRATCH), f"{name!r} is not a scratch object: never dropped here"
             try:
                 db.execute(drop_statement(db, kind, name))
             except Exception as exc:

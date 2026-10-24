@@ -1840,6 +1840,66 @@
         }
       }
     },
+    "/data/transfer/plan": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Transfer Plan",
+        "description": "Copy data's preview (spec \u2465 \u00a73.5.1): each table's column mapping, types and conversions, the statements the copy\nadds, its warnings and problems, and the plan id the copy command takes once (null while there is a problem). A\nread-only target is refused (403) and an engine without copies 422 `not_supported`, before any connection.",
+        "operationId": "transfer_plan_data_transfer_plan_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransferRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransferPlan"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/data/reveal": {
       "post": {
         "tags": [
@@ -3707,6 +3767,110 @@
         ],
         "title": "ColumnInfo"
       },
+      "ColumnMapping": {
+        "properties": {
+          "source_name": {
+            "type": "string",
+            "title": "Source Name"
+          },
+          "source_type": {
+            "type": "string",
+            "title": "Source Type"
+          },
+          "family": {
+            "type": "string",
+            "title": "Family"
+          },
+          "target_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Name"
+          },
+          "target_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Type"
+          },
+          "type_editable": {
+            "type": "boolean",
+            "title": "Type Editable",
+            "default": false
+          },
+          "overridden": {
+            "type": "boolean",
+            "title": "Overridden",
+            "default": false
+          },
+          "conversion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversion"
+          },
+          "skipped": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skipped"
+          },
+          "identity": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "keep",
+                  "generate"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Identity"
+          },
+          "problem": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Problem"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source_name",
+          "source_type",
+          "family"
+        ],
+        "title": "ColumnMapping",
+        "description": "One source column and where it goes (spec \u00a73.5.1)."
+      },
       "ColumnMeta": {
         "properties": {
           "name": {
@@ -5364,6 +5528,11 @@
           "dump": {
             "type": "boolean",
             "title": "Dump",
+            "default": false
+          },
+          "copy_data": {
+            "type": "boolean",
+            "title": "Copy Data",
             "default": false
           }
         },
@@ -7689,6 +7858,39 @@
         "title": "QueryContext",
         "description": "Couchbase: the bucket (and scope) that unqualified keyspace names resolve against, sent with every request\n(D-04-5: a structure, because a bucket name may hold a dot)."
       },
+      "QuerySource": {
+        "properties": {
+          "sql": {
+            "type": "string",
+            "maxLength": 1048576,
+            "minLength": 1,
+            "title": "Sql"
+          },
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnMeta"
+            },
+            "type": "array",
+            "maxItems": 4096,
+            "minItems": 1,
+            "title": "Columns"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 1024,
+            "title": "Title",
+            "default": "the query"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "sql",
+          "columns"
+        ],
+        "title": "QuerySource",
+        "description": "A query tab's result (spec \u00a73.5.1): its statement, run again on the tab's own session as an export is (the same\ntransaction, its temporary tables), and the columns the tab already has, which the preview maps without running it."
+      },
       "RemoveDocumentRequest": {
         "properties": {
           "profile_id": {
@@ -8955,6 +9157,75 @@
         ],
         "title": "SortKey"
       },
+      "SourceSpec": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "database": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1024
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Database"
+          },
+          "tables": {
+            "anyOf": [
+              {
+                "items": {
+                  "items": {
+                    "$ref": "#/components/schemas/PathSegment"
+                  },
+                  "type": "array"
+                },
+                "type": "array",
+                "maxItems": 500,
+                "minItems": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tables"
+          },
+          "query": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QuerySource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "filter": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 65536
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filter"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id"
+        ],
+        "title": "SourceSpec",
+        "description": "Tables, views and materialized views of one connection, or a query tab's result."
+      },
       "SplitRequest": {
         "properties": {
           "text": {
@@ -9545,6 +9816,191 @@
         "title": "StoppedAt",
         "description": "A place in a run's file: where it stopped (the statement that failed, was cancelled or was not sent), or where a\nrun again starts (`resume_at`, 06b B1). `exact`: `line` is where that statement starts. False for a stop with no\nstatement of its own (a line that is not UTF-8 inside a statement, a psql command, a statement over the limit, a\nread error): the line is where the run stopped, so a run again from it sends no `from_line` (06b review M-b)."
       },
+      "TableTransfer": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "target": {
+            "type": "string",
+            "title": "Target"
+          },
+          "source_key": {
+            "type": "string",
+            "title": "Source Key"
+          },
+          "source_path": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PathSegment"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Path"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "create",
+              "append",
+              "replace_rows"
+            ],
+            "title": "Mode"
+          },
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnMapping"
+            },
+            "type": "array",
+            "title": "Columns"
+          },
+          "before": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Before",
+            "default": []
+          },
+          "after": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "After",
+            "default": []
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "default": []
+          },
+          "problems": {
+            "items": {
+              "$ref": "#/components/schemas/TransferProblem"
+            },
+            "type": "array",
+            "title": "Problems",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "target",
+          "source_key",
+          "mode",
+          "columns"
+        ],
+        "title": "TableTransfer",
+        "description": "One table of the copy, in the order the copy runs (spec \u00a73.5.1)."
+      },
+      "TargetSpec": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "database": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1024
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Database"
+          },
+          "schema_name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1024
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schema Name"
+          },
+          "table": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1024,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "create",
+              "append",
+              "replace_rows"
+            ],
+            "title": "Mode"
+          },
+          "overrides": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": "object",
+            "title": "Overrides"
+          },
+          "identity": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string",
+                "enum": [
+                  "keep",
+                  "generate"
+                ]
+              },
+              "type": "object"
+            },
+            "type": "object",
+            "title": "Identity"
+          },
+          "left_out": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "object",
+            "title": "Left Out"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "mode"
+        ],
+        "title": "TargetSpec",
+        "description": "Where the rows go (spec \u00a73.5.1). `overrides`, `identity` and `left_out` are by the source table's name (a\nquery's: its `title`) and then the source column's."
+      },
       "TextSelection": {
         "properties": {
           "anchor": {
@@ -9565,6 +10021,119 @@
           "head"
         ],
         "title": "TextSelection"
+      },
+      "TransferPlan": {
+        "properties": {
+          "plan_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Id"
+          },
+          "source_profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Source Profile Id"
+          },
+          "tables": {
+            "items": {
+              "$ref": "#/components/schemas/TableTransfer"
+            },
+            "type": "array",
+            "title": "Tables"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "default": []
+          },
+          "problems": {
+            "items": {
+              "$ref": "#/components/schemas/TransferProblem"
+            },
+            "type": "array",
+            "title": "Problems",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "source_profile_id",
+          "tables"
+        ],
+        "title": "TransferPlan",
+        "description": "The preview (POST /data/transfer/plan). `plan_id` is null while any table or the copy has a problem (\u2464 E8)."
+      },
+      "TransferProblem": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "target_exists",
+              "target_missing",
+              "target_not_writable",
+              "unmappable_type",
+              "invalid_type",
+              "same_table",
+              "same_sqlite_file",
+              "source_missing",
+              "missing_column",
+              "unconvertible",
+              "query_not_select",
+              "no_columns",
+              "duplicate_column",
+              "invalid_filter"
+            ],
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "column": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Column"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "TransferProblem",
+        "description": "Why the copy cannot run as asked (spec \u00a74): the preview has no plan id while there is one."
+      },
+      "TransferRequest": {
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/SourceSpec"
+          },
+          "target": {
+            "$ref": "#/components/schemas/TargetSpec"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "source",
+          "target"
+        ],
+        "title": "TransferRequest"
       },
       "UncheckedColumn": {
         "properties": {

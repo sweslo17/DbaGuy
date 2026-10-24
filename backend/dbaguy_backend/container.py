@@ -26,6 +26,7 @@ from .services.safety import SafetyPolicy
 from .services.schema_cache import SchemaCache
 from .services.scripts_service import ScriptsService
 from .services.settings_service import SettingsService
+from .services.transfer_service import TransferService
 from .services.workspace_service import WorkspaceService
 from .sessions.hooks import SessionHooksFactory
 from .sessions.jobs.registry import JobRegistry
@@ -85,6 +86,7 @@ class AppContainer:
         self.field_samples = FieldSampleService(self.metadata, self.app_settings)
         self.jobs = JobRegistry()
         self.data = DataService(self.profiles, self.registry, self.metadata, self.jobs)
+        self.transfers = TransferService(self.profiles, self.registry, self.metadata, self.schema_cache)
         self.history = HistoryService(history_file(data_dir))
         self.policy = SafetyPolicy()
         hooks = SessionHooksFactory(

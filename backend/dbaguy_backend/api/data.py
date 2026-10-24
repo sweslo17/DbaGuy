@@ -1,5 +1,6 @@
 """Data tools (spec ⑥ §3.2): the jobs of this backend run. A job itself is a WebSocket command on a session of its
-own (dump, run_file); these routes find it again after the window reloads, and cancel it."""
+own (dump, run_file, copy_data); these routes find it again after the window reloads, and cancel it, and preview a
+dump, a file and a copy."""
 
 from typing import Self
 from uuid import UUID
@@ -13,6 +14,7 @@ from ..domain.data_jobs import (
     FileInspection, JobInfo, filter_fits,
 )
 from ..domain.errors import NotFound
+from ..domain.transfer import TransferPlan, TransferRequest
 from .deps import get_container, require_token
 
 router = APIRouter(prefix="/data", tags=["data"], dependencies=[Depends(require_token)])
@@ -71,6 +73,14 @@ def dump_plan(body: DumpPlanRequest, container: AppContainer = Depends(get_conta
     connection; nothing is written). 422 `not_supported` for an engine without dumps."""
     return container.data.dump_plan(body.profile_id, body.database, body.scope, body.content, body.objects, body.path,
                                     drop_first=body.drop_first, filter=body.filter)
+
+
+@router.post("/transfer/plan", response_model=TransferPlan)
+def transfer_plan(body: TransferRequest, container: AppContainer = Depends(get_container)) -> TransferPlan:
+    """Copy data's preview (spec ⑥ §3.5.1): each table's column mapping, types and conversions, the statements the copy
+    adds, its warnings and problems, and the plan id the copy command takes once (null while there is a problem). A
+    read-only target is refused (403) and an engine without copies 422 `not_supported`, before any connection."""
+    return container.transfers.plan(body)
 
 
 @router.post("/reveal", status_code=204)
