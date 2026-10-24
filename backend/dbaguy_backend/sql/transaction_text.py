@@ -44,7 +44,8 @@ _TSQL_OPENS = {"BEGIN": frozenset({"TRAN", "TRANSACTION", "DISTRIBUTED"}), "SAVE
 # The statements that write rows (documents) one at a time where a failed one keeps part of its work (writes_rows),
 # and the reads a WITH clause can lead to instead
 _WRITES = {Dialect.MYSQL: frozenset({"INSERT", "REPLACE", "UPDATE", "DELETE"}),
-           Dialect.SQLPP: frozenset({"INSERT", "UPSERT", "UPDATE", "DELETE", "MERGE"})}
+           Dialect.SQLPP: frozenset({"INSERT", "UPSERT", "UPDATE", "DELETE", "MERGE", "EXECUTE"})}
+# SQL++'s EXECUTE of a prepared statement counts as one: what it runs is not in the text (06b fix wave re-check).
 # The first two words that make a statement such a write, or not one, whatever its first word says (06b fix wave):
 # MySQL's LOAD DATA and LOAD XML; SQL++'s EXECUTE FUNCTION (a JavaScript function may write documents), and its
 # UPDATE STATISTICS, which writes optimizer statistics, not documents (its ANALYZE spelling starts with no write)
@@ -170,8 +171,8 @@ def may_commit(text: str, dialect: Dialect) -> bool:
 def writes_rows(text: str, dialect: Dialect) -> bool:
     """Whether the statement writes rows (documents) one at a time, so that what it wrote before it failed may stay:
     MySQL's INSERT, REPLACE, UPDATE, DELETE, LOAD DATA or XML and WITH … UPDATE / DELETE, on a table that cannot roll
-    back (MyISAM, 06b review M2); SQL++'s INSERT, UPSERT, UPDATE, DELETE, MERGE and EXECUTE FUNCTION, each document on
-    its own (M-c), but not UPDATE STATISTICS. Every other dialect: False (every table rolls a failed statement back)."""
+    back (MyISAM, 06b review M2); SQL++'s INSERT, UPSERT, UPDATE, DELETE, MERGE, EXECUTE FUNCTION and the EXECUTE of a
+    prepared statement (its text is not here), each document on its own (M-c), but not UPDATE STATISTICS. Every other dialect: False (every table rolls a failed statement back)."""
     writes = _WRITES.get(dialect)
     if writes is None:
         return False

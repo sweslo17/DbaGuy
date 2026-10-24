@@ -116,6 +116,7 @@ def test_what_ends_the_transaction_before_it_even_when_one_is_open_after_it(text
     ("ANALYZE KEYSPACE ks", SQLPP, False), ("ANALYZE ks(a)", SQLPP, False),
     ("UPDATE `statistics` SET n = 1", SQLPP, True),  # a keyspace of that name is quoted: a document write
     ("EXECUTE FUNCTION f()", MYSQL, False), ("LOAD XML INFILE 'x' INTO TABLE t", SQLPP, False),
+    ("EXECUTE p1", SQLPP, True), ("execute p1 USING [1]", SQLPP, True),  # a prepared statement: its text is unknown
 ])
 def test_what_writes_rows_one_at_a_time(text, dialect, writes):  # 06b review M2, M-c: what may keep part of its work
     assert writes_rows(text, dialect) is writes
