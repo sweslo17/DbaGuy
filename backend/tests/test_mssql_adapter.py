@@ -210,6 +210,15 @@ def test_text_is_sent_verbatim(conn):
     assert one(conn, "SELECT '100%' AS pct, N'GO' AS go_text, '%s' AS s") == [["100%", "GO", "%s"]]
 
 
+def test_the_describe_reads_the_batch_as_the_server_runs_it(conn):  # 06c Task 5b
+    # The batch goes into the describe's string literal. A backslash right before a line break was dropped there with
+    # the break, so a comment ending in a backslash swallowed the next line and the column types came from another batch
+    result = conn.run("SELECT CAST(1 AS smallint) AS a -- note \\\n, CAST(2 AS tinyint) AS b")
+    assert [(c.name, c.type_name) for c in result.columns()] == [("a", "smallint"), ("b", "tinyint")]
+    assert result.fetch(5) == [[1, 2]]
+    result.close()
+
+
 def test_text_that_cannot_be_sent_is_reported_with_its_position(conn):  # as MySQL: half an emoji from a broken paste
     with pytest.raises(StatementError) as info:
         conn.run("SELECT 1,\n N'\ud83d'")

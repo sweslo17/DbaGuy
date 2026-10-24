@@ -66,6 +66,12 @@ def value(text: str) -> CellInput:
     (PG, "other", "{1,2}", PLAIN, "'{1,2}'"),
     (MY, "text", "a\x00b", PLAIN, "'a\\0b'"),
     (TS, "text", "a\x00", PLAIN, "N'a' + CAST(NCHAR(0) AS NVARCHAR(MAX)) + N''"),
+    # T-SQL drops a backslash and the line break after it from a literal: the literal ends after the backslash (Task 5b)
+    (TS, "text", "a\\\nb", PLAIN, "CONCAT(CAST(N'' AS NVARCHAR(MAX)), N'a\\', N'\nb')"),
+    (TS, "text", "k\\\r\n1", VARCHAR, "CONCAT(CAST('' AS VARCHAR(MAX)), 'k\\', '\r\n1')"),  # still no N: a varchar key
+    (PG, "text", "a\\\nb", PLAIN, "'a\\\nb'"),
+    (LITE, "text", "a\\\r\nb", PLAIN, "'a\\\r\nb'"),
+    (MY, "text", "a\\\nb", PLAIN, "'a\\\\\nb'"),
     (LITE, "text", "a\x00", PLAIN, "'a' || char(0) || ''"),
 ])
 def test_input_literals(dialect, kind, text, style, expected):  # Review Focus 1
@@ -184,6 +190,9 @@ MATCH_ROWS = [
     (MY, col("text", "equals", "t"), "a\x00", False, NO_BACKSLASH, None),
     (TS, col("text", "equals", "vc", unicode=False), "k42", True, VARCHAR, "vc = 'k42'"),
     (TS, col("text", "equals", "nv"), "k42", True, PLAIN, "nv = N'k42'"),
+    (TS, col("text", "equals", "nv"), "a\\\nb", False, PLAIN, "nv = CONCAT(CAST(N'' AS NVARCHAR(MAX)), N'a\\', N'\nb')"),
+    (TS, col("text", "equals", "vc", unicode=False), "k\\\n1", True, VARCHAR,
+     "vc = CONCAT(CAST('' AS VARCHAR(MAX)), 'k\\', '\n1')"),  # a varchar key keeps its type, so its seek
     (TS, col("text", "equals", "vc", unicode=False), "é", True, VARCHAR, "vc = N'é'"),
     (TS, col("datetime", "equals", "dt"), "2026-10-19 12:34:56.123", False, PLAIN, "dt = N'2026-10-19T12:34:56.123'"),
     (TS, col("bool", "equals", "flag"), True, False, PLAIN, "flag = 1"),

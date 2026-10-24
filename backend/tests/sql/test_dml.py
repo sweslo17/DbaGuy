@@ -279,6 +279,26 @@ def test_each_dialect_writes_its_own_literals_and_frame():  # D-05-2, D-05-4, D-
         "INSERT OR ABORT INTO main.orders DEFAULT VALUES"])
 
 
+def test_a_tsql_commit_writes_a_backslash_before_a_line_break_so_the_server_keeps_it():  # 06c Task 5b
+    # SQL Server reads `\<LF>` in a string literal as a line continuation and drops both: the SET value, the original
+    # (a false conflict otherwise: the WHERE would hold a different text) and the key all go through quote_literal
+    columns = [column("code", compare="equals", unicode=False, nullable=False), column("note", compare="equals")]
+    ts = EditTarget(path=TS_PATH, editable=True, key=["code"], key_source="primary_key", columns=columns)
+    plan = build_plan(TS, ts, changes(updates=[{
+        "id": "u:1", "key": {"code": "k\\\n1"}, "set": {"note": value("new\\\r\ntext")},
+        "original": {"note": "old\\\nline"},
+    }]))
+    max_n, max_plain = "CAST(N'' AS NVARCHAR(MAX))", "CAST('' AS VARCHAR(MAX))"
+    assert plan.problems == []
+    assert plan.statements[0].sql == (
+        f"UPDATE dbo.orders SET note = CONCAT({max_n}, N'new\\', N'\r\ntext') "
+        f"WHERE code = CONCAT({max_plain}, 'k\\', '\n1') AND note = CONCAT({max_n}, N'old\\', N'\nline')"
+    )
+    other = build_plan(PG, pg_target(), changes(updates=[{
+        "id": "u:1", "key": {"id": 1}, "set": {"label": value("a\\\nb")}, "original": {"label": "c\\\nd"}}]))
+    assert other.statements[0].sql == "UPDATE public.orders SET label = 'a\\\nb' WHERE id = 1 AND label::text = 'c\\\nd'"
+
+
 def test_names_are_quoted_where_the_dialect_needs_it():  # Review Focus 2
     columns = [column("Key Col", "number", compare="equals", nullable=False), column("we]ird", compare="equals"),
                column("order", "number", compare="equals")]

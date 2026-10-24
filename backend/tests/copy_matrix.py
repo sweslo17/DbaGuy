@@ -106,9 +106,10 @@ SEVENTH_ROUNDED: list[tuple[int, datetime, datetime]] = [
     (45_296_123_457, datetime(2026, 10, 5, 12, 34, 56, 123457), datetime(2026, 10, 5, 7, 4, 56, 123457, tzinfo=UTC)),
     (0, datetime(2000, 1, 1), datetime(1970, 1, 1, 5, 30, tzinfo=UTC)),
 ]
-# A backslash right before a line break, which a T-SQL string literal reads as a line continuation and removes with the
-# break (found by this matrix, 06c Task 5 fix round 1: `quote_literal` writes it as it is, so SQL Server loses it);
-# a lone CR is kept, a backslash alone or before a space too. From SQLite (no escapes to confuse) into each target.
+# A backslash right before a line break, which a T-SQL string literal reads as a line continuation and removes (found by
+# this matrix, 06c Task 5 fix round 1; `quote_literal` ends the literal after it since Task 5b): LF and CRLF go with it
+# and a lone CR keeps itself without the backslash; a backslash alone or before a space is kept. From SQLite (no escapes
+# to confuse) into each target.
 BACKSLASH_BREAKS: tuple[str, list[str]] = (
     "CREATE TABLE {t} (id INTEGER PRIMARY KEY, tx TEXT)",
     ["INSERT INTO {t} VALUES (1, 'a\\\nb')", "INSERT INTO {t} VALUES (2, 'a\\\r\nb')",

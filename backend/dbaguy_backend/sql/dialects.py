@@ -240,6 +240,25 @@ _NUL_IN_LITERAL: dict[Dialect, str | None] = {
     Dialect.POSTGRES: None, Dialect.SQLITE: "' || char(0) || '", Dialect.MYSQL: "\\0",
     Dialect.TSQL: "' + CAST(NCHAR(0) AS NVARCHAR(MAX)) + N'", Dialect.SQLPP: None,
 }
+# T-SQL reads a backslash right before a line break inside a string literal as a line continuation and drops it (SQL
+# Server 2022, N'…' and '…' alike; every character after a backslash was tried, U+0001–U+FFFF with the N and 1–127
+# without, and only LF and CR do anything): LF and CRLF go with it (`N'a\<LF>b'` is `ab`), a lone CR stays and the
+# backslash goes (`N'a\<CR>b'` is `a<CR>b`). Only the backslash right next to the break counts (`\\<LF>` loses one
+# backslash and the break), and a backslash last in the literal is kept. So the literal ends after that backslash and
+# the text goes on in the next one: `CONCAT(<an empty MAX value>, N'a\', N'<LF>b')`. The MAX value keeps the result from
+# being capped at 4000 characters (8000 without the N), as in the NUL form above. The pair is (Unicode, not): the empty
+# value has the literal's own type, so a non-Unicode literal stays varchar and keeps its index seek where ⑤ relies on
+# that (A8: on a SQL collation N'…' turns a varchar key's seek into a scan, and `VARCHAR(MAX)` does not; plan checked).
+# CONCAT, not a chain of `+`: a chain is as deep as it is long and the server gives up at 1,000–2,000 breaks in one
+# value (8631, stack limit); CONCAT takes 254 arguments and is nested for more, so the limit becomes the expression
+# size of 65,535 constants (8632), about 32,000 breaks in one value (checked). Both are errors, never a changed value.
+# The other dialects read a backslash and a line break as they are (MySQL has the backslash doubled already): None.
+_LINE_CONTINUATION_GUARD: dict[Dialect, tuple[str, str] | None] = {
+    Dialect.POSTGRES: None, Dialect.SQLITE: None, Dialect.MYSQL: None, Dialect.SQLPP: None,
+    Dialect.TSQL: ("CAST(N'' AS NVARCHAR(MAX))", "CAST('' AS VARCHAR(MAX))"),
+}
+_AFTER_BACKSLASH_BEFORE_BREAK = re.compile(r"(?<=\\)(?=[\r\n])")  # the place between them
+_CONCAT_ARGUMENTS = 253  # CONCAT takes 254 arguments: the empty MAX value and these
 # SQL++ string literals are JSON strings (double quotes, JSON escapes; D-04-15); the other dialects quote with ''.
 _JSON_STRINGS: dict[Dialect, bool] = {
     Dialect.POSTGRES: False, Dialect.SQLITE: False, Dialect.MYSQL: False, Dialect.TSQL: False, Dialect.SQLPP: True,
@@ -312,7 +331,9 @@ def quote_literal(
 ) -> str:
     """A string literal that the dialect reads back as exactly `value`: quotes are doubled, and where backslash
     escapes exist (MySQL's default sql_mode), backslashes are doubled too. T-SQL literals carry the N prefix. A NUL
-    character never stays raw (`_NUL_IN_LITERAL`): an escape, or a concatenation that keeps the text one expression.
+    character never stays raw (`_NUL_IN_LITERAL`): an escape, or a concatenation that keeps the text one expression;
+    nor does a T-SQL backslash right before a line break (`_LINE_CONTINUATION_GUARD`), which the server would read as a
+    line continuation: such a text is a CONCAT of literals, so it is an expression, not a constant.
     SQL++: the value as a JSON string (`json.dumps`), which is also how the server reads a "…" literal (D-04-15).
 
     `national` False leaves T-SQL's N out (ASCII text for a non-Unicode column keeps its index seek, ⑤ D-05-2, A8).
@@ -325,9 +346,27 @@ def quote_literal(
         raise ValueError("A NUL character cannot be written in a MySQL literal without backslash escapes")
     if escapes:
         value = value.replace("\\", "\\\\")
-    literal = (_STRING_PREFIXES[dialect] if national else "") + "'" + value.replace("'", "''") + "'"
+    if (empty := _LINE_CONTINUATION_GUARD[dialect]) is None or "\\" not in value:  # nearly every value: no scan
+        return _quoted(dialect, value, national)
+    pieces = [_quoted(dialect, part, national) for part in _AFTER_BACKSLASH_BEFORE_BREAK.split(value)]
+    return pieces[0] if len(pieces) == 1 else _concatenated(empty[0] if national else empty[1], pieces)
+
+
+def _quoted(dialect: Dialect, text: str, national: bool) -> str:
+    """One quoted literal: the N prefix where it is wanted, quotes doubled, a NUL kept out."""
+    literal = (_STRING_PREFIXES[dialect] if national else "") + "'" + text.replace("'", "''") + "'"
     nul = _NUL_IN_LITERAL[dialect]
     return literal if nul is None else literal.replace("\x00", nul)
+
+
+def _concatenated(empty_max: str, pieces: list[str]) -> str:
+    """T-SQL expressions as one: `CONCAT(<empty MAX value>, a, b, …)`, nested when there are more than CONCAT takes.
+    Every level starts with the MAX value, so no level is capped."""
+    while True:
+        pieces = [f"CONCAT({empty_max}, {', '.join(pieces[i:i + _CONCAT_ARGUMENTS])})"
+                  for i in range(0, len(pieces), _CONCAT_ARGUMENTS)]
+        if len(pieces) == 1:
+            return pieces[0]
 
 
 def datetime_literal(dialect: Dialect, text: str, *, backslash_escapes: bool | None = None) -> str:

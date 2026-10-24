@@ -121,18 +121,10 @@ def test_a_seventh_fraction_digit_is_kept_where_the_target_holds_it_and_rounded_
         (column.source_name, column.conversion) for column in columns]
 
 
-# SQL Server drops a backslash and the line break after it from a string literal (a line continuation): a real, silent
-# change that `quote_literal` (shared by ⑤'s edits, 06a's dump and the copy) writes into every T-SQL INSERT. Strict:
-# the day it is fixed this fails until the mark is removed. It is the one failure the matrix knows of.
-_BREAKS_LOST_BY_SQL_SERVER = pytest.mark.xfail(
-    strict=True, reason="T-SQL reads backslash + LF (or CRLF) in a string literal as a continuation and drops both")
-
-
-@pytest.mark.parametrize("target", [
-    pytest.param(*param.values, marks=[*param.marks, *([_BREAKS_LOST_BY_SQL_SERVER] if param.id == "mssql" else [])],
-                 id=param.id)
-    for param in ENGINES
-])
+# SQL Server drops a backslash and the line break after it from a string literal (a line continuation): `quote_literal`
+# (shared by ⑤'s edits, 06a's dump and the copy) ends the T-SQL literal after such a backslash (06c Task 5b). Here from
+# SQLite's text into every target; tests/test_mssql_literal_breaks.py has the server side of it.
+@pytest.mark.parametrize("target", ENGINES)
 def test_a_backslash_before_a_line_break_is_kept(tmp_path: Path, target: str) -> None:
     ddl, rows = BACKSLASH_BREAKS
     with _copied(tmp_path, "sqlite", target, ddl, rows) as copied:
