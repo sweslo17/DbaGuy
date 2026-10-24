@@ -76,7 +76,7 @@ def rowid_alias(relation: SqliteRelation) -> str | None:
 def columns_of(relation: SqliteRelation) -> list[TableColumn]:
     rowid = rowid_alias(relation)
     found = []
-    for name, declared, notnull, default, _, hidden in relation.rows:
+    for name, declared, notnull, default, pk, hidden in relation.rows:
         if hidden == _HIDDEN:
             continue
         kind, compare = affinity_kind(declared or "", strict=relation.strict)
@@ -87,7 +87,7 @@ def columns_of(relation: SqliteRelation) -> list[TableColumn]:
             has_default=default is not None or generated or name == rowid, kind=kind, compare=compare,
             writable=not generated, read_only_reason=GENERATED if generated else None, **sizes,
             identity="by_default" if name == rowid else None, generated=generated,
-            **(not_copied(GENERATED) if generated else {}),
+            **(not_copied(GENERATED) if generated else {}), key_position=pk or None,
         ))
     return found
 

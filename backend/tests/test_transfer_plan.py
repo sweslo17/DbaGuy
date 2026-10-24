@@ -562,7 +562,7 @@ def test_a_copys_target_is_read_without_planning_a_browse(app: DataApp, tmp_path
             app.container.transfers.plan(tables_request(lite, src, [source], pg, me, "create", table=table_name("n")))
         assert (browse.stable_order, copy.stable_order, copy.editable) == (["id"], None, True)  # ⑤'s is unchanged
         assert appended == [me]  # one table appended: the target's foreign keys only, never the source's keys
-        assert read[len(appended):] == [src]  # create: the source's primary key
+        assert read[len(appended):] == []  # one table created: its key comes with its columns (fix round 3)
     finally:
         pg.close()
         lite.close()
@@ -657,3 +657,46 @@ def test_only_a_time_or_a_date_and_time_target_rounds_a_seventh_digit() -> None:
     assert not any(rounded(seven, dialect, type_sql) for dialect, type_sql in (
         (Dialect.MYSQL, "longtext"), (Dialect.MYSQL, "varchar(40)"), (Dialect.POSTGRES, "text"),
         (Dialect.MYSQL, "date"), (Dialect.POSTGRES, "date")))  # text keeps all 7 digits; a date has no fraction
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_each_engine_reads_a_columns_place_in_the_primary_key(app: DataApp, tmp_path: Path, engine: str) -> None:
+    """Fix round 3: `TableColumn.key_position`, read with the columns from the catalog, in the key's own order."""
+    db = scratch_db(engine, tmp_path)
+    try:
+        with dropping(db) as made:
+            name = table_name("k")
+            made.append(("TABLE", name))
+            db.execute(f"CREATE TABLE {db.table(name)} (a int NOT NULL, b int NOT NULL, c int, PRIMARY KEY (b, a))")
+            me = profile(app, db, "db")
+            read = app.container.metadata.with_connection(me, db.database, lambda c: c.table_columns(db.path(name)))
+        assert [(column.name, column.key_position) for column in read] == [("a", 2), ("b", 1), ("c", None)]
+    finally:
+        db.close()
+
+
+@requires_pg
+def test_a_key_added_after_the_snapshot_loaded_is_created(app: DataApp, tmp_path: Path) -> None:  # fix round 3
+    """The coordinator's browser pass: a create copied no PRIMARY KEY because the key was read from the completion
+    snapshot, cached before the key existed. It is read from the catalog when the preview runs."""
+    pg, lite = scratch_db("postgres", tmp_path), scratch_db("sqlite", tmp_path)
+    try:
+        with dropping(pg) as made:
+            name, other = table_name("big"), table_name("o")
+            made += [("TABLE", name), ("TABLE", other)]
+            pg.execute(f"CREATE TABLE {pg.table(name)} (a int NOT NULL, b int NOT NULL, label text)",
+                       f"CREATE TABLE {pg.table(other)} (id int PRIMARY KEY)")
+            src, dst = profile(app, pg, "pg"), profile(app, lite, "lite")
+            before = app.container.transfers.plan(tables_request(pg, src, [name, other], lite, dst))  # loads it
+            pg.execute(f"ALTER TABLE {pg.table(name)} ADD PRIMARY KEY (b, a)")
+            cached = app.container.schema_cache.get(src, pg.database)  # still the one from before the ALTER
+            after = app.container.transfers.plan(tables_request(pg, src, [name, other], lite, dst))
+        [stale] = [relation for schema in cached.schemas for relation in schema.relations if relation.name == name]
+        assert stale.primary_key == []  # what the preview used to take the key from
+        created = {table.source: table.before[0] for table in after.tables}
+        assert "PRIMARY KEY" not in {table.source: table.before[0] for table in before.tables}[f"public.{name}"]
+        assert created[f"public.{name}"].endswith("PRIMARY KEY (b, a)\n)")
+        assert created[f"public.{other}"].endswith("PRIMARY KEY (id)\n)")
+    finally:
+        pg.close()
+        lite.close()

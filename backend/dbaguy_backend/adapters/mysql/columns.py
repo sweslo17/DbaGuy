@@ -14,9 +14,12 @@ from .types import category_for_data_type
 
 _FIELDS = """COLUMN_NAME, COLUMN_TYPE, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, NUMERIC_PRECISION, NUMERIC_SCALE,
        CHARACTER_MAXIMUM_LENGTH, DATETIME_PRECISION"""  # column()'s arguments
+# One relation's columns also say each one's place in its primary key (a copy's new table, 06c Task 2 fix round 3)
 _COLUMNS = f"""
-SELECT {_FIELDS}
-FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s ORDER BY ORDINAL_POSITION
+SELECT {_FIELDS},
+       (SELECT s.SEQ_IN_INDEX FROM information_schema.STATISTICS s WHERE s.TABLE_SCHEMA = c.TABLE_SCHEMA
+        AND s.TABLE_NAME = c.TABLE_NAME AND s.INDEX_NAME = 'PRIMARY' AND s.COLUMN_NAME = c.COLUMN_NAME)
+FROM information_schema.COLUMNS c WHERE c.TABLE_SCHEMA = %s AND c.TABLE_NAME = %s ORDER BY c.ORDINAL_POSITION
 """
 _SCHEMA_COLUMNS = f"""
 SELECT TABLE_NAME, {_FIELDS}
@@ -33,6 +36,7 @@ _FLOAT_READ = "({} * 1E0)"
 def column(
     name: str, column_type: str, data_type: str, is_nullable: str, default: str | None, extra: str | None,
     precision: int | None, scale: int | None, length: int | None, fraction: int | None,
+    key_position: int | None = None,
 ) -> TableColumn:
     """One row of _COLUMNS."""
     data_type, extra, lowered = data_type.lower(), (extra or "").upper(), column_type.lower()
@@ -59,7 +63,7 @@ def column(
         kind=edit_kind(category_for_data_type(data_type)), compare=compare, writable=reason is None,
         read_only_reason=reason, **sizes, identity="by_default" if "AUTO_INCREMENT" in extra else None,
         generated=generated, **(not_copied(GENERATED) if generated else {}), hidden="INVISIBLE" in extra,
-        read_as=_FLOAT_READ if data_type == "float" else None,
+        read_as=_FLOAT_READ if data_type == "float" else None, key_position=key_position,
     )
 
 

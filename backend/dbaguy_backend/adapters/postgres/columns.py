@@ -16,7 +16,8 @@ from .loaders import category_for_type_name
 # `base` follows typbasetype from each column's type until a type that is not a domain, one row per column, carrying
 # the innermost type modifier a domain sets (a domain column's own atttypmod is -1). typtype 'c' is a composite type,
 # 'e' an enum; typcategory 'A' an array. The last column: the column's own type is the database's (a domain, an enum, a
-# row type, an extension's type, an array of one), which another database may not have (a copy, 06c).
+# row type, an extension's type, an array of one), which another database may not have (a copy, 06c). After it: the
+# column's place in the relation's primary key (a copy's new table, 06c Task 2 fix round 3), NULL when it is in none.
 _COLUMNS = """
 WITH RECURSIVE base (attrelid, attnum, typname, typtype, typbasetype, typtypmod, typcategory, typmod) AS (
     SELECT a.attrelid, a.attnum, t.typname, t.typtype, t.typbasetype, t.typtypmod, t.typcategory, a.atttypmod
@@ -30,7 +31,9 @@ WITH RECURSIVE base (attrelid, attnum, typname, typtype, typbasetype, typtypmod,
 )
 SELECT a.attrelid, a.attname::text, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, a.atthasdef,
        a.attidentity::text, a.attgenerated::text, b.typname::text, b.typtype::text, b.typcategory::text, b.typmod,
-       own.typtype IN ('d', 'e', 'c') OR own.typnamespace <> 'pg_catalog'::regnamespace
+       own.typtype IN ('d', 'e', 'c') OR own.typnamespace <> 'pg_catalog'::regnamespace,
+       (SELECT k.ord::int FROM pg_index i CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k (attnum, ord)
+        WHERE i.indrelid = a.attrelid AND i.indisprimary AND k.attnum = a.attnum)
 FROM pg_attribute a
 JOIN pg_type own ON own.oid = a.atttypid
 JOIN base b ON b.attrelid = a.attrelid AND b.attnum = a.attnum AND b.typtype <> 'd'
@@ -64,7 +67,7 @@ def _sizes(base: str, typmod: int) -> dict:
 
 def column(
     name: str, type_name: str, nullable: bool, has_default: bool, identity: str, generated: str, base: str,
-    typtype: str, category: str, typmod: int, custom: bool = False,
+    typtype: str, category: str, typmod: int, custom: bool = False, key_position: int | None = None,
 ) -> TableColumn:
     """One row of _COLUMNS."""
     kind: EditKind = "other" if base == "money" else edit_kind(category_for_type_name(base))  # money: lc_monetary
@@ -77,7 +80,7 @@ def column(
         writable=reason is None, read_only_reason=reason, **_sizes(base, typmod),
         identity="always" if identity == "a" else "by_default" if identity == "d" else None,
         generated=bool(generated), **(not_copied(GENERATED) if generated else {}), read_as=read_as, literal=literal,
-        custom_type=custom,
+        custom_type=custom, key_position=key_position,
     )
 
 

@@ -50,6 +50,9 @@ class TableColumn:
     # The column's type is the database's own (PostgreSQL: a domain, enum, row or extension type; SQL Server: an alias
     # type): a copy to another database cannot count on it, and maps it by its family (spec ⑥ R-06-10, 06c)
     custom_type: bool = False
+    # Its place (1, 2, …) in the relation's primary key, read with the columns from the catalog; None: not in one. A
+    # copy's new table gets the source's key from it, never from a cached snapshot (06c Task 2 fix round 3)
+    key_position: int | None = None
 
     @property
     def value_kind(self) -> EditKind:

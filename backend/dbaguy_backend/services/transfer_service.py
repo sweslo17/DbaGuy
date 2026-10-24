@@ -1,8 +1,11 @@
 """Copy data's preview (spec ⑥ §3.5.1, POST /data/transfer/plan): which source columns go to which target columns,
 with which types and conversions, the statements the copy adds (CREATE TABLE, DELETE, IDENTITY_INSERT, setval), its
 warnings and problems; when nothing is wrong, the plan the copy job takes once (D-06-8: the copy runs what was
-previewed). Reads the source and the target on their metadata connections (the relations' columns, the target's
-edit target, the source's keys from the schema snapshot); nothing is written and no query is run.
+previewed). Reads the source and the target on their metadata connections: the relations' columns, with each one's
+place in the primary key (what a new table is created with comes from the catalog, never from a cache: fix round 3),
+and the target's edit target. The schema snapshot of completion gives only what a warning or the order of tables needs:
+the source's foreign keys among two tables or more, and the target's foreign keys. Nothing is written and no query is
+run.
 
 Logs: INFO the two profiles, the table count, the mode and the problem count; never a value, a filter or a query's
 text."""
@@ -217,9 +220,10 @@ class TransferService:
         problems: list[TransferProblem] = []
         warnings: list[str] = []
         sources = self._sources(request, source_dialect, problems, warnings)
-        # The source's keys and foreign keys: a new table's primary key, and the order of two tables or more (fix M1)
-        keyed = source.tables is not None and (target.mode == "create" or len(source.tables) > 1)
-        snapshot = self._snapshot(source.profile_id, source.database, "source's keys") if keyed else None
+        # The source's foreign keys, for the order of two tables or more (fix M1); a new table's primary key is read
+        # with the columns, from the catalog (fix round 3: a cached snapshot can miss a key added since)
+        ordering = source.tables is not None and len(source.tables) > 1
+        snapshot = self._snapshot(source.profile_id, source.database, "source's foreign keys") if ordering else None
         ordered, cycle = self._order(sources, snapshot)
         if cycle and target.mode != "create" and target_dialect in RESTORE_CHECKS_FOREIGN_KEYS:
             warnings.append(FK_CYCLE.format(engine_name(target_dialect)))
@@ -237,7 +241,7 @@ class TransferService:
         planned: list[PlannedTable] = []
         for index, (item, name) in enumerate(zip(ordered, names, strict=True)):
             view, made = self._table(request, item, name, schema, existing.get(name), source_dialect,
-                                     target_dialect, target_adapter, source_profile, target_profile, snapshot)
+                                     target_dialect, target_adapter, source_profile, target_profile)
             if (earlier := first.setdefault(fold(name), index)) != index:  # two CREATE TABLE of one name (fix M2)
                 view.problems.append(_problem("duplicate_target", f"{ordered[earlier].name} goes into {view.target} "
                                                                   "too: copy them one at a time"))
@@ -304,9 +308,9 @@ class TransferService:
         return self._on(source.profile_id, source.database, read)
 
     def _snapshot(self, profile_id: UUID, database: str | None, what: str) -> SchemaSnapshot | None:
-        """The source's keys (a new table's primary key) and foreign keys (the order), or a MySQL or SQLite target's
-        foreign keys (L2): from the schema snapshot, built or cached for completion. Without it the copy runs anyway, in
-        the order chosen, without keys and without that warning."""
+        """The source's foreign keys (the order of its tables) or the target's (L2, fix M3's warnings): from the schema
+        snapshot, built or cached for completion, which may be up to its TTL old. Without it the copy runs anyway, in the
+        order chosen and without those warnings. Never a new table's primary key (fix round 3)."""
         try:
             return self._schema_cache.get(profile_id, database)
         except Exception as exc:  # above DEBUG only its code: a server's text may echo what it read (D-06-12)
@@ -358,7 +362,6 @@ class TransferService:
         self, request: TransferRequest, item: _Source, name: str, schema: str,
         existing: tuple[list[TableColumn], EditTarget] | None, source_dialect: Dialect, target_dialect: Dialect,
         adapter: DatabaseAdapter, source_profile: AnyProfile, target_profile: AnyProfile,
-        snapshot: SchemaSnapshot | None,
     ) -> tuple[TableTransfer, PlannedTable | None]:
         target = request.target
         shown = qualified(target_dialect, schema, name) if target_dialect is not Dialect.MYSQL else name
@@ -395,7 +398,7 @@ class TransferService:
         left_out = set(target.left_out.get(item.key, []))
         if target.mode == "create":
             written, before, after, create_first = self._create(view, item, read, left_out, schema, name,
-                                                                source_dialect, target_dialect, request, snapshot)
+                                                                source_dialect, target_dialect, request)
             transactional = True
         else:
             assert existing is not None
@@ -446,7 +449,6 @@ class TransferService:
     def _create(
         self, view: TableTransfer, item: _Source, read: list[TableColumn], left_out: set[str], schema: str,
         name: str, source_dialect: Dialect, target_dialect: Dialect, request: TransferRequest,
-        snapshot: SchemaSnapshot | None,
     ) -> tuple[list[PlannedColumn], list[str], list[str], str | None]:
         overrides = request.target.overrides.get(item.key, {})
         typed_columns: list[_Typed] = []
@@ -473,7 +475,7 @@ class TransferService:
                     view.columns.append(mapping.model_copy(update={"target_name": column.name, "problem": message}))
                     continue
                 typed_columns.append(_Typed(index, column, mapped.type_sql, mapped.note, False))
-        key = self._key(view, item, typed_columns, target_dialect, snapshot)
+        key = self._key(view, item, typed_columns, target_dialect)
         columns: list[tuple[str, str, bool]] = []
         written: list[PlannedColumn] = []
         fold = str.casefold if target_dialect in CASE_INSENSITIVE else str
@@ -501,26 +503,25 @@ class TransferService:
         return written, [ddl] if ddl else [], [], None
 
     @staticmethod
-    def _key(view: TableTransfer, item: _Source, typed: list[_Typed], dialect: Dialect,
-             snapshot: SchemaSnapshot | None) -> list[str]:
-        """The source's primary key for a new table, when every column of it is copied (spec §3.5.4) and the target can
-        key it (fix I2, `type_map.primary_key`): a key column whose own type the target cannot key gets the bounded
-        type and note `typed` then holds; a key the target cannot create at all is left out, with a warning."""
-        relation = _find(snapshot, item.schema, item.table) if item.path else None
-        if relation is None or not relation.primary_key:
-            return []
+    def _key(view: TableTransfer, item: _Source, typed: list[_Typed], dialect: Dialect) -> list[str]:
+        """The source's primary key for a new table, as the catalog says it now (`TableColumn.key_position`, read with
+        the columns: fix round 3), when every column of it is copied (spec §3.5.4) and the target can key it (fix I2,
+        `type_map.primary_key`): a key column whose own type the target cannot key gets the bounded type and note
+        `typed` then holds; a key the target cannot create at all is left out, with a warning. A query has none."""
+        keyed = sorted((column for column in item.columns or [] if column.key_position), key=lambda c: c.key_position)
+        primary = [column.name for column in keyed]
         at = {each.column.name: position for position, each in enumerate(typed)}
-        if not set(relation.primary_key) <= at.keys():
+        if not primary or not set(primary) <= at.keys():
             return []
         planned = primary_key([(typed[at[column]].column, typed[at[column]].type_sql, typed[at[column]].overridden)
-                               for column in relation.primary_key], dialect)
+                               for column in primary], dialect)
         if planned.reason is not None:
             view.warnings.append(KEY_NOT_CREATED.format(planned.reason))
             return []
-        for column, type_sql, note in zip(relation.primary_key, planned.types, planned.notes, strict=True):
+        for column, type_sql, note in zip(primary, planned.types, planned.notes, strict=True):
             if note is not None:
                 typed[at[column]] = typed[at[column]]._replace(type_sql=type_sql, note=note)
-        return list(relation.primary_key)
+        return primary
 
     def _append(
         self, view: TableTransfer, item: _Source, read: list[TableColumn], left_out: set[str], schema: str,

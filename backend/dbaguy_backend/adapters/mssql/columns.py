@@ -16,12 +16,15 @@ from .types import category_for_type
 COLUMNS = PerObject("""
 SELECT {key}c.name, t.name, COALESCE(st.name, t.name), t.is_assembly_type, c.max_length, c.precision, c.scale,
        c.is_nullable, c.is_identity, c.is_computed, CASE WHEN c.default_object_id <> 0 THEN 1 ELSE 0 END,
-       c.generated_always_type, c.is_column_set
+       c.generated_always_type, c.is_column_set, pkc.key_ordinal
 FROM sys.columns c
 JOIN sys.types t ON t.user_type_id = c.user_type_id
 LEFT JOIN sys.types st ON st.user_type_id = c.system_type_id AND st.is_user_defined = 0
+LEFT JOIN sys.indexes pk ON pk.object_id = c.object_id AND pk.is_primary_key = 1
+LEFT JOIN sys.index_columns pkc ON pkc.object_id = pk.object_id AND pkc.index_id = pk.index_id
+    AND pkc.column_id = c.column_id
 WHERE {where} ORDER BY {order}c.column_id
-""", "c.object_id")
+""", "c.object_id")  # the last column: its place in the primary key (a copy's new table, 06c Task 2 fix round 3)
 # A table's column set (`xml COLUMN_SET FOR ALL_SPARSE_COLUMNS`) is its sparse columns' values seen as one XML: a copy
 # writes the sparse columns themselves, and an INSERT may not name both (360)
 COLUMN_SET = "column set: its sparse columns hold its values"
@@ -47,6 +50,7 @@ def _sizes(base: str, max_length: int, precision: int, scale: int) -> dict:
 def column(
     name: str, type_name: str, base: str, assembly: bool, max_length: int, precision: int, scale: int,
     nullable: bool, identity: bool, computed: bool, default: int, generated_always: int, column_set: bool = False,
+    key_position: int | None = None,
 ) -> TableColumn:
     """One row of COLUMNS."""
     if computed:
@@ -79,6 +83,7 @@ def column(
         identity="always" if identity else None, generated=bool(computed or generated_always),
         **(not_copied(skipped) if skipped else {}), read_as=read_as, literal=literal,
         custom_type=type_name != base,  # an alias type, which another database may not have (06c)
+        key_position=key_position or None,
     )
 
 
