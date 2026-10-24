@@ -21,7 +21,7 @@ From `docs/research/2026-10-15-feature-priorities.md`. Every task review and the
 | §2 Q2 穩定、不丟工作 | One transaction per table (MySQL's CREATE TABLE excepted, and said); every outcome per table; the plan runs once, never resent; the job outlives its dialog and a reload (06b); a Cancel between two tables or during a COMMIT stops before the next table; one History record; deleting the source connection while a copy runs is refused (B13). |
 | §2 Q3 可信任 | Each column's mapping and conversion is shown before; a value the target cannot hold fails its row by table, row and column (never NULL, never rounded, never cut: MySQL's target session is strict); offsets go to UTC in Python keeping SQL Server's 7th digit; a MySQL source reads in UTC; an INSERT's matched rows are checked (A16), so a trigger that skips rows rolls the table back; the copy runs exactly the previewed plan; the 4×4 matrix reads every value back (A9). |
 | §2 Q4 聚焦 80% | Three modes; no upsert, no sync, no resumable copy, no Couchbase (R-06-14, CR-1, CR-2); a new table gets its columns, NOT NULL and its primary key only (R-06-9). |
-| §2 Q5 多引擎 | One family table and one type table for four engines in both directions; the engines' differences live in `families.py`, `type_map.py` and `transfer_sql.py`; Couchbase is greyed with §4's sentence. |
+| §2 Q5 多引擎 | One family table and one type table for four engines in both directions; the engines' differences live in `families.py`, `type_map.py` and `transfer_sql.py`; Couchbase is not offered as a target (R-06-14; pre-flight L-j: the dialog's `TargetPicker tool="copy_data"` leaves it out, and the API answers 422 `not_supported`). |
 | §2 Q6 macOS 慣例 | Return is the primary button, Esc closes (the job keeps running), ⌘⇧P; the Jobs list (06b). |
 | §3 M3 每個指令都能用鍵盤 | ⌘⇧P "Copy data to…" (a table tab's own "Copy rows to…", with its filter). |
 | §3 M9 複製與匯出 | "Copy result to a table…" next to Export in the result's status bar and in the grid's menu. |
@@ -8588,19 +8588,27 @@ On the dev databases (only `zz_06c_*` tables, each dropped by exact name; nothin
 
 ## Appendix A: the user's final test list (06c), for the coordinator's follow-ups note
 
-1. **你的真實資料（在可以亂改的 database 上）。** 從公司的 PostgreSQL、MySQL、SQL Server 各挑一張有代表性的表（含時區時間、DECIMAL、JSON、中文與 emoji、NULL），Copy 到另一個 engine 的新表：預覽的每一欄型別與 ⚠ 說明看起來合理；結果的列數與來源相同；抽幾列比對值（時間是同一個時刻、數字每一位都在）。
-2. **大表。** 一張幾百萬列的表 Copy 到另一個 engine：進度顯示「Copying <表> (k of n)」與列數；關掉對話框後 Jobs 裡還在；Cancel 之後那張表是 rolled back（目標裡沒有半張表；MySQL 建新表模式例外：表留著、是空的，結果會說）。
-3. **紅色連線。** 目標是 production 色的連線時，Copy 是紅色按鈕；「Delete its rows, then append」的 DELETE 在預覽裡是紅的。
-4. **注音。** 在對照表的型別欄、目標表名欄用注音輸入：組字中按 Enter 選字，不會送出型別、不會開始 Copy。
-5. **打包版的 ⌘Q。** Copy 進行中按 ⌘Q：問「Quit DbaGuy?」並列出那個 copy，說明會 rollback 正在複製的那張表、之前的表留著。
-6. **刪除連線。** 一個 copy 在跑時，刪除來源或目標連線都會被擋下（「Profile not deleted — a job is still running on it」）。
+As built (updated in Task 9 from what Tasks 1–8, Task 5b and the fix rounds made; the words in quotes are the app's). Nobody drove the packaged app: items 5 and 8 need it (Zhuyin and ⌘Q only work as they do there), item 9 needs the web mode, the rest can be done in either.
+
+1. **你的真實資料（在可以亂改的 database 上）。** 從公司的 PostgreSQL、MySQL、SQL Server 各挑一張有代表性的表（含時區時間、SQL Server 的 datetimeoffset／datetime2(7)、DECIMAL、JSON、中文與 emoji、NULL、有 `\` 接換行的文字），Copy 到另一個 engine 的新表：預覽的每一欄型別與 ⚠ 說明看起來合理（例如 timestamptz → `datetime(6)` 的 UTC 說明、MySQL `json` 會正規化的說明）；結果的列數與來源相同；抽幾列比對值（時間是同一個時刻、數字每一位都在、文字一字不差）。
+2. **大表。** 一張幾百萬列的表 Copy 到另一個 engine：進度顯示「Copying <表> (k of n)」與「N rows read」，側欄的 Jobs 那一列也有「(k of n)」；關掉對話框後 Jobs 裡還在（第一次關時 toast「The copy keeps running: open it again from Jobs, at the bottom of the sidebar」）；Cancel 之後結果是「Cancelled: nothing was copied」或那張表的列 rolled back（目標裡沒有半張表；MySQL 建新表模式例外：表留著、是空的，結果的說明會說「…stays, empty: drop it, or copy again into it」）。
+3. **好幾張表、停在一半。** 從一個 schema（或 Tables 資料夾勾幾張）Copy 到另一個 engine，讓第二張表失敗（例如一列有 PostgreSQL 的 `infinity` 進 MySQL）：結果說第一張 copied、失敗的那張的列 rolled back、指出第幾列哪一欄，後面的 not started；「Copy the rest…」回到表單、只勾沒複製的表。MySQL 建新表的那張失敗時表已經在了：先 DROP 那張空表，再「Copy the rest…」（否則預覽說 already exists）。
+4. **紅色連線。** 目標是 production 色的連線時，Copy 是紅色按鈕（不另外要勾選：每一句都在預覽裡）；「Delete its rows, then append」的 DELETE 在預覽裡是紅的。
+5. **注音。** 在對照表的型別欄、目標表名欄用注音輸入：組字中按 Enter 選字，不會送出型別、不會開始 Copy。
+6. **刪除連線。** 一個 copy 在跑時，刪除目標連線被擋下（「Profile not deleted — a job is still running on it」），刪除只被它讀取的來源連線也被擋下（「Profile not deleted — a copy is still reading from it」）；確認的對話框跟著關掉。
+7. **Query 結果。** 在 PostgreSQL 的 query tab 建一個 temp table 再 SELECT 它，結果的 status bar 按「Copy to table…」（或 grid 右鍵「Copy result to a table…」）複製到另一個 engine：預覽說 query 會重跑、copy 讀得到 temp table；copy 進行中關那個 tab（⌘W）或換它的連線會被擋下（toast 說明），copy 結束後就可以。
+8. **打包版的 ⌘Q。** Copy 進行中按 ⌘Q：問「Quit DbaGuy?」並列出那個 copy，說明「a copy rolls back the rows of the table it is copying, unless that table cannot roll back (the tables before it stay)」；Keep running 是預設。
+9. **重新載入。** Copy 進行中重新載入頁面（`scripts/dev.sh --web` 的瀏覽器重新整理；打包版的選單沒有 Reload）：Jobs 仍列出它、可以 Cancel；結束後它的結果沒有「Copy again…」（重新載入後的 job 沒有原本的表單）。
 
 已知的限制，不要當成 bug 回報：
 - SQL Server 目標表上的 INSTEAD OF trigger 若略過了列，Copy 看不出來（列數照樣對）。
 - 建新表只帶欄位、NOT NULL 與 primary key：預設值、index、FK、identity 都不建（要一模一樣的表：同 engine 用 Dump＋Run 建結構，再以附加模式 Copy）。
 - Database 節點沒有 Copy data to…：一次複製一個 schema。
-- Query 結果的 Copy 會在那個 tab 重跑那一句（同匯出），暫停中的結果會被結束。
-- 一個值目標裝不下（PostgreSQL 的 infinity、MySQL 的 0000-00-00、NaN…）時那張表整張 rollback 並指出第幾列哪一欄：用篩選排除那列，或把那欄的型別改成文字。
+- Query 結果的 Copy 會在那個 tab 重跑那一句（同匯出），暫停中的結果會被結束；Cancel 之後那個 tab 要等它正在讀的那一次回來才會閒下來。
+- 一個值目標裝不下（PostgreSQL 的 infinity 與 NaN、西元前的日期、MySQL 的 0000-00-00…）時那張表整張 rollback 並指出第幾列哪一欄：用篩選排除那列，或（建新表時）把那欄的型別改成文字。
+- MySQL 建新表失敗後表留著（MySQL 的 CREATE TABLE 立刻 commit）：再 Copy 之前先 DROP 它（見第 3 項）。
+- 結果是 unknown 的表（例如 MySQL 的 MyISAM）不顯示列數，說明裡寫「Up to N rows … may stand」：去目標看。
+- 附加模式的 identity 選單太窄、字被切掉（「Keep the sourc」）：修正波會修。
 - Couchbase 沒有 Copy（CR-1：要的話再說）。
 
 ## Self-review
