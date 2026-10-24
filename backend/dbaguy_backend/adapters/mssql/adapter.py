@@ -705,8 +705,8 @@ class MssqlConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
         self._check_database(path)
         return self._metadata_call(lambda: introspection.object_detail(self._conn, path))
 
-    def edit_target(self, path: list[PathSegment]) -> EditTarget:
-        self._check_database(path)
+    def edit_target(self, path: list[PathSegment], *, order: bool = True) -> EditTarget:
+        self._check_database(path)  # no stable_order to plan (PostgreSQL's only)
         return self._metadata_call(lambda: editing.edit_target(self._conn, path))
 
     def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:

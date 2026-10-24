@@ -6,15 +6,17 @@ from pathlib import Path
 
 import pytest
 
+from dbaguy_backend.adapters.columns import TableColumn
 from dbaguy_backend.domain.dialect import Dialect
 from dbaguy_backend.domain.edits import PLAN_EXPIRED, PLAN_MISMATCH, PlanUnavailable
 from dbaguy_backend.domain.errors import NotSupported, PasswordRequired, ReadOnlyProfile
 from dbaguy_backend.domain.schema import SchemaSnapshot, SnapshotForeignKey, SnapshotRelation, SnapshotSchema
 from dbaguy_backend.domain.transfer import SourceSpec, TargetSpec, TransferRequest
 from dbaguy_backend.services.transfer_service import (
-    CREATED_STAYS, FK_NOT_ENFORCED, FK_UNCHECKED, NON_TRANSACTIONAL, NON_TRANSACTIONAL_REPLACE, QUERY_RUNS_AGAIN,
-    foreign_key_warnings, referenced_tables,
+    CREATED_STAYS, FK_NOT_ENFORCED, FK_UNCHECKED, KEY_NOT_CREATED, NON_TRANSACTIONAL, NON_TRANSACTIONAL_REPLACE,
+    QUERY_RUNS_AGAIN, foreign_key_warnings, referenced_tables,
 )
+from dbaguy_backend.sql.type_map import FRACTION_NOTE, MYSQL_JSON_NOTE, conversion, planned_column, primary_key
 from tests.data_support import DataApp, dropping
 from tests.edit_support import ENGINES, scratch_db
 from tests.support import requires_mssql, requires_mysql, requires_pg
@@ -149,10 +151,12 @@ def test_a_type_without_a_counterpart_is_chosen_or_left_out(app: DataApp, tmp_pa
             left = app.container.transfers.plan(tables_request(ms, source, [name], pg, target,
                                                                left_out={key: ["g"]}))
         assert [p.code for p in asked.tables[0].problems] == ["unmappable_type"]
-        assert asked.tables[0].columns[0].skipped == "not copied: sql_variant column: only its raw bytes can be read"
-        assert typed.plan_id is not None and typed.tables[0].columns[2].overridden
+        # the source's order, with the column not copied in its place (Task 2 fix M4)
+        assert [c.source_name for c in asked.tables[0].columns] == ["id", "g", "v"]
+        assert asked.tables[0].columns[2].skipped == "not copied: sql_variant column: only its raw bytes can be read"
+        assert typed.plan_id is not None and typed.tables[0].columns[1].overridden
         assert [p.message for p in bad.tables[0].problems] == ["g: Not a single type: it has a ;"]
-        assert left.plan_id is not None and left.tables[0].columns[2].skipped == "left out"
+        assert left.plan_id is not None and left.tables[0].columns[1].skipped == "left out"
     finally:
         ms.close()
         pg.close()
@@ -316,6 +320,11 @@ def test_mysql_and_sqlite_targets_say_their_foreign_keys_go_unchecked() -> None:
     assert said(lite, "replace_rows", "main.tree", "tree") == [FK_UNCHECKED.format("main.tree", "SQLite")]
     assert said(my, "create", "child", "child") == []
     assert said(Dialect.POSTGRES, "append", "child", "child") == []  # PostgreSQL checks them row by row
+    # fix M3: there a table that references itself loads in the source's order, each row checked as it goes
+    itself = "shop.tree references itself: the copy may fail unless its rows load in order"
+    assert said(Dialect.POSTGRES, "append", "shop.tree", "tree") == [itself]
+    assert said(Dialect.TSQL, "replace_rows", "shop.tree", "tree") == [itself]
+    assert said(Dialect.POSTGRES, "create", "shop.tree", "tree") == []
     assert said(my, "append", "child", "child", keys=None) == []  # no snapshot: no warning
     assert said(my, "append", "gone", "gone") == []
 
@@ -364,3 +373,237 @@ def test_a_table_that_cannot_roll_back_is_warned_of_by_mode(app: DataApp, tmp_pa
     finally:
         lite.close()
         my.close()
+
+
+@requires_pg
+@pytest.mark.parametrize(("source_database", "target_database"), [
+    ("dbaguy", "dbaguy"), (None, "dbaguy"), (None, None), ("dbaguy", None)])
+def test_a_table_is_never_copied_into_itself_whichever_database_is_left_out(
+        app: DataApp, tmp_path: Path, source_database: str | None, target_database: str | None) -> None:  # fix I1
+    pg = scratch_db("postgres", tmp_path)
+    try:
+        with dropping(pg) as made:
+            name = table_name()
+            pg.execute(f"CREATE TABLE {pg.table(name)} (id int PRIMARY KEY)")
+            made.append(("TABLE", name))
+            me = profile(app, pg, "pg")
+            request = tables_request(pg, me, [name], pg, me, "append")
+            request = request.model_copy(update={
+                "source": request.source.model_copy(update={"database": source_database}),
+                "target": request.target.model_copy(update={"database": target_database})})
+            same = app.container.transfers.plan(request)  # either one left out is the profile's own, dbaguy
+        assert same.plan_id is None and [p.code for p in same.tables[0].problems] == ["same_table"]
+    finally:
+        pg.close()
+
+
+def _source_column(name: str, family: str, type_name: str = "text") -> TableColumn:
+    return TableColumn(name=name, type_name=type_name, family=family, nullable=False, has_default=False, kind="text",
+                       compare="none", writable=True)
+
+
+def test_a_new_tables_key_columns_get_types_the_target_can_key() -> None:  # fix I2, pure
+    code, doc, blob = _source_column("code", "text"), _source_column("doc", "json"), _source_column("b", "binary")
+    my, ms = Dialect.MYSQL, Dialect.TSQL
+    assert primary_key([(code, "longtext", False)], my).types == ("varchar(768)",)
+    assert primary_key([(code, "longtext", False)], my).notes == (
+        "Key column: varchar(768) because MySQL can't key longtext; longer values fail their row",)
+    assert primary_key([(code, "varchar(100)", False)], my).notes == (None,)  # its declared length fits: kept
+    assert primary_key([(code, "varchar(1000)", False)], my).types == ("varchar(768)",)  # 4,000 bytes do not
+    assert primary_key([(code, "nvarchar(max)", False)], ms).types == ("nvarchar(450)",)
+    assert primary_key([(_source_column("c", "varchar"), "varchar(max)", False)], ms).types == ("varchar(900)",)
+    assert primary_key([(blob, "longblob", False)], my).types == ("varbinary(3072)",)
+    assert primary_key([(blob, "varbinary(max)", False)], ms).types == ("varbinary(900)",)
+    assert primary_key([(doc, "json", False)], my).reason == "doc would be json, which MySQL can't key"
+    assert primary_key([(code, "longtext", True)], my).reason == "code would be longtext, which MySQL can't key"
+    assert primary_key([(code, "longtext", False), (code, "longtext", False)], my).reason == (
+        "its columns would take 6,144 bytes, and MySQL keys at most 3,072")
+    assert primary_key([(code, "nvarchar(400)", False), (_source_column("n", "int64"), "bigint", False)],
+                       ms).types == ("nvarchar(400)", "bigint")  # 808 bytes
+    assert primary_key([(code, "text", False)], Dialect.POSTGRES).types == ("text",)  # PostgreSQL keys it as it is
+
+
+def _key_tables(pg, made: list) -> tuple[str, str, str]:
+    text_key, pair, json_key = table_name("k"), table_name("p"), table_name("j")
+    pg.execute(f"CREATE TABLE {pg.table(text_key)} (code text PRIMARY KEY, v int)",
+               f"CREATE TABLE {pg.table(pair)} (a text, b text, PRIMARY KEY (a, b))",
+               f"CREATE TABLE {pg.table(json_key)} (doc jsonb PRIMARY KEY)")
+    made += [("TABLE", text_key), ("TABLE", pair), ("TABLE", json_key)]
+    return text_key, pair, json_key
+
+
+@requires_pg
+@requires_mysql
+def test_a_text_key_into_mysql_is_bounded_and_a_key_it_cannot_make_is_left_out(app: DataApp, tmp_path: Path) -> None:
+    pg, my = scratch_db("postgres", tmp_path), scratch_db("mysql", tmp_path)  # fix I2, the CREATE run live
+    try:
+        with dropping(pg) as pg_made, dropping(my, before_drop=app.close_sessions) as my_made:
+            text_key, pair, json_key = _key_tables(pg, pg_made)
+            src, dst = profile(app, pg, "pg"), profile(app, my, "my")
+            plan = app.container.transfers.plan(tables_request(pg, src, [text_key, pair, json_key], my, dst))
+            chosen = {f"public.{text_key}": {"code": "longtext"}}
+            typed = app.container.transfers.plan(tables_request(pg, src, [text_key], my, dst, overrides=chosen))
+            assert plan.plan_id is not None
+            for table in plan.tables:  # each CREATE TABLE the preview shows is one MySQL takes
+                my_made.append(("TABLE", table.target))
+                my.execute(table.before[0])
+        coded, paired, keyed_json = plan.tables
+        assert (coded.columns[0].target_type, coded.columns[0].conversion) == (
+            "varchar(768)", "Key column: varchar(768) because MySQL can't key longtext; longer values fail their row")
+        assert coded.before[0].endswith("PRIMARY KEY (code)\n)")
+        assert [c.target_type for c in paired.columns] == ["longtext", "longtext"]  # no key: nothing to bound
+        assert KEY_NOT_CREATED.format("its columns would take 6,144 bytes, and MySQL keys at most 3,072") in \
+            paired.warnings and "PRIMARY KEY" not in paired.before[0]
+        assert KEY_NOT_CREATED.format("doc would be json, which MySQL can't key") in keyed_json.warnings
+        assert KEY_NOT_CREATED.format("code would be longtext, which MySQL can't key") in typed.tables[0].warnings
+        assert typed.tables[0].columns[0].target_type == "longtext"  # the user's type wins
+    finally:
+        pg.close()
+        my.close()
+
+
+@requires_pg
+@requires_mssql
+def test_a_text_key_into_sql_server_is_bounded_and_a_key_it_cannot_make_is_left_out(app: DataApp,
+                                                                                    tmp_path: Path) -> None:
+    pg, ms = scratch_db("postgres", tmp_path), scratch_db("mssql", tmp_path)  # fix I2, the CREATE run live
+    try:
+        with dropping(pg) as pg_made, dropping(ms, before_drop=app.close_sessions) as ms_made:
+            text_key, pair, json_key = _key_tables(pg, pg_made)
+            src, dst = profile(app, pg, "pg"), profile(app, ms, "ms")
+            plan = app.container.transfers.plan(tables_request(pg, src, [text_key, pair, json_key], ms, dst))
+            assert plan.plan_id is not None
+            for table, name in zip(plan.tables, (text_key, pair, json_key), strict=True):
+                ms_made.append(("TABLE", name))
+                ms.execute(table.before[0])
+        coded, paired, keyed_json = plan.tables
+        assert (coded.columns[0].target_type, coded.columns[0].conversion) == (
+            "nvarchar(450)", "Key column: nvarchar(450) because SQL Server can't key nvarchar(max); longer values fail "
+                             "their row")
+        assert coded.before[0].endswith("PRIMARY KEY (code)\n)")
+        assert [c.target_type for c in paired.columns] == ["nvarchar(max)", "nvarchar(max)"]
+        assert KEY_NOT_CREATED.format("its columns would take 1,800 bytes, and SQL Server keys at most 900") in \
+            paired.warnings
+        assert KEY_NOT_CREATED.format("doc would be nvarchar(max), which SQL Server can't key") in keyed_json.warnings
+    finally:
+        pg.close()
+        ms.close()
+
+
+@requires_pg
+def test_a_copys_target_is_read_without_planning_a_browse(app: DataApp, tmp_path: Path, monkeypatch) -> None:  # M1
+    pg = scratch_db("postgres", tmp_path)
+    lite = scratch_db("sqlite", tmp_path)
+    try:
+        with dropping(pg) as made:
+            name, source = table_name(), table_name("s")
+            pg.execute(f"CREATE TABLE {pg.table(name)} (id int PRIMARY KEY)")
+            made.append(("TABLE", name))
+            lite.execute(f"CREATE TABLE {lite.table(source)} (id INTEGER PRIMARY KEY)")
+            me, src = profile(app, pg, "pg"), profile(app, lite, "lite")
+            browse, copy = app.container.metadata.with_connection(me, pg.database, lambda c: (
+                c.edit_target(pg.path(name)), c.edit_target(pg.path(name), order=False)))
+            read: list = []
+            real = app.container.schema_cache.get
+            monkeypatch.setattr(app.container.schema_cache, "get",
+                                lambda profile_id, database=None: read.append(profile_id) or real(profile_id, database))
+            app.container.transfers.plan(tables_request(lite, src, [source], pg, me, "append", table=name))
+            appended = list(read)
+            app.container.transfers.plan(tables_request(lite, src, [source], pg, me, "create", table=table_name("n")))
+        assert (browse.stable_order, copy.stable_order, copy.editable) == (["id"], None, True)  # ⑤'s is unchanged
+        assert appended == [me]  # one table appended: the target's foreign keys only, never the source's keys
+        assert read[len(appended):] == [src]  # create: the source's primary key
+    finally:
+        pg.close()
+        lite.close()
+
+
+def test_two_sources_into_one_target_table_are_refused(app: DataApp, tmp_path: Path) -> None:  # fix M2
+    (tmp_path / "other").mkdir()
+    lite, other = scratch_db("sqlite", tmp_path), scratch_db("sqlite", tmp_path / "other")
+    try:
+        name = table_name()
+        lite.execute(f"CREATE TABLE {lite.table(name)} (id INTEGER PRIMARY KEY)")
+        source, target = profile(app, lite, "a"), profile(app, other, "b")
+        plan = app.container.transfers.plan(tables_request(lite, source, [name, name], other, target))
+        assert plan.plan_id is None
+        assert [[p.code for p in table.problems] for table in plan.tables] == [[], ["duplicate_target"]]
+        assert plan.tables[1].problems[0].message == f"main.{name} goes into main.{name} too: copy them one at a time"
+    finally:
+        lite.close()
+        other.close()
+
+
+@requires_pg
+def test_column_names_that_differ_only_in_case_are_one_column_where_case_is_folded(app: DataApp,
+                                                                                    tmp_path: Path) -> None:  # M2
+    pg, lite = scratch_db("postgres", tmp_path), scratch_db("sqlite", tmp_path)
+    try:
+        with dropping(pg) as made:
+            name, into = table_name("s"), table_name("t")
+            pg.execute(f'CREATE TABLE {pg.table(name)} ("ID" int, id int)')
+            made.append(("TABLE", name))
+            lite.execute(f"CREATE TABLE {lite.table(into)} (id INTEGER)")
+            src, dst = profile(app, pg, "pg"), profile(app, lite, "lite")
+            create = app.container.transfers.plan(tables_request(pg, src, [name], lite, dst))
+            append = app.container.transfers.plan(tables_request(pg, src, [name], lite, dst, "append", table=into))
+            kept = app.container.transfers.plan(tables_request(pg, src, [name], pg, src, table=table_name("n")))
+        assert [(p.code, p.message) for p in create.tables[0].problems] == [
+            ("duplicate_column", "ID and id would be one column in SQLite")]
+        assert [(p.code, p.message) for p in append.tables[0].problems] == [
+            ("duplicate_column", f"ID and id would both go into {into}.id")]
+        assert kept.plan_id is not None  # PostgreSQL keeps both: quoted names are not folded
+    finally:
+        pg.close()
+        lite.close()
+
+
+@requires_pg
+def test_appending_into_a_table_that_references_itself_is_warned_of(app: DataApp, tmp_path: Path) -> None:  # M3
+    lite, pg = scratch_db("sqlite", tmp_path), scratch_db("postgres", tmp_path)
+    try:
+        with dropping(pg) as made:
+            source, tree = table_name("s"), table_name("t")
+            lite.execute(f"CREATE TABLE {lite.table(source)} (id INTEGER PRIMARY KEY, up INTEGER)")
+            pg.execute(f"CREATE TABLE {pg.table(tree)} (id int PRIMARY KEY, up int REFERENCES {pg.table(tree)})")
+            made.append(("TABLE", tree))
+            src, dst = profile(app, lite, "lite"), profile(app, pg, "pg")
+            plan = app.container.transfers.plan(tables_request(lite, src, [source], pg, dst, "append", table=tree))
+        assert plan.tables[0].warnings == [
+            f"public.{tree} references itself: the copy may fail unless its rows load in order"]
+    finally:
+        lite.close()
+        pg.close()
+
+
+def test_a_json_column_the_server_normalises_is_said_created_or_not() -> None:  # fix round 1, Task 1's I2
+    text = TableColumn(name="doc", type_name="text", family="text", nullable=True, has_default=False, kind="text",
+                       compare="none", writable=True)
+    into_mysql, into_jsonb = planned_column("doc", "json", Dialect.MYSQL), planned_column("doc", "JSONB",
+                                                                                          Dialect.POSTGRES)
+    assert MYSQL_JSON_NOTE in conversion(text, into_mysql, Dialect.POSTGRES, Dialect.MYSQL).notes
+    assert ("jsonb orders the keys and keeps the last of duplicate keys"
+            in conversion(text, into_jsonb, Dialect.TSQL, Dialect.POSTGRES).notes)
+    assert conversion(text, into_mysql, Dialect.MYSQL, Dialect.MYSQL).notes == ()  # the same engine's own text
+    kept = conversion(text, planned_column("doc", "json", Dialect.POSTGRES), Dialect.MYSQL, Dialect.POSTGRES).notes
+    assert not any("orders the keys" in note for note in kept)  # PostgreSQL's json keeps the text as it is
+    assert MYSQL_JSON_NOTE == ("MySQL's JSON orders the keys, keeps one of duplicate keys, and rewrites decimals "
+                               "(1.10 becomes 1.1) and integers beyond 64 bits as doubles: choose longtext to keep "
+                               "the text")  # Task 1 re-review N2: integers up to uint64 stay exact
+
+
+def test_only_a_time_or_a_date_and_time_target_rounds_a_seventh_digit() -> None:  # Task 1 re-review N1
+    seven = TableColumn(name="at", type_name="datetime2(7)", family="timestamp", nullable=True, has_default=False,
+                        kind="datetime", compare="none", writable=True, scale=7)
+    clock = TableColumn(name="at", type_name="time(7)", family="time", nullable=True, has_default=False,
+                        kind="datetime", compare="none", writable=True, scale=7)
+
+    def rounded(source: TableColumn, dialect: Dialect, type_sql: str) -> bool:
+        return FRACTION_NOTE in conversion(source, planned_column("at", type_sql, dialect), Dialect.TSQL,
+                                           dialect).notes
+
+    assert rounded(seven, Dialect.MYSQL, "datetime(6)") and rounded(seven, Dialect.POSTGRES, "timestamp")
+    assert rounded(clock, Dialect.MYSQL, "time(6)")  # MySQL's time is the duration family: its kind says datetime
+    assert not any(rounded(seven, dialect, type_sql) for dialect, type_sql in (
+        (Dialect.MYSQL, "longtext"), (Dialect.MYSQL, "varchar(40)"), (Dialect.POSTGRES, "text"),
+        (Dialect.MYSQL, "date"), (Dialect.POSTGRES, "date")))  # text keeps all 7 digits; a date has no fraction

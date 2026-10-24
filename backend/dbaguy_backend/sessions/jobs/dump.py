@@ -41,8 +41,8 @@ from ...services.safety import GuardAction, is_plain_read
 from ...sql.bulk_insert import InsertBatcher, size_warning
 from ...sql.dialects import Dialect
 from ...sql.dump_script import (
-    RESTORE_BACKSLASH_ESCAPES, RESTORE_CHECKS_FOREIGN_KEYS, DumpScript, default_rows_text, restore_warnings,
-    statement_end, table_sql,
+    REFERENCES_ITSELF, RESTORE_BACKSLASH_ESCAPES, RESTORE_CHECKS_FOREIGN_KEYS, DumpScript, default_rows_text,
+    restore_warnings, self_reference_warnings, statement_end, table_sql,
 )
 from ...sql.select_builder import FILTER_NOT_A_CONDITION, build_copy_select, build_count_select, check_filter
 from ...storage.atomic_file import atomic_text_file
@@ -57,7 +57,8 @@ DISK_FLOOR_BYTES = 256 * 1_048_576  # below this much free, the dump stops befor
 SQLITE_HEADER = b"SQLite format 3\x00"
 SQLITE_SIDE_FILES = ("-wal", "-shm", "-journal")
 FK_CYCLE = "Foreign keys between these tables form a cycle: a data-only restore may fail"
-SELF_REFERENCE = "{} references itself: a data-only restore may fail unless its rows load in order"  # fix M4
+DATA_ONLY_RESTORE = "a data-only restore"  # what may fail where a table references itself (fix M4)
+SELF_REFERENCE = REFERENCES_ITSELF.format(name="{}", what=DATA_ONLY_RESTORE)  # its text for one table
 NOT_UNICODE = ("holds text that is not valid Unicode (half of a surrogate pair), which a UTF-8 file cannot hold. "
                "Nothing was written")
 NOT_UTF8 = "holds text that is not valid UTF-8, which a UTF-8 file cannot hold. Nothing was written"  # fix L2
@@ -109,7 +110,8 @@ def data_order(dialect: Dialect, tables: tuple[DumpTable, ...]) -> tuple[list[Du
     if dialect not in RESTORE_CHECKS_FOREIGN_KEYS:
         return ordered, []
     said = [FK_CYCLE] if cycle else []
-    return ordered, said + [SELF_REFERENCE.format(table.name) for table in ordered if table.self_referencing]
+    return ordered, said + self_reference_warnings(dialect, [table.name for table in ordered if table.self_referencing],
+                                                   DATA_ONLY_RESTORE)
 
 
 def _first_unicode_problem(text: str) -> int | None:

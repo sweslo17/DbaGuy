@@ -44,6 +44,9 @@ RESTORE_SETTINGS: dict[Dialect, tuple[str, ...]] = {
 # The restores that check each row's foreign keys as it loads (MySQL's header turns the checks off, SQLite's defers
 # them to the COMMIT): only there can a data-only restore fail on the order of its rows (pre-flight M9, Task 9 fix M4)
 RESTORE_CHECKS_FOREIGN_KEYS = frozenset({Dialect.POSTGRES, Dialect.TSQL})
+# A table whose foreign key references itself loads only in an order where each row's parent comes first (Task 9 fix
+# M4): `{what}` is what may fail, a data-only restore or a copy into an existing table (06c)
+REFERENCES_ITSELF = "{name} references itself: {what} may fail unless its rows load in order"
 MAX_GO_REPEAT = 1000  # the largest `GO n` a dump writes: the query tab runs up to this many (Task 9 fix L4)
 RESET_SETTINGS: dict[Dialect, tuple[str, ...]] = {
     Dialect.MYSQL: ("SET FOREIGN_KEY_CHECKS = 1",), Dialect.SQLITE: ("PRAGMA foreign_keys = ON",),
@@ -54,6 +57,14 @@ _COUNTED = ("table", "partition", "view", "materialized view", "sequence", "type
             "procedure", "trigger", "event", "synonym")
 _COMMENTS = frozenset({TokenKind.COMMENT, TokenKind.EXEC_COMMENT})
 MAX_DEFAULT_ROWS = 1000  # rows of defaults a statement (MySQL) or a piece of text (SQLite) holds
+
+
+def self_reference_warnings(dialect: Dialect, names: Iterable[str], what: str) -> list[str]:
+    """`REFERENCES_ITSELF` of each table in `names` (each references itself) where `dialect` checks foreign keys as rows
+    load (RESTORE_CHECKS_FOREIGN_KEYS), none elsewhere: a data-only dump's restore and a copy's append say it alike."""
+    if dialect not in RESTORE_CHECKS_FOREIGN_KEYS:
+        return []
+    return [REFERENCES_ITSELF.format(name=name, what=what) for name in names]
 
 
 def _end(dialect: Dialect) -> str:

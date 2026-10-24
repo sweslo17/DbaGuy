@@ -213,8 +213,8 @@ class SqliteConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
         except sqlite3.Error as exc:
             raise _translate(exc, catalog=True) from exc
 
-    def edit_target(self, path: list[PathSegment]) -> EditTarget:
-        try:
+    def edit_target(self, path: list[PathSegment], *, order: bool = True) -> EditTarget:
+        try:  # no stable_order to plan (PostgreSQL's only)
             return editing.edit_target(self._conn, path)
         except sqlite3.Error as exc:
             raise _translate(exc, catalog=True) from exc

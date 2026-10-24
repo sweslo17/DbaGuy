@@ -347,9 +347,10 @@ class RowEditing(ABC):
     spec ⑤ §3.2). The profile's metadata connection answers it, on its worker thread like every method."""
 
     @abstractmethod
-    def edit_target(self, path: list[PathSegment]) -> EditTarget:
+    def edit_target(self, path: list[PathSegment], *, order: bool = True) -> EditTarget:
         """A view or another non-table, or a table without a usable key: `editable=False` with the reason, never an
-        error. NotFound when the table does not exist."""
+        error. NotFound when the table does not exist. `order` False: no browse of it follows (a copy's target, 06c),
+        so its `stable_order` is not planned (PostgreSQL's EXPLAIN) and stays None."""
 
 
 class DataTools(ABC):

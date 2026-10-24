@@ -9,7 +9,7 @@ text."""
 
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TypeVar
+from typing import NamedTuple, TypeVar
 from uuid import UUID, uuid4
 
 from loguru import logger
@@ -32,10 +32,12 @@ from ..domain.transfer import (
     TransferRequest,
 )
 from ..sql.dialects import Dialect, qualified
-from ..sql.dump_script import RESTORE_CHECKS_FOREIGN_KEYS
+from ..sql.dump_script import RESTORE_CHECKS_FOREIGN_KEYS, self_reference_warnings
 from ..sql.select_builder import FILTER_NOT_A_CONDITION, build_copy_select, check_filter, relation_from_path
 from ..sql.transfer_sql import advance_sequence, create_table, delete_rows, identity_switch, summary
-from ..sql.type_map import conversion, engine_name, incompatible, planned_column, target_type, type_problem
+from ..sql.type_map import (
+    conversion, engine_name, incompatible, planned_column, primary_key, target_type, type_problem,
+)
 from .metadata_service import MetadataService
 from .profile_service import ProfileService
 from .safety import is_plain_read
@@ -58,6 +60,13 @@ FK_UNCHECKED = ("{} has foreign keys, and {} does not check them during the copy
 FK_NOT_ENFORCED = ("Other tables reference {}, and {} does not enforce their foreign keys during the copy: deleting its "
                    "rows neither cascades to theirs nor stops on them")
 UNCHECKED_TARGETS = frozenset({Dialect.MYSQL, Dialect.SQLITE})
+# A PostgreSQL or SQL Server table whose foreign key references itself: its rows load in the source's order, each
+# checked as it goes (06a's data-only restore says the same, `dump_script.self_reference_warnings`; Task 2 fix M3)
+SELF_REFERENCE_FAILS = "the copy"
+# Names that differ only in case are one name there: SQL Server's default collations, SQLite, MySQL's columns (and its
+# tables on macOS); PostgreSQL's quoted names are not folded (Task 2 fix M2)
+CASE_INSENSITIVE = frozenset({Dialect.MYSQL, Dialect.SQLITE, Dialect.TSQL})
+KEY_NOT_CREATED = "Its primary key is not created: {}; choose key column types the target can index to keep it"
 NOT_UNICODE = ("{} is not Unicode ({}): characters outside its code page become ?")
 LEFT_OUT = "left out"
 NOT_IN_TARGET = "no such column in the target"
@@ -69,6 +78,17 @@ T = TypeVar("T")
 
 def _problem(code: str, message: str, column: str | None = None) -> TransferProblem:
     return TransferProblem(code=code, message=message, column=column)  # type: ignore[arg-type]
+
+
+class _Typed(NamedTuple):
+    """A column of a new table, before its primary key is settled: its place in the SELECT, the source column, the
+    type it gets and what the preview says of that type, and whether the user chose it."""
+
+    index: int
+    column: TableColumn
+    type_sql: str
+    note: str | None
+    overridden: bool
 
 
 class _Source:
@@ -130,15 +150,20 @@ def referenced_tables(snapshot: SchemaSnapshot | None) -> frozenset[tuple[str, s
 
 def foreign_key_warnings(dialect: Dialect, mode: str, shown: str, snapshot: SchemaSnapshot | None,
                          referenced: frozenset[tuple[str, str]], schema: str, name: str) -> list[str]:
-    """What the preview says of an existing MySQL or SQLite target whose foreign keys the copy does not check (L2): its
-    own, when appending or replacing; the ones of the tables that reference it (`referenced_tables`), when replacing
-    its rows. From the target's schema snapshot, the completion cache's (no catalog query of its own, so a table made
-    after it was built gets no warning): nothing when it lacks the table (a warning, never a refusal)."""
-    if dialect not in UNCHECKED_TARGETS or mode == "create":
+    """What the preview says of an existing target's foreign keys when appending or replacing. MySQL and SQLite, which
+    the copy does not check (L2): its own; the ones of the tables that reference it (`referenced_tables`), when
+    replacing its rows. PostgreSQL and SQL Server, which check each row as it loads: a foreign key of its own that
+    references itself (fix M3). From the target's schema snapshot, the completion cache's (no catalog query of its
+    own, so a table made after it was built gets no warning): nothing when it lacks the table (a warning, never a
+    refusal)."""
+    if mode == "create":
         return []
     relation = _find(snapshot, schema, name)
     if relation is None:
         return []
+    if dialect not in UNCHECKED_TARGETS:
+        itself = any((fk.ref_schema, fk.ref_table) == (schema, name) for fk in relation.foreign_keys)
+        return self_reference_warnings(dialect, [shown] if itself else [], SELF_REFERENCE_FAILS)
     engine = engine_name(dialect)
     said = [FK_UNCHECKED.format(shown, engine)] if relation.foreign_keys else []
     if mode == "replace_rows" and (schema, name) in referenced:
@@ -175,6 +200,13 @@ class TransferService:
             database = self._on(target.profile_id, None, lambda c: c.current_database())
             target = target.model_copy(update={"database": database})
             request = request.model_copy(update={"target": target})
+        per_database_source = source_adapter.capabilities.per_database_connection
+        if source.tables is not None and source.database is None and per_database_source:
+            # The same for tables of a source connection that names no database (fix I1): the same-table check
+            # compares the two databases by name
+            database = self._on(source.profile_id, None, lambda c: c.current_database())
+            source = source.model_copy(update={"database": database})
+            request = request.model_copy(update={"source": source})
         source_dialect, target_dialect = source_adapter.dialect, target_adapter.dialect
         schema = target.schema_name or DEFAULT_SCHEMAS.get(target_dialect)
         if schema is None:
@@ -182,7 +214,9 @@ class TransferService:
         problems: list[TransferProblem] = []
         warnings: list[str] = []
         sources = self._sources(request, source_dialect, problems, warnings)
-        snapshot = self._snapshot(source.profile_id, source.database, "source's keys") if source.tables else None
+        # The source's keys and foreign keys: a new table's primary key, and the order of two tables or more (fix M1)
+        keyed = source.tables is not None and (target.mode == "create" or len(source.tables) > 1)
+        snapshot = self._snapshot(source.profile_id, source.database, "source's keys") if keyed else None
         ordered, cycle = self._order(sources, snapshot)
         if cycle and target.mode != "create" and target_dialect in RESTORE_CHECKS_FOREIGN_KEYS:
             warnings.append(FK_CYCLE.format(engine_name(target_dialect)))
@@ -191,14 +225,20 @@ class TransferService:
                                                          "INSERT … SELECT in a query tab"))
         names = [target.table or item.table for item in ordered]
         existing = self._targets(target, target_adapter, schema, names)
-        unchecked = target_dialect in UNCHECKED_TARGETS and target.mode != "create"
-        keys = self._snapshot(target.profile_id, target.database, "target's foreign keys") if unchecked else None
+        keys = self._snapshot(target.profile_id, target.database, "target's foreign keys") \
+            if target.mode != "create" else None
         referenced = referenced_tables(keys)  # once: a server's snapshot may hold thousands of tables
+        fold = str.casefold if target_dialect in CASE_INSENSITIVE else str
+        first: dict[str, int] = {}  # each target table, by its folded name: the first source that goes into it
         tables: list[TableTransfer] = []
         planned: list[PlannedTable] = []
-        for item, name in zip(ordered, names, strict=True):
+        for index, (item, name) in enumerate(zip(ordered, names, strict=True)):
             view, made = self._table(request, item, name, schema, existing.get(name), source_dialect,
                                      target_dialect, target_adapter, source_profile, target_profile, snapshot)
+            if (earlier := first.setdefault(fold(name), index)) != index:  # two CREATE TABLE of one name (fix M2)
+                view.problems.append(_problem("duplicate_target", f"{ordered[earlier].name} goes into {view.target} "
+                                                                  "too: copy them one at a time"))
+                made = None
             if existing.get(name) is not None and not view.problems:
                 view.warnings += foreign_key_warnings(target_dialect, target.mode, view.target, keys, referenced,
                                                       schema, name)
@@ -276,11 +316,11 @@ class TransferService:
     @staticmethod
     def _order(sources: list[_Source], snapshot: SchemaSnapshot | None) -> tuple[list[_Source], bool]:
         """Parents first, by the source's foreign keys among these tables (R-06-9), else as chosen; and whether they
-        form a cycle."""
-        if len(sources) < 2 or snapshot is None:
-            return sources, False
+        form a cycle. A table chosen twice keeps both places (its second copy is a `duplicate_target`, never merged)."""
         key = "{}\x00{}".format  # schema and name: a name with a dot in it stays one name
         by_key = {key(item.schema, item.table): item for item in sources}
+        if len(sources) < 2 or snapshot is None or len(by_key) < len(sources):
+            return sources, False
         tables = []
         for item in sources:
             relation = _find(snapshot, item.schema, item.table)
@@ -305,7 +345,8 @@ class TransferService:
                 except NotFound:
                     found[name] = None
                     continue
-                edit = connection.edit_target(path) if isinstance(connection, RowEditing) else None
+                # what writing it allows, never a browse's order (no EXPLAIN on PostgreSQL: fix M1)
+                edit = connection.edit_target(path, order=False) if isinstance(connection, RowEditing) else None
                 found[name] = (columns, edit) if edit is not None else (columns, EditTarget(path=path, editable=True))
             return found
 
@@ -363,6 +404,10 @@ class TransferService:
             if not transactional:
                 said = NON_TRANSACTIONAL if target.mode == "append" else NON_TRANSACTIONAL_REPLACE
                 view.warnings.append(said.format(shown))
+        order: dict[str, int] = {}
+        for position, column in enumerate(item.columns):
+            order.setdefault(column.name, position)
+        view.columns.sort(key=lambda mapping: order.get(mapping.source_name, len(order)))  # the source's order (M4)
         if not written and not view.problems:
             view.problems.append(_problem("no_columns", f"No column of {item.name} would be copied"))
         view.before, view.after = ([create_first] if create_first else []) + before, after
@@ -402,8 +447,7 @@ class TransferService:
         snapshot: SchemaSnapshot | None,
     ) -> tuple[list[PlannedColumn], list[str], list[str], str | None]:
         overrides = request.target.overrides.get(item.key, {})
-        columns: list[tuple[str, str, bool]] = []
-        written: list[PlannedColumn] = []
+        typed_columns: list[_Typed] = []
         for index, column in enumerate(read):
             mapping = ColumnMapping(source_name=column.name, source_type=column.type_name, family=column.family,
                                     type_editable=True)
@@ -418,8 +462,7 @@ class TransferService:
                     view.columns.append(mapping.model_copy(update={"target_name": column.name, "target_type": typed,
                                                                    "overridden": True, "problem": message}))
                     continue
-                type_sql, note = typed.strip(), None
-                into = planned_column(column.name, type_sql, target_dialect)
+                typed_columns.append(_Typed(index, column, typed.strip(), None, True))
             else:
                 mapped = target_type(column, source_dialect, target_dialect)
                 if mapped.type_sql is None:
@@ -427,27 +470,55 @@ class TransferService:
                     view.problems.append(_problem("unmappable_type", message, column.name))
                     view.columns.append(mapping.model_copy(update={"target_name": column.name, "problem": message}))
                     continue
-                type_sql, note = mapped.type_sql, mapped.note
-                into = planned_column(column.name, type_sql, target_dialect)
+                typed_columns.append(_Typed(index, column, mapped.type_sql, mapped.note, False))
+        key = self._key(view, item, typed_columns, target_dialect, snapshot)
+        columns: list[tuple[str, str, bool]] = []
+        written: list[PlannedColumn] = []
+        fold = str.casefold if target_dialect in CASE_INSENSITIVE else str
+        named: dict[str, str] = {}  # each new column, by its folded name: the source column it is made for
+        for index, column, type_sql, note, overridden in typed_columns:
+            if (other := named.setdefault(fold(column.name), column.name)) != column.name:  # fix M2
+                view.problems.append(_problem("duplicate_column", f"{other} and {column.name} would be one column in "
+                                                                  f"{engine_name(target_dialect)}", column.name))
+            into = planned_column(column.name, type_sql, target_dialect)
             notes = [note] if note else []
             notes += [said for said in conversion(column, into, source_dialect, target_dialect).notes
                       if said not in notes]
             if (why := incompatible(column, into)) is not None:
                 view.problems.append(_problem("unconvertible", why, column.name))
-            view.columns.append(mapping.model_copy(update={
-                "target_name": column.name, "target_type": type_sql, "overridden": typed is not None,
-                "conversion": "; ".join(notes) or None}))
+            view.columns.append(ColumnMapping(
+                source_name=column.name, source_type=column.type_name, family=column.family, type_editable=True,
+                target_name=column.name, target_type=type_sql, overridden=overridden,
+                conversion="; ".join(notes) or None))
             columns.append((column.name, type_sql, column.nullable))
             written.append(PlannedColumn(index, column.name))
-        relation = _find(snapshot, item.schema, item.table) if item.path else None
-        copied = {column for column, _, _ in columns}
-        key = list(relation.primary_key) if relation and relation.primary_key and set(relation.primary_key) <= copied \
-            else []
         ddl = create_table(target_dialect, schema, name, columns, key) if columns else ""
         if target_dialect is Dialect.MYSQL:
             view.warnings.append(CREATED_STAYS.format(name))
             return written, [], [], ddl or None
         return written, [ddl] if ddl else [], [], None
+
+    @staticmethod
+    def _key(view: TableTransfer, item: _Source, typed: list[_Typed], dialect: Dialect,
+             snapshot: SchemaSnapshot | None) -> list[str]:
+        """The source's primary key for a new table, when every column of it is copied (spec §3.5.4) and the target can
+        key it (fix I2, `type_map.primary_key`): a key column whose own type the target cannot key gets the bounded
+        type and note `typed` then holds; a key the target cannot create at all is left out, with a warning."""
+        relation = _find(snapshot, item.schema, item.table) if item.path else None
+        if relation is None or not relation.primary_key:
+            return []
+        at = {each.column.name: position for position, each in enumerate(typed)}
+        if not set(relation.primary_key) <= at.keys():
+            return []
+        planned = primary_key([(typed[at[column]].column, typed[at[column]].type_sql, typed[at[column]].overridden)
+                               for column in relation.primary_key], dialect)
+        if planned.reason is not None:
+            view.warnings.append(KEY_NOT_CREATED.format(planned.reason))
+            return []
+        for column, type_sql, note in zip(relation.primary_key, planned.types, planned.notes, strict=True):
+            if note is not None:
+                typed[at[column]] = typed[at[column]]._replace(type_sql=type_sql, note=note)
+        return list(relation.primary_key)
 
     def _append(
         self, view: TableTransfer, item: _Source, read: list[TableColumn], left_out: set[str], schema: str,
@@ -457,6 +528,7 @@ class TransferService:
         choices: dict[str, IdentityChoice] = request.target.identity.get(item.key, {})
         by_name = {column.name: column for column in target_columns}
         used: set[str] = set()
+        writes: dict[str, str] = {}  # each target column written: the source column that goes into it
         written: list[PlannedColumn] = []
         kept_identity: list[TableColumn] = []
         for index, column in enumerate(read):
@@ -488,6 +560,10 @@ class TransferService:
             if target_dialect is Dialect.TSQL and not into.unicode and column.family in ("char", "varchar", "text"):
                 notes.append(NOT_UNICODE.format(into.name, into.type_name))
             update["conversion"] = "; ".join(notes) or None
+            if (other := writes.setdefault(into.name, column.name)) != column.name:  # an INSERT names it once (M2)
+                why = f"{other} and {column.name} would both go into {name}.{into.name}"
+                view.problems.append(_problem("duplicate_column", why, column.name))
+                update["problem"] = why
             view.columns.append(mapping.model_copy(update=update))
             written.append(PlannedColumn(index, into.name))
         for column in target_columns:

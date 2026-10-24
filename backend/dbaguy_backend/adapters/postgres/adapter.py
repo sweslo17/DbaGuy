@@ -440,9 +440,9 @@ class PostgresConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
         self._check_database(path)
         return ddl.object_detail(self._conn, path)
 
-    def edit_target(self, path: list[PathSegment]) -> EditTarget:
+    def edit_target(self, path: list[PathSegment], *, order: bool = True) -> EditTarget:
         self._check_database(path)
-        return editing.edit_target(self._conn, path)
+        return editing.edit_target(self._conn, path, order=order)
 
     def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
         self._check_database(path)

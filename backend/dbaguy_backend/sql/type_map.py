@@ -9,7 +9,7 @@ table is rolled back and the message names the row and the column, never NULL in
 
 import math
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -167,8 +167,10 @@ _NOTES: dict[tuple[TypeFamily, Dialect], str] = {
 }
 _AS_TEXT_NOTE = "PostgreSQL's text of the value"  # an array, a range, an inet … on another engine
 _JSONB_NOTE = "jsonb orders the keys and keeps the last of duplicate keys"
-MYSQL_JSON_NOTE = ("MySQL's JSON orders the keys, keeps one of duplicate keys, and reads numbers beyond a double's "
-                   "precision as doubles: choose longtext to keep the text")
+# Probed (06c Task 1 re-review N2): integers up to uint64 stay exact; a decimal is rewritten (1.10 as 1.1), and so is an
+# integer beyond 64 bits, as a double
+MYSQL_JSON_NOTE = ("MySQL's JSON orders the keys, keeps one of duplicate keys, and rewrites decimals (1.10 becomes "
+                   "1.1) and integers beyond 64 bits as doubles: choose longtext to keep the text")
 
 
 def _json(column: TableColumn, source: Dialect, target: Dialect) -> Mapped:
@@ -179,6 +181,16 @@ def _json(column: TableColumn, source: Dialect, target: Dialect) -> Mapped:
     if target is Dialect.MYSQL:
         return Mapped("json", MYSQL_JSON_NOTE if source is not Dialect.MYSQL else None)
     return Mapped({Dialect.TSQL: "nvarchar(max)", Dialect.SQLITE: "TEXT"}[target])
+
+
+def _normalised_json(target: TableColumn, dialect: Dialect) -> str | None:
+    """What a JSON column the server normalises does to another engine's value (MySQL's JSON, PostgreSQL's jsonb), the
+    note `_json` gives a new table's column, for an existing column or a type the user chose too; None for any other."""
+    if dialect is Dialect.MYSQL and target.family == "json":
+        return MYSQL_JSON_NOTE
+    if dialect is Dialect.POSTGRES and target.type_name.strip().lower() == "jsonb":
+        return _JSONB_NOTE
+    return None
 
 
 def _same_engine_custom(column: TableColumn, target: Dialect) -> Mapped:
@@ -307,6 +319,100 @@ def type_problem(dialect: Dialect, text: str) -> str | None:
     if depth:
         return "it leaves a parenthesis open"
     return None if words else "it does not name a type"
+
+
+# ---- a new table's primary key ----
+
+# The most bytes a primary key's columns take together (06c fix I2): MySQL's InnoDB index (a utf8mb4 character takes 4),
+# SQL Server's clustered index, which PRIMARY KEY makes (an nvarchar character takes 2). PostgreSQL and SQLite key every
+# type a copy gives a key column.
+KEY_BYTES: dict[Dialect, int] = {Dialect.MYSQL: 3_072, Dialect.TSQL: 900}
+# The bounded type a text or binary key column gets when its own is too wide to key: Unicode text, other text, binary
+_KEY_TYPES: dict[Dialect, tuple[str, str, str]] = {
+    Dialect.MYSQL: ("varchar(768)", "varchar(768)", "varbinary(3072)"),
+    Dialect.TSQL: ("nvarchar(450)", "varchar(900)", "varbinary(900)"),
+}
+# The bytes a key takes of a fixed-size type's column (the larger of MySQL's and SQL Server's; decimal by its digits)
+_KEY_WIDTHS: dict[TypeFamily, int] = {
+    "bool": 1, "int16": 2, "int32": 4, "int64": 8, "uint64": 8, "year": 2, "money": 8, "float32": 4, "float64": 8,
+    "date": 3, "time": 6, "duration": 6, "time_tz": 6, "timestamp": 8, "timestamp_tz": 10, "uuid": 16, "enum": 2,
+    "set": 8,
+}
+_DECIMAL_LEFTOVER = (0, 1, 1, 2, 2, 3, 3, 4, 4)  # MySQL: the bytes of 0–8 digits beyond each 9 (which take 4)
+_STRING = frozenset({"char", "varchar", "text"})
+
+
+def _decimal_bytes(dialect: Dialect, precision: int | None, scale: int | None) -> int:
+    if dialect is Dialect.TSQL:
+        digits = precision or 38
+        return 5 if digits <= 9 else 9 if digits <= 19 else 13 if digits <= 28 else 17
+    if precision is None:
+        return 30  # decimal(65,30), MySQL's widest
+    whole, fraction = precision - (scale or 0), scale or 0
+    return sum(part // 9 * 4 + _DECIMAL_LEFTOVER[part % 9] for part in (whole, fraction))
+
+
+def _key_width(dialect: Dialect, type_sql: str) -> int | None:
+    """The bytes a key takes of a column of `type_sql` on MySQL or SQL Server, or None: that engine cannot key it (an
+    unbounded text or binary type, json, xml, a type no rule knows)."""
+    named = of_name(dialect, type_sql)
+    if named.family in ("char", "varchar"):
+        if named.length is None:
+            return None
+        unit = 4 if dialect is Dialect.MYSQL else 2 if type_sql.strip().lower().startswith("n") else 1
+        return unit * named.length
+    if named.family == "binary":
+        return named.length
+    if named.family == "decimal":
+        return _decimal_bytes(dialect, named.precision, named.scale)
+    return _KEY_WIDTHS.get(named.family)
+
+
+@dataclass(frozen=True, slots=True)
+class KeyPlan:
+    """A new table's primary key on the target (06c fix I2): each key column's type in the key's order — its own, or a
+    bounded one where the engine cannot key its own (`notes` says so) — or, with `reason`, none at all."""
+
+    types: tuple[str, ...] = ()
+    notes: tuple[str | None, ...] = ()
+    reason: str | None = None
+
+
+def primary_key(columns: Sequence[tuple[TableColumn, str, bool]], dialect: Dialect) -> KeyPlan:
+    """The source's primary key as a new table on `dialect` can have it: `columns` are the key's source columns, each
+    with the type the new table gives it and whether the user chose that type. MySQL and SQL Server key a bounded
+    width only (KEY_BYTES): a text column too wide to key (MySQL's longtext, SQL Server's nvarchar(max), a varchar wider
+    than the limit) becomes varchar(768) / nvarchar(450) (varchar(900) for non-Unicode text), a binary one
+    varbinary(3072) / varbinary(900), each with a note, and its declared length is kept when it fits. A type the user
+    chose is never replaced; a column of any other type (json, xml, PostgreSQL's text of a value) the engine cannot
+    key, or columns wider together than the limit, give no key: `reason` says why."""
+    limit = KEY_BYTES.get(dialect)
+    if limit is None:
+        return KeyPlan(tuple(type_sql for _, type_sql, _ in columns), (None,) * len(columns))
+    name = engine_name(dialect)
+    types: list[str] = []
+    notes: list[str | None] = []
+    total = 0
+    for column, type_sql, chosen in columns:
+        width, kept, note = _key_width(dialect, type_sql), type_sql, None
+        if (width is None or width > limit) and not chosen:
+            unicode, other, binary = _KEY_TYPES[dialect]
+            into = of_name(dialect, type_sql).family
+            if column.family in _STRING and into in _STRING:
+                kept = unicode if type_sql.strip().lower().startswith("n") else other  # MySQL's are one type
+            elif column.family == "binary" and into == "binary":
+                kept = binary
+            if kept != type_sql:
+                width = _key_width(dialect, kept)
+                note = f"Key column: {kept} because {name} can't key {type_sql}; longer values fail their row"
+        if width is None or width > limit:
+            return KeyPlan(reason=f"{column.name} would be {type_sql}, which {name} can't key")
+        types.append(kept)
+        notes.append(note)
+        total += width
+    if total > limit:
+        return KeyPlan(reason=f"its columns would take {total:,} bytes, and {name} keys at most {limit:,}")
+    return KeyPlan(tuple(types), tuple(notes))
 
 
 # ---- values ----
@@ -586,7 +692,11 @@ def conversion(
             said = source_dialect is not Dialect.POSTGRES and kind != "datetime"  # PostgreSQL's text holds none
             steps.append((_no_nul(name), _NUL_NOTE if said else None))
     notes = [note for _, note in steps if note]
+    # Only a time or a date and time keeps a fraction to round: not a date, nor text, which holds the 7th digit as it is
+    # (N1: by the kind, as MySQL's time(6) is the duration family)
     if (source.scale or 0) > _FRACTION_DIGITS and family in _FRACTIONAL and target_dialect in (
-            Dialect.POSTGRES, Dialect.MYSQL):
+            Dialect.POSTGRES, Dialect.MYSQL) and kind == "datetime" and into != "date":
         notes.append(FRACTION_NOTE)  # the 7th digit goes up to the server as text, which rounds it (I1)
+    if source_dialect is not target_dialect and (said := _normalised_json(target, target_dialect)) is not None:
+        notes.append(said)  # whether the table is created or there already (06c Task 2 fix round 1)
     return Conversion(_chain([step for step, _ in steps]), tuple(dict.fromkeys(notes)))

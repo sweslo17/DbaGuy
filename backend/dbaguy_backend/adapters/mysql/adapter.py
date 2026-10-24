@@ -494,8 +494,8 @@ class MysqlConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
     def object_detail(self, path: list[PathSegment]) -> ObjectDetail:
         return introspection.object_detail(self._conn, path)
 
-    def edit_target(self, path: list[PathSegment]) -> EditTarget:
-        return editing.edit_target(self._conn, path)
+    def edit_target(self, path: list[PathSegment], *, order: bool = True) -> EditTarget:
+        return editing.edit_target(self._conn, path)  # no stable_order to plan (PostgreSQL's only)
 
     def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
         try:

@@ -47,7 +47,7 @@ _PLAN_TIMEOUT_MS = 1_000
 _PLAN_LIMITS = f"SET LOCAL statement_timeout = {_PLAN_TIMEOUT_MS}; SET LOCAL lock_timeout = {_PLAN_TIMEOUT_MS}"
 
 
-def edit_target(conn: psycopg.Connection, path: list[PathSegment]) -> EditTarget:
+def edit_target(conn: psycopg.Connection, path: list[PathSegment], *, order: bool = True) -> EditTarget:
     schema, name = relation_from_path(path)
     oid = relation_oid(conn, qualified(Dialect.POSTGRES, schema, name))
     row = conn.execute(_RELKIND, {"oid": oid}).fetchone()
@@ -64,7 +64,7 @@ def edit_target(conn: psycopg.Connection, path: list[PathSegment]) -> EditTarget
         if not composite.intersection(columns)
     ]
     target = build_target(path, [column.edit_column() for column in read], candidates)
-    if not target.editable:
+    if not target.editable or not order:  # no browse follows (a copy's target): nothing to plan
         return target
     return target.model_copy(update={"stable_order": _stable_order(conn, path, target.key)})
 
