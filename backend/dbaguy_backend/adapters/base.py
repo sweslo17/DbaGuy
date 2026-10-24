@@ -15,6 +15,7 @@ from ..domain.schema import RelationKind, SchemaSnapshot
 from ..sql.dialects import Dialect
 from .columns import TableColumn
 from .dump import DumpCatalog, DumpSession
+from .references import Reference
 from .positions import offset_to_line_col
 
 
@@ -360,6 +361,15 @@ class DataTools(ABC):
     @abstractmethod
     def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
         """The columns of the table, view or materialized view at `path`, in order; NotFound when it is gone."""
+
+
+class ReferenceReading(ABC):
+    """A connection that reads its foreign keys live with their ON DELETE action (PostgreSQL, SQL Server: a copy's
+    target, whose order and DELETE they decide, 06c Task 2 fix round 4), on its worker thread like every method."""
+
+    @abstractmethod
+    def references(self, schema: str, names: list[str]) -> list[Reference]:
+        """The foreign keys from or into the tables `names` of `schema`, in one catalog query."""
 
 
 class Dumping(ABC):

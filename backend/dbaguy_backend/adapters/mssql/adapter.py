@@ -45,6 +45,7 @@ from ..base import (
     Endpoint,
     MessageListener,
     ParsedUrl,
+    ReferenceReading,
     RowEditing,
     RunOptions,
     StatementCancelled,
@@ -55,7 +56,8 @@ from ..base import (
 )
 from ..columns import TableColumn
 from ..dump import DumpCatalog, DumpSession
-from . import catalog, columns, driver, dump, editing, freetds, introspection
+from ..references import Reference
+from . import catalog, columns, driver, dump, editing, freetds, introspection, references
 from . import schema as mssql_schema
 from .cancel import Call, CallKind, CancelControl, CancelledWhileWaiting, CancelPending
 from .settings import CONNECT_TIMEOUT_S, URL_SCHEMES, connect_params, parse_mssql_url
@@ -256,7 +258,7 @@ class MssqlResult(StatementResult):
         self._owner.finish_result(self, complete=self._exhausted)
 
 
-class MssqlConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
+class MssqlConnection(DatabaseConnection, RowEditing, DataTools, ReferenceReading, Dumping):
     def __init__(
         self, conn: driver.Connection, *, spid: int, database: str | None, read_only: bool,
         state: tuple[int, int, bool],  # (@@TRANCOUNT, XACT_STATE(), IMPLICIT_TRANSACTIONS) read at open
@@ -714,6 +716,10 @@ class MssqlConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
         UNCOMMITTED would make a dump's reads dirty)."""
         self._check_database(path)
         return self._catalog_call(lambda: columns.table_columns(self._conn, path))
+
+    def references(self, schema: str, names: list[str]) -> list[Reference]:
+        """A copy's preview, on the metadata connection (its lock timeout: a locked catalog answers in 5 s)."""
+        return self._metadata_call(lambda: references.references(self._conn, schema, names))
 
     def dump_session(self, scope: DumpScope) -> DumpSession:
         return self._catalog_call(lambda: dump.session(self._conn))

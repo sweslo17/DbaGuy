@@ -321,12 +321,7 @@ def test_mysql_and_sqlite_targets_say_their_foreign_keys_go_unchecked() -> None:
     assert said(my, "replace_rows", "parent", "parent") == [FK_NOT_ENFORCED.format("parent", "MySQL")]
     assert said(lite, "replace_rows", "main.tree", "tree") == [FK_UNCHECKED.format("main.tree", "SQLite")]
     assert said(my, "create", "child", "child") == []
-    assert said(Dialect.POSTGRES, "append", "child", "child") == []  # PostgreSQL checks them row by row
-    # fix M3: there a table that references itself loads in the source's order, each row checked as it goes
-    itself = "shop.tree references itself: the copy may fail unless its rows load in order"
-    assert said(Dialect.POSTGRES, "append", "shop.tree", "tree") == [itself]
-    assert said(Dialect.TSQL, "replace_rows", "shop.tree", "tree") == [itself]
-    assert said(Dialect.POSTGRES, "create", "shop.tree", "tree") == []
+    assert said(Dialect.POSTGRES, "append", "child", "child") == []  # PostgreSQL's keys are read live (fix round 4)
     assert said(my, "append", "child", "child", keys=None) == []  # no snapshot: no warning
     assert said(my, "append", "gone", "gone") == []
 
@@ -561,7 +556,7 @@ def test_a_copys_target_is_read_without_planning_a_browse(app: DataApp, tmp_path
             appended = list(read)
             app.container.transfers.plan(tables_request(lite, src, [source], pg, me, "create", table=table_name("n")))
         assert (browse.stable_order, copy.stable_order, copy.editable) == (["id"], None, True)  # ⑤'s is unchanged
-        assert appended == [me]  # one table appended: the target's foreign keys only, never the source's keys
+        assert appended == []  # one table appended into PostgreSQL: its keys are read live (fix round 4), no snapshot
         assert read[len(appended):] == []  # one table created: its key comes with its columns (fix round 3)
     finally:
         pg.close()

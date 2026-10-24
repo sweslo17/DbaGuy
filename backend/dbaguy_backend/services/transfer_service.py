@@ -11,17 +11,19 @@ Logs: INFO the two profiles, the table count, the mode and the problem count; ne
 text."""
 
 from collections.abc import Callable, Sequence
+from functools import partial
 from pathlib import Path
 from typing import NamedTuple, TypeVar
 from uuid import UUID, uuid4
 
 from loguru import logger
 
-from ..adapters.base import DatabaseAdapter, DatabaseConnection, DataTools, RowEditing
+from ..adapters.base import DatabaseAdapter, DatabaseConnection, DataTools, ReferenceReading, RowEditing
 from ..adapters.columns import TableColumn
-from ..adapters.dump import DumpTable, parents_first
+from ..adapters.dump import DumpTable, parents_first, shown_names
 from ..adapters.editing import not_writable_reason
 from ..adapters.families import of_name
+from ..adapters.references import Reference
 from ..adapters.registry import AdapterRegistry
 from ..domain.data_jobs import cannot
 from ..domain.edits import EditTarget, edit_kind
@@ -69,6 +71,14 @@ UNCHECKED_TARGETS = frozenset({Dialect.MYSQL, Dialect.SQLITE})
 # A PostgreSQL or SQL Server table whose foreign key references itself: its rows load in the source's order, each
 # checked as it goes (06a's data-only restore says the same, `dump_script.self_reference_warnings`; Task 2 fix M3)
 SELF_REFERENCE_FAILS = "the copy"
+# Replacing rows deletes each table's rows first (fix round 4). On PostgreSQL and SQL Server a foreign key's ON DELETE
+# CASCADE, SET NULL or SET DEFAULT carries that DELETE into the rows of the tables that reference it: the copy goes
+# parents first by the target's own keys, so it never reaches rows it already copied, except in a loop (a problem), and
+# says when it reaches a table the copy does not write (a warning). MySQL and SQLite copy with the checks, and so the
+# cascades, off.
+CASCADE_LOOP = ("Deleting the rows of {parent} also deletes or changes rows of {child}, and their tables' ON DELETE "
+                "actions form a loop, so no order copies {child} after {parent}: turn the cascade off, then copy them")
+CASCADES_OUTSIDE = "Deleting the rows of {} also deletes (or changes) rows of {}, which this copy does not write"
 # Names that differ only in case are one name there: SQL Server's default collations, SQLite, MySQL's columns (and its
 # tables on macOS); PostgreSQL's quoted names are not folded (Task 2 fix M2)
 CASE_INSENSITIVE = frozenset({Dialect.MYSQL, Dialect.SQLITE, Dialect.TSQL})
@@ -156,24 +166,88 @@ def referenced_tables(snapshot: SchemaSnapshot | None) -> frozenset[tuple[str, s
 
 def foreign_key_warnings(dialect: Dialect, mode: str, shown: str, snapshot: SchemaSnapshot | None,
                          referenced: frozenset[tuple[str, str]], schema: str, name: str) -> list[str]:
-    """What the preview says of an existing target's foreign keys when appending or replacing. MySQL and SQLite, which
-    the copy does not check (L2): its own; the ones of the tables that reference it (`referenced_tables`), when
-    replacing its rows. PostgreSQL and SQL Server, which check each row as it loads: a foreign key of its own that
-    references itself (fix M3). From the target's schema snapshot, the completion cache's (no catalog query of its
-    own, so a table made after it was built gets no warning): nothing when it lacks the table (a warning, never a
-    refusal)."""
-    if mode == "create":
+    """What the preview says of an existing MySQL or SQLite target's foreign keys, which the copy does not check (L2),
+    when appending or replacing: its own; the ones of the tables that reference it (`referenced_tables`), when
+    replacing its rows. From the target's schema snapshot, the completion cache's (no catalog query of its own, so a
+    table made after it was built gets no warning): nothing when it lacks the table (a warning, never a refusal).
+    PostgreSQL's and SQL Server's are read live: `reference_warnings`."""
+    if mode == "create" or dialect not in UNCHECKED_TARGETS:
         return []
     relation = _find(snapshot, schema, name)
     if relation is None:
         return []
-    if dialect not in UNCHECKED_TARGETS:
-        itself = any((fk.ref_schema, fk.ref_table) == (schema, name) for fk in relation.foreign_keys)
-        return self_reference_warnings(dialect, [shown] if itself else [], SELF_REFERENCE_FAILS)
     engine = engine_name(dialect)
     said = [FK_UNCHECKED.format(shown, engine)] if relation.foreign_keys else []
     if mode == "replace_rows" and (schema, name) in referenced:
         said.append(FK_NOT_ENFORCED.format(shown, engine))
+    return said
+
+
+def snapshot_references(snapshot: SchemaSnapshot | None, schema: str, names: Sequence[str]) -> list[Reference]:
+    """The foreign keys from or into the tables `names` of `schema`, from a MySQL or SQLite target's schema snapshot:
+    the order of the tables it copies into. Their ON DELETE action is not read: the copy turns their checks, and so
+    their cascades, off (each is `no_action` here)."""
+    if snapshot is None:
+        return []
+    mine = {(schema, name) for name in names}
+    return [Reference(each.name, relation.name, fk.ref_schema, fk.ref_table)
+            for each in snapshot.schemas for relation in each.relations for fk in relation.foreign_keys
+            if (each.name, relation.name) in mine or (fk.ref_schema, fk.ref_table) in mine]
+
+
+def order_by_target(names: Sequence[str], schema: str, references: Sequence[Reference], *,
+                    replace: bool) -> tuple[list[int], bool, list[tuple[str, str]]]:
+    """The copy's tables (by their target names, in the order chosen) parents first by the target's foreign keys among
+    them (appending or replacing rows of existing tables, fix round 4), as positions in `names`; whether those keys
+    form a cycle; and, when `replace` (a target whose cascades fire), each (parent, child) of them whose parent's
+    DELETE changes the child's rows (ON DELETE CASCADE, SET NULL, SET DEFAULT) and that no order copies child after
+    parent: such keys form a loop. Where all the keys allow no order, one that keeps every such child after its parent
+    goes first. A table chosen twice keeps the order chosen (it is a `duplicate_target`)."""
+    if len(set(names)) < len(names):
+        return list(range(len(names))), False, []
+    copied = set(names)
+    depends: dict[str, set[str]] = {name: set() for name in names}
+    changes: dict[str, set[str]] = {name: set() for name in names}
+    for reference in references:
+        child, parent = reference.table, reference.ref_table
+        if reference.schema == schema == reference.ref_schema and {child, parent} <= copied and child != parent:
+            depends[child].add(parent)
+            if replace and reference.changes_children:
+                changes[child].add(parent)
+
+    def placed(edges: dict[str, set[str]]) -> tuple[list[str], bool]:
+        ordered, cycle = parents_first(tuple(DumpTable(schema=schema, table=name, name=name, columns=(),
+                                                       references=tuple(sorted(edges[name]))) for name in names))
+        return [table.name for table in ordered], cycle
+
+    def reached(order: list[str]) -> list[tuple[str, str]]:
+        at = {name: position for position, name in enumerate(order)}
+        return [(parent, child) for child in order for parent in sorted(changes[child]) if at[parent] > at[child]]
+
+    order, cycle = placed(depends)
+    if reached(order):
+        order = placed(changes)[0]
+    position = {name: index for index, name in enumerate(names)}
+    return [position[name] for name in order], cycle, reached(order)
+
+
+def reference_warnings(dialect: Dialect, mode: str, shown: str, schema: str, name: str, copied: set[str],
+                       references: Sequence[Reference], display: Callable[[str, str], str]) -> list[str]:
+    """What the preview says of an existing PostgreSQL or SQL Server table's foreign keys, read live (fix round 4), when
+    appending or replacing: a key of its own that references it (its rows load in the source's order, each checked as
+    it goes: fix M3); and, when its rows are replaced, the tables the copy does not write (`copied`: the copy's tables
+    of `schema`) whose rows its DELETE deletes or changes (CASCADE_OUTSIDE)."""
+    if mode == "create" or dialect not in RESTORE_CHECKS_FOREIGN_KEYS:
+        return []
+    into = [reference for reference in references if (reference.ref_schema, reference.ref_table) == (schema, name)]
+    itself = any((reference.schema, reference.table) == (schema, name) for reference in into)
+    said = self_reference_warnings(dialect, [shown] if itself else [], SELF_REFERENCE_FAILS)
+    if mode == "replace_rows":
+        outside = list(dict.fromkeys(display(reference.schema, reference.table) for reference in into
+                                     if reference.changes_children
+                                     and not (reference.schema == schema and reference.table in copied)))
+        if outside:
+            said.append(CASCADES_OUTSIDE.format(shown, shown_names(outside)))
     return said
 
 
@@ -220,21 +294,34 @@ class TransferService:
         problems: list[TransferProblem] = []
         warnings: list[str] = []
         sources = self._sources(request, source_dialect, problems, warnings)
-        # The source's foreign keys, for the order of two tables or more (fix M1); a new table's primary key is read
-        # with the columns, from the catalog (fix round 3: a cached snapshot can miss a key added since)
-        ordering = source.tables is not None and len(source.tables) > 1
-        snapshot = self._snapshot(source.profile_id, source.database, "source's foreign keys") if ordering else None
-        ordered, cycle = self._order(sources, snapshot)
-        if cycle and target.mode != "create" and target_dialect in RESTORE_CHECKS_FOREIGN_KEYS:
-            warnings.append(FK_CYCLE.format(engine_name(target_dialect)))
         if _same_file(source_profile, target_profile):
             problems.append(_problem("same_sqlite_file", "The source and the target are the same SQLite file: use "
                                                          "INSERT … SELECT in a query tab"))
-        names = [target.table or item.table for item in ordered]
-        existing = self._targets(target, target_adapter, schema, names)
+        chosen = [target.table or item.table for item in sources]
+        # PostgreSQL's and SQL Server's foreign keys, whose checks and cascades the copy meets, are read live with the
+        # target's columns; MySQL's and SQLite's, which it turns off, come from the snapshot (L2's warnings, the order)
+        live = target.mode != "create" and target_dialect in RESTORE_CHECKS_FOREIGN_KEYS
+        existing, links = self._targets(target, target_adapter, schema, chosen, references=live)
         keys = self._snapshot(target.profile_id, target.database, "target's foreign keys") \
-            if target.mode != "create" else None
+            if target.mode != "create" and target_dialect in UNCHECKED_TARGETS else None
         referenced = referenced_tables(keys)  # once: a server's snapshot may hold thousands of tables
+        if target.mode == "create":
+            # New tables have no foreign keys: the source's order, parents first, for two tables or more (fix M1);
+            # their primary key comes with the columns, from the catalog (fix round 3)
+            ordering = source.tables is not None and len(source.tables) > 1
+            snapshot = self._snapshot(source.profile_id, source.database, "source's foreign keys") if ordering else None
+            ordered, cycle = self._order(sources, snapshot)
+        else:  # existing tables: parents first by the target's own keys (fix round 4)
+            links = links if live else snapshot_references(keys, schema, chosen)
+            order, cycle, loops = order_by_target(chosen, schema, links, replace=live and
+                                                  target.mode == "replace_rows")
+            ordered = [sources[position] for position in order]
+            problems += [_problem("cascade_loop", CASCADE_LOOP.format(
+                parent=qualified(target_dialect, schema, parent), child=qualified(target_dialect, schema, child)))
+                for parent, child in loops]
+            if cycle and target_dialect in RESTORE_CHECKS_FOREIGN_KEYS:
+                warnings.append(FK_CYCLE.format(engine_name(target_dialect)))
+        names = [target.table or item.table for item in ordered]
         fold = str.casefold if target_dialect in CASE_INSENSITIVE else str
         first: dict[str, int] = {}  # each target table, by its folded name: the first source that goes into it
         tables: list[TableTransfer] = []
@@ -249,6 +336,8 @@ class TransferService:
             if existing.get(name) is not None and not view.problems:
                 view.warnings += foreign_key_warnings(target_dialect, target.mode, view.target, keys, referenced,
                                                       schema, name)
+                view.warnings += reference_warnings(target_dialect, target.mode, view.target, schema, name,
+                                                    set(names), links or [], partial(qualified, target_dialect))
             tables.append(view)
             if made is not None:
                 planned.append(made)
@@ -337,12 +426,15 @@ class TransferService:
         ordered, cycle = parents_first(tuple(tables))
         return [by_key[table.name] for table in ordered], cycle
 
-    def _targets(self, target: TargetSpec, adapter: DatabaseAdapter, schema: str,
-                 names: list[str]) -> dict[str, tuple[list[TableColumn], EditTarget] | None]:
+    def _targets(
+        self, target: TargetSpec, adapter: DatabaseAdapter, schema: str, names: list[str], *, references: bool,
+    ) -> tuple[dict[str, tuple[list[TableColumn], EditTarget] | None], list[Reference] | None]:
         """Each target table's columns and what grid editing says of writing it (a view, a table that cannot be
-        written as a whole), or None when there is no such table."""
+        written as a whole), or None when there is no such table; and, with `references`, the foreign keys from or
+        into the tables that are there, in one more catalog query (fix round 4; None: not read)."""
 
-        def read(connection: DatabaseConnection) -> dict[str, tuple[list[TableColumn], EditTarget] | None]:
+        def read(connection: DatabaseConnection) -> tuple[
+                dict[str, tuple[list[TableColumn], EditTarget] | None], list[Reference] | None]:
             found: dict[str, tuple[list[TableColumn], EditTarget] | None] = {}
             for name in dict.fromkeys(names):
                 path = adapter.relation_path(target.database, schema, name, "table")
@@ -354,7 +446,10 @@ class TransferService:
                 # what writing it allows, never a browse's order (no EXPLAIN on PostgreSQL: fix M1)
                 edit = connection.edit_target(path, order=False) if isinstance(connection, RowEditing) else None
                 found[name] = (columns, edit) if edit is not None else (columns, EditTarget(path=path, editable=True))
-            return found
+            there = [name for name, table in found.items() if table is not None]
+            links = connection.references(schema, there) \
+                if references and isinstance(connection, ReferenceReading) else None
+            return found, links
 
         return self._on(target.profile_id, target.database, read)
 
