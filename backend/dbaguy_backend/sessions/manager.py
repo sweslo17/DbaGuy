@@ -8,11 +8,14 @@ from uuid import UUID, uuid4
 from loguru import logger
 from pydantic import BaseModel
 
+from ..domain.edits import PLAN_MISMATCH, PlanUnavailable
 from ..domain.errors import SessionNotFound
 from ..domain.metadata import ServerInfo
+from ..domain.transfer import COPY_PLAN_EXPIRED
 from ..services.connection_service import ConnectionService
 from ..services.profile_service import ProfileService
 from .hooks import SessionHooksFactory
+from .jobs.context import SourceLease
 from .jobs.registry import JobRegistry
 from .worker import Emitter, SessionWorker
 
@@ -69,7 +72,7 @@ class SessionManager:
             if self._hooks is not None:
                 hooks = self._hooks.build(profile.id, server.current_database)
                 jobs = replace(hooks.jobs, announce=partial(self.jobs.begin, session_id, profile.id),
-                               report=partial(self.jobs.report, session_id))
+                               report=partial(self.jobs.report, session_id), source=self._source)
                 worker.configure(replace(hooks, jobs=jobs))  # before it is registered
         except BaseException:
             worker.close()  # whatever failed, never leave the thread, connection or tunnel behind
@@ -79,6 +82,27 @@ class SessionManager:
             self._sessions[session_id] = _Entry(worker=worker, info=info, detached_at=self._clock())
         logger.info("Opened session {} for '{}'", session_id, profile.name)
         return info
+
+    def _source(self, profile_id: UUID, database: str | None, session_id: str | None) -> SourceLease:
+        """A copy's source session (06c): the query tab's session the copy names, which must be one of the plan's source
+        profile (`plan_mismatch`, the copy's §4 text: pre-flight L-a), and stays the tab's; or a session of the copy's
+        own, closed when the copy releases it. Opening one may fail as a session does (a password, a server down): the
+        copy then never started. Its own session counts as attached while leased: between two tables (a long DELETE, a
+        COMMIT) it is idle, and the reaper must not close it under the copy."""
+        if session_id is not None:
+            entry = self._entry(session_id)
+            if entry.info.profile_id != profile_id:
+                raise PlanUnavailable(PLAN_MISMATCH, COPY_PLAN_EXPIRED)
+            return SourceLease(entry.worker, lambda: None)
+        info = self.create(SessionCreateRequest(profile_id=profile_id, database=database))
+        with self._lock:
+            if (own := self._sessions.get(info.session_id)) is not None:
+                own.attached += 1
+        return SourceLease(self.worker(info.session_id), partial(self._release, info.session_id))
+
+    def _release(self, session_id: str) -> None:
+        """A copy's own source session ends with it (never reused, as a job's own session)."""
+        self._pop_and_close(session_id)
 
     def _entry(self, session_id: str) -> _Entry:
         with self._lock:

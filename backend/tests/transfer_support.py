@@ -4,7 +4,9 @@
 from typing import Any
 from uuid import UUID
 
+from dbaguy_backend.adapters.columns import TableColumn
 from dbaguy_backend.domain.transfer import QuerySource, SourceSpec, TargetSpec, TransferRequest
+from dbaguy_backend.services.transfer_plans import PlannedColumn, PlannedTable
 from tests.data_support import SCRATCH_06C, DataApp, scratch_name
 from tests.edit_support import ScratchDb
 
@@ -38,4 +40,14 @@ def query_request(source: ScratchDb, source_profile: UUID, sql: str, columns: li
                           query=QuerySource(sql=sql, columns=columns, title="Query 1")),
         target=TargetSpec(profile_id=target_profile, database=target.database, schema_name=target.schema, mode=mode,
                           table=table, **target_fields),
+    )
+
+
+def planned(select: str, columns: list[TableColumn], *, filtered: bool = False) -> PlannedTable:
+    """A table of a plan, for a source read on its own (TransferSource): only its SELECT and columns matter."""
+    return PlannedTable(
+        source_name="the source", target_name="the target", target_schema=None, target_table="t", target_path=(),
+        select=select, columns=tuple(columns),
+        written=tuple(PlannedColumn(index, column.name) for index, column in enumerate(columns)), before=(), after=(),
+        created=False, filtered=filtered,
     )

@@ -46,12 +46,10 @@ from ...sql.dump_script import (
 )
 from ...sql.select_builder import FILTER_NOT_A_CONDITION, build_copy_select, build_count_select, check_filter
 from ...storage.atomic_file import atomic_text_file
-from .context import Job, JobContext, JobReport
+from .context import FIRST_FETCH, Job, JobContext, JobReport, fetch_size
 
 DUMP_IO = "dump_io"
-FETCH_ROWS = 1000  # rows read at a time at most (the export's chunk)
-FETCH_CHARS = 32 * 1_048_576  # … and about this much row text (pre-flight M12)
-FIRST_FETCH = 1  # a table's first read, before the size of its rows is known (Task 9 fix M1)
+FETCH_CHARS = 32 * 1_048_576  # about this much row text a read takes, at most FETCH_ROWS rows (pre-flight M12)
 # The free space is looked at every this much written (pre-flight M14): at most 64 MiB of bytes (4 a character, Task 9
 # fix L6) between two looks, under DISK_FLOOR_BYTES
 DISK_CHECK_CHARS = 16 * 1_048_576
@@ -328,7 +326,7 @@ class DumpJob(Job):
                 ctx.progress.rows += len(chunk)
                 ctx.raise_if_cancelled()
                 ctx.tick()
-                size = max(1, min(FETCH_ROWS, FETCH_CHARS // max(largest, 1)))  # fix M1: the largest row, not the mean
+                size = fetch_size(largest, FETCH_CHARS)  # fix M1: the largest row, not the mean
         finally:
             ctx.close(result)
         write(batcher.flush())

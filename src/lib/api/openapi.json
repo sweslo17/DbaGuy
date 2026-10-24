@@ -4217,6 +4217,46 @@
         "title": "ContextOption",
         "description": "One entry of the query-context picker. `text` is `QueryContext(bucket, scope).text()`, so the frontend never\nquotes a name (B13)."
       },
+      "CopyDataCommand": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "type": {
+            "type": "string",
+            "const": "copy_data",
+            "title": "Type",
+            "default": "copy_data"
+          },
+          "plan_id": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Plan Id"
+          },
+          "source_session_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Session Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "plan_id"
+        ],
+        "title": "CopyDataCommand",
+        "description": "Copy data between connections (spec \u2465 \u00a73.5.5): the previewed plan, run on this session (the target's), reading\neach table on the source's: the query tab's session the plan's query came from, or one the copy opens and closes\nitself (None). Each table is copied in a transaction of its own; nothing is ever sent again."
+      },
       "CouchbaseSettings": {
         "properties": {
           "sample_size": {
@@ -5734,6 +5774,9 @@
               },
               {
                 "$ref": "#/components/schemas/DumpCommand"
+              },
+              {
+                "$ref": "#/components/schemas/CopyDataCommand"
               }
             ],
             "title": "Command",
@@ -5743,6 +5786,7 @@
                 "apply_edits": "#/components/schemas/ApplyEditsCommand",
                 "cancel": "#/components/schemas/CancelCommand",
                 "commit": "#/components/schemas/CommitCommand",
+                "copy_data": "#/components/schemas/CopyDataCommand",
                 "discard": "#/components/schemas/DiscardCommand",
                 "dump": "#/components/schemas/DumpCommand",
                 "execute": "#/components/schemas/ExecuteCommand",
@@ -6727,7 +6771,8 @@
             "type": "string",
             "enum": [
               "dump",
-              "run_file"
+              "run_file",
+              "copy_data"
             ],
             "title": "Job"
           },
@@ -6739,6 +6784,18 @@
             "type": "string",
             "format": "uuid",
             "title": "Profile Id"
+          },
+          "source_profile_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Profile Id"
           },
           "started_at": {
             "type": "string",
@@ -6792,6 +6849,34 @@
             "type": "integer",
             "title": "Rows",
             "default": 0
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "copied",
+                  "rolled_back",
+                  "not_started",
+                  "unknown"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
           }
         },
         "type": "object",
@@ -6800,7 +6885,7 @@
           "name"
         ],
         "title": "JobObject",
-        "description": "One object of a dump, with the rows written for it."
+        "description": "One object of a dump, with the rows written for it; one table of a copy, with its outcome."
       },
       "JobOutcomeEvent": {
         "properties": {
@@ -6818,7 +6903,8 @@
             "type": "string",
             "enum": [
               "dump",
-              "run_file"
+              "run_file",
+              "copy_data"
             ],
             "title": "Job"
           },

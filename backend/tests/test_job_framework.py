@@ -56,7 +56,8 @@ class ScriptedJob(Job):
     """Steps: `sql <text>` runs a statement and drains it (StatementCancelled → stopped, cancelled), `tick` and
     `tick!` progress, `msg <text>`, `msgs <n>`, `crash`, `fail <code>` (an error report), `record`, `hold <name>`
     (stop_cancels(), then wait as a COMMIT would: HOLDS), `wait <name>` (wait, a Cancel still lands), `check`
-    (raise_if_cancelled(), let through). Its broke() is the framework's, fails too, or a plain unknown."""
+    (raise_if_cancelled(), let through), `resume` (resume_cancels(): stopped, cancelled, when a Cancel was held). Its
+    broke() is the framework's, fails too, or a plain unknown."""
 
     kind = "run_file"
 
@@ -101,6 +102,9 @@ class ScriptedJob(Job):
                 assert go.wait(5)
             elif word == "check":
                 ctx.raise_if_cancelled()
+            elif word == "resume":  # a copy's next table (06c): a Cancel held since `hold` stops it here
+                if ctx.resume_cancels():
+                    return JobReport(ctx.outcome("stopped", cancelled=True, statements=done), StatementCancelled())
         return JobReport(ctx.outcome("completed", statements=done), schema_changed=done > 0)
 
     def broke(self, ctx: JobContext, exc: Exception) -> JobReport:
@@ -180,7 +184,7 @@ def test_a_job_sends_its_events_in_order_and_one_outcome(env):  # D-06-2
     assert e.conn.runs == ["rows 3"]
     assert e.records == [("begin", "-- scripted"), ("finish", 7, "ok", e.records[1][3], 0, None)]
     assert e.schema_changes == 1
-    assert e.listed[0] == ("announce", "j", "run_file", "Scripted job")
+    assert e.listed[0] == ("announce", "j", "run_file", "Scripted job", None)  # no source profile: not a copy
     assert [item for item in e.listed[1:]] == [("report", "job_progress"), ("report", "job_progress"),
                                                ("report", "job_outcome")]
 

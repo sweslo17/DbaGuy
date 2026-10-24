@@ -257,9 +257,20 @@ class DumpCommand(JobCommand):
         return self
 
 
+class CopyDataCommand(JobCommand):
+    """Copy data between connections (spec ⑥ §3.5.5): the previewed plan, run on this session (the target's), reading
+    each table on the source's: the query tab's session the plan's query came from, or one the copy opens and closes
+    itself (None). Each table is copied in a transaction of its own; nothing is ever sent again."""
+
+    job_kind = "copy_data"
+    type: Literal["copy_data"] = "copy_data"
+    plan_id: str = Field(min_length=1, max_length=64)
+    source_session_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+
 ClientCommand = Annotated[
     ExecuteCommand | ExportCommand | FetchMoreCommand | CancelCommand | DiscardCommand | CommitCommand
-    | RollbackCommand | SetAutocommitCommand | ApplyEditsCommand | RunFileCommand | DumpCommand,
+    | RollbackCommand | SetAutocommitCommand | ApplyEditsCommand | RunFileCommand | DumpCommand | CopyDataCommand,
     Field(discriminator="type"),
 ]
 

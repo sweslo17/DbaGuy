@@ -1,5 +1,5 @@
-"""Data tools (spec ⑥): a job — a dump, a run of a SQL file — runs on a session of its own and ends with exactly one
-outcome (R-06-12, ⑤ E1). Its WebSocket events, and what the job list shows of it (D-06-10)."""
+"""Data tools (spec ⑥): a job — a dump, a run of a SQL file, a copy between connections — runs on a session of its own
+and ends with exactly one outcome (R-06-12, ⑤ E1). Its WebSocket events, and what the job list shows of it (D-06-10)."""
 
 from datetime import datetime
 from typing import ClassVar, Literal, Self
@@ -9,11 +9,13 @@ from pydantic import BaseModel, Field, model_validator
 
 from .profiles import Engine
 
-JobKind = Literal["dump", "run_file"]
+JobKind = Literal["dump", "run_file", "copy_data"]
 # R-06-12. Dump: completed or failed (nothing written). Run, all or nothing: completed, rolled_back, partial (the file
 # or a DDL ended the transaction), unknown (the link died during COMMIT). Run, statement by statement: completed,
 # stopped, unknown (the link died while a statement ran). Any job: not_started (cancelled while queued, its session
-# closed first, or refused before anything was sent). A cancel is the `cancelled` flag on one of these, never an outcome.
+# closed first, or refused before anything was sent). Copy (06c): completed (every table copied), partial (some were,
+# then one failed or a Cancel stopped it), rolled_back (none was), unknown (what a table's COMMIT did, or a table that
+# cannot roll back, is not known). A cancel is the `cancelled` flag on one of these, never an outcome.
 JobOutcomeKind = Literal["completed", "failed", "rolled_back", "partial", "stopped", "unknown", "not_started"]
 JobStage = Literal["starting", "schema", "data", "post_data", "statements", "commit"]
 
@@ -69,12 +71,19 @@ class StoppedAt(BaseModel):
     exact: bool = Field(default=True, json_schema_extra=lambda schema: schema.pop("default", None))
 
 
+# A table of a copy (06c, R-06-12): its rows are in, its transaction was rolled back, it never began, or what its
+# COMMIT (or a table that cannot roll back) did is not known
+TableOutcome = Literal["copied", "rolled_back", "not_started", "unknown"]
+
+
 class JobObject(BaseModel):
-    """One object of a dump, with the rows written for it."""
+    """One object of a dump, with the rows written for it; one table of a copy, with its outcome."""
 
     kind: str  # table, view, sequence, function, …
-    name: str  # as the file names it: schema.name
+    name: str  # as the file names it: schema.name (a copy: the target table)
     rows: int = 0
+    outcome: TableOutcome | None = None  # a copy's table
+    source: str | None = None  # a copy's table: what it was copied from
 
 
 class JobProgressEvent(BaseModel):
@@ -132,6 +141,8 @@ class JobInfo(BaseModel):
     job: JobKind
     title: str
     profile_id: UUID
+    # A copy's source connection (06c): its sessions close when that connection is deleted, so the delete waits
+    source_profile_id: UUID | None = None
     started_at: datetime
     progress: JobProgressEvent | None = None  # the last one sent
     outcome: JobOutcomeEvent | None = None  # set once the job ended

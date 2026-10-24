@@ -85,7 +85,7 @@ from .edit_apply import (
     history_error,
     refused,
 )
-from .jobs.context import JOB_ROLLBACK_FAILED, Job, JobContext, JobHooks, JobReport, history_status
+from .jobs.context import JOB_ROLLBACK_FAILED, Job, JobContext, JobHooks, JobReport, PreparedJob, history_status
 from .options import run_options
 from .read_ahead import READ_AHEAD_POLL_S, STALL_RESET_FACTOR, StallClock
 from .session_state import SessionStateTracker
@@ -303,6 +303,10 @@ class SessionWorker:
         # A job runs, from its start until its last event went out (guarded by _state_lock). Past stop_cancels() no
         # request is "running", yet its COMMIT or rollback is: the reaper must not close it then (pre-flight L1)
         self._job_active = False
+        self._job_request: str | None = None  # that job's request id (guarded by _state_lock)
+        # A Cancel of that job while its statements could not be cancelled (a copy's COMMIT between two tables): kept
+        # for `_resume`, so the next table does not start (06c; guarded by _state_lock)
+        self._held_cancel = False
 
     # ---- lifecycle (any thread) ----
 
@@ -411,6 +415,11 @@ class SessionWorker:
             if request_id in self._queued:
                 logger.info("Request {} on {} cancelled before it started", request_id, self.name)
                 self._queued[request_id] = True
+                return
+            if self._job_active and self._job_request == request_id:  # its COMMIT, say: the job reads it later
+                logger.info("Cancel of job {} on {} kept until its statements can be cancelled again", request_id,
+                            self.name)
+                self._held_cancel = True
                 return
         try:
             self._put(lambda: self._discard(request_id, cancelled=True))  # a paused result, if it is the open one
@@ -1245,12 +1254,12 @@ class SessionWorker:
         a job cancelled while queued, or whose session closed first, still gets its job_outcome (not_started). The
         session is busy until the job's last event went out, through its COMMIT too (pre-flight L1)."""
         with self._state_lock:
-            self._job_active = True
+            self._job_active, self._job_request, self._held_cancel = True, cmd.request_id, False
         try:
             self._job(cmd)
         finally:
             with self._state_lock:
-                self._job_active = False
+                self._job_active, self._job_request, self._held_cancel = False, None, False
 
     def _job(self, cmd: JobCommand) -> None:
         """`_run_job`'s request, from `started` to `finished`."""
@@ -1261,6 +1270,7 @@ class SessionWorker:
             self._job_events = {}
 
         def not_started(why: str) -> None:  # right before the `finished` _start_request sends
+            self._never_ran(cmd, StatementError(why, code="not_started"))
             self._job_event(JobOutcomeEvent(  # `why` is the warning sent live, kept for a later window too (F3)
                 request_id=req.request_id, job=kind, outcome="not_started", cancelled=why != CLOSED_BEFORE_START,
                 warnings=[why],
@@ -1270,6 +1280,7 @@ class SessionWorker:
             return
         job: Job | None = None
         ctx: JobContext | None = None
+        began = False  # job.run was called
         try:
             job = self._hooks.jobs.build(cmd)
             ctx = JobContext(
@@ -1278,10 +1289,14 @@ class SessionWorker:
                 _close=self._close_result, _raise_if_cancelled=self._raise_if_cancelled, _send=self._send,
                 _publish=self._job_event,
                 _stop_cancels=lambda: self._set_running(None), _sent=lambda: req.ran,
+                _resume_cancels=lambda: self._resume(req.request_id),
             )
-            self._notify("job list", self._hooks.jobs.announce, req.request_id, kind, job.title)
-            if self.connection.in_transaction():  # a job runs on a session of its own: never inside a user's
-                raise transaction_open_error()
+            if not job.helper:  # a copy's source is its copy's part: never listed, run in the session's transaction
+                self._notify("job list", self._hooks.jobs.announce, req.request_id, kind, job.title,
+                             job.source_profile_id)
+                if self.connection.in_transaction():  # a job runs on a session of its own: never inside a user's
+                    raise transaction_open_error()
+            began = True
             report = job.run(ctx)
         except Exception as exc:
             cancelled = isinstance(exc, StatementCancelled)  # a flag on whatever the outcome is (spec ⑥ §3.2)
@@ -1292,16 +1307,38 @@ class SessionWorker:
                 report = JobReport(JobOutcomeEvent(
                     request_id=req.request_id, job=kind, outcome="not_started", cancelled=cancelled,
                 ), error)
+                if not began:  # refused before its run (it has no job, or the session is in a transaction)
+                    self._never_ran(cmd, error)
             else:
                 self._log_unclassified(req.request_id, exc)
                 report = self._broke(job, ctx, exc)
                 if cancelled and not report.outcome.cancelled:
                     report = replace(report, outcome=report.outcome.model_copy(update={"cancelled": True}))
-                if (said := self._release_broken_job(req.request_id)) is not None:
+                # A helper's transaction is its session's (a query tab's): never rolled back for it
+                if not job.helper and (said := self._release_broken_job(req.request_id)) is not None:
                     report = report.warned(said)
         finally:
             self._set_running(None)
         self._end_job(req, ctx, report)
+
+    def _never_ran(self, cmd: JobCommand, error: StatementError) -> None:
+        """A job its maker built that ends before its run began: its maker may be waiting on it (a copy's sink on its
+        pipe, 06c pre-flight M1), so it hears why."""
+        if isinstance(cmd, PreparedJob):
+            self._notify("prepared job", cmd.job.not_run, error)
+
+    def _resume(self, request_id: str) -> bool:
+        """The job's statements can be cancelled again (a copy's next table, 06c): it is the running request once more,
+        and a Cancel held since `stop_cancels()` is honoured at its next check. Whether one was held — or the session
+        began closing meanwhile: its close interrupts only a running request, so the next table must not start
+        either."""
+        with self._state_lock:
+            stop, self._held_cancel = self._held_cancel or self._closed, False
+            self._running_request = request_id
+            self._cancel_requested = stop
+            self._cancels = 0
+            self._tracker.activity(busy=True)
+        return stop
 
     def _log_unclassified(self, request_id: str, exc: Exception) -> None:
         """An exception a job's run() let through once something was sent. A StatementError's text may echo literals:

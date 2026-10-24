@@ -8,10 +8,11 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Protocol
+from uuid import UUID
 
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from ...adapters.base import (
     AdapterCapabilities, DatabaseConnection, RunOptions, StatementCancelled, StatementError, StatementResult,
@@ -31,6 +32,14 @@ NO_DESCRIBE = RunOptions(describe=False)  # a job shows no result set: SQL Serve
 # rolls it back when the job's session closes (its dialog closes it, or the reaper once it is idle)
 JOB_ROLLBACK_FAILED = "The transaction could not be rolled back: it ends when the job's session closes"
 _DRAIN_CHUNK = 1000  # rows read and dropped at a time
+FETCH_ROWS = 1000  # rows a job reads at a time at most (the export's chunk)
+FIRST_FETCH = 1  # a table's first read, before the size of its rows is known (06a Task 9 fix M1)
+
+
+def fetch_size(largest: int, budget: int) -> int:
+    """How many rows the next read of a table takes: as many as fit `budget` characters at the size of the largest row
+    seen so far, at most FETCH_ROWS (06a pre-flight M12: memory follows the rows' size, never their number)."""
+    return max(1, min(FETCH_ROWS, budget // max(largest, 1)))
 
 
 def _no_job(command: JobCommand) -> "Job":
@@ -53,6 +62,28 @@ def _ignore(*_: object) -> None:
     return None
 
 
+class SourceWorker(Protocol):
+    """Another session's worker, as a copy reaches its source's (a SessionWorker): a job submitted, a request
+    cancelled."""
+
+    def submit(self, command: BaseModel) -> None: ...
+
+    def cancel(self, request_id: str) -> None: ...
+
+
+@dataclass(frozen=True)
+class SourceLease:
+    """A copy's source session (06c): its worker, and what ends the lease — closing a session the copy opened for
+    itself; nothing for a query tab's."""
+
+    worker: SourceWorker
+    release: Callable[[], None]
+
+
+def _no_source(profile_id: UUID, database: str | None, session_id: str | None) -> SourceLease:
+    raise StatementError("This session cannot reach another connection", code="not_supported")
+
+
 @dataclass(frozen=True)
 class JobHooks:
     """How a job reaches the rest of the app (a session's WorkerHooks.jobs). The defaults run nothing and record
@@ -63,8 +94,11 @@ class JobHooks:
     read_only: Callable[[], bool] = _writable  # the profile is read-only now
     begin_record: Callable[[str, datetime], int | None] = _no_record  # History (D-06-9): the record's id
     finish_record: Callable[[int, HistoryStatus, int, int, str | None], None] = _ignore  # id, status, ms, rows, error
-    announce: Callable[[str, JobKind, str], None] = _ignore  # the job list (D-06-10): request id, kind, title
+    # The job list (D-06-10): request id, kind, title and a copy's source profile (None for the other jobs)
+    announce: Callable[[str, JobKind, str, UUID | None], None] = _ignore
     report: Callable[[BaseModel], None] = _ignore  # the job list: each job_progress and the job_outcome
+    # A copy's source session (06c): (source profile, its database, the query tab's session or None) → its lease
+    source: Callable[[UUID, str | None, str | None], SourceLease] = _no_source
 
 
 @dataclass
@@ -126,6 +160,7 @@ class JobContext:
     _publish: Callable[[BaseModel], None]  # a job event: sent, kept for a replay, and given to the job list
     _stop_cancels: Callable[[], bool]
     _sent: Callable[[], bool]
+    _resume_cancels: Callable[[], bool] = lambda: False
     _clock: Callable[[], float] = time.monotonic
     progress: JobProgress = field(default_factory=JobProgress)
     record_id: int | None = None
@@ -162,6 +197,30 @@ class JobContext:
         finally:
             self._close(result)
 
+    def setting(self, sql: str) -> None:
+        """A setting of the job's own session (a SET, a PRAGMA): run, and its answer dropped with its messages (MySQL
+        warns that a strict sql_mode without NO_ZERO_DATE is deprecated: nothing its reader can act on, 06c)."""
+        result = self.run(sql)
+        try:
+            result.take_messages()
+            while result.next_result():
+                result.take_messages()
+        finally:
+            self._close(result)
+
+    def matched(self, sql: str) -> int | None:
+        """One DML statement: the rows it matched, read first, then the rest of its answer to the end (so SQL Server
+        never stops it with an attention, ⑤ E9), its messages forwarded. None: not known (a trigger returned rows)."""
+        result = self.run(sql)
+        try:
+            rows = result.matched_rows()
+            self._forward(result)
+            while result.next_result():
+                self._forward(result)
+            return rows
+        finally:
+            self._close(result)
+
     def close(self, result: StatementResult) -> None:
         self._close(result)
 
@@ -172,6 +231,11 @@ class JobContext:
     def stop_cancels(self) -> bool:
         """From now on a Cancel never reaches the driver (before a COMMIT, ⑤ R-05-6). Whether one had been asked."""
         return self._stop_cancels()
+
+    def resume_cancels(self) -> bool:
+        """A Cancel reaches the job's statements again (a copy's next table, after the COMMIT of the one before:
+        06c). Whether one came while it could not: the next check (`raise_if_cancelled`, `run`) then stops it."""
+        return self._resume_cancels()
 
     def tick(self, *, force: bool = False) -> None:
         """Send `progress` when PROGRESS_INTERVAL_S has passed since the last one, or now with `force` (an object
@@ -212,9 +276,18 @@ class JobContext:
 
 
 class Job(ABC):
-    """One job of one command. `run` classifies every way it ends (R-06-12) and never resends anything."""
+    """One job of one command. `run` classifies every way it ends (R-06-12) and never resends anything.
+
+    `helper`: the part of another job that runs on another session (a copy's source, 06c): never listed on its own, and
+    it runs inside whatever transaction that session has (a query tab's, as an export does)."""
 
     kind: ClassVar[JobKind]
+    helper: ClassVar[bool] = False
+
+    @property
+    def source_profile_id(self) -> UUID | None:
+        """A copy's source connection, for the job list (06c B13); None for the other jobs."""
+        return None
 
     @property
     @abstractmethod
@@ -223,6 +296,11 @@ class Job(ABC):
 
     @abstractmethod
     def run(self, ctx: JobContext) -> JobReport: ...
+
+    def not_run(self, error: StatementError) -> None:
+        """It ended before `run` began (cancelled while queued, or its session closed first). Nothing to undo; a
+        helper's maker may be waiting on it (a copy's source: its pipe, 06c pre-flight M1)."""
+        return None
 
     def broke(self, ctx: JobContext, exc: Exception) -> JobReport:
         """An exception `run` did not classify (a bug, or an error it let through): nothing is known to have been
@@ -246,3 +324,12 @@ def history_status(outcome: JobOutcomeEvent, error: StatementError | None) -> tu
         "unknown": f"Outcome unknown{where}", "failed": "Failed", "not_started": "Not started",
     }[outcome.outcome]
     return "error", f"{prefix}: {text}" if text else prefix
+
+
+class PreparedJob(JobCommand):
+    """A job its maker built, run like any job on the worker it is submitted to: a copy's source, made with the pipe to
+    its sink (06c). Never a client's command (not in ClientCommand): it comes from another job only."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    job_kind = "copy_data"
+    job: Any = Field(exclude=True)

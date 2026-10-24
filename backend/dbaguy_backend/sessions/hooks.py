@@ -17,7 +17,7 @@ from ..services.history_service import HistoryService
 from ..services.profile_service import ProfileService
 from ..services.safety import GuardDecision, SafetyPolicy
 from ..services.schema_cache import SchemaCache
-from .jobs.context import Job, JobHooks
+from .jobs.context import Job, JobHooks, PreparedJob
 from .jobs.dump import DumpJob
 from .jobs.run_file import RunFileJob
 from .worker import ExecutionRecord, WorkerHooks
@@ -124,6 +124,8 @@ class SessionHooksFactory:
         command the engine has no tool for is refused with §4's sentence (pre-flight L4)."""
         capabilities = self._registry.get(profile.engine).capabilities
         match command:
+            case PreparedJob():  # made by another job (a copy's source, 06c)
+                return command.job
             case RunFileCommand() if capabilities.run_file:
                 return RunFileJob(command, profile.name)
             case RunFileCommand():

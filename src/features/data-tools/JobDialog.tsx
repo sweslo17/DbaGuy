@@ -20,6 +20,7 @@ import { againEntry } from "./runForm";
 const KEEPS_RUNNING = {
   dump: "The dump keeps running: open it again from Jobs, at the bottom of the sidebar",
   run_file: "The SQL file keeps running: open it again from Jobs, at the bottom of the sidebar",
+  copy_data: "The copy keeps running: open it again from Jobs, at the bottom of the sidebar",
 } as const;
 /** The jobs whose dialog was closed while they ran and that were told so (once each). */
 const toldKeepsRunning = new Set<string>();

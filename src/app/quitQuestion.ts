@@ -5,10 +5,12 @@
  * `QuitGuard.tsx` the two names are one file on the Mac's case-insensitive disk (06b pre-flight H2).
  */
 
+import type { JobInfo } from "@/lib/api/types";
+
 export type QuitHow = "quit" | "close";
 
 export interface RunningJob {
-  job: "dump" | "run_file";
+  job: JobInfo["job"];
   title: string;
 }
 

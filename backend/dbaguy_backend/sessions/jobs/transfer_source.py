@@ -1,0 +1,147 @@
+"""A copy's source (spec ⑥ R-06-8, §3.5.5): one table's rows read on the source's own worker — the session the copy
+opened for itself, or the query tab's (the same transaction and temporary tables as the tab, as an export) — and put
+into the pipe to its sink, a chunk at a time. A helper job (`Job.helper`): never listed on its own; its events reach the
+source session's client, which knows no such request (a query tab ignores them). Its outcome is not the copy's: the sink
+reads the pipe, where every way it ends is put (`finish`, `fail`; `not_run` when it never began, 06c pre-flight M1).
+
+Its read is DbaGuy's SELECT of the table (with the table-data tab's filter, one condition that only reads), or the
+tab's statement as it is, which must only read too (the classifier's plain read, as a dump's filter: Task 9 fix M2),
+give the columns the preview mapped (`columns_changed`) and only one result (a T-SQL batch of several would copy its
+first, maybe not the one shown: pre-flight M4). Around it the session's output settings are set to what every engine
+reads and set back after (`transfer_sql.SOURCE_SETTINGS`): PostgreSQL's ISO dates, MySQL's UTC TIMESTAMPs and a
+net_write_timeout a slow target cannot outwait (A11). Reads are sized by the rows' text (PIPE_CHUNK_CHARS a chunk, at
+most FETCH_ROWS rows), so memory follows the rows' size, never their number (Q1). When the sink stops first it closes
+the pipe and never cancels a query tab's read (pre-flight H2: on PostgreSQL that aborts the tab's transaction): the
+next `put` ends the read, and closing a result early is safe on every engine."""
+
+from typing import Any
+
+from loguru import logger
+
+from ...adapters.base import StatementCancelled, StatementError
+from ...domain.execution import ColumnMeta
+from ...services.safety import GuardAction, is_plain_read
+from ...services.transfer_plans import PlannedTable
+from ...sql.transfer_sql import SOURCE_SETTINGS, read_settings, set_setting
+from .context import FIRST_FETCH, Job, JobContext, JobReport, fetch_size
+from .pipe import RowPipe
+
+PIPE_CHUNK_CHARS = 4 * 1_048_576  # R-06-13: a chunk's values hold about this much text at most
+COLUMNS_CHANGED = "columns_changed"
+COLUMNS_CHANGED_MESSAGE = "The query's columns changed since the preview: preview the copy again"
+NOT_A_READ = "query_not_select"
+NOT_A_READ_MESSAGE = "Only a statement that returns rows, and only reads, can be copied"
+MANY_RESULTS = "The statement returns more than one result: copy one statement's result at a time"
+_OTHER_CHARS = 8  # what a value that is not text or bytes counts for in a chunk's size
+
+
+def row_chars(row: list[Any]) -> int:
+    return sum(len(value) if isinstance(value, str | bytes | bytearray) else _OTHER_CHARS for value in row)
+
+
+class TransferSource(Job):
+    kind = "copy_data"
+    helper = True
+
+    def __init__(self, pipe: RowPipe, table: PlannedTable, *, query: bool, label: str) -> None:
+        self._pipe = pipe
+        self._table = table
+        self._query = query  # the tab's statement: it is checked to only read, and its columns are compared
+        self._label = label  # the copy's name in the source session's log
+
+    @property
+    def title(self) -> str:
+        return f"Read {self._table.source_name} for {self._label}"
+
+    def run(self, ctx: JobContext) -> JobReport:
+        saved: list[tuple[str, str]] = []
+        rows = 0
+        try:
+            saved = self._read(ctx)
+            for name, value in SOURCE_SETTINGS.get(ctx.dialect, ()):
+                ctx.setting(set_setting(ctx.dialect, name, value))
+            result = ctx.run(self._checked(ctx))
+            try:
+                self._compare(result.columns())
+                size, largest = FIRST_FETCH, 0
+                while chunk := result.fetch(size):  # until `[]`: an error may follow a short chunk (06a fix H1)
+                    largest = max(largest, max(row_chars(row) for row in chunk))
+                    rows += len(chunk)
+                    self._pipe.put(chunk, ctx.raise_if_cancelled)
+                    size = fetch_size(largest, PIPE_CHUNK_CHARS)
+                if self._query and result.next_result():  # a T-SQL batch: its first result was read, maybe not the
+                    raise StatementError(MANY_RESULTS, code=NOT_A_READ)  # one shown (the table rolls back, M4)
+            finally:
+                ctx.close(result)
+            self._pipe.finish()
+            return JobReport(ctx.outcome("completed", rows=rows))
+        except StatementError as exc:
+            self._pipe.fail(exc)
+            return JobReport(ctx.outcome("failed" if ctx.sent else "not_started", rows=rows,
+                                         cancelled=isinstance(exc, StatementCancelled)), exc)
+        except Exception as exc:  # a bug: the sink must not wait for rows that never come
+            logger.exception("Reading {} for a copy failed", self._table.source_name)
+            error = StatementError(f"Internal error: {exc}")
+            self._pipe.fail(error)
+            return JobReport(ctx.outcome("failed" if ctx.sent else "not_started", rows=rows), error)
+        finally:
+            self._restore(ctx, saved)
+
+    def not_run(self, error: StatementError) -> None:
+        """Never started (cancelled while queued, or its session closed first): the sink must not wait for rows."""
+        self._pipe.fail(error)
+
+    def broke(self, ctx: JobContext, exc: Exception) -> JobReport:
+        """Never reached (`run` classifies every error), but the sink must hear of it whatever happened."""
+        error = exc if isinstance(exc, StatementError) else StatementError(f"Internal error: {exc}")
+        self._pipe.fail(error)
+        return super().broke(ctx, exc)
+
+    def _checked(self, ctx: JobContext) -> str:
+        """The SELECT, when it may run: a statement the user wrote, or a filter of theirs in DbaGuy's, must only read
+        (on any profile), and every statement passes the session's gate."""
+        sql = self._table.select
+        if (self._query or self._table.filtered) and not is_plain_read(sql, ctx.dialect):
+            raise StatementError(NOT_A_READ_MESSAGE, code=NOT_A_READ)
+        if ctx.hooks.gate(sql).action != GuardAction.RUN:
+            raise StatementError("This connection is read-only, and the statement is not a plain read",
+                                 code="read_only")
+        return sql
+
+    def _compare(self, columns: list[ColumnMeta] | None) -> None:
+        """A query runs again: its columns must be the ones the preview mapped (spec §3.5.5 step 2)."""
+        expected = [column.name for column in self._table.columns]
+        found = [column.name for column in columns or []]
+        if columns is None or (self._query and found != expected):
+            raise StatementError(COLUMNS_CHANGED_MESSAGE, code=COLUMNS_CHANGED)
+
+    @staticmethod
+    def _read(ctx: JobContext) -> list[tuple[str, str]]:
+        """The session's own values of the settings the copy sets (`transfer_sql.SOURCE_SETTINGS`): set back after."""
+        read = read_settings(ctx.dialect)
+        if read is None:
+            return []
+        result = ctx.run(read)
+        try:
+            [values] = result.fetch(1)
+            while result.fetch(1):
+                pass
+        finally:
+            ctx.close(result)
+        names = [name for name, _ in SOURCE_SETTINGS[ctx.dialect]]
+        return [(name, str(value)) for name, value in zip(names, values, strict=True)]
+
+    @staticmethod
+    def _restore(ctx: JobContext, saved: list[tuple[str, str]]) -> None:
+        """Set back what the copy changed (a query tab's session is the user's); no Cancel may stop it. A failure is
+        logged with its code only (a server's text may echo what it read, D-06-12) and stops the rest."""
+        if not saved:
+            return
+        ctx.stop_cancels()
+        for name, value in saved:
+            try:
+                ctx.setting(set_setting(ctx.dialect, name, value))
+            except Exception as exc:  # never let it escape: the read's own end is already in the pipe
+                logger.warning("[copy] setting {} back on the source failed ({})", name,
+                               getattr(exc, "code", None) or type(exc).__name__)
+                return

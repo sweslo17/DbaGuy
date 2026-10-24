@@ -21,9 +21,10 @@ class JobRegistry:
         self._jobs: dict[tuple[str, str], JobInfo] = {}  # in the order they started
         self._lock = threading.Lock()
 
-    def begin(self, session_id: str, profile_id: UUID, request_id: str, kind: JobKind, title: str) -> None:
+    def begin(self, session_id: str, profile_id: UUID, request_id: str, kind: JobKind, title: str,
+              source_profile_id: UUID | None = None) -> None:
         info = JobInfo(session_id=session_id, request_id=request_id, job=kind, title=title, profile_id=profile_id,
-                       started_at=self._clock())
+                       source_profile_id=source_profile_id, started_at=self._clock())
         with self._lock:
             self._jobs[(session_id, request_id)] = info
             self._trim()

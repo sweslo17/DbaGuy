@@ -1262,6 +1262,25 @@ export interface components {
              */
             listed: boolean;
         };
+        /**
+         * CopyDataCommand
+         * @description Copy data between connections (spec ⑥ §3.5.5): the previewed plan, run on this session (the target's), reading
+         *     each table on the source's: the query tab's session the plan's query came from, or one the copy opens and closes
+         *     itself (None). Each table is copied in a transaction of its own; nothing is ever sent again.
+         */
+        CopyDataCommand: {
+            /** Request Id */
+            request_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "copy_data";
+            /** Plan Id */
+            plan_id: string;
+            /** Source Session Id */
+            source_session_id?: string | null;
+        };
         /** CouchbaseSettings */
         CouchbaseSettings: {
             /**
@@ -1926,7 +1945,7 @@ export interface components {
          */
         ExecutionSchema: {
             /** Command */
-            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["ExportCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"] | components["schemas"]["CommitCommand"] | components["schemas"]["RollbackCommand"] | components["schemas"]["SetAutocommitCommand"] | components["schemas"]["ApplyEditsCommand"] | components["schemas"]["RunFileCommand"] | components["schemas"]["DumpCommand"];
+            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["ExportCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"] | components["schemas"]["CommitCommand"] | components["schemas"]["RollbackCommand"] | components["schemas"]["SetAutocommitCommand"] | components["schemas"]["ApplyEditsCommand"] | components["schemas"]["RunFileCommand"] | components["schemas"]["DumpCommand"] | components["schemas"]["CopyDataCommand"];
             /** Event */
             event: components["schemas"]["StartedEvent"] | components["schemas"]["ResultSetEvent"] | components["schemas"]["RowsEvent"] | components["schemas"]["ResultSetEndEvent"] | components["schemas"]["AffectedEvent"] | components["schemas"]["MessageEvent"] | components["schemas"]["ErrorEvent"] | components["schemas"]["ProgressEvent"] | components["schemas"]["ConfirmationRequiredEvent"] | components["schemas"]["SessionStateEvent"] | components["schemas"]["FinishedEvent"] | components["schemas"]["EditOutcomeEvent"] | components["schemas"]["JobProgressEvent"] | components["schemas"]["JobOutcomeEvent"];
         };
@@ -2293,7 +2312,7 @@ export interface components {
              * Job
              * @enum {string}
              */
-            job: "dump" | "run_file";
+            job: "dump" | "run_file" | "copy_data";
             /** Title */
             title: string;
             /**
@@ -2301,6 +2320,8 @@ export interface components {
              * Format: uuid
              */
             profile_id: string;
+            /** Source Profile Id */
+            source_profile_id?: string | null;
             /**
              * Started At
              * Format: date-time
@@ -2311,7 +2332,7 @@ export interface components {
         };
         /**
          * JobObject
-         * @description One object of a dump, with the rows written for it.
+         * @description One object of a dump, with the rows written for it; one table of a copy, with its outcome.
          */
         JobObject: {
             /** Kind */
@@ -2323,6 +2344,10 @@ export interface components {
              * @default 0
              */
             rows: number;
+            /** Outcome */
+            outcome?: ("copied" | "rolled_back" | "not_started" | "unknown") | null;
+            /** Source */
+            source?: string | null;
         };
         /**
          * JobOutcomeEvent
@@ -2340,7 +2365,7 @@ export interface components {
              * Job
              * @enum {string}
              */
-            job: "dump" | "run_file";
+            job: "dump" | "run_file" | "copy_data";
             /**
              * Outcome
              * @enum {string}
