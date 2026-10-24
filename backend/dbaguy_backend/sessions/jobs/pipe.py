@@ -43,6 +43,12 @@ class RowPipe:
         self._error: StatementError | None = None
         self._closed = False
 
+    @property
+    def closed(self) -> bool:
+        """The sink stopped: a source that has not begun reads nothing (06c Task 3 review M-1)."""
+        with self._lock:
+            return self._closed
+
     # ---- the source's side ----
 
     def put(self, rows: Rows, check: Callable[[], None]) -> None:

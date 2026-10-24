@@ -85,7 +85,9 @@ from .edit_apply import (
     history_error,
     refused,
 )
-from .jobs.context import JOB_ROLLBACK_FAILED, Job, JobContext, JobHooks, JobReport, PreparedJob, history_status
+from .jobs.context import (
+    JOB_ROLLBACK_FAILED, Job, JobContext, JobHooks, JobReport, PreparedJob, history_status, read_matched,
+)
 from .options import run_options
 from .read_ahead import READ_AHEAD_POLL_S, STALL_RESET_FACTOR, StallClock
 from .session_state import SessionStateTracker
@@ -417,14 +419,26 @@ class SessionWorker:
                 self._queued[request_id] = True
                 return
             if self._job_active and self._job_request == request_id:  # its COMMIT, say: the job reads it later
-                logger.info("Cancel of job {} on {} kept until its statements can be cancelled again", request_id,
-                            self.name)
+                logger.info("Cancel of job {} on {} came while its statements could not be cancelled: kept for its "
+                            "next step, if any", request_id, self.name)
                 self._held_cancel = True
                 return
         try:
             self._put(lambda: self._discard(request_id, cancelled=True))  # a paused result, if it is the open one
         except SessionBusy:
             pass  # closing: the worker finishes the open result itself
+
+    def withdraw(self, request_id: str) -> bool:
+        """Skip a request that still waits in the queue, as `cancel()` does (it ends not_started and never reaches the
+        driver); False once it has started, when nothing is done. A copy whose sink stopped withdraws its query tab's
+        read that has not begun, where a cancel of a running one could abort the tab's transaction (pre-flight H2, 06c
+        Task 3 review M-1)."""
+        with self._state_lock:
+            if request_id not in self._queued:
+                return False
+            logger.info("Request {} on {} withdrawn before it started", request_id, self.name)
+            self._queued[request_id] = True
+            return True
 
     def check_idle_transaction(self, warn_after_s: float, rollback_after_s: float) -> None:
         """Warn once per idle stretch of an open transaction, and roll it back once idle too long (0 disables)."""
@@ -1192,11 +1206,7 @@ class SessionWorker:
         to the request."""
         result = self._run_statement(req, "edit", sql, _EDIT_OPTIONS)
         try:
-            rows = result.matched_rows()
-            self._forward_messages(req.request_id, result)
-            while result.next_result():
-                self._forward_messages(req.request_id, result)
-            return rows
+            return read_matched(result, partial(self._forward_messages, req.request_id))
         finally:
             self._close_result(result)
 
@@ -1280,7 +1290,6 @@ class SessionWorker:
             return
         job: Job | None = None
         ctx: JobContext | None = None
-        began = False  # job.run was called
         try:
             job = self._hooks.jobs.build(cmd)
             ctx = JobContext(
@@ -1296,7 +1305,6 @@ class SessionWorker:
                              job.source_profile_id)
                 if self.connection.in_transaction():  # a job runs on a session of its own: never inside a user's
                     raise transaction_open_error()
-            began = True
             report = job.run(ctx)
         except Exception as exc:
             cancelled = isinstance(exc, StatementCancelled)  # a flag on whatever the outcome is (spec ⑥ §3.2)
@@ -1307,8 +1315,9 @@ class SessionWorker:
                 report = JobReport(JobOutcomeEvent(
                     request_id=req.request_id, job=kind, outcome="not_started", cancelled=cancelled,
                 ), error)
-                if not began:  # refused before its run (it has no job, or the session is in a transaction)
-                    self._never_ran(cmd, error)
+                # Refused before its run (no job, or the session is in a transaction), or its run raised before its
+                # first statement: either way nothing was sent, and its maker hears it (06c Task 3 review M-5)
+                self._never_ran(cmd, error)
             else:
                 self._log_unclassified(req.request_id, exc)
                 report = self._broke(job, ctx, exc)
@@ -1322,8 +1331,8 @@ class SessionWorker:
         self._end_job(req, ctx, report)
 
     def _never_ran(self, cmd: JobCommand, error: StatementError) -> None:
-        """A job its maker built that ends before its run began: its maker may be waiting on it (a copy's sink on its
-        pipe, 06c pre-flight M1), so it hears why."""
+        """A job its maker built that ends without sending anything: its maker may be waiting on it (a copy's sink on
+        its pipe, 06c pre-flight M1), so it hears why."""
         if isinstance(cmd, PreparedJob):
             self._notify("prepared job", cmd.job.not_run, error)
 
@@ -1334,9 +1343,12 @@ class SessionWorker:
         either."""
         with self._state_lock:
             stop, self._held_cancel = self._held_cancel or self._closed, False
+            # A job that never stopped its cancels is still the running request: a Cancel that reached it and found no
+            # driver call to stop is kept, and so is the count that makes a second Cancel force (06c Task 3 review M-2)
+            if self._running_request != request_id:
+                self._cancels = 0
             self._running_request = request_id
-            self._cancel_requested = stop
-            self._cancels = 0
+            self._cancel_requested = self._cancel_requested or stop
             self._tracker.activity(busy=True)
         return stop
 

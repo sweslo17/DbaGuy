@@ -36,6 +36,17 @@ FETCH_ROWS = 1000  # rows a job reads at a time at most (the export's chunk)
 FIRST_FETCH = 1  # a table's first read, before the size of its rows is known (06a Task 9 fix M1)
 
 
+def read_matched(result: StatementResult, forward: Callable[[StatementResult], None]) -> int | None:
+    """One DML statement's answer: the rows it matched, read first, then the rest of it to the end (so SQL Server never
+    stops it with an attention, ⑤ E9), each set's messages handed to `forward`. None: not known (a trigger returned
+    rows). The caller closes `result`. A grid apply's statements and a job's (JobContext.matched) both read it so."""
+    rows = result.matched_rows()
+    forward(result)
+    while result.next_result():
+        forward(result)
+    return rows
+
+
 def fetch_size(largest: int, budget: int) -> int:
     """How many rows the next read of a table takes: as many as fit `budget` characters at the size of the largest row
     seen so far, at most FETCH_ROWS (06a pre-flight M12: memory follows the rows' size, never their number)."""
@@ -64,11 +75,14 @@ def _ignore(*_: object) -> None:
 
 class SourceWorker(Protocol):
     """Another session's worker, as a copy reaches its source's (a SessionWorker): a job submitted, a request
-    cancelled."""
+    cancelled, or withdrawn while it still waits in the queue (a query tab's read, which is never cancelled once it
+    runs: pre-flight H2, Task 3 review M-1)."""
 
     def submit(self, command: BaseModel) -> None: ...
 
     def cancel(self, request_id: str) -> None: ...
+
+    def withdraw(self, request_id: str) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -213,11 +227,7 @@ class JobContext:
         never stops it with an attention, ⑤ E9), its messages forwarded. None: not known (a trigger returned rows)."""
         result = self.run(sql)
         try:
-            rows = result.matched_rows()
-            self._forward(result)
-            while result.next_result():
-                self._forward(result)
-            return rows
+            return read_matched(result, self._forward)
         finally:
             self._close(result)
 
@@ -298,8 +308,9 @@ class Job(ABC):
     def run(self, ctx: JobContext) -> JobReport: ...
 
     def not_run(self, error: StatementError) -> None:
-        """It ended before `run` began (cancelled while queued, or its session closed first). Nothing to undo; a
-        helper's maker may be waiting on it (a copy's source: its pipe, 06c pre-flight M1)."""
+        """It ended before it sent anything: cancelled or withdrawn while queued, its session closed first, refused
+        before its `run`, or its `run` raised before its first statement (06c Task 3 review M-5). Nothing to undo; a
+        helper's maker may be waiting on it (a copy's source: its pipe, 06c pre-flight M1). Called at most once."""
         return None
 
     def broke(self, ctx: JobContext, exc: Exception) -> JobReport:

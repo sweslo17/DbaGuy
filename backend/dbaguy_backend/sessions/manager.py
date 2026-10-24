@@ -72,7 +72,8 @@ class SessionManager:
             if self._hooks is not None:
                 hooks = self._hooks.build(profile.id, server.current_database)
                 jobs = replace(hooks.jobs, announce=partial(self.jobs.begin, session_id, profile.id),
-                               report=partial(self.jobs.report, session_id), source=self._source)
+                               report=partial(self.jobs.report, session_id),
+                               source=partial(self._source, from_session=session_id))
                 worker.configure(replace(hooks, jobs=jobs))  # before it is registered
         except BaseException:
             worker.close()  # whatever failed, never leave the thread, connection or tunnel behind
@@ -83,17 +84,22 @@ class SessionManager:
         logger.info("Opened session {} for '{}'", session_id, profile.name)
         return info
 
-    def _source(self, profile_id: UUID, database: str | None, session_id: str | None) -> SourceLease:
-        """A copy's source session (06c): the query tab's session the copy names, which must be one of the plan's source
-        profile (`plan_mismatch`, the copy's §4 text: pre-flight L-a), and stays the tab's; or a session of the copy's
-        own, closed when the copy releases it. Opening one may fail as a session does (a password, a server down): the
-        copy then never started. Its own session counts as attached while leased: between two tables (a long DELETE, a
-        COMMIT) it is idle, and the reaper must not close it under the copy."""
+    def _source(self, profile_id: UUID, database: str | None, session_id: str | None, *,
+                from_session: str) -> SourceLease:
+        """A copy's source session (06c), for the copy running on `from_session`: the query tab's session the copy
+        names, which must be one of the plan's source profile and never the copy's own (its read would wait behind the
+        copy on the same thread, Task 3 review M-7) (`plan_mismatch`, the copy's §4 text: pre-flight L-a), and stays the
+        tab's; or a session of the copy's own, closed when the copy releases it. Opening one may fail as a session does
+        (a password, a server down): the copy then never started. Either counts as attached while leased (a query tab's
+        too, whose socket may be gone, M-6): between two tables (a long DELETE, a COMMIT) it is idle, and the reaper
+        must not close it under the copy."""
         if session_id is not None:
             entry = self._entry(session_id)
-            if entry.info.profile_id != profile_id:
+            if entry.info.profile_id != profile_id or session_id == from_session:
                 raise PlanUnavailable(PLAN_MISMATCH, COPY_PLAN_EXPIRED)
-            return SourceLease(entry.worker, lambda: None)
+            with self._lock:
+                entry.attached += 1
+            return SourceLease(entry.worker, partial(self._unlease, session_id))
         info = self.create(SessionCreateRequest(profile_id=profile_id, database=database))
         with self._lock:
             if (own := self._sessions.get(info.session_id)) is not None:
@@ -103,6 +109,21 @@ class SessionManager:
     def _release(self, session_id: str) -> None:
         """A copy's own source session ends with it (never reused, as a job's own session)."""
         self._pop_and_close(session_id)
+
+    def _unlease(self, session_id: str) -> None:
+        """A query tab's session the copy read from is the tab's again: one attach fewer, as a socket that detaches."""
+        self._detached(session_id)
+
+    def _detached(self, session_id: str) -> _Entry | None:
+        """One attach fewer (a socket, or a copy's lease); idle time counts from the last one. None: it is gone."""
+        with self._lock:
+            entry = self._sessions.get(session_id)
+            if entry is None:
+                return None
+            entry.attached = max(0, entry.attached - 1)
+            if entry.attached == 0:
+                entry.detached_at = self._clock()
+        return entry
 
     def _entry(self, session_id: str) -> _Entry:
         with self._lock:
@@ -127,14 +148,8 @@ class SessionManager:
         return entry.worker
 
     def detach(self, session_id: str, emit: Emitter) -> None:
-        with self._lock:
-            entry = self._sessions.get(session_id)
-            if entry is None:
-                return
-            entry.attached = max(0, entry.attached - 1)
-            if entry.attached == 0:
-                entry.detached_at = self._clock()
-        entry.worker.clear_emitter(emit)
+        if (entry := self._detached(session_id)) is not None:
+            entry.worker.clear_emitter(emit)
 
     def close(self, session_id: str) -> None:
         if not self._pop_and_close(session_id):
@@ -204,7 +219,8 @@ class SessionManager:
                 return False
         with self._lock:
             entry = self._sessions.get(session_id)
-            # A request needs an attached client to be submitted, so one submitted since `busy()` shows here
+            # A request is submitted by an attached client or by a copy holding a lease on the session, which counts as
+            # attached too (06c): one submitted since `busy()` shows here
             if entry is None or (idle_only and not self._is_quiet(entry)):
                 return False
             del self._sessions[session_id]

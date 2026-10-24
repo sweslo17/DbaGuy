@@ -11,7 +11,7 @@ from typing import Any
 from ..adapters.columns import TableColumn
 from ..domain.column_category import ColumnCategory
 from ..domain.edits import kind_category
-from .dialects import Dialect, overriding_identity, quote_ident
+from .dialects import Dialect, insert_head, overriding_identity, quote_ident
 from .lexer import TokenKind, scan
 from .literals import Cell, CellLiterals, LiteralStyle, normalise_raw
 from .statement_stream import MAX_STATEMENT_CHARS
@@ -40,18 +40,21 @@ def _cell(value: Any) -> Cell:
 
 class InsertBatcher:
     """`add()` a row at a time, then `flush()`; each returns a finished statement (no terminator: the file adds it,
-    `dump_script.insert_text`) or None. `row_chars`: the characters of every row's text so far (a dump sizes its next
-    fetch by it, pre-flight M12)."""
+    `dump_script.insert_text`) or None, and `flushed_rows` is how many rows that statement holds. `row_chars`: the
+    characters of every row's text so far (a dump sizes its next fetch by it, pre-flight M12). `abort_on_conflict`: a
+    copy into an existing table (06c) writes SQLite's `INSERT OR ABORT`, so a constraint's own ON CONFLICT REPLACE or
+    IGNORE never deletes or skips a row while the INSERT reports them all (⑤ final review I1)."""
 
     def __init__(
         self, dialect: Dialect, table_sql: str, columns: Sequence[TableColumn], *, backslash_escapes: bool | None = None,
-        max_rows: int | None = None, max_chars: int = MAX_INSERT_CHARS,
+        max_rows: int | None = None, max_chars: int = MAX_INSERT_CHARS, abort_on_conflict: bool = False,
     ) -> None:
         self._dialect = dialect
         self._names = [column.name for column in columns]
         names = ", ".join(quote_ident(dialect, column.name) for column in columns)
         overriding = overriding_identity(dialect) if any(c.identity == "always" for c in columns) else None
-        self._head = f"INSERT INTO {table_sql} ({names}){f' {overriding}' if overriding else ''} VALUES\n"
+        verb = insert_head(dialect, table_sql) if abort_on_conflict else f"INSERT INTO {table_sql}"
+        self._head = f"{verb} ({names}){f' {overriding}' if overriding else ''} VALUES\n"
         writers = {unicode: CellLiterals(dialect, LiteralStyle(national=unicode, backslash_escapes=backslash_escapes))
                    for unicode in (True, False)}
         self._cells: list[tuple[CellLiterals, ColumnCategory]] = [
@@ -61,6 +64,7 @@ class InsertBatcher:
         self._rows: list[str] = []
         self._chars = 0
         self.row_chars = 0
+        self.flushed_rows = 0
 
     def row_text(self, row: Sequence[Any]) -> str:
         return "(" + ", ".join(write(_cell(value), category)
@@ -80,6 +84,7 @@ class InsertBatcher:
         if not self._rows:
             return None
         statement = self._head + ",\n".join(self._rows)
+        self.flushed_rows = len(self._rows)
         self._rows, self._chars = [], 0
         return statement
 

@@ -91,6 +91,7 @@ class AppContainer:
         self.policy = SafetyPolicy()
         hooks = SessionHooksFactory(
             self.registry, self.profiles, self.policy, self.history, self.schema_cache, self.edits.plans,
+            self.transfers.plans,
         )
         self.sessions = SessionManager(self.connections, self.profiles, hooks, jobs=self.jobs)
         self._stop = threading.Event()

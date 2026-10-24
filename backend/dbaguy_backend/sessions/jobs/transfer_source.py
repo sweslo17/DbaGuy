@@ -7,13 +7,16 @@ reads the pipe, where every way it ends is put (`finish`, `fail`; `not_run` when
 Its read is DbaGuy's SELECT of the table (with the table-data tab's filter, one condition that only reads), or the
 tab's statement as it is, which must only read too (the classifier's plain read, as a dump's filter: Task 9 fix M2),
 give the columns the preview mapped (`columns_changed`) and only one result (a T-SQL batch of several would copy its
-first, maybe not the one shown: pre-flight M4). Around it the session's output settings are set to what every engine
-reads and set back after (`transfer_sql.SOURCE_SETTINGS`): PostgreSQL's ISO dates, MySQL's UTC TIMESTAMPs and a
-net_write_timeout a slow target cannot outwait (A11). Reads are sized by the rows' text (PIPE_CHUNK_CHARS a chunk, at
+first, maybe not the one shown: pre-flight M4). It is checked before anything is sent to the session (Task 3 review
+M-3), and a source whose sink already stopped sends nothing (M-1). Around it the session's output settings are set to
+what every engine reads and set back after (`transfer_sql.SOURCE_SETTINGS`): PostgreSQL's ISO dates, MySQL's UTC
+TIMESTAMPs and a net_write_timeout a slow target cannot outwait (A11). `wait_ended()`: the sink closes a session it
+opened only once its last read set them back. Reads are sized by the rows' text (PIPE_CHUNK_CHARS a chunk, at
 most FETCH_ROWS rows), so memory follows the rows' size, never their number (Q1). When the sink stops first it closes
 the pipe and never cancels a query tab's read (pre-flight H2: on PostgreSQL that aborts the tab's transaction): the
 next `put` ends the read, and closing a result early is safe on every engine."""
 
+import threading
 from typing import Any
 
 from loguru import logger
@@ -22,9 +25,11 @@ from ...adapters.base import StatementCancelled, StatementError
 from ...domain.execution import ColumnMeta
 from ...services.safety import GuardAction, is_plain_read
 from ...services.transfer_plans import PlannedTable
+from ...sql.select_builder import FILTER_NOT_A_CONDITION
 from ...sql.transfer_sql import SOURCE_SETTINGS, read_settings, set_setting
 from .context import FIRST_FETCH, Job, JobContext, JobReport, fetch_size
-from .pipe import RowPipe
+from .dump import INVALID_FILTER
+from .pipe import PipeClosed, RowPipe
 
 PIPE_CHUNK_CHARS = 4 * 1_048_576  # R-06-13: a chunk's values hold about this much text at most
 COLUMNS_CHANGED = "columns_changed"
@@ -48,19 +53,33 @@ class TransferSource(Job):
         self._table = table
         self._query = query  # the tab's statement: it is checked to only read, and its columns are compared
         self._label = label  # the copy's name in the source session's log
+        self._ended = threading.Event()  # its run is over, settings set back included (or it never ran)
 
     @property
     def title(self) -> str:
         return f"Read {self._table.source_name} for {self._label}"
 
+    def wait_ended(self, timeout: float) -> bool:
+        """Wait until its run is over (its settings set back) or it is known never to run; whether it is."""
+        return self._ended.wait(timeout)
+
     def run(self, ctx: JobContext) -> JobReport:
+        try:
+            return self._run(ctx)
+        finally:
+            self._ended.set()
+
+    def _run(self, ctx: JobContext) -> JobReport:
         saved: list[tuple[str, str]] = []
         rows = 0
         try:
+            if self._pipe.closed:  # its sink stopped while it waited in the queue (Task 3 review M-1): nothing is sent
+                raise PipeClosed()
+            sql = self._checked(ctx)  # before the session's settings are touched (M-3)
             saved = self._read(ctx)
             for name, value in SOURCE_SETTINGS.get(ctx.dialect, ()):
                 ctx.setting(set_setting(ctx.dialect, name, value))
-            result = ctx.run(self._checked(ctx))
+            result = ctx.run(sql)
             try:
                 self._compare(result.columns())
                 size, largest = FIRST_FETCH, 0
@@ -88,13 +107,16 @@ class TransferSource(Job):
             self._restore(ctx, saved)
 
     def not_run(self, error: StatementError) -> None:
-        """Never started (cancelled while queued, or its session closed first): the sink must not wait for rows."""
+        """Nothing sent (cancelled or withdrawn while queued, its session closed first): the sink must not wait for
+        rows."""
         self._pipe.fail(error)
+        self._ended.set()
 
     def broke(self, ctx: JobContext, exc: Exception) -> JobReport:
         """Never reached (`run` classifies every error), but the sink must hear of it whatever happened."""
         error = exc if isinstance(exc, StatementError) else StatementError(f"Internal error: {exc}")
         self._pipe.fail(error)
+        self._ended.set()
         return super().broke(ctx, exc)
 
     def _checked(self, ctx: JobContext) -> str:
@@ -102,7 +124,10 @@ class TransferSource(Job):
         (on any profile), and every statement passes the session's gate."""
         sql = self._table.select
         if (self._query or self._table.filtered) and not is_plain_read(sql, ctx.dialect):
-            raise StatementError(NOT_A_READ_MESSAGE, code=NOT_A_READ)
+            if self._query:
+                raise StatementError(NOT_A_READ_MESSAGE, code=NOT_A_READ)
+            # The user typed a filter, not a statement: the dump's words for the same check (Task 3 review M-4)
+            raise StatementError(FILTER_NOT_A_CONDITION, code=INVALID_FILTER)
         if ctx.hooks.gate(sql).action != GuardAction.RUN:
             raise StatementError("This connection is read-only, and the statement is not a plain read",
                                  code="read_only")

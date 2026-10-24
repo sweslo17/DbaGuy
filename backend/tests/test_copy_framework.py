@@ -4,20 +4,25 @@ and a copy's source read into the pipe on the dev databases (fetch sizing, a que
 
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
+from dbaguy_backend.adapters.base import StatementError
 from dbaguy_backend.adapters.columns import TableColumn
 from dbaguy_backend.domain.edits import PLAN_MISMATCH, PlanUnavailable
 from dbaguy_backend.domain.execution import ExecuteCommand
 from dbaguy_backend.domain.transfer import COPY_PLAN_EXPIRED
 from dbaguy_backend.sessions.jobs.context import Job, JobContext, JobReport, PreparedJob
+from dbaguy_backend.sessions.jobs.dump import INVALID_FILTER
 from dbaguy_backend.sessions.jobs.pipe import RowPipe, SourceFailed
 from dbaguy_backend.sessions.jobs.registry import JobRegistry
 from dbaguy_backend.sessions.jobs.transfer_source import MANY_RESULTS, NOT_A_READ, TransferSource
 from dbaguy_backend.sessions.manager import SessionCreateRequest
+from dbaguy_backend.sql.dialects import Dialect
+from dbaguy_backend.sql.select_builder import FILTER_NOT_A_CONDITION
 from tests.data_support import DataApp, dropping
 from tests.edit_support import scratch_db
 from tests.fake_db import FakeResult
@@ -132,15 +137,21 @@ def test_a_copys_source_is_its_query_tabs_session_or_one_of_its_own(tmp_path: Pa
         mine, other = profile(app, lite, "mine"), profile(app, lite, "other")
         manager = app.container.sessions
         tab = manager.create(SessionCreateRequest(profile_id=mine))
-        borrowed = manager._source(mine, None, tab.session_id)
+        copying = manager.create(SessionCreateRequest(profile_id=mine)).session_id  # the copy's own job session
+        borrowed = manager._source(mine, None, tab.session_id, from_session=copying)
         assert borrowed.worker is manager.worker(tab.session_id)
+        assert manager._sessions[tab.session_id].attached == 1  # leased: never reaped under the copy (review M-6)
         borrowed.release()
         assert manager.worker(tab.session_id) is borrowed.worker  # a query tab's session stays the tab's
+        assert manager._sessions[tab.session_id].attached == 0
         with pytest.raises(PlanUnavailable) as mismatch:
-            manager._source(other, None, tab.session_id)  # the plan's source is another connection
+            manager._source(other, None, tab.session_id, from_session=copying)  # the plan's source is another one
         assert mismatch.value.code == PLAN_MISMATCH
         assert mismatch.value.message == COPY_PLAN_EXPIRED  # a copy's words, not a grid edit's (pre-flight L-a)
-        own = manager._source(other, None, None)
+        with pytest.raises(PlanUnavailable) as itself:  # its read would wait behind the copy until Cancel (M-7)
+            manager._source(mine, None, copying, from_session=copying)
+        assert (itself.value.code, manager._sessions[copying].attached) == (PLAN_MISMATCH, 0)
+        own = manager._source(other, None, None, from_session=copying)
         opened = [sid for sid in manager._sessions if manager.worker(sid) is own.worker]
         assert manager._sessions[opened[0]].attached == 1  # leased: never reaped as idle between two tables
         own.release()
@@ -302,3 +313,86 @@ def test_a_read_stops_at_its_next_chunk_once_its_sink_stops(env) -> None:  # the
     pipe.close()
     done = outcome(request_events(e.recorder, "src"))
     assert (done.outcome, done.cancelled, result.closed, e.conn.cancel_calls) == ("failed", True, True, 0)
+
+
+# ---- 06c Task 3 review M-1…M-7, applied with Task 4 ----
+
+
+def test_a_source_whose_sink_stopped_before_it_began_sends_nothing(env) -> None:  # M-1 (a)
+    e = env()
+    pipe = RowPipe("t", poll_s=0.01)
+    pipe.close()  # its copy stopped while the read waited in the queue
+    e.worker.submit(PreparedJob(request_id="src", job=_source(pipe)))
+    done = outcome(request_events(e.recorder, "src"))
+    assert (done.outcome, done.cancelled, e.conn.runs) == ("not_started", True, [])
+
+
+def test_a_queued_request_is_withdrawn_and_a_running_one_never_is(env) -> None:  # M-1 (b): H2's way to stop a read
+    e = env()
+    e.worker.submit(ExecuteCommand(request_id="busy", sql="block"))
+    assert e.conn.blocked.wait(5)
+    queued = RowPipe("t", poll_s=0.01)
+    e.worker.submit(PreparedJob(request_id="queued", job=_source(queued)))
+    assert (e.worker.withdraw("busy"), e.conn.cancel_calls) == (False, 0)  # it runs: never cancelled by a withdraw
+    assert e.worker.withdraw("queued") is True
+    e.worker.cancel("busy")
+    with pytest.raises(SourceFailed) as failed:
+        _drain(queued, within_s=10)
+    assert (failed.value.cause.code, outcome(request_events(e.recorder, "queued")).outcome) == (
+        "not_started", "not_started")
+    assert e.conn.runs == ["block"] and e.worker.withdraw("queued") is False  # nothing of it ran; it is over
+
+
+def test_a_cancel_that_found_nothing_to_stop_survives_resuming(env) -> None:  # M-2: never lost
+    HOLDS["m2"] = (threading.Event(), threading.Event())
+    e = env()
+    e.submit("sql first", "wait m2", "resume", "sql second")
+    reached, go = HOLDS["m2"]
+    assert reached.wait(5)
+    e.worker.cancel("j")  # it is running, and no driver call is there to stop
+    go.set()
+    events = request_events(e.recorder, "j")
+    assert (outcome(events).outcome, outcome(events).cancelled, e.conn.runs) == ("stopped", True, ["first"])
+
+
+def test_a_query_that_may_not_run_leaves_the_tabs_settings_untouched(env) -> None:  # M-3: refused before anything
+    e = env()
+    e.worker.configure(replace(e.worker._hooks, dialect=Dialect.POSTGRES))  # a source with settings to set and reset
+    pipe = RowPipe("Query 1", poll_s=0.01)
+    e.worker.submit(PreparedJob(request_id="q", job=_source(pipe, "DELETE FROM t RETURNING n", query=True)))
+    with pytest.raises(SourceFailed) as failed:
+        _drain(pipe, within_s=10)
+    assert (failed.value.cause.code, e.conn.runs) == (NOT_A_READ, [])
+    assert outcome(request_events(e.recorder, "q")).outcome == "not_started"
+
+
+def test_a_filter_that_is_not_a_condition_is_said_in_a_filters_words(env) -> None:  # M-4: the dump's words
+    e = env()
+    pipe = RowPipe("t", poll_s=0.01)
+    table = planned("SELECT n FROM t WHERE 1 = 1; DELETE FROM t", [_column("n")], filtered=True)
+    e.worker.submit(PreparedJob(request_id="f", job=TransferSource(pipe, table, query=False, label="t")))
+    with pytest.raises(SourceFailed) as failed:
+        _drain(pipe, within_s=10)
+    assert (failed.value.cause.code, failed.value.cause.message, e.conn.runs) == (
+        INVALID_FILTER, FILTER_NOT_A_CONDITION, [])
+
+
+class _RefusesAtOnce(Helper):
+    """A helper whose run raises before it sends anything; it records what its maker heard."""
+
+    def __init__(self) -> None:
+        self.heard: list[str | None] = []
+
+    def run(self, ctx: JobContext) -> JobReport:
+        raise StatementError("refused", code="refused")
+
+    def not_run(self, error: StatementError) -> None:
+        self.heard.append(error.code)
+
+
+def test_a_helper_whose_run_raises_before_it_sends_anything_tells_its_maker(env) -> None:  # M-5
+    e = env()
+    helper = _RefusesAtOnce()
+    e.worker.submit(PreparedJob(request_id="h", job=helper))
+    assert outcome(request_events(e.recorder, "h")).outcome == "not_started"
+    assert (helper.heard, e.conn.runs) == (["refused"], [])
