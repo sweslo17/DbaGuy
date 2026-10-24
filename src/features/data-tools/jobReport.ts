@@ -69,7 +69,12 @@ export interface TableLine {
   source: string | null;
   target: string;
   outcome: string;
-  rows: number;
+  /**
+   * The rows it holds, only for a copied table. A table that was not copied has none to count; one whose outcome is
+   * unknown reports 0 (the model has no field for "up to N may stand": the outcome's warning says that), so printing it
+   * would claim an empty table.
+   */
+  rows: number | null;
   tone: Tone;
 }
 
@@ -129,7 +134,7 @@ export const CODE_LABELS = {
   plan_expired: "The preview expired",
   plan_mismatch: "Not this connection's preview",
   source_failed: "Reading the source failed",
-  row_count_mismatch: "A trigger skipped or added rows",
+  row_count_mismatch: "The target reported other rows than were sent",
   row_count_unknown: "The rows written were not confirmed",
   columns_changed: "The columns changed since the preview",
   value_not_copyable: "A value the target cannot hold",
@@ -155,8 +160,11 @@ const CODE_HINTS: Partial<Record<JobErrorCode, string>> = {
   file_changed:
     "The file was edited after the run that gave this place, so its statement numbers are not the ones they were. Look at the file, then set where to start again.",
   plan_expired: "Copy again: the preview is read once more.",
-  value_not_copyable: "Leave that row out with a filter, or give the column a text type, then copy again.",
-  row_count_mismatch: "A trigger on the target changed what was written: copy into a table without it.",
+  // a new table's column type can be typed over; an existing table's cannot
+  value_not_copyable: "Leave that row out with a filter or, in a new table, give the column a text type; then copy again.",
+  // as the backend says it: "may" (a trigger, a rule or an index option that ignores duplicates reports the same)
+  row_count_mismatch:
+    "A trigger, rule or index option on the target may have skipped or changed rows: copy into a table without it.",
   session_not_found: "Copy again from the result of a tab that is open.",
   // The preview read the source with its password; the backend has forgotten it since (a restart): ask for it again
   password_required: "Unlock that connection (opening it in the tree asks for its password), then copy again.",
@@ -194,17 +202,24 @@ export function codeLabel(code: string | null | undefined, kind?: JobKind): stri
 }
 
 /**
- * What a lost connection (the target's: a source that is lost is `source_failed`) means for a copy: each table is a
- * transaction of its own, which the server rolls back as the connection ends, so the tables before it stay.
+ * The table a copy's connection ended in: each table is a transaction of its own, which the server rolls back as the
+ * connection ends (never during its COMMIT). `known`: the backend's outcome says so; without an outcome the frontend only
+ * knows the connection ended, so it says "should have been".
  */
+const lostTable = (known: boolean): string =>
+  known
+    ? "The table being copied was rolled back by the server as the connection ended"
+    : "The table being copied should have been rolled back by the server as its connection ended";
+
+/** What a lost connection (the target's: a source that is lost is `source_failed`) means for a copy, by its outcome. */
 function copyLostHint(outcome: JobOutcomeEvent): string {
   if (outcome.outcome === "unknown") return "Check the target before copying again.";
   if (outcome.objects.every((table) => table.outcome === "not_started")) {
     return "The connection was lost before the first table started: nothing was copied.";
   }
   return outcome.outcome === "partial"
-    ? "The table being copied was rolled back by the server as the connection ended; the tables before it stay copied."
-    : "The table being copied was rolled back by the server as the connection ended: nothing was copied.";
+    ? `${lostTable(true)}; the tables before it stay copied.`
+    : `${lostTable(true)}: nothing was copied.`;
 }
 
 /** What a lost connection means for what to do next: a run that is unknown must be checked, a dump wrote nothing. */
@@ -308,7 +323,8 @@ function dumpReport(outcome: JobOutcomeEvent, command: JobCommand | null, error:
 
 const TABLE_WORDS: Record<NonNullable<JobObject["outcome"]>, { text: string; tone: Tone }> = {
   copied: { text: "copied", tone: "success" },
-  rolled_back: { text: "rolled back", tone: "danger" },
+  // its rows: a table a MySQL copy created stays (the outcome's note says so), so "rolled back" alone would contradict it
+  rolled_back: { text: "rows rolled back", tone: "danger" },
   not_started: { text: "not copied", tone: "muted" },
   unknown: { text: "unknown: check it", tone: "danger" },
 };
@@ -317,7 +333,8 @@ const TABLE_WORDS: Record<NonNullable<JobObject["outcome"]>, { text: string; ton
 function tableLines(objects: readonly JobObject[]): TableLine[] {
   return objects.map((object) => {
     const words = TABLE_WORDS[object.outcome ?? "unknown"];
-    return { source: object.source ?? null, target: object.name, outcome: words.text, rows: object.rows ?? 0, tone: words.tone };
+    const rows = object.outcome === "copied" ? (object.rows ?? 0) : null;
+    return { source: object.source ?? null, target: object.name, outcome: words.text, rows, tone: words.tone };
   });
 }
 
@@ -341,7 +358,7 @@ function partialDetail(tables: readonly JobObject[]): string {
   const undone = tables.find((table) => table.outcome === "rolled_back");
   if (!undone) return "The tables copied stay; the rest were not started.";
   const rest = tables.some((table) => table.outcome === "not_started") ? "; the rest were not started" : "";
-  return `The tables copied stay. ${undone.name} was rolled back${rest}.`;
+  return `The tables copied stay. The rows of ${undone.name} were rolled back${rest}.`;
 }
 
 /** A copy that is not known: the table whose COMMIT or rollback could not be told, when the backend names one. */
@@ -377,7 +394,7 @@ function copyReport(outcome: JobOutcomeEvent, command: JobCommand | null, source
           ? "Cancelled: nothing was copied"
           : noTableStarted
             ? "Nothing was copied"
-            : "Nothing was copied: the table was rolled back",
+            : "Nothing was copied: the table's rows were rolled back",
         detail: null,
         notes,
         actions,
@@ -589,10 +606,14 @@ function lossReport(view: JobView): JobReport {
           ...base,
           tone: "danger",
           title,
-          // each table is a transaction of its own: the server rolled back the one open, except during its COMMIT
-          detail: state.progress?.stage === "commit"
-            ? "It stopped during a table's COMMIT: whether that table is copied is not known. Check the target."
-            : "The table being copied was rolled back by the server as its connection ended; the tables before it stay copied. Check the target.",
+          // no outcome from the backend: what a copy's connection ending means is hedged (a MySQL table that was created, or
+          // one that cannot roll back, is not undone; `not_listed` also covers a command the backend never got)
+          detail:
+            state.progress === null
+              ? "No progress was reported before it stopped: check the target to see whether anything was copied."
+              : state.progress.stage === "commit"
+                ? "It stopped during a table's COMMIT: whether that table is copied is not known. Check the target."
+                : `${lostTable(false)}, and the tables before it should still be copied. Check the target.`,
           actions: [],
         };
       }
@@ -730,11 +751,14 @@ export function cancelNote(view: JobView): string | null {
     : "Cancel stops the run: what took effect stays, except a transaction the file opened and did not commit (rolled back)";
 }
 
-/** One line for the Jobs list: the progress while it runs, the outcome's title once it ended. */
-export function jobSummary(view: JobView, now: number): { text: string; tone: Tone | null } {
+/**
+ * One line for the Jobs list: the progress while it runs, the outcome's title once it ended. `tables`: the job's tables in
+ * their order, as its dialog has them ("Copying b (2 of 3)"), when this window started it.
+ */
+export function jobSummary(view: JobView, now: number, tables: readonly string[] | null = null): { text: string; tone: Tone | null } {
   const report = jobReport(view);
   if (report) return { text: report.title, tone: report.tone };
-  const progress = progressView(view, now);
+  const progress = progressView(view, now, tables);
   return { text: [progress.headline, progress.eta].filter(Boolean).join(" · "), tone: null };
 }
 

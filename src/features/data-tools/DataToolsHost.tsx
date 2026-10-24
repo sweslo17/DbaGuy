@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { CopyDataDialog } from "./CopyDataDialog";
 import { closeDataDialog, shownJob, useDataDialogAsk } from "./dataDialogs";
 import { DumpDialog } from "./DumpDialog";
 import { JobDialog } from "./JobDialog";
@@ -16,7 +17,7 @@ function JobAsk({ requestId }: { requestId: string }) {
 }
 
 /**
- * The data tools' one dialog (`dataDialogs.ts`), in the app shell: a dump's form, a run's form, or a job's view. A tab
+ * The data tools' one dialog (`dataDialogs.ts`), in the app shell: a dump's, a run's or a copy's form, or a job's view. A tab
  * that closes never takes a job's dialog with it. Each ask mounts its dialog anew (`serial`).
  */
 export function DataToolsHost() {
@@ -26,6 +27,8 @@ export function DataToolsHost() {
       return <DumpDialog key={ask.serial} entry={ask.entry} form={ask.form} />;
     case "run":
       return <RunFileDialog key={ask.serial} entry={ask.entry} />;
+    case "copy":
+      return <CopyDataDialog key={ask.serial} entry={ask.entry} form={ask.form} />;
     case "job":
       return <JobAsk key={ask.serial} requestId={ask.requestId} />;
     default:

@@ -2,11 +2,14 @@ import { Loader2 } from "lucide-react";
 import type { KeyboardEvent } from "react";
 import { EngineIcon } from "@/components/EngineIcon";
 import { Button } from "@/components/ui/Button";
+import { errorMessage } from "@/lib/api/client";
 import { cn } from "@/lib/cn";
 import { plural } from "@/lib/format";
 import { useNow } from "@/lib/useNow";
 import { useProfiles } from "../connections/hooks";
 import { profileColor } from "../connections/profileColors";
+import { RecoverableError } from "../connections/RecoverableError";
+import { isPasswordRequired } from "../connections/UnlockDialog";
 import { jobReport, progressView, type ErrorLine, type JobReport, type Tone } from "./jobReport";
 import type { JobRecord } from "./jobsStore";
 
@@ -46,6 +49,43 @@ export function ConnectionLine({ profileId, database }: { profileId: string; dat
       <span className={cn("truncate", red ? "font-medium text-danger" : "font-medium")}>{profile.name}</span>
       {database && <span className="shrink-0 text-muted">· database {database}</span>}
     </p>
+  );
+}
+
+/**
+ * A read a dialog needs that failed (a dump's plan, a copy's preview, a folder's tables): a missing password asks for it
+ * (then reads again); another error says why, with Retry.
+ */
+export function ReadProblem({ profileId, error, retry }: { profileId: string; error: Error; retry: () => void }) {
+  if (isPasswordRequired(error)) return <RecoverableError profileId={profileId} error={error} onRetry={retry} />;
+  return (
+    <div className="flex items-start gap-2 text-[12px] text-danger">
+      <span className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]" data-selectable>
+        {errorMessage(error)}
+      </span>
+      <Button size="sm" onClick={retry}>
+        Retry
+      </Button>
+    </div>
+  );
+}
+
+/** A copy's tables and how each ended (06c, R-06-12), in the copy's order. */
+function CopiedTables({ report }: { report: JobReport }) {
+  if (report.tables.length === 0) return null;
+  return (
+    <ul className="max-h-40 overflow-y-auto rounded-md border border-border py-0.5 [scrollbar-gutter:stable]">
+      {report.tables.map((line, i) => (
+        <li key={i} className="flex min-w-0 items-baseline gap-2 px-2 py-0.5">
+          <span className="min-w-0 flex-1 truncate" title={`${line.source ?? ""} → ${line.target}`} data-selectable>
+            {line.source ? `${line.source} → ` : ""}
+            {line.target}
+          </span>
+          <span className={cn("shrink-0", TONE_CLASS[line.tone])}>{line.outcome}</span>
+          {line.rows !== null && <span className="shrink-0 text-muted tabular-nums">{plural(line.rows, "row")}</span>}
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -189,6 +229,7 @@ export function JobReportView({ record, onShowLine }: { record: JobRecord; onSho
           {report.detail}
         </p>
       )}
+      <CopiedTables report={report} />
       {report.error && <ErrorBox error={report.error} onShowLine={onShowLine} />}
       {report.hint && <p className="text-muted">{report.hint}</p>}
       {report.notes.length > 0 && (

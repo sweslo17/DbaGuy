@@ -290,6 +290,20 @@ describe("Copy data to… (06c)", () => {
     expect(copyEntryForNode(P, PG, node(view))?.source).toMatchObject({ kind: "relation", relationKind: "view" });
   });
 
+  it("copies a MySQL schema's tables: its database is the schema node, so the session's database stays the profile's", () => {
+    const shop = [seg("schema", "shop")];
+    const shopTables = [...shop, seg("folder", "tables")];
+    expect(copyEntryForNode(P, MYSQL, node(shop))).toEqual({
+      profileId: P, database: null, source: { kind: "tables", schema: "shop", folder: shopTables },
+    });
+    expect(copyEntryForNode(P, MYSQL, node(shopTables))?.source).toEqual({ kind: "tables", schema: "shop", folder: shopTables });
+    const items = [...shopTables, seg("table", "items")];
+    expect(copyEntryForNode(P, MYSQL, node(items))).toEqual({
+      profileId: P, database: null,
+      source: { kind: "relation", path: items, schema: "shop", name: "items", relationKind: "table", filter: null },
+    });
+  });
+
   it("offers nothing on a database node, another SQLite schema, or an engine that does not copy", () => {
     expect(copyEntryForNode(P, PG, node(db))).toBeNull();
     expect(copyEntryForNode(P, SQLITE, node([seg("schema", "aux")]))).toBeNull();

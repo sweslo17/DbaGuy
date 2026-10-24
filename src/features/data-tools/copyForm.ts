@@ -1,3 +1,4 @@
+import { ApiError } from "@/lib/api/client";
 import type {
   CopyDataCommand,
   EngineInfo,
@@ -73,11 +74,16 @@ export function initialCopyForm(entry: CopyEntry, checked: readonly string[] | n
   };
 }
 
-/** A new target connection: its own database, and that database's default schema. */
+/**
+ * A new target connection: its own database, and that database's default schema. The types typed over a new table's
+ * columns went with the connection before (they were written in its engine's types: another engine reads them
+ * differently, or not at all); the choices about the source's own columns and the mode stay.
+ */
 export function withTarget(form: CopyForm, profile: Profile, engine: EngineInfo): CopyForm {
   const database = "database" in profile ? (profile.database ?? null) : null;
   return {
     ...form,
+    overrides: {},
     targetProfileId: profile.id,
     targetDatabase: engine.per_database_connection ? database : null,
     targetSchema: defaultSchema(engine.engine, database),
@@ -97,18 +103,21 @@ function checkedPaths(entry: CopyEntry, form: CopyForm, tables: readonly ObjectN
   return (tables ?? []).filter((node) => on.has(node.name)).map((node) => node.path);
 }
 
+/** What is wrong with the checked tables of a schema's copy (none, or more than a copy takes), or null: said by the list. */
+export function tablesProblem(entry: CopyEntry, form: CopyForm, tables: readonly ObjectNode[] | null): string | null {
+  if (entry.source.kind !== "tables" || tables === null) return null;
+  const count = checkedPaths(entry, form, tables)?.length ?? 0;
+  if (count === 0) return "Check the tables to copy";
+  return count > MAX_COPY_TABLES ? `A copy takes at most ${MAX_COPY_TABLES.toLocaleString()} tables` : null;
+}
+
 /** Why the preview cannot be asked for yet, or null. */
 export function requestProblem(entry: CopyEntry, form: CopyForm, tables: readonly ObjectNode[] | null): string | null {
   if (!form.targetProfileId) return "Choose the connection to copy into";
   if (!form.targetSchema) return "Choose the schema to copy into";
   if (isOne(entry) && !form.table.trim()) return "Name the table to copy into";
-  if (entry.source.kind === "tables") {
-    if (tables === null) return "Reading the tables…";
-    const count = checkedPaths(entry, form, tables)?.length ?? 0;
-    if (count === 0) return "Check the tables to copy";
-    if (count > MAX_COPY_TABLES) return `A copy takes at most ${MAX_COPY_TABLES.toLocaleString()} tables`;
-  }
-  return null;
+  if (entry.source.kind === "tables" && tables === null) return "Reading the tables…";
+  return tablesProblem(entry, form, tables);
 }
 
 /** The preview's request, or null while it cannot be asked (`requestProblem`). The command's plan comes from it. */
@@ -160,12 +169,16 @@ export function copyProblem(
   return null;
 }
 
-/** The command that runs the preview shown (its plan, once). A query's copy reads on its tab's session. */
-export function copyCommand(plan: TransferPlan, entry: CopyEntry, requestId: string): CopyDataCommand {
+/**
+ * The command that runs the preview shown (its plan, once); null for a preview without a plan id (it has problems: ⑤ E8),
+ * which is never sent. A query's copy reads on its tab's session.
+ */
+export function copyCommand(plan: TransferPlan, entry: CopyEntry, requestId: string): CopyDataCommand | null {
+  if (!plan.plan_id) return null;
   return {
     type: "copy_data",
     request_id: requestId,
-    plan_id: plan.plan_id ?? "",
+    plan_id: plan.plan_id,
     source_session_id: entry.source.kind === "query" ? entry.source.sessionId : null,
   };
 }
@@ -178,6 +191,8 @@ export function copyDialogTitle(entry: CopyEntry): string {
   const { source } = entry;
   switch (source.kind) {
     case "relation":
+      // `relationHasRows` is the dump's rule (a table or partition holds rows of its own; a view is its definition): here it
+      // only tells "Copy public.orders" from "Copy the rows of public.v" (a view's rows are copied too)
       return `Copy ${relationHasRows(source.relationKind) ? "" : "the rows of "}${source.schema}.${source.name}`;
     case "tables":
       return `Copy tables of ${source.schema}`;
@@ -198,4 +213,15 @@ export function copyJobTitle(plan: TransferPlan, from: string, to: string): stri
  */
 export function restForm(form: CopyForm, notCopied: readonly string[]): CopyForm {
   return { ...form, checked: notCopied };
+}
+
+/**
+ * Whose password a preview's `password_required` asks for (pre-flight M3): the preview reads two connections, and the
+ * backend names the one it needed (`detail.profile_id`), which is not always the source's. `fallback`: the source, as a
+ * dump's or a run's single connection is.
+ */
+export function passwordOwner(error: Error, fallback: string): string {
+  const detail = error instanceof ApiError && typeof error.detail === "object" ? error.detail : null;
+  const named = detail !== null && Object.hasOwn(detail, "profile_id") ? (detail as { profile_id: unknown }).profile_id : null;
+  return typeof named === "string" ? named : fallback;
 }

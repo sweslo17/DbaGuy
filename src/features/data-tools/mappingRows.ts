@@ -29,8 +29,6 @@ export interface MappingRow {
   canLeaveOut: boolean;
 }
 
-const LEFT_OUT = "left out";
-
 /** A key's own value: a table or column named `constructor` or `__proto__` is a name like any other (05b K2). */
 const own = <T>(record: Readonly<Record<string, T>>, key: string): T | undefined =>
   Object.hasOwn(record, key) ? record[key] : undefined;
@@ -44,8 +42,12 @@ function withKey<T>(record: Readonly<Record<string, T>>, key: string, value: T |
 export function mappingRows(table: TableTransfer, form: CopyForm): MappingRow[] {
   const typed = own(form.overrides, table.source_key) ?? {};
   const out = new Set(own(form.leftOut, table.source_key) ?? []);
+  const identities = own(form.identity, table.source_key) ?? {};
   return table.columns.map((column: ColumnMapping) => {
-    const leftOut = out.has(column.source_name) && column.skipped === LEFT_OUT;
+    // What the form asks for is shown at once, not when the next preview answers (a checkbox that sprang back for the
+    // length of a read would look broken). The backend leaves out every column the form names, so the two agree; the
+    // preview's own `skipped` text says it in words. (No match on that text: the schema carries no code for it.)
+    const leftOut = out.has(column.source_name);
     return {
       source: column.source_name,
       sourceType: column.source_type,
@@ -55,7 +57,7 @@ export function mappingRows(table: TableTransfer, form: CopyForm): MappingRow[] 
       typed: own(typed, column.source_name) ?? null,
       conversion: column.conversion ?? null,
       skipped: column.skipped ?? null,
-      identity: column.identity ?? null,
+      identity: column.identity ? (own(identities, column.source_name) ?? "keep") : null,
       problem: column.problem ?? null,
       leftOut,
       canLeaveOut: leftOut || (!column.skipped && column.target_name != null),

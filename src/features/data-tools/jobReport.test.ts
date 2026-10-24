@@ -594,7 +594,24 @@ describe("a copy in words (06c)", () => {
     expect(one.tables).toEqual([{ source: "public.orders", target: "orders", outcome: "copied", rows: 1200, tone: "success" }]);
     const partial = said(copied({ outcome: "partial", rows: 2 }));
     expect([partial.tone, partial.title]).toEqual(["danger", "Stopped: 1 of 3 tables copied"]);
-    expect(partial.tables.map((line) => line.outcome)).toEqual(["copied", "rolled back", "not copied"]);
+    expect(partial.tables.map((line) => line.outcome)).toEqual(["copied", "rows rolled back", "not copied"]);
+  });
+
+  it("counts rows only for a copied table: an unknown one says its outcome and leaves the count to the warning", () => {
+    const warning = "Up to 5 rows written to b may stand";
+    const unknown = said(copied({
+      outcome: "unknown",
+      warnings: [warning],
+      objects: [
+        { kind: "table", name: "a", source: "public.a", rows: 2, outcome: "copied" },
+        { kind: "table", name: "b", source: "public.b", rows: 0, outcome: "unknown" },
+        { kind: "table", name: "c", source: "public.c", rows: 0, outcome: "not_started" },
+      ],
+    }));
+    expect(unknown.tables.map((line) => [line.outcome, line.rows])).toEqual([["copied", 2], ["unknown: check it", null], ["not copied", null]]);
+    expect(unknown.notes).toEqual([warning]);
+    expect(unknown.detail).not.toMatch(/\d+ rows?/); // nothing in its words counts them either
+    expect(said(copied({ outcome: "rolled_back" })).tables[1].rows).toBeNull();
   });
 
   it("offers the rest of a copy that stopped part way, and the whole of one that applied nothing", () => {
@@ -609,7 +626,7 @@ describe("a copy in words (06c)", () => {
     const failed = said(copied({ outcome: "rolled_back", error: { code: "value_not_copyable", message: "Row 2 of public.a, column at: …" } }));
     expect([failed.error?.label, failed.hint]).toEqual([
       CODE_LABELS.value_not_copyable,
-      "Leave that row out with a filter, or give the column a text type, then copy again.",
+      "Leave that row out with a filter or, in a new table, give the column a text type; then copy again.",
     ]);
     expect(codeLabel("source_failed")).toBe("Reading the source failed");
     const lost = said(copied({ outcome: "partial", error: { code: "connection_lost", message: "gone" } }));
@@ -649,7 +666,8 @@ describe("a copy in words (06c)", () => {
     const held = said(outcome({ job: "copy_data", path: null, outcome: "not_started", cancelled: true, objects: none }), copy, ["a", "b"]);
     expect([held.tone, held.title]).toEqual(["muted", "Cancelled before anything was copied"]);
     // a table that was rolled back is said so; the first table's rollback is not "nothing started"
-    expect(said(copied({ outcome: "rolled_back" })).title).toBe("Nothing was copied: the table was rolled back");
+    // its rows: a MySQL copy's created table stays (the outcome's note says so), so the title must not say "the table"
+    expect(said(copied({ outcome: "rolled_back" })).title).toBe("Nothing was copied: the table's rows were rolled back");
     // a Cancel between two tables, or a connection made read-only meanwhile: stopped, and none was rolled back
     const between = [
       { kind: "table", name: "a", source: "public.a", rows: 2, outcome: "copied" as const },
@@ -658,7 +676,7 @@ describe("a copy in words (06c)", () => {
     const gap = said(outcome({ job: "copy_data", path: null, outcome: "partial", cancelled: true, objects: between }), copy, ["a", "b"]);
     expect([gap.tone, gap.title, gap.detail]).toEqual(["warning", "Cancelled: 1 of 2 tables copied", "The tables copied stay; the rest were not started."]);
     expect(gap.actions).toEqual([{ kind: "copy_again", label: "Copy the rest…", tables: ["b"] }]);
-    expect(said(copied({ outcome: "partial" })).detail).toBe("The tables copied stay. b was rolled back; the rest were not started.");
+    expect(said(copied({ outcome: "partial" })).detail).toBe("The tables copied stay. The rows of b were rolled back; the rest were not started.");
   });
 
   it("says a connection lost for what it left, and never offers to copy what may be there (unknown)", () => {
@@ -689,5 +707,38 @@ describe("a copy in words (06c)", () => {
     expect([locked.error?.label, locked.hint]).toEqual([CODE_LABELS.password_required, CODE_HINTS_COPY.password_required]);
     // an unlabelled code is shown by its message alone
     expect(said(copied({ outcome: "rolled_back", error: { code: "23505", message: "dup" } })).error).toMatchObject({ label: null, message: "dup" });
+  });
+
+  it("hedges what a trigger did and what a new table's type can fix, as the backend does (Task 6 review 2, 3)", () => {
+    const mismatch = said(copied({ outcome: "rolled_back", error: { code: "row_count_mismatch", message: "An INSERT of 3 rows reported 2 rows (a trigger may have skipped or changed them)" } }));
+    expect(mismatch.hint).toBe("A trigger, rule or index option on the target may have skipped or changed rows: copy into a table without it.");
+    expect(mismatch.error?.label).toBe("The target reported other rows than were sent");
+    const value = said(copied({ outcome: "rolled_back", error: { code: "value_not_copyable", message: "Row 3 of public.a, column at: …" } }));
+    expect(value.hint).toContain("in a new table, give the column a text type");
+  });
+
+  it("says no more of a copy lost without an outcome than the frontend knows (Task 6 review 1)", () => {
+    const lostCopy = (progress: JobProgressEvent | null, loss: "session_gone" | "not_listed" = "session_gone") => {
+      const sent = jobReducer(openingJob(0), { type: "sent", at: 1 });
+      const running = progress ? jobReducer(sent, { type: "server", event: progress, at: 2 }) : sent;
+      const state = jobReducer(running, loss === "session_gone" ? { type: "session_gone", at: 3 } : { type: "not_listed", at: 3 });
+      return jobReport({ kind: "copy_data", command: copy, state, copy: { sources: ["a"] } })!;
+    };
+    const progress: JobProgressEvent = { type: "job_progress", request_id: "r1", stage: "data", object: "b", rows: 10, bytes: 0, statements: 1, errors: 0 };
+    expect(lostCopy(progress).detail).toBe(
+      "The table being copied should have been rolled back by the server as its connection ended, and the tables before it should still be copied. Check the target.",
+    );
+    expect(lostCopy({ ...progress, stage: "commit" }).detail).toBe("It stopped during a table's COMMIT: whether that table is copied is not known. Check the target.");
+    // nothing reported at all: nothing is claimed of any table (not_listed also means the command never arrived)
+    expect(lostCopy(null, "not_listed").detail).toBe("No progress was reported before it stopped: check the target to see whether anything was copied.");
+    expect(lostCopy(progress).actions).toEqual([]);
+  });
+
+  it("gives the Jobs list's row the copy's table count when its tables are known", () => {
+    const progress: JobProgressEvent = { type: "job_progress", request_id: "r1", stage: "data", object: "b", rows: 10, bytes: 0, statements: 1, errors: 0 };
+    const state = jobReducer(jobReducer(openingJob(0), { type: "sent", at: 1 }), { type: "server", event: progress, at: 2 });
+    const row = { kind: "copy_data" as const, command: copy, state };
+    expect(jobSummary(row, 2_000, ["a", "b", "c"]).text).toBe("Copying b (2 of 3)");
+    expect(jobSummary(row, 2_000).text).toBe("Copying b"); // a job listed after a reload does not know its tables
   });
 });

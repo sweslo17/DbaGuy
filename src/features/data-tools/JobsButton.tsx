@@ -1,4 +1,4 @@
-import { DatabaseBackup, FileCode, ListChecks, Loader2 } from "lucide-react";
+import { ArrowRightLeft, DatabaseBackup, FileCode, ListChecks, Loader2, type LucideIcon } from "lucide-react";
 import { memo, useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { Button } from "@/components/ui/Button";
 import { Popover } from "@/components/ui/Popover";
@@ -10,6 +10,7 @@ import { useNow } from "@/lib/useNow";
 import { openJobDialog, setJobsPopoverOpen, useJobsPopoverOpen } from "./dataDialogs";
 import { shownElapsed } from "./jobEndings";
 import { jobSummary } from "./jobReport";
+import type { JobKind } from "./jobState";
 import { clearFinishedJobs, hasEndedJob, isRunning, runningCount, syncJobs, useJobs } from "./jobsStore";
 import { TONE_CLASS } from "./JobViews";
 
@@ -20,6 +21,9 @@ import { TONE_CLASS } from "./JobViews";
  */
 
 const ROW = "[data-job-row]";
+
+/** One icon for each kind of job: a dump writes a file, a run reads one, a copy moves rows between connections. */
+const JOB_ICONS: Record<JobKind, LucideIcon> = { dump: DatabaseBackup, run_file: FileCode, copy_data: ArrowRightLeft };
 
 /** Up and Down (Home, End) move between the rows; Return opens one (a button). */
 function moveBetweenRows(e: KeyboardEvent<HTMLUListElement>) {
@@ -38,9 +42,9 @@ const JobRow = memo(function JobRow({ requestId, onOpen }: { requestId: string; 
   const running = record !== undefined && isRunning(record);
   const now = useNow(1000, running);
   if (!record) return null;
-  const summary = jobSummary(record, now);
+  const summary = jobSummary(record, now, record.tables);
   const elapsed = shownElapsed(record.state, now);
-  const Icon = record.kind === "dump" ? DatabaseBackup : FileCode;
+  const Icon = JOB_ICONS[record.kind];
   return (
     <li>
       <button

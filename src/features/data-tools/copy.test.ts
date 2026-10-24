@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { ApiError } from "@/lib/api/client";
 import type { ColumnMapping, EngineInfo, ObjectNode, PathSegment, Profile, TableTransfer, TransferPlan } from "@/lib/api/types";
 import {
   copyCommand,
@@ -7,9 +8,11 @@ import {
   copyProblem,
   copyRequest,
   initialCopyForm,
+  passwordOwner,
   QUERY_TABLE,
   requestProblem,
   restForm,
+  tablesProblem,
   withTarget,
   type CopyForm,
 } from "./copyForm";
@@ -57,6 +60,13 @@ describe("the copy form", () => {
     });
   });
 
+  it("drops the types typed over for the connection before when the target changes, keeping the rest of the form", () => {
+    const typed = withLeftOut(withOverride(targeted(relation, { mode: "append" }), "public.orders", "id", "numeric(20)"), "public.orders", "note", true);
+    const other = withTarget(typed, profile({ id: "dst2", engine: "postgres", database: "dw" }), pg);
+    expect([other.overrides, other.targetProfileId, other.targetSchema]).toEqual([{}, "dst2", "public"]);
+    expect([other.leftOut, other.mode, other.table]).toEqual([{ "public.orders": ["note"] }, "append", "orders"]);
+  });
+
   it("asks for a relation with its filter, a schema's checked tables in the tree's order, a query with its columns", () => {
     expect(copyRequest(relation, targeted(relation), null)).toEqual({
       source: { profile_id: "src", database: "shop", tables: [ordersPath], filter: "id > 5" },
@@ -81,7 +91,23 @@ describe("the copy form", () => {
     expect(copyProblem(relation, targeted(relation), null, { ...plan, plan_id: null }, false)).toBe("The preview has problems: see them above");
     expect(copyProblem(relation, targeted(relation), null, plan, false)).toBeNull();
     expect(copyCommand(plan, query, "r1")).toEqual({ type: "copy_data", request_id: "r1", plan_id: "p1", source_session_id: "tab-1" });
-    expect(copyCommand(plan, relation, "r1").source_session_id).toBeNull();
+    expect(copyCommand(plan, relation, "r1")?.source_session_id).toBeNull();
+  });
+
+  it("never makes a command of a preview without a plan id (it has problems)", () => {
+    const plan = { plan_id: null, source_profile_id: "src", tables: [], warnings: [], problems: [] } as TransferPlan;
+    expect(copyCommand(plan, relation, "r1")).toBeNull();
+    expect(copyCommand({ ...plan, plan_id: "" }, relation, "r1")).toBeNull();
+  });
+
+  it("says what is wrong with the checked tables, for the list to show: none, or more than a copy takes", () => {
+    expect(tablesProblem(tables, targeted(tables, { checked: [] }), listed)).toBe("Check the tables to copy");
+    expect(tablesProblem(tables, targeted(tables, { checked: ["a", "c"] }), listed)).toBeNull();
+    expect(tablesProblem(tables, targeted(tables, { checked: [] }), null)).toBeNull(); // not listed yet
+    expect(tablesProblem(relation, targeted(relation), null)).toBeNull(); // not a schema's copy
+    const many = Array.from({ length: 501 }, (_, i) => node(`t${i}`));
+    expect(tablesProblem(tables, targeted(tables, { checked: many.map((t) => t.name) }), many)).toBe("A copy takes at most 500 tables");
+    expect(requestProblem(tables, targeted(tables, { checked: [] }), listed)).toBe("Check the tables to copy"); // the same words
   });
 
   it("names the dialog and the job by what is copied", () => {
@@ -119,6 +145,20 @@ const table: TableTransfer = {
   problems: [{ code: "unmappable_type", message: "g (geography) has no MySQL type: choose one, or leave the column out", column: "g" }],
 };
 
+describe("whose password a preview asks for (pre-flight M3)", () => {
+  const needed = (detail: unknown) => new ApiError("A password is required", "password_required", 428, detail);
+  it("is the profile the backend names, else the source's", () => {
+    expect(passwordOwner(needed({ password: true, ssh_password: false, profile_id: "dst" }), "src")).toBe("dst");
+    expect(passwordOwner(needed({ password: true, ssh_password: false }), "src")).toBe("src");
+    expect(passwordOwner(needed(null), "src")).toBe("src");
+    expect(passwordOwner(needed(undefined), "src")).toBe("src");
+    expect(passwordOwner(needed({ profile_id: 7 }), "src")).toBe("src");
+    expect(passwordOwner(new Error("x"), "src")).toBe("src");
+    // an inherited property is not a named profile (05b K2)
+    expect(passwordOwner(needed(JSON.parse('{"__proto__": {"profile_id": "evil"}}')), "src")).toBe("src");
+  });
+});
+
 describe("the column mapping", () => {
   it("shows each column, what changes on the way, what blocks the copy and what can be left out", () => {
     const form = withLeftOut(targeted(relation), "public.orders", "note", true);
@@ -131,6 +171,18 @@ describe("the column mapping", () => {
       ["v", null, null, false, false],
     ]);
     expect([rows[1].conversion, rows[2].problem]).toEqual(["converted to UTC: the offset is not kept", table.problems[0].message]);
+  });
+
+  it("shows what the form asks for at once, before the next preview answers (a stale preview is not the form)", () => {
+    const identity = col({ source_name: "id", source_type: "int", family: "int32", target_name: "id", target_type: "int", identity: "keep" });
+    const stale: TableTransfer = { ...table, columns: [identity, table.columns[1]] };
+    const asked = withLeftOut(withIdentity(targeted(relation), "public.orders", "id", "generate"), "public.orders", "placed", true);
+    const rows = mappingRows(stale, asked);
+    // the preview still says "keep" and still copies `placed`: the form's choices show, not the old preview's
+    expect([rows[0].identity, rows[1].leftOut, rows[1].canLeaveOut]).toEqual(["generate", true, true]);
+    // no identity column in the preview: no choice to show, whatever the form holds
+    expect(mappingRows({ ...stale, columns: [table.columns[0]] }, asked)[0].identity).toBeNull();
+    expect(mappingRows(stale, targeted(relation))[0].identity).toBe("keep");
   });
 
   it("keeps a typed type, an identity's choice and a column left out per table, clearing what goes back", () => {

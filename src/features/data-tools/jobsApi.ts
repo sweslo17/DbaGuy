@@ -6,6 +6,8 @@ import type {
   FileInspection,
   JobInfo,
   SessionInfo,
+  TransferPlan,
+  TransferRequest,
 } from "@/lib/api/types";
 
 /*
@@ -60,4 +62,9 @@ export async function fileExcerpt(path: string, line: number): Promise<FileExcer
 
 export async function fetchDumpPlan(body: DumpPlanRequest, signal?: AbortSignal): Promise<DumpPlan> {
   return unwrap(await (await api()).POST("/data/dump/plan", { body, signal }));
+}
+
+/** Copy data's preview (POST /data/transfer/plan): a plan id only while nothing is wrong. */
+export async function fetchTransferPlan(body: TransferRequest, signal?: AbortSignal): Promise<TransferPlan> {
+  return unwrap(await (await api()).POST("/data/transfer/plan", { body, signal }));
 }

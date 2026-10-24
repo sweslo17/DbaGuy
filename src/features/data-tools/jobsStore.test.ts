@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import type { JobInfo, JobOutcomeEvent, RunFileCommand } from "@/lib/api/types";
-import type { RunEntry } from "./entryPoints";
+import type { CopyDataCommand, JobInfo, JobOutcomeEvent, RunFileCommand } from "@/lib/api/types";
+import { initialCopyForm } from "./copyForm";
+import type { CopyEntry, RunEntry } from "./entryPoints";
 import { FakeSocket, sessionInfo } from "./jobFakes";
 import type { JobTransport } from "./jobRunner";
 import { openingJob, type JobLoss } from "./jobState";
@@ -118,6 +119,32 @@ describe("starting a job", () => {
     await flush();
     expect([useJobs.getState().jobs.r1.state.loss, ends]).toEqual(["open_failed", ["open_failed"]]);
     stop();
+  });
+
+  it("keeps a copy's source connection, its form and its tables, a retry too (06c: B13, Copy again, Copy the rest)", async () => {
+    const copyEntry: CopyEntry = {
+      profileId: "src", database: null, source: { kind: "tables", schema: "shop", folder: [{ kind: "schema", name: "shop" }, { kind: "folder", name: "tables" }] },
+    };
+    const form = { ...initialCopyForm(copyEntry, ["a", "b"]), targetProfileId: "p1", targetSchema: "app" };
+    const copyCommand: CopyDataCommand = { type: "copy_data", request_id: "c1", plan_id: "plan", source_session_id: null };
+    fail = new Error("A password is needed");
+    startJob({
+      kind: "copy_data", profileId: "p1", sourceProfileId: "src", database: null, title: "Copy 2 tables", command: copyCommand,
+      entry: copyEntry, tables: ["a", "b"], copy: { form, sources: ["a", "b"] },
+    });
+    const started = useJobs.getState().jobs.c1;
+    expect([started.kind, started.sourceProfileId, started.tables, started.copy]).toEqual(["copy_data", "src", ["a", "b"], { form, sources: ["a", "b"] }]);
+    // the source's connection is as busy as the target's while it runs (its deletion waits)
+    expect(runningOn(useJobs.getState(), "src").map((job) => job.requestId)).toEqual(["c1"]);
+    await flush();
+    fail = null;
+    expect(retryJob("c1")).toBe(true);
+    const again = useJobs.getState().jobs.c1;
+    expect([again.sourceProfileId, again.tables, again.copy]).toEqual(["src", ["a", "b"], { form, sources: ["a", "b"] }]);
+    // a run's record has none of them
+    startJob({ kind: "run_file", profileId: "p1", database: null, title: "t", command: { ...command, request_id: "r2" }, entry });
+    const run = useJobs.getState().jobs.r2;
+    expect([run.sourceProfileId, run.tables, run.copy]).toEqual([null, null, null]);
   });
 
   it("starts again only a job nothing of which reached the backend", async () => {

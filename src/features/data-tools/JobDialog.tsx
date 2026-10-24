@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
+import { FieldRow } from "@/components/ui/Field";
 import { toast } from "@/components/ui/Toast";
 import { ApiError, errorMessage } from "@/lib/api/client";
 import type { FileExcerpt } from "@/lib/api/types";
@@ -214,11 +215,23 @@ export function JobDialog({ record }: { record: JobRecord }) {
       open
       onOpenChange={(open) => !open && close()}
       title={record.title}
-      width={record.kind === "dump" ? 560 : 640}
+      width={record.kind === "dump" ? 560 : record.kind === "copy_data" ? 680 : 640}
       footer={footer}
     >
       <div className="flex flex-col gap-3">
-        <ConnectionLine profileId={record.profileId} database={record.database} />
+        {record.kind === "copy_data" && record.sourceProfileId ? (
+          // a copy has two connections: the title names them, the lines show them (a red one in red)
+          <>
+            <FieldRow label="From">
+              <ConnectionLine profileId={record.sourceProfileId} />
+            </FieldRow>
+            <FieldRow label="To">
+              <ConnectionLine profileId={record.profileId} database={record.database} />
+            </FieldRow>
+          </>
+        ) : (
+          <ConnectionLine profileId={record.profileId} database={record.database} />
+        )}
         {running ? (
           <JobProgressView record={record} />
         ) : state.loss === "open_failed" ? (

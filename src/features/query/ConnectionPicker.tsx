@@ -4,7 +4,7 @@ import { useState } from "react";
 import { EngineIcon } from "@/components/EngineIcon";
 import { DropdownMenu, type MenuItem } from "@/components/ui/ContextMenu";
 import { errorMessage } from "@/lib/api/client";
-import type { Profile, ProfileEntry, SessionInfo } from "@/lib/api/types";
+import type { PathSegment, Profile, ProfileEntry, SessionInfo } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { ENGINE_LABELS } from "@/lib/engines";
 import { buildFolderTree, type FolderNode } from "../connections/folders";
@@ -66,6 +66,8 @@ export function profileItems(
   ];
 }
 
+const NO_PATH: PathSegment[] = [];
+
 /** What the database picker lists: the root's database nodes, or MySQL's schema nodes (its databases). */
 export type DatabaseNodeKind = "database" | "schema";
 
@@ -85,16 +87,19 @@ export function DatabasePicker({
   blockedReason,
   onPick,
   nodeKind = "database",
+  under = NO_PATH,
 }: {
   profileId: string;
   current: string | null;
   blockedReason?: string;
   onPick: (database: string) => void;
   nodeKind?: DatabaseNodeKind;
+  /** Whose children it lists: the root, or a database node (a copy's target schema in PostgreSQL, SQL Server; 06c). */
+  under?: PathSegment[];
 }) {
   const words = NODE_WORDS[nodeKind];
   const [open, setOpen] = useState(false);
-  const children = useQuery({ ...childrenQuery(profileId, []), enabled: open });
+  const children = useQuery({ ...childrenQuery(profileId, under), enabled: open });
   let items: MenuItem[];
   if (children.isPending) items = [{ label: "Loading…", disabled: true }];
   else if (children.isError) items = [{ label: errorMessage(children.error), disabled: true }];

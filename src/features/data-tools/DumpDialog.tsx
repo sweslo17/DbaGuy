@@ -14,8 +14,6 @@ import { chooseSavePath } from "@/lib/native";
 import { useDebouncedValue } from "@/lib/useDebouncedValue";
 import { useStagedEdits } from "@/stores/stagedEdits";
 import { useEngineInfo, useProfiles } from "../connections/hooks";
-import { RecoverableError } from "../connections/RecoverableError";
-import { isPasswordRequired } from "../connections/UnlockDialog";
 import { changeCount } from "../edits/staging";
 import { NOT_IN_DUMP } from "../edits/tableEditing";
 import { childrenQuery } from "../explorer/useTreeRows";
@@ -40,7 +38,7 @@ import type { DumpEntry } from "./entryPoints";
 import { dumpFileName } from "./fileNames";
 import { fetchDumpPlan } from "./jobsApi";
 import { startJob } from "./jobsStore";
-import { ConnectionLine } from "./JobViews";
+import { ConnectionLine, ReadProblem } from "./JobViews";
 
 /**
  * The plan is read again once the choices have stayed the same this long: a run of clicks on the tables or a path being
@@ -54,21 +52,6 @@ const FILTER_TITLE_PREFIX = "WHERE ";
 /** The reasons of a group's greyed choices, each once: shown under the group (a `title` lands on the input only). */
 const reasonsOf = (choices: readonly Choice<unknown>[]) =>
   [...new Set(choices.flatMap((choice) => (choice.disabled ? [choice.disabled] : [])))].join(" · ");
-
-/** A read that failed: a missing password asks for it (then reads again); another error says why, with Retry. */
-function ReadProblem({ profileId, error, retry }: { profileId: string; error: Error; retry: () => void }) {
-  if (isPasswordRequired(error)) return <RecoverableError profileId={profileId} error={error} onRetry={retry} />;
-  return (
-    <div className="flex items-start gap-2 text-[12px] text-danger">
-      <span className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]" data-selectable>
-        {errorMessage(error)}
-      </span>
-      <Button size="sm" onClick={retry}>
-        Retry
-      </Button>
-    </div>
-  );
-}
 
 /**
  * The Tables folder's tables, every one checked the first time they arrive (§3.3.1); All, None and the count, and beside

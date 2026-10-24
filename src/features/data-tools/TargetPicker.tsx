@@ -1,5 +1,6 @@
+import type { ReactNode } from "react";
 import { DropdownMenu, type MenuItem } from "@/components/ui/ContextMenu";
-import type { Profile, ProfileEntry } from "@/lib/api/types";
+import type { EngineInfo, Profile, ProfileEntry } from "@/lib/api/types";
 import { buildFolderTree } from "../connections/folders";
 import { findEngineInfo, useEngines, useProfiles } from "../connections/hooks";
 import { DatabasePicker, profileItems } from "../query/ConnectionPicker";
@@ -11,18 +12,25 @@ const READ_ONLY = "Read-only: it cannot run files";
 const readOnlyReason = (profile: Profile): string | null => (profile.read_only ? READ_ONLY : null);
 
 /**
- * Where Run SQL file runs (spec ⑥ §3.6): the connection, among those whose engine runs files (a read-only one greyed
- * with why), and its database where the engine has them (MySQL: its schemas). The trigger reads as the query tab's: a
- * red connection on a red chip. Picking a connection gives its default database (`onChange(id, null)`).
+ * Where Run SQL file runs, or where a copy goes (spec ⑥ §3.6): the connection, among those whose engine has the tool
+ * (`tool`; one it refuses greyed with why: a read-only one), and its database where the engine has them (MySQL: its
+ * schemas). The trigger reads as the query tab's: a red connection on a red chip. Picking a connection gives its default
+ * database (`onChange(id, null)`). `children`: what follows the database (a copy's schema).
  */
 export function TargetPicker({
   profileId,
   database,
   onChange,
+  tool = "run_file",
+  refusal = readOnlyReason,
+  children,
 }: {
   profileId: string | null;
   database: string | null;
   onChange: (profileId: string, database: string | null) => void;
+  tool?: keyof Pick<EngineInfo, "run_file" | "copy_data">;
+  refusal?: (profile: Profile) => string | null;
+  children?: ReactNode;
 }) {
   const profiles = useProfiles();
   const engines = useEngines();
@@ -31,13 +39,13 @@ export function TargetPicker({
   const engine = findEngineInfo(entries, engines.data, profileId);
   // Only once both lists are here: until then, which engines run files is not known
   const runnable = engines.data
-    ? entries.filter((entry) => findEngineInfo(entries, engines.data, entry.profile.id)?.run_file)
+    ? entries.filter((entry) => findEngineInfo(entries, engines.data, entry.profile.id)?.[tool])
     : [];
   const pick = (id: string) => {
     if (id !== profileId) onChange(id, null);
   };
   const items: MenuItem[] = runnable.length
-    ? profileItems(buildFolderTree(runnable), profileId, pick, readOnlyReason)
+    ? profileItems(buildFolderTree(runnable), profileId, pick, refusal)
     : [{ label: profiles.isPending || engines.isPending ? "Loading…" : "No connections", disabled: true }];
   const nodes = databaseNodes(engine);
   return (
@@ -61,6 +69,7 @@ export function TargetPicker({
           onPick={(name) => name !== database && onChange(profileId, name)}
         />
       )}
+      {children}
     </div>
   );
 }
