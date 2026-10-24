@@ -24,9 +24,15 @@ const P = "p1";
 const TABLE: Tab = { id: "table:1", kind: "table", profileId: P, path: [{ kind: "database", name: "d" }, { kind: "schema", name: "s" }, { kind: "folder", name: "tables" }, { kind: "table", name: "t" }], title: "t" };
 const QUERY = { id: "query:1", kind: "query", profileId: P, database: null, title: "Q" } as unknown as Tab;
 
-function context(activeTab: Tab | null, dump = true, tableActions: TableTabActions | null = null, copy = true): CommandContext {
+function context(
+  activeTab: Tab | null,
+  dump = true,
+  tableActions: TableTabActions | null = null,
+  copy = true,
+  database: string | null = "dbaguy",
+): CommandContext {
   const queryClient = new QueryClient();
-  queryClient.setQueryData<ProfileEntry[]>(profilesKey, [{ profile: { id: P, engine: "postgres", name: "Local PG", database: "dbaguy" } } as ProfileEntry]);
+  queryClient.setQueryData<ProfileEntry[]>(profilesKey, [{ profile: { id: P, engine: "postgres", name: "Local PG", database } } as ProfileEntry]);
   queryClient.setQueryData<EngineInfo[]>(enginesKey, [
     { engine: "postgres", dump, run_file: true, copy_data: copy, per_database_connection: true } as EngineInfo,
   ]);
@@ -95,5 +101,23 @@ describe("the palette's data-tools commands", () => {
       database: "dbaguy",
       source: { kind: "tables", schema: "public", folder: [{ kind: "database", name: "dbaguy" }, { kind: "schema", name: "public" }, { kind: "folder", name: "tables" }] },
     }]);
+  });
+
+  it("grey Copy data to… on a query tab whose connection has no database, as Dump… is, and open nothing", () => {
+    const ctx = context(QUERY, true, null, true, null);
+    expect([command("dataTools.dump").enabled(ctx), command("dataTools.copy").enabled(ctx)]).toEqual([false, false]);
+    command("dataTools.copy").run(ctx);
+    expect(opened.copy).toEqual([]);
+    // with a database it is on
+    expect(command("dataTools.copy").enabled(context(QUERY))).toBe(true);
+  });
+
+  it("grey a table tab's Copy data to… while its own action cannot run, and run nothing then", () => {
+    const run = vi.fn();
+    mounted.actions = { dumpTable: { enabled: true, run: vi.fn() }, copyRows: { enabled: false, run } };
+    const ctx = context(TABLE, true, mounted.actions);
+    expect(command("dataTools.copy").enabled(ctx)).toBe(false);
+    command("dataTools.copy").run(ctx);
+    expect([run.mock.calls.length, opened.copy]).toEqual([0, []]);
   });
 });

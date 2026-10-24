@@ -8,16 +8,18 @@ import {
   copyProblem,
   copyRequest,
   initialCopyForm,
+  MODE_HINTS,
   passwordOwner,
   QUERY_TABLE,
   requestProblem,
   restForm,
+  statementFirstLine,
   tablesProblem,
   withTarget,
   type CopyForm,
 } from "./copyForm";
 import type { CopyEntry } from "./entryPoints";
-import { mappingRows, previewProblems, statementLines, withIdentity, withLeftOut, withOverride } from "./mappingRows";
+import { mappingRows, previewProblems, statementLines, tablesToDraw, withIdentity, withLeftOut, withOverride } from "./mappingRows";
 
 /* Copy data's form and its column mapping (spec ⑥ §3.6 CopyDataDialog, MappingTable; 06c Task 6). */
 
@@ -207,5 +209,37 @@ describe("the column mapping", () => {
   it("marks the DELETE of the rows a copy replaces as dangerous, and says each problem once", () => {
     expect(statementLines(table).map((line) => line.danger)).toEqual([false, true, false]);
     expect(previewProblems({ problems: [{ message: "x" }], tables: [table, table] })).toEqual(["x", table.problems[0].message]);
+  });
+
+  it("keeps the order of the rows among a table's statements, and draws the tables with a problem first once there is a cap", () => {
+    const lines = statementLines(table);
+    expect(lines.map((line) => [line.phase, line.danger])).toEqual([["before", false], ["before", true], ["after", false]]);
+    const plain = (name: string, fields: Partial<TableTransfer> = {}): TableTransfer => ({
+      ...table, source: name, source_key: name, target: name, columns: [], before: [], after: [], problems: [], ...fields,
+    });
+    const many = [plain("a"), plain("b"), plain("c", { problems: [{ code: "unmappable_type", message: "x" }] }), plain("d"), plain("e", {
+      columns: [col({ source_name: "g", source_type: "geography", family: "spatial", problem: "no type" })],
+    })];
+    // under the cap: the copy's own order (parents first)
+    expect(tablesToDraw(many, 5).map((t) => t.source)).toEqual(["a", "b", "c", "d", "e"]);
+    // over it: a table with a problem of its own or a column's is always drawn, and first; the rest fill the cap in order
+    expect(tablesToDraw(many, 3).map((t) => t.source)).toEqual(["c", "e", "a"]);
+    // more problems than the cap: all of them, nothing else
+    expect(tablesToDraw(many, 1).map((t) => t.source)).toEqual(["c", "e"]);
+    expect(tablesToDraw(many, Infinity)).toEqual(many);
+  });
+
+  it("says the modes the way the backend ends them: rolled back where the table can be, not always", () => {
+    expect(MODE_HINTS.append).toContain("rolled back where the table can");
+    expect(MODE_HINTS.replace_rows).toContain("in one transaction where the table can roll back");
+    expect(MODE_HINTS.append + MODE_HINTS.replace_rows).not.toMatch(/same transaction|rolls the table back/);
+  });
+
+  it("shows a query's first line that says something, cut, and only reads the start of a long statement", () => {
+    expect(statementFirstLine("\n\n  SELECT a,\n  b FROM t")).toBe("SELECT a,");
+    expect(statementFirstLine("-- Orders of 2026\nSELECT 1")).toBe("-- Orders of 2026");
+    expect(statementFirstLine("x".repeat(500), 20)).toBe(`${"x".repeat(20)}…`);
+    expect(statementFirstLine("")).toBe("");
+    expect(statementFirstLine(`SELECT 1${" ".repeat(10_000)}\nSELECT 2`)).toBe("SELECT 1");
   });
 });

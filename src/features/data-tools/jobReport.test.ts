@@ -626,7 +626,7 @@ describe("a copy in words (06c)", () => {
     const failed = said(copied({ outcome: "rolled_back", error: { code: "value_not_copyable", message: "Row 2 of public.a, column at: …" } }));
     expect([failed.error?.label, failed.hint]).toEqual([
       CODE_LABELS.value_not_copyable,
-      "Leave that row out with a filter or, in a new table, give the column a text type; then copy again.",
+      "Leave that row out (with a filter, or in the query) or, in a new table, give the column a text type; then copy again.",
     ]);
     expect(codeLabel("source_failed")).toBe("Reading the source failed");
     const lost = said(copied({ outcome: "partial", error: { code: "connection_lost", message: "gone" } }));
@@ -644,7 +644,7 @@ describe("a copy in words (06c)", () => {
     expect(progressView({ ...view, state: commit }, 3_000, ["a", "b", "c"]).headline).toBe("Committing b (2 of 3)");
     expect(cancelNote({ ...view, state: commit })).toBeNull();
     expect(progressView(view, 2_000, ["b"]).headline).toBe("Copying b");
-    expect(cancelNote(view)).toBe("Cancel rolls back the table being copied; the tables before it stay");
+    expect(cancelNote(view)).toBe("Cancel rolls back the rows of the table being copied, unless the table cannot roll back; the tables before it stay");
   });
 
   it("says what happened to the table a copy stopped at, and does not invent one (pre-flight L-k)", () => {
@@ -682,10 +682,10 @@ describe("a copy in words (06c)", () => {
   it("says a connection lost for what it left, and never offers to copy what may be there (unknown)", () => {
     const lost = (event: Partial<JobOutcomeEvent>) => said(copied({ error: { code: "connection_lost", message: "gone" }, ...event }));
     expect(lost({ outcome: "partial" }).hint).toBe(
-      "The table being copied was rolled back by the server as the connection ended; the tables before it stay copied.",
+      "The rows of the table being copied were rolled back by the server as the connection ended; the tables before it stay copied.",
     );
     expect(lost({ outcome: "rolled_back" }).hint).toBe(
-      "The table being copied was rolled back by the server as the connection ended: nothing was copied.",
+      "The rows of the table being copied were rolled back by the server as the connection ended: nothing was copied.",
     );
     expect(lost({ outcome: "rolled_back", objects: [{ kind: "table", name: "a", source: "public.a", rows: 0, outcome: "not_started" }] }).hint).toBe(
       "The connection was lost before the first table started: nothing was copied.",
@@ -726,7 +726,7 @@ describe("a copy in words (06c)", () => {
     };
     const progress: JobProgressEvent = { type: "job_progress", request_id: "r1", stage: "data", object: "b", rows: 10, bytes: 0, statements: 1, errors: 0 };
     expect(lostCopy(progress).detail).toBe(
-      "The table being copied should have been rolled back by the server as its connection ended, and the tables before it should still be copied. Check the target.",
+      "The rows of the table being copied should have been rolled back by the server as its connection ended, and the tables before it should still be copied. Check the target.",
     );
     expect(lostCopy({ ...progress, stage: "commit" }).detail).toBe("It stopped during a table's COMMIT: whether that table is copied is not known. Check the target.");
     // nothing reported at all: nothing is claimed of any table (not_listed also means the command never arrived)

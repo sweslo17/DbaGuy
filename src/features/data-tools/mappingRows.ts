@@ -84,9 +84,28 @@ export function withLeftOut(form: CopyForm, table: string, column: string, out: 
   return { ...form, leftOut: withKey(form.leftOut, table, columns.length ? columns : undefined) };
 }
 
-/** The statements a table adds, each with whether it destroys rows (replace's DELETE: danger, M11). */
-export function statementLines(table: TableTransfer): { sql: string; danger: boolean }[] {
-  return [...table.before, ...table.after].map((sql) => ({ sql, danger: /^\s*DELETE\b/i.test(sql) }));
+/**
+ * The statements a table adds, each with whether it destroys rows (replace's DELETE: danger, M11) and whether it runs
+ * before the rows or after them (the dialog marks where the rows go between the two groups).
+ */
+export function statementLines(table: TableTransfer): { sql: string; danger: boolean; phase: "before" | "after" }[] {
+  const line = (phase: "before" | "after") => (sql: string) => ({ sql, danger: /^\s*DELETE\b/i.test(sql), phase });
+  return [...table.before.map(line("before")), ...table.after.map(line("after"))];
+}
+
+/** A table with something that blocks the copy: a problem of its own or of one of its columns. */
+const hasProblem = (table: TableTransfer): boolean => table.problems.length > 0 || table.columns.some((column) => column.problem);
+
+/**
+ * The tables a preview draws: all of them while `limit` allows; past it the first `limit` ones, except that a table with a
+ * problem is always drawn, and first (the problem list names a column with no table; the user must find it). Without a
+ * cap the preview keeps the copy's own order (parents first).
+ */
+export function tablesToDraw(tables: readonly TableTransfer[], limit: number): TableTransfer[] {
+  if (tables.length <= limit) return [...tables];
+  const troubled = tables.filter(hasProblem);
+  const rest = tables.filter((table) => !hasProblem(table));
+  return [...troubled, ...rest.slice(0, Math.max(0, limit - troubled.length))];
 }
 
 /** Every problem of the preview, the copy's first: what blocks Copy, said once each. */

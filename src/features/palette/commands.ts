@@ -45,7 +45,7 @@ export interface CommandContext {
   tabActions: QueryTabActions | null;
   /** The active table tab's edit actions; null when no table tab is active. */
   editActions: TableEditActions | null;
-  /** The active table tab's other actions (Dump table…); null when no table tab is active. */
+  /** The active table tab's other actions (Dump table…, Copy rows to…); null when no table tab is active. */
   tableActions: TableTabActions | null;
   settings: {
     /** The stored settings are known (until then nothing may be saved over them). */

@@ -161,7 +161,7 @@ const CODE_HINTS: Partial<Record<JobErrorCode, string>> = {
     "The file was edited after the run that gave this place, so its statement numbers are not the ones they were. Look at the file, then set where to start again.",
   plan_expired: "Copy again: the preview is read once more.",
   // a new table's column type can be typed over; an existing table's cannot
-  value_not_copyable: "Leave that row out with a filter or, in a new table, give the column a text type; then copy again.",
+  value_not_copyable: "Leave that row out (with a filter, or in the query) or, in a new table, give the column a text type; then copy again.",
   // as the backend says it: "may" (a trigger, a rule or an index option that ignores duplicates reports the same)
   row_count_mismatch:
     "A trigger, rule or index option on the target may have skipped or changed rows: copy into a table without it.",
@@ -208,8 +208,8 @@ export function codeLabel(code: string | null | undefined, kind?: JobKind): stri
  */
 const lostTable = (known: boolean): string =>
   known
-    ? "The table being copied was rolled back by the server as the connection ended"
-    : "The table being copied should have been rolled back by the server as its connection ended";
+    ? "The rows of the table being copied were rolled back by the server as the connection ended"
+    : "The rows of the table being copied should have been rolled back by the server as its connection ended";
 
 /** What a lost connection (the target's: a source that is lost is `source_failed`) means for a copy, by its outcome. */
 function copyLostHint(outcome: JobOutcomeEvent): string {
@@ -735,15 +735,19 @@ export function progressView(view: JobView, now: number, tables: readonly string
 /**
  * What Cancel does to a running job, said beside the button (spec ⑥ §3.6): a dump writes no file; a run in one
  * transaction is rolled back; a run statement by statement keeps what took effect, except a transaction the file opened
- * and did not commit, which is rolled back (pre-flight M5). Nothing for a job listed after a reload (its mode is not
- * known here), nor during a run's COMMIT, which Cancel no longer stops.
+ * and did not commit, which is rolled back (pre-flight M5); a copy rolls back the rows of the table it is copying, unless
+ * that table cannot roll back (a MySQL table of another engine ends unknown; the backend's notes say so), and the tables
+ * before it stay. Nothing for a job listed after a reload (its mode is not known here), nor during a COMMIT, which Cancel
+ * no longer stops.
  */
 export function cancelNote(view: JobView): string | null {
   const { command, state } = view;
   if (!command || state.phase === "ended") return null;
   if (command.type === "dump") return "Cancel writes no file";
   if (command.type === "copy_data") {
-    return state.progress?.stage === "commit" ? null : "Cancel rolls back the table being copied; the tables before it stay";
+    return state.progress?.stage === "commit"
+      ? null
+      : "Cancel rolls back the rows of the table being copied, unless the table cannot roll back; the tables before it stay";
   }
   if (state.progress?.stage === "commit") return null;
   return command.mode === "all_or_nothing"

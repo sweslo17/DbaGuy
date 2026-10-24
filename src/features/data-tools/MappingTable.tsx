@@ -1,5 +1,5 @@
 import { useState, type KeyboardEvent } from "react";
-import { Checkbox, Input } from "@/components/ui/Field";
+import { Checkbox, Input, Select } from "@/components/ui/Field";
 import type { TableTransfer } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { isImeKeyEvent } from "@/lib/ime";
@@ -12,6 +12,9 @@ import { mappingRows, statementLines, withIdentity, withLeftOut, withOverride, t
  * identity's keep or generate when appending; the statements the copy adds around the rows (a DELETE in danger, M11).
  * Every change goes to the form, and the dialog reads the preview again. The words come from `mappingRows` only.
  */
+
+/** What marks where the rows go among a table's statements: those before them above it, those after them below. */
+const ROWS_HERE = "the rows are copied here";
 
 /** A header cell: sticky on its own (a sticky `thead` is not honoured everywhere), over the rows scrolling under it. */
 const HEAD = "sticky top-0 bg-elevated px-2 py-1 font-normal";
@@ -50,6 +53,21 @@ function TypeField({ row, onType }: { row: MappingRow; onType: (text: string) =>
   );
 }
 
+/** A statement the copy adds; replace's DELETE in the danger colour. */
+function StatementBox({ sql, danger }: { sql: string; danger: boolean }) {
+  return (
+    <pre
+      className={cn(
+        "max-h-40 overflow-auto rounded-md border px-2 py-1 font-mono text-[11px] whitespace-pre-wrap [scrollbar-gutter:stable] [overflow-wrap:anywhere]",
+        danger ? "border-danger/40 bg-danger/10 font-medium text-danger" : "border-border text-muted",
+      )}
+      data-selectable
+    >
+      {sql}
+    </pre>
+  );
+}
+
 export function MappingTable({
   table,
   form,
@@ -62,6 +80,15 @@ export function MappingTable({
   const rows = mappingRows(table, form);
   const key = table.source_key;
   const statements = statementLines(table);
+  // A column put back keeps its box until the next preview answers: the preview on show still says it is left out
+  // (so it is not "copied now"), and a box that vanished for the length of a read would look broken. The list belongs to
+  // the preview it was made on; a new preview (a new `table`) starts it empty.
+  const [putBack, setPutBack] = useState<{ on: TableTransfer; names: readonly string[] }>({ on: table, names: [] });
+  const returning = putBack.on === table ? putBack.names : [];
+  const leaveOut = (row: MappingRow, out: boolean) => {
+    onChange(withLeftOut(form, key, row.source, out));
+    if (!out) setPutBack({ on: table, names: [...returning, row.source] });
+  };
   return (
     <div className="flex flex-col gap-2 text-[12px]">
       {/* A fixed height, its scrollbar's room reserved: a classic scrollbar never sits over the last column */}
@@ -80,12 +107,21 @@ export function MappingTable({
             {/* By position: a query's columns may share a name (the preview names that as a problem), and the order is the source's */}
             {rows.map((row, index) => (
               <tr key={index} className="border-t border-border align-top">
-                <td className="px-2 py-1" data-selectable>
-                  <span className="font-mono [overflow-wrap:anywhere]">{row.source}</span>
+                {/* Names are never broken inside a word: room for them, and a long one is cut (whole on hover) */}
+                <td className="min-w-[7rem] px-2 py-1" data-selectable>
+                  <span className="block max-w-[14rem] truncate font-mono" title={row.source}>
+                    {row.source}
+                  </span>
                   <span className="block text-[11px] text-muted">{row.sourceType}</span>
                 </td>
-                <td className="px-2 py-1 font-mono [overflow-wrap:anywhere]" data-selectable>
-                  {row.target ?? <span className="text-muted">—</span>}
+                <td className="min-w-[7rem] px-2 py-1 font-mono" data-selectable>
+                  {row.target === null ? (
+                    <span className="text-muted">—</span>
+                  ) : (
+                    <span className="block max-w-[14rem] truncate" title={row.target}>
+                      {row.target}
+                    </span>
+                  )}
                 </td>
                 <td className="min-w-[9rem] px-2 py-1">
                   {row.typeEditable && !row.skipped && !row.leftOut ? (
@@ -96,18 +132,18 @@ export function MappingTable({
                     </span>
                   )}
                   {row.identity && (
-                    <select
-                      className="mt-1 h-6 rounded border border-border bg-elevated px-1 text-[12px]"
+                    <Select
+                      className="mt-1"
                       value={row.identity}
                       aria-label={`Identity of ${row.target ?? row.source}`}
                       onChange={(e) => onChange(withIdentity(form, key, row.source, e.target.value as IdentityChoice))}
                     >
                       <option value="keep">Keep the source's values</option>
                       <option value="generate">Let the target generate them</option>
-                    </select>
+                    </Select>
                   )}
                 </td>
-                <td className="px-2 py-1 [overflow-wrap:anywhere]" data-selectable>
+                <td className="min-w-[8rem] px-2 py-1 [overflow-wrap:anywhere]" data-selectable>
                   {row.problem ? (
                     <span className="text-danger">{row.problem}</span>
                   ) : row.skipped ? (
@@ -117,12 +153,12 @@ export function MappingTable({
                   ) : null}
                 </td>
                 <td className="px-2 py-1">
-                  {row.canLeaveOut && (
+                  {(row.canLeaveOut || returning.includes(row.source)) && (
                     <Checkbox
                       label=""
                       checked={!row.leftOut}
                       aria-label={`Copy ${row.source}`}
-                      onChange={(e) => onChange(withLeftOut(form, key, row.source, !e.target.checked))}
+                      onChange={(e) => leaveOut(row, !e.target.checked)}
                     />
                   )}
                 </td>
@@ -133,18 +169,17 @@ export function MappingTable({
       </div>
       {statements.length > 0 && (
         <div className="flex flex-col gap-1">
-          {statements.map((line, i) => (
-            <pre
-              key={i}
-              className={cn(
-                "max-h-40 overflow-auto rounded-md border px-2 py-1 font-mono text-[11px] whitespace-pre-wrap [scrollbar-gutter:stable] [overflow-wrap:anywhere]",
-                line.danger ? "border-danger/40 bg-danger/10 font-medium text-danger" : "border-border text-muted",
-              )}
-              data-selectable
-            >
-              {line.sql}
-            </pre>
-          ))}
+          {statements
+            .filter((line) => line.phase === "before")
+            .map((line, i) => (
+              <StatementBox key={`before-${i}`} sql={line.sql} danger={line.danger} />
+            ))}
+          <p className="text-center text-[11px] text-muted">— {ROWS_HERE} —</p>
+          {statements
+            .filter((line) => line.phase === "after")
+            .map((line, i) => (
+              <StatementBox key={`after-${i}`} sql={line.sql} danger={line.danger} />
+            ))}
         </div>
       )}
     </div>

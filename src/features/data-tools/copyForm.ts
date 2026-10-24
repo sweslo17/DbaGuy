@@ -33,8 +33,8 @@ export const MODE_LABELS: Record<CopyMode, string> = {
 /** What each mode does, under it (R-06-9). */
 export const MODE_HINTS: Record<CopyMode, string> = {
   create: "Its columns, NOT NULL and the primary key only: no defaults, indexes, foreign keys or identities",
-  append: "Columns are matched by name; a key that is already there rolls the table back",
-  replace_rows: "Every row of the target goes first (DELETE FROM), in the same transaction as the new ones",
+  append: "Columns are matched by name; a key that is already there stops the table, and its rows are rolled back where the table can",
+  replace_rows: "Every row of the target goes first (DELETE FROM), then the new ones follow, in one transaction where the table can roll back",
 };
 /** The new table's name of a query's result, until the user names it. */
 export const QUERY_TABLE = "query_result";
@@ -94,7 +94,8 @@ export function withTarget(form: CopyForm, profile: Profile, engine: EngineInfo)
 export const targetRefusal = (profile: Profile): string | null =>
   profile.read_only ? "Read-only: nothing can be copied into it" : null;
 
-const isOne = (entry: CopyEntry) => entry.source.kind !== "tables";
+/** One source (a table, a view or a query's result): the form names its target table; a schema's tables keep their names. */
+export const isOne = (entry: CopyEntry): boolean => entry.source.kind !== "tables";
 
 /** The relations a schema's tables source copies: the checked ones, in the tree's order. */
 function checkedPaths(entry: CopyEntry, form: CopyForm, tables: readonly ObjectNode[] | null) {
@@ -224,4 +225,12 @@ export function passwordOwner(error: Error, fallback: string): string {
   const detail = error instanceof ApiError && typeof error.detail === "object" ? error.detail : null;
   const named = detail !== null && Object.hasOwn(detail, "profile_id") ? (detail as { profile_id: unknown }).profile_id : null;
   return typeof named === "string" ? named : fallback;
+}
+
+/** What a query's statement shows in the form: its first line that says something, cut at `max` characters. */
+export function statementFirstLine(sql: string, max = 200): string {
+  // only the start is read: a statement may be megabytes, and its first line is what is shown
+  const line = sql.slice(0, 4 * max).split(/\r\n|\r|\n/).find((text) => text.trim() !== "") ?? "";
+  const text = line.trim();
+  return text.length > max ? `${text.slice(0, max).trimEnd()}…` : text;
 }

@@ -1,12 +1,11 @@
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { useId, useMemo, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
 import { Checkbox, FieldRow, Input, Radio } from "@/components/ui/Field";
-import type { TransferPlan, TransferRequest } from "@/lib/api/types";
+import type { TransferPlan } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { isImeKeyEvent } from "@/lib/ime";
-import { useDebouncedValue } from "@/lib/useDebouncedValue";
 import { useStagedEdits } from "@/stores/stagedEdits";
 import { findEngineInfo, useEngines, useProfiles } from "../connections/hooks";
 import { changeCount } from "../edits/staging";
@@ -21,11 +20,12 @@ import {
   copyRequest,
   defaultSchema,
   initialCopyForm,
+  isOne,
   MODE_HINTS,
   MODE_LABELS,
-  MAX_COPY_TABLES,
   passwordOwner,
   planTargets,
+  statementFirstLine,
   tablesProblem,
   targetRefusal,
   withTarget,
@@ -36,73 +36,18 @@ import { closeDataDialog, openJobDialog } from "./dataDialogs";
 import type { CopyEntry } from "./entryPoints";
 import { fetchTransferPlan } from "./jobsApi";
 import { startJob } from "./jobsStore";
-import { ConnectionLine, ignoreHeldReturn, ReadProblem } from "./JobViews";
-import { previewProblems } from "./mappingRows";
+import { ConnectionLine, FilterCode, ignoreHeldReturn, ReadProblem } from "./JobViews";
+import { previewProblems, tablesToDraw } from "./mappingRows";
 import { MappingTable } from "./MappingTable";
+import { databaseNodes } from "./runForm";
+import { TableChecks } from "./TableChecks";
 import { TargetPicker } from "./TargetPicker";
+import { useSettledRead } from "./useSettledRead";
 
-/**
- * The preview is read again once the choices have stayed the same this long (as the dump's plan): a run of clicks or a
- * typed type is one read of both catalogs, not one per change.
- */
-const PLAN_DEBOUNCE_MS = 400;
-const FILTER_TITLE_PREFIX = "WHERE ";
 const MODES: CopyMode[] = ["create", "append", "replace_rows"];
 /** A preview draws this many tables' mappings at first (Q1: a copy may hold 500); the rest on request. */
 const PREVIEW_TABLES = 40;
 const NO_DATABASE_FOR_SCHEMAS = "Choose the database first: its schemas are listed from it";
-
-/**
- * A schema's tables, every one checked the first time they arrive (the dialog seeds that); All, None, the count, and beside
- * it what is wrong with the checks (none, or more than a copy takes): said here, not only on Copy's tooltip.
- */
-function TableChecks({
-  names,
-  checked,
-  problem,
-  onChange,
-}: {
-  names: string[];
-  checked: readonly string[];
-  problem: string | null;
-  onChange: (names: string[]) => void;
-}) {
-  const on = new Set(checked);
-  // The tree's order, whatever the order of the clicks
-  const toggle = (name: string, value: boolean) => onChange(names.filter((n) => (n === name ? value : on.has(n))));
-  return (
-    <div className="flex flex-col gap-1">
-      <div className="flex items-start gap-1 text-[12px]">
-        <Button size="sm" variant="ghost" onClick={() => onChange(names)}>
-          All
-        </Button>
-        <Button size="sm" variant="ghost" onClick={() => onChange([])}>
-          None
-        </Button>
-        <span className="ml-auto min-w-0 pt-1 text-right">
-          <span className={cn("tabular-nums", checked.length > MAX_COPY_TABLES ? "text-danger" : "text-muted")}>
-            {checked.length.toLocaleString()} of {names.length.toLocaleString()} checked
-          </span>
-          {problem && (
-            // none checked: what to do; too many: what a copy cannot take
-            <span className={cn("block", checked.length > 0 ? "text-danger" : "text-muted")}>{problem}</span>
-          )}
-        </span>
-      </div>
-      <div className="flex max-h-40 flex-col gap-0.5 overflow-y-auto rounded-md border border-border px-2 py-1 [scrollbar-gutter:stable]">
-        {names.length === 0 && <p className="text-[12px] text-muted">No tables</p>}
-        {names.map((name) => (
-          <Checkbox
-            key={name}
-            label={<span className="[overflow-wrap:anywhere]">{name}</span>}
-            checked={on.has(name)}
-            onChange={(e) => toggle(name, e.target.checked)}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
 
 /**
  * The preview: what blocks the copy (each problem once, in red), each table's mapping and statements, then the warnings
@@ -122,11 +67,11 @@ function Preview({
   const [all, setAll] = useState(false);
   const problems = previewProblems(plan);
   const warnings = [...new Set([...plan.warnings, ...plan.tables.flatMap((table) => table.warnings)])];
-  const drawn = all ? plan.tables : plan.tables.slice(0, PREVIEW_TABLES);
+  const drawn = tablesToDraw(plan.tables, all ? Infinity : PREVIEW_TABLES);
   return (
     <div className={cn("flex flex-col gap-3 transition-opacity", stale && "opacity-60")}>
       {problems.length > 0 && (
-        <ul className="flex flex-col gap-1 rounded-md border border-danger/40 bg-danger/10 p-2 text-[12px] text-danger">
+        <ul className="flex max-h-48 flex-col gap-1 overflow-y-auto rounded-md border border-danger/40 bg-danger/10 p-2 text-[12px] text-danger [scrollbar-gutter:stable]">
           {problems.map((problem, i) => (
             <li key={i} className="whitespace-pre-wrap [overflow-wrap:anywhere]" data-selectable>
               {problem}
@@ -151,7 +96,7 @@ function Preview({
         </p>
       )}
       {warnings.length > 0 && (
-        <ul className="flex list-disc flex-col gap-1 pl-4 text-[12px] text-warning">
+        <ul className="flex max-h-48 list-disc flex-col gap-1 overflow-y-auto pl-4 text-[12px] text-warning [scrollbar-gutter:stable]">
           {warnings.map((warning, i) => (
             <li key={i} className="whitespace-pre-wrap [overflow-wrap:anywhere]" data-selectable>
               {warning}
@@ -192,33 +137,20 @@ export function CopyDataDialog({ entry, form: preset }: { entry: CopyEntry; form
     setForm((current) => ({ ...current, checked: tables.map((table) => table.name) }));
   }
 
-  // The preview: asked once the choices settle; the one of the choices before stays, dimmed, while the next is read.
-  // Keyed by its content: a form change the preview does not read keeps the same request, so nothing dims or waits.
+  // The preview: asked once the choices settle; the one of the choices before stays, dimmed, while the next is read, and is
+  // never what Copy runs (`current` is the only door to the job). Keyed by content: a form change the preview does not
+  // read keeps the same request, so nothing dims or waits.
   const requestKey = useMemo(() => {
     const fresh = copyRequest(entry, form, tables);
     return fresh === null ? null : JSON.stringify(fresh);
   }, [entry, form, tables]);
-  const request = useMemo(() => (requestKey === null ? null : (JSON.parse(requestKey) as TransferRequest)), [requestKey]);
-  const body = useDebouncedValue(request, PLAN_DEBOUNCE_MS);
-  const plan = useQuery({
-    queryKey: ["copyPlan", body],
-    queryFn: ({ signal }) => fetchTransferPlan(body!, signal),
-    enabled: body !== null,
-    retry: false,
-    gcTime: 0,
-    placeholderData: keepPreviousData,
-  });
-  // None while no preview can be asked (a disabled query still hands back the previous one as its placeholder). The one
-  // shown is behind while it is for other choices than these (settling, or being read): dimmed, and never what Copy runs.
-  const shownPlan = request !== null && !plan.isError ? (plan.data ?? null) : null;
-  const behind = body !== request || plan.isPlaceholderData;
-  const readPlan = behind ? null : shownPlan;
+  const { request, read: plan, shown: shownPlan, behind, current: readPlan } = useSettledRead("copyPlan", requestKey, fetchTransferPlan);
   const problem = copyProblem(entry, form, tables, readPlan, behind);
 
   const staged = useStagedEdits(entry.tabId ?? "");
   const stagedNote = staged && changeCount(staged) > 0 ? NOT_IN_COPY : null;
   const red = target?.color === "red";
-  const one = entry.source.kind !== "tables";
+  const one = isOne(entry);
 
   const pickTarget = (profileId: string, database: string | null) => {
     const profile = entries.find((item) => item.profile.id === profileId)?.profile;
@@ -229,7 +161,7 @@ export function CopyDataDialog({ entry, form: preset }: { entry: CopyEntry; form
       return;
     }
     // the same connection, another database: MySQL's "database" is the schema itself
-    if (engine.engine === "mysql") patch({ targetSchema: database });
+    if (databaseNodes(engine) === "schema") patch({ targetSchema: database });
     else patch({ targetDatabase: database, targetSchema: defaultSchema(engine.engine, database) });
   };
 
@@ -272,13 +204,23 @@ export function CopyDataDialog({ entry, form: preset }: { entry: CopyEntry; form
   );
 
   const source = entry.source;
-  const schemaInDatabase = targetEngine?.engine === "postgres" || targetEngine?.engine === "mssql";
+  // PostgreSQL's and SQL Server's schemas are the chosen database's children; MySQL's database is the schema itself
+  const schemaInDatabase = targetEngine?.per_database_connection === true;
+  const targetNodes = databaseNodes(targetEngine);
   return (
     <Dialog open onOpenChange={(open) => !open && closeDataDialog()} title={copyDialogTitle(entry)} width={760} footer={footer}>
       <div className="flex flex-col gap-3">
         <FieldRow label="From">
           <ConnectionLine profileId={entry.profileId} database={entry.database} />
         </FieldRow>
+        {source.kind === "query" && (
+          // the statement runs again on its tab when the copy starts (the preview warns): its first line is shown
+          <FieldRow label="Query">
+            <code className="block min-w-0 truncate font-mono text-[12px] text-muted" title={statementFirstLine(source.sql, 1000)} data-selectable>
+              {statementFirstLine(source.sql)}
+            </code>
+          </FieldRow>
+        )}
         {stagedNote && (
           <p className="text-[12px] text-warning" data-selectable>
             {stagedNote}
@@ -288,7 +230,7 @@ export function CopyDataDialog({ entry, form: preset }: { entry: CopyEntry; form
           <FieldRow label="Tables">
             {tables ? (
               <TableChecks
-                names={tables.map((node) => node.name)}
+                tables={tables}
                 checked={form.checked ?? []}
                 problem={tablesProblem(entry, form, tables)}
                 onChange={(checked) => patch({ checked })}
@@ -308,31 +250,24 @@ export function CopyDataDialog({ entry, form: preset }: { entry: CopyEntry; form
                 checked={form.onlyFiltered}
                 onChange={(e) => patch({ onlyFiltered: e.target.checked })}
               />
-              <code
-                className="min-w-0 truncate font-mono text-[12px] text-muted"
-                title={`${FILTER_TITLE_PREFIX}${source.filter}`}
-                data-selectable
-              >
-                {FILTER_TITLE_PREFIX}
-                {source.filter}
-              </code>
+              <FilterCode filter={source.filter} />
             </div>
           </FieldRow>
         )}
         <FieldRow label="To">
           <TargetPicker
             profileId={form.targetProfileId}
-            database={targetEngine?.engine === "mysql" ? form.targetSchema : form.targetDatabase}
+            database={targetNodes === "schema" ? form.targetSchema : form.targetDatabase}
             onChange={pickTarget}
             tool="copy_data"
             refusal={targetRefusal}
           >
             {form.targetProfileId && schemaInDatabase && (
-              // PostgreSQL's and SQL Server's schemas are the chosen database's children
               <DatabasePicker
                 profileId={form.targetProfileId}
                 current={form.targetSchema}
                 nodeKind="schema"
+                excludeSystem
                 under={form.targetDatabase ? [{ kind: "database", name: form.targetDatabase }] : []}
                 blockedReason={form.targetDatabase ? undefined : NO_DATABASE_FOR_SCHEMAS}
                 onPick={(schema) => patch({ targetSchema: schema })}

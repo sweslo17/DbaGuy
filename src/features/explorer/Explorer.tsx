@@ -19,7 +19,7 @@ import { secretsNeeded } from "../connections/UnlockDialog";
 import { joinUnlockPrompt } from "../connections/unlockPrompts";
 import { openCopyDialog, openDumpDialog, openRunDialog } from "../data-tools/dataDialogs";
 import { copyEntryForNode, dumpEntryForNode, runEntryForNode, type RunEntry } from "../data-tools/entryPoints";
-import { runningOn, syncJobs, useJobs } from "../data-tools/jobsStore";
+import { deleteBlockedMessage, runningOn, syncJobs, useJobs } from "../data-tools/jobsStore";
 import { READ_ONLY_RUN } from "../data-tools/runForm";
 import { askOpenDocument } from "../documents/openDocument";
 import { applyTreeContext } from "../query/queryContext";
@@ -225,9 +225,10 @@ export function Explorer() {
    */
   const releaseTabs = async (profileId: string): Promise<boolean> => {
     await syncJobs(); // a list that fails is logged, and the jobs stay as this window knows them
-    const jobs = runningOn(useJobs.getState(), profileId).length;
-    if (jobs > 0) {
-      toast("warning", `Profile not deleted — ${jobs === 1 ? "a job is" : `${jobs} jobs are`} still running on it`);
+    const jobs = runningOn(useJobs.getState(), profileId);
+    if (jobs.length > 0) {
+      toast("warning", deleteBlockedMessage(jobs, profileId));
+      setToDelete(null); // refused: the confirmation is answered (the toast says why); it does not wait for another click
       return false;
     }
     for (const tab of useWorkspace.getState().tabs.filter((t) => t.profileId === profileId)) {

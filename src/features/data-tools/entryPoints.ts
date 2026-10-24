@@ -292,9 +292,12 @@ export function paletteCopyEntry(
   if (tab.kind === "table") return copyEntryForTable(profile.id, engine, tab.path, tableFilter, tab.id);
   if (tab.kind !== "query") return null;
   const database = tab.database ?? ("database" in profile ? (profile.database ?? null) : null);
+  // PostgreSQL and SQL Server list a database's schemas: a tab with no database (a SQL Server login without a default
+  // one) has no tables to list, as Dump… says (06c Task 8 review)
+  if (engine.per_database_connection && !database) return null;
   const schema = defaultSchema(engine.engine, database);
   if (!schema) return null;
-  const head: PathSegment[] = engine.per_database_connection && database ? [{ kind: "database", name: database }] : [];
+  const head: PathSegment[] = database && engine.per_database_connection ? [{ kind: "database", name: database }] : [];
   const folder = tablesFolder([...head, { kind: "schema", name: schema }]);
   return {
     profileId: profile.id,

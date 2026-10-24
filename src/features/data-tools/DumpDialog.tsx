@@ -1,4 +1,4 @@
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { useEffect, useEffectEvent, useId, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
@@ -7,11 +7,10 @@ import { Checkbox, FieldRow, Radio } from "@/components/ui/Field";
 import { FilePathField } from "@/components/ui/FilePathField";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
-import type { DumpObjectKinds, DumpPlan, DumpPlanRequest, Engine, ObjectNode } from "@/lib/api/types";
+import type { DumpObjectKinds, DumpPlan, Engine, ObjectNode } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { BROWSER_PATH_HINT, pathProblem } from "@/lib/filePaths";
 import { chooseSavePath } from "@/lib/native";
-import { useDebouncedValue } from "@/lib/useDebouncedValue";
 import { useStagedEdits } from "@/stores/stagedEdits";
 import { useEngineInfo, useProfiles } from "../connections/hooks";
 import { changeCount } from "../edits/staging";
@@ -38,75 +37,15 @@ import type { DumpEntry } from "./entryPoints";
 import { dumpFileName } from "./fileNames";
 import { fetchDumpPlan } from "./jobsApi";
 import { startJob } from "./jobsStore";
-import { ConnectionLine, ReadProblem } from "./JobViews";
-
-/**
- * The plan is read again once the choices have stayed the same this long: a run of clicks on the tables or a path being
- * typed is one catalog read on the metadata connection, not one per change.
- */
-const PLAN_DEBOUNCE_MS = 400;
+import { ConnectionLine, FilterCode, ReadProblem } from "./JobViews";
+import { TableChecks } from "./TableChecks";
+import { useSettledRead } from "./useSettledRead";
 
 const DROP_FIRST_HINT = "A DROP … IF EXISTS before each object the file creates; nothing else is dropped";
-const FILTER_TITLE_PREFIX = "WHERE ";
 
 /** The reasons of a group's greyed choices, each once: shown under the group (a `title` lands on the input only). */
 const reasonsOf = (choices: readonly Choice<unknown>[]) =>
   [...new Set(choices.flatMap((choice) => (choice.disabled ? [choice.disabled] : [])))].join(" · ");
-
-/**
- * The Tables folder's tables, every one checked the first time they arrive (§3.3.1); All, None and the count, and beside
- * it what is wrong with the checks (none, or more than a dump names): said here, not only on Dump's tooltip.
- */
-function TablePicker({
-  tables,
-  checked,
-  problem,
-  onChange,
-}: {
-  tables: readonly ObjectNode[];
-  checked: readonly string[];
-  problem: string | null;
-  onChange: (names: string[]) => void;
-}) {
-  const on = new Set(checked);
-  // The tree's order, whatever the order of the clicks
-  const toggle = (name: string, value: boolean) =>
-    onChange(tables.map((table) => table.name).filter((n) => (n === name ? value : on.has(n))));
-  return (
-    <div className="flex flex-col gap-1">
-      <div className="flex items-start gap-1 text-[12px]">
-        <Button size="sm" variant="ghost" onClick={() => onChange(tables.map((table) => table.name))}>
-          All
-        </Button>
-        <Button size="sm" variant="ghost" onClick={() => onChange([])}>
-          None
-        </Button>
-        <span className="ml-auto min-w-0 pt-1 text-right">
-          <span className="text-muted tabular-nums">
-            {checked.length.toLocaleString()} of {tables.length.toLocaleString()} checked
-          </span>
-          {problem && (
-            // none checked: what to do; too many: what the dump cannot take
-            <span className={cn("block", checked.length > 0 ? "text-danger" : "text-muted")}>{problem}</span>
-          )}
-        </span>
-      </div>
-      <div className="flex max-h-48 flex-col gap-0.5 overflow-y-auto rounded-md border border-border px-2 py-1 [scrollbar-gutter:stable]">
-        {tables.length === 0 && <p className="text-[12px] text-muted">No tables</p>}
-        {tables.map((table) => (
-          <div key={table.name} className="flex min-w-0 items-center gap-2">
-            <Checkbox
-              label={<span className="[overflow-wrap:anywhere]">{table.name}</span>}
-              checked={on.has(table.name)}
-              onChange={(e) => toggle(table.name, e.target.checked)}
-            />
-            {table.detail && <span className="ml-auto shrink-0 text-[11px] text-muted">{table.detail}</span>}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
 
 /** What the file will hold, from the plan (`/data/dump/plan`): counts by kind, the objects, the snapshot, what is left out. */
 function PlanSummary({ plan, stale }: { plan: DumpPlan; stale: boolean }) {
@@ -220,30 +159,14 @@ export function DumpDialog({ entry, form: preset }: { entry: DumpEntry; form: Du
     setForm((current) => ({ ...current, checked: tables.map((table) => table.name) }));
   }
 
-  // The plan: the same fields as the command, asked once the choices settle (memoised: the same form, the same request)
-  // keyed by its content: a form change the plan does not read (a path still being typed) keeps the same request, so
-  // nothing dims or waits for it (Task 6 re-review)
+  // The plan: the same fields as the command, asked once the choices settle (keyed by content: a form change the plan does
+  // not read, a path still being typed, keeps the same request, so nothing dims or waits for it). The plan shown is behind
+  // while it is for other choices than these (settling, or being read): dimmed, and its tables never go with the job.
   const requestKey = useMemo(() => {
     const fresh = dumpPlanRequest(entry, form);
     return fresh === null ? null : JSON.stringify(fresh);
   }, [entry, form]);
-  const request = useMemo(() => (requestKey === null ? null : (JSON.parse(requestKey) as DumpPlanRequest)), [requestKey]);
-  const body = useDebouncedValue(request, PLAN_DEBOUNCE_MS);
-  const plan = useQuery({
-    queryKey: ["dumpPlan", body],
-    queryFn: ({ signal }) => fetchDumpPlan(body!, signal),
-    enabled: body !== null,
-    retry: false,
-    gcTime: 0,
-    // The plan of the choices before stays (dimmed) while the new one is read: the dialog does not jump at each click
-    placeholderData: keepPreviousData,
-  });
-  // None while no plan can be asked (no table checked, or too many): a disabled query still hands back the previous
-  // plan as its placeholder. The plan shown is behind while it is for other choices than these (they are settling, or
-  // being read): dimmed, and its tables never go with the job.
-  const shownPlan = request !== null && !plan.isError ? (plan.data ?? null) : null;
-  const behind = body !== request || plan.isPlaceholderData;
-  const readPlan = behind ? null : shownPlan;
+  const { request, read: plan, shown: shownPlan, behind, current: readPlan } = useSettledRead("dumpPlan", requestKey, fetchDumpPlan);
 
   const staged = useStagedEdits(entry.tabId ?? "");
   const stagedNote = staged && changeCount(staged) > 0 ? NOT_IN_DUMP : null;
@@ -400,7 +323,7 @@ function DumpChoices({
       {tables && (
         <FieldRow label="Tables">
           {tables.nodes ? (
-            <TablePicker
+            <TableChecks
               tables={tables.nodes}
               checked={form.checked ?? []}
               problem={tablesProblem(entry, form)}
@@ -471,14 +394,7 @@ function DumpChoices({
                   title={choices.filter.disabled ?? undefined}
                   onChange={(e) => patch({ onlyFiltered: e.target.checked })}
                 />
-                <code
-                  className="min-w-0 truncate font-mono text-[12px] text-muted"
-                  title={`${FILTER_TITLE_PREFIX}${entry.filter}`}
-                  data-selectable
-                >
-                  {FILTER_TITLE_PREFIX}
-                  {entry.filter}
-                </code>
+                <FilterCode filter={entry.filter} />
               </div>
               {choices.filter.disabled && <span className="pl-5 text-[11px] text-muted">{choices.filter.disabled}</span>}
             </>

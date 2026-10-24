@@ -88,6 +88,7 @@ export function DatabasePicker({
   onPick,
   nodeKind = "database",
   under = NO_PATH,
+  excludeSystem = false,
 }: {
   profileId: string;
   current: string | null;
@@ -96,6 +97,8 @@ export function DatabasePicker({
   nodeKind?: DatabaseNodeKind;
   /** Whose children it lists: the root, or a database node (a copy's target schema in PostgreSQL, SQL Server; 06c). */
   under?: PathSegment[];
+  /** Without the system ones (a copy's target schema: sys, INFORMATION_SCHEMA, pg_catalog take no new tables). */
+  excludeSystem?: boolean;
 }) {
   const words = NODE_WORDS[nodeKind];
   const [open, setOpen] = useState(false);
@@ -104,7 +107,7 @@ export function DatabasePicker({
   if (children.isPending) items = [{ label: "Loading…", disabled: true }];
   else if (children.isError) items = [{ label: errorMessage(children.error), disabled: true }];
   else {
-    const databases = children.data.filter((node) => node.kind === nodeKind);
+    const databases = children.data.filter((node) => node.kind === nodeKind && !(excludeSystem && node.system));
     items = databases.length
       ? databases.map((node) => ({
           label: node.name,

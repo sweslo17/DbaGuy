@@ -7,6 +7,7 @@ import type { JobTransport } from "./jobRunner";
 import { openingJob, type JobLoss } from "./jobState";
 import {
   clearFinishedJobs,
+  deleteBlockedMessage,
   copyReadsSession,
   hasEndedJob,
   jobList,
@@ -319,6 +320,18 @@ describe("the Jobs button's counts", () => {
     const ended = record({ requestId: "c", state: { ...openingJob(0), phase: "ended", sent: true, sentAt: 0, loss: "not_listed", endedAt: 1 } });
     const some = snapshot([...running, ended]);
     expect([runningCount(some), hasEndedJob(some)]).toEqual([2, true]);
+  });
+});
+
+describe("why a connection is not deleted while jobs run (06c B13)", () => {
+  const onIt = record({ requestId: "a", profileId: "p1" });
+  const reading = (id: string) => record({ requestId: id, kind: "copy_data", profileId: "other", sourceProfileId: "p1" });
+  it("says a copy that only reads from it is reading, not running on it (Task 8 review 5)", () => {
+    expect(deleteBlockedMessage([onIt], "p1")).toBe("Profile not deleted — a job is still running on it");
+    expect(deleteBlockedMessage([onIt, record({ requestId: "b", profileId: "p1" })], "p1")).toBe("Profile not deleted — 2 jobs are still running on it");
+    expect(deleteBlockedMessage([reading("c")], "p1")).toBe("Profile not deleted — a copy is still reading from it");
+    expect(deleteBlockedMessage([reading("c"), reading("d")], "p1")).toBe("Profile not deleted — 2 copies are still reading from it");
+    expect(deleteBlockedMessage([onIt, reading("c")], "p1")).toBe("Profile not deleted — 2 jobs are still running on it or reading from it");
   });
 });
 

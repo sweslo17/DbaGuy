@@ -380,6 +380,18 @@ export const runningOn = (snapshot: JobsSnapshot, profileId: string): JobRecord[
  */
 export const copyReadsSession = (snapshot: JobsSnapshot, sessionId: string): boolean =>
   runningJobs(snapshot).some((job) => job.command?.type === "copy_data" && job.command.source_session_id === sessionId);
+/**
+ * Why a connection is not deleted while `jobs` (from `runningOn`) run: a job on its sessions (a dump, a run, a copy into
+ * it), or a copy only reading from it (06c: its source's session goes with it too).
+ */
+export function deleteBlockedMessage(jobs: readonly JobRecord[], profileId: string): string {
+  const reading = jobs.filter((job) => job.profileId !== profileId).length; // its target is another connection
+  const copies = reading === 1 ? "a copy is" : `${reading} copies are`;
+  if (reading === jobs.length) return `Profile not deleted — ${copies} still reading from it`;
+  const n = jobs.length;
+  return `Profile not deleted — ${n === 1 ? "a job is" : `${n} jobs are`} still running ${reading > 0 ? "on it or reading from it" : "on it"}`;
+}
+
 /** How many jobs run (the Jobs button's count): a number, so a selector of it renders only when it changes (Q1). */
 export const runningCount = (snapshot: JobsSnapshot): number => runningJobs(snapshot).length;
 /** Whether a job has ended (Clear finished has something to clear): a boolean, for the same reason. */

@@ -52,6 +52,18 @@ export function ConnectionLine({ profileId, database }: { profileId: string; dat
   );
 }
 
+const FILTER_TITLE_PREFIX = "WHERE ";
+
+/** A table tab's filter as a dump's and a copy's form show it: `WHERE <condition>`, cut to the line, whole on hover. */
+export function FilterCode({ filter }: { filter: string }) {
+  return (
+    <code className="min-w-0 truncate font-mono text-[12px] text-muted" title={`${FILTER_TITLE_PREFIX}${filter}`} data-selectable>
+      {FILTER_TITLE_PREFIX}
+      {filter}
+    </code>
+  );
+}
+
 /**
  * A read a dialog needs that failed (a dump's plan, a copy's preview, a folder's tables): a missing password asks for it
  * (then reads again); another error says why, with Retry.

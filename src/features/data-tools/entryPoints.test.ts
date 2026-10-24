@@ -330,6 +330,21 @@ describe("Copy data to… (06c)", () => {
     expect(copyFormDefaultSchema).toBe(defaultSchema);
   });
 
+  it("from the palette: nothing for a PostgreSQL or SQL Server tab with no database to list the schemas of (as Dump… says)", () => {
+    const query = { id: "t1", kind: "query" as const, title: "Q", profileId: P, database: null, scriptPath: null,
+      savedText: null, textFromFile: false, initialText: "", autocommit: true };
+    const noDatabase = (engineName: string) => ({ id: P, name: "x", engine: engineName, database: null }) as never;
+    const mssql = engine("mssql", { per_database_connection: true });
+    expect(paletteCopyEntry(query, noDatabase("postgres"), PG, "")).toBeNull();
+    expect(paletteCopyEntry(query, noDatabase("mssql"), mssql, "")).toBeNull();
+    expect(paletteDumpEntry(query, noDatabase("postgres"), PG, "")).toBeNull(); // the twin it follows
+    expect(paletteCopyEntry({ ...query, database: "app" }, noDatabase("mssql"), mssql, "")).toMatchObject({
+      database: "app", source: { schema: "dbo", folder: [seg("database", "app"), seg("schema", "dbo"), seg("folder", "tables")] },
+    });
+    // SQLite has neither databases nor a profile database: main
+    expect(paletteCopyEntry(query, noDatabase("sqlite"), SQLITE, "")?.source).toMatchObject({ schema: "main" });
+  });
+
   it("from the palette: the table tab's table, else the query tab's default schema's tables", () => {
     const profile = { id: P, name: "Local PG", engine: "postgres", database: "dbaguy" } as never;
     const tab = { id: "t2", kind: "table" as const, profileId: P, title: "t", path: orders };
@@ -339,6 +354,8 @@ describe("Copy data to… (06c)", () => {
     expect(paletteCopyEntry(query, profile, PG, "")).toEqual({
       profileId: P, database: "dbaguy", source: { kind: "tables", schema: "public", folder },
     });
+    // a tab's own database is the one used
+    expect(paletteCopyEntry({ ...query, database: "dw" }, { id: P, name: "Local PG", engine: "postgres", database: null } as never, PG, "")?.database).toBe("dw");
     const mysqlProfile = { id: P, name: "My", engine: "mysql", database: "shop" } as never;
     expect(paletteCopyEntry(query, mysqlProfile, MYSQL, "")?.source).toEqual({
       kind: "tables", schema: "shop", folder: [seg("schema", "shop"), seg("folder", "tables")],
