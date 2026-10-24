@@ -148,31 +148,27 @@ class FailingContext:
         raise self.error
 
 
-class FullListenQueue:
-    """A local port whose listen queue is full, so a new connect to it waits (the kernel drops its SYN) until it times
-    out: a host that does not answer, without the network. On macOS `listen(1)` plus a connection nobody accepts fills
-    it; the fill goes on until a connect stays pending."""
+class SilentHost:
+    """A host that does not answer, without the network: macOS routes all of 127/8 to the loopback interface but holds
+    only 127.0.0.1, so a SYN to 127.0.0.2 is dropped and the connect waits until it times out. (A full listen queue
+    used to do this; since Darwin 27 the kernel resets a connect to a full queue at once.) The constructor checks that
+    a connect really stays pending, so a machine where it does not fails here, not in the test's timing."""
+
+    host = "127.0.0.2"
+    port = 9  # discard: nothing listens there, and nothing answers on 127.0.0.2 anyway
 
     def __init__(self) -> None:
-        self._server = socket.socket()
-        self._server.bind(("127.0.0.1", 0))
-        self._server.listen(1)
-        self.port = self._server.getsockname()[1]
-        self._fillers: list[socket.socket] = []
-        for _ in range(16):
-            filler = socket.socket()
-            filler.setblocking(False)
-            filler.connect_ex(("127.0.0.1", self.port))
-            self._fillers.append(filler)
-            if not select.select([], [filler], [], 0.2)[1]:
-                return  # this connect waits: so will the next one
-        self.close()
-        raise RuntimeError("the listen queue did not fill up")
+        probe = socket.socket()
+        try:
+            probe.setblocking(False)
+            probe.connect_ex((self.host, self.port))
+            if select.select([], [probe], [], 0.2)[1]:
+                raise RuntimeError(f"a connect to {self.host} did not stay pending")
+        finally:
+            probe.close()
 
     def close(self) -> None:
-        for filler in self._fillers:
-            filler.close()
-        self._server.close()
+        pass
 
 
 class FakeResponse:
