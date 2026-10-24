@@ -16,8 +16,9 @@ describe("formatElapsed", () => {
 
 describe("formatSize", () => {
   it("writes binary units as the backend's own texts do", () => {
-    expect(formatSize(0)).toBe("0 KB");
-    expect(formatSize(1)).toBe("1 KB");
+    // below 1 KiB, in bytes (06b F-f: a 223-byte dump said "1 KB")
+    expect([formatSize(0), formatSize(1), formatSize(223), formatSize(1023)]).toEqual(["0 bytes", "1 byte", "223 bytes", "1,023 bytes"]);
+    expect([formatSize(1024), formatSize(1025)]).toEqual(["1 KB", "2 KB"]);
     expect(formatSize(512 * 1024)).toBe("512 KB");
     expect(formatSize(1_048_576)).toBe("1.0 MB");
     expect(formatSize(3 * 1_048_576)).toBe("3.0 MB");

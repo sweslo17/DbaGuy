@@ -38,7 +38,8 @@ export const FileLines = memo(function FileLines({
         className,
       )}
     >
-      <div className="w-max min-w-full py-1">
+      {/* pb-3: the last line clears a horizontal scrollbar drawn inside the box (classic scrollbars, 06b F-c) */}
+      <div className="w-max min-w-full pt-1 pb-3">
         {lines.map((line) => (
           <div
             key={line.number}

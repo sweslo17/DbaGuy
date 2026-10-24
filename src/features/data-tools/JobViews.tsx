@@ -96,13 +96,23 @@ export function ReportTitle({ report }: { report: JobReport }) {
   );
 }
 
+/**
+ * The error that ended the job, in red; the user's own Cancel in muted words, without the backend's "Query cancelled"
+ * (the title says it already, 06b F-d), keeping the line it stopped at.
+ */
 function ErrorBox({ error, onShowLine }: { error: ErrorLine; onShowLine?: (line: number) => void }) {
   const line = error.line;
+  const cancelled = error.code === "cancelled";
   return (
-    <div className="flex flex-col gap-1 rounded-md border border-danger/40 bg-danger/10 p-2 text-[12px]">
+    <div
+      className={cn(
+        "flex flex-col gap-1 rounded-md border p-2 text-[12px]",
+        cancelled ? "border-border" : "border-danger/40 bg-danger/10",
+      )}
+    >
       {(error.label || error.code) && (
         <p className="flex flex-wrap items-baseline gap-x-2">
-          {error.label && <span className="font-medium text-danger">{error.label}</span>}
+          {error.label && <span className={cn("font-medium", cancelled ? "text-muted" : "text-danger")}>{error.label}</span>}
           {error.code && (
             <span className="font-mono text-[11px] text-muted" data-selectable>
               {error.code}
@@ -110,9 +120,11 @@ function ErrorBox({ error, onShowLine }: { error: ErrorLine; onShowLine?: (line:
           )}
         </p>
       )}
-      <p className="whitespace-pre-wrap [overflow-wrap:anywhere]" data-selectable>
-        {error.message}
-      </p>
+      {!cancelled && (
+        <p className="whitespace-pre-wrap [overflow-wrap:anywhere]" data-selectable>
+          {error.message}
+        </p>
+      )}
       {onShowLine && line !== null && (
         <div>
           <Button size="sm" onClick={() => onShowLine(line)}>

@@ -247,10 +247,21 @@ export const planLineText = (line: PlanLine): string =>
  */
 export const FILTERED_ROWS = "The file holds only the rows of ";
 
-/** The plan's warnings, those that change what restoring the file does first (F2: shown in red, above the others). */
+/**
+ * The backend's warning that a Drop objects first file drops an object something outside it depends on, so that
+ * restoring it where that exists fails at the DROP (06b I2, `dump_script.drop_warnings`); its text starts this way.
+ */
+export const DROP_BLOCKED = "Drop objects first: ";
+
+const PROMINENT = [FILTERED_ROWS, DROP_BLOCKED];
+const isProminent = (warning: string) => PROMINENT.some((start) => warning.startsWith(start));
+
+/**
+ * The plan's warnings, those that change what restoring the file does first (F2, I2: shown in red, above the others),
+ * each group in the backend's order.
+ */
 export function planWarnings(warnings: readonly string[]): { prominent: string[]; other: string[] } {
-  const prominent = warnings.filter((warning) => warning.startsWith(FILTERED_ROWS));
-  return { prominent, other: warnings.filter((warning) => !warning.startsWith(FILTERED_ROWS)) };
+  return { prominent: warnings.filter(isProminent), other: warnings.filter((warning) => !isProminent(warning)) };
 }
 
 /** The dump's tables in the plan's order: the job's "table k of n". */

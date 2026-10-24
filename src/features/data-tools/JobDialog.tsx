@@ -53,7 +53,7 @@ function actionButton(record: JobRecord, action: JobAction, key: number) {
   const { entry, command } = record;
   if (record.kind === "run_file" && command?.type === "run_file") {
     // From where the outcome says (its resume point, with its line when exact), or as it was
-    const again = againEntry({ profileId: record.profileId, database: record.database, command }, action.patch);
+    const again = againEntry({ profileId: record.profileId, database: record.database, command }, action.patch, action.note);
     return (
       <Button key={key} onClick={() => openRunDialog(again)}>
         {action.label}

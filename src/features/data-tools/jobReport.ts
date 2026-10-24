@@ -42,8 +42,11 @@ export interface RunPatch {
 
 export type JobAction =
   | { kind: "show_in_finder"; label: string; path: string }
-  /** Back to the form with the job's own settings, changed by `patch` (null: as they were). */
-  | { kind: "again"; label: string; patch: RunPatch | null };
+  /**
+   * Back to the form with the job's own settings, changed by `patch` (null: as they were); `note`: said above the
+   * form's file (a run again after `file_changed`, whose start is the refused statement's number).
+   */
+  | { kind: "again"; label: string; patch: RunPatch | null; note?: string };
 
 export interface ErrorLine {
   line: number | null;
@@ -98,6 +101,11 @@ export const CODE_LABELS = {
   invalid_command: "Refused by the backend",
   session_busy: "The job's session had closed",
   file_changed: "The file changed since the run before",
+  // Couchbase (06b fix wave): a BEGIN WORK the file holds, an answer the query service sent cut or malformed, and TLS
+  // failing as a statement opened a new connection to the query node
+  transactions_unsupported: "Couchbase runs no transactions",
+  protocol_error: "An answer DbaGuy cannot read",
+  tls_failed: "TLS failed",
 } as const;
 export type JobErrorCode = keyof typeof CODE_LABELS;
 
@@ -129,6 +137,8 @@ const NEEDS_STATEMENTS: ReadonlySet<string> = new Set([
 ]);
 /** A run again whose statement no longer starts at the line the run before gave (`RunFileCommand.from_line`). */
 const FILE_CHANGED = "file_changed";
+/** Its form starts at the statement number that was refused: said above the file (06b final review). */
+export const FILE_CHANGED_NOTE = "The file changed since the last run: check where to start.";
 
 /** Own properties only: "constructor" and "__proto__" are not codes (the K2 rule). */
 const has = <T extends object>(table: T, key: string): key is Extract<keyof T, string> => Object.hasOwn(table, key);
@@ -184,6 +194,11 @@ function againAction(kind: JobKind, command: JobCommand | null): JobAction[] {
 
 const NOTHING_WRITTEN_NOTE = "A file that was already at that path is as it was.";
 const NOT_KNOWN_NOTE = "What was applied is not known: check the target.";
+/**
+ * A statement-by-statement run that stopped where the backend cannot say what the statements before it did (no
+ * `resume_at`): no run again from the form, whose start would repeat the applied ones (06b final review I1).
+ */
+export const NO_RESUME_HINT = "Check the target, then choose where to start in a new run (Run SQL file… from the tree).";
 
 type Words = Omit<JobReport, "error" | "skipped" | "moreSkipped" | "hint">;
 
@@ -275,9 +290,13 @@ function runActions(outcome: JobOutcomeEvent, command: JobCommand | null, code: 
         kind: "again",
         label: "Run again…",
         patch: { mode: run.mode, on_error: run.on_error, from_statement: run.from_statement },
+        note: FILE_CHANGED_NOTE,
       },
     ];
   }
+  // Stopped, and what ran before is not known (no resume point): starting again from the form would repeat what was
+  // applied, as an unknown outcome would (06b final review I1); the hint says to choose the start in a new run
+  if (outcome.outcome === "stopped") return [];
   if ((outcome.outcome === "rolled_back" || outcome.outcome === "not_started") && code && NEEDS_STATEMENTS.has(code)) {
     return [
       {
@@ -430,6 +449,10 @@ function lossReport(view: JobView): JobReport {
   }
 }
 
+/** A run that stopped statement by statement where nothing places what ran before it (I1). */
+const stoppedUnplaced = (kind: JobKind, outcome: JobOutcomeEvent) =>
+  kind === "run_file" && outcome.outcome === "stopped" && (outcome.resume_at ?? null) === null;
+
 /** How the job ended, in words; null while it runs. */
 export function jobReport(view: JobView): JobReport | null {
   const { state, kind, command } = view;
@@ -439,10 +462,11 @@ export function jobReport(view: JobView): JobReport | null {
   const error = endingError(outcome, state);
   const words = kind === "dump" ? dumpReport(outcome, command, error) : runReport(outcome, command, error);
   const skipped = outcome.errors.map(toErrorLine);
+  const hints = [codeHint(error?.code ?? null, kind, outcome.outcome), stoppedUnplaced(kind, outcome) ? NO_RESUME_HINT : null];
   return {
     ...words,
     error,
-    hint: codeHint(error?.code ?? null, kind, outcome.outcome),
+    hint: hints.filter((hint) => hint !== null).join(" ") || null,
     skipped,
     moreSkipped: Math.max(0, outcome.error_count - skipped.length),
   };

@@ -9,6 +9,7 @@ import {
   dumpProblem,
   dumpScope,
   dumpTitle,
+  DROP_BLOCKED,
   initialDumpForm,
   kindCount,
   MAX_DUMP_TABLES,
@@ -46,6 +47,8 @@ import {
   withPath,
   withSearchPath,
 } from "./runForm";
+import { FILE_CHANGED_NOTE, jobReport } from "./jobReport";
+import { jobReducer, openingJob } from "./jobState";
 
 /* The two dialogs' forms (spec ⑥ §3.6): what is offered, greyed and why, and what is sent. */
 
@@ -463,6 +466,18 @@ describe("the forms' helpers", () => {
     });
   });
 
+  it("puts a Drop objects first file's blocked DROP first too, in red (06b I2)", () => {
+    const filtered = "The file holds only the rows of public.t that match a filter: restoring it drops the table and replaces it with those rows";
+    const blocked = "Drop objects first: other.v (view, not in this dump) depends on public.t, so restoring where it exists fails at that DROP. Dump it too, or turn Drop objects first off.";
+    expect(DROP_BLOCKED).toBe("Drop objects first: ");
+    expect(planWarnings(["Only 0.5 GB free where the dump is written", filtered, blocked, "Not a consistent snapshot"])).toEqual({
+      prominent: [filtered, blocked],
+      other: ["Only 0.5 GB free where the dump is written", "Not a consistent snapshot"],
+    });
+    // the words alone, elsewhere in a warning, are no such warning
+    expect(planWarnings(["A view uses Drop objects first: x"]).prominent).toEqual([]);
+  });
+
   it("dumps again with the job's own choices", () => {
     const command = dumpCommand(table, { ...initialDumpForm(table, "/tmp/o.sql"), dropFirst: true }, "r");
     expect(dumpFormFromCommand(table, command)).toEqual({
@@ -476,11 +491,31 @@ describe("the forms' helpers", () => {
     const job = { profileId: "p1", database: "dbaguy", command };
     expect(againEntry(job, { mode: "statements", on_error: "stop", from_statement: 9 })).toEqual({
       profileId: "p1", database: "dbaguy", searchPath: "sales", queryContext: null, path: "/tmp/x.sql",
-      preset: { mode: "statements", on_error: "stop", from_statement: 9 },
+      preset: { mode: "statements", on_error: "stop", from_statement: 9 }, note: null,
     });
     expect(againEntry(job, null).preset).toEqual({ mode: "statements", on_error: "stop", from_statement: 1 });
     // a plain run had no place to check: neither has running it again
     expect(againEntry(job, null).preset).not.toHaveProperty("from_line");
+  });
+
+  it("says above the file that it changed, when running again after file_changed (06b final review)", () => {
+    const command = runCommand({ ...initialRunForm(entry, engine("postgres")), mode: "statements" }, engine("postgres"), null, "r");
+    const sent = { ...command, from_statement: 4, from_line: 4 };
+    const state = jobReducer(jobReducer(openingJob(0), { type: "sent", at: 1 }), {
+      type: "server",
+      at: 2,
+      event: {
+        type: "job_outcome", request_id: "r", job: "run_file", outcome: "not_started", cancelled: false, rows: 0, bytes: 0,
+        statements: 0, path: "/tmp/x.sql", objects: [], errors: [], error_count: 0, warnings: [],
+        error: { code: "file_changed", message: "The file changed: statement 4 now starts at line 5" },
+      },
+    });
+    const [action] = jobReport({ kind: "run_file", command: sent, state })!.actions;
+    expect(action).toMatchObject({ kind: "again", label: "Run again…", note: FILE_CHANGED_NOTE });
+    expect(FILE_CHANGED_NOTE).toBe("The file changed since the last run: check where to start.");
+    const again = againEntry({ profileId: "p1", database: "dbaguy", command: sent }, action.kind === "again" ? action.patch : null,
+      action.kind === "again" ? action.note : undefined);
+    expect([again.note, again.preset]).toEqual([FILE_CHANGED_NOTE, { mode: "statements", on_error: "stop", from_statement: 4 }]);
   });
 
   it("runs again in the same Couchbase query context: the default stays the default, none stays none", () => {

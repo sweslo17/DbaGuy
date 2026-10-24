@@ -249,6 +249,8 @@ describe("a dump's file name", () => {
     expect(dumpFileName(mysqlSchema, "mysql", null, 0, at)).toBe("shop_20261023-1405.sql");
     const folder = dumpEntryForNode(P, MYSQL, node([seg("schema", "shop"), seg("folder", "tables")]))!;
     expect(dumpFileName(folder, "mysql", null, 3, at)).toBe("shop_3-tables_20261023-1405.sql");
+    // 06b F-f: none checked says no count ("…_0-tables_…")
+    expect(dumpFileName(folder, "mysql", null, 0, at)).toBe("shop_20261023-1405.sql");
     const sqlite = dumpEntryForNode(P, SQLITE, node([seg("schema", "main")]))!;
     expect(dumpFileName(sqlite, "sqlite", "/x/app.sqlite3", 0, at)).toBe("app_20261023-1405.sql");
     const odd = dumpEntryForNode(P, MYSQL, node([seg("schema", "a\nb")]))!;

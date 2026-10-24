@@ -18,3 +18,18 @@ const OPEN_DIALOG_BESIDES_PALETTE = `${OPEN_DIALOG}:not([${PALETTE_ATTRIBUTE}])`
 export function isDialogOpen({ exceptPalette = false }: { exceptPalette?: boolean } = {}): boolean {
   return document.querySelector(exceptPalette ? OPEN_DIALOG_BESIDES_PALETTE : OPEN_DIALOG) !== null;
 }
+
+/**
+ * What a dialog gives the focus back to when it closes: what had it as the dialog opened (`active`), or, when that is
+ * inside a non-modal panel (a row of the Jobs list, which closes as the dialog takes the focus and so is gone by
+ * then), the button that opened the panel: the one whose `aria-controls` names it (Radix sets it while the panel is
+ * open). 06b Task 8 review: the focus went to the page's body.
+ */
+export function focusToReturn(active: Element | null): Element | null {
+  const panel = active?.closest(`[${NON_MODAL_ATTRIBUTE}]`);
+  if (!panel?.id) return active;
+  const trigger = Array.from(document.querySelectorAll("[aria-controls]")).find(
+    (element) => element.getAttribute("aria-controls") === panel.id,
+  );
+  return trigger ?? active;
+}

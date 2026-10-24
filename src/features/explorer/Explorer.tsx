@@ -44,9 +44,10 @@ const CONTEXT_CLICK_DELAY_MS = 250;
 
 type ErrorRow = Extract<TreeRow, { type: "error" }>;
 
-/** A read-only connection's Run SQL file… is greyed with why: the backend refuses it before anything is sent (06a). */
-
-/** Run SQL file… for a node (or the connection's row): greyed on a read-only connection. */
+/**
+ * Run SQL file… for a node (or the connection's row): greyed on a read-only connection, with why (the backend refuses
+ * it before anything is sent, 06a).
+ */
 const runItem = (entry: RunEntry, readOnly: boolean): MenuItem => ({
   label: "Run SQL file…",
   onSelect: () => openRunDialog(entry),

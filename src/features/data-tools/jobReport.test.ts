@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { DumpCommand, JobOutcomeEvent, JobProgressEvent, RunFileCommand } from "@/lib/api/types";
 import { sqliteBusyNote } from "@/lib/sqliteBusy";
 import { FILTER_RULE } from "../table-data/filterValue";
-import { cancelNote, CODE_LABELS, codeLabel, endingIsNews, etaText, jobNotification, jobReport, jobSummary, progressView, type JobView } from "./jobReport";
+import { cancelNote, CODE_LABELS, codeLabel, endingIsNews, etaText, jobNotification, jobReport, jobSummary, NO_RESUME_HINT, progressView, type JobView } from "./jobReport";
 import { jobReducer, openingJob, type JobState } from "./jobState";
 
 const CODE_LABELS_HINT_FILE_CHANGED =
@@ -283,9 +283,14 @@ describe("a run's outcome in words", () => {
       "The file changed since the run before",
       CODE_LABELS_HINT_FILE_CHANGED,
     ]);
-    // the same settings, from the same statement, but no from_line: it would be refused again
+    // the same settings, from the same statement, but no from_line: it would be refused again; the form says why
     expect(said.actions).toEqual([
-      { kind: "again", label: "Run again…", patch: { mode: "statements", on_error: "continue", from_statement: 4 } },
+      {
+        kind: "again",
+        label: "Run again…",
+        patch: { mode: "statements", on_error: "continue", from_statement: 4 },
+        note: "The file changed since the last run: check where to start.",
+      },
     ]);
   });
 
@@ -298,6 +303,23 @@ describe("a run's outcome in words", () => {
       "Read-only connection",
       ["Run again…"],
     ]);
+  });
+
+  it("offers no run again for a stop it cannot place, and says to choose the start in a new run (06b I1)", () => {
+    const notes = ["Line 9 may be partly applied (non-transactional tables): a write that fails on a table that cannot roll back keeps the rows it wrote before the error"];
+    const unplaced = outcome({ outcome: "stopped", statements: 12, stopped_at: { line: 9, statement: 6 }, resume_at: null, warnings: notes, error: { line: 9, statement: 6, code: "1062", message: "Duplicate entry" } });
+    for (const said of [report(unplaced), report(unplaced, run({ on_error: "continue", from_statement: 3 })), report(outcome({ ...unplaced, cancelled: true }))]) {
+      expect([said.actions, said.hint]).toEqual([[], NO_RESUME_HINT]);
+    }
+    expect(NO_RESUME_HINT).toBe("Check the target, then choose where to start in a new run (Run SQL file… from the tree).");
+    // a code's own hint comes first (SQLite busy: what to do about the file), then where to start
+    const busy = report(outcome({ ...unplaced, error: { line: 9, statement: 6, code: "SQLITE_BUSY", message: "database is locked" } }));
+    expect(busy.hint).toBe(`${sqliteBusyNote("run the file again")} ${NO_RESUME_HINT}`);
+    // a stop it can place is unchanged: from that line, or skip it; no hint of its own
+    const placed = report(outcome({ ...unplaced, resume_at: { line: 9, statement: 6 } }));
+    expect([placed.actions.map((a) => a.label), placed.hint]).toEqual([["Run again from line 9", "Skip it and continue"], null]);
+    // not for the other outcomes (a rolled-back run offers its run again, without this hint)
+    expect(report(outcome({ outcome: "rolled_back", error: { code: "23505", message: "dup" } })).hint).toBeNull();
   });
 
   it("offers nothing to run again for a job listed after a reload (its command is not here)", () => {
@@ -420,7 +442,7 @@ describe("the error codes", () => {
       "transaction_ended", "psql_meta_command", "unsupported_copy", "file_io", "dump_io", "invalid_path", "invalid_filter",
       "invalid_text", "not_supported", "read_only", "transaction_open", "connection_lost", "commit_unconfirmed",
       "file_not_found", "unsupported_option", "transaction_failed", "cancelled", "invalid_command", "session_busy",
-      "file_changed",
+      "file_changed", "transactions_unsupported", "protocol_error", "tls_failed",
     ]) {
       expect(codeLabel(code), code).toBeTruthy();
     }

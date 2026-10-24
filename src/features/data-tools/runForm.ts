@@ -353,13 +353,18 @@ export function runCommand(
 /** What the job list calls a run (as the backend's `RunFileJob.title` does). */
 export const runTitle = (path: string, connection: string): string => `Run ${fileNameOf(path)} on ${connection}`;
 
-/** "Run again…": the job's own target and file, its settings changed by `patch` (null: as they were). */
+/**
+ * "Run again…": the job's own target and file, its settings changed by `patch` (null: as they were), and the action's
+ * `note` said above the file.
+ */
 export function againEntry(
   job: { profileId: string; database: string | null; command: RunFileCommand },
   patch: RunPatch | null,
+  note: string | null = null,
 ): RunEntry {
   const { command } = job;
   return {
+    note,
     profileId: job.profileId,
     database: job.database,
     searchPath: command.search_path ?? null,

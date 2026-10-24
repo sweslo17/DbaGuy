@@ -1,7 +1,7 @@
 import { Dialog as RadixDialog } from "radix-ui";
 import { useLayoutEffect, useRef, type ReactNode } from "react";
 import { cn } from "@/lib/cn";
-import { isDialogOpen, PALETTE_ATTRIBUTE } from "@/lib/dialogs";
+import { focusToReturn, isDialogOpen, PALETTE_ATTRIBUTE } from "@/lib/dialogs";
 import { isImeKeyEvent } from "@/lib/ime";
 
 export function Dialog({
@@ -32,12 +32,15 @@ export function Dialog({
   palette?: boolean;
 }) {
   const content = useRef<HTMLDivElement>(null);
-  /** What had the focus when the dialog opened; it gets it back on close (ruling R-02c-18). */
+  /**
+   * What had the focus when the dialog opened; it gets it back on close (ruling R-02c-18). In a non-modal panel (the
+   * Jobs list, gone by then): the panel's button (`focusToReturn`).
+   */
   const opener = useRef<Element | null>(null);
   // Recorded as `open` turns true, before anything inside can take the focus: Radix's Portal mounts the content a
   // commit later, so not even a child's `autoFocus` (the close guard's Cancel, Unlock's field) has run yet.
   useLayoutEffect(() => {
-    if (open) opener.current = document.activeElement;
+    if (open) opener.current = focusToReturn(document.activeElement);
   }, [open]);
   return (
     <RadixDialog.Root open={open} onOpenChange={onOpenChange}>

@@ -59,8 +59,9 @@ export function formatElapsed(ms: number): string {
 }
 
 const MIB = 1_048_576;
-/** A file's size as the backend's own texts write it (binary units, "MB"): "512 KB", "148.2 MB", "2.31 GB". */
+/** A file's size as the backend's own texts write it (binary units, "MB"): "223 bytes", "512 KB", "148.2 MB", "2.31 GB". */
 export function formatSize(bytes: number): string {
+  if (bytes < 1024) return plural(bytes, "byte");
   if (bytes < MIB) return `${Math.ceil(bytes / 1024).toLocaleString()} KB`;
   if (bytes < 1024 * MIB) return `${(bytes / MIB).toFixed(1)} MB`;
   return `${(bytes / (1024 * MIB)).toFixed(2)} GB`;
