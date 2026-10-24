@@ -1,5 +1,6 @@
 """Copy's type map and value conversions (spec ⑥ §3.5.2–3.5.3, 06c Task 1): pure."""
 
+import time
 from decimal import Decimal
 
 import pytest
@@ -9,8 +10,8 @@ from dbaguy_backend.adapters.families import NamedType, of_name
 from dbaguy_backend.domain.column_category import ColumnCategory
 from dbaguy_backend.domain.dialect import Dialect
 from dbaguy_backend.sql.type_map import (
-    DIGITS_AS_TEXT, UTC_NOTE, RowFailure, conversion, incompatible, planned_column, target_type, to_utc,
-    type_problem, with_minute_offset,
+    DIGITS_AS_TEXT, FRACTION_NOTE, MYSQL_JSON_NOTE, UTC_NOTE, RowFailure, conversion, incompatible, planned_column,
+    target_type, to_utc, type_problem, unmappable, with_minute_offset,
 )
 
 PG, MY, MS, LITE = Dialect.POSTGRES, Dialect.MYSQL, Dialect.TSQL, Dialect.SQLITE
@@ -78,6 +79,11 @@ def test_what_the_preview_says_of_a_lossy_mapping() -> None:
     assert target_type(col("json", "json", type_name="json"), PG, PG).type_sql == "json"
     assert target_type(col("other", "other", type_name="integer[]"), PG, MY).note == "PostgreSQL's text of the value"
     assert target_type(col("money", "number", type_name="money"), PG, PG).type_sql == "money"
+    for source in (PG, MS, LITE):  # pre-flight review I2: MySQL's JSON normalises what it is given
+        assert target_type(col("json", "json"), source, MY).note == MYSQL_JSON_NOTE
+    assert "doubles: choose longtext" in MYSQL_JSON_NOTE
+    assert target_type(col("json", "json"), MY, MY).note is None  # MySQL's own JSON is already normal
+    assert target_type(col("json", "json"), PG, LITE).note is None  # text keeps it as it is
 
 
 def test_a_type_with_no_counterpart_is_a_problem() -> None:
@@ -91,6 +97,19 @@ def test_a_type_with_no_counterpart_is_a_problem() -> None:
     assert target_type(col("decimal", "number", precision=38, scale=0), PG, MS).type_sql == "decimal(38,0)"
 
 
+def test_a_numeric_with_a_negative_scale_or_more_scale_than_digits_is_for_postgresql_only() -> None:
+    for precision, scale in ((5, -2), (3, 5)):  # PostgreSQL 15 takes both; MySQL and SQL Server refuse the CREATE
+        column = col("decimal", "number", type_name=f"numeric({precision},{scale})", precision=precision, scale=scale)
+        for target in (MY, MS):
+            mapped = target_type(column, PG, target)
+            assert (mapped.type_sql, mapped.problem) == (None, unmappable(column, target))
+        assert target_type(column, MS, PG).type_sql == f"numeric({precision},{scale})"
+        assert target_type(column, PG, LITE).type_sql == "TEXT"
+    assert unmappable(column, MY) == "c (numeric(3,5)) has no MySQL type: choose one, or leave the column out"
+    for target, wanted in ((MY, "decimal(5,5)"), (MS, "decimal(5,5)")):  # as many digits after the point as digits
+        assert target_type(col("decimal", "number", precision=5, scale=5), PG, target).type_sql == wanted
+
+
 def test_the_same_engine_keeps_the_declared_type_unless_it_is_the_databases_own() -> None:
     assert target_type(col("varchar", "text", type_name="character varying(10)"), PG, PG).type_sql == \
         "character varying(10)"
@@ -101,13 +120,38 @@ def test_the_same_engine_keeps_the_declared_type_unless_it_is_the_databases_own(
                                                              "column is varchar(40)")
     assert target_type(col("enum", "text", type_name="mood", custom_type=True), PG, PG).type_sql == "text"
     assert target_type(col("spatial", "binary", type_name="geometry", custom_type=True), PG, PG).type_sql == "geometry"
+    # money stays money, a domain over it too (spec §3.5.2: money from PostgreSQL to PostgreSQL)
+    assert target_type(col("money", "number", type_name="cash", custom_type=True), PG, PG).type_sql == "money"
+    # a domain over json becomes jsonb: its base is not kept, and the preview says what jsonb does (review Minor 2)
+    doc = target_type(col("json", "json", type_name="doc", custom_type=True), PG, PG)
+    assert (doc.type_sql, doc.note) == (
+        "jsonb", "doc is the source database's own type: the new column is jsonb; "
+                 "jsonb orders the keys and keeps the last of duplicate keys")
+    # SQL Server's alias over nvarchar(n) stays nvarchar(n): n is already UTF-16 units there (review Minor 7)
+    for family, fields, wanted in (
+            ("varchar", {"length": 10}, "nvarchar(10)"), ("varchar", {"length": 4000}, "nvarchar(4000)"),
+            ("char", {"length": 5}, "nchar(5)"), ("varchar", {"length": 100, "unicode": False}, "varchar(100)"),
+            ("char", {"length": 5, "unicode": False}, "char(5)"), ("varchar", {"length": 8000, "unicode": False},
+                                                                  "varchar(8000)")):
+        alias = target_type(col(family, "text", type_name="zz_alias", custom_type=True, **fields), MS, MS)
+        assert alias.type_sql == wanted and "UTF-16" not in (alias.note or ""), (family, fields)
 
 
 def test_text_and_binary_never_go_into_each_other() -> None:
     assert incompatible(col("binary", "binary", name="b"), col("text", "text", name="t", type_name="text"))
     assert incompatible(col("varchar", "text", name="v"), col("binary", "binary", name="b", type_name="bytea"))
     assert incompatible(col("binary", "binary"), col("binary", "binary")) is None
-    assert incompatible(col("int32", "number"), col("binary", "binary")) is None  # the server decides
+    # nothing but bytes goes into a binary column: a server would store a number's or a date's own bytes, silently
+    bytea = col("binary", "binary", name="b", type_name="bytea")
+    for family, kind in (("int32", "number"), ("decimal", "number"), ("float64", "number"), ("year", "datetime"),
+                         ("bool", "bool"), ("date", "datetime"), ("time", "datetime"), ("timestamp", "datetime"),
+                         ("timestamp_tz", "datetime"), ("duration", "datetime"), ("other", "other")):
+        assert incompatible(col(family, kind, name="x"), bytea), family
+    assert incompatible(col("int32", "number", name="x", type_name="int"), bytea) == (
+        "x (int) does not go into b (bytea), a binary column: only binary data does")
+    for family in ("spatial", "variant", "rowversion"):  # read as bytes: they may go into bytes
+        assert incompatible(col(family, "binary"), bytea) is None, family
+    assert incompatible(col("int32", "number"), col("other", "other")) is None  # an untyped column holds anything
 
 
 @pytest.mark.parametrize(("text", "problem"), [
@@ -123,6 +167,17 @@ def test_text_and_binary_never_go_into_each_other() -> None:
 ])
 def test_a_typed_type_is_one_type_and_nothing_else(text, problem) -> None:
     assert type_problem(MY, text) == problem
+
+
+@pytest.mark.parametrize(("dialect", "text", "problem"), [
+    (PG, '"Mood"', None), (PG, 'public."Mood"', None), (PG, '"Mood"[]', None), (MS, "[dbo].[Alias]", None),
+    (MY, "`Alias`", None), (PG, '"Mood" NOT NULL', "NOT is not part of a type"),
+    (PG, '"Mood', "it has an unterminated string, quoted name or comment"),
+    (MS, "[dbo].[Alias", "it has an unterminated string, quoted name or comment"),
+    (PG, "'text'", "it does not name a type"),
+])
+def test_a_quoted_type_name_is_a_type(dialect, text, problem) -> None:
+    assert type_problem(dialect, text) == problem
 
 
 @pytest.mark.parametrize(("dialect", "text", "category", "expected"), [
@@ -141,9 +196,28 @@ def test_a_typed_type_is_one_type_and_nothing_else(text, problem) -> None:
     (MS, "float", None, NamedType("float64")),
     (LITE, "VARCHAR(10)", ColumnCategory.TEXT, NamedType("varchar", length=10)),
     (LITE, "", ColumnCategory.OTHER, NamedType("other")),
+    # whatever the spaces between the words and around the parentheses (made single before the match, review I3)
+    (PG, "  double   precision ", None, NamedType("float64")),
+    (PG, " numeric ( 10 , 2 ) ", ColumnCategory.NUMBER, NamedType("decimal", precision=10, scale=2)),
+    (PG, "timestamp  with\ttime  zone", None, NamedType("timestamp_tz")),
+    (MY, "bigint  unsigned", ColumnCategory.NUMBER, NamedType("uint64")),
+    (MY, "tinyint(1 )", None, NamedType("bool")),
 ])
 def test_a_types_text_names_its_family(dialect, text, category, expected) -> None:
     assert of_name(dialect, text, category) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "int" + " " * 190 + ".", "int" + " " * 190 + '"x', "int" + " " * 5000 + "(", " ".join(["a"] * 90) + " !",
+    "x" * 5000 + "!", "numeric(" + "1," * 90, "a" + "\t " * 90 + "$",
+])
+def test_a_type_nothing_reads_is_refused_at_once_whatever_it_is_made_of(text) -> None:
+    """Review I3: a long run of spaces and a character the pattern rejects once took 16 seconds (and the sidecar's
+    other sessions with it: the match holds the GIL)."""
+    started = time.perf_counter()
+    named = of_name(PG, text)
+    assert time.perf_counter() - started < 0.1
+    assert named.family == "other"
 
 
 def test_a_new_columns_kind_is_what_its_engine_reads() -> None:
@@ -181,6 +255,21 @@ def test_a_time_zones_offset_is_written_as_hours_and_minutes() -> None:
     assert convert(col("time_tz", "datetime"), text, PG, LITE, "12:34:56+05") == "12:34:56+05:00"
 
 
+def test_the_seventh_digit_of_a_sql_server_time_is_rounded_elsewhere_and_the_preview_says_so() -> None:
+    """Review I1: the copy keeps all seven digits as text, and PostgreSQL and MySQL round the seventh away unasked."""
+    for family in ("time", "timestamp", "timestamp_tz"):
+        into = col(family, "datetime")
+        for target in (PG, MY):
+            seven = conversion(col(family, "datetime", scale=7), into, MS, target)
+            assert FRACTION_NOTE in seven.notes, (family, target)
+            assert FRACTION_NOTE not in conversion(col(family, "datetime", scale=6), into, MS, target).notes
+            assert FRACTION_NOTE not in conversion(col(family, "datetime"), into, MS, target).notes
+        for target in (MS, LITE):  # SQL Server holds seven, SQLite's text holds as many as it is given
+            assert FRACTION_NOTE not in conversion(col(family, "datetime", scale=7), into, MS, target).notes
+    assert FRACTION_NOTE not in conversion(col("date", "datetime", scale=7), col("date", "datetime"), MS, PG).notes
+    assert "rounded" in FRACTION_NOTE and "7" in FRACTION_NOTE
+
+
 @pytest.mark.parametrize(("value", "reason"), [
     ("infinity", "is 'infinity', which MySQL cannot hold"),
     ("-infinity", "is '-infinity', which MySQL cannot hold"),
@@ -212,6 +301,14 @@ def test_true_and_false_become_what_the_target_column_holds() -> None:
         convert(col("bool", "number"), col("bool", "bool"), MY, PG, 5)
     assert convert(col("bool", "bool"), col("bool", "number"), PG, MY, True) == 1
     assert convert(col("bool", "bool"), col("text", "text"), MS, PG, False) == "false"
+    assert convert(col("bool", "bool"), col("text", "text"), PG, LITE, True) == "true"
+    # a MySQL TINYINT(1) and a SQLite bool column are read as integers: 0 and 1 are false and true, as the spec says
+    text = col("text", "text")
+    assert [convert(col("bool", "number"), text, MY, PG, value) for value in (0, 1, 5, -1)] == [
+        "false", "true", "5", "-1"]
+    assert [convert(col("bool", "number"), text, LITE, MS, value) for value in (0, 1)] == ["false", "true"]
+    said = conversion(col("bool", "number"), text, MY, LITE).notes
+    assert said == ("true and false as text; other numbers as written",)
     assert convert(col("bool", "bool"), col("bool", "bool"), LITE, LITE, 5) == 5  # the same engine: as read
 
 

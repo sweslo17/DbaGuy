@@ -8,7 +8,7 @@ from dbaguy_backend.adapters.base import RunOptions, StatementError
 from dbaguy_backend.adapters.columns import TableColumn
 from dbaguy_backend.adapters.editing import VIEWS
 from dbaguy_backend.domain.errors import NotFound
-from tests.data_support import dropping, scratch_name
+from tests.data_support import SCRATCH_06C, dropping, scratch_name
 from tests.edit_support import scratch_db
 from tests.support import requires_mssql, requires_mysql, requires_pg
 
@@ -235,3 +235,23 @@ def test_sqlite_a_declared_size_too_long_for_a_number_is_no_size(tmp_path):
             assert conn.edit_target(db.path(table)).editable
         finally:
             conn.close()
+
+
+@requires_mssql
+def test_sql_server_alias_type_is_the_databases_own_and_a_plain_nvarchar_is_not(tmp_path):
+    """06c's `TableColumn.custom_type`, read from SQL Server's catalog: an alias type another database may lack is
+    custom, whatever its base; a system type, a CLR type and a rowversion are not (PostgreSQL's is pinned by the copy
+    preview's test)."""
+    db = scratch_db("mssql", tmp_path)
+    with dropping(db) as made:
+        alias, name = scratch_name("alias", SCRATCH_06C), scratch_name("cols", SCRATCH_06C)
+        made += [("TYPE", alias), ("TABLE", name)]  # dropped newest first: the table, then the type
+        db.execute(f"CREATE TYPE dbo.{alias} FROM nvarchar(10) NOT NULL",
+                   f"CREATE TABLE dbo.{name} (a dbo.{alias}, v nvarchar(10), c varchar(10), h hierarchyid, "
+                   "rv rowversion)")
+        found = read(db, name)
+        assert {column: (found[column].family, found[column].length, found[column].custom_type)
+                for column in found} == {
+            "a": ("varchar", 10, True), "v": ("varchar", 10, False), "c": ("varchar", 10, False),
+            "h": ("variant", None, False), "rv": ("rowversion", None, False),
+        }

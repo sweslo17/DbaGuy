@@ -158,7 +158,12 @@ class NamedType:
     length: int | None = None  # None: no limit (text, max)
 
 
-_NAME = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_ ]*?)\s*(?:\(\s*([^)]*)\s*\))?\s*(\[\])?\s*(unsigned)?\s*$", re.IGNORECASE)
+# Read after the whitespace is made single spaces (`of_name`), and with no overlap between its parts: a word is one run
+# of word characters, a name is words one space apart, so a text it rejects is rejected in linear time (a long run of
+# spaces once took seconds, I3). The base is lazy: `bigint unsigned` is a base and a suffix, `double precision` is
+# one base.
+_WORD = r"[A-Za-z_][A-Za-z0-9_]*"
+_NAME = re.compile(rf"({_WORD}(?: {_WORD})*?) ?(?:\(([^)]*)\))? ?(\[\])?(?: ?(unsigned))?$", re.IGNORECASE)
 # A query result's column with no family its name gives: by what the grid knows of it (spec §3.5.2's last sentence)
 _BY_CATEGORY: dict[ColumnCategory, TypeFamily] = {
     ColumnCategory.NUMBER: "decimal", ColumnCategory.TEXT: "text", ColumnCategory.DATETIME: "timestamp",
@@ -186,10 +191,10 @@ def of_name(dialect: Dialect, type_name: str, category: ColumnCategory | None = 
     """The family of a type's text in `dialect` (`numeric(10,2)`, `int4[]`, `nvarchar(max)`, `int unsigned`), with the
     sizes its parentheses give; a name no rule knows is the family `category` gives (a query result's column), else
     `other`. Never raises."""
-    found = _NAME.match(type_name or "")
+    found = _NAME.match(" ".join((type_name or "").split()))
     if found is None:
         return NamedType(_BY_CATEGORY.get(category, "other") if category else "other")
-    base, args, array, unsigned = found.group(1).lower(), found.group(2), found.group(3), found.group(4)
+    base, args, array, unsigned = found.group(1).lower(), (found.group(2) or "").strip(), found.group(3), found.group(4)
     numbers = _numbers(args)
     family: TypeFamily
     if dialect is Dialect.POSTGRES:

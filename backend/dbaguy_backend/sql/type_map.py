@@ -2,7 +2,7 @@
 table's column gets on the target engine, with what the preview says of it (⚠, `note`) or why it has none (a
 problem: a type to choose, or the column left out). Same-engine copies keep the declared type, unless it is the source
 database's own (`TableColumn.custom_type`), which the target database may lack. `incompatible`: text and binary data do
-not go into each other's columns. `converter`: how each value goes from a source column into a target column — `None`
+not go into each other's columns. `conversion`: how each value goes from a source column into a target column — `None`
 when it goes as the driver read it (the target column's literal writes it, `sql/literals.py`), else one function per
 column pair, chosen once per table, that raises `RowFailure` for a value the target cannot hold (that row fails: the
 table is rolled back and the message names the row and the column, never NULL in its place, Q3). Pure."""
@@ -40,8 +40,14 @@ _MSSQL_DECIMAL = 38
 _MYSQL_CHAR = 255  # CHAR(n) up to 255; wider is VARCHAR
 _MYSQL_VARCHAR = 16_383  # VARCHAR(n) of utf8mb4 that fits MySQL's 65,535-byte row (4 bytes a character)
 _NVARCHAR = 4_000  # nvarchar(n) / nchar(n) up to 4,000 UTF-16 code units; wider is (max)
+_VARCHAR = 8_000  # varchar(n) / char(n) up to 8,000 bytes; wider is (max)
 _BINARY = 8_000  # varbinary(n) up to 8,000 bytes; wider is (max) / LONGBLOB
 DIGITS_AS_TEXT = "stored as text, so that every digit is kept (SQLite would make it a number of 15 digits)"
+# What PostgreSQL and MySQL do with the 7th digit of a SQL Server time, datetime2 or datetimeoffset: round it, with no
+# warning of their own (I1); the copy keeps all seven as text up to the server, which then rounds
+FRACTION_NOTE = "Fractions beyond 6 digits are rounded (the source keeps 7)"
+_FRACTION_DIGITS = 6  # PostgreSQL's and MySQL's widest fraction of a second
+_FRACTIONAL: frozenset[TypeFamily] = frozenset({"time", "timestamp", "timestamp_tz"})
 
 
 def engine_name(dialect: Dialect) -> str:
@@ -74,6 +80,8 @@ def _decimal(column: TableColumn, target: Dialect) -> Mapped:
             Dialect.TSQL: Mapped("decimal(38,10)", "more than 10 digits after the point are rounded, more than 28 "
                                                    "before it fail"),
         }[target]
+    if target is not Dialect.POSTGRES and not 0 <= scale <= precision:  # numeric(5,-2), numeric(3,5): PostgreSQL 15
+        return Mapped(None, problem=unmappable(column, target))
     if target is Dialect.MYSQL and (precision > _MYSQL_DECIMAL[0] or scale > _MYSQL_DECIMAL[1]):
         return Mapped(None, problem=unmappable(column, target))
     if target is Dialect.TSQL and precision > _MSSQL_DECIMAL:
@@ -86,7 +94,7 @@ def _text(target: Dialect) -> str:
             Dialect.SQLITE: "TEXT"}[target]
 
 
-def _char(column: TableColumn, target: Dialect, varying: bool) -> Mapped:
+def _char(column: TableColumn, source: Dialect, target: Dialect, varying: bool) -> Mapped:
     n = column.length
     if n is None or target is Dialect.SQLITE:
         return Mapped(_text(target))
@@ -96,6 +104,11 @@ def _char(column: TableColumn, target: Dialect, varying: bool) -> Mapped:
         if not varying and n <= _MYSQL_CHAR:
             return Mapped(f"char({n})")
         return Mapped(f"varchar({n})" if n <= _MYSQL_VARCHAR else "longtext")
+    if source is Dialect.TSQL:  # an alias type of the same engine: n is already SQL Server's own unit, kept as it is
+        unit, widest = ("n", _NVARCHAR) if column.unicode else ("", _VARCHAR)  # UTF-16 units of an nvarchar, bytes
+        if not varying:
+            return Mapped(f"{unit}char({n})")
+        return Mapped(f"{unit}varchar({n})" if n <= widest else f"{unit}varchar(max)")
     if not varying:
         return Mapped(f"nchar({n})" if n <= _NVARCHAR else "nvarchar(max)")
     units = 2 * n  # nvarchar counts UTF-16 code units: a character beyond the BMP (an emoji) takes two
@@ -154,22 +167,27 @@ _NOTES: dict[tuple[TypeFamily, Dialect], str] = {
 }
 _AS_TEXT_NOTE = "PostgreSQL's text of the value"  # an array, a range, an inet … on another engine
 _JSONB_NOTE = "jsonb orders the keys and keeps the last of duplicate keys"
+MYSQL_JSON_NOTE = ("MySQL's JSON orders the keys, keeps one of duplicate keys, and reads numbers beyond a double's "
+                   "precision as doubles: choose longtext to keep the text")
 
 
 def _json(column: TableColumn, source: Dialect, target: Dialect) -> Mapped:
     if target is Dialect.POSTGRES:
-        if source is Dialect.POSTGRES:
-            return Mapped(column.type_name if column.type_name in ("json", "jsonb") else "jsonb")
-        return Mapped("jsonb", _JSONB_NOTE)
-    return Mapped({Dialect.MYSQL: "json", Dialect.TSQL: "nvarchar(max)", Dialect.SQLITE: "TEXT"}[target])
+        if source is Dialect.POSTGRES and column.type_name in ("json", "jsonb"):
+            return Mapped(column.type_name)
+        return Mapped("jsonb", _JSONB_NOTE)  # another engine's JSON, or a domain over json (its base is not kept)
+    if target is Dialect.MYSQL:
+        return Mapped("json", MYSQL_JSON_NOTE if source is not Dialect.MYSQL else None)
+    return Mapped({Dialect.TSQL: "nvarchar(max)", Dialect.SQLITE: "TEXT"}[target])
 
 
 def _same_engine_custom(column: TableColumn, target: Dialect) -> Mapped:
     """A type of the source database's own, on the same engine: its family's type (a domain's base), or text."""
     mapped = _cross(column, target, target)
-    why = f"{column.type_name} is the source database's own type"
-    return Mapped(mapped.type_sql, f"{why}: the new column is {mapped.type_sql}" if mapped.type_sql else None,
-                  mapped.problem)
+    if mapped.type_sql is None:
+        return mapped
+    why = f"{column.type_name} is the source database's own type: the new column is {mapped.type_sql}"
+    return Mapped(mapped.type_sql, "; ".join(filter(None, (why, mapped.note))), mapped.problem)
 
 
 def _cross(column: TableColumn, source: Dialect, target: Dialect) -> Mapped:
@@ -179,7 +197,7 @@ def _cross(column: TableColumn, source: Dialect, target: Dialect) -> Mapped:
     if family == "decimal":
         return _decimal(column, target)
     if family in ("char", "varchar"):
-        return _char(column, target, varying=family == "varchar")
+        return _char(column, source, target, varying=family == "varchar")
     if family == "binary":
         return _binary(column, target)
     if family == "json":
@@ -197,13 +215,13 @@ def _cross(column: TableColumn, source: Dialect, target: Dialect) -> Mapped:
 def target_type(column: TableColumn, source: Dialect, target: Dialect) -> Mapped:
     """The type a new table's column gets for `column` (spec §3.5.2). Same engine: the declared type, unless it is the
     database's own (a domain, an enum, an extension's or an alias type: its family's type then, with a note); spatial
-    types keep theirs. Another engine: by family."""
+    types keep theirs. Another engine: by family. PostgreSQL's money stays money, a domain over it too."""
+    if column.family == "money" and source is Dialect.POSTGRES and target is Dialect.POSTGRES:
+        return Mapped("money")
     if source is target:
         if column.custom_type and column.family != "spatial":
             return _same_engine_custom(column, target)
         return Mapped(column.type_name)  # SQLite's untyped column too: none ("")
-    if column.family == "money" and target is Dialect.POSTGRES and source is Dialect.POSTGRES:
-        return Mapped("money")
     return _cross(column, source, target)
 
 
@@ -227,13 +245,22 @@ def planned_column(name: str, type_sql: str, dialect: Dialect) -> TableColumn:
                        length=named.length)
 
 
+# What is not bytes: a binary column takes only bytes (a server would store a number's or a date's own bytes, silently:
+# SQL Server's int 5 into varbinary is 0x00000005)
+_NOT_BYTES: frozenset[TypeFamily] = _TEXTUAL | _NUMERIC | _DATED | frozenset({"time", "time_tz", "duration", "bool",
+                                                                              "composite", "other"})
+
+
 def incompatible(source: TableColumn, target: TableColumn) -> str | None:
     """Why a source column's values cannot go into an existing target column at all (spec §3.5.3: text and binary
-    data are not converted into each other), or None."""
+    data are not converted into each other, and nothing else is read as bytes), or None."""
     if source.family == "binary" and target.value_kind not in ("binary", "other"):
         return f"{source.name} holds binary data, which does not go into {target.name} ({target.type_name})"
     if target.value_kind == "binary" and source.family in _TEXTUAL:
         return f"{source.name} holds text, which does not go into {target.name} ({target.type_name}), a binary column"
+    if target.value_kind == "binary" and source.family in _NOT_BYTES:
+        return (f"{source.name} ({source.type_name}) does not go into {target.name} ({target.type_name}), a binary "
+                f"column: only binary data does")
     return None
 
 
@@ -274,6 +301,8 @@ def type_problem(dialect: Dialect, text: str) -> str | None:
         elif depth == 0 and token.kind is TokenKind.WORD:
             if token.upper in _NOT_A_TYPE:
                 return f"{token.text} is not part of a type"
+            words += 1
+        elif depth == 0 and token.kind is TokenKind.QUOTED:  # "Mood", [dbo].[Alias], `t`: a type's own name
             words += 1
     if depth:
         return "it leaves a parenthesis open"
@@ -437,9 +466,13 @@ def _bool_to_int(value: Any) -> Any:
 
 
 def _bool_text(value: Any) -> Any:
+    """A bool column's value as text: `true` / `false`, also from the integer 0 or 1 a MySQL or SQLite bool column is
+    read as; any other integer keeps its digits (a TINYINT(1) may hold 5)."""
     if isinstance(value, bool):
         return "true" if value else "false"
-    return str(value) if isinstance(value, int) else value
+    if isinstance(value, int):
+        return "false" if value == 0 else "true" if value == 1 else str(value)
+    return value
 
 
 def _number_text(value: Any) -> Any:
@@ -477,7 +510,7 @@ _DROP_OFFSET_NOTE = "the offset is dropped"
 _DAY_NOTE = "a value of 24 hours or more, or a negative one, fails its row"
 _TO_BOOL_NOTE = "0 and 1 as false and true; any other number fails its row"
 _TO_INT_NOTE = "true and false as 1 and 0"
-_BOOL_TEXT_NOTE = "true and false as text"
+_BOOL_TEXT_NOTE = "true and false as text; other numbers as written"
 _FINITE_NOTE = "NaN and infinity fail their row"
 _NAN_NOTE = "NaN fails its row (SQLite would store NULL)"
 _NUL_NOTE = "text holding a NUL character (U+0000) fails its row"
@@ -552,5 +585,8 @@ def conversion(
         if target_dialect is Dialect.POSTGRES or (target_dialect is Dialect.MYSQL and backslash_escapes is False):
             said = source_dialect is not Dialect.POSTGRES and kind != "datetime"  # PostgreSQL's text holds none
             steps.append((_no_nul(name), _NUL_NOTE if said else None))
-    notes = tuple(dict.fromkeys(note for _, note in steps if note))
-    return Conversion(_chain([step for step, _ in steps]), notes)
+    notes = [note for _, note in steps if note]
+    if (source.scale or 0) > _FRACTION_DIGITS and family in _FRACTIONAL and target_dialect in (
+            Dialect.POSTGRES, Dialect.MYSQL):
+        notes.append(FRACTION_NOTE)  # the 7th digit goes up to the server as text, which rounds it (I1)
+    return Conversion(_chain([step for step, _ in steps]), tuple(dict.fromkeys(notes)))
