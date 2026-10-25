@@ -10,6 +10,7 @@ import time
 
 import anyio
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from dbaguy_backend.agent.host import START_DELAY_S, claude_commands
@@ -284,3 +285,108 @@ def test_a_websocket_never_reaches_the_sdk():
     headers = [(b"host", b"127.0.0.1:17532"), (b"authorization", f"Bearer {MCP_TOKEN}".encode())]
     anyio.run(gate, {"type": "websocket", "path": "/mcp", "headers": headers}, receive, send)
     assert reached == [] and sent == [{"type": "websocket.close", "code": 1008}]
+
+
+@pytest.mark.parametrize("family, address, v6only", [
+    (socket.AF_INET, "0.0.0.0", None),
+    (socket.AF_INET6, "::", 0),  # dual-stack
+    (socket.AF_INET6, "::", 1),
+    (socket.AF_INET6, "::1", None),
+], ids=["0.0.0.0", "[::] dual-stack", "[::] v6only", "[::1]"])
+def test_a_port_another_program_holds_on_any_address_is_in_use(container, family, address, v6only):
+    """Ruling M1: DbaGuy never shares a port with another program (a SO_REUSEADDR bind of 127.0.0.1 succeeds beside
+    these on macOS, and would take 127.0.0.1's traffic or leave `localhost`'s to the other program)."""
+    port = free_port()
+    holder = socket.socket(family, socket.SOCK_STREAM)
+    holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # as most servers set it
+    if v6only is not None:
+        holder.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, v6only)
+    holder.bind((address, port))
+    holder.listen(1)
+    try:
+        container.agent_host.apply(McpSettings(enabled=True, port=port))
+        wait_for_state(container, "port_in_use")
+        assert f"Port {port} is in use" in container.agent_host.status().message
+    finally:
+        holder.close()
+        container.agent_host.stop()
+
+
+def test_a_restart_beside_its_own_closed_connections_listens(container):
+    """DbaGuy's own TIME_WAIT sockets on the port (the server closed first) never count as another program."""
+    port = free_port()
+    container.agent_host.apply(McpSettings(enabled=True, port=port))
+    wait_for_state(container, "listening")
+    with httpx.Client() as client:
+        assert client.post(f"http://127.0.0.1:{port}/mcp", json={}).status_code == 401  # kept alive
+        container.agent_host.apply(McpSettings(enabled=False, port=port))  # the server closes it first
+    container.agent_host.apply(McpSettings(enabled=True, port=port))
+    wait_for_state(container, "listening")
+    container.agent_host.stop()
+
+
+class _SlowWrites(InMemoryTokenStore):
+    """A Keychain write that waits, as one does while the Keychain asks the user to allow it."""
+
+    def __init__(self) -> None:
+        super().__init__(MCP_TOKEN)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def set(self, value):
+        self.entered.set()
+        self.release.wait(10)
+        super().set(value)
+
+
+def test_requests_are_answered_while_regenerate_waits_on_the_keychain(tmp_path):
+    tokens = _SlowWrites()
+    built = AppContainer(Settings(token=TOKEN, data_dir=tmp_path / "data", log_to_file=False),
+                         secret_store=InMemorySecretStore(), token_store=tokens)
+    try:
+        with serving(built) as port:
+            regenerating = threading.Thread(target=built.agent_host.regenerate)
+            regenerating.start()
+            assert tokens.entered.wait(10)
+            asked = time.monotonic()
+            answer = httpx.post(f"http://127.0.0.1:{port}/mcp", json={}, timeout=10,
+                                headers={"Authorization": f"Bearer {MCP_TOKEN}"})
+            assert answer.status_code != 401 and time.monotonic() - asked < 0.5  # the old token, at once
+            tokens.release.set()
+            regenerating.join(10)
+            assert call_tool(port, "list_connections", token=built.agent_host.current_token())[0] is False
+    finally:
+        tokens.release.set()
+        built.close()
+
+
+def test_a_run_superseded_during_a_slow_token_read_never_binds(tmp_path, monkeypatch):
+    from dbaguy_backend.agent import host
+
+    monkeypatch.setattr(host, "STOP_JOIN_S", 0.2)  # the stop gives up on the run that waits on the Keychain
+    binds, real_listen = [], host.listen_socket
+
+    def listen(*args, **kwargs):
+        binds.append(threading.current_thread().name)
+        return real_listen(*args, **kwargs)
+
+    monkeypatch.setattr(host, "listen_socket", listen)
+    tokens = _SlowTokens()
+    built = AppContainer(Settings(token=TOKEN, data_dir=tmp_path / "data", log_to_file=False),
+                         secret_store=InMemorySecretStore(), token_store=tokens)
+    port = free_port()
+    try:
+        built.agent_host.apply(McpSettings(enabled=True, port=port))
+        assert tokens.entered.wait(10)
+        built.agent_host.apply(McpSettings(enabled=False, port=port))  # off and on again while the Keychain asks
+        built.agent_host.apply(McpSettings(enabled=True, port=port))
+        tokens.release.set()
+        wait_for_state(built, "listening")
+        for thread in threading.enumerate():
+            if thread.name == "mcp-server-1":
+                thread.join(5)
+        assert binds == ["mcp-server-2"]  # the superseded run never bound: it cannot take the port from the new one
+        assert built.agent_host.status().state == "listening"
+    finally:
+        tokens.release.set()
+        built.close()

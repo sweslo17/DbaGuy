@@ -18,6 +18,7 @@ from dbaguy_backend.config import Settings
 from dbaguy_backend.container import AppContainer
 from dbaguy_backend.domain.profiles import AnyProfile, ProfileUpsertRequest
 from dbaguy_backend.domain.settings import McpSettings
+from dbaguy_backend.listen import held_elsewhere
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
 
 from .support import COUCHBASE_PASSWORD, MSSQL_PASSWORD, MYSQL_PASSWORD, PG_PASSWORD
@@ -41,7 +42,8 @@ def share(container: AppContainer, profile: AnyProfile, access: str = "query", *
 
 
 def free_port() -> int:
-    """A port in the settings' range (1024–49151) that nothing listens on now. Never 17531 or 17532."""
+    """A port in the settings' range (1024–49151) that nothing listens on now, on any address (ruling M1). Never 17531
+    or 17532."""
     for _ in range(200):
         port = random.randint(20_000, 40_000)
         with socket.socket() as probe:
@@ -49,6 +51,8 @@ def free_port() -> int:
                 probe.bind(("127.0.0.1", port))
             except OSError:
                 continue
+        if held_elsewhere(port):
+            continue
         return port
     raise RuntimeError("no free port")
 

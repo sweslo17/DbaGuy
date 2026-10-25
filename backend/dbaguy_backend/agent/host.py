@@ -85,6 +85,9 @@ class AgentHost:
 
     def current_token(self) -> str:
         """The token, read once from its store; created and stored the first time there is none."""
+        token = self._token  # the gate asks on every request, on the server's loop: never wait behind a Keychain write
+        if token is not None:
+            return token
         with self._token_lock:
             if self._token is None:
                 stored = self._tokens.get()
@@ -100,7 +103,8 @@ class AgentHost:
 
     def regenerate(self) -> McpToken:
         """A new token, at once: the old one's next request is 401. Stored and kept under one lock, so a first read
-        that creates a token at the same moment cannot leave the store and memory holding different ones."""
+        that creates a token at the same moment cannot leave the store and memory holding different ones. While the
+        Keychain write waits (it may ask the user), requests keep being answered with the old token."""
         token = new_token()
         with self._token_lock:
             self._tokens.set(token)
@@ -214,7 +218,10 @@ class AgentHost:
 
             logging.getLogger("mcp").setLevel(logging.WARNING)  # D-08-9: its INFO lines quote what clients send
             self.current_token()  # the Keychain read happens here, not on the first request
-            sock = listen_socket(MCP_HOST, run.port)
+            with self._lock:
+                if run.stopping:  # stopped while the Keychain asked: never bind beside the run that replaced it
+                    return
+            sock = listen_socket(MCP_HOST, run.port, alone=True)  # ruling M1: never beside another program
         except OSError as exc:
             if exc.errno == errno.EADDRINUSE:
                 logger.warning("MCP server: port {} is in use", run.port)
