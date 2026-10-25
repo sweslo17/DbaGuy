@@ -484,6 +484,71 @@ EXPLAIN_HEADS: dict[Dialect, tuple[str, ...]] = {
 }
 
 
+@dataclass(frozen=True)
+class SessionAssumption:
+    """A setting the lexer (and so the agent gate) reads the dialect's statements by: an agent's session reads it once,
+    when it opens (`query` gives its value), and is refused unless it is `value` (pre-flight M1, as ⑤'s G3)."""
+
+    setting: str
+    query: str
+    value: str
+
+
+@dataclass(frozen=True)
+class ReadFrame:
+    """DbaGuy's own statements around an MCP agent's (spec ⑧ D-08-3), sent on the agent's session: `begin` before it
+    (`{timeout_ms}`: the call's timeout plus SERVER_TIMEOUT_MARGIN_S, the server's own limit as a backstop), the
+    adapter's rollback() after it when `rolls_back`, then `end`, which releases what a function may have locked for the
+    session (a ROLLBACK keeps session locks, H1-e, M5). `explain_around`: what an explain sends before and after the
+    statement instead of a head (T-SQL's SHOWPLAN: the statement is not run, T7). `assumes`: a setting the lexer needs
+    of the session, read once when the session opens."""
+
+    begin: tuple[str, ...] = ()
+    end: tuple[str, ...] = ()
+    rolls_back: bool = False
+    explain_around: tuple[str, str] | None = None
+    assumes: SessionAssumption | None = None
+
+
+SERVER_TIMEOUT_MARGIN_S = 5
+_READ_FRAMES: dict[Dialect, ReadFrame] = {
+    # BEGIN READ ONLY on a session that is read-only by default too (P1, P2); statement_timeout: P10. Off, a backslash
+    # in '…' escapes, which RULES[POSTGRES] reads as standard (the server is on by default; a role or database may not)
+    Dialect.POSTGRES: ReadFrame(("BEGIN READ ONLY", "SET LOCAL statement_timeout = {timeout_ms}"),
+                                ("SELECT pg_advisory_unlock_all()",), rolls_back=True,
+                                assumes=SessionAssumption("standard_conforming_strings",
+                                                          "SELECT current_setting('standard_conforming_strings')",
+                                                          "on")),
+    # an explicit READ ONLY transaction each time: a function can turn the session's default off (M3, M3e)
+    Dialect.MYSQL: ReadFrame(("SET SESSION max_execution_time = {timeout_ms}", "START TRANSACTION READ ONLY"),
+                             ("SELECT RELEASE_ALL_LOCKS()",), rolls_back=True),
+    # no read-only session at all: what slips through is rolled back (T6)
+    Dialect.TSQL: ReadFrame(("BEGIN TRANSACTION",), rolls_back=True,
+                            explain_around=("SET SHOWPLAN_TEXT ON", "SET SHOWPLAN_TEXT OFF")),
+    Dialect.SQLITE: ReadFrame(),  # mode=ro, query_only and the authorizer (D-08-4); no transaction to hold locks
+    Dialect.SQLPP: ReadFrame(),  # readonly=true on every request (C1); no transactions
+}
+_MYSQL_VERSION = re.compile(r"MySQL (\d+)\.(\d+)\.(\d+)")
+_MYSQL_TREE = (8, 0, 16)
+
+
+def read_frame(dialect: Dialect) -> ReadFrame:
+    return _READ_FRAMES[dialect]
+
+
+def explain_head(dialect: Dialect, server_version: str) -> str | None:
+    """What the explain tool puts before an agent's statement (D-08-10); None for T-SQL (SHOWPLAN). MySQL's tree format
+    needs 8.0.16 (MariaDB and older servers get the plain EXPLAIN)."""
+    heads = EXPLAIN_HEADS[dialect]
+    if not heads:
+        return None
+    if dialect == Dialect.MYSQL:
+        found = _MYSQL_VERSION.match(server_version)
+        if found is None or tuple(int(part) for part in found.groups()) < _MYSQL_TREE:
+            return heads[-1]
+    return heads[0]
+
+
 def transaction_frame(dialect: Dialect) -> TransactionFrame:
     frame = _TRANSACTION_FRAMES[dialect]
     if frame is None:

@@ -38,11 +38,13 @@ class _Entry:
     info: SessionInfo
     attached: int = 0
     detached_at: float = 0.0
+    agent: bool = False  # an MCP agent's session (spec ⑧ D-08-1)
 
 
 class SessionManager:
-    """User sessions (one per editor tab, one per data-tools job). Closed explicitly, or once idle without a WebSocket:
-    nothing running or queued (D-06-10), and no attach and no request ending for `idle_timeout`."""
+    """User sessions (one per editor tab, one per data-tools job) and MCP agents' sessions (spec ⑧ D-08-1). Closed
+    explicitly, or once idle without a WebSocket: nothing running or queued (D-06-10), and no attach and no request
+    ending for `idle_timeout`."""
 
     def __init__(
         self, connections: ConnectionService, profiles: ProfileService, hooks: SessionHooksFactory | None = None,
@@ -58,18 +60,29 @@ class SessionManager:
         self._lock = threading.Lock()
 
     def create(self, request: SessionCreateRequest) -> SessionInfo:
-        profile = self._profiles.get(request.profile_id)
+        return self._open(request.profile_id, request.database, agent=False)
+
+    def create_agent(self, profile_id: UUID, database: str | None) -> SessionInfo:
+        """An MCP agent's session (D-08-1): on a read-only copy of the profile (`ConnectionService.open(agent=True)`),
+        with the agent's hooks; the reaper closes it like any other. A password it does not have is PasswordRequired:
+        it never asks (R-08-9)."""
+        return self._open(profile_id, database, agent=True)
+
+    def _open(self, profile_id: UUID, database: str | None, *, agent: bool) -> SessionInfo:
+        profile = self._profiles.get(profile_id)
         secrets = self._profiles.resolve_secrets(profile)
         session_id = uuid4().hex
         worker = SessionWorker(
-            f"{profile.name}:{session_id[:8]}",
-            lambda: self._connections.open(profile, request.database, secrets),
+            f"{'mcp:' if agent else ''}{profile.name}:{session_id[:8]}",
+            lambda: self._connections.open(profile, database, secrets, agent=agent),
             clock=self._clock,
         )
         try:
             worker.start()
             server = worker.call(lambda c: c.server_info())
-            if self._hooks is not None:
+            if self._hooks is not None and agent:
+                worker.configure(self._hooks.build_agent(profile.id))  # before it is registered
+            elif self._hooks is not None:
                 hooks = self._hooks.build(profile.id, server.current_database)
                 jobs = replace(hooks.jobs, announce=partial(self.jobs.begin, session_id, profile.id),
                                report=partial(self.jobs.report, session_id),
@@ -80,9 +93,24 @@ class SessionManager:
             raise
         info = SessionInfo(session_id=session_id, profile_id=profile.id, database=server.current_database, server=server)
         with self._lock:
-            self._sessions[session_id] = _Entry(worker=worker, info=info, detached_at=self._clock())
-        logger.info("Opened session {} for '{}'", session_id, profile.name)
+            self._sessions[session_id] = _Entry(worker=worker, info=info, detached_at=self._clock(), agent=agent)
+        logger.info("Opened {}session {} for '{}'", "an agent's " if agent else "", session_id, profile.name)
         return info
+
+    def hold(self, session_id: str) -> SessionWorker:
+        """Count `session_id` as attached until `release`: the reaper never closes it in between (a copy's source
+        session between two tables, an agent's session between the statements of one call). Found and counted under
+        one lock: a session the reaper took meanwhile is not found, never handed out while it closes."""
+        with self._lock:
+            entry = self._sessions.get(session_id)
+            if entry is not None:
+                entry.attached += 1
+        if entry is None:
+            raise SessionNotFound(f"Session {session_id} not found")
+        return entry.worker
+
+    def release(self, session_id: str) -> None:
+        self._detached(session_id)
 
     def _source(self, profile_id: UUID, database: str | None, session_id: str | None, *,
                 from_session: str) -> SourceLease:
@@ -97,22 +125,14 @@ class SessionManager:
             entry = self._entry(session_id)
             if entry.info.profile_id != profile_id or session_id == from_session:
                 raise PlanUnavailable(PLAN_MISMATCH, COPY_PLAN_EXPIRED)
-            with self._lock:
-                entry.attached += 1
-            return SourceLease(entry.worker, partial(self._unlease, session_id))
+            # a query tab's session the copy read from is the tab's again on release: one attach fewer
+            return SourceLease(self.hold(session_id), partial(self.release, session_id))
         info = self.create(SessionCreateRequest(profile_id=profile_id, database=database))
-        with self._lock:
-            if (own := self._sessions.get(info.session_id)) is not None:
-                own.attached += 1
-        return SourceLease(self.worker(info.session_id), partial(self._release, info.session_id))
+        return SourceLease(self.hold(info.session_id), partial(self._end_copy_source, info.session_id))
 
-    def _release(self, session_id: str) -> None:
+    def _end_copy_source(self, session_id: str) -> None:
         """A copy's own source session ends with it (never reused, as a job's own session)."""
         self._pop_and_close(session_id)
-
-    def _unlease(self, session_id: str) -> None:
-        """A query tab's session the copy read from is the tab's again: one attach fewer, as a socket that detaches."""
-        self._detached(session_id)
 
     def _detached(self, session_id: str) -> _Entry | None:
         """One attach fewer (a socket, or a copy's lease); idle time counts from the last one. None: it is gone."""
@@ -158,6 +178,14 @@ class SessionManager:
     def close_for_profile(self, profile_id: UUID) -> None:
         with self._lock:
             ids = [sid for sid, e in self._sessions.items() if e.info.profile_id == profile_id]
+        for sid in ids:
+            self._pop_and_close(sid)
+
+    def close_agents(self, profile_id: UUID | None = None) -> None:
+        """Close MCP agents' sessions: a profile's (it changed), or all (the MCP server stopped)."""
+        with self._lock:
+            ids = [sid for sid, e in self._sessions.items()
+                   if e.agent and (profile_id is None or e.info.profile_id == profile_id)]
         for sid in ids:
             self._pop_and_close(sid)
 

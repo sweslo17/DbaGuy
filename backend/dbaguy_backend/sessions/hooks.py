@@ -1,12 +1,14 @@
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
 from ..adapters.base import StatementError
 from ..adapters.registry import AdapterRegistry
+from ..domain.classification import Classification, GuardReason, StatementKind
 from ..domain.data_jobs import BE_DUMPED, RUN_SQL_FILES, JobCommand, cannot
 from ..domain.edits import PLAN_EXPIRED, PLAN_EXPIRED_MESSAGE, EditPlan, PlanUnavailable
 from ..domain.errors import DomainError
@@ -15,9 +17,10 @@ from ..domain.history import HistoryRecord, HistoryStatus
 from ..domain.profiles import AnyProfile, Engine, SqliteProfile
 from ..domain.transfer import COPY_DATA
 from ..services.edit_plans import EditPlanStore
+from ..services.agent_gate import agent_read
 from ..services.history_service import HistoryService
 from ..services.profile_service import ProfileService
-from ..services.safety import GuardDecision, SafetyPolicy
+from ..services.safety import GuardAction, GuardDecision, SafetyPolicy
 from ..services.schema_cache import SchemaCache
 from ..services.transfer_plans import TransferPlanStore
 from .jobs.context import Job, JobHooks, PreparedJob
@@ -101,6 +104,25 @@ class SessionHooksFactory:
             on_schema_change=lambda: self._schema_cache.invalidate(profile_id),  # every database of the profile
             take_edit_plan=take_edit_plan, jobs=self._job_hooks(profile, database),
         )
+
+    def build_agent(self, profile_id: UUID) -> WorkerHooks:
+        """An MCP agent's session (spec ⑧ D-08-1): the agent gate as its check (the MCP layer ran it already: this is
+        the backstop), no read-ahead while paused and no rows read ahead of a page (CR-08-7), and no History, schema
+        invalidation, edit plans or jobs: the MCP layer writes its own History (one record per tool call)."""
+        adapter = self._registry.get(self._profiles.get(profile_id).engine)
+        dialect = adapter.dialect
+
+        def check(sql: str, confirmed: bool) -> GuardDecision:
+            verdict = agent_read(sql, dialect)
+            if not verdict.allowed:  # an explain's text: the head and one statement the gate allows
+                verdict = agent_read(sql, dialect, "explain")
+            if verdict.allowed:
+                return GuardDecision(action=GuardAction.RUN, classification=verdict.classification)
+            kind = verdict.classification or Classification(kind=StatementKind.UNKNOWN)
+            return GuardDecision(action=GuardAction.BLOCK, reasons=[GuardReason.READ_ONLY], classification=kind)
+
+        return WorkerHooks(dialect=dialect, check=check, describe=False,
+                           capabilities=replace(adapter.capabilities, read_ahead_bytes=None))
 
     def _job_hooks(self, profile: AnyProfile, database: str | None) -> JobHooks:
         """A job's statement gate (gate_confirmed, the profile re-read at most once a second) and its History record."""

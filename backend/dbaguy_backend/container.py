@@ -13,6 +13,8 @@ from .adapters.registry import AdapterRegistry
 from .adapters.sqlite.adapter import SqliteAdapter
 from .agent.host import AgentHost
 from .agent.login import LoginRegistry
+from .agent.reader import AgentReader
+from .agent.sessions import AgentSessions
 from .agent.token_store import InMemoryTokenStore, KeyringTokenStore, TokenStore
 from .agent.tools import AgentTools
 from .config import Settings, default_data_dir
@@ -118,6 +120,8 @@ class AppContainer:
         )
         self.sessions = SessionManager(self.connections, self.profiles, hooks, jobs=self.jobs)
         self.agent_login = LoginRegistry(self.metadata, self.registry)
+        self.agent_sessions = AgentSessions(self.sessions, self.agent_login)
+        self.agent_reader = AgentReader(self.agent_sessions)
         self.agent_tools = AgentTools(self.profiles, self.registry, self.metadata, self.schema_cache, self.agent_login)
         self.agent_host = AgentHost(
             self.agent_tools, token_store or _token_store(settings, secret_store), default_mcp_port(data_dir),
@@ -138,6 +142,7 @@ class AppContainer:
 
     def _close_agents(self) -> None:
         """The MCP server stopped: nothing an agent opened stays open."""
+        self.agent_sessions.close()
         self.metadata.close_all(agents_only=True)
 
     def _housekeep(self) -> None:

@@ -46,6 +46,30 @@ _NOT_UTF8 = re.compile(r"Could not decode to UTF-8 column '(.*?)' with text", re
 # never repeat, and 128 compiled 1,000-row INSERTs held 300 MB (⑥ A10): statements are compiled each time instead
 _STATEMENT_CACHE = 0
 _PROGRESS_OPS = 10_000  # VM instructions between two looks at the cancel flag: ~0.3% slower, stops within ~0.1 ms
+# An MCP agent's connection (spec ⑧ D-08-4): mode=ro lets ATTACH write the attached file (S4) and VACUUM INTO write a
+# new one (S3), and query_only still leaves VACUUM INTO's empty file (S5). The authorizer, which SQLite asks while it
+# prepares every statement, allows only reading: SELECT, reading a column, functions but the two that load code (the
+# agent gate's own SQLite deny-list), recursive CTEs, and these pragmas, which have no form that writes (the catalog
+# reads through some of them, H6; their pragma_* table functions ask for SQLITE_PRAGMA too).
+_AGENT_PRAGMAS = frozenset({
+    "table_list", "table_info", "table_xinfo", "index_list", "index_info", "index_xinfo", "foreign_key_list",
+    "database_list",
+})
+_AGENT_ACTIONS = frozenset({sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_RECURSIVE})
+_AGENT_DENIED_FUNCTIONS = frozenset({"load_extension", "fts3_tokenizer"})
+
+
+def _agent_authorizer(action: int, arg1: str | None, arg2: str | None, database: str | None,
+                      source: str | None) -> int:
+    if action in _AGENT_ACTIONS:
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_FUNCTION:  # arg2 is the function's name
+        return sqlite3.SQLITE_DENY if (arg2 or "").lower() in _AGENT_DENIED_FUNCTIONS else sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_PRAGMA and (arg1 or "").lower() in _AGENT_PRAGMAS:
+        return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+
+
 # Statements that control the transaction themselves or cannot run inside one: manual mode does not BEGIN for them.
 _NO_AUTO_BEGIN = frozenset(
     {"BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE", "VACUUM", "PRAGMA", "ATTACH", "DETACH"}
@@ -340,9 +364,12 @@ class SqliteAdapter(DatabaseAdapter):
                                    cached_statements=_STATEMENT_CACHE)
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("SELECT count(*) FROM sqlite_master").fetchone()  # fails for non-database files
+            if agent:
+                conn.execute("PRAGMA query_only = ON")
+                conn.set_authorizer(_agent_authorizer)  # last: nothing after it may change a setting
         except sqlite3.Error as exc:
             if conn is not None:
                 conn.close()
             raise ConnectionFailed(f"Cannot open {path}: {exc}") from exc
-        logger.info("Opened SQLite database {} (mode={})", path, mode)
+        logger.info("Opened SQLite database {} (mode={}{})", path, mode, ", an agent's" if agent else "")
         return SqliteConnection(conn, path)

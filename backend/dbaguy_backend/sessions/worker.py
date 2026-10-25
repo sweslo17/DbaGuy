@@ -182,6 +182,9 @@ class WorkerHooks:
     # The previewed grid-edit plan with this id, taken once (spec ⑤ D-05-7); raises PlanUnavailable
     take_edit_plan: Callable[[str], EditPlan] = _no_edit_plans
     jobs: JobHooks = JobHooks()  # data tools' jobs (spec ⑥ D-06-2)
+    # False: an execute's run() reads no rows ahead of fetch() and skips describing the columns first (an MCP agent's
+    # session, spec ⑧ CR-08-7: a page is all it holds); RunOptions.describe
+    describe: bool = True
 
 
 @dataclass
@@ -325,6 +328,17 @@ class SessionWorker:
         self._hooks = hooks
 
     @property
+    def closed(self) -> bool:
+        """It is closing or closed: nothing more runs on it (a request it ends now was ended by the close)."""
+        return self._closed
+
+    @property
+    def dialect(self) -> Dialect:
+        """The dialect its hooks read statements in: its engine's (an MCP agent's session checks what the lexer
+        assumes of it by this, spec ⑧ pre-flight M1)."""
+        return self._hooks.dialect
+
+    @property
     def connection(self) -> DatabaseConnection:
         if self._lease is None:
             raise ConnectionFailed("Connection is not open")
@@ -368,8 +382,11 @@ class SessionWorker:
         with self._state_lock:
             return self._job_active or self._running_request is not None or bool(self._queued)
 
-    def call(self, fn: Callable[[DatabaseConnection], T], timeout: float | None = 120.0) -> T:
-        """Run fn(connection) on the worker thread and wait for its result."""
+    def call(self, fn: Callable[[DatabaseConnection], T], timeout: float | None = 120.0, *,
+             refresh_state: bool = False) -> T:
+        """Run fn(connection) on the worker thread and wait for its result. `refresh_state`: fn may have begun or ended
+        a transaction (an MCP agent's read frame, spec ⑧ D-08-3): the session's state is read again before the result
+        is given, so the idle-transaction check never sees one that has ended."""
         future: Future[T] = Future()
 
         def task() -> None:
@@ -378,11 +395,18 @@ class SessionWorker:
             if self._closed:
                 future.set_exception(SessionBusy("Session is closed"))
                 return
+            failure: BaseException | None = None
             try:
                 self._discard_open()
-                future.set_result(fn(self.connection))
+                result = fn(self.connection)
             except BaseException as exc:
-                future.set_exception(exc)
+                failure = exc
+            if refresh_state:
+                self._refresh_state()  # never raises: a connection that cannot tell has no transaction
+            if failure is not None:
+                future.set_exception(failure)
+            else:
+                future.set_result(result)
 
         self._put(task)
         return future.result(timeout)
@@ -740,7 +764,8 @@ class SessionWorker:
             if not self._passes_policy(req, cmd.confirmed):
                 return
             req.query_context = options.query_context
-            options = replace(options, retry_safe=req.kind == StatementKind.READ)  # D-04-14: only a read is resent
+            # D-04-14: only a read is resent
+            options = replace(options, retry_safe=req.kind == StatementKind.READ, describe=self._hooks.describe)
             with self._timeout(req):
                 result = self._run_statement(req, "execute", cmd.sql, options)
                 budget = self._hooks.capabilities.read_ahead_bytes

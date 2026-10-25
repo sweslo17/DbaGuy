@@ -44,7 +44,7 @@ from ..cancel_window import CancelWindow
 from ..columns import TableColumn
 from ..dump import DumpCatalog, DumpSession
 from ..sockets import enable_keepalive
-from . import catalog, columns, dump, editing, introspection
+from . import catalog, columns, dump, editing, introspection, read_only
 from . import schema as mysql_schema
 from .settings import URL_SCHEMES, connect_params, kill_params, parse_mysql_url, requires_tls, session_settings
 from .types import column_meta, row_converter
@@ -598,6 +598,11 @@ class MysqlAdapter(DatabaseAdapter):
                 except mysql.connector.Error as exc:
                     message = f"Could not apply the time_zone / sql_mode connection options: {exc}"
                     raise ConnectionFailed(message) from exc
+            if agent:  # spec ⑧ CR-08-5: never a mode in which the server reads a string the lexer reads otherwise
+                try:
+                    read_only.make_agent_sql_mode(conn)
+                except mysql.connector.Error as exc:
+                    raise ConnectionFailed(f"Could not set the agent connection's sql_mode: {exc}") from exc
             if profile.read_only:
                 # Last: nothing sent at connect may undo it, and the server enforces READ ONLY for writes hidden in
                 # functions or procedures too.
