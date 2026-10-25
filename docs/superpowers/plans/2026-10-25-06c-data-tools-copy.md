@@ -8588,17 +8588,21 @@ On the dev databases (only `zz_06c_*` tables, each dropped by exact name; nothin
 
 ## Appendix A: the user's final test list (06c), for the coordinator's follow-ups note
 
-As built (updated in Task 9 from what Tasks 1–8, Task 5b and the fix rounds made; the words in quotes are the app's). Nobody drove the packaged app: items 5 and 8 need it (Zhuyin and ⌘Q only work as they do there), item 9 needs the web mode, the rest can be done in either.
+As built (updated in Task 9 from what Tasks 1–8, Task 5b and the fix rounds made, and again in the final fix wave; the words in quotes are the app's). Nobody drove the packaged app: items 5, 8 and 11 need it (Zhuyin, ⌘Q and the frozen sidecar only work as they do there), item 9 needs the web mode, the rest can be done in either.
 
-1. **你的真實資料（在可以亂改的 database 上）。** 從公司的 PostgreSQL、MySQL、SQL Server 各挑一張有代表性的表（含時區時間、SQL Server 的 datetimeoffset／datetime2(7)、DECIMAL、JSON、中文與 emoji、NULL、有 `\` 接換行的文字），Copy 到另一個 engine 的新表：預覽的每一欄型別與 ⚠ 說明看起來合理（例如 timestamptz → `datetime(6)` 的 UTC 說明、MySQL `json` 會正規化的說明）；結果的列數與來源相同；抽幾列比對值（時間是同一個時刻、數字每一位都在、文字一字不差）。
-2. **大表。** 一張幾百萬列的表 Copy 到另一個 engine：進度顯示「Copying <表> (k of n)」與「N rows read」，側欄的 Jobs 那一列也有「(k of n)」；關掉對話框後 Jobs 裡還在（第一次關時 toast「The copy keeps running: open it again from Jobs, at the bottom of the sidebar」）；Cancel 之後結果是「Cancelled: nothing was copied」或那張表的列 rolled back（目標裡沒有半張表；MySQL 建新表模式例外：表留著、是空的，結果的說明會說「…stays, empty: drop it, or copy again into it」）。
-3. **好幾張表、停在一半。** 從一個 schema（或 Tables 資料夾勾幾張）Copy 到另一個 engine，讓第二張表失敗（例如一列有 PostgreSQL 的 `infinity` 進 MySQL）：結果說第一張 copied、失敗的那張的列 rolled back、指出第幾列哪一欄，後面的 not started；「Copy the rest…」回到表單、只勾沒複製的表。MySQL 建新表的那張失敗時表已經在了：先 DROP 那張空表，再「Copy the rest…」（否則預覽說 already exists）。
+1. **你的真實資料（在可以亂改的 database 上）。** 從公司的 PostgreSQL、MySQL、SQL Server 各挑一張有代表性的表（含時區時間、SQL Server 的 datetimeoffset／datetime2(7)、DECIMAL、JSON、中文與 emoji、NULL、有 `\` 接換行的文字），Copy 到另一個 engine 的新表：預覽的每一欄型別與 ⚠ 說明看起來合理（例如 timestamptz → `datetime(6)` 的 UTC 說明、MySQL `json` 會正規化的說明）；結果的列數與來源相同；抽幾列比對值（時間是同一個時刻、數字每一位都在、文字一字不差）。MySQL 的 `TIMESTAMP` 欄（公司的 server 或 profile 的時區不是 UTC 時）：預覽說「MySQL TIMESTAMP is read as UTC: 20:00 at +08:00 is copied as 12:00」，copy 出去的是 UTC 的時間（grid 顯示的減去時區）；MySQL TIMESTAMP 進 MySQL TIMESTAMP 沒有這句、值不變。
+2. **大表。** 一張幾百萬列的表 Copy 到另一個 engine：進度顯示「Copying <表>」與「N rows read」（兩張以上的表才有「(k of n)」，側欄的 Jobs 那一列也一樣；要看到它，就用第 3 項那種好幾張表的 copy）；關掉對話框後 Jobs 裡還在（第一次關時 toast「The copy keeps running: open it again from Jobs, at the bottom of the sidebar」）；Cancel 之後結果是「Cancelled: nothing was copied」或那張表的列 rolled back（目標裡沒有半張表；MySQL 建新表模式例外：表留著、是空的，結果的說明會說「…stays, empty: drop it, or copy again into it」）。
+3. **好幾張表、停在一半。** 先在 PostgreSQL 建兩張表，第二張放一列 `'infinity'::timestamp`（表的順序是 FK 的父表先，沒有 FK 就照勾選的順序）；從那個 schema（或 Tables 資料夾勾這幾張）Copy 到 MySQL：結果裡第一張「copied」、失敗的那張「rows rolled back」並指出第幾列哪一欄，後面的「not copied」；「Copy the rest…」回到表單、只勾沒複製的表。MySQL 建新表的那張失敗時表已經在了：先 DROP 那張空表，再「Copy the rest…」（否則預覽說 already exists）。
 4. **紅色連線。** 目標是 production 色的連線時，Copy 是紅色按鈕（不另外要勾選：每一句都在預覽裡）；「Delete its rows, then append」的 DELETE 在預覽裡是紅的。
 5. **注音。** 在對照表的型別欄、目標表名欄用注音輸入：組字中按 Enter 選字，不會送出型別、不會開始 Copy。
 6. **刪除連線。** 一個 copy 在跑時，刪除目標連線被擋下（「Profile not deleted — a job is still running on it」），刪除只被它讀取的來源連線也被擋下（「Profile not deleted — a copy is still reading from it」）；確認的對話框跟著關掉。
 7. **Query 結果。** 在 PostgreSQL 的 query tab 建一個 temp table 再 SELECT 它，結果的 status bar 按「Copy to table…」（或 grid 右鍵「Copy result to a table…」）複製到另一個 engine：預覽說 query 會重跑、copy 讀得到 temp table；copy 進行中關那個 tab（⌘W）或換它的連線會被擋下（toast 說明），copy 結束後就可以。
 8. **打包版的 ⌘Q。** Copy 進行中按 ⌘Q：問「Quit DbaGuy?」並列出那個 copy，說明「a copy rolls back the rows of the table it is copying, unless that table cannot roll back (the tables before it stay)」；Keep running 是預設。
 9. **重新載入。** Copy 進行中重新載入頁面（`scripts/dev.sh --web` 的瀏覽器重新整理；打包版的選單沒有 Reload）：Jobs 仍列出它、可以 Cancel；結束後它的結果沒有「Copy again…」（重新載入後的 job 沒有原本的表單）。
+10. **傳統捲軸。** 對照表很寬（或有很多欄）、預覽的語句很長時：水平捲軸不蓋住最後一列、不畫在固定高度的框裡面（CLAUDE.md 的傳統捲軸規則）；附加進有 identity 的表時，identity 的選單是「Keep values」／「Generate new」，字沒有被切掉，hover 看到完整的說法。
+11. **打包版跑一次 copy。** 在 `.app` 裡做第 1 項的任何一個 copy 一次：凍結的 sidecar 經 WKWebView 的 WebSocket 跑 `copy_data`，只有 probe 驗過，沒有人從 UI 驗過。
+12. **取代有 FK 的表。** 在 PostgreSQL（或 SQL Server）有一張父表、一張以一般的 FK（沒有 ON DELETE CASCADE）參照它而且有列的子表；用「Delete its rows, then append」把兩張一起 Copy 進去：預覽在父表下說「Replacing the rows of <父表> fails while <子表> holds rows that reference them (ON DELETE NO ACTION or RESTRICT): empty <子表> first, then copy」；照樣按 Copy 會在父表失敗（23503／547）、rolled back、什麼都沒少；在 query tab 先 `DELETE FROM <子表>` 再 Copy 就成功。
+13. **很多表的預覽。** 一個超過 40 張表的 schema Copy 到別的 engine，讓其中一張有問題（例如一欄的型別對不上）：它畫在最前面；把那欄的型別改好之後，它留在原地（不會掉出畫出來的範圍），底下寫「Showing 40 of N tables: those with a problem or a change first」；快速連續改幾個選擇時，樹與補全不會被舊的預覽卡住。
 
 已知的限制，不要當成 bug 回報：
 - SQL Server 目標表上的 INSTEAD OF trigger 若略過了列，Copy 看不出來（列數照樣對）。
@@ -8608,7 +8612,9 @@ As built (updated in Task 9 from what Tasks 1–8, Task 5b and the fix rounds ma
 - 一個值目標裝不下（PostgreSQL 的 infinity 與 NaN、西元前的日期、MySQL 的 0000-00-00…）時那張表整張 rollback 並指出第幾列哪一欄：用篩選排除那列，或（建新表時）把那欄的型別改成文字。
 - MySQL 建新表失敗後表留著（MySQL 的 CREATE TABLE 立刻 commit）：再 Copy 之前先 DROP 它（見第 3 項）。
 - 結果是 unknown 的表（例如 MySQL 的 MyISAM）不顯示列數，說明裡寫「Up to N rows … may stand」：去目標看。
-- 附加模式的 identity 選單太窄、字被切掉（「Keep the sourc」）：修正波會修。
+- 取代進 PostgreSQL、SQL Server 時，父表不能和以一般的 FK 參照它、而且有列的表一起取代（預覽會說，第 12 項）：先清空那些表。
+- MySQL 的 TIMESTAMP 以 UTC 讀寫（預覽會說，第 1 項）；query 結果照 grid 的讀法重讀（MySQL 的 FLOAT 只有 6 位、SQL Server 的第 7 位小數、PostgreSQL 的 money 文字，預覽逐欄說）：要每一位就 Copy 那張表。
+- 預覽每張表讀幾次 catalog：表多、server 遠時預覽要好幾秒到幾分鐘（較新的預覽會讓舊的停下）。
 - Couchbase 沒有 Copy（CR-1：要的話再說）。
 
 ## Self-review
