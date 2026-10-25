@@ -140,7 +140,7 @@ export function MappingTable({
                   {row.identity && (
                     // Short words that fit the column's 9rem (the long ones were cut: MP-4); the whole choice on hover
                     <Select
-                      className="mt-1 text-[12px]"
+                      className="mt-1"
                       value={row.identity}
                       aria-label={`Identity of ${row.target ?? row.source}`}
                       title={IDENTITY_TITLES[row.identity]}

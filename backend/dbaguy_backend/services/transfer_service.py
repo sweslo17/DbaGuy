@@ -91,7 +91,9 @@ CASCADES_OUTSIDE = "Deleting the rows of {} also deletes (or changes) rows of {}
 # A key that only refuses (NO ACTION, RESTRICT) from a table that holds rows: the parent's DELETE fails as it runs, and
 # the table rolls back. Parents go first, and each table is a transaction of its own, so one copy never empties a child
 # before replacing its parent's rows (06c final review I-2)
-REFUSES_DELETE = ("Replacing the rows of {parent} fails while {children} {hold} rows that reference them (ON DELETE NO "
+# Where a referencing table's rows could not be read (PostgreSQL's size read locked out past 5 s), it says "may" (fix wave
+# re-review N-1): only the tables known to hold rows are said to.
+REFUSES_DELETE = ("Replacing the rows of {parent} {fails} while {children} {hold} rows that reference them (ON DELETE NO "
                   "ACTION or RESTRICT): empty {those} first, then copy")
 # Names that differ only in case are one name there: SQL Server's default collations, SQLite, MySQL's columns (and its
 # tables on macOS); PostgreSQL's quoted names are not folded (Task 2 fix M2)
@@ -270,12 +272,14 @@ def reference_warnings(dialect: Dialect, mode: str, shown: str, schema: str, nam
                                      and not (reference.schema == schema and reference.table in copied)))
         if outside:
             said.append(CASCADES_OUTSIDE.format(shown, shown_names(outside)))
-        refusing = list(dict.fromkeys(display(reference.schema, reference.table) for reference in into
-                                      if reference.refuses_delete))
+        refusers = [reference for reference in into if reference.refuses_delete]
+        refusing = list(dict.fromkeys(display(reference.schema, reference.table) for reference in refusers))
         if refusing:
             one = len(refusing) == 1
+            unread = any(reference.child_rows is None for reference in refusers)
             said.append(REFUSES_DELETE.format(parent=shown, children=shown_names(refusing),
-                                              hold="holds" if one else "hold",
+                                              fails="may fail" if unread else "fails",
+                                              hold="may hold" if unread else "holds" if one else "hold",
                                               those=refusing[0] if one else "those tables"))
     return said
 

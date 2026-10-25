@@ -78,7 +78,8 @@ def test_a_replace_says_which_tables_outside_the_copy_its_delete_reaches() -> No
                key("z", "p", "restrict"), Reference("other", "w", "s", "p", "set_null")]
     assert said("replace_rows", Dialect.POSTGRES, *outside) == [
         CASCADES_OUTSIDE.format("s.p", "s.x, s.y, other.w"),  # c is copied; z only refuses …
-        REFUSES_DELETE.format(parent="s.p", children="s.z", hold="holds", those="s.z")]  # … and may hold rows (I-2)
+        REFUSES_DELETE.format(parent="s.p", children="s.z", fails="may fail", hold="may hold",
+                              those="s.z")]  # … and may hold rows: not read (I-2, re-review N-1)
     assert CASCADES_OUTSIDE.format("s.p", "s.x") == (
         "Deleting the rows of s.p also deletes (or changes) rows of s.x, which this copy does not write")
     assert said("append", Dialect.POSTGRES, *outside) == []  # nothing is deleted
@@ -100,10 +101,13 @@ def test_a_replace_says_which_tables_holding_rows_refuse_its_delete() -> None:  
     assert said(*refusing) == [
         "s.p references itself: the copy may fail unless its rows load in order",
         CASCADES_OUTSIDE.format("s.p", "s.gone"),
-        REFUSES_DELETE.format(parent="s.p", children="s.c, s.x, s.unread", hold="hold", those="those tables")]
+        REFUSES_DELETE.format(parent="s.p", children="s.c, s.x, s.unread", fails="may fail", hold="may hold",
+                              those="those tables")]  # s.unread's rows were not read (re-review N-1)
     assert said(held("c")) == [
         "Replacing the rows of s.p fails while s.c holds rows that reference them (ON DELETE NO ACTION or RESTRICT): "
         "empty s.c first, then copy"]
+    assert said(held("c"), held("x", "restrict")) == [REFUSES_DELETE.format(
+        parent="s.p", children="s.c, s.x", fails="fails", hold="hold", those="those tables")]  # every one read
     assert said(*refusing, mode="append") == ["s.p references itself: the copy may fail unless its rows load in order"]
     assert said(held("c"), dialect=Dialect.MYSQL) == []  # its checks are off during the copy
 
@@ -248,7 +252,7 @@ def test_replacing_a_parent_whose_children_hold_rows_is_warned_of_and_fails_loud
             kept = pg.rows(f"SELECT label FROM {pg.table(parent)}")
         assert [table.target for table in plan.tables] == [f"public.{parent}", f"public.{child}"]
         assert plan.plan_id is not None and plan.tables[0].warnings == [REFUSES_DELETE.format(
-            parent=f"public.{parent}", children=f"public.{child}, public.{outside}", hold="hold",
+            parent=f"public.{parent}", children=f"public.{child}, public.{outside}", fails="fails", hold="hold",
             those="those tables")]  # not the empty table, nor the deferred key's (checked at COMMIT)
         assert all("Replacing" not in warning for table in appended.tables for warning in table.warnings)
         assert (ran.outcome.outcome, ran.error.code, kept) == ("rolled_back", "23503", [("old",)])
@@ -272,7 +276,8 @@ def test_sql_server_names_the_tables_holding_rows_that_refuse_a_replaces_delete(
             src, dst = profile(app, lite, "lite"), profile(app, ms, "ms")
             plan = app.container.transfers.plan(tables_request(lite, src, [parent], ms, dst, "replace_rows"))
         assert plan.tables[0].warnings == [REFUSES_DELETE.format(
-            parent=f"dbo.{parent}", children=f"dbo.{outside}", hold="holds", those=f"dbo.{outside}")]
+            parent=f"dbo.{parent}", children=f"dbo.{outside}", fails="fails", hold="holds",
+            those=f"dbo.{outside}")]  # SQL Server reads every table's rows (sys.partitions)
     finally:
         lite.close()
         ms.close()
