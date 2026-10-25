@@ -20,6 +20,7 @@ from dbaguy_backend.agent.tools import ToolFailure
 from dbaguy_backend.app import create_app
 from dbaguy_backend.domain.errors import StorageError
 from dbaguy_backend.domain.profiles import ProfileUpsertRequest, SqliteProfile
+from dbaguy_backend.sql.dialects import Dialect
 
 from .agent_support import AUTH, MCP_TOKEN, call_tool, container, logged, mcp_session, serving, share
 from .support import (
@@ -443,3 +444,16 @@ def test_the_log_carries_no_sql_no_server_text_and_no_token(container):
     # ruling I-2 (Task 2 fix round): the connection's id, never the agent's or the client's text above DEBUG
     assert f"MCP run_query on {pid}: 42P01, 0 rows, " in text
     assert f"MCP refused run_query on {pid}: not_allowed_start" in text
+
+
+def test_a_plan_of_several_columns_keeps_them_all():
+    """MySQL before 8.0.16 has no tree: its plain EXPLAIN is a table. Its rows keep every column, under a header line
+    (one column, as the other engines', is a line per row)."""
+    from dbaguy_backend.agent.queries import _plan_text
+
+    table = ReadOutcome(columns=[{"name": "id", "type": None}, {"name": "table", "type": None},
+                                 {"name": "type", "type": None}], rows=[[1, "customers", "const"]])
+    assert _plan_text(Dialect.MYSQL, table) == ("id | table | type\n1 | customers | const", False)
+    tree = ReadOutcome(columns=[{"name": "EXPLAIN", "type": None}], rows=[["-> Rows fetched before execution"]],
+                       more_rows=True)
+    assert _plan_text(Dialect.MYSQL, tree) == ("-> Rows fetched before execution", True)
