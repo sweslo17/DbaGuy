@@ -22,11 +22,15 @@ IdentityChoice = Literal["keep", "generate"]
 COPY_DATA = "copy data"  # what a connection without `copy_data` cannot (spec §4)
 ONE_TABLE_FILTER = "a filter applies to a copy of one table"
 COPY_PLAN_EXPIRED = "The preview has expired: preview the copy again"  # spec §4: plan_expired and plan_mismatch
-# A query result whose statement does not only read, or returns no rows: refused by the preview and again by the copy's
-# read (the same code and words in both)
+# A query result whose statement does not only read, returns no rows or (a T-SQL batch) more than one result: refused
+# by the preview and again by the copy's read, with the same code and words (the copy's outcome keeps both, `pipe.
+# SourceFailed`; Task 9 docs review I2). The preview cannot tell a batch of several reads: only the copy refuses that
 QUERY_NOT_SELECT = "query_not_select"
-QUERY_NOT_SELECT_MESSAGE = ("Only a statement that returns rows (SELECT, WITH, VALUES…) can be copied, and one that "
-                            "only reads")
+QUERY_NOT_SELECT_MESSAGE = ("Only one statement that returns rows (SELECT, WITH, VALUES…) and only reads can be "
+                            "copied")
+# A query's columns are not the ones the preview mapped when the copy runs it again, or a target table's columns
+# changed since the preview: preview the copy again
+COLUMNS_CHANGED = "columns_changed"
 
 
 class QuerySource(BaseModel):
@@ -85,11 +89,17 @@ class TargetSpec(BaseModel):
         return self
 
 
+PREVIEW_KEY_LENGTH = 64
+
+
 class TransferRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     source: SourceSpec
     target: TargetSpec
+    # The asking dialog's own id: a preview still reading stops between two tables once the same dialog asks for a newer
+    # one (409 `preview_superseded`, 06c final review); none: it reads to its end
+    preview_key: str | None = Field(default=None, min_length=1, max_length=PREVIEW_KEY_LENGTH)
 
     @model_validator(mode="after")
     def _a_name_for_one_table(self) -> Self:
@@ -101,7 +111,7 @@ class TransferRequest(BaseModel):
 ProblemCode = Literal[
     "target_exists", "target_missing", "target_not_writable", "unmappable_type", "invalid_type", "same_table",
     "same_sqlite_file", "source_missing", "missing_column", "unconvertible", "query_not_select", "no_columns",
-    "duplicate_column", "invalid_filter", "duplicate_target", "cascade_loop",
+    "duplicate_column", "invalid_filter", "duplicate_target", "cascade_loop", "name_too_long",
 ]
 
 

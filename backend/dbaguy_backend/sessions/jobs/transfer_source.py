@@ -24,7 +24,7 @@ from loguru import logger
 from ...adapters.base import StatementCancelled, StatementError
 from ...domain.data_jobs import INVALID_FILTER
 from ...domain.execution import ColumnMeta
-from ...domain.transfer import QUERY_NOT_SELECT, QUERY_NOT_SELECT_MESSAGE
+from ...domain.transfer import COLUMNS_CHANGED, QUERY_NOT_SELECT, QUERY_NOT_SELECT_MESSAGE
 from ...services.transfer_plans import PlannedTable
 from ...sql.select_builder import FILTER_NOT_A_CONDITION
 from ...sql.transfer_sql import SOURCE_SETTINGS, read_settings, set_setting
@@ -32,9 +32,8 @@ from .context import FIRST_FETCH, Job, JobContext, JobReport, fetch_size, plain_
 from .pipe import PipeClosed, RowPipe
 
 PIPE_CHUNK_CHARS = 4 * 1_048_576  # R-06-13: a chunk's values hold about this much text at most
-COLUMNS_CHANGED = "columns_changed"
 COLUMNS_CHANGED_MESSAGE = "The query's columns changed since the preview: preview the copy again"
-MANY_RESULTS = "The statement returns more than one result: copy one statement's result at a time"
+MANY_RESULTS = QUERY_NOT_SELECT_MESSAGE  # a T-SQL batch of several results: the preview's words (Task 9 docs review I2)
 _OTHER_CHARS = 8  # what a value that is not text or bytes counts for in a chunk's size
 
 

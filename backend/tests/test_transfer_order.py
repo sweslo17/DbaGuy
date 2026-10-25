@@ -12,7 +12,7 @@ from dbaguy_backend.adapters.references import Reference
 from dbaguy_backend.domain.dialect import Dialect
 from dbaguy_backend.domain.schema import SchemaSnapshot, SnapshotForeignKey, SnapshotRelation, SnapshotSchema
 from dbaguy_backend.services.transfer_service import (
-    CASCADE_LOOP, CASCADES_OUTSIDE, order_by_target, reference_warnings, snapshot_references,
+    CASCADE_LOOP, CASCADES_OUTSIDE, REFUSES_DELETE, order_by_target, reference_warnings, snapshot_references,
 )
 from tests.data_support import DataApp, dropping
 from tests.edit_support import scratch_db
@@ -77,13 +77,35 @@ def test_a_replace_says_which_tables_outside_the_copy_its_delete_reaches() -> No
     outside = [key("x", "p", "cascade"), key("y", "p", "set_default"), key("c", "p", "cascade"),
                key("z", "p", "restrict"), Reference("other", "w", "s", "p", "set_null")]
     assert said("replace_rows", Dialect.POSTGRES, *outside) == [
-        CASCADES_OUTSIDE.format("s.p", "s.x, s.y, other.w")]  # c is copied; z only refuses
+        CASCADES_OUTSIDE.format("s.p", "s.x, s.y, other.w"),  # c is copied; z only refuses …
+        REFUSES_DELETE.format(parent="s.p", children="s.z", hold="holds", those="s.z")]  # … and may hold rows (I-2)
     assert CASCADES_OUTSIDE.format("s.p", "s.x") == (
         "Deleting the rows of s.p also deletes (or changes) rows of s.x, which this copy does not write")
     assert said("append", Dialect.POSTGRES, *outside) == []  # nothing is deleted
     assert said("replace_rows", Dialect.MYSQL, *outside) == []  # its cascades are off during the copy
     assert said("append", Dialect.TSQL, key("p", "p")) == [
         "s.p references itself: the copy may fail unless its rows load in order"]  # fix M3, read live now
+
+
+def test_a_replace_says_which_tables_holding_rows_refuse_its_delete() -> None:  # 06c final review I-2
+    def said(*links: Reference, mode: str = "replace_rows", dialect: Dialect = Dialect.POSTGRES) -> list[str]:
+        return reference_warnings(dialect, mode, "s.p", "s", "p", {"p", "c"}, links,
+                                  lambda schema, table: f"{schema}.{table}")
+
+    def held(child: str, on_delete: str = "no_action", rows: bool | None = True, **fields) -> Reference:
+        return Reference("s", child, "s", "p", on_delete, child_rows=rows, **fields)  # type: ignore[arg-type]
+
+    refusing = [held("c"), held("x", "restrict"), held("empty", rows=False), held("later", deferred=True),
+                held("unread", rows=None), held("gone", "cascade"), held("p")]
+    assert said(*refusing) == [
+        "s.p references itself: the copy may fail unless its rows load in order",
+        CASCADES_OUTSIDE.format("s.p", "s.gone"),
+        REFUSES_DELETE.format(parent="s.p", children="s.c, s.x, s.unread", hold="hold", those="those tables")]
+    assert said(held("c")) == [
+        "Replacing the rows of s.p fails while s.c holds rows that reference them (ON DELETE NO ACTION or RESTRICT): "
+        "empty s.c first, then copy"]
+    assert said(*refusing, mode="append") == ["s.p references itself: the copy may fail unless its rows load in order"]
+    assert said(held("c"), dialect=Dialect.MYSQL) == []  # its checks are off during the copy
 
 
 def _family(db, made: list, *, loop: bool = False) -> tuple[str, str]:
@@ -189,3 +211,68 @@ def test_mysql_cascades_nothing_with_its_checks_off(tmp_path: Path) -> None:
         assert rows == [(10, 1)]  # checks off: its row stays, referencing a parent that is gone
     finally:
         my.close()
+
+
+@requires_pg
+def test_replacing_a_parent_whose_children_hold_rows_is_warned_of_and_fails_loudly(app: DataApp,
+                                                                                    tmp_path: Path) -> None:
+    """06c final review I-2: replacing the rows of a parent and of a child whose key only refuses (NO ACTION) goes
+    parents first, so the parent's DELETE meets the child's old rows: 23503, rolled back, nothing lost. The preview
+    names every table whose rows refuse it, in the copy or not, from the same live read as the order."""
+    lite, pg = scratch_db("sqlite", tmp_path), scratch_db("postgres", tmp_path)
+    try:
+        with dropping(pg, before_drop=app.close_sessions) as made:
+            parent, child = table_name("p"), table_name("c")
+            outside, empty, later = table_name("x"), table_name("e"), table_name("d")
+            made += [("TABLE", parent), ("TABLE", child), ("TABLE", outside), ("TABLE", empty), ("TABLE", later)]
+            pg.execute(f"CREATE TABLE {pg.table(parent)} (id int PRIMARY KEY, label text)",
+                       f"CREATE TABLE {pg.table(child)} (id int PRIMARY KEY, p int REFERENCES {pg.table(parent)})",
+                       f"CREATE TABLE {pg.table(outside)} (id int, p int REFERENCES {pg.table(parent)} "
+                       "ON DELETE RESTRICT)",
+                       f"CREATE TABLE {pg.table(empty)} (id int, p int REFERENCES {pg.table(parent)})",
+                       f"CREATE TABLE {pg.table(later)} (id int, p int REFERENCES {pg.table(parent)} "
+                       "DEFERRABLE INITIALLY DEFERRED)",
+                       f"INSERT INTO {pg.table(parent)} VALUES (1, 'old')",
+                       f"INSERT INTO {pg.table(child)} VALUES (1, 1)",
+                       f"INSERT INTO {pg.table(outside)} VALUES (1, 1)",
+                       f"INSERT INTO {pg.table(later)} VALUES (1, 1)")
+            lite.execute(f"CREATE TABLE {lite.table(parent)} (id INTEGER PRIMARY KEY, label TEXT)",
+                         f"CREATE TABLE {lite.table(child)} (id INTEGER PRIMARY KEY, p INTEGER)",
+                         f"INSERT INTO {lite.table(parent)} VALUES (1, 'new')",
+                         f"INSERT INTO {lite.table(child)} VALUES (1, 1)")
+            src, dst = profile(app, lite, "lite"), profile(app, pg, "pg")
+            request = tables_request(lite, src, [child, parent], pg, dst, "replace_rows")
+            plan = app.container.transfers.plan(request)
+            appended = app.container.transfers.plan(tables_request(lite, src, [child, parent], pg, dst, "append"))
+            ran = copy(app, request, dst, "dbaguy")
+            kept = pg.rows(f"SELECT label FROM {pg.table(parent)}")
+        assert [table.target for table in plan.tables] == [f"public.{parent}", f"public.{child}"]
+        assert plan.plan_id is not None and plan.tables[0].warnings == [REFUSES_DELETE.format(
+            parent=f"public.{parent}", children=f"public.{child}, public.{outside}", hold="hold",
+            those="those tables")]  # not the empty table, nor the deferred key's (checked at COMMIT)
+        assert all("Replacing" not in warning for table in appended.tables for warning in table.warnings)
+        assert (ran.outcome.outcome, ran.error.code, kept) == ("rolled_back", "23503", [("old",)])
+    finally:
+        lite.close()
+        pg.close()
+
+
+@requires_mssql
+def test_sql_server_names_the_tables_holding_rows_that_refuse_a_replaces_delete(app: DataApp, tmp_path: Path) -> None:
+    lite, ms = scratch_db("sqlite", tmp_path), scratch_db("mssql", tmp_path)
+    try:
+        with dropping(ms, before_drop=app.close_sessions) as made:
+            parent, outside, empty = table_name("p"), table_name("x"), table_name("e")
+            made += [("TABLE", parent), ("TABLE", outside), ("TABLE", empty)]
+            ms.execute(f"CREATE TABLE {ms.table(parent)} (id int PRIMARY KEY)",
+                       f"CREATE TABLE {ms.table(outside)} (id int, p int REFERENCES {ms.table(parent)} (id))",
+                       f"CREATE TABLE {ms.table(empty)} (id int, p int REFERENCES {ms.table(parent)} (id))",
+                       f"INSERT INTO {ms.table(parent)} VALUES (1)", f"INSERT INTO {ms.table(outside)} VALUES (1, 1)")
+            lite.execute(f"CREATE TABLE {lite.table(parent)} (id INTEGER PRIMARY KEY)")
+            src, dst = profile(app, lite, "lite"), profile(app, ms, "ms")
+            plan = app.container.transfers.plan(tables_request(lite, src, [parent], ms, dst, "replace_rows"))
+        assert plan.tables[0].warnings == [REFUSES_DELETE.format(
+            parent=f"dbo.{parent}", children=f"dbo.{outside}", hold="holds", those=f"dbo.{outside}")]
+    finally:
+        lite.close()
+        ms.close()

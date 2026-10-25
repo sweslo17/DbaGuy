@@ -105,6 +105,17 @@ class AlreadyExists(DomainError):
     status = 409
 
 
+class PreviewSuperseded(DomainError):
+    """A copy's preview stopped between two tables: the same dialog asked for a newer one (its `preview_key`), and nobody
+    waits for this one any more (06c final review)."""
+
+    code = "preview_superseded"
+    status = 409
+
+    def __init__(self) -> None:
+        super().__init__("A newer preview was asked for")
+
+
 class QueryFailed(DomainError):
     code = "query_failed"
     status = 400

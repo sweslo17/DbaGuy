@@ -717,9 +717,9 @@ class MssqlConnection(DatabaseConnection, RowEditing, DataTools, ReferenceReadin
         self._check_database(path)
         return self._catalog_call(lambda: columns.table_columns(self._conn, path))
 
-    def references(self, schema: str, names: list[str]) -> list[Reference]:
+    def references(self, schema: str, names: list[str], *, rows: bool = False) -> list[Reference]:
         """A copy's preview, on the metadata connection (its lock timeout: a locked catalog answers in 5 s)."""
-        return self._metadata_call(lambda: references.references(self._conn, schema, names))
+        return self._metadata_call(lambda: references.references(self._conn, schema, names, rows=rows))
 
     def dump_session(self, scope: DumpScope) -> DumpSession:
         return self._catalog_call(lambda: dump.session(self._conn))

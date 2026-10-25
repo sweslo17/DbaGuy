@@ -174,10 +174,10 @@ MYSQL_JSON_NOTE = ("MySQL's JSON orders the keys, keeps one of duplicate keys, a
 
 
 def _json(column: TableColumn, source: Dialect, target: Dialect) -> Mapped:
+    """Another engine's JSON; on the same engine only a domain over json (`_same_engine_custom`: a plain json or jsonb
+    column keeps its declared type before it gets here, 06c Task 1 N4)."""
     if target is Dialect.POSTGRES:
-        if source is Dialect.POSTGRES and column.type_name in ("json", "jsonb"):
-            return Mapped(column.type_name)
-        return Mapped("jsonb", _JSONB_NOTE)  # another engine's JSON, or a domain over json (its base is not kept)
+        return Mapped("jsonb", _JSONB_NOTE)  # a domain over json too: its base is not kept
     if target is Dialect.MYSQL:
         return Mapped("json", MYSQL_JSON_NOTE if source is not Dialect.MYSQL else None)
     return Mapped({Dialect.TSQL: "nvarchar(max)", Dialect.SQLITE: "TEXT"}[target])
@@ -193,13 +193,17 @@ def _normalised_json(target: TableColumn, dialect: Dialect) -> str | None:
     return None
 
 
+def _own_type(column: TableColumn, type_sql: str) -> str:
+    return f"{column.type_name} is the source database's own type: the new column is {type_sql}"
+
+
 def _same_engine_custom(column: TableColumn, target: Dialect) -> Mapped:
     """A type of the source database's own, on the same engine: its family's type (a domain's base), or text."""
     mapped = _cross(column, target, target)
     if mapped.type_sql is None:
         return mapped
-    why = f"{column.type_name} is the source database's own type: the new column is {mapped.type_sql}"
-    return Mapped(mapped.type_sql, "; ".join(filter(None, (why, mapped.note))), mapped.problem)
+    return Mapped(mapped.type_sql, "; ".join(filter(None, (_own_type(column, mapped.type_sql), mapped.note))),
+                  mapped.problem)
 
 
 def _cross(column: TableColumn, source: Dialect, target: Dialect) -> Mapped:
@@ -227,9 +231,10 @@ def _cross(column: TableColumn, source: Dialect, target: Dialect) -> Mapped:
 def target_type(column: TableColumn, source: Dialect, target: Dialect) -> Mapped:
     """The type a new table's column gets for `column` (spec §3.5.2). Same engine: the declared type, unless it is the
     database's own (a domain, an enum, an extension's or an alias type: its family's type then, with a note); spatial
-    types keep theirs. Another engine: by family. PostgreSQL's money stays money, a domain over it too."""
+    types keep theirs. Another engine: by family. PostgreSQL's money stays money, a domain over it too (with the
+    own-type note, 06c Task 1 N3)."""
     if column.family == "money" and source is Dialect.POSTGRES and target is Dialect.POSTGRES:
-        return Mapped("money")
+        return Mapped("money", _own_type(column, "money") if column.custom_type else None)
     if source is target:
         if column.custom_type and column.family != "spatial":
             return _same_engine_custom(column, target)
@@ -246,15 +251,18 @@ _KINDS: dict[TypeFamily, EditKind] = {
 
 def planned_column(name: str, type_sql: str, dialect: Dialect) -> TableColumn:
     """A new table's column as its catalog will read it — its family and kind from the type's text (MySQL's
-    tinyint(1) is read as a number) — what the preview computes its conversions against. The copy itself reads the
-    real column after its CREATE TABLE."""
+    tinyint(1) is read as a number; SQL Server's char, varchar and text are not Unicode, 06c final review M-6) — what
+    the preview computes its conversions and notes against. The copy itself reads the real column after its CREATE
+    TABLE."""
     named = of_name(dialect, type_sql)
     kind = _KINDS.get(named.family, "text")
     if named.family == "bool" and dialect is Dialect.MYSQL:
         kind = "number"
+    unicode = not (dialect is Dialect.TSQL and named.family in _STRING
+                   and not type_sql.strip().lstrip("[").lower().startswith("n"))
     return TableColumn(name=name, type_name=type_sql, family=named.family, nullable=True, has_default=False,
                        kind=kind, compare="none", writable=True, precision=named.precision, scale=named.scale,
-                       length=named.length)
+                       length=named.length, unicode=unicode)
 
 
 # What is not bytes: a binary column takes only bytes (a server would store a number's or a date's own bytes, silently:
@@ -440,7 +448,7 @@ def primary_key(columns: Sequence[tuple[TableColumn, str, bool]], dialect: Diale
 
 class RowFailure(Exception):
     """A value its target column cannot hold: its row fails (the table is rolled back). The reason never quotes the
-    value beyond a special word (`infinity`, a zero date, a number that is neither 0 nor 1)."""
+    value beyond a special word (`infinity`, a zero date)."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -585,7 +593,7 @@ def _to_bool(value: Any) -> Any:
         return value  # a bool, or text the server reads itself ('t', 'true')
     if value in (0, 1):
         return bool(value)
-    raise RowFailure(f"holds {value}, which is neither 0 nor 1 (true or false)")
+    raise RowFailure("holds a number that is neither 0 nor 1 (true or false)")  # never the value (Task 9 review M5)
 
 
 def _bool_to_int(value: Any) -> Any:
@@ -631,6 +639,11 @@ def _no_binary(value: Any) -> Any:
 
 
 UTC_NOTE = "converted to UTC: the offset is not kept"
+# MySQL's TIMESTAMP goes through the session's time zone, which a copy sets to UTC on both sides (`transfer_sql`): a
+# TIMESTAMP is read as its UTC time, and a value written to one is taken as UTC, whatever zone the grid shows it in (a
+# profile's `time_zone` option, the server's own). Between two MySQL TIMESTAMPs nothing moves (06c final review I-1).
+MYSQL_TIMESTAMP_READ = "MySQL TIMESTAMP is read as UTC: 20:00 at +08:00 is copied as 12:00"
+MYSQL_TIMESTAMP_WRITTEN = "MySQL TIMESTAMP takes it as UTC: 12:00 is shown as 20:00 at +08:00"
 _PG_SPECIAL_NOTE = "PostgreSQL's infinity and dates before the year 1 fail their row"
 _ZERO_DATE_NOTE = "MySQL's zero dates (0000-00-00) fail their row"
 _DROP_OFFSET_NOTE = "the offset is dropped"
@@ -668,16 +681,59 @@ def _chain(steps: list[Convert]) -> Convert | None:
     return convert
 
 
+# A query's result is read again as the grid reads it, never with the `read_as` a table's copy reads its columns with
+# (06c final review M-4): what that loses on the way, said of the query's column (a table's copy of it keeps it all)
+QUERY_FLOAT = ("A query's result is read as the grid reads it: MySQL sends a FLOAT with 6 significant digits; copy the "
+               "table to keep every digit")
+QUERY_FRACTION = ("A query's result is read as the grid reads it: the driver drops the 7th digit of the fraction; copy "
+                  "the table to keep it")
+QUERY_MONEY = ("A query's result is read as the grid reads it: money comes as the server's currency text ($1,234.56); "
+               "copy the table to read it as a number")
+_SEVEN_DIGITS = ("datetime2", "datetimeoffset", "time")  # SQL Server's types of 7 fractional digits by default
+
+
+def query_read_note(column: TableColumn, target: TableColumn, source: Dialect, target_dialect: Dialect) -> str | None:
+    """What a query's column loses being read as the grid reads it (M-4), or None: MySQL's FLOAT, SQL Server's 7th
+    fractional digit (datetime2, datetimeoffset, time of a scale over 6, or none given: 7), PostgreSQL's money as
+    lc_monetary's text (which a PostgreSQL money column reads back as it was)."""
+    if source is Dialect.MYSQL and column.family == "float32":
+        return QUERY_FLOAT
+    if source is Dialect.TSQL and column.family in _FRACTIONAL and (column.scale is None or column.scale > 6) \
+            and column.type_name.strip().lower().startswith(_SEVEN_DIGITS):
+        return QUERY_FRACTION
+    if source is Dialect.POSTGRES and column.family == "money" and not (
+            target_dialect is Dialect.POSTGRES and target.family == "money"):
+        return QUERY_MONEY
+    return None
+
+
+def _mysql_timestamp(column: TableColumn, dialect: Dialect) -> bool:
+    """A MySQL TIMESTAMP column (SQL Server's `timestamp` is a rowversion: not one)."""
+    return dialect is Dialect.MYSQL and column.type_name.strip().lower().startswith("timestamp")
+
+
+def _time_zone_notes(source: TableColumn, target: TableColumn, source_dialect: Dialect,
+                     target_dialect: Dialect) -> tuple[str, ...]:
+    """What MySQL's TIMESTAMP does to a value on the way (I-1): read as UTC, or written as UTC; nothing between two."""
+    read, written = _mysql_timestamp(source, source_dialect), _mysql_timestamp(target, target_dialect)
+    if read and not written:
+        return (MYSQL_TIMESTAMP_READ,)
+    if written and not read and source.family in ("timestamp", "timestamp_tz"):
+        return (MYSQL_TIMESTAMP_WRITTEN,)
+    return ()
+
+
 def conversion(
     source: TableColumn, target: TableColumn, source_dialect: Dialect, target_dialect: Dialect, *,
     backslash_escapes: bool | None = None,
 ) -> Conversion:
     """How a value of `source` goes into `target` (spec §3.5.3). A value of the same engine's same kind of column goes
-    as read: it came from that engine. `backslash_escapes` False: a MySQL target session with NO_BACKSLASH_ESCAPES,
-    where no literal can write a NUL."""
+    as read: it came from that engine (a MySQL TIMESTAMP into a DATETIME still says it is read as UTC).
+    `backslash_escapes` False: a MySQL target session with NO_BACKSLASH_ESCAPES, where no literal can write a NUL."""
     family, kind, into = source.family, target.value_kind, target.family
+    zone = _time_zone_notes(source, target, source_dialect, target_dialect)
     if source_dialect is target_dialect and family == into and source.value_kind == kind:
-        return Conversion(None)
+        return Conversion(None, zone)
     name = engine_name(target_dialect)
     steps: list[tuple[Convert, str | None]] = []
     if source_dialect is Dialect.POSTGRES and target_dialect is not Dialect.POSTGRES and family in _DATED:
@@ -720,4 +776,5 @@ def conversion(
         notes.append(FRACTION_NOTE)  # the 7th digit goes up to the server as text, which rounds it (I1)
     if source_dialect is not target_dialect and (said := _normalised_json(target, target_dialect)) is not None:
         notes.append(said)  # whether the table is created or there already (06c Task 2 fix round 1)
+    notes += zone
     return Conversion(_chain([step for step, _ in steps]), tuple(dict.fromkeys(notes)))

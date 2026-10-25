@@ -15,7 +15,7 @@ from dbaguy_backend.adapters.columns import TableColumn
 from dbaguy_backend.domain.data_jobs import INVALID_FILTER
 from dbaguy_backend.domain.edits import PLAN_MISMATCH, PlanUnavailable
 from dbaguy_backend.domain.execution import ExecuteCommand
-from dbaguy_backend.domain.transfer import COPY_PLAN_EXPIRED, QUERY_NOT_SELECT
+from dbaguy_backend.domain.transfer import COPY_PLAN_EXPIRED, QUERY_NOT_SELECT, QUERY_NOT_SELECT_MESSAGE
 from dbaguy_backend.sessions.jobs.context import Job, JobContext, JobReport, PreparedJob
 from dbaguy_backend.sessions.jobs.pipe import RowPipe, SourceFailed
 from dbaguy_backend.sessions.jobs.registry import JobRegistry
@@ -217,9 +217,10 @@ def test_a_query_that_writes_or_changed_its_columns_is_never_read(tmp_path: Path
                     pipe, planned(sql, [_column(c) for c in columns]), query=True, label="q")))
                 with pytest.raises(SourceFailed) as failed:
                     _drain(pipe)
-                causes.append(failed.value.cause.code)
+                causes.append((failed.value.cause.code, failed.value.code))
             assert lite.rows(f"SELECT a FROM {lite.table(name)}") == [(1,)]  # the DELETE never ran
-        assert causes == ["query_not_select", "columns_changed"]
+        # the copy's error keeps the source's code for what the preview checks too (Task 9 docs review I2)
+        assert causes == [("query_not_select", "query_not_select"), ("columns_changed", "columns_changed")]
     finally:
         lite.close()
         app.close()
@@ -300,6 +301,7 @@ def test_a_query_with_more_than_one_result_is_never_copied(env) -> None:  # M4: 
     with pytest.raises(SourceFailed) as failed:
         _drain(pipe, within_s=10)
     assert (failed.value.cause.code, failed.value.cause.message) == (QUERY_NOT_SELECT, MANY_RESULTS)
+    assert MANY_RESULTS == QUERY_NOT_SELECT_MESSAGE and failed.value.code == QUERY_NOT_SELECT  # the preview's (I2)
     assert outcome(request_events(e.recorder, "q")).outcome == "failed"
 
 
@@ -340,6 +342,7 @@ def test_a_queued_request_is_withdrawn_and_a_running_one_never_is(env) -> None: 
         _drain(queued, within_s=10)
     assert (failed.value.cause.code, outcome(request_events(e.recorder, "queued")).outcome) == (
         "not_started", "not_started")
+    assert failed.value.code == "source_failed"  # any other error of the source is the source's (I2)
     assert e.conn.runs == ["block"] and e.worker.withdraw("queued") is False  # nothing of it ran; it is over
 
 
@@ -375,6 +378,7 @@ def test_a_filter_that_is_not_a_condition_is_said_in_a_filters_words(env) -> Non
         _drain(pipe, within_s=10)
     assert (failed.value.cause.code, failed.value.cause.message, e.conn.runs) == (
         INVALID_FILTER, FILTER_NOT_A_CONDITION, [])
+    assert failed.value.code == INVALID_FILTER
 
 
 class _RefusesAtOnce(Helper):

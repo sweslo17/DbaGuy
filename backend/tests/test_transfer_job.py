@@ -18,10 +18,12 @@ from dbaguy_backend.domain.execution import CopyDataCommand, ExecuteCommand
 from dbaguy_backend.services.transfer_plans import PlannedColumn, PlannedTable, StoredTransfer
 from dbaguy_backend.sessions.jobs.context import JOB_ROLLBACK_FAILED, SourceLease
 from dbaguy_backend.sessions.jobs.kept_changes import KEPT, SHOW_WARNINGS
+from dbaguy_backend.domain.transfer import QUERY_NOT_SELECT_MESSAGE
 from dbaguy_backend.sessions.jobs.transfer import (
-    CREATED_CHECK, CREATED_EMPTY, CREATED_KEPT, DELETE_STOPPED, DELETED_STAY, MAY_STAND, NOT_ROLLED_BACK, TRIGGER_ENDED,
-    TransferSink,
+    CREATED_CHECK, CREATED_EMPTY, CREATED_KEPT, DELETE_STOPPED, DELETED_STAY, MAY_STAND, NOT_ROLLED_BACK, SOME_MAY_STAND,
+    TRIGGER_ENDED, TransferSink,
 )
+from dbaguy_backend.sql.type_map import MYSQL_TIMESTAMP_READ
 from dbaguy_backend.sql.bulk_insert import InsertBatcher
 from dbaguy_backend.sql.dialects import Dialect
 from tests.data_support import DataApp, JobTab, Ran, dropping
@@ -295,10 +297,17 @@ def test_a_query_tabs_copy_reads_on_its_session_and_a_failing_read_is_the_source
                    source_session=tab.session_id)
         failing = copy(app, query_request(pg, src, "SELECT 1 / (n - 500) AS n FROM generate_series(1, 1000) n",
                                           columns, lite, dst, "zz_06c_q2"), dst, None, source_session=tab.session_id)
+        # the tab's result had other columns than the statement gives now: the preview mapped `m`
+        changed = copy(app, query_request(pg, src, "SELECT n FROM zz_06c_tmp", [{**columns[0], "name": "m"}], lite,
+                                          dst, "zz_06c_q3"), dst, None, source_session=tab.session_id)
         assert ran.outcome.outcome == "completed" and lite.rows("SELECT n FROM zz_06c_q") == [(7,)]
         assert (failing.outcome.outcome, failing.error.code) == ("rolled_back", "source_failed")
         assert failing.error.message.startswith("Reading Query 1 failed: division by zero")
         assert lite.rows("SELECT name FROM sqlite_master WHERE name = 'zz_06c_q2'") == []
+        # what the preview checks too keeps its own code in the copy's outcome (Task 9 docs review I2)
+        assert (changed.outcome.outcome, changed.outcome.error.code, changed.outcome.error.message) == (
+            "rolled_back", "columns_changed",
+            "Reading Query 1 failed: The query's columns changed since the preview: preview the copy again")
     finally:
         pg.close()
         lite.close()
@@ -420,7 +429,9 @@ def test_a_batch_with_more_than_one_result_is_never_copied(app: DataApp, tmp_pat
         columns = [{"name": "a", "type_name": "int", "category": "number"}]
         ran = copy(app, query_request(ms, src, "SELECT 1 AS a; SELECT 2 AS a", columns, lite, dst, "zz_06c_q"), dst,
                    None, source_session=info.session_id)
-        assert (ran.outcome.outcome, ran.error.code) == ("rolled_back", "source_failed")
+        # the preview's code and words (Task 9 docs review I2): it cannot tell a batch of reads, the copy can
+        assert (ran.outcome.outcome, ran.error.code) == ("rolled_back", "query_not_select")
+        assert ran.outcome.error.message == f"Reading Query 1 failed: {QUERY_NOT_SELECT_MESSAGE}"
         assert lite.rows("SELECT name FROM sqlite_master WHERE name = 'zz_06c_q'") == []
     finally:
         ms.close()
@@ -588,6 +599,8 @@ def test_a_rollback_that_left_a_triggers_changes_is_unknown(app: DataApp, tmp_pa
             counts = [my.rows(f"SELECT COUNT(*) FROM {my.table(name)}")[0][0] for name in (target, log)]
         assert (ran.outcome.outcome, ran.error.code) == ("unknown", "1062")
         assert KEPT in ran.outcome.warnings and counts == [1, 1000]  # the table rolled back; the trigger's rows stayed
+        # what stands is the trigger's table, never the rows of the one copied (Task 4 re-review N-1)
+        assert SOME_MAY_STAND in ran.outcome.warnings and not [w for w in ran.outcome.warnings if target in w]
     finally:
         lite.close()
         my.close()
@@ -620,11 +633,13 @@ class _Answer(FakeResult):
 class _Target(FakeConnection):
     """A copy's target: BEGIN opens a transaction and an INSERT matches its rows. `fail`: a statement's first word →
     what it raises (a StatementError, or a function of the connection that returns one); `commit`: what COMMIT does
-    (ok, lost, left_open, crash); `engine`: whether MySQL says the table rolls back (YES, NO); `warnings`: what SHOW
+    (ok, lost, left_open, crash); `engine`: whether MySQL says the table rolls back (YES, NO; None: it finds no such
+    table); `warnings`: what SHOW
     WARNINGS holds; `ends`: an INSERT ends the transaction; `rollback_fails`; `check_crashes`: the check before COMMIT
     raises a bug's exception once; `hold`: COMMIT waits (reached, go)."""
 
-    def __init__(self, *, fail: dict | None = None, commit: str = "ok", engine: str = "YES", warnings: tuple = (),
+    def __init__(self, *, fail: dict | None = None, commit: str = "ok", engine: str | None = "YES",
+                 warnings: tuple = (),
                  ends: bool = False, rollback_fails: bool = False, check_crashes: bool = False,
                  hold: tuple[threading.Event, threading.Event] | None = None) -> None:
         super().__init__()
@@ -657,7 +672,7 @@ class _Target(FakeConnection):
         elif sql == SHOW_WARNINGS:
             return _Answer([list(warning) for warning in self.warnings])
         elif "information_schema.TABLES" in sql:
-            return _Answer([[self.engine]])
+            return _Answer([[self.engine]] if self.engine is not None else [])  # None: no such table, as it spells it
         return _Answer()
 
     def _commit(self) -> _Answer:
@@ -837,7 +852,8 @@ def test_a_mysql_table_is_what_the_server_says_when_it_starts(fakes) -> None:  #
     warned = fakes(_Target(fail={"INSERT": _duplicate}, warnings=(("Warning", 1196, "…"),)), Dialect.MYSQL,
                    created).run()  # InnoDB, but its ROLLBACK left another table's changes (a trigger's: R3)
     assert _ended(warned) == ("unknown", ["unknown"], "1062")
-    assert outcome(warned).warnings == [KEPT, CREATED_CHECK.format("t"), MAY_STAND.format(3, "t")]
+    # what may stand is another table's, not the rows written to t, which rolled back (Task 4 re-review N-1)
+    assert outcome(warned).warnings == [KEPT, CREATED_CHECK.format("t"), SOME_MAY_STAND]
     undone = fakes(_Target(fail={"INSERT": _duplicate}), Dialect.MYSQL, created).run()
     assert _ended(undone) == ("rolled_back", ["rolled_back"], "1062")
     assert outcome(undone).warnings == [CREATED_EMPTY.format("t")]  # empty: only once it rolled back
@@ -854,3 +870,69 @@ def test_a_delete_that_stopped_part_way_is_said_as_such(fakes) -> None:  # revie
 def test_a_rollback_that_failed_is_said_where_the_table_is_unknown(fakes) -> None:  # review M-10
     events = fakes(_Target(fail={"INSERT": _duplicate}, engine="NO", rollback_fails=True), Dialect.MYSQL).run()
     assert outcome(events).warnings == [NOT_ROLLED_BACK.format("t"), JOB_ROLLBACK_FAILED, MAY_STAND.format(3, "t")]
+
+
+def test_a_created_table_the_server_does_not_find_is_taken_as_one_that_cannot_roll_back(fakes) -> None:
+    """Task 4 re-review N-2: the copy just created it, so "not found" is the server spelling its name otherwise
+    (lower_case_table_names), and its engine may be one that cannot roll back: a failed write is unknown."""
+    created = _planned("t", create_first="CREATE TABLE t (n int)", created=True)
+    events = fakes(_Target(fail={"INSERT": _duplicate}, engine=None), Dialect.MYSQL, created).run()
+    assert _ended(events) == ("unknown", ["unknown"], "1062")
+    assert outcome(events).warnings == [CREATED_KEPT.format("t"), MAY_STAND.format(3, "t")]
+    there = fakes(_Target(fail={"INSERT": _duplicate}, engine=None), Dialect.MYSQL, _planned("u")).run()
+    assert _ended(there) == ("rolled_back", ["rolled_back"], "1062")  # an existing one: as the plan said
+
+
+@requires_mysql
+def test_a_value_too_long_for_a_table_that_cannot_roll_back_fails_instead_of_being_cut(app: DataApp,
+                                                                                         tmp_path: Path) -> None:
+    """Task 9 docs review M10: MySQL's STRICT_TRANS_TABLES cuts a value too long for a MyISAM column past the first row
+    of a multi-row INSERT, with a warning only (probed); the copy's session is strict for every table, so the INSERT
+    fails and the table is unknown, never copied with a value changed."""
+    lite, my = scratch_db("sqlite", tmp_path), scratch_db("mysql", tmp_path)
+    try:
+        with dropping(my, before_drop=app.close_sessions) as made:
+            source, target = table_name("s"), table_name("t")
+            lite.execute(f"CREATE TABLE {lite.table(source)} (id INTEGER PRIMARY KEY, s TEXT)",
+                         f"INSERT INTO {lite.table(source)} VALUES (1, 'abc'), (2, 'abcdef'), (3, 'x')")
+            my.execute(f"CREATE TABLE {my.table(target)} (id int PRIMARY KEY, s varchar(3)) ENGINE=MyISAM")
+            made.append(("TABLE", target))
+            src, dst = profile(app, lite, "lite"), profile(app, my, "my")
+            ran = copy(app, tables_request(lite, src, [source], my, dst, "append", table=target), dst, None)
+            rows = my.rows(f"SELECT id, s FROM {my.table(target)} ORDER BY id")
+        assert (ran.outcome.outcome, ran.error.code) == ("unknown", "1406")  # Data too long
+        assert NOT_ROLLED_BACK.format(target) in ran.outcome.warnings
+        assert rows == [(1, "abc")]  # the row before it stays (MyISAM), and no value was cut
+    finally:
+        lite.close()
+        my.close()
+
+
+@requires_mysql
+def test_a_mysql_timestamp_is_copied_as_its_utc_time_and_the_preview_says_so(app: DataApp, tmp_path: Path) -> None:
+    """06c final review I-1: a profile whose time_zone is +08:00 shows 20:00 for a TIMESTAMP stored as 12:00 UTC; the
+    copy reads it in UTC (its session's time_zone, `transfer_sql.SOURCE_SETTINGS`), and the preview says so."""
+    my, lite = scratch_db("mysql", tmp_path), scratch_db("sqlite", tmp_path)
+    try:
+        with dropping(my, before_drop=app.close_sessions) as made:
+            source = table_name("s")
+            my.execute(f"CREATE TABLE {my.table(source)} (id int PRIMARY KEY, ts timestamp NULL, dt datetime NULL)",
+                       "SET SESSION time_zone = '+00:00'",
+                       f"INSERT INTO {my.table(source)} VALUES (1, '2026-10-05 12:00:00', '2026-10-05 12:00:00')")
+            made.append(("TABLE", source))
+            src = app.add_profile(my.profile(name="my +08", options={"time_zone": "+08:00"}))
+            dst = profile(app, lite, "lite")
+            tab = app.job_session(src)
+            shown = tab.run(lambda rid: ExecuteCommand(request_id=rid, sql=f"SELECT ts FROM {my.table(source)}"))
+            request = tables_request(my, src, [source], lite, dst, table=table_name("t"))
+            plan = app.container.transfers.plan(request)
+            ran = copy(app, request, dst, None)
+            copied = lite.rows(f"SELECT ts, dt FROM {lite.table(request.target.table)}")
+        notes = {column.source_name: column.conversion or "" for column in plan.tables[0].columns}
+        assert MYSQL_TIMESTAMP_READ in notes["ts"] and MYSQL_TIMESTAMP_READ not in notes["dt"]
+        assert ["2026-10-05 20:00:00"] == [row[0] for event in shown.events if event.type == "rows"
+                                           for row in event.rows]  # the grid, at +08:00
+        assert ran.outcome.outcome == "completed" and copied == [("2026-10-05 12:00:00", "2026-10-05 12:00:00")]
+    finally:
+        my.close()
+        lite.close()

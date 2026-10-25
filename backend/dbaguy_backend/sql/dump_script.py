@@ -20,20 +20,29 @@ _CONTENT = {"schema": "schema only", "data": "data only", "both": "schema and da
 
 # MySQL: what a file restores under, and so what its dump session reads definitions and rows under (adapters/mysql/
 # dump.py, pre-flight M5): zero dates and an id of 0 restore as they are (no NO_ZERO_DATE; NO_AUTO_VALUE_ON_ZERO),
-# strict, so a value that does not fit stops the run instead of being cut; TIMESTAMPs read and written in UTC
+# strict, so a value that does not fit stops the run instead of being cut (a table that can roll back: a MyISAM one cuts
+# a value past the first row of a multi-row INSERT, with a warning, probed: 06c Task 9 docs review M10; a copy's
+# session is strict for every table, `transfer_sql.COPY_SQL_MODE`); TIMESTAMPs read and written in UTC
 RESTORE_SQL_MODE = "STRICT_TRANS_TABLES,NO_AUTO_VALUE_ON_ZERO"
 # … so a restore reads backslashes as escapes, and a dump's MySQL literals are written for that (never for the mode
 # of the server dumped)
 RESTORE_BACKSLASH_ESCAPES = "NO_BACKSLASH_ESCAPES" not in RESTORE_SQL_MODE.split(",")
 RESTORE_TIME_ZONE = "+00:00"
 RESTORE_CHARSET = "utf8mb4"  # SET NAMES
+
+
+def mysql_settings(sql_mode: str) -> tuple[str, ...]:
+    """MySQL's restore settings under `sql_mode` (a copy's target session is stricter than a restore's)."""
+    return (f"SET NAMES {RESTORE_CHARSET}", "SET FOREIGN_KEY_CHECKS = 0",
+            f"SET SESSION sql_mode = {quote_literal(Dialect.MYSQL, sql_mode)}",
+            f"SET time_zone = {quote_literal(Dialect.MYSQL, RESTORE_TIME_ZONE)}")
+
+
 # What a restore must run under (D-06-7, §3.3.3)
 RESTORE_SETTINGS: dict[Dialect, tuple[str, ...]] = {
     Dialect.POSTGRES: ("SET client_encoding = 'UTF8'", "SET standard_conforming_strings = on",
                        "SET check_function_bodies = false"),
-    Dialect.MYSQL: (f"SET NAMES {RESTORE_CHARSET}", "SET FOREIGN_KEY_CHECKS = 0",
-                    f"SET SESSION sql_mode = {quote_literal(Dialect.MYSQL, RESTORE_SQL_MODE)}",
-                    f"SET time_zone = {quote_literal(Dialect.MYSQL, RESTORE_TIME_ZONE)}"),
+    Dialect.MYSQL: mysql_settings(RESTORE_SQL_MODE),
     # no SET NOCOUNT ON (unlike SSMS's scripts): under it no INSERT reports its rows, and the run of the dump would
     # say 0 rows restored (S21)
     Dialect.TSQL: ("SET QUOTED_IDENTIFIER ON", "SET ANSI_NULLS ON"),

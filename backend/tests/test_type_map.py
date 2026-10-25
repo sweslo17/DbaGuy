@@ -10,7 +10,8 @@ from dbaguy_backend.adapters.families import NamedType, of_name
 from dbaguy_backend.domain.column_category import ColumnCategory
 from dbaguy_backend.domain.dialect import Dialect
 from dbaguy_backend.sql.type_map import (
-    DIGITS_AS_TEXT, FRACTION_NOTE, MYSQL_JSON_NOTE, UTC_NOTE, RowFailure, conversion, incompatible, planned_column,
+    DIGITS_AS_TEXT, FRACTION_NOTE, MYSQL_JSON_NOTE, MYSQL_TIMESTAMP_READ, MYSQL_TIMESTAMP_WRITTEN, QUERY_FLOAT,
+    QUERY_FRACTION, QUERY_MONEY, UTC_NOTE, RowFailure, conversion, incompatible, planned_column, query_read_note,
     target_type, to_utc, type_problem, unmappable, with_minute_offset,
 )
 
@@ -120,8 +121,11 @@ def test_the_same_engine_keeps_the_declared_type_unless_it_is_the_databases_own(
                                                              "column is varchar(40)")
     assert target_type(col("enum", "text", type_name="mood", custom_type=True), PG, PG).type_sql == "text"
     assert target_type(col("spatial", "binary", type_name="geometry", custom_type=True), PG, PG).type_sql == "geometry"
-    # money stays money, a domain over it too (spec §3.5.2: money from PostgreSQL to PostgreSQL)
-    assert target_type(col("money", "number", type_name="cash", custom_type=True), PG, PG).type_sql == "money"
+    # money stays money, a domain over it too (spec §3.5.2: money from PostgreSQL to PostgreSQL), and the domain is
+    # named as every other own type is (06c Task 1 N3)
+    cash = target_type(col("money", "number", type_name="cash", custom_type=True), PG, PG)
+    assert (cash.type_sql, cash.note) == ("money", "cash is the source database's own type: the new column is money")
+    assert target_type(col("money", "number", type_name="money"), PG, PG).note is None
     # a domain over json becomes jsonb: its base is not kept, and the preview says what jsonb does (review Minor 2)
     doc = target_type(col("json", "json", type_name="doc", custom_type=True), PG, PG)
     assert (doc.type_sql, doc.note) == (
@@ -297,8 +301,10 @@ def test_mysqls_zero_dates_and_long_times_fail_their_row_elsewhere() -> None:
 def test_true_and_false_become_what_the_target_column_holds() -> None:
     assert convert(col("bool", "number"), col("bool", "bool"), MY, PG, 1) is True
     assert convert(col("bool", "number"), col("bool", "bool"), LITE, PG, 0) is False
-    with pytest.raises(RowFailure, match="holds 5, which is neither 0 nor 1"):
+    with pytest.raises(RowFailure) as failed:
         convert(col("bool", "number"), col("bool", "bool"), MY, PG, 5)
+    # the reason never quotes the value (Task 9 docs review M5): a number, by its kind only
+    assert failed.value.reason == "holds a number that is neither 0 nor 1 (true or false)"
     assert convert(col("bool", "bool"), col("bool", "number"), PG, MY, True) == 1
     assert convert(col("bool", "bool"), col("text", "text"), MS, PG, False) == "false"
     assert convert(col("bool", "bool"), col("text", "text"), PG, LITE, True) == "true"
@@ -337,3 +343,53 @@ def test_a_nul_or_binary_data_in_text_fails_its_row_where_it_cannot_be_written()
         conversion(col("text", "text"), col("text", "text"), MS, MY, backslash_escapes=False).convert("a\x00b")
     with pytest.raises(RowFailure, match="binary data"):
         convert(col("other", "other"), col("text", "text"), LITE, PG, b"\x00")
+
+
+def test_mysqls_timestamp_is_said_to_go_as_utc_except_between_two() -> None:
+    """06c final review I-1: the copy reads and writes MySQL's TIMESTAMP in UTC (its sessions' time_zone is +00:00),
+    whatever zone the grid shows it in; a MySQL TIMESTAMP into a MySQL TIMESTAMP is exact."""
+    stamp = col("timestamp", "datetime", type_name="timestamp(3)")
+    for target, into in ((LITE, col("text", "text", type_name="TEXT")), (PG, col("timestamp", "datetime")),
+                         (MS, col("timestamp", "datetime", type_name="datetime2(7)")),
+                         (MY, col("timestamp", "datetime", type_name="datetime(6)"))):  # a DATETIME: shifted too
+        assert MYSQL_TIMESTAMP_READ in conversion(stamp, into, MY, target).notes, target
+    assert conversion(stamp, col("timestamp", "datetime", type_name="TIMESTAMP"), MY, MY).notes == ()
+    query = col("timestamp", "datetime", type_name="timestamp")  # a query's column: the protocol's name
+    assert MYSQL_TIMESTAMP_READ in conversion(query, col("text", "text"), MY, LITE).notes
+    # into a MySQL TIMESTAMP: a value without a zone is taken as UTC, one with a zone goes as its UTC time
+    into = col("timestamp", "datetime", type_name="timestamp")
+    for source, dialect in ((col("timestamp", "datetime"), PG), (col("timestamp_tz", "datetime"), PG),
+                            (col("timestamp", "datetime", type_name="datetime"), MY)):
+        assert MYSQL_TIMESTAMP_WRITTEN in conversion(source, into, dialect, MY).notes, (source.type_name, dialect)
+    assert UTC_NOTE in conversion(col("timestamp_tz", "datetime"), into, PG, MY).notes
+    assert MYSQL_TIMESTAMP_WRITTEN not in conversion(col("date", "datetime"), into, PG, MY).notes
+    # SQL Server's `timestamp` is a rowversion, and no other engine's TIMESTAMP is MySQL's
+    for source, dialect in ((col("rowversion", "binary", type_name="timestamp"), MS),
+                            (col("timestamp", "datetime", type_name="timestamp"), PG)):
+        said = conversion(source, col("text", "text"), dialect, MY).notes
+        assert MYSQL_TIMESTAMP_READ not in said and MYSQL_TIMESTAMP_WRITTEN not in said, dialect
+    assert "20:00 at +08:00 is copied as 12:00" in MYSQL_TIMESTAMP_READ
+
+
+def test_a_querys_column_says_what_the_grids_read_of_it_loses() -> None:
+    """06c final review M-4: a query's result is read again as the grid reads it, not with a table's `read_as`."""
+    text = col("text", "text")
+    assert query_read_note(col("float32", "number", type_name="float"), text, MY, LITE) == QUERY_FLOAT
+    assert query_read_note(col("float64", "number", type_name="double"), text, MY, LITE) is None
+    for name, scale in (("datetime2(7)", 7), ("time(7)", 7), ("datetimeoffset(7)", 7), ("datetime2", None)):
+        family = {"datetime2": "timestamp", "time": "time", "datetimeoffset": "timestamp_tz"}[name.split("(")[0]]
+        assert query_read_note(col(family, "datetime", type_name=name, scale=scale), text, MS, PG) == QUERY_FRACTION
+    assert query_read_note(col("timestamp", "datetime", type_name="datetime2(3)", scale=3), text, MS, PG) is None
+    assert query_read_note(col("timestamp", "datetime", type_name="datetime"), text, MS, PG) is None
+    money = col("money", "other", type_name="money")
+    assert query_read_note(money, col("decimal", "number"), PG, MY) == QUERY_MONEY
+    assert query_read_note(money, col("money", "other", type_name="money"), PG, PG) is None  # it reads its own text
+    assert query_read_note(money, text, PG, PG) == QUERY_MONEY
+
+
+def test_sql_servers_new_text_column_that_is_not_unicode_is_known_as_such() -> None:
+    """06c final review M-6: the preview says a code page's note of a new SQL Server column of char, varchar or text."""
+    assert [planned_column("c", type_sql, MS).unicode for type_sql in (
+        "varchar(10)", "char(3)", "text", "nvarchar(max)", "nchar(2)", "ntext", "int")] == [
+        False, False, False, True, True, True, True]
+    assert planned_column("c", "varchar(10)", PG).unicode and planned_column("c", "text", MY).unicode

@@ -450,7 +450,24 @@ class PostgresConnection(DatabaseConnection, RowEditing, DataTools, ReferenceRea
         self._check_database(path)
         return columns.table_columns(self._conn, path)
 
-    def references(self, schema: str, names: list[str]) -> list[Reference]:
+    def references(self, schema: str, names: list[str], *, rows: bool = False) -> list[Reference]:
+        """With `rows`, the size of each referencing table is read, which waits for its lock (an uncommitted ALTER in
+        another session): at most PLAN_LOCK_TIMEOUT_MS, in a block of its own, rolled back, as a dump plan's (only on
+        an auto-commit connection between statements). Locked: the keys again without the sizes (each table may hold
+        rows), logged with the code only."""
+        bounded = rows and self._conn.autocommit and self._conn.info.transaction_status == pq.TransactionStatus.IDLE
+        try:
+            if bounded:
+                self._conn.execute("BEGIN")
+                self._conn.execute(f"SET LOCAL lock_timeout = {PLAN_LOCK_TIMEOUT_MS}")
+            return references.references(self._conn, schema, names, rows=rows)
+        except psycopg.Error as exc:
+            if not (bounded and exc.sqlstate == _LOCK_NOT_AVAILABLE):
+                raise
+            logger.info("A copy plan's foreign keys were read without the tables' sizes ({})", exc.sqlstate)
+        finally:
+            if bounded:
+                self._end_block()
         return references.references(self._conn, schema, names)
 
     def dump_session(self, scope: DumpScope) -> DumpSession:

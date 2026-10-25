@@ -10,10 +10,17 @@ from collections.abc import Callable
 from typing import Any
 
 from ...adapters.base import StatementCancelled, StatementError
+from ...domain.data_jobs import INVALID_FILTER
+from ...domain.transfer import COLUMNS_CHANGED, QUERY_NOT_SELECT
 
 PIPE_CHUNKS = 2  # R-06-8: chunks the pipe holds
 POLL_S = 0.1  # how often a side waiting on the other looks at its own Cancel (§3.5.5 step 5)
 SOURCE_FAILED = "source_failed"
+# The source's refusals of what the preview checks too (a query that does not only read or gives more than one result,
+# columns that changed, a filter that is not one condition): the copy's error keeps their code, so it reads as the
+# preview's would (Task 9 docs review I2). Any other error of the source is `source_failed`: its code is the source
+# connection's (a lost connection there is not the target's), and its text says where
+SOURCE_CHECKS = frozenset({QUERY_NOT_SELECT, COLUMNS_CHANGED, INVALID_FILTER})
 Rows = list[list[Any]]
 
 
@@ -25,10 +32,12 @@ class PipeClosed(StatementCancelled):
 
 
 class SourceFailed(StatementError):
-    """The source's read failed (spec §4 `source_failed`): its own error in `cause`, the text says where."""
+    """The source's read failed (spec §4 `source_failed`, or the code of one of SOURCE_CHECKS): its own error in
+    `cause`, the text says where."""
 
     def __init__(self, source: str, cause: StatementError) -> None:
-        super().__init__(f"Reading {source} failed: {cause.message}", code=SOURCE_FAILED)
+        code = cause.code if cause.code in SOURCE_CHECKS else SOURCE_FAILED
+        super().__init__(f"Reading {source} failed: {cause.message}", code=code)
         self.cause = cause
 
 

@@ -17,7 +17,10 @@ from .loaders import category_for_type_name
 # the innermost type modifier a domain sets (a domain column's own atttypmod is -1). typtype 'c' is a composite type,
 # 'e' an enum; typcategory 'A' an array. The last column: the column's own type is the database's (a domain, an enum, a
 # row type, an extension's type, an array of one), which another database may not have (a copy, 06c). After it: the
-# column's place in the relation's primary key (a copy's new table, 06c Task 2 fix round 3), NULL when it is in none.
+# column's place in the relation's primary key (a copy's new table, 06c Task 2 fix round 3), NULL when it is in none:
+# `keyed` reads every primary key of the relations once, MATERIALIZED so that it is hashed and joined (inlined, the
+# planner probes pg_index per column; a subquery per column made the dump's catalog read about 1.5 times as long: 06c
+# final review M-3, 1,000 tables of 20 columns, medians: 53 ms before 06c, 79 ms with the subquery, 58 ms now).
 _COLUMNS = """
 WITH RECURSIVE base (attrelid, attnum, typname, typtype, typbasetype, typtypmod, typcategory, typmod) AS (
     SELECT a.attrelid, a.attnum, t.typname, t.typtype, t.typbasetype, t.typtypmod, t.typcategory, a.atttypmod
@@ -28,15 +31,20 @@ WITH RECURSIVE base (attrelid, attnum, typname, typtype, typbasetype, typtypmod,
            CASE WHEN d.typmod <> -1 THEN d.typmod ELSE d.typtypmod END
     FROM base d JOIN pg_type t ON t.oid = d.typbasetype
     WHERE d.typtype = 'd'
+),
+keyed (attrelid, attnum, ord) AS MATERIALIZED (
+    SELECT i.indrelid, k.attnum, k.ord::int
+    FROM pg_index i CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k (attnum, ord)
+    WHERE i.indisprimary AND i.indrelid = ANY(%(oids)s)
 )
 SELECT a.attrelid, a.attname::text, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, a.atthasdef,
        a.attidentity::text, a.attgenerated::text, b.typname::text, b.typtype::text, b.typcategory::text, b.typmod,
        own.typtype IN ('d', 'e', 'c') OR own.typnamespace <> 'pg_catalog'::regnamespace,
-       (SELECT k.ord::int FROM pg_index i CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k (attnum, ord)
-        WHERE i.indrelid = a.attrelid AND i.indisprimary AND k.attnum = a.attnum)
+       k.ord
 FROM pg_attribute a
 JOIN pg_type own ON own.oid = a.atttypid
 JOIN base b ON b.attrelid = a.attrelid AND b.attnum = a.attnum AND b.typtype <> 'd'
+LEFT JOIN keyed k ON k.attrelid = a.attrelid AND k.attnum = a.attnum
 WHERE a.attrelid = ANY(%(oids)s) AND a.attnum > 0 AND NOT a.attisdropped
 ORDER BY a.attrelid, a.attnum
 """

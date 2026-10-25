@@ -368,8 +368,10 @@ class ReferenceReading(ABC):
     target, whose order and DELETE they decide, 06c Task 2 fix round 4), on its worker thread like every method."""
 
     @abstractmethod
-    def references(self, schema: str, names: list[str]) -> list[Reference]:
-        """The foreign keys from or into the tables `names` of `schema`, in one catalog query."""
+    def references(self, schema: str, names: list[str], *, rows: bool = False) -> list[Reference]:
+        """The foreign keys from or into the tables `names` of `schema`, in one catalog query; with `rows`, whether
+        each table that references one of them through a key that only refuses holds rows (`Reference.child_rows`: a
+        copy that replaces their rows, 06c final review I-2)."""
 
 
 class Dumping(ABC):

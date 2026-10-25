@@ -7,9 +7,15 @@ and the target's edit target. The schema snapshot of completion gives only what 
 the source's foreign keys among two tables or more, and the target's foreign keys. Nothing is written and no query is
 run.
 
+A dialog asks again at each settled change of its form: a preview read for its `preview_key` stops between two tables
+once the same dialog has asked for a newer one (`PreviewSuperseded`, 06c final review), so a run of changes does not
+queue its full catalog reads on the profile's metadata connection, where the tree and completion wait behind them.
+
 Logs: INFO the two profiles, the table count, the mode and the problem count; never a value, a filter or a query's
 text."""
 
+import threading
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
@@ -27,7 +33,9 @@ from ..adapters.references import Reference
 from ..adapters.registry import AdapterRegistry
 from ..domain.data_jobs import cannot
 from ..domain.edits import EditTarget, edit_kind
-from ..domain.errors import NotFound, NotSupported, PasswordRequired, ReadOnlyProfile, ValidationFailed
+from ..domain.errors import (
+    NotFound, NotSupported, PasswordRequired, PreviewSuperseded, ReadOnlyProfile, ValidationFailed,
+)
 from ..domain.execution import ColumnMeta
 from ..domain.metadata import PathSegment
 from ..domain.profiles import AnyProfile, SqliteProfile
@@ -41,7 +49,8 @@ from ..sql.dump_script import RESTORE_CHECKS_FOREIGN_KEYS, self_reference_warnin
 from ..sql.select_builder import FILTER_NOT_A_CONDITION, build_copy_select, check_filter, relation_from_path
 from ..sql.transfer_sql import advance_sequence, create_table, delete_rows, identity_switch, summary
 from ..sql.type_map import (
-    conversion, engine_name, incompatible, planned_column, primary_key, target_type, type_problem,
+    FRACTION_NOTE, QUERY_FRACTION, conversion, engine_name, incompatible, planned_column, primary_key,
+    query_read_note, target_type, type_problem,
 )
 from .metadata_service import MetadataService
 from .profile_service import ProfileService
@@ -79,11 +88,23 @@ SELF_REFERENCE_FAILS = "the copy"
 CASCADE_LOOP = ("Deleting the rows of {parent} also deletes or changes rows of {child}, and their tables' ON DELETE "
                 "actions form a loop, so no order copies {child} after {parent}: turn the cascade off, then copy them")
 CASCADES_OUTSIDE = "Deleting the rows of {} also deletes (or changes) rows of {}, which this copy does not write"
+# A key that only refuses (NO ACTION, RESTRICT) from a table that holds rows: the parent's DELETE fails as it runs, and
+# the table rolls back. Parents go first, and each table is a transaction of its own, so one copy never empties a child
+# before replacing its parent's rows (06c final review I-2)
+REFUSES_DELETE = ("Replacing the rows of {parent} fails while {children} {hold} rows that reference them (ON DELETE NO "
+                  "ACTION or RESTRICT): empty {those} first, then copy")
 # Names that differ only in case are one name there: SQL Server's default collations, SQLite, MySQL's columns (and its
 # tables on macOS); PostgreSQL's quoted names are not folded (Task 2 fix M2)
 CASE_INSENSITIVE = frozenset({Dialect.MYSQL, Dialect.SQLITE, Dialect.TSQL})
 KEY_NOT_CREATED = "Its primary key is not created: {}; choose key column types the target can index to keep it"
 NOT_UNICODE = ("{} is not Unicode ({}): characters outside its code page become ?")
+# PostgreSQL cuts a longer name to 63 bytes at CREATE TABLE, and the copy then finds no column (or table) of the name it
+# planned (06c final review M-2); MySQL (64) and SQL Server (128) refuse a longer one at CREATE with their own words
+PG_NAME_BYTES = 63
+TABLE_NAME_TOO_LONG = "{} is longer than PostgreSQL's 63-byte names: copy it on its own, under a shorter name"
+COLUMN_NAME_TOO_LONG = ("{} is longer than PostgreSQL's 63-byte names: leave it out, or copy a query that renames it "
+                        "(AS)")
+PREVIEW_KEYS = 256  # dialogs whose latest preview is remembered (the oldest is forgotten first)
 LEFT_OUT = "left out"
 NOT_IN_TARGET = "no such column in the target"
 COMPUTED = "the target computes it"
@@ -236,7 +257,8 @@ def reference_warnings(dialect: Dialect, mode: str, shown: str, schema: str, nam
     """What the preview says of an existing PostgreSQL or SQL Server table's foreign keys, read live (fix round 4), when
     appending or replacing: a key of its own that references it (its rows load in the source's order, each checked as
     it goes: fix M3); and, when its rows are replaced, the tables the copy does not write (`copied`: the copy's tables
-    of `schema`) whose rows its DELETE deletes or changes (CASCADE_OUTSIDE)."""
+    of `schema`) whose rows its DELETE deletes or changes (CASCADE_OUTSIDE), and the tables, in the copy or not, whose
+    rows make that DELETE fail (`Reference.refuses_delete`: a key that only refuses, from a table holding rows, I-2)."""
     if mode == "create" or dialect not in RESTORE_CHECKS_FOREIGN_KEYS:
         return []
     into = [reference for reference in references if (reference.ref_schema, reference.ref_table) == (schema, name)]
@@ -248,7 +270,19 @@ def reference_warnings(dialect: Dialect, mode: str, shown: str, schema: str, nam
                                      and not (reference.schema == schema and reference.table in copied)))
         if outside:
             said.append(CASCADES_OUTSIDE.format(shown, shown_names(outside)))
+        refusing = list(dict.fromkeys(display(reference.schema, reference.table) for reference in into
+                                      if reference.refuses_delete))
+        if refusing:
+            one = len(refusing) == 1
+            said.append(REFUSES_DELETE.format(parent=shown, children=shown_names(refusing),
+                                              hold="holds" if one else "hold",
+                                              those=refusing[0] if one else "those tables"))
     return said
+
+
+def _too_long(dialect: Dialect, name: str) -> bool:
+    """A new table's or column's name PostgreSQL would cut (M-2)."""
+    return dialect is Dialect.POSTGRES and len(name.encode("utf-8")) > PG_NAME_BYTES
 
 
 def _match(name: str, target: dict[str, TableColumn]) -> TableColumn | None:
@@ -259,6 +293,34 @@ def _match(name: str, target: dict[str, TableColumn]) -> TableColumn | None:
     return folded[0] if len(folded) == 1 else None
 
 
+class Previews:
+    """The latest preview each dialog asked for, by its `preview_key` (at most PREVIEW_KEYS dialogs): `begin` hands a
+    preview its check, which raises PreviewSuperseded once the same dialog asked for a newer one. Any thread."""
+
+    def __init__(self, keys: int = PREVIEW_KEYS) -> None:
+        self._keys = keys
+        self._latest: OrderedDict[str, int] = OrderedDict()
+        self._count = 0
+        self._lock = threading.Lock()
+
+    def begin(self, key: str | None) -> Callable[[], None]:
+        if key is None:
+            return lambda: None
+        with self._lock:
+            self._count += 1
+            mine = self._latest[key] = self._count
+            self._latest.move_to_end(key)
+            while len(self._latest) > self._keys:
+                self._latest.popitem(last=False)
+
+        def check() -> None:
+            with self._lock:
+                latest = self._latest.get(key, mine)
+            if latest != mine:
+                raise PreviewSuperseded()
+        return check
+
+
 class TransferService:
     def __init__(self, profiles: ProfileService, registry: AdapterRegistry, metadata: MetadataService,
                  schema_cache: SchemaCache, plans: TransferPlanStore | None = None) -> None:
@@ -267,8 +329,17 @@ class TransferService:
         self._metadata = metadata
         self._schema_cache = schema_cache
         self.plans = plans if plans is not None else TransferPlanStore()
+        self.previews = Previews()
 
     def plan(self, request: TransferRequest) -> TransferPlan:
+        current = self.previews.begin(request.preview_key)
+        try:
+            return self._plan(request, current)
+        except PreviewSuperseded:
+            logger.info("A copy preview stopped: its dialog asked for a newer one")
+            raise
+
+    def _plan(self, request: TransferRequest, current: Callable[[], None]) -> TransferPlan:
         source, target = request.source, request.target
         source_profile, source_adapter = self._admit(source.profile_id)
         target_profile, target_adapter = self._admit(target.profile_id)
@@ -293,7 +364,7 @@ class TransferService:
             raise ValidationFailed("Choose the schema (MySQL: the database) to copy into")
         problems: list[TransferProblem] = []
         warnings: list[str] = []
-        sources = self._sources(request, source_dialect, problems, warnings)
+        sources = self._sources(request, source_dialect, problems, warnings, current)
         if _same_file(source_profile, target_profile):
             problems.append(_problem("same_sqlite_file", "The source and the target are the same SQLite file: use "
                                                          "INSERT … SELECT in a query tab"))
@@ -301,7 +372,8 @@ class TransferService:
         # PostgreSQL's and SQL Server's foreign keys, whose checks and cascades the copy meets, are read live with the
         # target's columns; MySQL's and SQLite's, which it turns off, come from the snapshot (L2's warnings, the order)
         live = target.mode != "create" and target_dialect in RESTORE_CHECKS_FOREIGN_KEYS
-        existing, links = self._targets(target, target_adapter, schema, chosen, references=live)
+        current()
+        existing, links = self._targets(target, target_adapter, schema, chosen, current, references=live)
         keys = self._snapshot(target.profile_id, target.database, "target's foreign keys") \
             if target.mode != "create" and target_dialect in UNCHECKED_TARGETS else None
         referenced = referenced_tables(keys)  # once: a server's snapshot may hold thousands of tables
@@ -365,7 +437,7 @@ class TransferService:
         return profile, adapter
 
     def _sources(self, request: TransferRequest, dialect: Dialect, problems: list[TransferProblem],
-                 warnings: list[str]) -> list[_Source]:
+                 warnings: list[str], current: Callable[[], None]) -> list[_Source]:
         source = request.source
         if source.query is not None:
             query = source.query
@@ -385,6 +457,7 @@ class TransferService:
                 raise NotSupported(cannot(connection.server_info().engine, COPY_DATA))
             found = []
             for path in paths:
+                current()  # between two tables: a newer preview of the same dialog stops this one
                 schema, name = relation_from_path(path)
                 shown = qualified(dialect, schema, name) if schema else name
                 try:
@@ -427,16 +500,19 @@ class TransferService:
         return [by_key[table.name] for table in ordered], cycle
 
     def _targets(
-        self, target: TargetSpec, adapter: DatabaseAdapter, schema: str, names: list[str], *, references: bool,
+        self, target: TargetSpec, adapter: DatabaseAdapter, schema: str, names: list[str],
+        current: Callable[[], None], *, references: bool,
     ) -> tuple[dict[str, tuple[list[TableColumn], EditTarget] | None], list[Reference] | None]:
         """Each target table's columns and what grid editing says of writing it (a view, a table that cannot be
         written as a whole), or None when there is no such table; and, with `references`, the foreign keys from or
-        into the tables that are there, in one more catalog query (fix round 4; None: not read)."""
+        into the tables that are there, in one more catalog query (fix round 4; None: not read), which also says,
+        when rows are replaced, whether each table that refuses their DELETE holds rows (I-2)."""
 
         def read(connection: DatabaseConnection) -> tuple[
                 dict[str, tuple[list[TableColumn], EditTarget] | None], list[Reference] | None]:
             found: dict[str, tuple[list[TableColumn], EditTarget] | None] = {}
             for name in dict.fromkeys(names):
+                current()  # between two tables: a newer preview of the same dialog stops this one
                 path = adapter.relation_path(target.database, schema, name, "table")
                 try:
                     columns = connection.table_columns(path) if isinstance(connection, DataTools) else []
@@ -447,7 +523,8 @@ class TransferService:
                 edit = connection.edit_target(path, order=False) if isinstance(connection, RowEditing) else None
                 found[name] = (columns, edit) if edit is not None else (columns, EditTarget(path=path, editable=True))
             there = [name for name, table in found.items() if table is not None]
-            links = connection.references(schema, there) \
+            current()
+            links = connection.references(schema, there, rows=target.mode == "replace_rows") \
                 if references and isinstance(connection, ReferenceReading) else None
             return found, links
 
@@ -465,11 +542,15 @@ class TransferService:
         if item.columns is None:
             view.problems.append(_problem("source_missing", f"{item.name} is not there any more"))
             return view, None
+        # Names that differ only in case are one table where the target folds them, as for `duplicate_target` (06c
+        # final review M-1: SQL Server's replace of its own table under another case waited on its own DELETE's locks)
+        fold = str.casefold if target_dialect in CASE_INSENSITIVE else str
         same_database = (source_profile.id == target_profile.id
                          and (not adapter.capabilities.per_database_connection
-                              or request.source.database == target.database))
-        if same_database and item.path is not None and (item.schema or DEFAULT_SCHEMAS.get(source_dialect)) == schema \
-                and item.table == name:
+                              or fold(request.source.database or "") == fold(target.database or "")))
+        if same_database and item.path is not None \
+                and fold(item.schema or DEFAULT_SCHEMAS.get(source_dialect) or "") == fold(schema) \
+                and fold(item.table) == fold(name):
             view.problems.append(_problem("same_table", "The source and the target are the same table"))
             return view, None
         if target.mode == "create" and existing is not None:
@@ -575,20 +656,26 @@ class TransferService:
         written: list[PlannedColumn] = []
         fold = str.casefold if target_dialect in CASE_INSENSITIVE else str
         named: dict[str, str] = {}  # each new column, by its folded name: the source column it is made for
+        if _too_long(target_dialect, name):
+            view.problems.append(_problem("name_too_long", TABLE_NAME_TOO_LONG.format(name)))
         for index, column, type_sql, note, overridden in typed_columns:
             if (other := named.setdefault(fold(column.name), column.name)) != column.name:  # fix M2
                 view.problems.append(_problem("duplicate_column", f"{other} and {column.name} would be one column in "
                                                                   f"{engine_name(target_dialect)}", column.name))
             into = planned_column(column.name, type_sql, target_dialect)
             notes = [note] if note else []
-            notes += [said for said in conversion(column, into, source_dialect, target_dialect).notes
+            notes += [said for said in self._notes(request, column, into, source_dialect, target_dialect)
                       if said not in notes]
+            found: list[TransferProblem] = []
             if (why := incompatible(column, into)) is not None:
-                view.problems.append(_problem("unconvertible", why, column.name))
+                found.append(_problem("unconvertible", why, column.name))
+            if _too_long(target_dialect, column.name):  # M-2
+                found.append(_problem("name_too_long", COLUMN_NAME_TOO_LONG.format(column.name), column.name))
+            view.problems += found
             view.columns.append(ColumnMapping(
                 source_name=column.name, source_type=column.type_name, family=column.family, type_editable=True,
                 target_name=column.name, target_type=type_sql, overridden=overridden,
-                conversion="; ".join(notes) or None))
+                conversion="; ".join(notes) or None, problem="; ".join(p.message for p in found) or None))
             columns.append((column.name, type_sql, column.nullable))
             written.append(PlannedColumn(index, column.name))
         ddl = create_table(target_dialect, schema, name, columns, key) if columns else ""
@@ -654,9 +741,7 @@ class TransferService:
             if (why := incompatible(column, into)) is not None:
                 view.problems.append(_problem("unconvertible", why, column.name))
                 update["problem"] = why
-            notes = list(conversion(column, into, source_dialect, target_dialect).notes)
-            if target_dialect is Dialect.TSQL and not into.unicode and column.family in ("char", "varchar", "text"):
-                notes.append(NOT_UNICODE.format(into.name, into.type_name))
+            notes = self._notes(request, column, into, source_dialect, target_dialect)
             update["conversion"] = "; ".join(notes) or None
             if (other := writes.setdefault(into.name, column.name)) != column.name:  # an INSERT names it once (M2)
                 why = f"{other} and {column.name} would both go into {name}.{into.name}"
@@ -681,6 +766,21 @@ class TransferService:
                       if column.name in {planned.target for planned in written} and column.family in numbers
                       and (column.identity is not None or column.has_default)]
         return written, before, after
+
+    @staticmethod
+    def _notes(request: TransferRequest, column: TableColumn, into: TableColumn, source_dialect: Dialect,
+               target_dialect: Dialect) -> list[str]:
+        """What happens to a column's values on the way into `into` (an existing column, or a new one as planned):
+        the conversion's notes, SQL Server's code page where the column is not Unicode (an append's, and since 06c
+        final review M-6 a new one's of a type kept from SQL Server), and what a query's result loses being read as
+        the grid reads it (M-4: then the 7th digit is the driver's, not a rounding)."""
+        notes = list(conversion(column, into, source_dialect, target_dialect).notes)
+        if target_dialect is Dialect.TSQL and not into.unicode and column.family in ("char", "varchar", "text"):
+            notes.append(NOT_UNICODE.format(into.name, into.type_name))
+        if request.source.query is not None and (said := query_read_note(column, into, source_dialect,
+                                                                         target_dialect)) is not None:
+            notes = [note for note in notes if not (said == QUERY_FRACTION and note == FRACTION_NOTE)] + [said]
+        return notes
 
     def _store(self, request: TransferRequest, planned: list[PlannedTable], source_profile: AnyProfile,
                target_profile: AnyProfile, target_adapter: DatabaseAdapter) -> str:

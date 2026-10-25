@@ -12,8 +12,8 @@ from ..domain.metadata import PathSegment
 from ..domain.transfer import COPY_PLAN_EXPIRED
 from .plans import OneTimePlanStore
 
-PLAN_TOO_LARGE = (f"The copy's statements are too large to keep for it: at most {MAX_PLAN_CHARS // 1_048_576} MiB of "
-                  "text. Copy fewer tables at once")
+PLAN_TOO_LARGE = (f"The copy's plan is too large to keep for it: at most {MAX_PLAN_CHARS // 1_048_576} MiB of "
+                  "statements and columns. Copy fewer tables at once")
 
 
 @dataclass(frozen=True)
@@ -60,9 +60,16 @@ class StoredTransfer:
     title: str  # the job list's: `Copy public.orders from Local PG to Dev MySQL`
 
 
+# What one source column a plan keeps (its `TableColumn`, about 274 bytes measured) counts for against the store's bound,
+# as characters of text do: a 500-table, 50-column preview holds about 7 MB of them, and 32 of those would be 220 MB
+# while its text stayed far below the bound (06c final review M-5)
+COLUMN_CHARS = 300
+
+
 def stored_chars(plan: StoredTransfer) -> int:
-    """What a stored copy holds that grows with it: its SELECTs and statements."""
-    return len(plan.summary) + sum(len(table.select) + sum(map(len, table.statements)) for table in plan.tables)
+    """What a stored copy holds that grows with it: its SELECTs and statements, and its source columns."""
+    return len(plan.summary) + sum(len(table.select) + sum(map(len, table.statements))
+                                   + COLUMN_CHARS * len(table.columns) for table in plan.tables)
 
 
 class TransferPlanStore(OneTimePlanStore[StoredTransfer]):

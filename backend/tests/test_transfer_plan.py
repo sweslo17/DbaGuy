@@ -3,21 +3,28 @@ databases. Scratch tables are `zz_06c_*`, dropped by exact name; nothing is copi
 
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
 from dbaguy_backend.adapters.columns import TableColumn
 from dbaguy_backend.domain.dialect import Dialect
 from dbaguy_backend.domain.edits import PLAN_EXPIRED, PLAN_MISMATCH, PlanUnavailable
-from dbaguy_backend.domain.errors import NotSupported, PasswordRequired, ReadOnlyProfile
+from dbaguy_backend.adapters.sqlite.adapter import SqliteConnection
+from dbaguy_backend.domain.errors import NotSupported, PasswordRequired, PreviewSuperseded, ReadOnlyProfile
 from dbaguy_backend.domain.schema import SchemaSnapshot, SnapshotForeignKey, SnapshotRelation, SnapshotSchema
 from dbaguy_backend.domain.transfer import SourceSpec, TargetSpec, TransferRequest
+from dbaguy_backend.services.transfer_plans import (
+    COLUMN_CHARS, PlannedColumn, PlannedTable, StoredTransfer, stored_chars,
+)
 from dbaguy_backend.services.transfer_service import (
-    CREATED_STAYS, FK_NOT_ENFORCED, FK_UNCHECKED, KEY_NOT_CREATED, NON_TRANSACTIONAL, NON_TRANSACTIONAL_REPLACE,
-    QUERY_RUNS_AGAIN, foreign_key_warnings, referenced_tables,
+    COLUMN_NAME_TOO_LONG, CREATED_STAYS, FK_NOT_ENFORCED, FK_UNCHECKED, KEY_NOT_CREATED, NON_TRANSACTIONAL,
+    NON_TRANSACTIONAL_REPLACE, NOT_UNICODE, QUERY_RUNS_AGAIN, TABLE_NAME_TOO_LONG, Previews, foreign_key_warnings,
+    referenced_tables,
 )
 from dbaguy_backend.sql.type_map import (
-    FRACTION_NOTE, MYSQL_JSON_NOTE, KeyPlan, conversion, planned_column, primary_key,
+    FRACTION_NOTE, MYSQL_JSON_NOTE, QUERY_FLOAT, QUERY_FRACTION, QUERY_MONEY, KeyPlan, conversion, planned_column,
+    primary_key,
 )
 from tests.data_support import DataApp, dropping
 from tests.edit_support import ENGINES, scratch_db
@@ -695,3 +702,175 @@ def test_a_key_added_after_the_snapshot_loaded_is_created(app: DataApp, tmp_path
     finally:
         pg.close()
         lite.close()
+
+
+@requires_mssql
+def test_a_table_is_never_copied_into_itself_under_another_case_where_names_fold(app: DataApp,
+                                                                                  tmp_path: Path) -> None:  # M-1
+    """06c final review M-1: on SQL Server `T` and `t` are one table (its default collations), as `duplicate_target`
+    already folds them: a replace into the table's own name in other case would wait on its own DELETE's locks."""
+    ms = scratch_db("mssql", tmp_path)
+    try:
+        with dropping(ms) as made:
+            name = table_name()
+            ms.execute(f"CREATE TABLE {ms.table(name)} (id int PRIMARY KEY)")
+            made.append(("TABLE", name))
+            me = profile(app, ms, "ms")
+            plan = app.container.transfers.plan(tables_request(ms, me, [name], ms, me, "replace_rows",
+                                                               table=name.upper()))
+        assert plan.plan_id is None and [p.code for p in plan.tables[0].problems] == ["same_table"]
+    finally:
+        ms.close()
+
+
+@requires_pg
+def test_a_name_postgresql_would_cut_is_a_problem_of_the_preview(app: DataApp, tmp_path: Path) -> None:  # M-2
+    """06c final review M-2: PostgreSQL cuts a name past 63 bytes at CREATE TABLE, and the copy then found no column of
+    the name it planned. The preview refuses it, by bytes (a CJK character is three)."""
+    lite, pg = scratch_db("sqlite", tmp_path), scratch_db("postgres", tmp_path)
+    try:
+        source = table_name("s")
+        long_column, cjk_63, cjk_66 = "c" * 64, "字" * 21, "字" * 22
+        lite.execute(f'CREATE TABLE {lite.table(source)} (id INTEGER PRIMARY KEY, "{long_column}" TEXT, '
+                     f'"{cjk_63}" TEXT, "{cjk_66}" TEXT)')
+        src, dst = profile(app, lite, "lite"), profile(app, pg, "pg")
+        long_table = "zz_06c_" + "t" * 60
+        plan = app.container.transfers.plan(tables_request(lite, src, [source], pg, dst, table=long_table))
+        fine = app.container.transfers.plan(tables_request(lite, src, [source], pg, dst, table=table_name("n"),
+                                                           left_out={f"main.{source}": [long_column, cjk_66]}))
+        assert plan.plan_id is None
+        assert [(p.code, p.column, p.message) for p in plan.tables[0].problems] == [
+            ("name_too_long", None, TABLE_NAME_TOO_LONG.format(long_table)),
+            ("name_too_long", long_column, COLUMN_NAME_TOO_LONG.format(long_column)),
+            ("name_too_long", cjk_66, COLUMN_NAME_TOO_LONG.format(cjk_66))]
+        rows = {column.source_name: column.problem for column in plan.tables[0].columns}
+        assert rows[long_column] == COLUMN_NAME_TOO_LONG.format(long_column) and rows[cjk_63] is None
+        assert fine.plan_id is not None  # 63 bytes is PostgreSQL's own limit: kept
+    finally:
+        lite.close()
+        pg.close()
+
+
+def test_a_querys_columns_say_what_the_grids_read_loses(app: DataApp, tmp_path: Path) -> None:  # M-4
+    """06c final review M-4: a query's result is read again as the grid reads it (no table's `read_as`). The preview
+    of a query reads no source connection, so these profiles need no server."""
+    lite = scratch_db("sqlite", tmp_path)
+    try:
+        dst = profile(app, lite, "lite")
+        sources = {engine: app.add_profile({"profile": {"engine": engine, "name": engine, "host": "127.0.0.1",
+                                                        "database": "x", "username": "u"},
+                                            "secrets": {"password": "x"}}) for engine in ("mysql", "mssql", "postgres")}
+
+        def notes(engine: str, name: str, type_name: str) -> str | None:
+            request = TransferRequest(
+                source=SourceSpec(profile_id=sources[engine], query={
+                    "sql": f"SELECT {name} FROM t", "title": "Query 1",
+                    "columns": [{"name": name, "type_name": type_name, "category": "number"}]}),
+                target=TargetSpec(profile_id=dst, schema_name="main", mode="create", table=table_name("q")))
+            return app.container.transfers.plan(request).tables[0].columns[0].conversion
+
+        assert QUERY_FLOAT in (notes("mysql", "f", "float") or "")
+        assert QUERY_FRACTION in (notes("mssql", "at", "datetime2(7)") or "")
+        assert QUERY_MONEY in (notes("postgres", "m", "money") or "")
+        assert notes("mysql", "d", "double") is None
+    finally:
+        lite.close()
+
+
+@requires_pg
+def test_a_querys_seventh_digit_is_said_lost_by_the_driver_not_rounded(app: DataApp, tmp_path: Path) -> None:  # M-4
+    pg = scratch_db("postgres", tmp_path)
+    try:
+        ms = app.add_profile({"profile": {"engine": "mssql", "name": "ms", "host": "127.0.0.1", "database": "x",
+                                          "username": "u"}, "secrets": {"password": "x"}})
+        request = TransferRequest(
+            source=SourceSpec(profile_id=ms, query={"sql": "SELECT at FROM t", "title": "Query 1", "columns": [
+                {"name": "at", "type_name": "datetime2(7)", "category": "datetime"}]}),
+            target=TargetSpec(profile_id=profile(app, pg, "pg"), database="dbaguy", schema_name="public",
+                              mode="create", table=table_name("q")))
+        said = app.container.transfers.plan(request).tables[0].columns[0].conversion or ""
+        assert QUERY_FRACTION in said and FRACTION_NOTE not in said
+    finally:
+        pg.close()
+
+
+@requires_mssql
+def test_a_new_sql_server_column_that_is_not_unicode_says_its_code_page(app: DataApp, tmp_path: Path) -> None:  # M-6
+    ms = scratch_db("mssql", tmp_path)
+    try:
+        with dropping(ms) as made:
+            name = table_name()
+            ms.execute(f"CREATE TABLE {ms.table(name)} (id int PRIMARY KEY, a varchar(10), b nvarchar(10), c text)")
+            made.append(("TABLE", name))
+            me = profile(app, ms, "ms")
+            plan = app.container.transfers.plan(tables_request(ms, me, [name], ms, me, table=table_name("n")))
+        said = {column.source_name: column.conversion or "" for column in plan.tables[0].columns}
+        assert said["a"] == NOT_UNICODE.format("a", "varchar(10)") and said["c"] == NOT_UNICODE.format("c", "text")
+        assert said["b"] == "" and said["id"] == ""
+    finally:
+        ms.close()
+
+
+def _stored(columns: int) -> StoredTransfer:
+    column = _source_column("c", "int32", "int")
+    table = PlannedTable(source_name="s", target_name="t", target_schema=None, target_table="t", target_path=(),
+                         select="SELECT c FROM s", columns=(column,) * columns, written=(PlannedColumn(0, "c"),),
+                         before=("CREATE TABLE t (c int)",), after=(), created=True)
+    return StoredTransfer(plan_id="p", profile_id=uuid4(), database=None, source_profile_id=uuid4(),
+                          source_database=None, query=False, tables=(table,), summary="-- Copy data", title="Copy")
+
+
+def test_a_stored_plan_counts_its_columns_against_the_bound() -> None:  # 06c final review M-5
+    text = len("-- Copy data") + len("SELECT c FROM s") + len("CREATE TABLE t (c int)")
+    assert stored_chars(_stored(1)) == text + COLUMN_CHARS
+    assert stored_chars(_stored(50)) == text + 50 * COLUMN_CHARS
+
+
+def test_a_dialogs_newer_preview_stops_the_one_it_no_longer_waits_for() -> None:
+    previews = Previews(keys=2)
+    first = previews.begin("dialog")
+    first()  # still the latest
+    second = previews.begin("dialog")
+    with pytest.raises(PreviewSuperseded) as stopped:
+        first()
+    assert (stopped.value.code, stopped.value.status) == ("preview_superseded", 409)
+    second()
+    previews.begin(None)()  # a request without a key reads to its end
+    other = previews.begin("other")
+    previews.begin("third")  # past `keys`: the oldest dialog is forgotten, and its preview is never stopped
+    second()
+    other()
+
+
+def test_a_preview_stops_between_tables_once_its_dialog_asked_again(app: DataApp, tmp_path: Path,
+                                                                    monkeypatch) -> None:
+    """06c final review (preview cost): the old read stops at the next table, never running to its end on the
+    metadata connection that the tree and completion wait for."""
+    (tmp_path / "other").mkdir()
+    lite, other = scratch_db("sqlite", tmp_path), scratch_db("sqlite", tmp_path / "other")
+    try:
+        names = [table_name(kind) for kind in ("a", "b", "c")]
+        for name in names:
+            lite.execute(f"CREATE TABLE {lite.table(name)} (id INTEGER PRIMARY KEY)")
+        source, target = profile(app, lite, "a"), profile(app, other, "b")
+        read: list = []
+        newer = [True]
+        real = SqliteConnection.table_columns
+
+        def table_columns(connection: SqliteConnection, path: list) -> list:
+            read.append(path[-1].name)
+            if newer and newer.pop():
+                app.container.transfers.previews.begin("dialog")  # the dialog asked for a newer preview meanwhile
+            return real(connection, path)
+
+        monkeypatch.setattr(SqliteConnection, "table_columns", table_columns)
+        request = tables_request(lite, source, names, other, target).model_copy(update={"preview_key": "dialog"})
+        with pytest.raises(PreviewSuperseded):
+            app.container.transfers.plan(request)
+        assert read == names[:1]
+        read.clear()
+        whole = app.container.transfers.plan(request)  # asked again: it is the latest now, and reads to its end
+        assert whole.plan_id is not None and len(read) == 2 * len(names)  # the source's three, the target's three
+    finally:
+        lite.close()
+        other.close()

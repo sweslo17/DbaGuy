@@ -39,6 +39,7 @@ from ...domain.data_jobs import JobObject, JobOutcomeKind, TableOutcome
 from ...domain.edits import PlanUnavailable
 from ...domain.errors import READ_ONLY_MESSAGE, DomainError, NotFound
 from ...domain.execution import CopyDataCommand
+from ...domain.transfer import COLUMNS_CHANGED
 from ...services.safety import GuardAction
 from ...services.transfer_plans import PlannedTable, StoredTransfer
 from ...sql.bulk_insert import InsertBatcher
@@ -68,6 +69,9 @@ DELETE_STOPPED = ("{} cannot roll back (non-transactional): its DELETE stopped p
                   "before that stay removed")
 TRIGGER_ENDED = "A trigger ended the transaction of {}: what it committed stays"
 MAY_STAND = "Up to {:,} rows written to {} may stand"  # an unknown table's (review M-2: its object counts none)
+# After a ROLLBACK that left changes (1196): what stands is another table's, one a trigger wrote, not the rows of the
+# table copied, which rolled back (Task 4 re-review N-1)
+SOME_MAY_STAND = "Some changes may stand (a table that cannot roll back)"
 NOT_STARTED = "{} not copied: {}"  # `1 table` or `n tables`, then their names (review M-8)
 SOURCE_UNAVAILABLE = "The source connection could not be opened: {}"
 SOURCE_END_WAIT_S = 10.0  # how long a session the copy opened may take to end its last read before it is closed
@@ -247,9 +251,13 @@ class _Copy:
     def _rolls_back(self, table: PlannedTable, assumed: bool) -> bool:
         """MySQL: whether the table's engine rolls back, as the server says when the table starts. A table the copy
         created took the server's default engine (MyISAM on some servers), and another may have changed engines since
-        the preview (review I-1). One it does not find: as the plan said (the columns' read then says it is gone)."""
+        the preview (review I-1). One it does not find: a table it just created is there, under a name the server
+        spells otherwise (lower_case_table_names), so it may not roll back (Task 4 re-review N-2); another, as the plan
+        said (the columns' read then says it is gone)."""
         found = table_rolls_back(self.ctx, table.target_schema, table.target_table)
-        return assumed if found is None else found
+        if found is None:
+            return False if table.created else assumed
+        return found
 
     def _stop_source(self, source_id: str) -> None:
         """A read on the copy's own session is cancelled; a query tab's only withdrawn while it waits in the tab's
@@ -266,14 +274,14 @@ class _Copy:
             found = {column.name: column for column in self.ctx.connection.table_columns(list(table.target_path))}
         except NotFound:  # dropped since the preview (pre-flight L-c): nothing of it was written
             raise StatementError(f"{table.target_name} is not there any more: preview the copy again",
-                                 code="columns_changed") from None
+                                 code=COLUMNS_CHANGED) from None
         except DomainError as exc:
             raise StatementError(exc.message, code=exc.code) from None
         targets: list[TableColumn] = []
         for planned in table.written:
             if planned.target not in found:
                 raise StatementError(f"{table.target_name} has no column {planned.target} any more: preview the copy "
-                                     "again", code="columns_changed")
+                                     "again", code=COLUMNS_CHANGED)
             targets.append(found[planned.target])
         converts = [conversion(table.columns[planned.source], target, self.source_dialect, self.dialect,
                                backslash_escapes=escapes).convert
@@ -375,7 +383,7 @@ class _Copy:
             return _Table("rolled_back", error=error, warnings=[*self._created(table, state), JOB_ROLLBACK_FAILED])
         if self.dialect is Dialect.MYSQL and kept_changes(self.ctx, "copy"):
             said = [KEPT, *([CREATED_CHECK.format(name)] if state.created else [])]
-            return self._unknown(table, state, error, said=said)
+            return self._unknown(table, state, error, said=said, stand=SOME_MAY_STAND)
         return _Table("rolled_back", error=error, warnings=self._created(table, state))
 
     @staticmethod
@@ -388,13 +396,16 @@ class _Copy:
         return NOT_ROLLED_BACK.format(table.target_name)
 
     def _unknown(self, table: PlannedTable, state: _Writing, error: StatementError, *, said: list[str] | None = None,
-                 rollback: bool = False) -> _Table:
+                 rollback: bool = False, stand: str | None = None) -> _Table:
         """A table whose rows may or may not stand: why, its transaction ended first when `rollback` (and said when
-        that failed, review M-10), and how many rows may stand at most (its object counts none, review M-2)."""
+        that failed, review M-10), and how many rows may stand at most (its object counts none, review M-2), or
+        `stand` when what may stand is not this table's rows (N-1)."""
         warnings = list(said or [])
         if rollback and not self._rollback():
             warnings.append(JOB_ROLLBACK_FAILED)
-        if state.written:
+        if stand is not None:
+            warnings.append(stand)
+        elif state.written:
             warnings.append(MAY_STAND.format(state.written, table.target_name))
         return _Table("unknown", error=error, warnings=warnings)
 
