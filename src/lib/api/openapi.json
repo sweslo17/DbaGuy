@@ -7421,7 +7421,8 @@
                 "file",
                 "can_write",
                 "sysadmin",
-                "bulkadmin"
+                "bulkadmin",
+                "view_server_state"
               ]
             },
             "type": "array",

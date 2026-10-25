@@ -186,7 +186,7 @@ def test_sql_server_says_the_login_can_write_and_its_server_roles(container):
     request = ProfileUpsertRequest.model_validate({"profile": draft | {"mcp_access": "schema"},
                                                    "secrets": {"password": MSSQL_SA_PASSWORD}})
     sa = str(container.profiles.create(request).profile.id)
-    assert _login(container, sa).grants == ["can_write", "sysadmin", "bulkadmin"]
+    assert _login(container, sa).grants == ["can_write", "sysadmin", "bulkadmin", "view_server_state"]
 
 
 def test_the_dialogs_route_reads_it_and_a_saved_profile_forgets_it(container, tmp_path):
@@ -497,9 +497,13 @@ def test_sql_server_can_write_counts_what_is_granted_on_objects_schemas_and_role
 
 @requires_mssql
 @pytest.mark.parametrize(("server_grant", "expected"), [
-    ("GRANT CONTROL SERVER TO zz_08_t3_l", ["can_write", "sysadmin", "bulkadmin"]),  # sysadmin in all but the name
+    ("GRANT CONTROL SERVER TO zz_08_t3_l", ["can_write", "sysadmin", "bulkadmin", "view_server_state"]),  # sysadmin
     ("GRANT ADMINISTER BULK OPERATIONS TO zz_08_t3_l", ["bulkadmin"]),  # without the server role
     ("ALTER SERVER ROLE bulkadmin ADD MEMBER zz_08_t3_l", ["bulkadmin"]),
+    # the registry, volume and service readers the gate leaves to the server (final fix wave, I2), and 2022's halves
+    ("GRANT VIEW SERVER STATE TO zz_08_t3_l", ["view_server_state"]),
+    ("GRANT VIEW SERVER SECURITY STATE TO zz_08_t3_l", ["view_server_state"]),
+    ("GRANT VIEW SERVER PERFORMANCE STATE TO zz_08_t3_l", ["view_server_state"]),
 ])
 def test_sql_server_server_level_rights_are_the_logins_effective_ones(container, server_grant, expected):
     with _sql_server_login([], server_grant=server_grant):

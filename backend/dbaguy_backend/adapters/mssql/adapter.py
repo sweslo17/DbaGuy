@@ -81,7 +81,9 @@ _SERVER_INFO = "SELECT @@VERSION, DB_NAME(), SUSER_SNAME()"
 # sys.database_permissions at READ COMMITTED for ever. No object is looked up by id (sys.objects and OBJECTPROPERTY wait
 # for a table under an open ALTER or GRANT even at READ UNCOMMITTED, probed). The system databases are left to the
 # database-level functions: master holds 1,739 default EXECUTE grants to public.
-# sysadmin includes CONTROL SERVER; bulkadmin is ADMINISTER BULK OPERATIONS, granted directly too.
+# sysadmin includes CONTROL SERVER; bulkadmin is ADMINISTER BULK OPERATIONS, granted directly too. view_server_state is
+# VIEW SERVER STATE or either of 2022's halves (SECURITY, PERFORMANCE): the registry, volume and service readers the
+# gate leaves to the server (final fix wave, I2). An older server answers NULL for the names it does not know.
 _LOGIN_SQL = """
 SELECT
   CASE WHEN IS_MEMBER('db_owner') = 1
@@ -103,9 +105,13 @@ SELECT
        THEN 1 ELSE 0 END,
   CASE WHEN IS_SRVROLEMEMBER('sysadmin') = 1 OR HAS_PERMS_BY_NAME(NULL, NULL, 'CONTROL SERVER') = 1
        THEN 1 ELSE 0 END,
-  CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, 'ADMINISTER BULK OPERATIONS') = 1 THEN 1 ELSE 0 END
+  CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, 'ADMINISTER BULK OPERATIONS') = 1 THEN 1 ELSE 0 END,
+  CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE') = 1
+        OR HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER SECURITY STATE') = 1
+        OR HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER PERFORMANCE STATE') = 1
+       THEN 1 ELSE 0 END
 """
-_LOGIN_GRANTS: tuple[LoginGrant, ...] = ("can_write", "sysadmin", "bulkadmin")  # the columns of _LOGIN_SQL
+_LOGIN_GRANTS: tuple[LoginGrant, ...] = ("can_write", "sysadmin", "bulkadmin", "view_server_state")  # its columns
 _COMMIT = "WHILE @@TRANCOUNT > 0 COMMIT TRANSACTION"  # every nesting level (Ruling 18)
 _ROLLBACK = "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION"
 _NO_COLUMN_NAME = "(No column name)"

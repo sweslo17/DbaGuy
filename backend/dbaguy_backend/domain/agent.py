@@ -48,16 +48,17 @@ class ToolFailure(Exception):
 
 # What a login may do beyond reading that a read-only transaction does not stop (CR-08-1, §3.3), in this order:
 # PostgreSQL superuser, the four pg_* roles and REPLICATION (final review I1: replication slots outlive a ROLLBACK);
-# MySQL FILE; SQL Server writes in the database, sysadmin, bulkadmin
+# MySQL FILE; SQL Server writes in the database, sysadmin, bulkadmin, VIEW SERVER STATE (its registry, volumes, services)
 LoginGrant = Literal[
     "superuser", "server_files_read", "server_files_write", "server_programs", "signal_backends", "replication",
-    "file", "can_write", "sysadmin", "bulkadmin",
+    "file", "can_write", "sysadmin", "bulkadmin", "view_server_state",
 ]
 _GRANT_TEXT: dict[str, str] = {
     "superuser": "is a superuser", "server_files_read": "read the server's files",
     "server_files_write": "write the server's files", "server_programs": "run programs on the server",
     "signal_backends": "end other sessions", "replication": "manage replication slots (REPLICATION)",
     "can_write": "write in this database", "sysadmin": "is a sysadmin", "bulkadmin": "bulk-load files (bulkadmin)",
+    "view_server_state": "read the server's registry, volumes and services (VIEW SERVER STATE)",
 }
 PATH_CHARS = 200  # the server's secure_file_priv, at most this much of it in the summary (T3 N3)
 
