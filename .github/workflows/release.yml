@@ -1,0 +1,100 @@
+# Builds DbaGuy.app on an Apple Silicon runner, checks the bundled sidecar, and packages the drag-to-install .dmg.
+# A pushed tag vX.Y.Z (equal to the version in src-tauri/tauri.conf.json) attaches the .dmg and its SHA-256 to that
+# tag's GitHub release, creating the release with .github/release-notes.md when it does not exist yet (a release made
+# by hand first keeps its own notes). A manual run (Actions › Release › Run workflow) only builds and keeps the .dmg as
+# a workflow artifact for a week. The app is signed ad hoc, not notarized: the notes say how to open it.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      POETRY_VERSION: "2.1.3"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: The tag is the app's version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME is not v$version, the version in src-tauri/tauri.conf.json"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Homebrew's Python: build-backend.sh requires the venv's OpenSSL to be the one pymssql's wheel bundles, and fails
+      # loudly when they differ (CLAUDE.md, 打包流程)
+      - name: Python 3.13 and Poetry
+        run: |
+          brew install python@3.13
+          python="$(brew --prefix python@3.13)/bin/python3.13"
+          pipx install "poetry==$POETRY_VERSION"
+          cd backend
+          poetry env use "$python"
+          .venv/bin/python -c 'import ssl, sys; print(sys.version.split()[0], ssl.OPENSSL_VERSION)'
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pypoetry
+          key: poetry-${{ runner.os }}-${{ hashFiles('backend/poetry.lock') }}
+
+      - run: npm ci
+
+      - name: Build the app
+        run: npm run build:app
+
+      - name: Check the bundled sidecar
+        run: bash scripts/smoke-sidecar.sh
+
+      - name: Package the .dmg
+        id: dmg
+        run: |
+          path="$(bash scripts/package-dmg.sh | tail -n 1)"
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Keep the .dmg (manual run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DbaGuy-dmg
+          path: |
+            ${{ steps.dmg.outputs.path }}
+            ${{ steps.dmg.outputs.path }}.sha256
+          retention-days: 7
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "DbaGuy $version" \
+              --notes-file .github/release-notes.md
+          fi
+          gh release upload "$GITHUB_REF_NAME" "${{ steps.dmg.outputs.path }}" \
+            "${{ steps.dmg.outputs.path }}.sha256" --clobber
