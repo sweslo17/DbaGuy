@@ -29,10 +29,12 @@ class FieldSampleService:
         self._samples: dict[UUID, OrderedDict[Keyspace, FieldSample]] = {}
         self._lock = threading.Lock()
 
-    def sample(self, profile_id: UUID, keyspace: Keyspace, size: int | None) -> FieldSample:
+    def sample(self, profile_id: UUID, keyspace: Keyspace, size: int | None, *,
+               agent: bool = False) -> FieldSample:
         """Read a sample of `keyspace` (`size` documents; None: the setting's `couchbase.sample_size`) and keep it as the
         keyspace's current one. A failed sample keeps the previous one. The server's error answer (a missing keyspace, a
-        privilege) is raised as it is, and not sent a second time on a fresh connection (B39)."""
+        privilege) is raised as it is, and not sent a second time on a fresh connection (B39). `agent`: on the MCP
+        agents' read-only metadata connection (spec ⑧ D-08-11); the kept sample is the same one the app shows."""
         requested = size if size is not None else self._settings.get().couchbase.sample_size
 
         def run(connection: DatabaseConnection) -> FieldSample:
@@ -41,15 +43,20 @@ class FieldSampleService:
             with server_errors_are_final():
                 return connection.sample_fields(keyspace, requested)
 
-        sample = self._metadata.with_connection(profile_id, None, run)
+        if agent:
+            sample = self._metadata.with_connection(profile_id, None, run, agent=True)
+        else:
+            sample = self._metadata.with_connection(profile_id, None, run)
         with self._lock:
             kept = self._samples.setdefault(profile_id, OrderedDict())
             kept[keyspace] = sample
             kept.move_to_end(keyspace)
             while len(kept) > SAMPLES_PER_PROFILE_MAX:
                 kept.popitem(last=False)
-        logger.info("Sampled {} documents of {}.{}.{} in {} ms ({} field paths)", sample.documents, keyspace.bucket,
-                    keyspace.scope, keyspace.collection, sample.elapsed_ms, len(sample.fields))
+        # An agent's keyspace is the agent's own text: DEBUG only (spec ⑧ ruling I-2); the MCP tool logs its INFO line
+        (logger.debug if agent else logger.info)(
+            "Sampled {} documents of {}.{}.{} in {} ms ({} field paths)", sample.documents, keyspace.bucket,
+            keyspace.scope, keyspace.collection, sample.elapsed_ms, len(sample.fields))
         return sample
 
     def cached(self, profile_id: UUID, keyspace: Keyspace) -> FieldSample | None:

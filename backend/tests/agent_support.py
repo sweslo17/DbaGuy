@@ -5,8 +5,8 @@ import json
 import random
 import socket
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -94,8 +94,10 @@ def serving(container: AppContainer) -> Iterator[int]:
         container.agent_host.stop()
 
 
-async def _call(port: int, token: str, mode: str, tool: str | None, arguments: dict[str, Any],
-                client: str) -> Any:
+@asynccontextmanager
+async def mcp_session(port: int, *, token: str = MCP_TOKEN, mode: str = "legacy",
+                      client: str = "pytest") -> AsyncIterator[Any]:
+    """An MCP client session against 127.0.0.1:`port`, open for the block."""
     from mcp import Client
     from mcp.client.streamable_http import streamable_http_client
     from mcp.shared._httpx_utils import create_mcp_http_client
@@ -104,17 +106,25 @@ async def _call(port: int, token: str, mode: str, tool: str | None, arguments: d
     async with create_mcp_http_client(headers={"Authorization": f"Bearer {token}"}) as http:
         transport = streamable_http_client(f"http://127.0.0.1:{port}/mcp", http_client=http)
         async with Client(transport, mode=mode, client_info=Implementation(name=client, version="1")) as session:
-            if tool is None:
-                return await session.list_tools()
-            return await session.call_tool(tool, arguments)
+            yield session
+
+
+async def _call(port: int, token: str, mode: str, tool: str | None, arguments: dict[str, Any],
+                client: str) -> Any:
+    async with mcp_session(port, token=token, mode=mode, client=client) as session:
+        if tool is None:
+            return await session.list_tools()
+        return await session.call_tool(tool, arguments)
 
 
 def call_tool(port: int, tool: str, arguments: dict[str, Any] | None = None, *, mode: str = "legacy",
               token: str = MCP_TOKEN, client: str = "pytest") -> tuple[bool, Any]:
-    """(is_error, the JSON of its one text block): one tool call through a new MCP client session."""
+    """(is_error, the JSON of its one text block): one tool call through a new MCP client session. The SDK's own
+    refusal of an argument is plain text, returned as it is."""
     result = anyio.run(_call, port, token, mode, tool, arguments or {}, client)
     assert len(result.content) == 1 and result.content[0].type == "text"
-    return result.is_error, json.loads(result.content[0].text)
+    text = result.content[0].text
+    return result.is_error, json.loads(text) if text.startswith("{") else text
 
 
 def list_tools(port: int, *, mode: str = "legacy") -> list[Any]:

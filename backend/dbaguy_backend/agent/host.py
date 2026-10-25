@@ -3,11 +3,12 @@ thread, event loop and socket (127.0.0.1, a fixed port, R-08-2), beside the API'
 with the switch off nothing of it is loaded, Q1), reads the token, binds, builds a new MCPServer and serves; stopping
 ends it within 5 s and closes every agent session and agent catalog connection."""
 
+import asyncio
 import errno
 import itertools
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 import uvicorn
@@ -17,6 +18,7 @@ from ..domain.agent import McpState, McpStatus, McpToken
 from ..domain.settings import McpSettings
 from ..listen import listen_socket
 from ..tokens import new_token
+from .queries import QueryTools
 from .token_store import TokenStore
 from .tools import AgentTools
 
@@ -24,6 +26,7 @@ MCP_HOST = "127.0.0.1"
 START_DELAY_S = 1.0  # at app start with the switch on: the API answers its first requests first (D-08-8, Q1)
 STOP_JOIN_S = 5.0
 GRACEFUL_S = 2  # uvicorn's graceful shutdown: open requests get this long before they are cut
+END_REQUESTS_S = 1.0  # ending the requests still being answered before that (Task 1 review m2)
 _PORT_IN_USE = "Port {} is in use by another program: choose another port in Settings"
 
 
@@ -39,16 +42,29 @@ def claude_commands(url: str, token: str) -> tuple[str, str]:
 
 
 class _Uvicorn(uvicorn.Server):
-    """Says when it is serving: `started` is set inside startup, on the server's own loop."""
+    """Says when it is serving: `started` is set inside startup, on the server's own loop. Before its graceful
+    shutdown, `before_shutdown` runs on that loop (at most END_REQUESTS_S): the app ends the requests it is still
+    answering, so the shutdown has nothing to wait for (Task 1 review m2: an idle client's GET stream held every stop
+    for GRACEFUL_S and was cut with an ERROR)."""
 
-    def __init__(self, config: uvicorn.Config, on_started: Callable[[], None]) -> None:
+    def __init__(self, config: uvicorn.Config, on_started: Callable[[], None],
+                 before_shutdown: Callable[[], Awaitable[None]] | None = None) -> None:
         super().__init__(config)
         self._on_started = on_started
+        self._before_shutdown = before_shutdown
 
     async def startup(self, sockets=None) -> None:  # noqa: ANN001 (uvicorn's signature)
         await super().startup(sockets=sockets)
         if self.started:
             self._on_started()
+
+    async def shutdown(self, sockets=None) -> None:  # noqa: ANN001 (uvicorn's signature)
+        if self._before_shutdown is not None:
+            try:
+                await asyncio.wait_for(self._before_shutdown(), END_REQUESTS_S)
+            except Exception as exc:  # the graceful shutdown still ends them, only later
+                logger.warning("MCP server: ending the open requests failed ({})", type(exc).__name__)
+        await super().shutdown(sockets=sockets)
 
 
 @dataclass(eq=False)
@@ -62,9 +78,10 @@ class _Run:
 
 
 class AgentHost:
-    def __init__(self, tools: AgentTools, tokens: TokenStore, default_port: int, *,
+    def __init__(self, tools: AgentTools, queries: QueryTools, tokens: TokenStore, default_port: int, *,
                  on_stop: Callable[[], None] = lambda: None) -> None:
         self._tools = tools
+        self._queries = queries
         self._tokens = tokens
         self._default_port = default_port
         self._on_stop = on_stop  # closes the agent sessions and catalog connections
@@ -235,10 +252,11 @@ class AgentHost:
             self._set("error", run.port, f"Could not start: {type(exc).__name__}", run)
             return
         try:
-            app = mcp_server.build_app(self._tools, port=run.port, token=self.current_token)
+            app = mcp_server.build_app(self._tools, self._queries, port=run.port, token=self.current_token)
             config = uvicorn.Config(app, log_config=None, access_log=False, lifespan="on",
                                     timeout_graceful_shutdown=GRACEFUL_S)
-            server = _Uvicorn(config, on_started=lambda: self._listening(run))
+            server = _Uvicorn(config, on_started=lambda: self._listening(run),
+                              before_shutdown=getattr(app, "stop_serving", None))
             with self._lock:
                 if run.stopping:
                     return

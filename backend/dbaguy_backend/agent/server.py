@@ -3,6 +3,7 @@ gate in front of it. The only module that imports the MCP SDK, and only `AgentHo
 (D-08-8): with the switch off the SDK is never loaded (Q1)."""
 
 import re
+import threading
 import time
 from collections.abc import Callable
 from typing import Annotated, Any
@@ -10,18 +11,21 @@ from typing import Annotated, Any
 import anyio
 from loguru import logger
 from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import Field
 from starlette.datastructures import Headers
 from starlette.responses import Response
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ..domain.metadata import PathSegment
 from ..domain.well_formed import well_formed
 from ..tokens import same_token
 from ..version import app_version
-from .shape import compact
+from .queries import SAMPLE_MAX, SQL_MAX, TIMEOUT_DEFAULT_S, TIMEOUT_MAX_S, QueryTools
+from .reader import CallControl
+from .shape import MAX_CELL, MAX_CELL_DEFAULT, MAX_ROWS, MAX_ROWS_DEFAULT, compact
 from .tools import LIMIT_MAX, LIST_LIMIT, SEARCH_LIMIT, AgentTools, ToolFailure
 
 MCP_PATH = "/mcp"
@@ -38,9 +42,14 @@ INSTRUCTIONS = (
     "(max_rows, max_cell_chars, about 40,000 characters, timeout up to 60 s). SQL Server connections are read-only by "
     "DbaGuy's checks only. Couchbase takes a query_context (bucket.scope)."
 )
+_STOPPING = "The MCP server is stopping"
 _READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 Connection = Annotated[str, Field(min_length=1, max_length=200, description="A connection's id or name")]
 Name = Annotated[str, Field(min_length=1, max_length=1000)]
+Sql = Annotated[str, Field(min_length=1, max_length=SQL_MAX, description="One statement")]
+QueryContextText = Annotated[str, Field(min_length=1, max_length=400, description="Couchbase: bucket or bucket.scope")]
+Timeout = Annotated[float, Field(gt=0, le=TIMEOUT_MAX_S, description=f"Seconds, default {TIMEOUT_DEFAULT_S}; "
+                                                                        "at most 30 on production (red) connections")]
 
 
 class ObjectPathSegment(PathSegment):
@@ -60,10 +69,36 @@ class BearerGate:
     127.0.0.1:<port> and localhost:<port>), then any Origin (403: CLI clients send none, a web page always does). A
     refused request never reaches the SDK. `token` is read per request, so a regenerated token applies at once."""
 
-    def __init__(self, app: ASGIApp, *, token: Callable[[], str], port: int) -> None:
+    def __init__(self, app: ASGIApp, *, token: Callable[[], str], port: int,
+                 sessions: StreamableHTTPSessionManager | None = None) -> None:
         self._app = app
         self._token = token
         self._hosts = frozenset({f"127.0.0.1:{port}", f"localhost:{port}"})
+        self._sessions = sessions  # the SDK's 2025-11-25 sessions
+        self._serving: set[anyio.CancelScope] = set()  # the requests the SDK is answering
+        self._stopping = False
+
+    async def stop_serving(self) -> None:
+        """Before uvicorn's graceful shutdown, on the server's loop (Task 1 review m2): end every request the SDK is
+        still answering, and refuse new ones (503). An idle 2025-11-25 client holds its GET stream open (as Claude
+        Code does), and a 2026-07-28 call answers on its own request's stream; either held each stop for GRACEFUL_S,
+        then uvicorn cut it with an ERROR. Ended here, each response is completed (an empty last chunk, or a 503 when
+        none started), so uvicorn finds nothing to wait for. A call's statement is cancelled the way a client's cancel
+        does it (`run_tool`). A request that comes after (a client reconnecting its stream) gets the 503.
+
+        Then the 2025-11-25 sessions end as a client's DELETE ends one: a call of theirs still running answers into a
+        closed stream at once, where the SDK would otherwise wait a second for the one it cut. The SDK has no public
+        call that ends them all, so its manager's table is read; without it the stop is only that second slower."""
+        self._stopping = True
+        serving = list(self._serving)
+        for cancel in serving:
+            cancel.cancel()
+        transports = list(getattr(self._sessions, "_server_instances", {}).values())
+        for transport in transports:
+            await transport.terminate()
+        if serving or transports:
+            logger.info("MCP: ended {} open request(s) and {} client session(s) before stopping", len(serving),
+                        len(transports))
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
@@ -82,10 +117,38 @@ class BearerGate:
         elif "origin" in headers:
             refusal = Response("Origin not allowed", status_code=403)
         if refusal is None:
-            await self._app(scope, receive, send)
+            await self._serve(scope, receive, send)
             return
         logger.info("MCP request refused: {}", refusal.status_code)  # never a header's value: one may be a token
         await refusal(scope, receive, send)
+
+    async def _serve(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """The SDK answers the request, unless `stop_serving` ends it first: then its response is completed here."""
+        if self._stopping:
+            await Response(_STOPPING, status_code=503)(scope, receive, send)
+            return
+        started = done = False
+
+        async def sending(message: Message) -> None:
+            nonlocal started, done
+            if message["type"] == "http.response.start":
+                started = True
+            elif message["type"] == "http.response.body" and not message.get("more_body", False):
+                done = True
+            await send(message)
+
+        with anyio.CancelScope() as cancel:
+            self._serving.add(cancel)
+            try:
+                await self._app(scope, receive, sending)
+            finally:
+                self._serving.discard(cancel)
+        if not self._stopping or done:
+            return
+        if started:  # a stream (SSE) the stop cut: its last chunk, so the client sees it end
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        else:
+            await Response(_STOPPING, status_code=503)(scope, receive, send)
 
 
 def client_name(ctx: Context) -> str | None:
@@ -110,13 +173,26 @@ def failure_result(failure: ToolFailure) -> CallToolResult:
     return _text({"error": {"code": failure.code, "message": failure.message}}, error=True)
 
 
-async def run_tool(tool: str, client: str | None, call: Callable[[], dict[str, Any]]) -> CallToolResult:
+async def run_tool(tool: str, client: str | None, call: Callable[[], dict[str, Any]],
+                   control: CallControl | None = None) -> CallToolResult:
     """`call` on a worker thread; its data or its failure as a result, never an exception the SDK would log with its
     message (D-08-6). An unexpected error is logged by its type only above DEBUG. Above DEBUG a line names the tool,
-    the connection's id, the outcome and the time, never what the agent sent or calls itself (fix round 1, I-2)."""
+    the connection's id, the outcome and the time, never what the agent sent or calls itself (fix round 1, I-2).
+
+    The client cancelling the request (A4: 2025-11-25's notifications/cancelled, or a 2026-07-28 client closing its
+    request's stream) cancels this task, as a stop does: the thread is abandoned at once, and `control` cancels the
+    call's statement from a thread of its own (a PostgreSQL cancel can wait on the server for seconds). The call then
+    ends on its own thread, `cancelled`, and writes its History record."""
     started = time.monotonic()
     try:
-        return _text(await anyio.to_thread.run_sync(call))
+        return _text(await anyio.to_thread.run_sync(call, abandon_on_cancel=True))
+    except anyio.get_cancelled_exc_class():
+        if control is not None:
+            threading.Thread(target=control.cancel, name=f"mcp-cancel-{tool}", daemon=True).start()
+        # the client gave up, or the MCP server is stopping (BearerGate.stop_serving)
+        logger.info("MCP {}: cancelled after {} ms", tool, int((time.monotonic() - started) * 1000))
+        logger.debug("MCP {} by {!r}: cancelled", tool, client)
+        raise
     except ToolFailure as failure:
         if not failure.logged:
             elapsed = int((time.monotonic() - started) * 1000)
@@ -130,7 +206,7 @@ async def run_tool(tool: str, client: str | None, call: Callable[[], dict[str, A
         return failure_result(ToolFailure("internal_error", "Internal error"))
 
 
-def build_server(tools: AgentTools) -> MCPServer:
+def build_server(tools: AgentTools, queries: QueryTools) -> MCPServer:
     """A new server each start: the SDK's session manager runs once per instance (D-08-8)."""
     server = MCPServer("dbaguy", title="DbaGuy", instructions=INSTRUCTIONS, version=app_version())
 
@@ -144,7 +220,9 @@ def build_server(tools: AgentTools) -> MCPServer:
             "Read-only. The database connections the user shares with AI tools in DbaGuy: id, name, engine, access "
             "('schema': names and definitions only; 'query': also run_query and explain), the default database, "
             "whether the server or only DbaGuy enforces read-only, whether it needs unlocking in DbaGuy first, and "
-            "what the login may do beyond reading (null until a call has used the connection)."
+            "what the login may do beyond reading (null until a call has used the connection). A login that may do "
+            "more than read is only fully contained by a duplicate of the connection whose login can only read, which "
+            "the user can share instead."
         ),
     )
 
@@ -198,19 +276,79 @@ def build_server(tools: AgentTools) -> MCPServer:
             "indexes, comment; its DDL with include_ddl. Reads no rows."
         ),
     )
+
+    async def run_query(
+        connection: Connection, sql: Sql, ctx: Context, database: Name | None = None,
+        query_context: QueryContextText | None = None,
+        max_rows: Annotated[int, Field(ge=1, le=MAX_ROWS)] = MAX_ROWS_DEFAULT,
+        max_cell_chars: Annotated[int, Field(ge=1, le=MAX_CELL)] = MAX_CELL_DEFAULT, timeout_s: Timeout | None = None,
+    ) -> CallToolResult:
+        client, control = client_name(ctx), CallControl()
+        return await run_tool("run_query", client, lambda: queries.run_query(
+            connection, sql, database, query_context, max_rows, max_cell_chars, timeout_s, client=client,
+            control=control), control)
+
+    server.add_tool(
+        run_query, name="run_query", annotations=_READ_ONLY, structured_output=False,
+        description=(
+            "Read-only. Needs 'Read-only queries' access. Runs exactly one SELECT, WITH, VALUES, TABLE or SHOW "
+            "statement (SQLite: SELECT, WITH or VALUES; SQL Server and Couchbase: SELECT or WITH) in a read-only "
+            "transaction that is rolled back. "
+            "Returns columns, rows (big integers as strings; long text cut at max_cell_chars, with its size), "
+            "row_count, more_rows, and notes. At most max_rows rows (100 by default, 1000 at most) and about 40,000 "
+            "characters; timeout_s 30 s by default, 60 at most (30 on production connections). DbaGuy checks every "
+            "statement and rolls it back; for full protection the user shares a duplicate of the connection whose "
+            "login can only read."
+        ),
+    )
+
+    async def explain(
+        connection: Connection, sql: Sql, ctx: Context, database: Name | None = None,
+        query_context: QueryContextText | None = None, timeout_s: Timeout | None = None,
+    ) -> CallToolResult:
+        client, control = client_name(ctx), CallControl()
+        return await run_tool("explain", client, lambda: queries.explain(
+            connection, sql, database, query_context, timeout_s, client=client, control=control), control)
+
+    server.add_tool(
+        explain, name="explain", annotations=_READ_ONLY, structured_output=False,
+        description=(
+            "Read-only. Needs 'Read-only queries' access. The plan of one read statement (the statement run_query "
+            "would take), without running it: no ANALYZE. Pass the statement without EXPLAIN; DbaGuy adds it "
+            "(SQL Server: SHOWPLAN_TEXT). Couchbase also lists findings such as primary or uncovered scans."
+        ),
+    )
+
+    async def sample_fields(
+        connection: Connection, bucket: Name, scope: Name, collection: Name, ctx: Context,
+        size: Annotated[int, Field(ge=1, le=SAMPLE_MAX)] | None = None,
+    ) -> CallToolResult:
+        client = client_name(ctx)
+        return await run_tool("sample_fields", client, lambda: queries.sample_fields(
+            connection, bucket, scope, collection, size, client=client))
+
+    server.add_tool(
+        sample_fields, name="sample_fields", annotations=_READ_ONLY, structured_output=False,
+        description=(
+            "Read-only. Needs 'Read-only queries' access; Couchbase only. The field paths of a collection's "
+            "documents, from a sample (the last one DbaGuy took, or a new one of `size` documents, at most 1000): "
+            "each path with its JSON types and how many documents have it."
+        ),
+    )
     return server
 
 
-def build_app(tools: AgentTools, *, port: int, token: Callable[[], str]) -> ASGIApp:
-    """The ASGI app the MCP thread serves on 127.0.0.1:`port`."""
+def build_app(tools: AgentTools, queries: QueryTools, *, port: int, token: Callable[[], str]) -> BearerGate:
+    """The ASGI app the MCP thread serves on 127.0.0.1:`port`; `stop_serving` before it stops."""
     security = TransportSecuritySettings(  # the SDK checks again; BearerGate has refused anything else already
         allowed_hosts=[f"127.0.0.1:{port}", f"localhost:{port}"], allowed_origins=[],
     )
     # json_response=False (P18): only the SDK's SSE path notices a 2026-07-28 client closing its request's stream,
     # which is how that client cancels a call (A4). A call that ends within the SDK's 15 s still answers JSON there;
     # 2025-11-25 answers as an SSE stream and cancels with notifications/cancelled.
-    app = build_server(tools).streamable_http_app(
+    server = build_server(tools, queries)
+    app = server.streamable_http_app(
         streamable_http_path=MCP_PATH, json_response=False, stateless_http=False, max_sessions=MAX_SESSIONS,
         session_idle_timeout=SESSION_IDLE_S, max_request_body_size=MAX_BODY_BYTES, transport_security=security,
     )
-    return BearerGate(app, token=token, port=port)
+    return BearerGate(app, token=token, port=port, sessions=server.session_manager)

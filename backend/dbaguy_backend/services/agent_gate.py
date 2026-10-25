@@ -76,6 +76,13 @@ DENIED_FUNCTIONS: dict[Dialect, tuple[tuple[str, str], ...]] = {
     Dialect.SQLPP: (("curl", "reaches the network"), ("advisor", "starts index advisor sessions")),
 }
 _QUOTED_NAMES_KEEP_CASE = frozenset({Dialect.POSTGRES})
+# The codes a server answers a write with on an agent's read-only session (§3.4: P4, M2, S1/S9, C1): the tool adds that
+# DbaGuy's MCP access is read-only. SQL Server has none: it is DbaGuy's checks and a rollback there.
+SERVER_READ_ONLY: dict[Dialect, frozenset[str]] = {
+    Dialect.POSTGRES: frozenset({"25006"}), Dialect.MYSQL: frozenset({"1792"}),
+    Dialect.SQLITE: frozenset({"SQLITE_READONLY", "SQLITE_AUTH"}), Dialect.SQLPP: frozenset({"1000"}),
+    Dialect.TSQL: frozenset(),
+}
 _HEX = re.compile(r"[0-9A-Fa-f]+")
 
 

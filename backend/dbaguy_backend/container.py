@@ -13,6 +13,7 @@ from .adapters.registry import AdapterRegistry
 from .adapters.sqlite.adapter import SqliteAdapter
 from .agent.host import AgentHost
 from .agent.login import LoginRegistry
+from .agent.queries import QueryTools
 from .agent.reader import AgentReader
 from .agent.sessions import AgentSessions
 from .agent.token_store import InMemoryTokenStore, KeyringTokenStore, TokenStore
@@ -123,9 +124,11 @@ class AppContainer:
         self.agent_sessions = AgentSessions(self.sessions, self.agent_login)
         self.agent_reader = AgentReader(self.agent_sessions)
         self.agent_tools = AgentTools(self.profiles, self.registry, self.metadata, self.schema_cache, self.agent_login)
+        self.agent_queries = QueryTools(self.agent_tools, self.agent_reader, self.history, self.field_samples,
+                                        self.app_settings)
         self.agent_host = AgentHost(
-            self.agent_tools, token_store or _token_store(settings, secret_store), default_mcp_port(data_dir),
-            on_stop=self._close_agents,
+            self.agent_tools, self.agent_queries, token_store or _token_store(settings, secret_store),
+            default_mcp_port(data_dir), on_stop=self._close_agents,
         )
         self._stop = threading.Event()
         self._housekeeper: threading.Thread | None = None
