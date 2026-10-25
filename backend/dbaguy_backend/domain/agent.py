@@ -6,8 +6,8 @@ from pydantic import BaseModel
 
 from .profiles import McpAccess
 
-__all__ = ["McpAccess", "McpState", "McpStatus", "McpToken", "ToolErrorCode", "APP_MCP_PORT", "DEV_MCP_PORT",
-           "LoginGrant", "LoginPrivileges"]
+__all__ = ["McpAccess", "McpState", "McpStatus", "McpToken", "ToolErrorCode", "ToolFailure", "APP_MCP_PORT",
+           "DEV_MCP_PORT", "LoginGrant", "LoginPrivileges", "PAGE_RAW_CHARS", "READ_RAW_CHARS"]
 
 APP_MCP_PORT = 17531  # the app's own data dir (R-08-2)
 DEV_MCP_PORT = 17532  # any other data dir: dev/data, tests, a scratch sidecar
@@ -22,6 +22,28 @@ ToolErrorCode = Literal[
     "connection_failed", "query_failed", "timeout", "cancelled", "busy", "not_found", "invalid_argument",
     "internal_error",
 ]
+
+# What one agent's read holds (§3.6, ruling T6-I1, P10), here so that `sessions/` (the worker's page) and `adapters/`
+# (SQLite's length limit, final review I3) need not import `agent/` (final review M7):
+PAGE_RAW_CHARS = 8 * 1024 * 1024  # an agent's page ends once its rows reach this many characters, raw (T6-I1)
+# Every value one call reads, raw: past it, no more rows are asked for. A few huge values end the call (one 100 MB
+# value: that row alone), instead of dozens of them being read for their 1,000-character previews (P10)
+READ_RAW_CHARS = 64 * 1024 * 1024
+
+
+class ToolFailure(Exception):
+    """A tool's error result (§4): its code and a message for the agent. `logged`: whoever raised it wrote its log line
+    already (a refusal names its reason), so the server does not add a second. `connection`: the id of the profile it
+    concerns, once known (the log line names it, never what the agent typed). Here, not in `agent/tools.py`, so the
+    reader and the agent sessions raise it without importing the tools (final review M7)."""
+
+    def __init__(self, code: ToolErrorCode, message: str, *, logged: bool = False,
+                 connection: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.logged = logged
+        self.connection = connection
 
 
 # What a login may do beyond reading that a read-only transaction does not stop (CR-08-1, §3.3), in this order:

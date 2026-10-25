@@ -2,11 +2,12 @@
 `agent/server.py` turns both into a CallToolResult (D-08-6). Every call reads the profiles again, so a connection the
 user set to Off is gone from the next call on (R-08-5)."""
 
+import functools
 import re
 import sys
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -15,7 +16,7 @@ from loguru import logger
 
 from ..adapters.base import DatabaseAdapter, DatabaseConnection, StatementError
 from ..adapters.registry import AdapterRegistry
-from ..domain.agent import McpAccess, ToolErrorCode
+from ..domain.agent import McpAccess, ToolErrorCode, ToolFailure
 from ..domain.errors import (
     ConnectionFailed, NotFound, PasswordRequired, ProfileNotFound, QueryFailed, SecretStoreError, SessionBusy,
     ValidationFailed,
@@ -29,7 +30,7 @@ from ..services.metadata_service import MetadataService
 from ..services.profile_service import ProfileService
 from ..services.schema_cache import SchemaCache
 from .login import LoginRegistry
-from .shape import MAX_CELL_DEFAULT, NOTE_ROOM, RESPONSE_CHARS, cut_text, fit_lists, fit_text
+from .shape import MAX_CELL_DEFAULT, NOTE_ROOM, RESPONSE_BYTES, cut_text, fit_lists, fit_text, note
 
 LIST_LIMIT, SEARCH_LIMIT, LIMIT_MAX = 100, 50, 1000  # list_objects, search_objects (§3.5)
 COLUMNS_PER_HIT = 50  # search_objects' matching columns of one object: one wide table never fills the response alone
@@ -44,27 +45,13 @@ _NO_SECRET = "'{}': DbaGuy could not read its saved password from the Keychain: 
 _CLOSED = "'{}': the connection was closed while the call waited (DbaGuy reset it): try again"
 _NO_DATABASE = "No database named '{}' on '{}'"
 _SEVERAL_DATABASES = "Several databases match '{}': {}"
-_LEFT_OUT = f"{{}} left out to keep the response under {RESPONSE_CHARS:,} characters: {{}}"
+_LEFT_OUT = f"{{}} left out to keep the response under {RESPONSE_BYTES:,} bytes: {{}}"
 _LONG_TEXT = f"Comments and defaults longer than {MAX_CELL_DEFAULT:,} characters are cut"
 _AMBIGUOUS = "Several connections are named '{}': pass one of their ids ({})"
 _SCHEMA_ONLY = "'{}' allows schema only: {} needs 'Read-only queries' in DbaGuy's connection settings"
 _BAD_DATABASE = ("`database` holds a control character or half of a surrogate pair: pass a database's name as "
                  "list_objects shows it")
 CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")  # C0, DEL, C1: never in a name an agent passes on, nor in a log
-
-
-class ToolFailure(Exception):
-    """A tool's error result (§4): its code and a message for the agent. `logged`: whoever raised it wrote its log line
-    already (a refusal names its reason), so the server does not add a second. `connection`: the id of the profile it
-    concerns, once known (the log line names it, never what the agent typed)."""
-
-    def __init__(self, code: ToolErrorCode, message: str, *, logged: bool = False,
-                 connection: str | None = None) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.logged = logged
-        self.connection = connection
 
 
 @dataclass(frozen=True)
@@ -103,6 +90,16 @@ def answered(profile: AnyProfile) -> Iterator[None]:
         raise failure("query_failed", exc.message) from None
     except ValidationFailed as exc:
         raise failure("invalid_argument", exc.message) from None
+
+
+def _listed(objects: list[dict[str, Any]], truncated: bool, narrower: str) -> dict[str, Any]:
+    """list_objects' and search_objects' answer inside the budget: `truncated` and the note first, then the objects
+    (final review I4: what says the answer is partial comes before what it is about)."""
+    result: dict[str, Any] = {"truncated": truncated, "objects": objects}
+    if dropped := fit_lists(result, ("objects",), RESPONSE_BYTES - NOTE_ROOM):
+        notes = [_LEFT_OUT.format(f"{dropped['objects']} more objects", narrower)]
+        return {"truncated": True, "notes": notes, "objects": result["objects"]}
+    return result
 
 
 def _path_text(path: list[PathSegment]) -> str:
@@ -156,6 +153,18 @@ def _narrowed_to(shared: Shared, database: str | None) -> str | None:
 def _within(narrow: str | None, database: str | None, schema: str) -> bool:
     """Whether an object (its snapshot's database or bucket, its schema or scope) is in `narrow` (`_narrowed_to`)."""
     return narrow is None or (database if database is not None else schema) == narrow
+
+
+def _one_call[R](method: Callable[..., R]) -> Callable[..., R]:
+    """A schema tool: every catalog read of the call is judged by the MCP server's stop as the call began (T2 re-review
+    2: a describe still running when the server stops opens no new connection for its next read)."""
+
+    @functools.wraps(method)
+    def call(self: "AgentTools", *args: Any, **kwargs: Any) -> R:
+        with self.agent_call():
+            return method(self, *args, **kwargs)
+
+    return call
 
 
 _RELATION_KINDS = frozenset({NodeKind.TABLE, NodeKind.PARTITION, NodeKind.VIEW, NodeKind.MATERIALIZED_VIEW,
@@ -214,6 +223,10 @@ class AgentTools:
         if len(named) > 1:
             raise ToolFailure("ambiguous", _AMBIGUOUS.format(connection, ", ".join(str(p.id) for p in named)))
         return named[0]
+
+    def agent_call(self) -> AbstractContextManager[None]:
+        """One tool call's scope on the agents' catalog connections (`MetadataService.agent_call`)."""
+        return self._metadata.agent_call()
 
     def shared_counts(self) -> tuple[int, int]:
         """How many connections are shared at `schema` and at `query` (the Settings status line)."""
@@ -288,6 +301,7 @@ class AgentTools:
             return [PathSegment(kind=NodeKind.DATABASE, name=spelled or path[0].name), *path[1:]], key
         return path, profile_database(shared.profile) or None  # the root (M-2), or a path its adapter refuses
 
+    @_one_call
     def list_objects(self, connection: str, path: list[PathSegment] | None = None, limit: int = LIST_LIMIT, *,
                      client: str | None = None) -> dict[str, Any]:
         started = time.monotonic()
@@ -296,15 +310,13 @@ class AgentTools:
             self._login.ensure(shared.profile)
             path, key = self._located(shared, path or [])
             nodes = self._catalog(shared, key, lambda c: c.list_children(path))
-        result: dict[str, Any] = {"objects": [_node(node) for node in nodes[:limit]], "truncated": len(nodes) > limit}
-        if dropped := fit_lists(result, ("objects",), RESPONSE_CHARS - NOTE_ROOM):
-            result["truncated"] = True
-            result["notes"] = [_LEFT_OUT.format(f"{dropped['objects']} more objects",
-                                                "pass a smaller limit or a deeper path")]
+        result = _listed([_node(node) for node in nodes[:limit]], len(nodes) > limit,
+                         "pass a smaller limit or a deeper path")
         self._done("list_objects", shared, started, len(result["objects"]), "objects", client,
                    f": {_path_text(path)}")
         return result
 
+    @_one_call
     def search_objects(self, connection: str, pattern: str, database: str | None = None,
                        include_columns: bool = False, limit: int = SEARCH_LIMIT, *,
                        client: str | None = None) -> dict[str, Any]:
@@ -327,11 +339,7 @@ class AgentTools:
             if include_columns and (needle := pattern.strip().lower()):
                 snapshot = self._schema_cache.get(pid, scope, agent=True)
                 self._add_column_hits(shared, snapshot, needle, narrow, found, limit)
-        result: dict[str, Any] = {"objects": found[:limit], "truncated": len(found) > limit}
-        if dropped := fit_lists(result, ("objects",), RESPONSE_CHARS - NOTE_ROOM):
-            result["truncated"] = True
-            result["notes"] = [_LEFT_OUT.format(f"{dropped['objects']} more objects",
-                                                "narrow the pattern or pass a smaller limit")]
+        result = _listed(found[:limit], len(found) > limit, "narrow the pattern or pass a smaller limit")
         self._done("search_objects", shared, started, len(result["objects"]), "objects", client,
                    f": {repr(pattern)[:300]}")
         return result
@@ -362,6 +370,7 @@ class AgentTools:
                 if len(columns) > COLUMNS_PER_HIT:
                     hit["more_columns"] = len(columns) - COLUMNS_PER_HIT
 
+    @_one_call
     def describe(self, connection: str, path: list[PathSegment] | None = None, database: str | None = None,
                  schema: str | None = None, name: str | None = None, include_ddl: bool = False, *,
                  client: str | None = None) -> dict[str, Any]:
@@ -388,8 +397,8 @@ class AgentTools:
                 if snapshot is None:
                     snapshot = self._schema_cache.get(shared.profile.id, key, agent=True)
                 relation = _relation_of(snapshot, path)
-            except Exception as exc:  # the detail stands without them
-                notes.append(_NO_SNAPSHOT.format(getattr(exc, "message", type(exc).__name__)))
+            except Exception as exc:  # the detail stands without them (the server's text cut: T2 re-review 3)
+                notes.append(_NO_SNAPSHOT.format(note(str(getattr(exc, "message", None) or type(exc).__name__))))
         result = self._described(detail, path, relation, indexes, include_ddl, notes)
         self._done("describe", shared, started, len(result["columns"]), "columns", client, f": {_path_text(path)}")
         return result
@@ -412,18 +421,20 @@ class AgentTools:
         comment, cut_comment = cut_text(detail.comment)
         if cut or cut_comment:
             notes.append(_LONG_TEXT)
+        # final review I4: `truncated` and the notes first; the notes are inside the budget (T2 re-review 3), with
+        # NOTE_ROOM kept for the one that says what was left out
         result: dict[str, Any] = {
-            "kind": detail.kind, "name": detail.name, "path": _path_json(path), "columns": listed,
-            "primary_key": primary,
+            "truncated": cut or cut_comment, "notes": notes, "kind": detail.kind, "name": detail.name,
+            "path": _path_json(path), "comment": comment, "primary_key": primary,
             "foreign_keys": [{"name": fk.name, "columns": fk.columns, "references": f"{fk.ref_schema}.{fk.ref_table}",
                               "ref_columns": fk.ref_columns} for fk in (relation.foreign_keys if relation else [])],
-            "indexes": indexes, "comment": comment, "truncated": cut or cut_comment,
+            "indexes": indexes, "columns": listed,
         }
-        room = RESPONSE_CHARS - NOTE_ROOM
+        room = RESPONSE_BYTES - NOTE_ROOM
         cut_ddl = False
         if include_ddl:
-            result["ddl"], cut_ddl = cut_text(detail.ddl, RESPONSE_CHARS // 2)
             result["ddl_is_generated"] = detail.ddl_is_generated
+            result["ddl"], cut_ddl = cut_text(detail.ddl, RESPONSE_BYTES // 2)
         dropped = fit_lists(result, ("columns", "indexes", "foreign_keys"), room)
         left_out = [f"{n} {what.replace('_', ' ')}" for what, n in dropped.items()]
         if include_ddl and (fit_text(result, "ddl", room) or cut_ddl):
@@ -431,8 +442,8 @@ class AgentTools:
         if left_out:
             result["truncated"] = True
             notes.append(_LEFT_OUT.format(", ".join(left_out), "describe it by its parts with list_objects"))
-        if notes:
-            result["notes"] = notes
+        if not notes:
+            del result["notes"]
         return result
 
     def _indexes(self, shared: Shared, key: str | None, path: list[PathSegment]) -> list[dict[str, Any]]:

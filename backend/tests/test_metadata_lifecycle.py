@@ -127,17 +127,19 @@ def test_the_agents_hold_at_most_the_cap_closing_the_least_recently_used(monkeyp
 
 
 def test_a_call_that_ends_after_the_server_stopped_closes_its_connection(agents_env):
-    """Minor 3: the MCP server stopped (close_all(agents_only=True)) while a call was opening its connection."""
+    """Minor 3: the MCP server stopped (close_all(agents_only=True)) while a call was opening its connection. Since the
+    final review's fix wave (M1, obs 3) the open is fenced: it is closed at once and the call runs nothing on it."""
     service, connections, pid = agents_env
     connections.gate.clear()
     done: list = []
-    caller = threading.Thread(target=lambda: done.append(service.with_connection(pid, "a", _noop, agent=True)))
+    caller = threading.Thread(target=lambda: _attempt(done, lambda: service.with_connection(pid, "a", _noop,
+                                                                                            agent=True)))
     caller.start()
     assert connections.opening.wait(5)
     service.close_all(agents_only=True)  # nothing registered yet: the call is still opening
     connections.gate.set()
     caller.join(10)
-    assert done == [None]  # it finished
+    assert len(done) == 1 and isinstance(done[0], SessionBusy)
     assert connections.leases[("a", True)].closed.wait(5)
     assert not any(key[2] for key in service._workers)
 
@@ -174,3 +176,88 @@ def test_a_call_queued_when_the_server_stopped_does_not_reopen(agents_env):
         thread.join(10)
     assert len(outcomes) == 1 and isinstance(outcomes[0], SessionBusy)
     assert not any(key[2] for key in service._workers)
+
+
+def _held(service, pid, database):
+    """A call holding the agents' connection of `database` until `release` is set; (holding, release, thread)."""
+    holding, release = threading.Event(), threading.Event()
+
+    def hold(connection):
+        holding.set()
+        assert release.wait(10)
+
+    thread = threading.Thread(target=lambda: _attempt([], lambda: service.with_connection(pid, database, hold,
+                                                                                          agent=True)))
+    thread.start()
+    assert holding.wait(5)
+    return holding, release, thread
+
+
+def _attempt(outcomes, call):
+    try:
+        outcomes.append(call())
+    except Exception as exc:  # noqa: BLE001
+        outcomes.append(exc)
+
+
+def test_a_call_queued_when_its_profile_changed_never_reopens_with_the_old_one(agents_env):
+    """Final review M1 (T8 fix concern 3): a schema call or a sample queued on the agents' connection when the profile
+    is saved (switched Off, another host) does not open a new connection with the profile it read before the save."""
+    service, connections, pid = agents_env
+    service.with_connection(pid, "a", _noop, agent=True)
+    _, release, first = _held(service, pid, "a")
+    outcomes: list = []
+    second = threading.Thread(target=lambda: _attempt(outcomes, lambda: service.with_connection(
+        pid, "a", _noop, agent=True)))
+    second.start()
+    time.sleep(0.2)  # queued behind the first
+    service.invalidate(pid)  # the profile was saved
+    release.set()
+    for thread in (first, second):
+        thread.join(10)
+    assert len(outcomes) == 1 and isinstance(outcomes[0], SessionBusy)
+    assert not any(key[2] for key in service._workers)  # nothing reopened with the old profile
+
+
+def test_an_open_in_flight_when_the_profile_changed_is_not_kept(agents_env):
+    """T6 re-review 2 obs 3: invalidate fences an agent's connection still opening (the login read's, say)."""
+    service, connections, pid = agents_env
+    connections.gate.clear()
+    outcomes: list = []
+    caller = threading.Thread(target=lambda: _attempt(outcomes, lambda: service.with_connection(
+        pid, "a", _noop, agent=True)))
+    caller.start()
+    assert connections.opening.wait(5)
+    service.invalidate(pid)  # nothing registered yet: the connection is still opening
+    connections.gate.set()
+    caller.join(10)
+    assert len(outcomes) == 1 and isinstance(outcomes[0], SessionBusy)
+    assert connections.leases[("a", True)].closed.wait(5) and not service._workers
+
+
+def test_a_tool_call_judges_every_connection_by_the_stop_it_began_before(agents_env):
+    """T2 re-review 2: the stop epoch is read once per tool call (`agent_call`), so a describe still running when the
+    MCP server stops opens nothing after it, even for a database it had not used yet."""
+    service, connections, pid = agents_env
+    with service.agent_call():
+        service.with_connection(pid, "a", _noop, agent=True)
+        service.close_all(agents_only=True)  # the server stopped between two of the call's catalog reads
+        with pytest.raises(SessionBusy):
+            service.with_connection(pid, "b", _noop, agent=True)
+    assert ("b", True) not in connections.leases and not service._workers
+    service.with_connection(pid, "b", _noop, agent=True)  # a call after the stop is judged by its own start
+
+
+def test_the_least_recently_used_connection_with_a_call_in_flight_is_not_closed(monkeypatch, agents_env):
+    """T2 re-review 1: past the cap, the least recently used connection that has no call running or queued closes."""
+    service, connections, pid = agents_env
+    monkeypatch.setattr(metadata_service, "MAX_AGENT_CONNECTIONS", 3)
+    service.with_connection(pid, "a", _noop, agent=True)
+    _, release, first = _held(service, pid, "a")  # a is the least recently used one, and busy
+    for database in ("b", "c", "d"):
+        service.with_connection(pid, database, _noop, agent=True)
+    assert not connections.leases[("a", True)].closed.is_set() and connections.leases[("b", True)].closed.is_set()
+    release.set()
+    first.join(10)
+    service.with_connection(pid, "e", _noop, agent=True)  # once a is idle, the cap holds again
+    assert len([key for key in service._workers if key[2]]) == 3

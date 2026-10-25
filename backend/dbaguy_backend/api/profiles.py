@@ -50,8 +50,10 @@ def update_profile(
 def delete_profile(profile_id: UUID, container: AppContainer = Depends(get_container)) -> Response:
     container.profiles.get(profile_id)  # 404 before touching sessions
     container.sessions.close_for_profile(profile_id)
-    _forget_profile_state(container, profile_id)
+    # Deleted before what was learned from it is dropped (T8 re-review): an agent's call that wakes in between finds no
+    # profile (`unknown_connection`), never one it could still open a session on that nothing would close
     container.profiles.delete(profile_id)
+    _forget_profile_state(container, profile_id)
     return Response(status_code=204)
 
 

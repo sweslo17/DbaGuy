@@ -180,6 +180,9 @@ class _Reader:
         self.requests.append(request)
         return self.outcome
 
+    def stops(self):
+        return 0
+
 
 @pytest.mark.parametrize(("code", "message", "expected"), [
     ("read_only", "Blocked: read-only connection", ("refused", "Blocked: read-only connection")),
@@ -192,6 +195,10 @@ class _Reader:
      ("connection_failed", "DbaGuy closed the connection during the call: try again")),
     ("connection_lost", "The connection to the server was lost",
      ("connection_failed", "The connection to the server was lost")),
+    # T7 re-review: the agent's session was closed for it; "reconnect" is the user's tab's advice, not the agent's
+    ("read_only_state_unreadable", "The session's read-only state could not be read: reconnect",
+     ("connection_failed", "DbaGuy could not read whether the connection was still read-only, so it closed it "
+                           "without running the statement: try again (the next call opens a new connection)")),
 ])
 def test_what_a_read_ends_with_is_the_tools_error(container, lite, code, message, expected):
     """§4: the worker's backstop is `refused`; a server's read-only refusal says MCP is read-only; a server error ends
@@ -673,3 +680,104 @@ def test_rows_the_client_gave_up_on_are_recorded_cancelled(container, lite):
     queries.run_query(pid, "SELECT 1", client="pytest", control=control)
     [record] = container.history.search(source="mcp").items
     assert (record.status, record.rows) == ("cancelled", 1)
+
+
+_LENGTH_PROBE = """
+import resource, sys
+from pathlib import Path
+from dbaguy_backend.adapters.base import RunOptions
+from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
+from dbaguy_backend.domain.profiles import SqliteProfile
+profile = SqliteProfile(id="00000000-0000-0000-0000-000000000001", engine="sqlite", name="zz_08_ff", path=sys.argv[1])
+connection = SqliteAdapter().open(profile, None, None, None, agent=True)
+try:
+    result = connection.run("SELECT length(randomblob(400000000))", RunOptions(describe=False))
+    print("read", result.fetch(1))
+except Exception as exc:
+    print("refused", type(exc).__name__)
+print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+"""
+
+
+def test_an_agents_sqlite_value_is_bounded_by_the_engine(container, lite):
+    """Final review I3: SQLite runs inside the sidecar, so `randomblob(4e8)` allocated 400 MB per statement. An agent's
+    SQLite connection caps a value at READ_RAW_CHARS (SQLITE_LIMIT_LENGTH): the engine refuses before it allocates."""
+    import subprocess
+    import sys
+
+    pid = _lite(container, lite)
+    with pytest.raises(ToolFailure) as failed:
+        container.agent_queries.run_query(pid, "SELECT length(randomblob(400000000))", client="pytest")
+    assert failed.value.code == "query_failed" and "too big" in failed.value.message
+    out = subprocess.run([sys.executable, "-c", _LENGTH_PROBE, str(lite)], capture_output=True, text=True,
+                         check=True, cwd=str(__import__("pathlib").Path(__file__).resolve().parents[1])).stdout
+    verdict, peak = out.splitlines()[0], int(out.splitlines()[-1])
+    assert verdict.startswith("refused") and peak < 200 * 1024 * 1024  # macOS: bytes; a fresh interpreter, about 60 MB
+
+
+_CJK = "資料庫連線的唯讀查詢與繁體中文內容"  # 17 characters, 51 bytes of UTF-8
+
+
+def _bytes(data: dict) -> int:
+    return len(json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _first(text: str, *keys: str) -> list[int]:
+    return [text.index(f'"{key}":') for key in keys]
+
+
+def test_a_cjk_answer_stays_inside_the_byte_budget_with_its_counts_first(container, tmp_path):
+    """Final review I4: the budget is 40,000 bytes of UTF-8, not characters (Chinese takes about one token a character:
+    40,000 characters were 27–40k tokens, past Claude Code's 25,000), and what says the answer is partial comes before
+    the rows, so a client that cuts the text keeps it."""
+    path = tmp_path / "zz_08_ff_cjk.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+    conn.executemany("INSERT INTO notes (body) VALUES (?)", [(f"{n} {_CJK * 6}",) for n in range(2_000)])
+    conn.commit()
+    conn.close()
+    pid = share(container, SqliteProfile(id="00000000-0000-0000-0000-000000000003", engine="sqlite", name="zz_08 cjk",
+                                         path=str(path)))
+    with serving(container) as port:
+        error, data = call_tool(port, "run_query", {"connection": pid, "sql": "SELECT id, body FROM notes",
+                                                     "max_rows": 1000})
+    text = json.dumps(data, ensure_ascii=False, separators=(",", ":"))  # the server's own text (`compact`)
+    assert not error and _bytes(data) <= 40_000 and len(text) < 40_000 // 2  # bytes, not characters
+    assert data["more_rows"] and data["truncated"]["rows_dropped_for_size"] >= 1 and 0 < data["row_count"] < 1000
+    assert list(data)[:5] == ["row_count", "more_rows", "truncated", "notes", "elapsed_ms"]
+    assert max(_first(text, "row_count", "more_rows", "truncated", "notes")) < min(_first(text, "columns", "rows"))
+    assert data["notes"] == ["The response is limited to about 40,000 bytes: select fewer columns, lower "
+                             "max_cell_chars or narrow the query"]
+
+
+def test_explain_and_sample_fields_put_their_notes_before_the_plan_and_the_paths():
+    """Final review I4: the notes (a plan cut, paths left out) come before what they are about."""
+    from datetime import UTC, datetime
+
+    from dbaguy_backend.agent.queries import _sample_result
+    from dbaguy_backend.domain.couchbase import FieldPath, FieldSample, Keyspace, SampleLimits
+
+    paths = [FieldPath(path=[f"字段_{n}"], display=f"`字段_{n}_{_CJK}`", types={"string": 1}, docs=1, percent=100.0)
+             for n in range(2_000)]
+    sample = FieldSample(keyspace=Keyspace(bucket="b", scope="s", collection="c"), sampled_at=datetime.now(UTC),
+                         requested=1, documents=1, cut_at_bytes=False, paths_capped=False, long_keys_skipped=False,
+                         depth_capped=False, elapsed_ms=1, fields=paths,
+                         limits=SampleLimits(max_bytes=1, max_paths=1, max_depth=1, max_key_chars=1))
+    answer = _sample_result(sample)
+    text = json.dumps(answer, ensure_ascii=False, separators=(",", ":"))
+    assert _bytes(answer) <= 40_000 and answer["notes"] and list(answer)[-1] == "fields"
+    assert text.index('"notes":') < text.index('"fields":')
+
+
+def test_a_deleted_profile_is_gone_before_its_agent_sessions_close(container, lite, monkeypatch):
+    """T8 re-review (delete order): the profile is deleted first, then what was learned from it is dropped, so a call
+    that wakes in between finds no profile (`unknown_connection`) instead of opening a session on one about to go."""
+    pid = _lite(container, lite)
+    order: list[str] = []
+    delete, close = container.profiles.delete, container.agent_sessions.close
+    monkeypatch.setattr(container.profiles, "delete", lambda profile_id: (order.append("delete"), delete(profile_id)))
+    monkeypatch.setattr(container.agent_sessions, "close",
+                        lambda profile_id=None: (order.append("close agents"), close(profile_id)))
+    with TestClient(create_app(container.settings, container), base_url="http://127.0.0.1") as client:
+        assert client.delete(f"/profiles/{pid}", headers=AUTH).status_code == 204
+    assert order == ["delete", "close agents"]

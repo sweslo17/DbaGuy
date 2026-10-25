@@ -35,10 +35,15 @@ class LoginRegistry:
         self._changes: dict[UUID, int] = {}  # how many times each profile was forgotten: a read in flight checks it
         self._lock = threading.Lock()
 
-    def known(self, profile_id: UUID) -> bool:
-        """Whether it was read (None too: the engine has nothing to tell); an agent's call reads it only if not."""
+    def due(self, profile_id: UUID) -> bool:
+        """Whether a read would run now: not read yet (None counts as read: the engine has nothing to tell), and no
+        query of it failed within RETRY_AFTER_S. An agent's call starts a login read only then (T6 re-review 2 N-3: it
+        started a thread on every call that `remember` ended at once)."""
         with self._lock:
-            return profile_id in self._known
+            if profile_id in self._known:
+                return False
+            failed = self._failed_at.get(profile_id)
+            return failed is None or self._clock() - failed >= RETRY_AFTER_S
 
     def peek(self, profile_id: UUID) -> LoginPrivileges | None:
         """What is known, without connecting: None until a connection has read it."""

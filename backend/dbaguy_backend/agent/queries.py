@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from ..adapters.base import CONNECTION_LOST, StatementError
 from ..adapters.couchbase.explain import analyze
+from ..adapters.mysql.read_only import READ_ONLY_STATE_UNREADABLE
 from ..domain.couchbase import FieldSample, Keyspace
 from ..domain.data_jobs import ENGINE_NAMES
 from ..domain.errors import ProfileNotFound, QueryFailed
@@ -30,7 +31,7 @@ from ..services.history_service import HistoryService
 from ..services.settings_service import SettingsService
 from ..sql.dialects import Dialect
 from .reader import CONNECTION_CLOSED, AgentReader, CallControl, ReadOutcome, ReadRequest
-from .shape import ERROR_CHARS, MAX_CELL_DEFAULT, MAX_ROWS, MAX_ROWS_DEFAULT, RESPONSE_CHARS, compact, note
+from .shape import ERROR_CHARS, MAX_CELL_DEFAULT, MAX_ROWS, MAX_ROWS_DEFAULT, RESPONSE_BYTES, note, size
 from .tools import AgentTools, Shared, ToolFailure, answered, checked_database, elapsed_ms
 
 TIMEOUT_DEFAULT_S, TIMEOUT_MAX_S, TIMEOUT_RED_S = 30, 60, 30  # CR-08-8: red connections: 30 at most
@@ -38,8 +39,8 @@ SQL_MAX = 20_000  # CR-08-3: also a History record's longest text
 SAMPLE_MAX = 1_000
 EXPLAIN_CELL_CHARS = 30_000  # one plan cell; the rest of the response is its keys and notes
 MORE_ROWS = "More rows exist: raise max_rows (at most 1000) or narrow the query"
-TOO_BIG = ("The response is limited to about 40,000 characters: select fewer columns, lower max_cell_chars or narrow "
-           "the query")
+TOO_BIG = (f"The response is limited to about {RESPONSE_BYTES:,} bytes: select fewer columns, lower max_cell_chars or "
+           "narrow the query")
 READ_CAPPED = ("Stopped after reading about 64 Mi characters of values: select fewer or smaller columns, or narrow the "
                "query")
 PLAN_CUT = "The plan is longer than the response holds: it is cut"
@@ -54,6 +55,10 @@ _BAD_CONTEXT = "query_context is `bucket` or `bucket.scope`: {}"
 _LONG_CONTEXT = "a bucket's name is at most 100 characters, a scope's 251"
 _BAD_KEYSPACE = "Couchbase names a bucket in at most 100 characters, a scope and a collection in at most 251"
 _SHOWPLAN = "-- SHOWPLAN_TEXT (the statement was not run)\n"
+# T7 re-review: MySQL's look could not tell whether the session was still READ ONLY: the reader closed the agent's
+# session without sending the statement (the user's tab says "reconnect"; an agent's next call opens a new one)
+_UNREADABLE = ("DbaGuy could not read whether the connection was still read-only, so it closed it without running the "
+               "statement: try again (the next call opens a new connection)")
 # The reader's codes for a session that closed or lost its server under the call (Task 6 carry): not the server's error
 _CONNECTION_GONE = frozenset({CONNECTION_LOST, CONNECTION_CLOSED})
 # Engines whose agent session has no database of the agent's choosing (AgentSessions.key): SQLite has one; Couchbase's
@@ -95,11 +100,13 @@ class QueryTools:
             notes.append(TOO_BIG)
         elif outcome.more_rows:
             notes.append(MORE_ROWS)
+        truncated = {key: n for key, n in (("rows_dropped_for_size", outcome.rows_dropped),
+                                             ("columns_dropped", outcome.columns_dropped)) if n}
+        # final review I4: what says the answer is partial comes before the rows, so a client that cuts it keeps that
         return {
-            "columns": outcome.columns, "rows": outcome.rows, "row_count": len(outcome.rows),
-            "more_rows": outcome.more_rows,
-            "truncated": {"rows_dropped_for_size": outcome.rows_dropped} if outcome.rows_dropped else None,
-            "elapsed_ms": outcome.elapsed_ms, "notes": notes + outcome.notes,
+            "row_count": len(outcome.rows), "more_rows": outcome.more_rows, "truncated": truncated or None,
+            "notes": notes + outcome.notes, "elapsed_ms": outcome.elapsed_ms, "columns": outcome.columns,
+            "rows": outcome.rows,
         }
 
     def explain(self, connection: str, sql: str, database: str | None = None, query_context: str | None = None,
@@ -115,11 +122,11 @@ class QueryTools:
         request = replace(request, explain=True, max_rows=MAX_ROWS, max_cell_chars=EXPLAIN_CELL_CHARS)
         outcome = self._read("explain", shared, request, recorded, client, control)
         plan, cut = _plan_text(dialect, outcome)
-        result: dict[str, Any] = {"plan": plan, "elapsed_ms": outcome.elapsed_ms, "notes": notes + outcome.notes}
+        result: dict[str, Any] = {"notes": notes + outcome.notes + ([PLAN_CUT] if cut else []),
+                                  "elapsed_ms": outcome.elapsed_ms}  # final review I4: the notes before the plan
         if shared.adapter.capabilities.plan_format == "couchbase":
             result["findings"] = [] if cut else _findings(outcome)
-        if cut:
-            result["notes"].append(PLAN_CUT)
+        result["plan"] = plan
         return result
 
     def _request(self, shared: Shared, tool: str, sql: str, recorded: str, database: str | None,
@@ -148,7 +155,8 @@ class QueryTools:
             timeout = float(limit)
         return ReadRequest(profile=profile, dialect=dialect, sql=sql, query_context=context, timeout_s=timeout,
                            database=None if profile.engine in _NO_DATABASE else database,
-                           admit=lambda: self._tools.shared(str(profile.id), tool, "query")), notes
+                           admit=lambda: self._tools.shared(str(profile.id), tool, "query"),
+                           stops=self._reader.stops()), notes
 
     @staticmethod
     def _context(shared: Shared, text: str | None) -> QueryContext | None:
@@ -252,6 +260,8 @@ class QueryTools:
             return failed("session_changed", message)
         if code in _CONNECTION_GONE:
             return failed("connection_failed", message)
+        if code == READ_ONLY_STATE_UNREADABLE:
+            return failed("connection_failed", _UNREADABLE)
         if code in SERVER_READ_ONLY.get(shared.adapter.dialect, ()):
             message += _READ_ONLY_NOTE
         return failed("query_failed", f"{message} ({code})" if code else message)
@@ -296,7 +306,7 @@ class QueryTools:
         except ValidationError:
             raise ToolFailure("invalid_argument", _BAD_KEYSPACE) from None
         summary = f"-- MCP sample_fields {'.'.join((bucket, scope, collection))}"
-        with self._recorded(profile, summary, None, started, clock, client):
+        with self._recorded(profile, summary, None, started, clock, client), self._tools.agent_call():
             with answered(profile), self._still_shared(shared, "sample_fields"):
                 sample = self._samples.cached(profile.id, keyspace) if size is None else None
                 if sample is None:
@@ -321,22 +331,24 @@ class QueryTools:
 
 def _sample_result(sample: FieldSample) -> dict[str, Any]:
     """The sample's paths (SQL++'s way of writing each, its JSON kinds, how many documents have it) while the response
-    has room, then a note saying how many were left out."""
+    has room (bytes), and, before them (final review I4), a note saying how many were left out."""
     result: dict[str, Any] = {
         "keyspace": ".".join((sample.keyspace.bucket, sample.keyspace.scope, sample.keyspace.collection)),
-        "sampled_at": sample.sampled_at.isoformat(), "documents": sample.documents, "fields": [],
+        "sampled_at": sample.sampled_at.isoformat(), "documents": sample.documents,
         "paths_capped": sample.paths_capped, "depth_capped": sample.depth_capped,
         "long_keys_skipped": sample.long_keys_skipped, "cut_at_bytes": sample.cut_at_bytes,
     }
-    room = RESPONSE_CHARS - len(compact(result)) - 200
+    fields: list[dict[str, Any]] = []
+    room = RESPONSE_BYTES - size({**result, "fields": []}) - 200  # 200: the note
     for path in sample.fields:
         entry = {"path": path.display, "types": path.types, "docs": path.docs}
-        size = len(compact(entry)) + 1
-        if size > room:
-            result["notes"] = [f"{len(sample.fields) - len(result['fields'])} more paths left out (response size)"]
+        taken = size(entry) + 1
+        if taken > room:
+            result["notes"] = [f"{len(sample.fields) - len(fields)} more paths left out (response size)"]
             break
-        result["fields"].append(entry)
-        room -= size
+        fields.append(entry)
+        room -= taken
+    result["fields"] = fields
     return result
 
 

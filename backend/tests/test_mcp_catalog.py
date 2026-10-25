@@ -405,12 +405,12 @@ def wide_file(tmp_path):
     return path
 
 
-def _size(result: dict) -> int:
-    return len(json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str))
+def _size(result: dict) -> int:  # UTF-8 bytes (final review I4)
+    return len(json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str).encode())
 
 
 def test_the_schema_tools_stay_inside_the_response_budget(container, wide_file):
-    """M-1: about 40,000 characters, as the query tools: past it, items are left out and `truncated` says so."""
+    """M-1: about 40,000 bytes, as the query tools: past it, items are left out and `truncated` says so."""
     pid = share(container, SqliteProfile(id="00000000-0000-0000-0000-000000000007", engine="sqlite", name="wide",
                                          path=str(wide_file)), access="schema")
     tools = container.agent_tools
@@ -478,3 +478,44 @@ def test_a_column_path_never_borrows_the_keys_of_a_table_with_its_name(container
     described = tools.describe(pid, column)
     assert described["kind"] == "column" and described["primary_key"] == [] and described["foreign_keys"] == []
     assert tools.describe(pid, name="parent")["foreign_keys"][0]["references"] == "main.grand"  # the table's own
+
+
+def test_the_schema_tools_count_bytes_and_say_what_is_left_out_first(container, tmp_path):
+    """Final review I4: Chinese names take three bytes a character, and `truncated` and the notes come before the
+    objects and columns (T2 re-review 3: the notes are inside the budget)."""
+    path = tmp_path / "zz_08_ff_cjk.db"
+    conn = sqlite3.connect(path)
+    for n in range(600):
+        conn.execute(f'CREATE TABLE "客戶訂單資料表_很長的名字_{n:04}" (id INTEGER PRIMARY KEY)')
+    conn.execute("CREATE TABLE 寬表 (" + ", ".join(f"欄位_很長的中文欄位名稱_{n:04} TEXT" for n in range(1_500)) + ")")
+    conn.close()
+    pid = share(container, SqliteProfile(id="00000000-0000-0000-0000-000000000008", engine="sqlite", name="cjk",
+                                         path=str(path)), access="schema")
+    tools = container.agent_tools
+    tables = [PathSegment(kind="schema", name="main"), PathSegment(kind="folder", name="tables")]
+    listed = tools.list_objects(pid, tables, limit=1000)
+    described = tools.describe(pid, name="寬表", include_ddl=True)
+    for answer, last in ((listed, "objects"), (described, "ddl")):
+        text = json.dumps(answer, ensure_ascii=False, separators=(",", ":"))
+        assert _size(answer) <= 40_000 and answer["truncated"] and answer["notes"]
+        assert list(answer)[:2] == ["truncated", "notes"] and list(answer)[-1] == last
+        assert text.index('"notes":') < text.index(f'"{last}":')
+    assert "under 40,000 bytes" in listed["notes"][0]
+
+
+def test_a_snapshot_failure_note_is_cut_and_inside_the_budget(container, wide_file, monkeypatch):
+    """T2 re-review 3: the note that keys and foreign keys could not be read quotes the server's text, cut at 500
+    characters, and every note is inside the response budget."""
+    from dbaguy_backend.domain.errors import QueryFailed
+
+    pid = share(container, SqliteProfile(id="00000000-0000-0000-0000-000000000007", engine="sqlite", name="wide",
+                                         path=str(wide_file)), access="schema")
+
+    def failing(*_args, **_kwargs):
+        raise QueryFailed("鍵" * 100_000)
+
+    monkeypatch.setattr(container.schema_cache, "get", failing)
+    wide = container.agent_tools.describe(pid, path=[PathSegment(kind="schema", name="main"),
+                                                     PathSegment(kind="table", name="wide")], include_ddl=True)
+    snapshot_note = next(n for n in wide["notes"] if n.startswith("Keys and foreign keys could not be read"))
+    assert len(snapshot_note) < 600 and _size(wide) <= 40_000 and wide["truncated"]

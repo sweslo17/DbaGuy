@@ -595,3 +595,128 @@ def test_couchbase_refuses_writes_with_readonly(container, no_gate):
     assert (written.status, written.error_code) == ("error", "1000")
     found = couchbase_query('SELECT RAW COUNT(*) FROM dbaguy.app.orders USE KEYS "zz_08_x"')["results"]
     assert found == [0]
+
+
+# ---- the final review's fix wave: M2, T6 re-review 2 (N-1, N-3, observations 1 and 2) ----
+
+def test_a_cancel_that_came_before_the_lock_opens_nothing(container, lite, monkeypatch):
+    """Final review M2: `cancelled` is looked at again once the slot's lock is taken, before anything opens."""
+    pid = share(container, _lite_profile(lite))
+    opened = []
+    monkeypatch.setattr(container.sessions, "create_agent", lambda *a, **k: opened.append(a))
+    control = CallControl()
+    control.cancel()
+    outcome = container.agent_reader.read(ReadRequest(profile=container.profiles.get(UUID(pid)),
+                                                      dialect=Dialect.SQLITE, sql="SELECT 1"), control)
+    assert outcome.status == "cancelled" and not opened
+
+
+def test_a_call_queued_when_the_server_stopped_opens_no_session(container, lite):
+    """Final review M2: a call that waited for a slot whose session the stop closed takes the key's new slot, and the
+    profile is still shared; it opens nothing (the agents' closed epoch, read as the call began)."""
+    pid = share(container, _lite_profile(lite))
+    profile = container.profiles.get(UUID(pid))
+    outcomes: list = []
+    with container.agent_sessions.lease(profile, None, time.monotonic() + 5):  # the first call holds the slot
+        waiter = threading.Thread(target=lambda: outcomes.append(_read(container, pid, "SELECT 1", Dialect.SQLITE,
+                                                                       timeout_s=5)))
+        waiter.start()
+        time.sleep(0.3)  # it waits for the slot's lock
+        container.agent_sessions.close()  # the MCP server stopped
+    waiter.join(10)
+    assert [o.status for o in outcomes] == ["cancelled"] and not outcomes[0].rows
+    assert not _agent_workers(container) and not container.agent_sessions._slots
+
+
+def test_an_open_that_ends_as_its_wait_times_out_is_taken_not_orphaned(container, lite, monkeypatch):
+    """T6 re-review 2 N-1: the open lands between the wait's timeout and `done()`: the session is the call's (or the
+    slot's), never a session no slot knows of."""
+    from concurrent.futures import Future
+
+    pid = share(container, _lite_profile(lite))
+    sessions = container.agent_sessions
+    real_open = sessions._open
+
+    class Racy(Future):
+        def __init__(self, inner):
+            super().__init__()
+            self._inner = inner
+
+        def result(self, timeout=None):
+            if timeout is not None and not self.done():
+                self.set_result(self._inner.result(5))  # the open lands just as this wait times out
+                raise TimeoutError
+            return super().result(timeout)
+
+    monkeypatch.setattr(sessions, "_open", lambda slot, profile_id, database: Racy(real_open(slot, profile_id,
+                                                                                               database)))
+    outcome = _read(container, pid, "SELECT 1", Dialect.SQLITE, timeout_s=2)
+    held = {slot.session_id for slot in sessions._slots.values()} | {
+        slot.opening.result().session_id for slot in sessions._slots.values() if slot.opening is not None}
+    registered = {sid for sid, entry in container.sessions._sessions.items() if entry.agent}
+    assert outcome.status in ("ok", "timeout") and registered <= held
+
+
+@requires_pg
+def test_waiting_for_an_open_hears_the_clients_cancel(container):
+    """T6 re-review 2 observation 2: a cancel while the session opens ends the call within TICK_S, not at the
+    deadline (it came back `timeout` at the deadline)."""
+    with _stalled_server() as port:
+        pid = share(container, make_pg_profile(name="zz_08 stalled", port=port))
+        control = CallControl()
+        threading.Timer(0.3, control.cancel).start()
+        started = time.monotonic()
+        outcome = container.agent_reader.read(ReadRequest(profile=container.profiles.get(UUID(pid)),
+                                                          dialect=Dialect.POSTGRES, sql="SELECT 1", timeout_s=3),
+                                              control)
+        took = time.monotonic() - started
+    assert outcome.status == "cancelled" and took < scaled(0.9), f"{took:.2f} s"
+
+
+@requires_pg
+def test_an_opening_that_takes_the_rest_of_the_deadline_sends_no_statement(container, monkeypatch):
+    """T6 re-review 2 observation 1: the frame's opening answered after the deadline: the statement is not sent (it
+    was, then cancelled at once, which on a slow server cost seconds and a connection); the frame's end rolls back."""
+    pid = share(container, make_pg_profile(name="zz_08 pg"))
+    _read(container, pid, "SELECT 1", Dialect.POSTGRES)  # the session is open
+    begin, sent = reader_module._begin, []
+
+    def slow_begin(assumed, statements, connection):
+        found = begin(assumed, statements, connection)
+        time.sleep(0.08)  # the opening answers within its least time (_LEAST_S), past the call's deadline
+        return found
+
+    monkeypatch.setattr(reader_module, "_begin", slow_begin)
+    submit = reader_module.AgentReader._submit
+    monkeypatch.setattr(reader_module.AgentReader, "_submit", staticmethod(
+        lambda lease, command, outcome: (sent.append(type(command).__name__), submit(lease, command, outcome))[1]))
+    # the session's lock and opening took all but a few milliseconds of the call
+    outcome = _read(container, pid, "SELECT 1", Dialect.POSTGRES, timeout_s=0.5, admit=lambda: time.sleep(0.47))
+    assert outcome.status == "timeout" and not outcome.rows and not sent and not outcome.reset
+    assert len(_agent_workers(container)) == 1 and not _agent_workers(container)[0].connection.in_transaction()
+
+
+def test_a_failed_login_query_starts_no_thread_per_call(container, lite, monkeypatch):
+    """T6 re-review 2 N-3: after a login query failed, no call starts a login thread until it is due again."""
+    from dbaguy_backend.agent import sessions as sessions_module
+    from dbaguy_backend.domain.errors import QueryFailed
+
+    pid = share(container, _lite_profile(lite))
+    profile = container.profiles.get(UUID(pid))
+
+    def failing():
+        raise QueryFailed("permission denied")
+
+    container.agent_login.remember(profile, failing)  # failed: not tried again for a minute
+    started = []
+    real = sessions_module.threading.Thread
+
+    def counting(*args, **kwargs):
+        if str(kwargs.get("name", "")).startswith("mcp-login-"):
+            started.append(kwargs["name"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(sessions_module.threading, "Thread", counting)
+    for _ in range(3):
+        container.agent_sessions.read_login(profile)
+    assert started == []

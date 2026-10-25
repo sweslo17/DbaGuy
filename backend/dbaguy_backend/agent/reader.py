@@ -19,6 +19,7 @@ from loguru import logger
 from pydantic import BaseModel
 
 from ..adapters.base import DatabaseConnection, RunOptions, StatementCancelled
+from ..domain.agent import ToolFailure
 from ..domain.data_jobs import ENGINE_NAMES
 from ..domain.errors import DomainError
 from ..domain.execution import (
@@ -29,8 +30,7 @@ from ..domain.profiles import AnyProfile, Engine
 from ..sessions.worker import CLOSED_BEFORE_START
 from ..sql.dialects import SERVER_TIMEOUT_MARGIN_S, Dialect, SessionAssumption, explain_head, quote_literal, read_frame
 from .sessions import TICK_S, AgentSessions, Lease, WaitCancelled
-from .tools import ToolFailure
-from .shape import FIRST_PAGE, MAX_CELL_DEFAULT, MAX_ROWS_DEFAULT, NOTES_MAX, ResultBudget, compact, note
+from .shape import FIRST_PAGE, MAX_CELL_DEFAULT, MAX_ROWS_DEFAULT, NOTES_MAX, ResultBudget, note, size
 
 FORCE_AFTER_S = 1.5  # after a timeout's cancel, a second (SQL Server's that ends a statement stuck in a transaction)
 CANCEL_GRACE_S = 10.0  # then the statement has this long to stop before its session is closed
@@ -66,6 +66,7 @@ class ReadRequest:
     # Called once the call holds its session's lock, before anything opens or is sent: raises when the call may no
     # longer read (the profile changed while it waited, review I1)
     admit: Callable[[], object] | None = None
+    stops: int | None = None  # AgentSessions.stops() as the tool call began (final review M2); None: when read begins
 
 
 @dataclass
@@ -187,6 +188,10 @@ class AgentReader:
         self._sessions = sessions
         self._clock = clock
 
+    def stops(self) -> int:
+        """How many times the MCP server stopped (`AgentSessions.stops`): a tool call reads it as it begins."""
+        return self._sessions.stops()
+
     def read(self, request: ReadRequest, control: CallControl | None = None) -> ReadOutcome:
         """The statement's first result (every result for an explain), within its limits. A password the profile
         lacks, a session that cannot open, a busy session, a session refused for a setting: DomainError / ToolFailure
@@ -198,12 +203,12 @@ class AgentReader:
         reached = False  # the server answered: a session opened (only then is the login worth reading)
         try:
             with self._sessions.lease(request.profile, request.database, deadline, admit=request.admit,
-                                      cancelled=lambda: control.cancelled) as lease:
+                                      cancelled=lambda: control.cancelled, stops=request.stops) as lease:
                 reached = True
                 self._framed(lease, request, deadline, control, outcome)
         except TimeoutError:  # still opening at the deadline: the open stays in its slot for the next call (R-3)
             outcome.status, outcome.error_message = "timeout", _OPEN_LATE
-        except WaitCancelled:  # the client gave up while the call waited for its session (review I2): nothing sent
+        except WaitCancelled:  # the client gave up, or the MCP server stopped, while the call waited (review I2, M2)
             outcome.status = "cancelled"
         outcome.elapsed_ms = int((self._clock() - started) * 1000)
         if reached:
@@ -243,12 +248,18 @@ class AgentReader:
                     return
                 if found is not None and frame.assumes is not None:
                     self._refuse(lease, request.profile, frame.assumes, found)
-            try:
-                if not self._statement(lease, events, request, deadline, control, outcome):
-                    return  # the session was closed under it
-            except BaseException:  # review M-1: whatever broke, never a transaction or paused result left behind
-                self._reset(lease, outcome)
-                raise
+            if self._clock() >= deadline:
+                # T6 re-review 2 observation 1: the opening answered past the deadline (it gets at least _LEAST_S): the
+                # statement is not sent only to be cancelled at once (a slow server's cancel cost seconds and a
+                # connection); the frame's end below rolls back what the opening began
+                outcome.status = "timeout"
+            else:
+                try:
+                    if not self._statement(lease, events, request, deadline, control, outcome):
+                        return  # the session was closed under it
+                except BaseException:  # review M-1: whatever broke, never a transaction or paused result left behind
+                    self._reset(lease, outcome)
+                    raise
         finally:
             worker.clear_emitter(events)
         if not (closing or frame.rolls_back or frame.end):
@@ -310,7 +321,7 @@ class AgentReader:
                             outcome.columns = [{"name": c.name, "type": c.type_name or None} for c in event.columns]
                             budget = ResultBudget(outcome.columns, request.max_rows, request.max_cell_chars)
                             outcome.columns, outcome.columns_dropped = budget.columns, budget.columns_dropped
-                            budget.spend(sum(len(compact(text)) + 1 for text in outcome.notes))
+                            budget.spend(sum(size(text) + 1 for text in outcome.notes))
                     case RowsEvent():
                         awaiting = False
                         if budget is not None and (event.index == 0 or request.explain):
@@ -336,7 +347,7 @@ class AgentReader:
                             text = note(event.text)
                             outcome.notes.append(text)
                             if budget is not None:
-                                budget.spend(len(compact(text)) + 1)
+                                budget.spend(size(text) + 1)
                     case ErrorEvent():
                         awaiting = False
                         outcome.failed(event.code, event.message)
@@ -382,8 +393,10 @@ class AgentReader:
 
     @staticmethod
     def _refuse(lease: Lease, profile: AnyProfile, assumed: SessionAssumption, found: str) -> None:
-        """Pre-flight M1, review M-2: the lexer would read this session's statements unlike the server. Nothing was
-        sent; the session is closed and the call refused (the next one opens a new session and checks it again)."""
+        """Pre-flight M1, review M-2: the lexer would read this session's statements unlike the server. The statement
+        was not sent (the frame's opening may have been: re-review R-1 checks again after it); the session is closed,
+        which ends whatever the opening began, and the call refused (the next one opens a new session and checks it
+        again)."""
         logger.warning("MCP: refused a read on {}: {} is {}", profile.id, assumed.setting, found)
         lease.drop()
         raise ToolFailure("refused", _ASSUMED.format(engine=ENGINE_NAMES[Engine(profile.engine)],

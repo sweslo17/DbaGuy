@@ -9,6 +9,7 @@ from urllib.parse import quote, unquote, urlparse
 
 from loguru import logger
 
+from ...domain.agent import READ_RAW_CHARS
 from ...domain.data_jobs import DumpObjectKinds, DumpScope
 from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, ValidationFailed
@@ -57,6 +58,12 @@ _AGENT_PRAGMAS = frozenset({
 })
 _AGENT_ACTIONS = frozenset({sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_RECURSIVE})
 _AGENT_DENIED_FUNCTIONS = frozenset({"load_extension", "fts3_tokenizer"})
+# Final review I3: SQLite runs inside the sidecar, and `randomblob(4e8)`, `zeroblob`, `printf('%.*c', …)` or a
+# group_concat over a recursive CTE built a value of up to 1 GB (SQLITE_MAX_LENGTH) per statement, which no result bound
+# sees (the result is one small row). An agent's connection caps every string, blob and row the engine builds or reads
+# at READ_RAW_CHARS (bytes here): past it, SQLITE_TOOBIG before anything is allocated. A stored value over 64 MiB is
+# refused too, where a read of it would stop after that one row anyway.
+_AGENT_LENGTH = READ_RAW_CHARS
 
 
 def _agent_authorizer(action: int, arg1: str | None, arg2: str | None, database: str | None,
@@ -366,6 +373,7 @@ class SqliteAdapter(DatabaseAdapter):
             conn.execute("SELECT count(*) FROM sqlite_master").fetchone()  # fails for non-database files
             if agent:
                 conn.execute("PRAGMA query_only = ON")
+                conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, _AGENT_LENGTH)
                 conn.set_authorizer(_agent_authorizer)  # last: nothing after it may change a setting
         except sqlite3.Error as exc:
             if conn is not None:

@@ -8,7 +8,7 @@ from uuid import UUID
 
 from ..adapters.base import StatementError
 from ..adapters.registry import AdapterRegistry
-from ..agent.shape import PAGE_RAW_CHARS
+from ..domain.agent import PAGE_RAW_CHARS
 from ..domain.classification import Classification, GuardReason, StatementKind
 from ..domain.data_jobs import BE_DUMPED, RUN_SQL_FILES, JobCommand, cannot
 from ..domain.edits import PLAN_EXPIRED, PLAN_EXPIRED_MESSAGE, EditPlan, PlanUnavailable

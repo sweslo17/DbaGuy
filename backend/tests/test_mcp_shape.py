@@ -1,6 +1,6 @@
 """What an MCP result may hold and how big its next page is (spec ⑧ §3.6, CR-08-7). Pure."""
 
-from dbaguy_backend.agent.shape import PAGE_ROWS_MAX, RESPONSE_CHARS, ResultBudget, cap_cell, compact, note
+from dbaguy_backend.agent.shape import PAGE_ROWS_MAX, RESPONSE_BYTES, ResultBudget, cap_cell, compact, note
 
 COLUMNS = [{"name": "v", "type": "text"}]
 
@@ -25,7 +25,7 @@ def test_rows_are_kept_while_they_fit_and_one_that_does_not_ends_the_result():
     budget.take([row] * 100)
     kept = len(budget.rows)
     assert 30 < kept < 40 and budget.dropped == 100 - kept and budget.full
-    assert len(compact({"columns": COLUMNS, "rows": budget.rows})) < RESPONSE_CHARS
+    assert len(compact({"columns": COLUMNS, "rows": budget.rows}).encode()) < RESPONSE_BYTES
 
 
 def test_max_rows_ends_it_too():
@@ -62,3 +62,32 @@ def test_a_few_huge_values_end_the_reading():
     huge = {"$type": "text", "preview": "x" * 65536, "size": 100_000_000, "truncated": True}
     budget.take([[huge]])
     assert budget.read_capped and budget.full and len(budget.rows) == 1  # one 100 MB value: that row alone
+
+
+def test_sessions_and_adapters_never_import_the_mcp_layer():
+    """Final review M7 (spec §3.1): `agent/` builds on `sessions/`, `adapters/` and `domain/`, never the other way."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "dbaguy_backend"
+    importing = re.compile(r"^\s*(from\s+\.+agent\b|from\s+dbaguy_backend\.agent\b|import\s+dbaguy_backend\.agent\b)",
+                           re.MULTILINE)
+    offenders = [str(path.relative_to(root)) for folder in ("sessions", "adapters", "services", "domain", "sql")
+                 for path in (root / folder).rglob("*.py") if importing.search(path.read_text())]
+    assert offenders == []
+
+
+def test_a_later_wider_result_keeps_its_cells_when_no_column_was_dropped():
+    """T8 re-review 1: rows are cut to the kept columns only when columns were left out (an explain reads every result
+    set, and a later one may be wider than the first)."""
+    budget = ResultBudget([{"name": "a", "type": None}], 10, 1_000)
+    budget.take([["x", "y", "z"]])
+    assert budget.rows == [["x", "y", "z"]] and budget.columns_dropped == 0
+
+
+def test_the_budget_counts_bytes_not_characters():
+    """Final review I4: a Chinese cell takes three bytes a character, and the rows kept stop at the bytes."""
+    budget = ResultBudget([{"name": "note", "type": "text"}], 1_000, 1_000)
+    budget.take([["資料庫" * 100] for _ in range(1_000)])  # 300 characters, 900 bytes each
+    taken = len(compact(budget.rows).encode())
+    assert budget.dropped and RESPONSE_BYTES - 2_000 < taken < RESPONSE_BYTES and len(compact(budget.rows)) < 14_000
