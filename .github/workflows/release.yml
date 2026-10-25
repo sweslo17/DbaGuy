@@ -1,8 +1,13 @@
-# Builds DbaGuy.app on an Apple Silicon runner, checks the bundled sidecar, and packages the drag-to-install .dmg.
-# A pushed tag vX.Y.Z (equal to the version in src-tauri/tauri.conf.json) attaches the .dmg and its SHA-256 to that
-# tag's GitHub release, creating the release with .github/release-notes.md when it does not exist yet (a release made
-# by hand first keeps its own notes). A manual run (Actions › Release › Run workflow) only builds and keeps the .dmg as
-# a workflow artifact for a week. The app is signed ad hoc, not notarized: the notes say how to open it.
+# Releases, in two channels:
+#   stable  vX.Y.Z          a commit on main (merged and fully verified); the GitHub release is marked Latest
+#   beta    vX.Y.Z-beta.N   any branch (a sub-project's newest features, not merged yet); a GitHub pre-release
+# X.Y.Z is the version in src-tauri/tauri.conf.json: on a branch, the version it will ship as. A stable tag on a commit
+# that is not on main fails before anything is built.
+# The job builds DbaGuy.app on an Apple Silicon runner, checks the bundled sidecar, packages the drag-to-install .dmg
+# (named after the tag) and attaches it with its SHA-256 to the tag's release, creating the release when it does not
+# exist yet (.github/release-notes.md, with .github/release-notes-beta.md on top for a beta); a release made by hand
+# first keeps its notes. A manual run (Actions › Release › Run workflow) only builds and keeps the .dmg as a workflow
+# artifact for a week. The app is signed ad hoc, not notarized: the notes say how to open it.
 name: Release
 
 on:
@@ -25,6 +30,8 @@ jobs:
       POETRY_VERSION: "2.1.3"
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the stable channel's check reads main's history
 
       # check-latest: the runner's cached Node 24 can lag behind a security release (it had 24.20.0 after the 24.22.1
       # fixes of 2026-10-21); this resolves the newest 24.x on every run
@@ -34,14 +41,28 @@ jobs:
           check-latest: true
           cache: npm
 
-      - name: The tag is the app's version
+      - name: The tag's channel
+        id: tag
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
-          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "::error::tag $GITHUB_REF_NAME is not v$version, the version in src-tauri/tauri.conf.json"
+          tag="$GITHUB_REF_NAME"
+          beta="${tag#"v$version-beta."}"
+          if [[ "$tag" == "v$version" ]]; then
+            if ! git merge-base --is-ancestor HEAD origin/main; then
+              echo "::error::$tag is a stable tag, but its commit is not on main: merge first, or tag a beta (v$version-beta.N)"
+              exit 1
+            fi
+            channel=stable
+          elif [[ "$beta" != "$tag" && "$beta" =~ ^[0-9]+$ ]]; then
+            channel=beta
+          else
+            echo "::error::$tag is neither v$version (stable, on main) nor v$version-beta.N (beta): $version is src-tauri/tauri.conf.json's version"
             exit 1
           fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "label=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "$tag: the $channel channel, app version $version"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -74,8 +95,10 @@ jobs:
 
       - name: Package the .dmg
         id: dmg
+        env:
+          LABEL: ${{ steps.tag.outputs.label }}
         run: |
-          path="$(bash scripts/package-dmg.sh | tail -n 1)"
+          path="$(bash scripts/package-dmg.sh "" "" "$LABEL" | tail -n 1)"
           echo "path=$path" >> "$GITHUB_OUTPUT"
 
       - name: Keep the .dmg (manual run)
@@ -92,11 +115,21 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ steps.tag.outputs.channel }}
+          LABEL: ${{ steps.tag.outputs.label }}
+          DMG: ${{ steps.dmg.outputs.path }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" --verify-tag --title "DbaGuy $version" \
-              --notes-file .github/release-notes.md
+          tag="$GITHUB_REF_NAME"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            if [[ "$CHANNEL" == beta ]]; then
+              cat .github/release-notes-beta.md .github/release-notes.md > "$RUNNER_TEMP/notes.md"
+              gh release create "$tag" --verify-tag --prerelease --title "DbaGuy $LABEL" --notes-file "$RUNNER_TEMP/notes.md"
+            else
+              gh release create "$tag" --verify-tag --latest --title "DbaGuy $LABEL" --notes-file .github/release-notes.md
+            fi
+          elif [[ "$CHANNEL" == beta ]]; then
+            gh release edit "$tag" --prerelease  # a release made by hand keeps its notes, in its channel
+          else
+            gh release edit "$tag" --prerelease=false
           fi
-          gh release upload "$GITHUB_REF_NAME" "${{ steps.dmg.outputs.path }}" \
-            "${{ steps.dmg.outputs.path }}.sha256" --clobber
+          gh release upload "$tag" "$DMG" "$DMG.sha256" --clobber
