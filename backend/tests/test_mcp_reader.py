@@ -2,16 +2,21 @@
 memory bound, and what each server refuses with the gate taken away (`no_gate`: the worker's backstop allows anything,
 as a gate bug would). Scratch objects are zz_08_*, dropped by exact name; Couchbase is only read."""
 
+import socket
 import sqlite3
 import threading
 import time
 import tracemalloc
+from collections.abc import Iterator
+from contextlib import contextmanager
 from uuid import UUID
 
 import mysql.connector
 import psycopg
 import pytest
 
+from dbaguy_backend.adapters.base import RunOptions
+from dbaguy_backend.agent import reader as reader_module
 from dbaguy_backend.agent.reader import CallControl, ReadRequest
 from dbaguy_backend.agent.sessions import MAX_AGENT_SESSIONS
 from dbaguy_backend.agent.tools import ToolFailure
@@ -19,7 +24,8 @@ from dbaguy_backend.domain.classification import Classification, StatementKind
 from dbaguy_backend.domain.errors import DomainError
 from dbaguy_backend.domain.profiles import SqliteProfile
 from dbaguy_backend.services.agent_gate import AgentVerdict
-from dbaguy_backend.sql.dialects import Dialect, explain_head
+from dbaguy_backend.sessions.manager import SessionManager
+from dbaguy_backend.sql.dialects import Dialect, explain_head, read_frame
 
 from .agent_support import container, share
 from .support import (
@@ -41,6 +47,59 @@ def no_gate(monkeypatch):
 def _read(container, pid: str, sql: str, dialect: Dialect, **options):
     profile = container.profiles.get(UUID(pid))
     return container.agent_reader.read(ReadRequest(profile=profile, dialect=dialect, sql=sql, **options))
+
+
+def _agent_workers(container) -> list:
+    return [e.worker for e in container.sessions._sessions.values() if e.agent]
+
+
+def _small_first(dialect: Dialect) -> str:
+    """The first row small, every other one 1 MB (review I-1: a page sized by the rows before it took 99 of them)."""
+    if dialect == Dialect.SQLITE:
+        return ("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n LIMIT 1000) "
+                "SELECT CASE WHEN i = 1 THEN 'x' ELSE printf('%.*c', 1000000, 'x') END AS big FROM n")
+    return "SELECT CASE WHEN n = 1 THEN 'x' ELSE repeat('x', 1000000) END AS big FROM generate_series(1, 1000) AS n"
+
+
+def _traced(read):
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        outcome = read()
+        return outcome, tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+@contextmanager
+def _stalled_server() -> Iterator[int]:
+    """A port that accepts TCP and never answers: a server stuck before its greeting (review I-2)."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    listener.settimeout(0.1)
+    accepted: list[socket.socket] = []
+    stop = threading.Event()
+
+    def serve() -> None:
+        while not stop.is_set():
+            try:
+                accepted.append(listener.accept()[0])
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+
+    server = threading.Thread(target=serve, daemon=True)
+    server.start()
+    try:
+        yield listener.getsockname()[1]
+    finally:
+        stop.set()
+        server.join()
+        for conn in accepted:
+            conn.close()
+        listener.close()
 
 
 def _pg():
@@ -270,6 +329,113 @@ def test_closing_a_profiles_sessions_ends_its_call_and_leaves_nothing_open(conta
     assert _read(container, pid, "SELECT 1", Dialect.SQLITE).rows == [[1]]
 
 
+@requires_pg
+def test_a_page_is_bounded_by_its_size_whatever_the_rows_before_it(container):
+    """Ruling T6-I1: rows are fetched one at a time and a page ends once its raw size reaches PAGE_RAW_CHARS, so a
+    small first row never lets 99 rows of 1 MB into one page (the old rule: 101 rows read, 107 MB traced)."""
+    pid = share(container, make_pg_profile(name="zz_08 pg"))
+    _read(container, pid, "SELECT 1", Dialect.POSTGRES)  # the session is open before tracing
+    outcome, peak = _traced(lambda: _read(container, pid, _small_first(Dialect.POSTGRES), Dialect.POSTGRES,
+                                          max_rows=1000))
+    assert outcome.status == "ok" and outcome.more_rows and outcome.rows[0] == ["x"]
+    assert len(outcome.rows) < 40 and outcome.rows_read < 50  # about what the response holds
+    assert peak < 8 * 1024 * 1024, f"{peak / 1e6:.1f} MB"  # a few 1 MB rows, never a page of 99
+    assert _read(container, pid, "SELECT 1", Dialect.POSTGRES).rows == [[1]]  # the stream's cancel was rolled back
+
+
+@requires_pg
+def test_an_agents_postgres_read_streams_inside_its_frame(container):
+    """T6-I1: in its frame's transaction the agent's read is the server's single-row stream, not a cursor (a FETCH
+    per row would cost a round trip each)."""
+    pid = share(container, make_pg_profile(name="zz_08 pg"))
+    found = _read(container, pid, "SELECT count(*) FROM pg_cursors WHERE name LIKE 'dbaguy%'", Dialect.POSTGRES)
+    assert found.rows == [["0"]]  # DbaGuy's DECLAREd cursor would count itself (int8 is read as text)
+
+
+@requires_pg
+def test_postgres_standard_conforming_strings_is_checked_on_every_call(container):
+    """Review M-2: a session that turns it off after it opened (a server reload) is refused on its next call."""
+    pid = share(container, make_pg_profile(name="zz_08 pg"))
+    assert _read(container, pid, "SELECT 1", Dialect.POSTGRES).rows == [[1]]
+    worker = _agent_workers(container)[0]
+    worker.call(lambda c: c.run("SET standard_conforming_strings = off", RunOptions(describe=False)).close())
+    with pytest.raises(ToolFailure) as refused:
+        _read(container, pid, "SELECT 1", Dialect.POSTGRES)
+    assert refused.value.code == "refused" and not _agent_workers(container)
+    assert _read(container, pid, "SELECT 1", Dialect.POSTGRES).rows == [[1]]  # a new session: on again
+
+
+@requires_pg
+def test_an_error_in_the_read_still_ends_its_frame(container, monkeypatch):
+    """Review M-1: whatever goes wrong while the statement is read, the session is closed: no transaction, lock or
+    paused result is left for the next call."""
+    pid = share(container, make_pg_profile(name="zz_08 pg"))
+    _read(container, pid, "SELECT 1", Dialect.POSTGRES)
+
+    def broken(self, rows):
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(reader_module.ResultBudget, "take", broken)
+    with pytest.raises(RuntimeError):
+        _read(container, pid, "SELECT n FROM generate_series(1, 10) AS n", Dialect.POSTGRES)
+    assert not _agent_workers(container) and not container.agent_sessions._slots
+    monkeypatch.undo()
+    assert _read(container, pid, "SELECT 1", Dialect.POSTGRES).rows == [[1]]
+
+
+@requires_pg
+def test_the_deadline_covers_opening_the_session(container):
+    """Ruling T6-I2: a server that accepts and never answers ends the call at its timeout, as `timeout` (it took
+    PostgreSQL's 10 s connect_timeout and came back ConnectionFailed)."""
+    with _stalled_server() as port:
+        pid = share(container, make_pg_profile(name="zz_08 stalled", port=port))
+        started = time.monotonic()
+        outcome = _read(container, pid, "SELECT 1", Dialect.POSTGRES, timeout_s=1)
+        took = time.monotonic() - started
+    assert outcome.status == "timeout" and took < scaled(1.6), f"{took:.2f} s"
+    assert not _agent_workers(container) and not container.agent_sessions._slots
+
+
+def test_a_cancel_before_the_frame_sends_nothing(container, lite):
+    pid = share(container, _lite_profile(lite))
+    control = CallControl()
+    control.cancel()
+    outcome = container.agent_reader.read(ReadRequest(profile=container.profiles.get(UUID(pid)),
+                                                      dialect=Dialect.SQLITE, sql="SELECT 1"), control)
+    assert outcome.status == "cancelled" and not outcome.rows
+
+
+def test_a_sqlite_page_is_bounded_by_its_size_too(container, lite):
+    pid = share(container, _lite_profile(lite))
+    _read(container, pid, "SELECT 1", Dialect.SQLITE)
+    outcome, peak = _traced(lambda: _read(container, pid, _small_first(Dialect.SQLITE), Dialect.SQLITE,
+                                          max_rows=1000))
+    assert outcome.status == "ok" and outcome.more_rows and len(outcome.rows) < 40 and outcome.rows_read < 50
+    assert peak < 8 * 1024 * 1024, f"{peak / 1e6:.1f} MB"
+
+
+@pytest.mark.parametrize(("version", "refused"), [
+    ("MariaDB 10.11.6-MariaDB", True), ("MariaDB 11.4.2-MariaDB-ubu2404", True), ("MySQL 5.7.7-log", True),
+    ("MySQL 5.6.51", True), ("MySQL 5.7.8", False), ("MySQL 5.7.44-log", False), ("MySQL 8.4.11", False),
+    ("MySQL 8.0.mysql_aurora.3.05.2", False), ("MySQL 9.1.0-commercial", False),
+])
+def test_mysql_reads_need_mysql_5_7_8_and_refuse_mariadb(version, refused):  # ruling T6-1
+    why = read_frame(Dialect.MYSQL).requires.refusal(version)
+    assert (why is not None) == refused
+    if refused:
+        assert why == f"MCP reads need MySQL 5.7.8 or later (this server is {version})"
+    assert read_frame(Dialect.POSTGRES).requires is None
+
+
+def test_an_agent_session_without_hooks_is_refused(container, lite):
+    """Review M-5: without the agent gate as its check it would run anything: it is never opened."""
+    bare = SessionManager(container.connections, container.profiles)
+    pid = UUID(share(container, _lite_profile(lite)))
+    with pytest.raises(DomainError):
+        bare.create_agent(pid, None)
+    assert not bare._sessions
+
+
 @requires_mssql
 def test_sql_server_rolls_back_what_the_gate_would_have_stopped(container, no_gate):
     pid = share(container, make_mssql_profile(name="zz_08 mssql"))
@@ -285,6 +451,17 @@ def test_sql_server_rolls_back_what_the_gate_would_have_stopped(container, no_ga
     finally:
         owner.execute_non_query("IF OBJECT_ID('dbo.zz_08_victim') IS NOT NULL DROP TABLE dbo.zz_08_victim")
         owner.close()
+
+
+
+@requires_mssql
+def test_sql_server_options_the_lexer_assumes_are_set_again_on_every_call(container, no_gate):
+    """Review M-3: a session option a statement turned off (QUOTED_IDENTIFIER: `"…"` then reads as a string, not as
+    the lexer reads it) does not reach the next call."""
+    pid = share(container, make_mssql_profile(name="zz_08 mssql"))
+    assert _read(container, pid, "SET QUOTED_IDENTIFIER OFF", Dialect.TSQL).status == "ok"
+    probe = "SELECT CAST(SESSIONPROPERTY('QUOTED_IDENTIFIER') AS int), CAST(SESSIONPROPERTY('ANSI_NULLS') AS int)"
+    assert _read(container, pid, probe, Dialect.TSQL).rows == [[1, 1]]
 
 
 @requires_couchbase

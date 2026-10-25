@@ -73,6 +73,11 @@ class RunOptions:
     # 05a review M1), and reads no rows ahead of what `fetch()` asks for (the rows it peeks at for the types, SQLite's
     # and SQL Server's; PostgreSQL's cursor read-ahead): a dump sizes its reads by the rows' size (06a pre-flight M12)
     describe: bool = True
+    # True: the caller fetches one row at a time and ends its page by the rows' size, so the adapter holds no row it was
+    # not asked for (an MCP agent's read, spec ⑧ T6-I1). PostgreSQL then streams in single-row mode even inside a
+    # transaction: the agent's frame rolls back whatever an abandoned stream's cancel aborts. MySQL, SQL Server, SQLite
+    # and Couchbase read row by row from the stream already (with `describe` False).
+    row_at_a_time: bool = False
 
 
 @dataclass(frozen=True)
@@ -289,6 +294,12 @@ class DatabaseConnection(ABC):
         """Whether the session reads a backslash in a string literal as an escape, as the answer to the last `run()`
         said (no round trip; a grid commit checks it after its BEGIN, ⑤ D-05-13). None when the engine's answers do not
         say (every engine but MySQL) or that answer did not (rows, an error)."""
+        return None
+
+    def reported_setting(self, name: str) -> str | None:
+        """A session setting's value as the server last reported it, with no round trip (PostgreSQL's parameter status:
+        an MCP agent's frame checks `standard_conforming_strings` on every call by it, spec ⑧ pre-flight M1, review
+        M-2). None when the engine reports none, or not this one."""
         return None
 
     def login_privileges(self) -> LoginPrivileges | None:

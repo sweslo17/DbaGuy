@@ -29,7 +29,7 @@ from ..adapters.base import (
     invalid_text_error,
     transaction_open_error,
 )
-from ..adapters.values import PLAN_TEXT_LIMIT, TEXT_LIMIT, encode_row
+from ..adapters.values import PLAN_TEXT_LIMIT, TEXT_LIMIT, encode_row, raw_chars
 from ..domain.classification import Classification, StatementKind
 from ..domain.data_jobs import JobCommand, JobOutcomeEvent
 from ..domain.edits import PLAN_EXPIRED, PLAN_EXPIRED_MESSAGE, EditPlan, PlanUnavailable
@@ -111,6 +111,14 @@ _EDIT_OPTIONS = RunOptions(describe=False)
 _JOB_LOG_CHARS = 200  # a job's statement at DEBUG: its first characters only (D-06-12: a million-statement run)
 
 
+OPEN_TIMEOUT_S = 30.0  # start()'s wait for the connection to open
+CALL_TIMEOUT_S = 120.0  # call()'s wait for its result
+
+
+class OpenTimedOut(ConnectionFailed):
+    """The connection did not open within `start()`'s timeout. Its thread closes it once the opener returns."""
+
+
 def paused_result_closed_text(limit_s: float) -> str:
     """The warning a paused result gets when the worker closes it `limit_s` after the server was left waiting for it
     (the engine's limit, counted by the stall clock: from where the read-ahead stopped, or from the first pause for an
@@ -185,6 +193,10 @@ class WorkerHooks:
     # False: an execute's run() reads no rows ahead of fetch() and skips describing the columns first (an MCP agent's
     # session, spec ⑧ CR-08-7: a page is all it holds); RunOptions.describe
     describe: bool = True
+    # Set: an execute's rows are fetched one at a time and a page ends once their raw size (values.raw_chars) reaches
+    # it, whatever count was asked for (an MCP agent's session, spec ⑧ T6-I1); RunOptions.row_at_a_time. None: pages
+    # are counted in rows only (a tab)
+    page_raw_chars: int | None = None
 
 
 @dataclass
@@ -315,11 +327,11 @@ class SessionWorker:
 
     # ---- lifecycle (any thread) ----
 
-    def start(self, timeout: float = 30.0) -> None:
+    def start(self, timeout: float = OPEN_TIMEOUT_S) -> None:
         self._thread.start()
         if not self._opened.wait(timeout):
             self._begin_close()  # the thread closes the connection itself as soon as the opener returns
-            raise ConnectionFailed(f"Timed out opening a connection for {self.name}")
+            raise OpenTimedOut(f"Timed out opening a connection for {self.name}")
         if self._open_error is not None:
             raise self._open_error
 
@@ -334,8 +346,8 @@ class SessionWorker:
 
     @property
     def dialect(self) -> Dialect:
-        """The dialect its hooks read statements in: its engine's (an MCP agent's session checks what the lexer
-        assumes of it by this, spec ⑧ pre-flight M1)."""
+        """The dialect its hooks read statements in: its engine's (an MCP agent's session finds its read frame's
+        server requirement by it, spec ⑧ ruling T6-1)."""
         return self._hooks.dialect
 
     @property
@@ -382,7 +394,7 @@ class SessionWorker:
         with self._state_lock:
             return self._job_active or self._running_request is not None or bool(self._queued)
 
-    def call(self, fn: Callable[[DatabaseConnection], T], timeout: float | None = 120.0, *,
+    def call(self, fn: Callable[[DatabaseConnection], T], timeout: float | None = CALL_TIMEOUT_S, *,
              refresh_state: bool = False) -> T:
         """Run fn(connection) on the worker thread and wait for its result. `refresh_state`: fn may have begun or ended
         a transaction (an MCP agent's read frame, spec ⑧ D-08-3): the session's state is read again before the result
@@ -511,13 +523,15 @@ class SessionWorker:
             return None
         return ahead
 
-    def close(self) -> None:
+    def close(self, wait: bool = True) -> None:
+        """`wait` False: never wait for the thread (a call stuck in the driver that a caller's deadline has passed: the
+        thread closes the connection itself once the driver returns)."""
         if not self._begin_close():
             return
         with self._state_lock:
             if self._running_request is not None and self._lease is not None:
                 self._interrupt_running("abort")
-        if self._thread.ident is not None:
+        if wait and self._thread.ident is not None:
             self._thread.join(timeout=10)
             if self._thread.is_alive():
                 logger.warning("Session {} did not stop within 10s", self.name)
@@ -765,7 +779,8 @@ class SessionWorker:
                 return
             req.query_context = options.query_context
             # D-04-14: only a read is resent
-            options = replace(options, retry_safe=req.kind == StatementKind.READ, describe=self._hooks.describe)
+            options = replace(options, retry_safe=req.kind == StatementKind.READ, describe=self._hooks.describe,
+                              row_at_a_time=self._hooks.page_raw_chars is not None)
             with self._timeout(req):
                 result = self._run_statement(req, "execute", cmd.sql, options)
                 budget = self._hooks.capabilities.read_ahead_bytes
@@ -958,7 +973,15 @@ class SessionWorker:
                         request_id=ex.request_id, index=ex.index, columns=columns, presentation=presentation,
                     ))
                     ex.columns_sent = True
+                limit = self._hooks.page_raw_chars
                 while budget > 0:
+                    if limit is not None:  # an agent's page: one row at a time, ended by its size (T6-I1)
+                        exhausted = self._send_sized(ex, budget, limit)
+                        self._send_messages(ex)
+                        if exhausted:
+                            break
+                        budget = 0  # full by its size or its count: peek, then pause
+                        continue
                     want = min(budget, _CHUNK)
                     rows, ex.peeked = ex.peeked[:want], ex.peeked[want:]
                     if len(rows) < want:
@@ -991,12 +1014,52 @@ class SessionWorker:
 
     def _send_rows(self, ex: _OpenExecution, rows: list) -> int:
         """Send `rows` of the current result set (none: nothing); how many."""
-        if rows:
-            cells = [encode_row(r, ex.text_limit) for r in rows]
+        return self._send_cells(ex, [encode_row(r, ex.text_limit) for r in rows])
+
+    def _send_cells(self, ex: _OpenExecution, cells: list[list[Any]]) -> int:
+        """Send rows already encoded (none: nothing); how many."""
+        if cells:
             self._send(RowsEvent(request_id=ex.request_id, index=ex.index, rows=cells))
-            ex.sent += len(rows)
-            ex.req.rows += len(rows)
-        return len(rows)
+            ex.sent += len(cells)
+            ex.req.rows += len(cells)
+        return len(cells)
+
+    def _send_sized(self, ex: _OpenExecution, count: int, limit: int) -> bool:
+        """An MCP agent's page (spec ⑧ T6-I1): up to `count` rows fetched one at a time (RunOptions.row_at_a_time: the
+        driver holds none it was not asked for), each encoded before the next is fetched, until their raw size reaches
+        `limit`. Memory holds the page's encoded rows, the row being read and the one peeked at, never a page of rows
+        as large as the largest. Sent in chunks of _CHUNK rows. True when the result set ended."""
+        result = ex.result
+        cells: list[list[Any]] = []
+        raw = taken = 0
+        exhausted = False
+        try:
+            while taken < count and raw < limit:
+                if ex.peeked:
+                    row, ex.peeked = ex.peeked[0], ex.peeked[1:]
+                else:
+                    self._raise_if_cancelled()  # between two rows: a cancel that found no driver call in flight
+                    fetched = result.fetch(1)
+                    if not fetched:
+                        exhausted = True
+                        break
+                    row = fetched[0]
+                    del fetched
+                encoded = encode_row(row, ex.text_limit)
+                del row  # the raw row is not held while the next is read
+                raw += sum(raw_chars(cell) for cell in encoded)
+                cells.append(encoded)
+                taken += 1
+                if len(cells) == _CHUNK:
+                    self._send_cells(ex, cells)
+                    cells = []
+        except StatementCancelled:
+            raise  # a cancel ends the result as it always did: nothing more is shown
+        except StatementError:
+            self._send_cells(ex, cells)  # the rows in hand go out before the error, as a page of the grid's does
+            raise
+        self._send_cells(ex, cells)
+        return exhausted
 
     def _export(self, cmd: ExportCommand) -> None:
         self._discard_open()  # one connection: a result the grid left paused ends before the export runs

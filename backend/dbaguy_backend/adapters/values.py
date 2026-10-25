@@ -89,3 +89,17 @@ def encode_value(value: Any, text_limit: int = TEXT_LIMIT) -> Any:
 
 def encode_row(row: Any, text_limit: int = TEXT_LIMIT) -> list[Any]:
     return [encode_value(v, text_limit) for v in row]
+
+
+def raw_chars(cell: Any) -> int:
+    """How many characters of value an encoded cell stands for: a text's or JSON's length (its `size` once it was cut
+    to a preview), bytes' `size`, else the length of its JSON (a number, a date, null). An MCP agent's page ends once
+    its rows reach PAGE_RAW_CHARS of it, and its response measures what it read by it (spec ⑧ T6-I1, P10)."""
+    if isinstance(cell, str):
+        return len(cell)
+    if isinstance(cell, dict):
+        if isinstance(size := cell.get("size"), int):
+            return size
+        if isinstance(text := cell.get("text"), str):
+            return len(text)
+    return len(json.dumps(cell, ensure_ascii=False, separators=(",", ":"), default=str))

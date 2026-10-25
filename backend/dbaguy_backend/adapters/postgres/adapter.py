@@ -247,11 +247,12 @@ class _BufferedResult(StatementResult):
 
 
 class _StreamResult(StatementResult):
-    """Row-returning statement streamed with bounded memory (libpq chunked mode)."""
+    """Row-returning statement streamed with bounded memory (libpq chunked mode; single-row mode with `size` 1)."""
 
-    def __init__(self, owner: "PostgresConnection", cursor: psycopg.Cursor, sql: str) -> None:
+    def __init__(self, owner: "PostgresConnection", cursor: psycopg.Cursor, sql: str,
+                 size: int = _STREAM_CHUNK) -> None:
         self._owner, self._cursor, self._sql = owner, cursor, sql
-        self._gen = cursor.stream(sql, size=_STREAM_CHUNK)
+        self._gen = cursor.stream(sql, size=size)
         self._pending: list[Any] = []
         self._done = False
         self._closed = False
@@ -452,6 +453,9 @@ class PostgresConnection(DatabaseConnection, RowEditing, DataTools, ReferenceRea
     def current_database(self) -> str | None:
         return self._conn.info.dbname
 
+    def reported_setting(self, name: str) -> str | None:
+        return self._conn.info.parameter_status(name)  # sent by the server at connect and on every change
+
     def login_privileges(self) -> LoginPrivileges:
         try:
             row = self._conn.execute(_LOGIN_SQL).fetchone()
@@ -559,9 +563,9 @@ class PostgresConnection(DatabaseConnection, RowEditing, DataTools, ReferenceRea
             self._messages.append(ServerMessage(severity=MessageSeverity.WARNING, text=FAILED_COMMIT_MESSAGE))
         return _BufferedResult(self, cursor, sql)
 
-    def _run_streamed(self, sql: str) -> StatementResult:
+    def _run_streamed(self, sql: str, size: int = _STREAM_CHUNK) -> StatementResult:
         try:
-            return _StreamResult(self, self._user_cursor(), sql)  # closes its cursor when it fails
+            return _StreamResult(self, self._user_cursor(), sql, size)  # closes its cursor when it fails
         except StatementError as exc:
             if not _is_multi_statement_rejection(exc):
                 raise
@@ -598,6 +602,10 @@ class PostgresConnection(DatabaseConnection, RowEditing, DataTools, ReferenceRea
             self._restore_read_only()
             if _likely_returns_rows(sql):
                 status = self._conn.info.transaction_status
+                if options is not None and options.row_at_a_time and status != pq.TransactionStatus.INERROR:
+                    # An MCP agent's read (spec ⑧ T6-I1): one row in memory at a time, no FETCH round trip per row;
+                    # cancelling an abandoned stream aborts the frame's transaction, which is rolled back anyway
+                    return self._run_streamed(sql, size=1)
                 if status == pq.TransactionStatus.IDLE and self._conn.autocommit:
                     return self._run_streamed(sql)  # no transaction: cancelling an abandoned stream is harmless
                 # In a transaction, or about to open one (manual mode: psycopg begins before the first statement):

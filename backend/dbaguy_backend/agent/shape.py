@@ -1,11 +1,13 @@
 """How big one MCP tool result may be (spec ⑧ §3.6, CR-08-7), pure: the response budget every tool keeps, the helpers
 the schema tools cut their lists and free text with (task 2 fix round 1, M-1), and what one query result may hold:
 cells cut at `max_cell_chars`, rows kept while the response stays under RESPONSE_CHARS and `max_rows`, and the size of
-the next page, so that memory never holds more than the kept rows plus one page of the driver's rows (plus the row the
-worker peeks at)."""
+the next page. Memory holds the kept rows plus one page, which the worker ends once its rows reach PAGE_RAW_CHARS of raw
+values (they are fetched one at a time: ruling T6-I1), plus the row the worker peeks at."""
 
 import json
 from typing import Any
+
+from ..adapters.values import raw_chars
 
 MAX_ROWS_DEFAULT, MAX_ROWS = 100, 1_000
 # run_query's default and largest max_cell_chars; the schema tools cut comments and defaults at the default too
@@ -13,7 +15,7 @@ MAX_CELL_DEFAULT, MAX_CELL = 1_000, 20_000
 RESPONSE_CHARS = 40_000  # Claude Code warns past 10,000 tokens; about 4 characters a token
 NOTE_ROOM = 500  # kept free for the notes that say what was left out
 RESPONSE_OVERHEAD = 1_000  # a query result's keys, counts and the truncation note
-PAGE_RAW_CHARS = 8 * 1024 * 1024  # one page of the driver's rows: about this many characters, raw
+PAGE_RAW_CHARS = 8 * 1024 * 1024  # an agent's page ends once its rows reach this many characters, raw (T6-I1)
 # Every value one call reads, raw: past it, no more rows are asked for. A few huge values end the call (one 100 MB
 # value: that row alone), instead of dozens of them being read for their 1,000-character previews (P10)
 READ_RAW_CHARS = 64 * 1024 * 1024
@@ -64,21 +66,17 @@ def fit_lists(result: dict[str, Any], keys: tuple[str, ...], room: int) -> dict[
 
 def cap_cell(cell: Any, max_chars: int) -> tuple[Any, int]:
     """The cell as the agent gets it (the grid's encoding, text past `max_chars` as `{"$type": "text", preview, size,
-    truncated}`, P4), and its raw size in characters (`size` where the encoding has one, else its encoded length)."""
-    if isinstance(cell, str):
-        if len(cell) > max_chars:
-            return {"$type": "text", "preview": cell[:max_chars], "size": len(cell), "truncated": True}, len(cell)
-        return cell, len(cell)
+    truncated}`, P4), and its raw size in characters (`values.raw_chars`: the worker's pages are measured alike)."""
+    raw = raw_chars(cell)
+    if isinstance(cell, str) and len(cell) > max_chars:
+        return {"$type": "text", "preview": cell[:max_chars], "size": len(cell), "truncated": True}, raw
     if isinstance(cell, dict):
-        kind, size = cell.get("$type"), cell.get("size")
+        kind = cell.get("$type")
         if kind == "text" and len(cell.get("preview", "")) > max_chars:  # cut at the grid's 64 KiB already
-            return {**cell, "preview": cell["preview"][:max_chars]}, int(size or 0)
-        if kind == "json" and len(cell.get("text", "")) > max_chars:
-            text = cell["text"]
-            return {"$type": "text", "preview": text[:max_chars], "size": len(text), "truncated": True}, len(text)
-        if isinstance(size, int):  # bytes, a truncated text
-            return cell, size
-    return cell, len(compact(cell))
+            return {**cell, "preview": cell["preview"][:max_chars]}, raw
+        if kind == "json" and len(text := cell.get("text", "")) > max_chars:
+            return {"$type": "text", "preview": text[:max_chars], "size": len(text), "truncated": True}, raw
+    return cell, raw
 
 
 class ResultBudget:
@@ -90,8 +88,7 @@ class ResultBudget:
         self.max_cell_chars = max_cell_chars
         self.rows: list[list[Any]] = []
         self.dropped = 0  # rows read but left out: the response had no room for them
-        self.largest_raw = 1  # the largest row so far, raw (sizes the next page's driver read)
-        self.largest_encoded = 1  # the largest row so far, as sent (sizes it against the room left)
+        self.largest_encoded = 1  # the largest row so far, as sent (sizes the next page against the room left)
         self.remaining = budget_chars - RESPONSE_OVERHEAD - len(compact(columns))
         self.raw_read = 0  # the kept rows' values, raw
 
@@ -110,7 +107,6 @@ class ResultBudget:
             cells = [cell for cell, _ in capped]
             raw = sum(size for _, size in capped) or 1
             encoded = len(compact(cells)) + 1  # its comma
-            self.largest_raw = max(self.largest_raw, raw)
             self.largest_encoded = max(self.largest_encoded, encoded)
             if self.full or encoded > self.remaining:
                 self.dropped += 1
@@ -124,11 +120,11 @@ class ResultBudget:
         self.remaining -= chars
 
     def next_page(self) -> int:
-        """§3.6: PAGE_RAW_CHARS over the largest row so far, between 1 and PAGE_ROWS_MAX, and no more than the rows
-        still wanted or than the room left holds rows of the largest size (at least 1)."""
-        by_raw = PAGE_RAW_CHARS // self.largest_raw
+        """How many rows to ask for: at most PAGE_ROWS_MAX, the rows still wanted, and the rows of the largest size so
+        far the room left holds (at least 1). Only a count: the worker ends the page sooner once its rows reach
+        PAGE_RAW_CHARS (ruling T6-I1 amends §3.6, which sized the page by the rows before it)."""
         by_room = self.remaining // self.largest_encoded
-        return max(1, min(PAGE_ROWS_MAX, by_raw, self.max_rows - len(self.rows), by_room))
+        return max(1, min(PAGE_ROWS_MAX, self.max_rows - len(self.rows), by_room))
 
 
 def note(text: str) -> str:

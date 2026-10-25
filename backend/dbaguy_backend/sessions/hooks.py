@@ -8,6 +8,7 @@ from uuid import UUID
 
 from ..adapters.base import StatementError
 from ..adapters.registry import AdapterRegistry
+from ..agent.shape import PAGE_RAW_CHARS
 from ..domain.classification import Classification, GuardReason, StatementKind
 from ..domain.data_jobs import BE_DUMPED, RUN_SQL_FILES, JobCommand, cannot
 from ..domain.edits import PLAN_EXPIRED, PLAN_EXPIRED_MESSAGE, EditPlan, PlanUnavailable
@@ -107,8 +108,9 @@ class SessionHooksFactory:
 
     def build_agent(self, profile_id: UUID) -> WorkerHooks:
         """An MCP agent's session (spec ⑧ D-08-1): the agent gate as its check (the MCP layer ran it already: this is
-        the backstop), no read-ahead while paused and no rows read ahead of a page (CR-08-7), and no History, schema
-        invalidation, edit plans or jobs: the MCP layer writes its own History (one record per tool call)."""
+        the backstop), no read-ahead while paused and no rows read ahead of a page (CR-08-7), pages ended by their size
+        (T6-I1), and no History, schema invalidation, edit plans or jobs: the MCP layer writes its own History (one
+        record per tool call)."""
         adapter = self._registry.get(self._profiles.get(profile_id).engine)
         dialect = adapter.dialect
 
@@ -121,7 +123,7 @@ class SessionHooksFactory:
             kind = verdict.classification or Classification(kind=StatementKind.UNKNOWN)
             return GuardDecision(action=GuardAction.BLOCK, reasons=[GuardReason.READ_ONLY], classification=kind)
 
-        return WorkerHooks(dialect=dialect, check=check, describe=False,
+        return WorkerHooks(dialect=dialect, check=check, describe=False, page_raw_chars=PAGE_RAW_CHARS,
                            capabilities=replace(adapter.capabilities, read_ahead_bytes=None))
 
     def _job_hooks(self, profile: AnyProfile, database: str | None) -> JobHooks:

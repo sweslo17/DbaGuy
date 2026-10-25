@@ -1,8 +1,6 @@
 """What an MCP result may hold and how big its next page is (spec ⑧ §3.6, CR-08-7). Pure."""
 
-from dbaguy_backend.agent.shape import (
-    PAGE_RAW_CHARS, PAGE_ROWS_MAX, RESPONSE_CHARS, ResultBudget, cap_cell, compact, note,
-)
+from dbaguy_backend.agent.shape import PAGE_ROWS_MAX, RESPONSE_CHARS, ResultBudget, cap_cell, compact, note
 
 COLUMNS = [{"name": "v", "type": "text"}]
 
@@ -38,14 +36,14 @@ def test_max_rows_ends_it_too():
     assert budget.full and len(budget.rows) == 3 and budget.dropped == 1
 
 
-def test_the_next_page_follows_the_largest_row_raw_and_the_room_left():
+def test_the_next_page_asks_for_what_the_room_left_holds():
+    """Only a count of rows to ask for: the worker ends a page by its size (ruling T6-I1), so a large row read before
+    does not shrink the next request, and a small one does not let a page of large rows through."""
     budget = ResultBudget(COLUMNS, max_rows=1000, max_cell_chars=10)
     budget.take([["z"]])
     assert budget.next_page() == PAGE_ROWS_MAX  # small rows: the page cap
-    budget.take([["m" * 1_000_000]])  # 1 Mi characters raw: 8 rows a page
-    assert budget.next_page() == PAGE_RAW_CHARS // 1_000_000
-    budget.take([[{"$type": "text", "preview": "h", "size": 100_000_000, "truncated": True}]])
-    assert budget.next_page() == 1  # a huge value: one row a page, never fewer
+    budget.take([["m" * 1_000_000], [{"$type": "text", "preview": "h", "size": 100_000_000, "truncated": True}]])
+    assert budget.next_page() == PAGE_ROWS_MAX  # sent as 10-character previews: their raw size asks for nothing
     nearly = ResultBudget(COLUMNS, max_rows=5, max_cell_chars=10)
     nearly.take([["a"]] * 3)
     assert nearly.next_page() == 2  # no more than the rows still wanted

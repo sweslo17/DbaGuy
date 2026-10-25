@@ -2,8 +2,9 @@
 ReadFrame opening with `call()` (never through the agent gate: DbaGuy's own text), the statement as an ExecuteCommand
 (the gate again as the worker's check, describe off, no read-ahead), page by page as `ResultBudget` sizes them, discard
 once nothing more is wanted, then ROLLBACK and the frame's end with `call()`. The call's deadline covers the lock, the
-check of a session that opens, the frame's opening and every page (P12). A frame that does not end cleanly closes the
-session: the next call never meets a transaction or a lock this one left."""
+session's opening, the frame's opening and every page (P12, ruling T6-I2). A frame that does not end cleanly, or a read
+that breaks, closes the session: the next call never meets a transaction or a lock this one left. The profile's login is
+read after the read, best effort."""
 
 import queue
 import threading
@@ -18,15 +19,17 @@ from loguru import logger
 from pydantic import BaseModel
 
 from ..adapters.base import DatabaseConnection, RunOptions, StatementCancelled
+from ..domain.data_jobs import ENGINE_NAMES
 from ..domain.errors import DomainError
 from ..domain.execution import (
     DiscardCommand, ErrorEvent, ExecuteCommand, FetchMoreCommand, FinishedEvent, MessageEvent, QueryContext,
     ResultSetEndEvent, ResultSetEvent, RowsEvent,
 )
-from ..domain.profiles import AnyProfile
+from ..domain.profiles import AnyProfile, Engine
 from ..sessions.worker import CLOSED_BEFORE_START
-from ..sql.dialects import SERVER_TIMEOUT_MARGIN_S, Dialect, explain_head, read_frame
+from ..sql.dialects import SERVER_TIMEOUT_MARGIN_S, Dialect, SessionAssumption, explain_head, read_frame
 from .sessions import AgentSessions, Lease
+from .tools import ToolFailure
 from .shape import FIRST_PAGE, MAX_CELL_DEFAULT, MAX_ROWS_DEFAULT, NOTES_MAX, ResultBudget, compact, note
 
 FORCE_AFTER_S = 1.5  # after a timeout's cancel, a second (SQL Server's that ends a statement stuck in a transaction)
@@ -38,9 +41,12 @@ _INTERNAL = RunOptions(describe=False)
 RESET_NOTE = ("DbaGuy closed this connection after the call (it could not end the call cleanly); the next call opens a "
               "new one")
 _STUCK = "The statement did not stop when it was cancelled: DbaGuy closed the connection"
-_CLOSED = "connection_closed"
+CONNECTION_CLOSED = "connection_closed"  # the outcome's error_code when the session closed under the call
 _CLOSED_UNDER = ("DbaGuy closed the connection during the call (its settings changed, or the MCP server stopped): try "
                  "again")
+_ASSUMED = ("This {engine} login has {setting} {found}, which DbaGuy's read-only checks assume is {wanted}: give the "
+            "AI a login (or database) with it {wanted}, or duplicate this connection")
+_OPEN_LATE = "The connection did not open within the call's timeout"
 # What the worker itself says when a statement ends cancelled: never a server message, so never a note
 _CANCEL_TEXTS = frozenset({StatementCancelled().message, CLOSED_BEFORE_START, "Query cancelled before it started"})
 ReadStatus = Literal["ok", "error", "timeout", "cancelled"]
@@ -136,6 +142,15 @@ def _send(statements: list[str], connection: DatabaseConnection) -> None:
             result.close()
 
 
+def _begin(assumed: SessionAssumption | None, statements: list[str], connection: DatabaseConnection) -> str | None:
+    """The frame's opening, unless the session's setting is not what the lexer assumes: then nothing is sent, and the
+    setting's value (as the server last reported it, no round trip) is returned."""
+    if assumed is not None and (found := connection.reported_setting(assumed.setting)) != assumed.value:
+        return found or "unknown"
+    _send(statements, connection)
+    return None
+
+
 def _end(before: list[str], rolls_back: bool, after: list[str], connection: DatabaseConnection) -> None:
     _send(before, connection)
     if rolls_back:
@@ -162,9 +177,10 @@ class AgentReader:
         try:
             with self._sessions.lease(request.profile, request.database, deadline) as lease:
                 self._framed(lease, request, deadline, control or CallControl(), outcome)
-        except TimeoutError:  # a session that opened for this call did not answer its check in time: closed (lease)
-            outcome.status = "timeout"
+        except TimeoutError:  # the session did not open before the deadline: its worker was closed (T6-I2)
+            outcome.status, outcome.error_message = "timeout", _OPEN_LATE
         outcome.elapsed_ms = int((self._clock() - started) * 1000)
+        self._sessions.read_login(request.profile, deadline)  # after the read, never failing or delaying it
         return outcome
 
     def _framed(self, lease: Lease, request: ReadRequest, deadline: float, control: CallControl,
@@ -177,13 +193,17 @@ class AgentReader:
         if self._clock() >= deadline:  # the lock or the session's opening took it all: nothing is sent
             outcome.status = "timeout"
             return
+        if control.cancelled:  # the client gave up while the call waited: nothing is sent
+            outcome.status = "cancelled"
+            return
         events = _Events(uuid4().hex)
         worker = lease.worker
         worker.set_emitter(events)
         try:
-            if opening:
+            if opening or frame.assumes is not None:
                 try:
-                    worker.call(partial(_send, opening), timeout=max(_LEAST_S, deadline - self._clock()))
+                    found = worker.call(partial(_begin, frame.assumes, opening),
+                                        timeout=max(_LEAST_S, deadline - self._clock()))
                 except TimeoutError:
                     self._reset(lease, outcome)
                     outcome.status = "timeout"
@@ -192,8 +212,14 @@ class AgentReader:
                     self._reset(lease, outcome)
                     outcome.failed(_code(exc), getattr(exc, "message", None) or "The read could not start")
                     return
-            if not self._statement(lease, events, request, deadline, control, outcome):
-                return  # the session was closed under it
+                if found is not None and frame.assumes is not None:
+                    self._refuse(lease, request.profile, frame.assumes, found)
+            try:
+                if not self._statement(lease, events, request, deadline, control, outcome):
+                    return  # the session was closed under it
+            except BaseException:  # review M-1: whatever broke, never a transaction or paused result left behind
+                self._reset(lease, outcome)
+                raise
         finally:
             worker.clear_emitter(events)
         if not (closing or frame.rolls_back or frame.end):
@@ -289,7 +315,7 @@ class AgentReader:
                         # close's own cancel of it (the profile changed, the MCP server stopped)
                         if closed_before_start or (awaiting and not event.cancelled) or (
                                 event.cancelled and stage == "running" and worker.closed):
-                            outcome.failed(_CLOSED, _CLOSED_UNDER)
+                            outcome.failed(CONNECTION_CLOSED, _CLOSED_UNDER)
                             outcome.more_rows = awaiting
                         elif event.cancelled:
                             # cancelled with no cancel of ours or the client's: the server's own limit (PG's
@@ -304,7 +330,7 @@ class AgentReader:
         if budget is not None:
             outcome.rows, outcome.rows_dropped, outcome.read_capped = budget.rows, budget.dropped, budget.read_capped
             outcome.more_rows = outcome.more_rows or budget.dropped > 0
-        if outcome.error_code == _CLOSED:
+        if outcome.error_code == CONNECTION_CLOSED:
             lease.drop()  # whatever state it is in, it is never used again
             return False
         if control.cancelled:
@@ -319,10 +345,19 @@ class AgentReader:
         try:
             lease.worker.submit(command)
         except DomainError:
-            outcome.failed(_CLOSED, _CLOSED_UNDER)
+            outcome.failed(CONNECTION_CLOSED, _CLOSED_UNDER)
             lease.drop()
             return False
         return True
+
+    @staticmethod
+    def _refuse(lease: Lease, profile: AnyProfile, assumed: SessionAssumption, found: str) -> None:
+        """Pre-flight M1, review M-2: the lexer would read this session's statements unlike the server. Nothing was
+        sent; the session is closed and the call refused (the next one opens a new session and checks it again)."""
+        logger.warning("MCP: refused a read on {}: {} is {}", profile.id, assumed.setting, found)
+        lease.drop()
+        raise ToolFailure("refused", _ASSUMED.format(engine=ENGINE_NAMES[Engine(profile.engine)],
+                                                     setting=assumed.setting, found=found, wanted=assumed.value))
 
     @staticmethod
     def _reset(lease: Lease, outcome: ReadOutcome) -> None:

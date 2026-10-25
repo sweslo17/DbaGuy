@@ -486,12 +486,42 @@ EXPLAIN_HEADS: dict[Dialect, tuple[str, ...]] = {
 
 @dataclass(frozen=True)
 class SessionAssumption:
-    """A setting the lexer (and so the agent gate) reads the dialect's statements by: an agent's session reads it once,
-    when it opens (`query` gives its value), and is refused unless it is `value` (pre-flight M1, as ⑤'s G3)."""
+    """A setting the lexer (and so the agent gate) reads the dialect's statements by: the frame checks it on every
+    call, as the server last reported it (`DatabaseConnection.reported_setting`, no round trip), and refuses the call
+    and closes the session unless it is `value` (pre-flight M1, as ⑤'s G3; review M-2)."""
 
     setting: str
-    query: str
     value: str
+
+
+_MYSQL_VERSION = re.compile(r"MySQL (\d+)\.(\d+)\.(\d+)")
+_MARIADB = re.compile(r"MariaDB \d")
+
+
+def _mysql_version(server_version: str) -> tuple[int, int, int] | None:
+    """MySQL's version from ServerInfo.version (`MySQL 8.4.11`); None for anything else (MariaDB, or a fork whose
+    VERSION() is not three numbers: Aurora's `8.0.mysql_aurora.3.05.2`)."""
+    found = _MYSQL_VERSION.match(server_version)
+    return None if found is None else (int(found[1]), int(found[2]), int(found[3]))
+
+
+@dataclass(frozen=True)
+class ServerRequirement:
+    """The servers an MCP agent's frame runs on, judged from ServerInfo.version when its session opens, with no round
+    trip (ruling T6-1): MySQL's frame needs `max_execution_time` and RELEASE_ALL_LOCKS(), which MariaDB and MySQL before
+    5.7.8 do not have. Only what parses as one of them is refused; any other text (Aurora, an unknown fork) is let
+    through."""
+
+    minimum: tuple[int, int, int]
+    refused_products: re.Pattern[str]
+
+    def refusal(self, server_version: str) -> str | None:
+        """Why `server_version` is refused, or None."""
+        found = _mysql_version(server_version)
+        if self.refused_products.match(server_version) or (found is not None and found < self.minimum):
+            least = ".".join(str(part) for part in self.minimum)
+            return f"MCP reads need MySQL {least} or later (this server is {server_version})"
+        return None
 
 
 @dataclass(frozen=True)
@@ -501,13 +531,14 @@ class ReadFrame:
     adapter's rollback() after it when `rolls_back`, then `end`, which releases what a function may have locked for the
     session (a ROLLBACK keeps session locks, H1-e, M5). `explain_around`: what an explain sends before and after the
     statement instead of a head (T-SQL's SHOWPLAN: the statement is not run, T7). `assumes`: a setting the lexer needs
-    of the session, read once when the session opens."""
+    of the session, checked on every call. `requires`: the servers the frame runs on, checked when a session opens."""
 
     begin: tuple[str, ...] = ()
     end: tuple[str, ...] = ()
     rolls_back: bool = False
     explain_around: tuple[str, str] | None = None
     assumes: SessionAssumption | None = None
+    requires: ServerRequirement | None = None
 
 
 SERVER_TIMEOUT_MARGIN_S = 5
@@ -516,19 +547,18 @@ _READ_FRAMES: dict[Dialect, ReadFrame] = {
     # in '…' escapes, which RULES[POSTGRES] reads as standard (the server is on by default; a role or database may not)
     Dialect.POSTGRES: ReadFrame(("BEGIN READ ONLY", "SET LOCAL statement_timeout = {timeout_ms}"),
                                 ("SELECT pg_advisory_unlock_all()",), rolls_back=True,
-                                assumes=SessionAssumption("standard_conforming_strings",
-                                                          "SELECT current_setting('standard_conforming_strings')",
-                                                          "on")),
+                                assumes=SessionAssumption("standard_conforming_strings", "on")),
     # an explicit READ ONLY transaction each time: a function can turn the session's default off (M3, M3e)
     Dialect.MYSQL: ReadFrame(("SET SESSION max_execution_time = {timeout_ms}", "START TRANSACTION READ ONLY"),
-                             ("SELECT RELEASE_ALL_LOCKS()",), rolls_back=True),
-    # no read-only session at all: what slips through is rolled back (T6)
-    Dialect.TSQL: ReadFrame(("BEGIN TRANSACTION",), rolls_back=True,
+                             ("SELECT RELEASE_ALL_LOCKS()",), rolls_back=True,
+                             requires=ServerRequirement((5, 7, 8), _MARIADB)),
+    # no read-only session at all: what slips through is rolled back (T6). One batch, no extra round trip: the options
+    # the lexer assumes (QUOTED_IDENTIFIER: `"…"` is a name) set again, since a SET is not rolled back (review M-3)
+    Dialect.TSQL: ReadFrame(("SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; BEGIN TRANSACTION",), rolls_back=True,
                             explain_around=("SET SHOWPLAN_TEXT ON", "SET SHOWPLAN_TEXT OFF")),
     Dialect.SQLITE: ReadFrame(),  # mode=ro, query_only and the authorizer (D-08-4); no transaction to hold locks
     Dialect.SQLPP: ReadFrame(),  # readonly=true on every request (C1); no transactions
 }
-_MYSQL_VERSION = re.compile(r"MySQL (\d+)\.(\d+)\.(\d+)")
 _MYSQL_TREE = (8, 0, 16)
 
 
@@ -543,8 +573,8 @@ def explain_head(dialect: Dialect, server_version: str) -> str | None:
     if not heads:
         return None
     if dialect == Dialect.MYSQL:
-        found = _MYSQL_VERSION.match(server_version)
-        if found is None or tuple(int(part) for part in found.groups()) < _MYSQL_TREE:
+        found = _mysql_version(server_version)
+        if found is None or found < _MYSQL_TREE:
             return heads[-1]
     return heads[0]
 

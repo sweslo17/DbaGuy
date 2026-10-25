@@ -1,8 +1,8 @@
 """MCP agents' sessions (spec ⑧ D-08-1): one per (profile, database), at most MAX_AGENT_SESSIONS, one call at a time
-each. A call leases its session: it waits for the session's lock within the call's deadline (`busy` past it), and holds
-the session in the SessionManager so the reaper never closes it between the frame's statements. A session that opens is
-first checked for what the lexer assumes of it (pre-flight M1: PostgreSQL's standard_conforming_strings), and the
-profile's login is read once, on the agents' catalog connection of its own database (CR-08-1, P16)."""
+each. A call leases its session: it waits for the session's lock within the call's deadline (`busy` past it), opens the
+session within it too (ruling T6-I2), and holds it in the SessionManager so the reaper never closes it between the
+frame's statements. A session that opens on a server its frame cannot run on is refused (ruling T6-1). The profile's
+login is read after a call, best effort, on the agents' catalog connection of its own database (CR-08-1, P16)."""
 
 import threading
 import time
@@ -14,24 +14,18 @@ from uuid import UUID
 
 from loguru import logger
 
-from ..adapters.base import DatabaseConnection, RunOptions
-from ..domain.data_jobs import ENGINE_NAMES
 from ..domain.errors import SessionNotFound
 from ..domain.execution import QueryContext
 from ..domain.profiles import AnyProfile, Engine, profile_database
 from ..sessions.manager import SessionManager
 from ..sessions.worker import SessionWorker
-from ..sql.dialects import SessionAssumption, read_frame
+from ..sql.dialects import read_frame
 from .login import LoginRegistry
 from .tools import ToolFailure
 
 MAX_AGENT_SESSIONS = 8
 _BUSY = "Another call on '{}' was still running"
 _ALL_BUSY = "All {} of DbaGuy's agent connections are busy: try again"
-_ASSUMED = ("This {engine} login has {setting} {found}, which DbaGuy's read-only checks assume is {wanted}: give the "
-            "AI a login (or database) with it {wanted}, or duplicate this connection")
-_CHECK_S = 0.1  # the least time the check of a session that opened gets, its call's deadline past
-_INTERNAL = RunOptions(describe=False)
 _Key = tuple[UUID, str | None]
 
 
@@ -57,16 +51,6 @@ class Lease:
     drop: Callable[[], None]
 
 
-def _value(query: str, connection: DatabaseConnection) -> str | None:
-    """The first cell of `query`'s first row, as text (DbaGuy's own statement, on the worker thread)."""
-    result = connection.run(query, _INTERNAL)
-    try:
-        rows = result.fetch(1)
-    finally:
-        result.close()
-    return None if not rows or rows[0][0] is None else str(rows[0][0])
-
-
 class AgentSessions:
     def __init__(self, sessions: SessionManager, login: LoginRegistry,
                  clock: Callable[[], float] = time.monotonic) -> None:
@@ -85,9 +69,9 @@ class AgentSessions:
 
     @contextmanager
     def lease(self, profile: AnyProfile, database: str | None, deadline: float) -> Iterator[Lease]:
-        """The session of (profile, database), opened when there is none, its lock taken before `deadline`. A session
-        that opens and does not answer its check before `deadline` is closed: TimeoutError. A slot left without a
-        session (it could not open, or its call closed it) leaves the registry: only sessions count toward the cap."""
+        """The session of (profile, database), its lock taken and, when there is none, the session opened before
+        `deadline` (TimeoutError past it). A slot left without a session (it could not open, or its call closed it)
+        leaves the registry: only sessions count toward the cap."""
         key = self.key(profile, database)
         while True:
             slot = self._slot(key)
@@ -100,7 +84,6 @@ class AgentSessions:
         try:
             worker = self._worker(slot, profile, key[1], deadline)
             held = slot.session_id
-            self._login.ensure(profile)  # known: nothing is read (a query that failed: tried again after a minute)
             yield Lease(worker, slot.server_version, slot.default_context, partial(self._drop, slot))
         finally:
             if held is not None:
@@ -112,6 +95,18 @@ class AgentSessions:
             if slot.session_id is None:
                 self._forget(slot)
             slot.lock.release()
+
+    def read_login(self, profile: AnyProfile, deadline: float) -> None:
+        """After a call: the profile's login, read unless known (CR-08-1), best effort and only while the call's
+        deadline lasts (ruling T6-I2): it never fails or holds up a read. A query that failed is tried again after a
+        minute (LoginRegistry); anything else is logged by its code."""
+        if self._clock() >= deadline:
+            return
+        try:
+            self._login.ensure(profile)
+        except Exception as exc:
+            logger.warning("MCP: the login of {} could not be read ({})", profile.id,
+                           getattr(exc, "code", None) or type(exc).__name__)
 
     def close(self, profile_id: UUID | None = None) -> None:
         """A profile changed (its sessions close), or the MCP server stopped (all close)."""
@@ -156,34 +151,25 @@ class AgentSessions:
         raise ToolFailure("busy", _ALL_BUSY.format(MAX_AGENT_SESSIONS))
 
     def _worker(self, slot: _Slot, profile: AnyProfile, database: str | None, deadline: float) -> SessionWorker:
-        """The slot's session, held for this call; a new one when it has none or the reaper closed it. One that opens
-        and is refused, or whose check fails, is closed (and not held)."""
+        """The slot's session, held for this call; a new one, opened within `deadline`, when it has none or the reaper
+        closed it. One on a server the frame cannot run on is refused and closed (ruling T6-1: the version its opening
+        read, no round trip)."""
         if slot.session_id is not None:
             try:
                 return self._sessions.hold(slot.session_id)
             except SessionNotFound:
                 slot.session_id = None  # idle too long: reaped
-        info = self._sessions.create_agent(profile.id, database)
+        info = self._sessions.create_agent(profile.id, database, timeout=max(0.0, deadline - self._clock()))
         slot.session_id, slot.server_version = info.session_id, info.server.version
         slot.default_context = info.server.default_query_context
         worker = self._sessions.hold(info.session_id)
-        try:
-            if (assumed := read_frame(worker.dialect).assumes) is not None:
-                self._check(worker, profile, assumed, deadline)
-        except BaseException:
+        required = read_frame(worker.dialect).requires
+        if required is not None and (why := required.refusal(info.server.version)) is not None:
+            logger.warning("MCP: refused an agent session on {}: the server's version", profile.id)
             self._sessions.release(info.session_id)
             self._drop(slot, quietly=True)
-            raise
+            raise ToolFailure("refused", why)
         return worker
-
-    def _check(self, worker: SessionWorker, profile: AnyProfile, assumed: SessionAssumption, deadline: float) -> None:
-        """Pre-flight M1: a session whose setting the lexer reads statements by is not what it assumes is refused."""
-        found = worker.call(partial(_value, assumed.query), timeout=max(_CHECK_S, deadline - self._clock()))
-        if found != assumed.value:
-            logger.warning("MCP: refused an agent session on {}: {} is {}", profile.id, assumed.setting, found)
-            raise ToolFailure("refused", _ASSUMED.format(
-                engine=ENGINE_NAMES[Engine(profile.engine)], setting=assumed.setting,
-                found=found, wanted=assumed.value))
 
     def _drop(self, slot: _Slot, quietly: bool = False) -> None:
         session_id, slot.session_id = slot.session_id, None
