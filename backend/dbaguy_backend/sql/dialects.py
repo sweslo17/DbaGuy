@@ -1,4 +1,5 @@
 import json
+import math
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -50,6 +51,11 @@ class LexRules:
     identifier_backslash_escapes: bool = False  # SQL++: `\`` and `\\` inside back-ticks
     named_param_prefixes: frozenset[str] = frozenset()  # SQL++ "$" and "@": `$name`, `@name`, `$1` are one PARAM token
     question_params: bool = False  # SQL++: `?` is a positional PARAM
+    # How a number literal ends; None: the lexer's own (digits, a fraction, an exponent with its digits). T-SQL's
+    # differs, and a token boundary SQL Server draws elsewhere than DbaGuy hides a keyword (Task 9 fix round 3)
+    number: re.Pattern[str] | None = None
+    # T-SQL: `$1.5` is one money literal (no exponent: `$1e` is `$1` and a name), `$action` / `$IDENTITY` one name
+    dollar_money_and_names: bool = False
 
 
 RULES: dict[Dialect, LexRules] = {
@@ -80,6 +86,13 @@ RULES: dict[Dialect, LexRules] = {
         # `"` names an identifier: DbaGuy connects with QUOTED_IDENTIFIER ON (Task 6, Ruling 3)
         identifier_quotes=(("[", "]"), ('"', '"')), variable_prefixes=frozenset("@#"),
         body_rule=BodyRule.TSQL_MODULE, client_command=ClientCommand.GO, national_strings=True, unicode_spaces=True,
+        # As SQL Server 2022 reads them (probed, Task 9 fix round 3): `0x` and any run of hex digits, none included, is
+        # one binary literal (`0x1TRUNCATE` is 0x1 then TRUNCATE; `0xg` is 0x then the name g); an exponent marker
+        # belongs to its number with or without a sign and digits (`1e`, `1.e`, `.5e`, `1e+`, `1E-`: `1eTRUNCATE` is
+        # 1e then TRUNCATE, `1else` 1e then lse). There are no suffixes: `1d`, `1f`, `1m`, `0b1`, `1_0` are a number
+        # and a name, which the lexer's own rule already says.
+        number=re.compile(r"0[xX][0-9a-fA-F]*|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d*)?"),
+        dollar_money_and_names=True,
     ),
     Dialect.SQLPP: LexRules(  # Couchbase SQL++ 7.6 (survey §8.1; spec §3.3.1)
         nested_block_comments=False, line_comment_end=re.compile(r"[\n\r]"), dash_comment_needs_space=False,
@@ -227,6 +240,25 @@ _NUL_IN_LITERAL: dict[Dialect, str | None] = {
     Dialect.POSTGRES: None, Dialect.SQLITE: "' || char(0) || '", Dialect.MYSQL: "\\0",
     Dialect.TSQL: "' + CAST(NCHAR(0) AS NVARCHAR(MAX)) + N'", Dialect.SQLPP: None,
 }
+# T-SQL reads a backslash right before a line break inside a string literal as a line continuation and drops it (SQL
+# Server 2022, N'…' and '…' alike; every character after a backslash was tried, U+0001–U+FFFF with the N and 1–127
+# without, and only LF and CR do anything): LF and CRLF go with it (`N'a\<LF>b'` is `ab`), a lone CR stays and the
+# backslash goes (`N'a\<CR>b'` is `a<CR>b`). Only the backslash right next to the break counts (`\\<LF>` loses one
+# backslash and the break), and a backslash last in the literal is kept. So the literal ends after that backslash and
+# the text goes on in the next one: `CONCAT(<an empty MAX value>, N'a\', N'<LF>b')`. The MAX value keeps the result from
+# being capped at 4000 characters (8000 without the N), as in the NUL form above. The pair is (Unicode, not): the empty
+# value has the literal's own type, so a non-Unicode literal stays varchar and keeps its index seek where ⑤ relies on
+# that (A8: on a SQL collation N'…' turns a varchar key's seek into a scan, and `VARCHAR(MAX)` does not; plan checked).
+# CONCAT, not a chain of `+`: a chain is as deep as it is long and the server gives up at 1,000–2,000 breaks in one
+# value (8631, stack limit); CONCAT takes 254 arguments and is nested for more, so the limit becomes the expression
+# size of 65,535 constants (8632), about 32,000 breaks in one value (checked). Both are errors, never a changed value.
+# The other dialects read a backslash and a line break as they are (MySQL has the backslash doubled already): None.
+_LINE_CONTINUATION_GUARD: dict[Dialect, tuple[str, str] | None] = {
+    Dialect.POSTGRES: None, Dialect.SQLITE: None, Dialect.MYSQL: None, Dialect.SQLPP: None,
+    Dialect.TSQL: ("CAST(N'' AS NVARCHAR(MAX))", "CAST('' AS VARCHAR(MAX))"),
+}
+_AFTER_BACKSLASH_BEFORE_BREAK = re.compile(r"(?<=\\)(?=[\r\n])")  # the place between them
+_CONCAT_ARGUMENTS = 253  # CONCAT takes 254 arguments: the empty MAX value and these
 # SQL++ string literals are JSON strings (double quotes, JSON escapes; D-04-15); the other dialects quote with ''.
 _JSON_STRINGS: dict[Dialect, bool] = {
     Dialect.POSTGRES: False, Dialect.SQLITE: False, Dialect.MYSQL: False, Dialect.TSQL: False, Dialect.SQLPP: True,
@@ -241,6 +273,20 @@ KEYWORD_ONLY_DIALECTS: frozenset[Dialect] = frozenset({Dialect.SQLPP})
 CASE_SENSITIVE_IDENTIFIERS: frozenset[Dialect] = frozenset({Dialect.SQLPP})
 _DATE_ONLY = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
 _DATE_SPACE_TIME = re.compile(r"(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})", re.ASCII)
+# A space before a time's offset (`12:34:56 +08:00`, as SSMS and CAST write a datetimeoffset): with the `T`, SQL Server
+# refuses it (241, ⑥ A15), so the two are joined
+_SPACE_BEFORE_OFFSET = re.compile(r"(?<=\d)\s+(?=[+-]\d{2}:\d{2}$)", re.ASCII)
+# What SQLite's REAL writes for the values a number literal cannot (⑥ R-06-11, L3): 9e999 is read as infinity, while
+# 'inf' would be stored as text; NaN is stored as NULL anyway. The keys are Python's text of the float (repr).
+# PostgreSQL reads the quoted text ('inf', 'nan'); MySQL and SQL Server floats hold none of them (⑥ S3).
+_NON_FINITE: dict[Dialect, dict[str, str]] = {Dialect.SQLITE: {"inf": "9e999", "-inf": "-9e999", "nan": "NULL"}}
+# −0.0: a number literal without an exponent is an exact numeric, whose zero has no sign. MySQL reads one with an
+# exponent as a DOUBLE (06a Task 4); PostgreSQL's float input reads the quoted text (_QUOTED_NEGATIVE_ZERO)
+_NEGATIVE_ZERO: dict[Dialect, str] = {Dialect.MYSQL: "-0.0e0"}
+_QUOTED_NEGATIVE_ZERO: frozenset[Dialect] = frozenset({Dialect.POSTGRES})
+# Writing an identity column's own values (⑥ D-06-5): PostgreSQL's GENERATED ALWAYS needs OVERRIDING SYSTEM VALUE in
+# the INSERT (P1); SQL Server's IDENTITY needs IDENTITY_INSERT on, one table at a time (A S2)
+_OVERRIDING: dict[Dialect, str] = {Dialect.POSTGRES: "OVERRIDING SYSTEM VALUE"}
 NUMERIC_LITERAL = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?", re.ASCII)  # text that can be written as a bare number
 
 
@@ -285,7 +331,9 @@ def quote_literal(
 ) -> str:
     """A string literal that the dialect reads back as exactly `value`: quotes are doubled, and where backslash
     escapes exist (MySQL's default sql_mode), backslashes are doubled too. T-SQL literals carry the N prefix. A NUL
-    character never stays raw (`_NUL_IN_LITERAL`): an escape, or a concatenation that keeps the text one expression.
+    character never stays raw (`_NUL_IN_LITERAL`): an escape, or a concatenation that keeps the text one expression;
+    nor does a T-SQL backslash right before a line break (`_LINE_CONTINUATION_GUARD`), which the server would read as a
+    line continuation: such a text is a CONCAT of literals, so it is an expression, not a constant.
     SQL++: the value as a JSON string (`json.dumps`), which is also how the server reads a "…" literal (D-04-15).
 
     `national` False leaves T-SQL's N out (ASCII text for a non-Unicode column keeps its index seek, ⑤ D-05-2, A8).
@@ -298,9 +346,27 @@ def quote_literal(
         raise ValueError("A NUL character cannot be written in a MySQL literal without backslash escapes")
     if escapes:
         value = value.replace("\\", "\\\\")
-    literal = (_STRING_PREFIXES[dialect] if national else "") + "'" + value.replace("'", "''") + "'"
+    if (empty := _LINE_CONTINUATION_GUARD[dialect]) is None or "\\" not in value:  # nearly every value: no scan
+        return _quoted(dialect, value, national)
+    pieces = [_quoted(dialect, part, national) for part in _AFTER_BACKSLASH_BEFORE_BREAK.split(value)]
+    return pieces[0] if len(pieces) == 1 else _concatenated(empty[0] if national else empty[1], pieces)
+
+
+def _quoted(dialect: Dialect, text: str, national: bool) -> str:
+    """One quoted literal: the N prefix where it is wanted, quotes doubled, a NUL kept out."""
+    literal = (_STRING_PREFIXES[dialect] if national else "") + "'" + text.replace("'", "''") + "'"
     nul = _NUL_IN_LITERAL[dialect]
     return literal if nul is None else literal.replace("\x00", nul)
+
+
+def _concatenated(empty_max: str, pieces: list[str]) -> str:
+    """T-SQL expressions as one: `CONCAT(<empty MAX value>, a, b, …)`, nested when there are more than CONCAT takes.
+    Every level starts with the MAX value, so no level is capped."""
+    while True:
+        pieces = [f"CONCAT({empty_max}, {', '.join(pieces[i:i + _CONCAT_ARGUMENTS])})"
+                  for i in range(0, len(pieces), _CONCAT_ARGUMENTS)]
+        if len(pieces) == 1:
+            return pieces[0]
 
 
 def datetime_literal(dialect: Dialect, text: str, *, backslash_escapes: bool | None = None) -> str:
@@ -314,8 +380,39 @@ def datetime_literal(dialect: Dialect, text: str, *, backslash_escapes: bool | N
         if _DATE_ONLY.fullmatch(text):
             text = text.replace("-", "")
         elif found := _DATE_SPACE_TIME.match(text):
-            text = f"{found.group(1)}T{found.group(2)}{text[found.end():]}"
+            text = _SPACE_BEFORE_OFFSET.sub("", f"{found.group(1)}T{found.group(2)}{text[found.end():]}")
     return quote_literal(dialect, text, backslash_escapes=backslash_escapes)
+
+
+def non_finite_literal(dialect: Dialect, text: str) -> str | None:
+    """How the dialect writes Python's `inf`, `-inf` or `nan` as a number; None: as quoted text (PostgreSQL reads
+    'inf' and 'nan' itself; MySQL and SQL Server cannot hold them)."""
+    return _NON_FINITE.get(dialect, {}).get(text)
+
+
+def float_literal(dialect: Dialect, value: float) -> str | None:
+    """A float as a number literal that reads back as the same value: Python's repr, the shortest text that does
+    (`0.1`, `1e+16`); SQLite's infinities (non_finite_literal); −0.0 with its sign where a plain `-0.0` loses it.
+    None: the value is written as quoted text instead (PostgreSQL's 'inf', 'nan' and '-0.0', which its float input
+    reads)."""
+    text = repr(value)
+    if not math.isfinite(value):
+        return non_finite_literal(dialect, text)
+    if value == 0 and math.copysign(1.0, value) < 0:
+        return None if dialect in _QUOTED_NEGATIVE_ZERO else _NEGATIVE_ZERO.get(dialect, text)
+    return text
+
+
+def overriding_identity(dialect: Dialect) -> str | None:
+    """What an INSERT that writes a GENERATED ALWAYS identity's values says after its column list."""
+    return _OVERRIDING.get(dialect)
+
+
+def identity_insert(dialect: Dialect, table_sql: str) -> tuple[str, str] | None:
+    """The statements around writing an IDENTITY column's values (SQL Server); None where no switch exists."""
+    if dialect is not Dialect.TSQL:
+        return None
+    return f"SET IDENTITY_INSERT {table_sql} ON", f"SET IDENTITY_INSERT {table_sql} OFF"
 
 
 def bool_literal(dialect: Dialect, value: bool) -> str:

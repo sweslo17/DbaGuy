@@ -31,6 +31,7 @@ from ..adapters.base import (
 )
 from ..adapters.values import PLAN_TEXT_LIMIT, TEXT_LIMIT, encode_row
 from ..domain.classification import Classification, StatementKind
+from ..domain.data_jobs import JobCommand, JobOutcomeEvent
 from ..domain.edits import PLAN_EXPIRED, PLAN_EXPIRED_MESSAGE, EditPlan, PlanUnavailable
 from ..domain.errors import ConnectionFailed, SessionBusy
 from ..domain.execution import (
@@ -84,12 +85,15 @@ from .edit_apply import (
     history_error,
     refused,
 )
+from .jobs.context import (
+    JOB_ROLLBACK_FAILED, Job, JobContext, JobHooks, JobReport, PreparedJob, history_status, read_matched,
+)
 from .options import run_options
 from .read_ahead import READ_AHEAD_POLL_S, STALL_RESET_FACTOR, StallClock
 from .session_state import SessionStateTracker
 
 T = TypeVar("T")
-RequestCommand = TypeVar("RequestCommand", ExecuteCommand, ExportCommand, ApplyEditsCommand)
+RequestCommand = TypeVar("RequestCommand", ExecuteCommand, ExportCommand, ApplyEditsCommand, JobCommand)
 Emitter = Callable[[BaseModel], None]
 TransactionCommand = CommitCommand | RollbackCommand | SetAutocommitCommand
 _CHUNK = 200
@@ -104,6 +108,7 @@ CLOSED_BEFORE_START = "Session closed before the query started"
 # A grid commit's texts (BEGIN, its DML, COMMIT) return no result set to show: nothing to describe (05a review M1). A
 # trigger's SELECT still comes back as a result set, which has no count (row_count_unknown, ruling E9).
 _EDIT_OPTIONS = RunOptions(describe=False)
+_JOB_LOG_CHARS = 200  # a job's statement at DEBUG: its first characters only (D-06-12: a million-statement run)
 
 
 def paused_result_closed_text(limit_s: float) -> str:
@@ -176,6 +181,7 @@ class WorkerHooks:
     capabilities: AdapterCapabilities = AdapterCapabilities()  # which run() options the engine takes; idle limits
     # The previewed grid-edit plan with this id, taken once (spec ⑤ D-05-7); raises PlanUnavailable
     take_edit_plan: Callable[[str], EditPlan] = _no_edit_plans
+    jobs: JobHooks = JobHooks()  # data tools' jobs (spec ⑥ D-06-2)
 
 
 @dataclass
@@ -244,7 +250,8 @@ class SessionWorker:
     `_state_lock` guards `_running_request`, `_cancel_requested`, `_queued`, `_paused`, `_Request.timer_armed` and the
     open execution's `ahead`; it is held across `connection.cancel()`, so a cancel can never hit a statement other than
     the one it was meant for (the worker changes the running request under it). `_tracker` has its own leaf lock for the
-    session state that other threads read; `_state_send_lock` keeps a replayed state from overtaking a newer one.
+    session state that other threads read; `_state_send_lock` keeps a replayed state from overtaking a newer one, and
+    `_job_send_lock` does the same for a job's replayed events (taken before `_emit_lock`, never inside it).
 
     Read-ahead (engines with `capabilities.read_ahead_bytes`): while the open result is paused, the worker thread steps
     `result.read_ahead()` between tasks, only when none is queued. A step never blocks and touches only the open result,
@@ -259,7 +266,7 @@ class SessionWorker:
     def __init__(self, name: str, opener: Callable[[], Any], clock: Callable[[], float] = time.monotonic) -> None:
         self.name = name
         self._opener = opener
-        self._clock = clock  # measures how long a result has been paused
+        self._clock = clock  # how long a result has been paused; when the last request finished
         self._queue: queue.Queue = queue.Queue()
         self._thread = threading.Thread(target=self._run, name=f"session-{name}", daemon=True)
         self._lease: Any = None
@@ -287,6 +294,21 @@ class SessionWorker:
         self._tracker = SessionStateTracker()
         self._ddl_pending = False  # worker thread only: DDL ran inside a transaction that has not ended yet
         self.last_activity = time.monotonic()
+        # When the last request sent its `finished`, on `clock` (the reaper counts idle time from it)
+        self.finished_at = 0.0
+        # The last job_progress and job_outcome of this session's job, by type: sent again to a client that attaches
+        # (D-06-10). Written by the worker thread, read by any (under _emit_lock)
+        self._job_events: dict[str, BaseModel] = {}
+        # A job event is kept and sent under it, and a client attaches under it: a replayed job event is never sent
+        # live to the same client too, and never comes after a newer one (pre-flight M2)
+        self._job_send_lock = threading.Lock()
+        # A job runs, from its start until its last event went out (guarded by _state_lock). Past stop_cancels() no
+        # request is "running", yet its COMMIT or rollback is: the reaper must not close it then (pre-flight L1)
+        self._job_active = False
+        self._job_request: str | None = None  # that job's request id (guarded by _state_lock)
+        # A Cancel of that job while its statements could not be cancelled (a copy's COMMIT between two tables): kept
+        # for `_resume`, so the next table does not start (06c; guarded by _state_lock)
+        self._held_cancel = False
 
     # ---- lifecycle (any thread) ----
 
@@ -324,6 +346,28 @@ class SessionWorker:
             if state is not None:
                 self._send(state)
 
+    def attach_emitter(self, emit: Emitter) -> None:
+        """Make `emit` the emitter, sending it first the last job_progress and job_outcome of this session's job, if
+        any (D-06-10: a reloaded window finds where its job is). Under the job-send lock, a job event is either among
+        those replayed or sent live after them, never both (pre-flight M2); and the replay goes out before `emit` gets
+        any live event, so nothing the worker sends overtakes it. What is sent before `emit` is set reaches the
+        previous emitter."""
+        with self._job_send_lock:
+            with self._emit_lock:
+                events = list(self._job_events.values())
+            for event in events:
+                try:
+                    emit(event)
+                except Exception:
+                    logger.exception("Failed to deliver event on {}", self.name)
+            self.set_emitter(emit)
+
+    def busy(self) -> bool:
+        """A request runs or waits in the queue, or a job has not sent its last event yet: the session must not be
+        reaped (D-06-10, pre-flight L1)."""
+        with self._state_lock:
+            return self._job_active or self._running_request is not None or bool(self._queued)
+
     def call(self, fn: Callable[[DatabaseConnection], T], timeout: float | None = 120.0) -> T:
         """Run fn(connection) on the worker thread and wait for its result."""
         future: Future[T] = Future()
@@ -351,6 +395,8 @@ class SessionWorker:
                 self._submit_request(command, self._export)
             case ApplyEditsCommand():
                 self._submit_request(command, self._apply_edits)
+            case JobCommand():
+                self._submit_request(command, self._run_job)
             case FetchMoreCommand():
                 self._put(lambda: self._fetch_more(command))
             case DiscardCommand():
@@ -372,10 +418,27 @@ class SessionWorker:
                 logger.info("Request {} on {} cancelled before it started", request_id, self.name)
                 self._queued[request_id] = True
                 return
+            if self._job_active and self._job_request == request_id:  # its COMMIT, say: the job reads it later
+                logger.info("Cancel of job {} on {} came while its statements could not be cancelled: kept for its "
+                            "next step, if any", request_id, self.name)
+                self._held_cancel = True
+                return
         try:
             self._put(lambda: self._discard(request_id, cancelled=True))  # a paused result, if it is the open one
         except SessionBusy:
             pass  # closing: the worker finishes the open result itself
+
+    def withdraw(self, request_id: str) -> bool:
+        """Skip a request that still waits in the queue, as `cancel()` does (it ends not_started and never reaches the
+        driver); False once it has started, when nothing is done. A copy whose sink stopped withdraws its query tab's
+        read that has not begun, where a cancel of a running one could abort the tab's transaction (pre-flight H2, 06c
+        Task 3 review M-1)."""
+        with self._state_lock:
+            if request_id not in self._queued:
+                return False
+            logger.info("Request {} on {} withdrawn before it started", request_id, self.name)
+            self._queued[request_id] = True
+            return True
 
     def check_idle_transaction(self, warn_after_s: float, rollback_after_s: float) -> None:
         """Warn once per idle stretch of an open transaction, and roll it back once idle too long (0 disables)."""
@@ -645,16 +708,19 @@ class SessionWorker:
             self._tracker.activity(busy=True)
         return None
 
-    def _start_request(self, req: _Request, *, before_finished: BaseModel | None = None) -> bool:
-        """Leave the queue and announce `started`. When the request must not run, end it here (with `before_finished`
-        right before its `finished`, when given) and return False."""
+    def _start_request(
+        self, req: _Request, *, before_finished: Callable[[str], BaseModel | None] | None = None,
+    ) -> bool:
+        """Leave the queue and announce `started`. When the request must not run, end it here — with the event
+        `before_finished(why)` gives right before its `finished`, when given (None: it sent its own) — and return
+        False."""
         skipped = self._begin_request(req.request_id)
         self._send(StartedEvent(request_id=req.request_id))
         if skipped is None:
             return True
         self._send(MessageEvent(request_id=req.request_id, severity=MessageSeverity.WARNING, text=skipped))
-        if before_finished is not None:
-            self._send(before_finished)
+        if before_finished is not None and (event := before_finished(skipped)) is not None:
+            self._send(event)
         self._send_finished(req.request_id, req.elapsed_ms(), cancelled=True)
         return False
 
@@ -695,18 +761,22 @@ class SessionWorker:
         finally:
             self._set_running(None)
 
-    def _run_statement(self, req: _Request, what: str, sql: str, options: RunOptions) -> StatementResult:
+    def _run_statement(
+        self, req: _Request, what: str, sql: str, options: RunOptions, *,
+        listener: Callable[[ServerMessage], None] | None = None, log_chars: int = 2000,
+    ) -> StatementResult:
         """The request's last cancel check, then run(). A cancel that lands between the two finds the driver idle (an
         adapter must ignore an idle cancel, R-03a-P4), so the statement would run to its end: the connection is armed
         before the check and keeps such a cancel, and run() then does not start (Task 6b). Disarmed on every way out,
-        once run() has returned or raised; the result's own cancel handling takes over from there."""
+        once run() has returned or raised; the result's own cancel handling takes over from there. `listener`: where
+        live messages go instead of the request's Messages (a job counts them, D-06-11)."""
         connection = self.connection
         try:
             connection.arm_cancel()
             self._raise_if_cancelled()  # cancelled during the checks: the driver had nothing to interrupt
-            self._log_statement(what, req.request_id, sql, options)
+            self._log_statement(what, req.request_id, sql, options, log_chars)
             req.ran = True
-            self._listen(req.request_id)
+            self._listen(req.request_id, listener)
             return connection.run(sql, options)
         finally:
             try:
@@ -714,9 +784,9 @@ class SessionWorker:
             except Exception:  # never lose the result (or the error) over it
                 logger.warning("Could not disarm the cancel on {}", self.name, exc_info=True)
 
-    def _log_statement(self, what: str, request_id: str, sql: str, options: RunOptions) -> None:
+    def _log_statement(self, what: str, request_id: str, sql: str, options: RunOptions, chars: int = 2000) -> None:
         """The SQL text and the parameter names, at DEBUG; never parameter values (spec §5)."""
-        logger.debug("[{}] {} {}: {}", self.name, what, request_id, sql[:2000])
+        logger.debug("[{}] {} {}: {}", self.name, what, request_id, sql[:chars])
         if options.params is not None:
             logger.debug("[{}] {} parameters: {}", self.name, request_id, _param_names(options.params))
 
@@ -819,10 +889,13 @@ class SessionWorker:
         if self._open_exec is not None:
             self._finish(self._open_exec)
 
-    def _listen(self, request_id: str | None) -> None:
-        """Route messages the connection delivers as they arrive to `request_id`'s Messages (None: stop). Connections
-        without live messages ignore it and keep using take_messages()."""
-        listener = None if request_id is None else partial(self._send_live_message, request_id)
+    def _listen(self, request_id: str | None, listener: Callable[[ServerMessage], None] | None = None) -> None:
+        """Route messages the connection delivers as they arrive to `request_id`'s Messages, or to `listener` when
+        given (None: stop). Connections without live messages ignore it and keep using take_messages()."""
+        if request_id is None:
+            listener = None
+        elif listener is None:
+            listener = partial(self._send_live_message, request_id)
         try:
             self.connection.set_message_listener(listener)
         except Exception:  # a session whose connection is gone still ends its request
@@ -864,13 +937,14 @@ class SessionWorker:
                     want = min(budget, _CHUNK)
                     rows, ex.peeked = ex.peeked[:want], ex.peeked[want:]
                     if len(rows) < want:
-                        rows += result.fetch(want - len(rows))
-                    if rows:
-                        cells = [encode_row(r, ex.text_limit) for r in rows]
-                        self._send(RowsEvent(request_id=ex.request_id, index=ex.index, rows=cells))
-                        ex.sent += len(rows)
-                        ex.req.rows += len(rows)
-                        budget -= len(rows)
+                        try:
+                            rows += result.fetch(want - len(rows))
+                        except StatementCancelled:
+                            raise  # a cancel ends the result as it always did: nothing more is shown
+                        except StatementError:
+                            self._send_rows(ex, rows)  # the peeked rows in hand go out before the error (fix round 2)
+                            raise
+                    budget -= self._send_rows(ex, rows)
                     self._send_messages(ex)
                     if len(rows) < want:
                         break  # result set exhausted
@@ -889,6 +963,15 @@ class SessionWorker:
             ex.columns_sent = False
             ex.peeked = []
         self._finish(ex)
+
+    def _send_rows(self, ex: _OpenExecution, rows: list) -> int:
+        """Send `rows` of the current result set (none: nothing); how many."""
+        if rows:
+            cells = [encode_row(r, ex.text_limit) for r in rows]
+            self._send(RowsEvent(request_id=ex.request_id, index=ex.index, rows=cells))
+            ex.sent += len(rows)
+            ex.req.rows += len(rows)
+        return len(rows)
 
     def _export(self, cmd: ExportCommand) -> None:
         self._discard_open()  # one connection: a result the grid left paused ends before the export runs
@@ -921,8 +1004,10 @@ class SessionWorker:
     def _fail_export(self, req: _Request, cmd: ExportCommand, exc: StatementError) -> None:
         if isinstance(exc, StatementCancelled):
             logger.info("[{}] export {} to {} cancelled", self.name, cmd.request_id, cmd.path)
-        else:
-            logger.warning("[{}] export {} to {} failed: {}", self.name, cmd.request_id, cmd.path, exc.message)
+        else:  # the code above DEBUG: the server's text can echo the statement's literals (spec §5)
+            logger.warning("[{}] export {} to {} failed ({})", self.name, cmd.request_id, cmd.path,
+                           exc.code or type(exc).__name__)
+            logger.debug("[{}] export {} failed: {}", self.name, cmd.request_id, exc.message)
         self._fail(req, exc)
 
     def _check_export(self, cmd: ExportCommand, req: _Request) -> Path:
@@ -990,7 +1075,7 @@ class SessionWorker:
         self._discard_open()  # the grid's paused result ends first (R-05-4); its own `finished` goes out as usual
         req = _Request(request_id=cmd.request_id, sql="", kind=StatementKind.WRITE)
         skipped = EditOutcomeEvent(request_id=req.request_id, outcome="rolled_back")
-        if not self._start_request(req, before_finished=skipped):
+        if not self._start_request(req, before_finished=lambda _: skipped):
             return
         plan: EditPlan | None = None
         progress: EditProgress | None = None
@@ -1121,33 +1206,34 @@ class SessionWorker:
         to the request."""
         result = self._run_statement(req, "edit", sql, _EDIT_OPTIONS)
         try:
-            rows = result.matched_rows()
-            self._forward_messages(req.request_id, result)
-            while result.next_result():
-                self._forward_messages(req.request_id, result)
-            return rows
+            return read_matched(result, partial(self._forward_messages, req.request_id))
         finally:
             self._close_result(result)
 
-    def _rollback_quietly(self, request_id: str) -> None:
-        """End the apply's transaction once it stopped. No Cancel may reach the ROLLBACK, so the request stops running
-        first. A connection that is gone cannot roll back: the server does it as the connection ends (R-05-6). One that
-        is still there and still in the transaction gets a warning: a table-data tab has no Rollback (pre-flight L8)."""
+    def _rollback_quietly(
+        self, request_id: str, what: str = "apply", failed_text: str = ROLLBACK_FAILED,
+    ) -> str | None:
+        """End the apply's (or a broken job's) transaction once it stopped. No Cancel may reach the ROLLBACK, so the
+        request stops running first. A connection that is gone cannot roll back: the server does it as the connection
+        ends (R-05-6). One that is still there and still in the transaction gets `failed_text` as a warning: a
+        table-data tab has no Rollback (pre-flight L8), and a job's dialog none either. Returns the warning sent."""
         self._set_running(None)
         try:
             self.connection.rollback()
-            return
+            return None
         except Exception as exc:
-            logger.info("[{}] the rollback after a stopped apply failed ({})", self.name,
+            logger.info("[{}] the rollback after a stopped {} failed ({})", self.name, what,
                         getattr(exc, "code", None) or type(exc).__name__)
         try:
             still_open = self.connection.in_transaction()
         except Exception:
-            return  # it cannot tell: as for a connection that is gone
-        if still_open:
-            logger.warning("[{}] apply {}: its transaction is still open after the rollback failed", self.name,
-                           request_id)
-            self._send(MessageEvent(request_id=request_id, severity=MessageSeverity.WARNING, text=ROLLBACK_FAILED))
+            return None  # it cannot tell: as for a connection that is gone
+        if not still_open:
+            return None
+        logger.warning("[{}] {} {}: its transaction is still open after the rollback failed", self.name, what,
+                       request_id)
+        self._send(MessageEvent(request_id=request_id, severity=MessageSeverity.WARNING, text=failed_text))
+        return failed_text
 
     def _end_apply(self, req: _Request, plan: EditPlan | None, report: EditReport) -> None:
         """The apply's last events: its error (for a commit that stood, a warning instead), the edit_outcome, then the
@@ -1171,6 +1257,175 @@ class SessionWorker:
                    report.outcome, req.elapsed_ms(), f" ({error.code})" if error is not None and error.code else "")
         cancelled = report.outcome == "rolled_back" and isinstance(error, StatementCancelled)
         self._complete(req, error=history_error(report, len(statements)), cancelled=cancelled)
+
+    def _run_job(self, cmd: JobCommand) -> None:
+        """Every data-tools job (spec ⑥ D-06-2): the job object does its own work through a JobContext, this does
+        the rest. Events: started → job_progress × n → [message] → [error] → job_outcome → session_state → finished;
+        a job cancelled while queued, or whose session closed first, still gets its job_outcome (not_started). The
+        session is busy until the job's last event went out, through its COMMIT too (pre-flight L1)."""
+        with self._state_lock:
+            self._job_active, self._job_request, self._held_cancel = True, cmd.request_id, False
+        try:
+            self._job(cmd)
+        finally:
+            with self._state_lock:
+                self._job_active, self._job_request, self._held_cancel = False, None, False
+
+    def _job(self, cmd: JobCommand) -> None:
+        """`_run_job`'s request, from `started` to `finished`."""
+        self._discard_open()  # one connection: a paused result ends first
+        req = _Request(request_id=cmd.request_id, sql="", history=False)
+        kind = cmd.job_kind
+        with self._emit_lock:
+            self._job_events = {}
+
+        def not_started(why: str) -> None:  # right before the `finished` _start_request sends
+            self._never_ran(cmd, StatementError(why, code="not_started"))
+            self._job_event(JobOutcomeEvent(  # `why` is the warning sent live, kept for a later window too (F3)
+                request_id=req.request_id, job=kind, outcome="not_started", cancelled=why != CLOSED_BEFORE_START,
+                warnings=[why],
+            ))
+
+        if not self._start_request(req, before_finished=not_started):
+            return
+        job: Job | None = None
+        ctx: JobContext | None = None
+        try:
+            job = self._hooks.jobs.build(cmd)
+            ctx = JobContext(
+                request_id=req.request_id, kind=kind, connection=self.connection, dialect=self._hooks.dialect,
+                capabilities=self._hooks.capabilities, hooks=self._hooks.jobs, _run=partial(self._job_statement, req),
+                _close=self._close_result, _raise_if_cancelled=self._raise_if_cancelled, _send=self._send,
+                _publish=self._job_event,
+                _stop_cancels=lambda: self._set_running(None), _sent=lambda: req.ran,
+                _resume_cancels=lambda: self._resume(req.request_id),
+            )
+            if not job.helper:  # a copy's source is its copy's part: never listed, run in the session's transaction
+                self._notify("job list", self._hooks.jobs.announce, req.request_id, kind, job.title,
+                             job.source_profile_id)
+                if self.connection.in_transaction():  # a job runs on a session of its own: never inside a user's
+                    raise transaction_open_error()
+            report = job.run(ctx)
+        except Exception as exc:
+            cancelled = isinstance(exc, StatementCancelled)  # a flag on whatever the outcome is (spec ⑥ §3.2)
+            if job is None or ctx is None or not req.ran:
+                if not isinstance(exc, StatementError):
+                    logger.exception("Unexpected error starting a job on {}", self.name)
+                error = exc if isinstance(exc, StatementError) else StatementError(f"Internal error: {exc}")
+                report = JobReport(JobOutcomeEvent(
+                    request_id=req.request_id, job=kind, outcome="not_started", cancelled=cancelled,
+                ), error)
+                # Refused before its run (no job, or the session is in a transaction), or its run raised before its
+                # first statement: either way nothing was sent, and its maker hears it (06c Task 3 review M-5)
+                self._never_ran(cmd, error)
+            else:
+                self._log_unclassified(req.request_id, exc)
+                report = self._broke(job, ctx, exc)
+                if cancelled and not report.outcome.cancelled:
+                    report = replace(report, outcome=report.outcome.model_copy(update={"cancelled": True}))
+                # A helper's transaction is its session's (a query tab's): never rolled back for it
+                if not job.helper and (said := self._release_broken_job(req.request_id)) is not None:
+                    report = report.warned(said)
+        finally:
+            self._set_running(None)
+        self._end_job(req, ctx, report)
+
+    def _never_ran(self, cmd: JobCommand, error: StatementError) -> None:
+        """A job its maker built that ends without sending anything: its maker may be waiting on it (a copy's sink on
+        its pipe, 06c pre-flight M1), so it hears why."""
+        if isinstance(cmd, PreparedJob):
+            self._notify("prepared job", cmd.job.not_run, error)
+
+    def _resume(self, request_id: str) -> bool:
+        """The job's statements can be cancelled again (a copy's next table, 06c): it is the running request once more,
+        and a Cancel held since `stop_cancels()` is honoured at its next check. Whether one was held — or the session
+        began closing meanwhile: its close interrupts only a running request, so the next table must not start
+        either."""
+        with self._state_lock:
+            stop, self._held_cancel = self._held_cancel or self._closed, False
+            # A job that never stopped its cancels is still the running request: a Cancel that reached it and found no
+            # driver call to stop is kept, and so is the count that makes a second Cancel force (06c Task 3 review M-2)
+            if self._running_request != request_id:
+                self._cancels = 0
+            self._running_request = request_id
+            self._cancel_requested = self._cancel_requested or stop
+            self._tracker.activity(busy=True)
+        return stop
+
+    def _log_unclassified(self, request_id: str, exc: Exception) -> None:
+        """An exception a job's run() let through once something was sent. A StatementError's text may echo literals:
+        above DEBUG only its code (D-06-12); anything else is a bug, with its traceback."""
+        if isinstance(exc, StatementCancelled):
+            logger.info("[{}] job {} was cancelled where it did not expect it", self.name, request_id)
+        elif isinstance(exc, StatementError):
+            logger.warning("[{}] job {} stopped on an error it did not classify ({})", self.name, request_id,
+                           exc.code or type(exc).__name__)
+            logger.debug("[{}] job {}: {}", self.name, request_id, exc.message)
+        else:
+            logger.exception("Unexpected error in job {} on {}", request_id, self.name)
+
+    def _broke(self, job: Job, ctx: JobContext, exc: Exception) -> JobReport:
+        """`job.broke()`; when an override of it fails too, the framework's own (the outcome is still exactly one)."""
+        try:
+            return job.broke(ctx, exc)
+        except Exception:
+            logger.exception("The broke() of job {} on {} failed: the framework's outcome instead", ctx.request_id,
+                             self.name)
+            return Job.broke(job, ctx, exc)
+
+    def _release_broken_job(self, request_id: str) -> str | None:
+        """A job that broke may have left its transaction open (an all-or-nothing run's BEGIN), holding its locks
+        until the session closes: roll it back (pre-flight L2). The outcome stays what `broke()` said; the warning
+        sent when the rollback failed is returned for its warnings too (F3)."""
+        try:
+            open_now = self.connection.in_transaction()
+        except Exception:
+            return None  # it cannot tell (the connection is gone): the server ends the transaction with it
+        if open_now:
+            logger.warning("[{}] job {} broke inside a transaction: rolling it back", self.name, request_id)
+            return self._rollback_quietly(request_id, "job", JOB_ROLLBACK_FAILED)
+        return None
+
+    def _job_statement(
+        self, req: _Request, sql: str, options: RunOptions, listener: Callable[[ServerMessage], None],
+    ) -> StatementResult:
+        """A job's statement (JobContext.run): refused text first (U+0000), then the worker's path."""
+        _check_text(sql)
+        return self._run_statement(req, "job", sql, options, listener=listener, log_chars=_JOB_LOG_CHARS)
+
+    def _job_event(self, event: BaseModel) -> None:
+        """A job's progress or outcome: kept for a client that attaches later, given to the job list, and sent; as one
+        step under the job-send lock, so attach_emitter() finds it either kept and sent, or neither (pre-flight M2)."""
+        with self._job_send_lock:
+            self._keep_job_event(event)
+            self._send(event)
+
+    def _keep_job_event(self, event: BaseModel) -> None:
+        with self._emit_lock:
+            self._job_events[getattr(event, "type", "")] = event
+        self._notify("job list", self._hooks.jobs.report, event)
+
+    def _end_job(self, req: _Request, ctx: JobContext | None, report: JobReport) -> None:
+        """The job's last events: its error, the job_outcome, then its History record, the schema cache, the
+        session_state and `finished`."""
+        rid, outcome, error = req.request_id, report.sent_outcome(), report.error
+        if error is not None:
+            self._send(ErrorEvent(request_id=rid, message=error.message, code=error.code, position=error.position))
+        self._job_event(outcome)  # with the error, for a later window and the job list (F3)
+        if ctx is not None and ctx.record_id is not None:
+            status, text = history_status(outcome, error)
+            self._notify("history", self._hooks.jobs.finish_record, ctx.record_id, status, req.elapsed_ms(),
+                         outcome.rows, text)
+        if report.schema_changed:
+            self._notify("schema change", self._hooks.on_schema_change)
+        warn = outcome.outcome in ("partial", "unknown")
+        logger.log("WARNING" if warn else "INFO",
+                   "[{}] job {} ({}) → {}{} in {} ms: {:,} statement(s), {:,} row(s), {:,} bytes{}", self.name, rid,
+                   outcome.job, outcome.outcome, " (cancelled)" if outcome.cancelled else "", req.elapsed_ms(),
+                   outcome.statements, outcome.rows, outcome.bytes,
+                   f" ({error.code})" if error is not None and error.code else "")
+        self._listen(None)
+        self._send_finished(rid, req.elapsed_ms(), cancelled=outcome.cancelled)
 
     def _transaction_command(self, cmd: TransactionCommand) -> None:
         self._discard_open()
@@ -1223,7 +1478,8 @@ class SessionWorker:
             self.connection.rollback()
         except Exception as exc:  # e.g. the connection is gone
             if isinstance(exc, StatementError):
-                logger.warning("Idle rollback failed on {}: {}", self.name, exc.message)
+                logger.warning("Idle rollback failed on {} ({})", self.name, exc.code or type(exc).__name__)
+                logger.debug("Idle rollback failed on {}: {}", self.name, exc.message)  # the server's text: DEBUG only
                 reason = exc.message
             else:
                 logger.exception("Idle rollback failed on {}", self.name)
@@ -1291,6 +1547,7 @@ class SessionWorker:
     ) -> None:
         """The one `finished` every request ends with, right after the `session_state` it reports."""
         state = self._refresh_state(began_at, ddl_done)
+        self.finished_at = self._clock()
         self._send(FinishedEvent(
             request_id=request_id,
             elapsed_ms=elapsed_ms,

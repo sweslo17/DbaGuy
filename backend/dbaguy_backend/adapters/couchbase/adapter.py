@@ -477,7 +477,7 @@ class CouchbaseAdapter(DatabaseAdapter, DocumentEngine):
     capabilities = AdapterCapabilities(
         server_read_only=True, transactions=False, query_context=True, parameters=True, documents=True,
         executed_plan=True, plan_format="couchbase", paused_result_max_idle_s=PAUSED_RESULT_MAX_IDLE_S,
-        read_ahead_bytes=READ_AHEAD_BYTES,
+        read_ahead_bytes=READ_AHEAD_BYTES, run_file=True,
     )
 
     def parse_url(self, url: str) -> ParsedUrl:

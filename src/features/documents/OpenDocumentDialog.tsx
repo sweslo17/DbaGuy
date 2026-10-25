@@ -1,10 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
 import { FieldRow, Input } from "@/components/ui/Field";
 import type { Keyspace } from "@/lib/api/types";
 import { isImeKeyEvent } from "@/lib/ime";
+import { useDebouncedValue } from "@/lib/useDebouncedValue";
 import { useWorkspace } from "@/stores/workspace";
 import { childrenQuery } from "../explorer/useTreeRows";
 import {
@@ -26,19 +27,11 @@ const WORDING = {
   new: { title: "New document", action: "Create" },
 } as const;
 
-/** `value` as it was `delayMs` ago: it follows once it has stayed the same that long. */
-function useSettled<T>(value: T, delayMs: number): T {
-  const [settled, setSettled] = useState(value);
-  useEffect(() => {
-    const timer = window.setTimeout(() => setSettled(value), delayMs);
-    return () => window.clearTimeout(timer);
-  }, [value, delayMs]);
-  return settled;
-}
-
 /** The names of a scope's collections, for the Collection field's suggestions; none until bucket and scope are known. */
 function useCollectionNames(profileId: string, bucket: string, scope: string): string[] {
-  const settled = useSettled({ bucket, scope }, LOOKUP_DELAY_MS);
+  // One object per pair of names: a literal made at each render would settle anew every LOOKUP_DELAY_MS, for ever
+  const typed = useMemo(() => ({ bucket, scope }), [bucket, scope]);
+  const settled = useDebouncedValue(typed, LOOKUP_DELAY_MS);
   const known = settled.bucket !== "" && settled.scope !== "";
   const path = [
     { kind: "bucket", name: settled.bucket },

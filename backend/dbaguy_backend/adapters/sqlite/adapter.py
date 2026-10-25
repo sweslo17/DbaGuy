@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -8,6 +9,7 @@ from urllib.parse import quote, unquote, urlparse
 
 from loguru import logger
 
+from ...domain.data_jobs import DumpObjectKinds, DumpScope
 from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import ColumnCategory, ColumnMeta, ServerMessage
@@ -20,7 +22,10 @@ from ..base import (
     AdapterCapabilities,
     DatabaseAdapter,
     DatabaseConnection,
+    DataTools,
+    Dumping,
     Endpoint,
+    InvalidText,
     ParsedUrl,
     RowEditing,
     RunOptions,
@@ -30,10 +35,16 @@ from ..base import (
     transaction_open_error,
 )
 from ..cancel_window import CancelWindow
-from . import editing, introspection
+from ..columns import TableColumn
+from ..dump import DumpCatalog, DumpSession
+from . import columns, dump, editing, introspection
 from . import schema as sqlite_schema
 
 _PEEK_ROWS = 200
+_NOT_UTF8 = re.compile(r"Could not decode to UTF-8 column '(.*?)' with text", re.DOTALL)  # the driver's
+# sqlite3 keeps this many compiled statements per connection (128 by default). Run SQL file's multi-row INSERTs
+# never repeat, and 128 compiled 1,000-row INSERTs held 300 MB (⑥ A10): statements are compiled each time instead
+_STATEMENT_CACHE = 0
 _PROGRESS_OPS = 10_000  # VM instructions between two looks at the cancel flag: ~0.3% slower, stops within ~0.1 ms
 # Statements that control the transaction themselves or cannot run inside one: manual mode does not BEGIN for them.
 _NO_AUTO_BEGIN = frozenset(
@@ -41,10 +52,13 @@ _NO_AUTO_BEGIN = frozenset(
 )
 
 
-def _translate(exc: sqlite3.Error) -> StatementError:
+def _translate(exc: sqlite3.Error, *, catalog: bool = False) -> StatementError:
+    """`catalog`: the error came from a read of the schema (sqlite_master, the pragmas), not of the user's rows."""
     message = str(exc)
     if isinstance(exc, sqlite3.OperationalError) and message == "interrupted":
         return StatementCancelled()
+    if isinstance(exc, sqlite3.OperationalError) and (found := _NOT_UTF8.match(message)):
+        return InvalidText(found.group(1), in_catalog=catalog)  # the driver's text quotes the value (Task 9 fix L2)
     return StatementError(message, code=getattr(exc, "sqlite_errorname", None))
 
 
@@ -118,8 +132,10 @@ class _CancelGate:
 
 
 class SqliteStatementResult(StatementResult):
-    def __init__(self, cursor: sqlite3.Cursor, gate: _CancelGate) -> None:
-        """Called by `run()` inside `gate.call()`, right after `execute()`, so reading the first rows is covered too."""
+    def __init__(self, cursor: sqlite3.Cursor, gate: _CancelGate, *, peek: bool = True) -> None:
+        """Called by `run()` inside `gate.call()`, right after `execute()`, so reading the first rows is covered too.
+        `peek` False (RunOptions.describe False: nobody is shown the columns' types): no rows are read ahead for them
+        (a dump sizes its reads by the rows' size, 06a pre-flight M12)."""
         self._cursor = cursor
         self._gate = gate
         self._buffer: list[tuple[Any, ...]] = []
@@ -127,7 +143,8 @@ class SqliteStatementResult(StatementResult):
         self._closed = False
         if cursor.description is not None:
             try:
-                self._buffer = cursor.fetchmany(_PEEK_ROWS)
+                if peek:
+                    self._buffer = cursor.fetchmany(_PEEK_ROWS)
             except sqlite3.Error as exc:
                 raise _translate(exc) from exc
             self._columns = [self._column(i, d[0]) for i, d in enumerate(cursor.description)]
@@ -171,7 +188,7 @@ class SqliteStatementResult(StatementResult):
             self._cursor.close()
 
 
-class SqliteConnection(DatabaseConnection, RowEditing):
+class SqliteConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
     def __init__(self, conn: sqlite3.Connection, path: Path) -> None:
         self._conn = conn  # isolation_level=None: the driver never begins a transaction on its own
         self._path = path
@@ -188,25 +205,40 @@ class SqliteConnection(DatabaseConnection, RowEditing):
         try:
             return introspection.list_children(self._conn, path)
         except sqlite3.Error as exc:
-            raise _translate(exc) from exc
+            raise _translate(exc, catalog=True) from exc
 
     def object_detail(self, path: list[PathSegment]) -> ObjectDetail:
         try:
             return introspection.object_detail(self._conn, path)
         except sqlite3.Error as exc:
-            raise _translate(exc) from exc
+            raise _translate(exc, catalog=True) from exc
 
-    def edit_target(self, path: list[PathSegment]) -> EditTarget:
-        try:
+    def edit_target(self, path: list[PathSegment], *, order: bool = True) -> EditTarget:
+        try:  # no stable_order to plan (PostgreSQL's only)
             return editing.edit_target(self._conn, path)
         except sqlite3.Error as exc:
-            raise _translate(exc) from exc
+            raise _translate(exc, catalog=True) from exc
+
+    def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
+        try:
+            return columns.table_columns(self._conn, path)
+        except sqlite3.Error as exc:
+            raise _translate(exc, catalog=True) from exc
+
+    def dump_session(self, scope: DumpScope) -> DumpSession:
+        return dump.SESSION
+
+    def dump_catalog(self, scope: DumpScope, kinds: DumpObjectKinds, *, ddl: bool = True) -> DumpCatalog:
+        try:
+            return dump.dump_catalog(self._conn, scope, kinds, ddl=ddl)
+        except sqlite3.Error as exc:
+            raise _translate(exc, catalog=True) from exc
 
     def schema_snapshot(self) -> SchemaSnapshot:
         try:
             return sqlite_schema.build_snapshot(self._conn)
         except sqlite3.Error as exc:
-            raise _translate(exc) from exc
+            raise _translate(exc, catalog=True) from exc
 
     def _begin_if_manual(self, sql: str) -> None:
         """Manual mode: open the transaction the statement runs in, as psycopg does for PostgreSQL.
@@ -227,7 +259,7 @@ class SqliteConnection(DatabaseConnection, RowEditing):
             cursor = self._conn.cursor()
             try:
                 cursor.execute(sql)
-                return SqliteStatementResult(cursor, self._gate)
+                return SqliteStatementResult(cursor, self._gate, peek=options is None or options.describe)
             except sqlite3.Error as exc:
                 cursor.close()
                 raise _translate(exc) from exc
@@ -277,7 +309,7 @@ class SqliteAdapter(DatabaseAdapter):
     url_schemes = ("sqlite",)
     default_port = None
     dialect = Dialect.SQLITE
-    capabilities = AdapterCapabilities(row_editing=True)
+    capabilities = AdapterCapabilities(row_editing=True, run_file=True, dump=True, copy_data=True)
 
     def parse_url(self, url: str) -> ParsedUrl:
         """`sqlite:///abs/path` and `sqlite:////abs/path` (SQLAlchemy's absolute form) are absolute paths, `sqlite://rel`
@@ -303,7 +335,8 @@ class SqliteAdapter(DatabaseAdapter):
         uri = f"file:{quote(str(path))}?mode={mode}"
         conn: sqlite3.Connection | None = None
         try:
-            conn = sqlite3.connect(uri, uri=True, isolation_level=None, check_same_thread=True)
+            conn = sqlite3.connect(uri, uri=True, isolation_level=None, check_same_thread=True,
+                                   cached_statements=_STATEMENT_CACHE)
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("SELECT count(*) FROM sqlite_master").fetchone()  # fails for non-database files
         except sqlite3.Error as exc:

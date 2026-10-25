@@ -2,23 +2,10 @@ import { X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { create } from "zustand";
 import { cn } from "@/lib/cn";
+import { withToast, type ToastAction, type ToastItem, type ToastKind } from "./toastItems";
 
-export type ToastKind = "info" | "success" | "warning" | "error";
+export type { ToastAction, ToastKind } from "./toastItems";
 
-/** A button on a toast: running it dismisses the toast. */
-export interface ToastAction {
-  label: string;
-  run: () => void;
-}
-
-interface ToastItem {
-  id: number;
-  kind: ToastKind;
-  text: string;
-  action?: ToastAction;
-}
-
-const MAX_VISIBLE = 4;
 const DURATION_MS: Record<ToastKind, number> = { info: 4000, success: 4000, warning: 4000, error: 8000 };
 const STRIPE: Record<ToastKind, string> = {
   info: "bg-accent",
@@ -32,15 +19,21 @@ let nextId = 1;
 
 /**
  * Shows a toast in the bottom-right corner (app-wide; the oldest goes once more than MAX_VISIBLE are shown). One with an
- * `action` stays as long as an error does: there is something to do with it.
+ * `action` stays as long as an error does: there is something to do with it. `key`: a toast about the same thing as
+ * one still shown takes its place, with its time anew (a job's ending that the backend's word corrected).
  */
-export function toast(kind: ToastKind, text: string, action?: ToastAction): void {
-  const item: ToastItem = { id: nextId++, kind, text, action };
-  useToasts.setState((s) => ({ items: [...s.items, item].slice(-MAX_VISIBLE) }));
+export function toast(kind: ToastKind, text: string, action?: ToastAction, key?: string): void {
+  const item: ToastItem = { id: nextId++, kind, text, action, key };
+  useToasts.setState((s) => ({ items: withToast(s.items, item) }));
 }
 
 function dismiss(id: number): void {
   useToasts.setState((s) => ({ items: s.items.filter((item) => item.id !== id) }));
+}
+
+/** Dismisses the toast shown with `key`, if any (what it said is no longer so: a job's guessed ending, corrected). */
+export function dismissToast(key: string): void {
+  useToasts.setState((s) => (s.items.some((item) => item.key === key) ? { items: s.items.filter((item) => item.key !== key) } : s));
 }
 
 /** One toast: dismisses itself after its kind's duration, counted only while the stack is not hovered. */

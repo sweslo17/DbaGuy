@@ -147,3 +147,6 @@ class EngineInfo(BaseModel):
     row_editing: bool  # a table-data grid can be edited (spec ⑤)
     # A table-data tab's first browse waits for the edit target and sorts by its stable_order (PostgreSQL, 05b K13)
     orders_browse_by_key: bool
+    run_file: bool = False  # Run SQL file (spec ⑥ D-06-13)
+    dump: bool = False  # a native SQL dump (spec ⑥ D-06-13)
+    copy_data: bool = False  # copy rows between connections (spec ⑥ D-06-13; 06c)

@@ -1,4 +1,5 @@
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from .dialects import RULES, BodyRule, ClientCommand, Dialect
@@ -18,6 +19,7 @@ _DELIMITER_ARGUMENT = re.compile(r"[ \t]+(\S+)[^\n]*")  # after the word DELIMIT
 _GO_REST = re.compile(r"(?:[ \t]+(\d+))?[ \t]*(?:--[^\r\n]*)?\r?(?=\n|\Z)")  # after GO: [count] [-- comment], line end
 _MODULES = frozenset({"PROC", "PROCEDURE", "FUNCTION", "TRIGGER", "VIEW"})
 _MAX_COUNT_DIGITS = 9  # `GO n` counts longer than this are read as 10**9
+MODULE_HEAD = 4  # CREATE OR ALTER PROCEDURE: the significant tokens that tell whether a T-SQL batch defines a module
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +32,7 @@ class StatementSpan:
     has_body: bool = False
     repeat: int = 1  # T-SQL "GO n": times the batch runs (0 for GO 0)
     params: tuple[str, ...] = ()  # the parameters it uses (SQL++): $name, $1, and each ?
+    meta: bool = False  # a psql meta-command line (`iter_spans(meta_commands=True)` only): never sent to the server
 
 
 class _BodyTracker:
@@ -96,7 +99,7 @@ class _BodyTracker:
         return self._head_word(0) == "CREATE" and created == "TRIGGER"
 
 
-def _after_account(head: list[Token], i: int) -> int:
+def after_account(head: list[Token], i: int) -> int:
     """`head[i]` follows the word DEFINER: skips `= account`, the account being user, 'user'@'host', `user`@`host`,
     user@host or CURRENT_USER[()], and returns the index after it. The lexer reads `@host` as one word, and a bare
     `@` as a word of its own that a quoted host follows."""
@@ -125,7 +128,7 @@ def _creates_stored_program(head: list[Token]) -> bool:
     if words[i:i + 2] == ["OR", "REPLACE"]:
         i += 2
     if words[i:i + 1] == ["DEFINER"]:
-        i = _after_account(head, i + 1)
+        i = after_account(head, i + 1)
     if words[i:i + 2] == ["SQL", "SECURITY"]:
         i += 3
     return i < len(words) and words[i] in _COMPOUND_OBJECTS
@@ -198,34 +201,46 @@ def _tracker(rule: BodyRule) -> _BodyTracker | _CompoundTracker:
     return _CompoundTracker() if rule is BodyRule.COMPOUND else _BodyTracker(rule)
 
 
-def _params(tokens: list[Token]) -> tuple[str, ...]:
-    """The parameters of one statement in order of first use: `$x` for both `$x` and `@x` (one parameter), `$1`…, and
-    every `?` (each one takes the next positional argument)."""
-    named: dict[str, None] = {}
-    found: list[str] = []
-    for token in tokens:
-        if token.kind != TokenKind.PARAM:
-            continue
-        if token.text == "?":
-            found.append("?")
-        elif (name := "$" + token.text[1:]) not in named:
-            named[name] = None
-            found.append(name)
-    return tuple(found)
+class _Accumulator:
+    """What one statement's span needs from its tokens, kept as they go by instead of the tokens themselves (D-06-3:
+    a 50 MB INSERT is millions of tokens): where its first and last significant tokens are, its first few significant
+    tokens (T-SQL reads whether a batch defines a module from them) and, when the dialect has them, its parameters."""
 
+    __slots__ = ("start", "end", "head", "_named", "params", "_with_params")
 
-def _emit(
-    spans: list[StatementSpan], text: str, tokens: list[Token], terminator_end: int | None, has_body: bool,
-    repeat: int = 1, params: bool = False,
-) -> None:
-    significant = [t for t in tokens if t.kind not in INSIGNIFICANT]
-    if not significant:
-        return
-    start, end = significant[0].start, significant[-1].end
-    terminator = terminator_end if terminator_end is not None else end
-    spans.append(
-        StatementSpan(start, end, terminator, text[start:end], has_body, repeat, _params(significant) if params else ())
-    )
+    def __init__(self, with_params: bool) -> None:
+        self.start: int | None = None
+        self.end = 0
+        self.head: list[Token] = []
+        self._named: set[str] = set()
+        self.params: list[str] = []
+        self._with_params = with_params
+
+    @property
+    def started(self) -> bool:
+        return self.start is not None
+
+    def add(self, token: Token) -> None:
+        """A significant token of the statement."""
+        if self.start is None:
+            self.start = token.start
+        self.end = token.end
+        if len(self.head) < MODULE_HEAD:
+            self.head.append(token)
+        if self._with_params and token.kind == TokenKind.PARAM:
+            if token.text == "?":  # each `?` takes the next positional argument
+                self.params.append("?")
+            elif (name := "$" + token.text[1:]) not in self._named:  # `$x` for both `$x` and `@x`: one parameter
+                self._named.add(name)
+                self.params.append(name)
+
+    def span(self, text: str, terminator_end: int | None, has_body: bool, repeat: int = 1) -> StatementSpan | None:
+        """The statement's span, None when it holds no significant token (an empty statement, a comment)."""
+        if self.start is None:
+            return None
+        terminator = terminator_end if terminator_end is not None else self.end
+        return StatementSpan(self.start, self.end, terminator, text[self.start:self.end], has_body, repeat,
+                             tuple(self.params))
 
 
 def _first_on_line(text: str, token: Token) -> bool:
@@ -247,6 +262,15 @@ def _delimiter_line(text: str, token: Token, started: bool) -> re.Match[str] | N
     return _DELIMITER_ARGUMENT.match(text, token.end)
 
 
+def _meta_line(text: str, token: Token, started: bool) -> int | None:
+    """A psql meta-command (`\\restrict …`, `\\connect db`): a backslash first on its line where no statement has
+    started (D-06-3). Where its line ends (the newline excluded), or None when the token starts none."""
+    if started or token.kind != TokenKind.OTHER or token.text != "\\" or not _first_on_line(text, token):
+        return None
+    end = text.find("\n", token.start)
+    return len(text) if end < 0 else end
+
+
 def _go_line(text: str, token: Token) -> re.Match[str] | None:
     """A T-SQL `GO [n]` line, as sqlcmd and SSMS read it: the word GO alone on its line, optionally followed by a count
     and a `--` comment. `GO;`, `GO2` and `GO /* c */` are not. A GO inside a string, comment or [name] is not a WORD
@@ -265,65 +289,101 @@ def _go_count(digits: str | None) -> int:
     return int(significant or "0") if len(significant) <= _MAX_COUNT_DIGITS else 10**_MAX_COUNT_DIGITS
 
 
-def _defines_module(significant: list[Token]) -> bool:
+def defines_module(significant: list[Token]) -> bool:
     """CREATE [OR ALTER] | ALTER  PROC|PROCEDURE|FUNCTION|TRIGGER|VIEW. T-SQL requires such a statement to be the only
     one in its batch, so everything after it, up to the GO line, is the module's body and runs later, not now."""
-    words = [t.upper if t.kind == TokenKind.WORD else "" for t in significant[:4]]
+    words = [t.upper if t.kind == TokenKind.WORD else "" for t in significant[:MODULE_HEAD]]
     if words[:3] == ["CREATE", "OR", "ALTER"]:
         return words[3:4] != [] and words[3] in _MODULES
     return words[:1] in (["CREATE"], ["ALTER"]) and len(words) > 1 and words[1] in _MODULES
 
 
-def _split_batches(text: str, dialect: Dialect) -> list[StatementSpan]:
+@dataclass
+class SplitState:
+    """Where splitting stands between two calls of `iter_spans` over a growing text (`StatementStream`): the MySQL
+    terminator a DELIMITER line set (None: `;`), and where the statement that has not ended yet begins — the end of
+    the last terminator (or DELIMITER or GO line) read, so its leading comments come along."""
+
+    delimiter: str | None = None
+    resume: int = 0
+
+
+def _iter_batches(text: str, dialect: Dialect, state: SplitState, final: bool) -> Iterator[StatementSpan]:
     """T-SQL: batches end at GO lines (spec §3.3); `;` never splits a batch, because variables and temporary tables
     live as long as the batch."""
-    spans: list[StatementSpan] = []
-    start = 0
+    start = state.resume
     while True:
-        current: list[Token] = []
+        acc = _Accumulator(with_params=False)
         line: re.Match[str] | None = None
         for token in scan(text, dialect, start):
             if line := _go_line(text, token):
                 break
-            current.append(token)
-        significant = [t for t in current if t.kind not in INSIGNIFICANT]
+            if token.kind not in INSIGNIFICANT:
+                acc.add(token)
         if line is None:
-            _emit(spans, text, current, None, _defines_module(significant))
-            return spans
-        _emit(spans, text, current, line.end(), _defines_module(significant), _go_count(line.group(1)))
-        start = line.end()
+            if final and (span := acc.span(text, None, defines_module(acc.head))) is not None:
+                yield span
+            return
+        if (span := acc.span(text, line.end(), defines_module(acc.head), _go_count(line.group(1)))) is not None:
+            yield span
+        start = state.resume = line.end()
+
+
+def _iter_statements(
+    text: str, dialect: Dialect, state: SplitState, final: bool, meta_commands: bool,
+) -> Iterator[StatementSpan]:
+    rules = RULES[dialect]
+    commands = rules.client_command is ClientCommand.DELIMITER
+    with_params = bool(rules.named_param_prefixes or rules.question_params)
+    start = state.resume
+    while True:
+        tracker = _tracker(rules.body_rule)
+        acc = _Accumulator(with_params)
+        restart: int | None = None
+        for token in scan(text, dialect, start, state.delimiter):
+            if commands and (line := _delimiter_line(text, token, acc.started)):
+                state.delimiter = None if line.group(1) == ";" else line.group(1)
+                restart = line.end()  # the line is consumed: it belongs to no statement and never reaches the server
+                break
+            if meta_commands and (line_end := _meta_line(text, token, acc.started)) is not None:
+                if line_end == len(text) and not final:
+                    return  # its line may go on in the next chunk: it is the statement that has not ended yet
+                end = line_end - 1 if text[line_end - 1:line_end] == "\r" else line_end  # a CRLF line ends before its CR
+                yield StatementSpan(token.start, end, line_end, text[token.start:end], meta=True)
+                restart = line_end
+                break
+            if token.kind == TokenKind.DELIMITER or (
+                state.delimiter is None and token.kind == TokenKind.SEMI and tracker.depth == 0
+            ):
+                if (span := acc.span(text, token.end, tracker.has_body)) is not None:
+                    yield span
+                state.resume = token.end
+                tracker, acc = _tracker(rules.body_rule), _Accumulator(with_params)
+                continue
+            if token.kind not in INSIGNIFICANT:
+                acc.add(token)
+                tracker.feed(token)  # also under a custom delimiter: has_body tells the classifier about bodies
+        if restart is None:
+            if final and (span := acc.span(text, None, tracker.has_body)) is not None:
+                yield span
+            return
+        start = state.resume = restart
+
+
+def iter_spans(
+    text: str, dialect: Dialect, state: SplitState | None = None, *, final: bool = True, meta_commands: bool = False,
+) -> Iterator[StatementSpan]:
+    """The statements of `text[state.resume:]` in one pass, keeping no token list (D-06-3).
+
+    `final` False: `text` is a prefix of a longer text that ends at a line break (`StatementStream`); the statement that
+    has not ended at its end is not given, and `state` says where it begins and which MySQL terminator is in force, so
+    a later call over the longer text, from the start of that line, goes on from there. `meta_commands`: a psql
+    meta-command line (PostgreSQL files) is a span of its own with `meta` set."""
+    state = state if state is not None else SplitState()
+    if RULES[dialect].client_command is ClientCommand.GO:
+        return _iter_batches(text, dialect, state, final)
+    return _iter_statements(text, dialect, state, final, meta_commands)
 
 
 def split(text: str, dialect: Dialect) -> list[StatementSpan]:
-    rules = RULES[dialect]
-    if rules.client_command is ClientCommand.GO:
-        return _split_batches(text, dialect)
-    commands = rules.client_command is ClientCommand.DELIMITER
-    with_params = bool(rules.named_param_prefixes or rules.question_params)
-    spans: list[StatementSpan] = []
-    delimiter: str | None = None  # set by a DELIMITER line; None: `;` ends statements (outside bodies)
-    start = 0
-    while True:
-        tracker = _tracker(rules.body_rule)
-        current: list[Token] = []
-        started = False  # `current` holds a significant token: a statement has begun
-        restart: int | None = None
-        for token in scan(text, dialect, start, delimiter):
-            if commands and (line := _delimiter_line(text, token, started)):
-                delimiter = None if line.group(1) == ";" else line.group(1)
-                restart = line.end()  # the line is consumed: it belongs to no statement and never reaches the server
-                break
-            if token.kind == TokenKind.DELIMITER or (
-                delimiter is None and token.kind == TokenKind.SEMI and tracker.depth == 0
-            ):
-                _emit(spans, text, current, token.end, tracker.has_body, params=with_params)
-                current, tracker, started = [], _tracker(rules.body_rule), False
-                continue
-            current.append(token)
-            if token.kind not in INSIGNIFICANT:
-                started = True
-                tracker.feed(token)  # also under a custom delimiter: has_body tells the classifier about bodies
-        if restart is None:
-            _emit(spans, text, current, None, tracker.has_body, params=with_params)
-            return spans
-        start = restart
+    return list(iter_spans(text, dialect))

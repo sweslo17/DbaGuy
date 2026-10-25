@@ -481,6 +481,169 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/data/dump/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Dump Plan
+         * @description The dump dialog's object list, what the header leaves out, the consistency and the warnings (the metadata
+         *     connection; nothing is written). 422 `not_supported` for an engine without dumps.
+         */
+        post: operations["dump_plan_data_dump_plan_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/data/transfer/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Transfer Plan
+         * @description Copy data's preview (spec ⑥ §3.5.1): each table's column mapping, types and conversions, the statements the copy
+         *     adds, its warnings and problems, and the plan id the copy command takes once (null while there is a problem). A
+         *     read-only target is refused (403) and an engine without copies 422 `not_supported`, before any connection.
+         */
+        post: operations["transfer_plan_data_transfer_plan_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/data/reveal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reveal
+         * @description Show in Finder, for a file a completed dump of this backend run wrote (404 for any other path).
+         */
+        post: operations["reveal_data_reveal_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/data/run-file/inspect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Inspect Run File
+         * @description Run SQL file's dialog: the file's size, first lines and warnings. A read-only connection is refused (403).
+         */
+        post: operations["inspect_run_file_data_run_file_inspect_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/data/run-file/excerpt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run File Excerpt
+         * @description Run SQL file's error list: the file's lines around one line (06b B2). 404 `file_not_found` for no file.
+         */
+        post: operations["run_file_excerpt_data_run_file_excerpt_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/data/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Jobs
+         * @description Newest first: running and finished, until cleared (D-06-10).
+         */
+        get: operations["list_jobs_data_jobs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/data/jobs/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel Job
+         * @description The WebSocket's `cancel`, for a job whose dialog is gone: a job that has ended is left as it is.
+         */
+        post: operations["cancel_job_data_jobs_cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/data/jobs/clear": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Clear Jobs
+         * @description Forget the jobs that have ended (the Jobs list's Clear finished).
+         */
+        post: operations["clear_jobs_data_jobs_clear_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/settings": {
         parameters: {
             query?: never;
@@ -951,6 +1114,40 @@ export interface components {
             /** Comment */
             comment?: string | null;
         };
+        /**
+         * ColumnMapping
+         * @description One source column and where it goes (spec §3.5.1).
+         */
+        ColumnMapping: {
+            /** Source Name */
+            source_name: string;
+            /** Source Type */
+            source_type: string;
+            /** Family */
+            family: string;
+            /** Target Name */
+            target_name?: string | null;
+            /** Target Type */
+            target_type?: string | null;
+            /**
+             * Type Editable
+             * @default false
+             */
+            type_editable: boolean;
+            /**
+             * Overridden
+             * @default false
+             */
+            overridden: boolean;
+            /** Conversion */
+            conversion?: string | null;
+            /** Skipped */
+            skipped?: string | null;
+            /** Identity */
+            identity?: ("keep" | "generate") | null;
+            /** Problem */
+            problem?: string | null;
+        };
         /** ColumnMeta */
         ColumnMeta: {
             /** Name */
@@ -1064,6 +1261,25 @@ export interface components {
              * @default true
              */
             listed: boolean;
+        };
+        /**
+         * CopyDataCommand
+         * @description Copy data between connections (spec ⑥ §3.5.5): the previewed plan, run on this session (the target's), reading
+         *     each table on the source's: the query tab's session the plan's query came from, or one the copy opens and closes
+         *     itself (None). Each table is copied in a transaction of its own; nothing is ever sent again.
+         */
+        CopyDataCommand: {
+            /** Request Id */
+            request_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "copy_data";
+            /** Plan Id */
+            plan_id: string;
+            /** Source Session Id */
+            source_session_id?: string | null;
         };
         /** CouchbaseSettings */
         CouchbaseSettings: {
@@ -1201,6 +1417,206 @@ export interface components {
             text: string | null;
             /** Size */
             size: number;
+        };
+        /**
+         * DumpCommand
+         * @description Dump a scope of this session's database to a SQL file (spec ⑥ §3.3): written through a temporary file, so a
+         *     dump that fails or is cancelled leaves no file and keeps any old one.
+         */
+        DumpCommand: {
+            /** Request Id */
+            request_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "dump";
+            /** Path */
+            path: string;
+            scope: components["schemas"]["DumpScope"];
+            /**
+             * Content
+             * @default both
+             * @enum {string}
+             */
+            content: "schema" | "data" | "both";
+            /**
+             * @default {
+             *       "views": true,
+             *       "sequences": true,
+             *       "types": true,
+             *       "routines": true,
+             *       "triggers": true
+             *     }
+             */
+            objects: components["schemas"]["DumpObjectKinds"];
+            /**
+             * Drop First
+             * @default false
+             */
+            drop_first: boolean;
+            /** Filter */
+            filter?: string | null;
+        };
+        /**
+         * DumpHeader
+         * @description The first lines of a dump DbaGuy wrote (spec ⑥ §3.3.2), as Run SQL file's inspection reads them back: a hint
+         *     for the dialog, never a permission.
+         */
+        DumpHeader: {
+            /** Format */
+            format: number;
+            engine: components["schemas"]["Engine"];
+            /** Server */
+            server?: string | null;
+            /** Scope */
+            scope?: string | null;
+            /** Created */
+            created?: string | null;
+            /**
+             * Drop First
+             * @default false
+             */
+            drop_first: boolean;
+            /**
+             * Filtered
+             * @default false
+             */
+            filtered: boolean;
+            /** Filtered Table */
+            filtered_table?: string | null;
+            /** Lines */
+            lines: string[];
+        };
+        /**
+         * DumpObjectKinds
+         * @description Which objects besides tables a dump writes (R-06-2); a table's own sequences and column types always come
+         *     with it. Routines include MySQL events; views include SQL Server synonyms.
+         */
+        DumpObjectKinds: {
+            /**
+             * Views
+             * @default true
+             */
+            views: boolean;
+            /**
+             * Sequences
+             * @default true
+             */
+            sequences: boolean;
+            /**
+             * Types
+             * @default true
+             */
+            types: boolean;
+            /**
+             * Routines
+             * @default true
+             */
+            routines: boolean;
+            /**
+             * Triggers
+             * @default true
+             */
+            triggers: boolean;
+        };
+        /**
+         * DumpPlan
+         * @description What a dump of a scope would write (POST /data/dump/plan): the dialog's object list and warnings. Read on the
+         *     metadata connection, outside any snapshot; the dump reads the catalog again inside its own.
+         *
+         *     `objects` are the objects the content writes under their own names, in the file's order: schemas, extensions,
+         *     collations, types, sequences, routines, tables, views, triggers, events, synonyms, rules, extended statistics and
+         *     policies. The parts of another object are left to it: a table's indexes, foreign keys, check constraints,
+         *     defaults and settings, a trigger's state, a sequence's owner and value, an identity's value, a table's row-level
+         *     security switch, SQLite's header settings (user_version, application_id). A data-only plan lists the tables, parents
+         *     first, then what only a data-only dump writes (`refresh`: PostgreSQL's materialized views, made again from the
+         *     rows). `not_included` is the header's Not included list, word for word.
+         */
+        DumpPlan: {
+            /** Objects */
+            objects: components["schemas"]["DumpPlanObject"][];
+            /** Not Included */
+            not_included: string[];
+            /**
+             * Consistency
+             * @enum {string}
+             */
+            consistency: "snapshot" | "per_table";
+            /**
+             * Warnings
+             * @default []
+             */
+            warnings: string[];
+        };
+        /**
+         * DumpPlanObject
+         * @description One object a dump writes under its own name, as the dump dialog lists it.
+         */
+        DumpPlanObject: {
+            /** Kind */
+            kind: string;
+            /** Name */
+            name: string;
+            /** Rows Estimate */
+            rows_estimate?: number | null;
+            /**
+             * Notes
+             * @default []
+             */
+            notes: string[];
+        };
+        /** DumpPlanRequest */
+        DumpPlanRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Database */
+            database?: string | null;
+            scope: components["schemas"]["DumpScope"];
+            /**
+             * Content
+             * @default both
+             * @enum {string}
+             */
+            content: "schema" | "data" | "both";
+            /**
+             * @default {
+             *       "views": true,
+             *       "sequences": true,
+             *       "types": true,
+             *       "routines": true,
+             *       "triggers": true
+             *     }
+             */
+            objects: components["schemas"]["DumpObjectKinds"];
+            /** Path */
+            path?: string | null;
+            /**
+             * Drop First
+             * @default false
+             */
+            drop_first: boolean;
+            /** Filter */
+            filter?: string | null;
+        };
+        /**
+         * DumpScope
+         * @description What a dump covers (spec ⑥ §3.3.1): a whole database (PostgreSQL, SQL Server), one schema (MySQL: a database;
+         *     SQLite: main), or named tables and views of one schema.
+         */
+        DumpScope: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "database" | "schema" | "tables";
+            /** Schema Name */
+            schema_name?: string | null;
+            /** Names */
+            names?: string[];
         };
         /** EditChanges */
         EditChanges: {
@@ -1449,6 +1865,21 @@ export interface components {
             row_editing: boolean;
             /** Orders Browse By Key */
             orders_browse_by_key: boolean;
+            /**
+             * Run File
+             * @default false
+             */
+            run_file: boolean;
+            /**
+             * Dump
+             * @default false
+             */
+            dump: boolean;
+            /**
+             * Copy Data
+             * @default false
+             */
+            copy_data: boolean;
         };
         /** ErrorEvent */
         ErrorEvent: {
@@ -1514,9 +1945,9 @@ export interface components {
          */
         ExecutionSchema: {
             /** Command */
-            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["ExportCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"] | components["schemas"]["CommitCommand"] | components["schemas"]["RollbackCommand"] | components["schemas"]["SetAutocommitCommand"] | components["schemas"]["ApplyEditsCommand"];
+            command: components["schemas"]["ExecuteCommand"] | components["schemas"]["ExportCommand"] | components["schemas"]["FetchMoreCommand"] | components["schemas"]["CancelCommand"] | components["schemas"]["DiscardCommand"] | components["schemas"]["CommitCommand"] | components["schemas"]["RollbackCommand"] | components["schemas"]["SetAutocommitCommand"] | components["schemas"]["ApplyEditsCommand"] | components["schemas"]["RunFileCommand"] | components["schemas"]["DumpCommand"] | components["schemas"]["CopyDataCommand"];
             /** Event */
-            event: components["schemas"]["StartedEvent"] | components["schemas"]["ResultSetEvent"] | components["schemas"]["RowsEvent"] | components["schemas"]["ResultSetEndEvent"] | components["schemas"]["AffectedEvent"] | components["schemas"]["MessageEvent"] | components["schemas"]["ErrorEvent"] | components["schemas"]["ProgressEvent"] | components["schemas"]["ConfirmationRequiredEvent"] | components["schemas"]["SessionStateEvent"] | components["schemas"]["FinishedEvent"] | components["schemas"]["EditOutcomeEvent"];
+            event: components["schemas"]["StartedEvent"] | components["schemas"]["ResultSetEvent"] | components["schemas"]["RowsEvent"] | components["schemas"]["ResultSetEndEvent"] | components["schemas"]["AffectedEvent"] | components["schemas"]["MessageEvent"] | components["schemas"]["ErrorEvent"] | components["schemas"]["ProgressEvent"] | components["schemas"]["ConfirmationRequiredEvent"] | components["schemas"]["SessionStateEvent"] | components["schemas"]["FinishedEvent"] | components["schemas"]["EditOutcomeEvent"] | components["schemas"]["JobProgressEvent"] | components["schemas"]["JobOutcomeEvent"];
         };
         /**
          * ExportCommand
@@ -1606,6 +2037,43 @@ export interface components {
             elapsed_ms: number;
             /** Fields */
             fields: components["schemas"]["FieldPath"][];
+        };
+        /**
+         * FileExcerpt
+         * @description Lines of a file around one line (POST /data/run-file/excerpt): where an error of Run SQL file is, for its dialog
+         *     (06b B2). Lines are counted at LF, as a run counts them; text that is not UTF-8 is shown replaced.
+         */
+        FileExcerpt: {
+            /** Path */
+            path: string;
+            /** First Line */
+            first_line: number;
+            /** Text */
+            text: string;
+            /** Found */
+            found: boolean;
+            /** Truncated */
+            truncated: boolean;
+        };
+        /**
+         * FileInspection
+         * @description What Run SQL file's dialog shows of a file before it runs (POST /data/run-file/inspect).
+         */
+        FileInspection: {
+            /** Path */
+            path: string;
+            /** Size */
+            size: number;
+            header?: components["schemas"]["DumpHeader"] | null;
+            /** Preview */
+            preview: string;
+            /** Preview Truncated */
+            preview_truncated: boolean;
+            /**
+             * Warnings
+             * @default []
+             */
+            warnings: string[];
         };
         /** FinishedEvent */
         FinishedEvent: {
@@ -1750,7 +2218,7 @@ export interface components {
              * Status
              * @enum {string}
              */
-            status: "ok" | "error" | "cancelled" | "timeout";
+            status: "ok" | "error" | "cancelled" | "timeout" | "running" | "interrupted";
             /** Error */
             error?: string | null;
             /** Id */
@@ -1809,6 +2277,190 @@ export interface components {
              * @default false
              */
             confirmed: boolean;
+        };
+        /** JobCancelRequest */
+        JobCancelRequest: {
+            /** Session Id */
+            session_id: string;
+            /** Request Id */
+            request_id: string;
+        };
+        /**
+         * JobError
+         * @description One statement that failed: where, the server's code and its own text (shown, never logged above DEBUG).
+         */
+        JobError: {
+            /** Line */
+            line?: number | null;
+            /** Statement */
+            statement?: number | null;
+            /** Code */
+            code?: string | null;
+            /** Message */
+            message: string;
+        };
+        /**
+         * JobInfo
+         * @description A job of this backend run, as the Jobs list shows it (GET /data/jobs).
+         */
+        JobInfo: {
+            /** Session Id */
+            session_id: string;
+            /** Request Id */
+            request_id: string;
+            /**
+             * Job
+             * @enum {string}
+             */
+            job: "dump" | "run_file" | "copy_data";
+            /** Title */
+            title: string;
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Source Profile Id */
+            source_profile_id?: string | null;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            progress?: components["schemas"]["JobProgressEvent"] | null;
+            outcome?: components["schemas"]["JobOutcomeEvent"] | null;
+        };
+        /**
+         * JobObject
+         * @description One object of a dump, with the rows written for it; one table of a copy, with its outcome.
+         */
+        JobObject: {
+            /** Kind */
+            kind: string;
+            /** Name */
+            name: string;
+            /**
+             * Rows
+             * @default 0
+             */
+            rows: number;
+            /** Outcome */
+            outcome?: ("copied" | "rolled_back" | "not_started" | "unknown") | null;
+            /** Source */
+            source?: string | null;
+        };
+        /**
+         * JobOutcomeEvent
+         * @description How a job ended (R-06-12): sent once, right before the request's `session_state` and `finished`.
+         */
+        JobOutcomeEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "job_outcome";
+            /** Request Id */
+            request_id: string;
+            /**
+             * Job
+             * @enum {string}
+             */
+            job: "dump" | "run_file" | "copy_data";
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "completed" | "failed" | "rolled_back" | "partial" | "stopped" | "unknown" | "not_started";
+            /**
+             * Cancelled
+             * @default false
+             */
+            cancelled: boolean;
+            /**
+             * Rows
+             * @default 0
+             */
+            rows: number;
+            /**
+             * Bytes
+             * @default 0
+             */
+            bytes: number;
+            /**
+             * Statements
+             * @default 0
+             */
+            statements: number;
+            /** Path */
+            path?: string | null;
+            /**
+             * Objects
+             * @default []
+             */
+            objects: components["schemas"]["JobObject"][];
+            /**
+             * Errors
+             * @default []
+             */
+            errors: components["schemas"]["JobError"][];
+            /**
+             * Error Count
+             * @default 0
+             */
+            error_count: number;
+            stopped_at?: components["schemas"]["StoppedAt"] | null;
+            resume_at?: components["schemas"]["StoppedAt"] | null;
+            error?: components["schemas"]["JobError"] | null;
+            /**
+             * Warnings
+             * @default []
+             */
+            warnings: string[];
+        };
+        /**
+         * JobProgressEvent
+         * @description How far a job is (D-06-11): at most every 250 ms, and as each object starts and ends. Cumulative counts.
+         */
+        JobProgressEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "job_progress";
+            /** Request Id */
+            request_id: string;
+            /**
+             * Stage
+             * @default starting
+             * @enum {string}
+             */
+            stage: "starting" | "schema" | "data" | "post_data" | "statements" | "commit";
+            /** Object */
+            object?: string | null;
+            /**
+             * Rows
+             * @default 0
+             */
+            rows: number;
+            /**
+             * Bytes
+             * @default 0
+             */
+            bytes: number;
+            /** Total Bytes */
+            total_bytes?: number | null;
+            /**
+             * Statements
+             * @default 0
+             */
+            statements: number;
+            /**
+             * Errors
+             * @default 0
+             */
+            errors: number;
+            /** Line */
+            line?: number | null;
         };
         JsonValue: unknown;
         /**
@@ -2104,6 +2756,22 @@ export interface components {
             /** Scope */
             scope?: string | null;
         };
+        /**
+         * QuerySource
+         * @description A query tab's result (spec §3.5.1): its statement, run again on the tab's own session as an export is (the same
+         *     transaction, its temporary tables), and the columns the tab already has, which the preview maps without running it.
+         */
+        QuerySource: {
+            /** Sql */
+            sql: string;
+            /** Columns */
+            columns: components["schemas"]["ColumnMeta"][];
+            /**
+             * Title
+             * @default the query
+             */
+            title: string;
+        };
         /** RemoveDocumentRequest */
         RemoveDocumentRequest: {
             /**
@@ -2152,6 +2820,11 @@ export interface components {
              * @enum {string}
              */
             presentation: "grid" | "plan";
+        };
+        /** RevealRequest */
+        RevealRequest: {
+            /** Path */
+            path: string;
         };
         /** RollbackCommand */
         RollbackCommand: {
@@ -2231,6 +2904,62 @@ export interface components {
             index: number;
             /** Rows */
             rows: unknown[][];
+        };
+        /**
+         * RunFileCommand
+         * @description Run a SQL file on this session, a statement at a time (spec ⑥ §3.4): all of it in one transaction, or each
+         *     statement on its own (stopping at an error, or skipping it). Statements before `from_statement` are read, never
+         *     sent. `from_line`: the line that statement started at when a run before gave the place (`resume_at`): a file whose
+         *     statement starts elsewhere now changed, and the run is refused before any of it is sent (06b review M3).
+         */
+        RunFileCommand: {
+            /** Request Id */
+            request_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "run_file";
+            /** Path */
+            path: string;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "all_or_nothing" | "statements";
+            /**
+             * On Error
+             * @default stop
+             * @enum {string}
+             */
+            on_error: "stop" | "continue";
+            /**
+             * From Statement
+             * @default 1
+             */
+            from_statement: number;
+            /** From Line */
+            from_line?: number | null;
+            /** Search Path */
+            search_path?: string | null;
+            query_context?: components["schemas"]["QueryContext"] | null;
+        };
+        /** RunFileExcerptRequest */
+        RunFileExcerptRequest: {
+            /** Path */
+            path: string;
+            /** Line */
+            line: number;
+        };
+        /** RunFileInspectRequest */
+        RunFileInspectRequest: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Path */
+            path: string;
         };
         /** RunSettings */
         RunSettings: {
@@ -2582,6 +3311,24 @@ export interface components {
              */
             descending: boolean;
         };
+        /**
+         * SourceSpec
+         * @description Tables, views and materialized views of one connection, or a query tab's result.
+         */
+        SourceSpec: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Database */
+            database?: string | null;
+            /** Tables */
+            tables?: components["schemas"]["PathSegment"][][] | null;
+            query?: components["schemas"]["QuerySource"] | null;
+            /** Filter */
+            filter?: string | null;
+        };
         /** SplitRequest */
         SplitRequest: {
             /** Text */
@@ -2830,12 +3577,154 @@ export interface components {
             /** Params */
             params: string[];
         };
+        /**
+         * StoppedAt
+         * @description A place in a run's file: where it stopped (the statement that failed, was cancelled or was not sent), or where a
+         *     run again starts (`resume_at`, 06b B1). `exact`: `line` is where that statement starts. False for a stop with no
+         *     statement of its own (a line that is not UTF-8 inside a statement, a psql command, a statement over the limit, a
+         *     read error): the line is where the run stopped, so a run again from it sends no `from_line` (06b review M-b).
+         */
+        StoppedAt: {
+            /** Line */
+            line: number;
+            /** Statement */
+            statement: number;
+            /** Exact */
+            exact?: boolean;
+        };
+        /**
+         * TableTransfer
+         * @description One table of the copy, in the order the copy runs (spec §3.5.1).
+         */
+        TableTransfer: {
+            /** Source */
+            source: string;
+            /** Target */
+            target: string;
+            /** Source Key */
+            source_key: string;
+            /** Source Path */
+            source_path?: components["schemas"]["PathSegment"][] | null;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "create" | "append" | "replace_rows";
+            /** Columns */
+            columns: components["schemas"]["ColumnMapping"][];
+            /**
+             * Before
+             * @default []
+             */
+            before: string[];
+            /**
+             * After
+             * @default []
+             */
+            after: string[];
+            /**
+             * Warnings
+             * @default []
+             */
+            warnings: string[];
+            /**
+             * Problems
+             * @default []
+             */
+            problems: components["schemas"]["TransferProblem"][];
+        };
+        /**
+         * TargetSpec
+         * @description Where the rows go (spec §3.5.1). `overrides`, `identity` and `left_out` are by the source table's name (a
+         *     query's: its `title`) and then the source column's.
+         */
+        TargetSpec: {
+            /**
+             * Profile Id
+             * Format: uuid
+             */
+            profile_id: string;
+            /** Database */
+            database?: string | null;
+            /** Schema Name */
+            schema_name?: string | null;
+            /** Table */
+            table?: string | null;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "create" | "append" | "replace_rows";
+            /** Overrides */
+            overrides?: {
+                [key: string]: {
+                    [key: string]: string;
+                };
+            };
+            /** Identity */
+            identity?: {
+                [key: string]: {
+                    [key: string]: "keep" | "generate";
+                };
+            };
+            /** Left Out */
+            left_out?: {
+                [key: string]: string[];
+            };
+        };
         /** TextSelection */
         TextSelection: {
             /** Anchor */
             anchor: number;
             /** Head */
             head: number;
+        };
+        /**
+         * TransferPlan
+         * @description The preview (POST /data/transfer/plan). `plan_id` is null while any table or the copy has a problem (⑤ E8).
+         */
+        TransferPlan: {
+            /** Plan Id */
+            plan_id?: string | null;
+            /**
+             * Source Profile Id
+             * Format: uuid
+             */
+            source_profile_id: string;
+            /** Tables */
+            tables: components["schemas"]["TableTransfer"][];
+            /**
+             * Warnings
+             * @default []
+             */
+            warnings: string[];
+            /**
+             * Problems
+             * @default []
+             */
+            problems: components["schemas"]["TransferProblem"][];
+        };
+        /**
+         * TransferProblem
+         * @description Why the copy cannot run as asked (spec §4): the preview has no plan id while there is one.
+         */
+        TransferProblem: {
+            /**
+             * Code
+             * @enum {string}
+             */
+            code: "target_exists" | "target_missing" | "target_not_writable" | "unmappable_type" | "invalid_type" | "same_table" | "same_sqlite_file" | "source_missing" | "missing_column" | "unconvertible" | "query_not_select" | "no_columns" | "duplicate_column" | "invalid_filter" | "duplicate_target" | "cascade_loop" | "name_too_long";
+            /** Message */
+            message: string;
+            /** Column */
+            column?: string | null;
+        };
+        /** TransferRequest */
+        TransferRequest: {
+            source: components["schemas"]["SourceSpec"];
+            target: components["schemas"]["TargetSpec"];
+            /** Preview Key */
+            preview_key?: string | null;
         };
         /** UncheckedColumn */
         UncheckedColumn: {
@@ -3883,6 +4772,272 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["EditPreview"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    dump_plan_data_dump_plan_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DumpPlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DumpPlan"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    transfer_plan_data_transfer_plan_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TransferRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TransferPlan"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reveal_data_reveal_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RevealRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    inspect_run_file_data_run_file_inspect_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RunFileInspectRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FileInspection"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    run_file_excerpt_data_run_file_excerpt_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RunFileExcerptRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FileExcerpt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_jobs_data_jobs_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobInfo"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_job_data_jobs_cancel_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["JobCancelRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    clear_jobs_data_jobs_clear_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

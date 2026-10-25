@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Ban, CircleCheck, CircleX, Search, TimerOff, Trash2, X, type LucideIcon } from "lucide-react";
+import { Ban, CircleAlert, CircleCheck, CircleX, LoaderCircle, Search, TimerOff, Trash2, X, type LucideIcon } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { EngineIcon } from "@/components/EngineIcon";
 import { Button } from "@/components/ui/Button";
@@ -29,6 +29,9 @@ const STATUS: Record<HistoryStatus, { icon: LucideIcon; label: string; className
   error: { icon: CircleX, label: "Failed", className: "text-danger" },
   timeout: { icon: TimerOff, label: "Timed out", className: "text-warning" },
   cancelled: { icon: Ban, label: "Cancelled", className: "text-muted" },
+  // spec ⑥ D-06-9: a Run SQL file or copy that has not ended, or that was running when the backend ended
+  running: { icon: LoaderCircle, label: "Running", className: "text-muted" },
+  interrupted: { icon: CircleAlert, label: "Interrupted", className: "text-warning" },
 };
 
 function StatusIcon({ status }: { status: HistoryStatus }) {

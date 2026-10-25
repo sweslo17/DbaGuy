@@ -1,6 +1,6 @@
 import { memo, useCallback } from "react";
 import type { MenuItem } from "@/components/ui/ContextMenu";
-import type { Dialect } from "@/lib/api/types";
+import type { ColumnMeta, Dialect } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { askOpenDocument, idPrefill, prefillKeyspace } from "../documents/openDocument";
 import { DataGrid } from "../grid/DataGrid";
@@ -25,6 +25,11 @@ export interface ResultGridProps {
   exportable: boolean;
   /** Opens the tab's export dialog for this statement and what it was sent with; stable across renders. */
   onExport: (sql: string, request: RequestOptions) => void;
+  /**
+   * Opens the copy dialog for this statement's result, with its columns (spec ⑥ §3.6, 06c); stable across renders.
+   * Absent: the connection's engine does not copy.
+   */
+  onCopyToTable?: (sql: string, columns: ColumnMeta[]) => void;
   controller: SessionController | null;
   pageSize: number;
   dialect: Dialect | null;
@@ -38,10 +43,11 @@ export interface ResultGridProps {
  * changed (the reducer keeps the identity of every untouched execution and set), not every grid of the run.
  */
 export const ResultGrid = memo(function ResultGrid(props: ResultGridProps) {
-  const { set, requestId, sql, request, controller, pageSize, canLoadMore, exportable, onExport } = props;
+  const { set, requestId, sql, request, controller, pageSize, canLoadMore, exportable, onExport, onCopyToTable } = props;
   const { documentsProfileId } = props;
   const loadMore = useCallback(() => controller?.fetchMore(requestId, pageSize), [controller, requestId, pageSize]);
   const exportThis = useCallback(() => onExport(sql, request), [onExport, sql, request]);
+  const copyThis = useCallback(() => onCopyToTable?.(sql, set.columns), [onCopyToTable, sql, set.columns]);
   // "Open document…": the ID is the row's `id` column or the clicked text, the collection the one the statement reads
   // (when it reads exactly one), else the run's context and the collection opened last (ruling C44).
   const openDocumentItems = useCallback(
@@ -72,6 +78,7 @@ export const ResultGrid = memo(function ResultGrid(props: ResultGridProps) {
         dialect={props.dialect}
         extraCellMenu={documentsProfileId === null ? undefined : openDocumentItems}
         onExport={controller && exportable ? exportThis : undefined}
+        onCopyToTable={controller && exportable && onCopyToTable && set.columns.length ? copyThis : undefined}
       />
     </div>
   );

@@ -424,3 +424,11 @@ def test_sqlpp_spans_carry_their_parameters():
     assert first.params == ("$a", "$b", "$1", "?", "?")  # @a is $a; strings and names are not parameters
     assert second.params == ("$e",)
     assert split("SELECT $1", Dialect.POSTGRES)[0].params == ()  # only dialects with named or ? parameters
+
+
+def test_a_partition_clause_with_an_end_of_comment_in_its_strings_is_one_statement():  # 06a Task 6 review T8
+    ddl = ("CREATE TABLE pl (id int NOT NULL, s varchar(10) NOT NULL)\n/*!50500 PARTITION BY LIST  COLUMNS(s)\n"
+           "(PARTITION p1 VALUES IN ('a*/b') COMMENT = 'x */ ; y' ENGINE = InnoDB,\n"
+           " PARTITION p2 VALUES IN ('c') ENGINE = InnoDB) */")
+    assert [span.text for span in split(f"{ddl};\nCREATE TABLE z (id int);\n", Dialect.MYSQL)] == [
+        ddl, "CREATE TABLE z (id int)"]

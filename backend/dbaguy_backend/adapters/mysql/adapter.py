@@ -14,6 +14,7 @@ from mysql.connector.connection import MySQLConnection
 from mysql.connector.constants import ServerFlag
 from mysql.connector.cursor import MySQLCursorRaw
 
+from ...domain.data_jobs import DumpObjectKinds, DumpScope
 from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import ColumnMeta, ErrorPosition, MessageSeverity, ServerMessage
@@ -26,6 +27,8 @@ from ..base import (
     AdapterCapabilities,
     DatabaseAdapter,
     DatabaseConnection,
+    DataTools,
+    Dumping,
     Endpoint,
     ParsedUrl,
     RowEditing,
@@ -37,8 +40,10 @@ from ..base import (
     transaction_open_error,
 )
 from ..cancel_window import CancelWindow
+from ..columns import TableColumn
+from ..dump import DumpCatalog, DumpSession
 from ..sockets import enable_keepalive
-from . import catalog, editing, introspection
+from . import catalog, columns, dump, editing, introspection
 from . import schema as mysql_schema
 from .settings import URL_SCHEMES, connect_params, kill_params, parse_mysql_url, requires_tls, session_settings
 from .types import column_meta, row_converter
@@ -183,7 +188,7 @@ class MysqlResult(StatementResult):
         self._owner.finish(self._cursor, more_results=not self._failed)
 
 
-class MysqlConnection(DatabaseConnection, RowEditing):
+class MysqlConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
     def __init__(self, conn: MySQLConnection, kill_params: dict[str, Any], read_only: bool, database: str | None) -> None:
         self._conn = conn
         self._kill_params = kill_params
@@ -410,8 +415,9 @@ class MysqlConnection(DatabaseConnection, RowEditing):
         self._ok_status = cursor.ok_status
         result = MysqlResult(self, cursor, update=keyword == "UPDATE")
         if self._killed.is_set():  # it ended normally after KILL QUERY (SLEEP() returns 1): still a cancel
+            completed = not self._conn.have_next_result  # a CALL with more result sets to come is not over
             result.close()  # finish() clears the flag
-            raise StatementCancelled()
+            raise StatementCancelled(completed=completed)
         return result
 
     # ---- transactions ----
@@ -488,8 +494,24 @@ class MysqlConnection(DatabaseConnection, RowEditing):
     def object_detail(self, path: list[PathSegment]) -> ObjectDetail:
         return introspection.object_detail(self._conn, path)
 
-    def edit_target(self, path: list[PathSegment]) -> EditTarget:
-        return editing.edit_target(self._conn, path)
+    def edit_target(self, path: list[PathSegment], *, order: bool = True) -> EditTarget:
+        return editing.edit_target(self._conn, path)  # no stable_order to plan (PostgreSQL's only)
+
+    def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
+        try:
+            return columns.table_columns(self._conn, path)
+        except mysql.connector.Error as exc:
+            raise self.translate_error(exc) from exc
+
+    def dump_session(self, scope: DumpScope) -> DumpSession:
+        return dump.session(scope.schema_name or self._database or "")
+
+    def dump_catalog(self, scope: DumpScope, kinds: DumpObjectKinds, *, ddl: bool = True) -> DumpCatalog:
+        info = self.server_info()  # its current database too: the dump session USEs the dumped one
+        try:
+            return dump.dump_catalog(self._conn, info.current_database, scope, kinds, info.version, ddl=ddl)
+        except mysql.connector.Error as exc:
+            raise self.translate_error(exc) from exc
 
     def schema_snapshot(self) -> SchemaSnapshot:
         return mysql_schema.build_snapshot(self._conn)
@@ -537,7 +559,7 @@ class MysqlAdapter(DatabaseAdapter):
     default_port = 3306
     dialect = Dialect.MYSQL
     # one connection sees every database; KILL QUERY keeps the transaction
-    capabilities = AdapterCapabilities(row_editing=True)
+    capabilities = AdapterCapabilities(row_editing=True, run_file=True, dump=True, copy_data=True)
 
     def parse_url(self, url: str) -> ParsedUrl:
         return parse_mysql_url(url)

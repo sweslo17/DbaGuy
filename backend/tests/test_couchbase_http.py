@@ -15,7 +15,7 @@ from dbaguy_backend.adapters.couchbase.http import (
 )
 from dbaguy_backend.adapters.couchbase.stream import EndEvent, FieldEvent, ResponseParser, RowEvent
 from tests.couchbase_fakes import (
-    FailingContext, FakeQueryServer, FullListenQueue, PlainHttpPort, Reply, cert_error, ssl_error,
+    FailingContext, FakeQueryServer, PlainHttpPort, Reply, SilentHost, cert_error, ssl_error,
 )
 from tests.support import (
     COUCHBASE_HOST, COUCHBASE_PASSWORD, COUCHBASE_PORT, COUCHBASE_TLS_PORT, COUCHBASE_USER, LONG_AGGREGATE,
@@ -302,8 +302,8 @@ def test_a_host_name_with_more_addresses_tries_the_next_one():  # `localhost`: :
 
 
 def test_a_cancel_while_connecting_ends_the_connect_at_once():  # R-04a-T7a
-    queue = FullListenQueue()
-    client = NodeClient("127.0.0.1", queue.port, auth="", user_agent="DbaGuy/test", tls=None)
+    silent = SilentHost()
+    client = NodeClient(silent.host, silent.port, auth="", user_agent="DbaGuy/test", tls=None)
     shut_at = []
 
     def attach(channel):
@@ -320,13 +320,13 @@ def test_a_cancel_while_connecting_ends_the_connect_at_once():  # R-04a-T7a
         assert str(error.value) == "cancelled while connecting"
     finally:
         client.close()
-        queue.close()
+        silent.close()
 
 
 def test_a_connect_that_gets_no_answer_times_out(monkeypatch):
     monkeypatch.setattr(http_module, "CONNECT_TIMEOUT_S", 0.3)  # the whole attempt, every address
-    queue = FullListenQueue()
-    client = NodeClient("127.0.0.1", queue.port, auth="", user_agent="DbaGuy/test", tls=None)
+    silent = SilentHost()
+    client = NodeClient(silent.host, silent.port, auth="", user_agent="DbaGuy/test", tls=None)
     try:
         started = time.monotonic()
         with pytest.raises(ChannelError) as error:
@@ -335,7 +335,7 @@ def test_a_connect_that_gets_no_answer_times_out(monkeypatch):
         assert (str(error.value), error.value.before_response) == ("timed out", False)
     finally:
         client.close()
-        queue.close()
+        silent.close()
 
 
 @pytest.mark.parametrize("error, kind", [

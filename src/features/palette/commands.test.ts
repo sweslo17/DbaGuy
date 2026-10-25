@@ -61,6 +61,7 @@ function context(activeTab: Tab | null, editActions: CommandContext["editActions
     activeTab,
     tabActions: null,
     editActions,
+    tableActions: null,
     settings: { loaded: true, current: {} as AppSettings, save: async (next) => next },
     queryClient: queryClient(rowEditing),
   };

@@ -5,12 +5,11 @@ the I/O and asks here. Messages name the row by its key: they go to the user's d
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from ..adapters.base import StatementCancelled, StatementError
+from ..adapters.base import CONNECTION_LOST, StatementCancelled, StatementError
 from ..domain.dialect import Dialect
 from ..domain.edits import PlannedStatement
 from ..domain.execution import EditOutcome
 
-CONNECTION_LOST = "connection_lost"
 EDIT_CONFLICT = "edit_conflict"
 ROW_COUNT_UNKNOWN = "row_count_unknown"
 OUTCOME_UNKNOWN = "outcome_unknown"

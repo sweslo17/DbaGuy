@@ -1,11 +1,15 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .classification import Classification, GuardReason
 from .column_category import ColumnCategory
+from .data_jobs import (
+    DUMP_FILTER_LENGTH, FILTER_ONE_TABLE, DumpContent, DumpObjectKinds, DumpScope, JobCommand, JobOutcomeEvent,
+    JobProgressEvent, filter_fits,
+)
 from .formats import FormatKind, RowFormatOptions
 
 Presentation = Literal["grid", "plan"]  # "plan": an EXPLAIN / ADVISE / profile result the client may show as a plan
@@ -210,9 +214,63 @@ class ApplyEditsCommand(BaseModel):
     plan_id: str = Field(min_length=1, max_length=64)
 
 
+class RunFileCommand(JobCommand):
+    """Run a SQL file on this session, a statement at a time (spec ⑥ §3.4): all of it in one transaction, or each
+    statement on its own (stopping at an error, or skipping it). Statements before `from_statement` are read, never
+    sent. `from_line`: the line that statement started at when a run before gave the place (`resume_at`): a file whose
+    statement starts elsewhere now changed, and the run is refused before any of it is sent (06b review M3)."""
+
+    job_kind = "run_file"
+    type: Literal["run_file"] = "run_file"
+    path: str = Field(min_length=1, max_length=4096)  # absolute
+    mode: Literal["all_or_nothing", "statements"]
+    on_error: Literal["stop", "continue"] = "stop"  # continue: statement by statement only (R-06-7)
+    from_statement: int = Field(default=1, ge=1)
+    from_line: int | None = Field(default=None, ge=1)
+    search_path: str | None = Field(default=None, min_length=1, max_length=1024)  # PostgreSQL: one schema
+    query_context: QueryContext | None = None  # Couchbase
+
+    @model_validator(mode="after")
+    def _continue_only_statement_by_statement(self) -> Self:
+        if self.mode == "all_or_nothing" and self.on_error == "continue":
+            raise ValueError("an all-or-nothing run stops at the first error: skip errors statement by statement")
+        return self
+
+
+class DumpCommand(JobCommand):
+    """Dump a scope of this session's database to a SQL file (spec ⑥ §3.3): written through a temporary file, so a
+    dump that fails or is cancelled leaves no file and keeps any old one."""
+
+    job_kind = "dump"
+    type: Literal["dump"] = "dump"
+    path: str = Field(min_length=1, max_length=4096)  # absolute, in an existing folder
+    scope: DumpScope
+    content: DumpContent = "both"
+    objects: DumpObjectKinds = DumpObjectKinds()
+    drop_first: bool = False  # a DROP … IF EXISTS before each object it creates (the header says so)
+    filter: str | None = Field(default=None, max_length=DUMP_FILTER_LENGTH)  # one table only: the table-data tab's
+
+    @model_validator(mode="after")
+    def _a_filter_for_one_table_only(self) -> Self:
+        if not filter_fits(self.scope, self.filter):
+            raise ValueError(FILTER_ONE_TABLE)
+        return self
+
+
+class CopyDataCommand(JobCommand):
+    """Copy data between connections (spec ⑥ §3.5.5): the previewed plan, run on this session (the target's), reading
+    each table on the source's: the query tab's session the plan's query came from, or one the copy opens and closes
+    itself (None). Each table is copied in a transaction of its own; nothing is ever sent again."""
+
+    job_kind = "copy_data"
+    type: Literal["copy_data"] = "copy_data"
+    plan_id: str = Field(min_length=1, max_length=64)
+    source_session_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+
 ClientCommand = Annotated[
     ExecuteCommand | ExportCommand | FetchMoreCommand | CancelCommand | DiscardCommand | CommitCommand
-    | RollbackCommand | SetAutocommitCommand | ApplyEditsCommand,
+    | RollbackCommand | SetAutocommitCommand | ApplyEditsCommand | RunFileCommand | DumpCommand | CopyDataCommand,
     Field(discriminator="type"),
 ]
 
@@ -326,7 +384,8 @@ class EditOutcomeEvent(BaseModel):
 
 ServerEvent = Annotated[
     StartedEvent | ResultSetEvent | RowsEvent | ResultSetEndEvent | AffectedEvent | MessageEvent | ErrorEvent
-    | ProgressEvent | ConfirmationRequiredEvent | SessionStateEvent | FinishedEvent | EditOutcomeEvent,
+    | ProgressEvent | ConfirmationRequiredEvent | SessionStateEvent | FinishedEvent | EditOutcomeEvent
+    | JobProgressEvent | JobOutcomeEvent,
     Field(discriminator="type"),
 ]
 

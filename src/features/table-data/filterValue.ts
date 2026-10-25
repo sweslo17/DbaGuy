@@ -1,6 +1,13 @@
 import { api, unwrap } from "@/lib/api/client";
 import type { ColumnMeta, Dialect, PathSegment } from "@/lib/api/types";
 
+/**
+ * What a filter may be (06a ruling U3: the backend refuses anything else, `invalid_filter`): the table-data tab's filter
+ * bar and a filtered dump say it.
+ */
+export const FILTER_RULE =
+  "A filter is one condition on the rows, as after WHERE: no ORDER BY, LIMIT or second statement (sort with the column headers).";
+
 /** Tree object kinds that hold rows: they open as a table data tab (keep in sync with select_builder.py). */
 export const RELATION_KINDS: ReadonlySet<string> = new Set(["table", "view", "materialized_view", "partition"]);
 
@@ -12,13 +19,17 @@ export interface Relation {
   kind: string;
 }
 
+/** The database a tree path sits in (its first segment, PostgreSQL and SQL Server); null when the engine has none. */
+export const databaseOf = (path: PathSegment[]): string | null => (path[0]?.kind === "database" ? path[0].name : null);
+
+/** The innermost schema a tree path sits in (MySQL's database is its schema node); null when it is in none. */
+export const schemaOf = (path: PathSegment[]): string | null => path.findLast((segment) => segment.kind === "schema")?.name ?? null;
+
 /** The relation a tree path points at, or null when its last segment is not a relation (a function, an index, …). */
 export function relationOf(path: PathSegment[]): Relation | null {
   const last = path.at(-1);
   if (!last || !RELATION_KINDS.has(last.kind)) return null;
-  const database = path[0]?.kind === "database" ? path[0].name : null;
-  const schema = path.findLast((segment) => segment.kind === "schema")?.name ?? null;
-  return { database, schema, name: last.name, kind: last.kind };
+  return { database: databaseOf(path), schema: schemaOf(path), name: last.name, kind: last.kind };
 }
 
 /**

@@ -422,3 +422,25 @@ def test_sqlpp_levels():
     assert (strict.action, strict.reasons) == (A.CONFIRM, [GuardReason.STRICT_WRITE])
     unknown = check("EXECUTE p", SQ, "strict", read_only=False)
     assert (unknown.action, unknown.reasons) == (A.CONFIRM, [GuardReason.STRICT_UNKNOWN])
+
+
+@pytest.mark.parametrize("sql", ["DROP TABLE t", "DELETE FROM t", "TRUNCATE t", "frobnicate", "SELECT 1"])
+def test_a_confirmed_file_runs_unclassified_on_a_writable_connection(sql):  # spec ⑥ R-06-6
+    decision = policy.gate_confirmed(sql, PG, read_only=False)
+    assert (decision.action, decision.classification.kind) == (A.RUN, StatementKind.UNKNOWN)
+
+
+@pytest.mark.parametrize(("sql", "dialect", "action"), [
+    ("SELECT 1", PG, A.RUN),
+    ("SET search_path TO public", PG, A.RUN),
+    ("INSERT INTO t VALUES (1)", PG, A.BLOCK),
+    ("DROP TABLE t", PG, A.BLOCK),  # never CONFIRM: the file was confirmed as a whole
+    ("SELECT set_config('default_transaction_read_only', 'off', false)", PG, A.BLOCK),
+    ("USE dbaguy", Dialect.MYSQL, A.RUN),
+    ("UPSERT INTO ks (KEY, VALUE) VALUES ('k', 1)", Dialect.SQLPP, A.BLOCK),
+])
+def test_a_confirmed_file_on_a_read_only_connection_runs_only_what_check_runs(sql, dialect, action):
+    decision = policy.gate_confirmed(sql, dialect, read_only=True)
+    assert decision.action == action
+    if action == A.BLOCK:
+        assert decision.reasons == [GuardReason.READ_ONLY]

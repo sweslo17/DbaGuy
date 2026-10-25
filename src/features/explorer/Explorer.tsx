@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type Reac
 import { EngineIcon } from "@/components/EngineIcon";
 import { Button } from "@/components/ui/Button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
-import { ContextMenu } from "@/components/ui/ContextMenu";
+import { ContextMenu, type MenuItem } from "@/components/ui/ContextMenu";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
 import type { ObjectNode, ProfileEntry } from "@/lib/api/types";
@@ -17,6 +17,10 @@ import { findEngineInfo, isReadOnlyProfile, useDeleteProfile, useEngines, usePro
 import { profileColor } from "../connections/profileColors";
 import { secretsNeeded } from "../connections/UnlockDialog";
 import { joinUnlockPrompt } from "../connections/unlockPrompts";
+import { openCopyDialog, openDumpDialog, openRunDialog } from "../data-tools/dataDialogs";
+import { copyEntryForNode, dumpEntryForNode, runEntryForNode, type RunEntry } from "../data-tools/entryPoints";
+import { deleteBlockedMessage, runningOn, syncJobs, useJobs } from "../data-tools/jobsStore";
+import { READ_ONLY_RUN } from "../data-tools/runForm";
 import { askOpenDocument } from "../documents/openDocument";
 import { applyTreeContext } from "../query/queryContext";
 import { requestCloseTab, requestDisconnectTab } from "../workspace/closeGuards";
@@ -39,6 +43,16 @@ const BROWSABLE_KIND = "collection";
 const CONTEXT_CLICK_DELAY_MS = 250;
 
 type ErrorRow = Extract<TreeRow, { type: "error" }>;
+
+/**
+ * Run SQL file… for a node (or the connection's row): greyed on a read-only connection, with why (the backend refuses
+ * it before anything is sent, 06a).
+ */
+const runItem = (entry: RunEntry, readOnly: boolean): MenuItem => ({
+  label: "Run SQL file…",
+  onSelect: () => openRunDialog(entry),
+  ...(readOnly ? { disabled: true, title: READ_ONLY_RUN } : {}),
+});
 
 const isExpandable = (row: TreeRow) =>
   row.type === "folder" || row.type === "profile" || (row.type === "node" && row.node.has_children);
@@ -203,9 +217,20 @@ export function Explorer() {
 
   /**
    * Before a profile is deleted, each of its tabs is asked in turn (a running export, a run, an open transaction):
-   * table and object tabs close, query tabs agree to lose their session. Any "no" keeps the profile.
+   * table and object tabs close, query tabs agree to lose their session. Any "no" keeps the profile. First, a
+   * data-tools job running on it keeps it, before any tab is asked: the delete closes every session of the profile,
+   * the jobs' too (B13), and a copy reading from it as well (its source's session, 06c). The backend's list is read
+   * first: a job wrongly guessed lost (`not_listed`) that it has running counts again, and one it does not have never
+   * blocks the delete.
    */
   const releaseTabs = async (profileId: string): Promise<boolean> => {
+    await syncJobs(); // a list that fails is logged, and the jobs stay as this window knows them
+    const jobs = runningOn(useJobs.getState(), profileId);
+    if (jobs.length > 0) {
+      toast("warning", deleteBlockedMessage(jobs, profileId));
+      setToDelete(null); // refused: the confirmation is answered (the toast says why); it does not wait for another click
+      return false;
+    }
     for (const tab of useWorkspace.getState().tabs.filter((t) => t.profileId === profileId)) {
       const agreed = tab.kind === "query" ? await requestDisconnectTab(tab.id) : await requestCloseTab(tab.id);
       if (!agreed && useWorkspace.getState().tabs.some((t) => t.id === tab.id)) {
@@ -272,6 +297,27 @@ export function Explorer() {
     }
   };
 
+  /** A Couchbase collection's items: its documents, its detail and its fields. */
+  const collectionItems = (row: Extract<TreeRow, { type: "node" }>, opensDocuments: boolean): MenuItem[] => {
+    // The dialog asks for the document's ID in this collection: to open it, or to create it (never on a read-only one).
+    const askDocument = (mode: "open" | "new") =>
+      askOpenDocument({ profileId: row.profileId, mode, keyspace: keyspaceOfPath(row.node.path) ?? {} });
+    return [
+      { label: "Browse documents", onSelect: () => void openBrowseTab(row.profileId, row.node.path) },
+      ...(opensDocuments ? [{ label: "Open document by ID…", onSelect: () => askDocument("open") }] : []),
+      ...(opensDocuments && !isReadOnlyProfile(entries, row.profileId)
+        ? [{ label: "New document…", onSelect: () => askDocument("new") }]
+        : []),
+      { label: "Details", onSelect: () => openObject(row.profileId, row.node) },
+      {
+        label: "Sample fields…",
+        title: "Read some of its documents and list their fields (completion offers them)",
+        disabled: keyspaceOfPath(row.node.path) === null,
+        onSelect: () => setSampling({ profileId: row.profileId, node: row.node }),
+      },
+    ];
+  };
+
   const renderRow = (row: TreeRow): ReactNode => {
     const pad = { paddingLeft: 8 + row.depth * 14 };
     const open = expanded.has(row.key);
@@ -296,6 +342,7 @@ export function Explorer() {
       }
       case "profile": {
         const p = row.entry.profile;
+        const runEntry = runEntryForNode(p.id, findEngineInfo(entries, engines, p.id), null);
         const content = (
           <div
             {...aria}
@@ -316,6 +363,7 @@ export function Explorer() {
         return (
           <ContextMenu
             items={[
+              ...(runEntry ? [runItem(runEntry, p.read_only)] : []),
               { label: "New Query", onSelect: () => openQuery(p.id, null) },
               { label: "Edit…", onSelect: () => setDialog({ open: true, entry: row.entry }) },
               { label: "Refresh", onSelect: () => void qc.invalidateQueries({ queryKey: ["children", p.id] }) },
@@ -344,28 +392,20 @@ export function Explorer() {
             {row.node.detail && <span className="ml-auto shrink-[100] truncate pl-2 text-[11px] text-muted">{row.node.detail}</span>}
           </div>
         );
-        if (row.node.kind !== BROWSABLE_KIND) return content;
-        const opensDocuments = findEngineInfo(entries, engines, row.profileId)?.documents === true;
-        // The dialog asks for the document's ID in this collection: to open it, or to create it (never on a read-only one).
-        const askDocument = (mode: "open" | "new") =>
-          askOpenDocument({ profileId: row.profileId, mode, keyspace: keyspaceOfPath(row.node.path) ?? {} });
+        const engine = findEngineInfo(entries, engines, row.profileId);
+        // The data tools first (spec ⑥ §3.6: what the engine can do decides, D-06-13), then a collection's own items
+        const dumpEntry = dumpEntryForNode(row.profileId, engine, row.node);
+        const copyEntry = copyEntryForNode(row.profileId, engine, row.node);
+        const runEntry = runEntryForNode(row.profileId, engine, row.node);
+        const dataItems: MenuItem[] = [
+          ...(dumpEntry ? [{ label: "Dump…", onSelect: () => openDumpDialog(dumpEntry) }] : []),
+          ...(copyEntry ? [{ label: "Copy data to…", onSelect: () => openCopyDialog(copyEntry) }] : []),
+          ...(runEntry ? [runItem(runEntry, isReadOnlyProfile(entries, row.profileId))] : []),
+        ];
+        const items = [...dataItems, ...(row.node.kind === BROWSABLE_KIND ? collectionItems(row, engine?.documents === true) : [])];
+        if (items.length === 0) return content;
         return (
-          <ContextMenu
-            items={[
-              { label: "Browse documents", onSelect: () => void openBrowseTab(row.profileId, row.node.path) },
-              ...(opensDocuments ? [{ label: "Open document by ID…", onSelect: () => askDocument("open") }] : []),
-              ...(opensDocuments && !isReadOnlyProfile(entries, row.profileId)
-                ? [{ label: "New document…", onSelect: () => askDocument("new") }]
-                : []),
-              { label: "Details", onSelect: () => openObject(row.profileId, row.node) },
-              {
-                label: "Sample fields…",
-                title: "Read some of its documents and list their fields (completion offers them)",
-                disabled: keyspaceOfPath(row.node.path) === null,
-                onSelect: () => setSampling({ profileId: row.profileId, node: row.node }),
-              },
-            ]}
-          >
+          <ContextMenu items={items} onContextMenu={() => selectByClick(row)}>
             {content}
           </ContextMenu>
         );

@@ -1,6 +1,7 @@
 import type { EditOutcome, EditOutcomeEvent, EditPreview } from "@/lib/api/types";
 import { plainValue } from "@/lib/cells";
 import { plural } from "@/lib/format";
+import { isSqliteBusy, sqliteBusyNote } from "@/lib/sqliteBusy";
 import { CONNECTION_LOST, INTERRUPTED_MESSAGE, NOT_CONNECTED_CODE, type ExecutionState } from "../session/execution";
 import type { SessionPhase } from "../session/SessionController";
 import { findChange, type AppliedOutcome, type StagedProblem, type Staging } from "./staging";
@@ -196,8 +197,7 @@ export const TRANSACTION_OPEN_NOTE =
   "This tab's session has a transaction open (for example from SQL Server's IMPLICIT_TRANSACTIONS login option): roll it back or reconnect, then preview again.";
 export const SQL_MODE_NOTE =
   "This tab's connection and the connection DbaGuy reads the table with treat backslashes differently: the server's sql_mode changed while they were open. Reconnect this tab and preview again; setting sql_mode in the connection's options keeps it from happening.";
-export const SQLITE_BUSY_NOTE =
-  "Another tab still has an open result of this database file, or another program is using it: finish or close that result, then commit again.";
+export const SQLITE_BUSY_NOTE = sqliteBusyNote("commit again");
 export const PARTIAL_NOTE = "This table cannot roll back: what took effect is no longer staged, the rest still is.";
 const CANCELLED_TITLE = "Cancelled: nothing was applied";
 const CLOSED_TITLE = "The session closed before the commit started: nothing was applied";
@@ -217,10 +217,6 @@ export const NOT_SENT_REPORT: CommitReport = {
 /** The preview's line after an unknown outcome (R-05-6): what committing again does. */
 export const UNKNOWN_BEFORE =
   "The last commit's outcome was unknown: an UPDATE or DELETE checks the loaded values again, but a new row would be inserted a second time.";
-
-/** SQLite's busy and locked errors (`sqlite_errorname`): another connection holds the file. */
-export const isSqliteBusy = (code: string | null | undefined): boolean =>
-  !!code && (code.startsWith("SQLITE_BUSY") || code.startsWith("SQLITE_LOCKED"));
 
 /** The warning of a commit that stood though its COMMIT failed (non-transactional): `COMMIT_WARNING` in edit_apply.py. */
 const COMMIT_WARNING = "COMMIT reported an error after every statement had taken effect";

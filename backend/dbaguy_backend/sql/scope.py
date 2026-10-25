@@ -5,8 +5,8 @@ Lexical and tolerant of half-typed SQL; never parses fully. Used by completion a
 from dataclasses import dataclass
 
 from ..domain.schema import SnapshotColumn, SnapshotRelation
-from .dialects import RULES
-from .lexer import Token, TokenKind
+from .dialects import RULES, Dialect
+from .lexer import INSIGNIFICANT, Token, TokenKind, scan
 
 IDENT = (TokenKind.WORD, TokenKind.QUOTED)
 BEFORE_NAME = frozenset({"ONLY", "LATERAL", "IF", "NOT", "EXISTS"})  # FROM ONLY t, DROP TABLE IF EXISTS t
@@ -85,6 +85,28 @@ def unquote(token: Token) -> str:
         return text
     inner = text[1:-1] if len(text) > 1 and text.endswith(close) else text[1:]
     return inner.replace(close * 2, close)
+
+
+def names_used(text: str, dialect: Dialect) -> set[str]:
+    """Every name `text` uses, words and quoted names alike (never a string's text), as written (unquoted): what a dump
+    looks for in a view's or a trigger's text when an object it names is left out."""
+    return {unquote(token) for token in scan(text, dialect) if token.kind in IDENT}
+
+
+def routines_called(text: str, dialect: Dialect) -> set[str]:
+    """The routines `text` calls, as written: `CALL p` and `f(…)` where `f` is no qualified name's part (`x.f(`)."""
+    tokens = [token for token in scan(text, dialect) if token.kind not in INSIGNIFICANT]
+    found = set()
+    for i, token in enumerate(tokens):
+        if token.kind not in IDENT:
+            continue
+        before = tokens[i - 1] if i else None
+        after = tokens[i + 1] if i + 1 < len(tokens) else None
+        if before is not None and before.kind == TokenKind.WORD and before.upper == "CALL":
+            found.add(unquote(token))
+        elif after is not None and after.kind == TokenKind.LPAREN and (before is None or before.kind != TokenKind.DOT):
+            found.add(unquote(token))
+    return found
 
 
 def word(tokens: list[Token], i: int) -> str:

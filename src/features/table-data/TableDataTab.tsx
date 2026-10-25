@@ -1,8 +1,8 @@
-import { ChevronDown, ChevronRight, Loader2, RefreshCw, SquareTerminal } from "lucide-react";
+import { ChevronDown, ChevronRight, Loader2, MoreHorizontal, RefreshCw, SquareTerminal } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
-import type { MenuItem } from "@/components/ui/ContextMenu";
+import { DropdownMenu, type MenuItem } from "@/components/ui/ContextMenu";
 import { Tabs } from "@/components/ui/Tabs";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
@@ -17,6 +17,8 @@ import { useReportTabStatus } from "@/stores/tabStatus";
 import { useWorkspace, type TableTabState } from "@/stores/workspace";
 import { useEngineInfo, useProfiles } from "../connections/hooks";
 import { RecoverableError } from "../connections/RecoverableError";
+import { openCopyDialog, openDumpDialog } from "../data-tools/dataDialogs";
+import { copyEntryForTable, dumpEntryForTable } from "../data-tools/entryPoints";
 import { COMMIT_RUNNING } from "../edits/commitDialog";
 import { tableEditActions, useTableEditActions } from "../edits/editActions";
 import { EditBar } from "../edits/EditBar";
@@ -44,12 +46,18 @@ import { CLOSE_GUARD_ORDER, useCloseGuard, useDiscardQuestion } from "../workspa
 import { browseView, keptNotice } from "./browseView";
 import { FilterBar } from "./FilterBar";
 import { addCondition, valueCondition, type Relation } from "./filterValue";
+import { useTableTabActions } from "./tableTabActions";
 import { useAnchoredRerun } from "./useAnchoredRerun";
 import { useTableData, type TableDataState } from "./useTableData";
 
 type View = "data" | "columns" | "ddl";
 const FILTER_BY_VALUE = "Filter by this value";
 const CUT_VALUE_MESSAGE = "This value cannot be matched exactly: the grid holds only its beginning";
+/** Dump table…'s and Copy rows to…'s tooltip while a filter is applied: the dialog offers its rows only, or all of
+ * them. */
+const WITH_FILTER = "With the rows matching the filter, or all of them";
+const NO_DUMP = "This table cannot be dumped from here";
+const NO_COPY = "This table cannot be copied from here"; // an engine that does not copy (06c)
 const VIEWS: { value: View; label: string }[] = [
   { value: "data", label: "Data" },
   { value: "columns", label: "Columns" },
@@ -323,6 +331,52 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
       },
     ),
   );
+  // Dump table… (spec ⑥ §3.6), with the filter applied now; the dialog says when the tab has staged changes (L8)
+  const dumpEntry = useMemo(() => {
+    const entry = dumpEntryForTable(tab.profileId, engine, tab.path, state.filter);
+    return entry && { ...entry, tabId: tab.id };
+  }, [tab.profileId, tab.id, tab.path, engine, state.filter]);
+  const openDump = useCallback(() => {
+    if (dumpEntry) openDumpDialog(dumpEntry);
+  }, [dumpEntry]);
+  // Copy rows to… (spec ⑥ §3.6, 06c), with the filter applied now; the dialog says when the tab has staged changes
+  const copyEntry = useMemo(
+    () => copyEntryForTable(tab.profileId, engine, tab.path, state.filter, tab.id),
+    [tab.profileId, tab.id, tab.path, engine, state.filter],
+  );
+  const openCopy = useCallback(() => {
+    if (copyEntry) openCopyDialog(copyEntry);
+  }, [copyEntry]);
+  useTableTabActions(tab.id, {
+    dumpTable: { enabled: dumpEntry !== null, run: openDump },
+    copyRows: { enabled: copyEntry !== null, run: openCopy },
+  });
+  const moreItems: MenuItem[] = [
+    {
+      label: "Dump table…",
+      disabled: !dumpEntry,
+      title: !dumpEntry
+        ? engine
+          ? NO_DUMP
+          : "Reading the connection's details…"
+        : dumpEntry.filter !== null
+          ? WITH_FILTER
+          : undefined,
+      onSelect: openDump,
+    },
+    {
+      label: "Copy rows to…",
+      disabled: !copyEntry,
+      title: !copyEntry
+        ? engine
+          ? NO_COPY
+          : "Reading the connection's details…"
+        : copyEntry.source.kind === "relation" && copyEntry.source.filter !== null
+          ? WITH_FILTER
+          : undefined,
+      onSelect: openCopy,
+    },
+  ];
   // ⌘S while this tab's Data view is shown, wherever the focus is in it (an editor stages first and asks itself):
   // never the browser's Save page, nothing while a dialog has the keyboard or an input method composes.
   const openCommit = useRef(commit.open);
@@ -456,6 +510,11 @@ function DataView({ tab, active }: { tab: TableTabState; active: boolean }) {
             commitDisabled={commit.disabledReason}
           />
         </div>
+        <DropdownMenu items={moreItems} align="end">
+          <Button variant="ghost" size="sm" className="shrink-0 px-1.5" aria-label="More" title="More">
+            <MoreHorizontal size={14} />
+          </Button>
+        </DropdownMenu>
       </div>
       <RecoverableError profileId={tab.profileId} error={snapshot?.error ?? null} onRetry={table.retry} />
       {/* The edit target still wants a password after the session opened (L13): an unlock, then it is read again. */}

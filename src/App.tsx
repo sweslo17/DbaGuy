@@ -2,6 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { AppShell } from "./app/AppShell";
+import { QuitGuard } from "./app/QuitGuard";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Sidebar } from "./app/Sidebar";
 import { UnlockPromptHost } from "./features/connections/UnlockPromptHost";
@@ -52,13 +53,20 @@ export function App() {
   }, [queryClient]);
   usePaletteShortcuts(restored);
 
-  if (!restored) return <Restoring />;
-  // An error anywhere in the app shows its message and a Reload (a tab's own error stays inside that tab).
   return (
-    <ErrorBoundary name="App" title="DbaGuy hit an error" recover="reload">
-      <AppShell sidebar={<Sidebar />} workspace={<Workspace />} />
-      <PaletteHost />
-      <UnlockPromptHost />
-    </ErrorBoundary>
+    <>
+      {restored ? (
+        // An error anywhere in the app shows its message and a Reload (a tab's own error stays inside that tab).
+        <ErrorBoundary name="App" title="DbaGuy hit an error" recover="reload">
+          <AppShell sidebar={<Sidebar />} workspace={<Workspace />} />
+          <PaletteHost />
+          <UnlockPromptHost />
+        </ErrorBoundary>
+      ) : (
+        <Restoring />
+      )}
+      {/* ⌘Q and closing the window ask while jobs run: while the workspace restores and after the app's error too. */}
+      <QuitGuard />
+    </>
   );
 }

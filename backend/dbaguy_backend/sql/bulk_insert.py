@@ -1,0 +1,133 @@
+"""Multi-row INSERTs (spec ⑥ D-06-5): a dump's data, and later a copy's. Rows go in as the driver read them (raw
+values); each cell is written as its column's literal (`sql/literals.py`: the column's kind and its literal style), so a
+value reads back as itself. A statement holds at most MAX_INSERT_ROWS rows (SQL Server: TSQL_INSERT_ROWS — one VALUES
+list takes at most 1,000 rows, 10738, and 100 rows load three times faster, X4) and at most MAX_INSERT_CHARS of row
+text; a row longer than that is a statement of its own. Pure."""
+
+from collections.abc import Sequence
+from decimal import Decimal
+from typing import Any
+
+from ..adapters.columns import TableColumn
+from ..domain.column_category import ColumnCategory
+from ..domain.edits import kind_category
+from .dialects import Dialect, insert_head, overriding_identity, quote_ident
+from .lexer import TokenKind, scan
+from .literals import Cell, CellLiterals, LiteralStyle, normalise_raw
+from .statement_stream import MAX_STATEMENT_CHARS
+
+MAX_INSERT_ROWS = 1000
+TSQL_INSERT_ROWS = 100
+MAX_INSERT_CHARS = 1_048_576
+MYSQL_PACKET_BYTES = 64 * 1_048_576  # MySQL's default max_allowed_packet: the longest statement its server takes
+_MEBIBYTE = 1_048_576
+_UTF8_MOST = 4  # bytes a character takes at most in UTF-8
+_PLAIN_EXPONENT = 1000  # a Decimal is written out in plain digits up to this many places (SQL Server's hold 38)
+_TERMINATOR = 4  # what Run SQL file counts after a statement: its `;`, or a T-SQL batch's `\nGO`
+
+
+def _cell(value: Any) -> Cell:
+    """A driver's value as CellLiterals writes it. Numbers stay numbers: `normalise_raw` would make an integer past
+    2^53 or an infinity text (for the grid's JSON), and a column without a number kind (SQLite's untyped columns) would
+    then store it as text. A Decimal goes as its plain digits (`str` writes 1E-7, which MySQL and SQL Server read as a
+    double)."""
+    if isinstance(value, int | float):
+        return value
+    if isinstance(value, Decimal) and value.is_finite() and abs(value.as_tuple().exponent) <= _PLAIN_EXPONENT:
+        return format(value, "f")
+    return normalise_raw(value)
+
+
+class InsertBatcher:
+    """`add()` a row at a time, then `flush()`; each returns a finished statement (no terminator: the file adds it,
+    `dump_script.insert_text`) or None, and `flushed_rows` is how many rows that statement holds. `row_chars`: the
+    characters of every row's text so far (a dump sizes its next fetch by it, pre-flight M12). `abort_on_conflict`: a
+    copy into an existing table (06c) writes SQLite's `INSERT OR ABORT`, so a constraint's own ON CONFLICT REPLACE or
+    IGNORE never deletes or skips a row while the INSERT reports them all (⑤ final review I1)."""
+
+    def __init__(
+        self, dialect: Dialect, table_sql: str, columns: Sequence[TableColumn], *, backslash_escapes: bool | None = None,
+        max_rows: int | None = None, max_chars: int = MAX_INSERT_CHARS, abort_on_conflict: bool = False,
+    ) -> None:
+        self._dialect = dialect
+        self._names = [column.name for column in columns]
+        names = ", ".join(quote_ident(dialect, column.name) for column in columns)
+        overriding = overriding_identity(dialect) if any(c.identity == "always" for c in columns) else None
+        verb = insert_head(dialect, table_sql) if abort_on_conflict else f"INSERT INTO {table_sql}"
+        self._head = f"{verb} ({names}){f' {overriding}' if overriding else ''} VALUES\n"
+        writers = {unicode: CellLiterals(dialect, LiteralStyle(national=unicode, backslash_escapes=backslash_escapes))
+                   for unicode in (True, False)}
+        self._cells: list[tuple[CellLiterals, ColumnCategory]] = [
+            (writers[column.unicode], kind_category(column.value_kind)) for column in columns]
+        self._max_rows = max_rows or (TSQL_INSERT_ROWS if dialect is Dialect.TSQL else MAX_INSERT_ROWS)
+        self._max_chars = max_chars
+        self._rows: list[str] = []
+        self._chars = 0
+        self.row_chars = 0
+        self.flushed_rows = 0
+
+    def row_text(self, row: Sequence[Any]) -> str:
+        return "(" + ", ".join(write(_cell(value), category)
+                               for value, (write, category) in zip(row, self._cells, strict=True)) + ")"
+
+    def add(self, row: Sequence[Any]) -> str | None:
+        text = self.row_text(row)
+        self.row_chars += len(text)
+        done = None
+        if self._rows and (len(self._rows) >= self._max_rows or self._chars + len(text) > self._max_chars):
+            done = self.flush()
+        self._rows.append(text)
+        self._chars += len(text) + 2  # and its ",\n"
+        return done
+
+    def flush(self) -> str | None:
+        if not self._rows:
+            return None
+        statement = self._head + ",\n".join(self._rows)
+        self.flushed_rows = len(self._rows)
+        self._rows, self._chars = [], 0
+        return statement
+
+    def column_at(self, statement: str, offset: int) -> str | None:
+        """The column whose value holds character `offset` of one of this batcher's statements (where a write met text
+        that is not Unicode, pre-flight L15); None when it is in the statement's head (a name). Scans the statement:
+        for an error, never for each row."""
+        if offset < len(self._head):
+            return None
+        depth = index = 0
+        for token in scan(statement, self._dialect, len(self._head)):
+            if token.start <= offset < token.end:
+                return self._names[index] if depth >= 1 and index < len(self._names) else None
+            if token.kind is TokenKind.LPAREN:
+                depth += 1
+                index = 0 if depth == 1 else index
+            elif token.kind is TokenKind.RPAREN:
+                depth -= 1
+            elif token.kind is TokenKind.COMMA and depth == 1:
+                index += 1
+        return None
+
+
+def size_warning(dialect: Dialect, name: str, statement: str, packet_bytes: int | None = None) -> str | None:
+    """What a dump says about a statement too large to restore (R-06-11, pre-flight M11), or None: past Run SQL file's
+    limit (characters, as it measures), any dialect; past MySQL's max_allowed_packet (UTF-8 bytes, measured only when
+    the characters could reach it): `packet_bytes`, the dumped server's own (5.7's default is 4 MiB), or MySQL 8's
+    default when it is not known. A statement of one row or of several (Task 9 fix L5: under a small packet a batch
+    of MAX_INSERT_CHARS can be too long too). `name`: the table as the file names it."""
+    chars = len(statement)
+    if chars + _TERMINATOR > MAX_STATEMENT_CHARS:
+        return f"{name} has an INSERT statement over {_size(MAX_STATEMENT_CHARS)}: Run SQL file cannot restore it"
+    limit = packet_bytes or MYSQL_PACKET_BYTES
+    if dialect is Dialect.MYSQL and chars * _UTF8_MOST > limit:
+        size = chars if statement.isascii() else len(statement.encode("utf-8", "surrogatepass"))
+        if size > limit:
+            where = f"{_size(limit)} on the server dumped" if packet_bytes else "64 MiB by default"
+            return (f"{name} has an INSERT statement of {_size(size)}: MySQL refuses statements over its "
+                    f"max_allowed_packet ({where}) when the file is run")
+    return None
+
+
+def _size(count: int) -> str:
+    """`4 KiB`, `64 MiB`, `66.8 MiB`: KiB under a MiB, one decimal at most."""
+    value, unit = (count / _MEBIBYTE, "MiB") if count >= _MEBIBYTE else (count / 1024, "KiB")
+    return f"{value:.1f}".rstrip("0").rstrip(".") + f" {unit}"

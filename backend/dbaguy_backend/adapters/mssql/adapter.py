@@ -27,6 +27,7 @@ from typing import Any
 from loguru import logger
 
 from ...domain.column_category import ColumnCategory
+from ...domain.data_jobs import DumpObjectKinds, DumpScope
 from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, QueryFailed, ValidationFailed
 from ...domain.execution import ColumnMeta, ErrorPosition, MessageSeverity, ServerMessage
@@ -39,9 +40,12 @@ from ..base import (
     AdapterCapabilities,
     DatabaseAdapter,
     DatabaseConnection,
+    DataTools,
+    Dumping,
     Endpoint,
     MessageListener,
     ParsedUrl,
+    ReferenceReading,
     RowEditing,
     RunOptions,
     StatementCancelled,
@@ -50,7 +54,10 @@ from ..base import (
     invalid_text_error,
     transaction_open_error,
 )
-from . import catalog, driver, editing, freetds, introspection
+from ..columns import TableColumn
+from ..dump import DumpCatalog, DumpSession
+from ..references import Reference
+from . import catalog, columns, driver, dump, editing, freetds, introspection, references
 from . import schema as mssql_schema
 from .cancel import Call, CallKind, CancelControl, CancelledWhileWaiting, CancelPending
 from .settings import CONNECT_TIMEOUT_S, URL_SCHEMES, connect_params, parse_mssql_url
@@ -127,8 +134,12 @@ def _mentions_transaction(sql: str) -> bool:
 class MssqlResult(StatementResult):
     """The result sets of one batch, read on the worker thread."""
 
-    def __init__(self, owner: "MssqlConnection", described: list[ColumnKind] | None) -> None:
+    def __init__(self, owner: "MssqlConnection", described: list[ColumnKind] | None, *, peek: bool = True) -> None:
         self._owner = owner
+        # False (RunOptions.describe False: nobody is shown the columns' types): no rows are read ahead to guess them
+        # (a dump sizes its reads by the rows' size, 06a pre-flight M12); each column's type then comes from the
+        # driver's type code alone
+        self._peek = peek
         self._closed = False
         self._exhausted = False  # every result set read, or the batch failed
         # An error that came while rows were read (a procedure's RAISERROR right after its SELECT arrives with the
@@ -148,7 +159,7 @@ class MssqlResult(StatementResult):
         if described is not None and len(described) == len(names):  # run() already matched the described names
             kinds = described
         else:
-            self._buffer = self._read(_TYPE_PEEK)
+            self._buffer = self._read(_TYPE_PEEK) if self._peek else []
             kinds = guessed_kinds(header, self._buffer)
         if len(names) == 1 and names[0] in _JOINED_COLUMNS:
             kinds = [_JOINED_COLUMNS[names[0]]]
@@ -196,11 +207,17 @@ class MssqlResult(StatementResult):
         return self._columns
 
     def fetch(self, n: int) -> list[list[Any]]:
+        """The rows that arrived before an error later in the set come first; the error itself with the next call
+        (Task 9 fix H1): a reader that stops at a short chunk still learns of it from `next_result()`, and one that
+        reads until `[]` (a dump, an export) from here, instead of taking the cut rows for the whole set."""
         if self._columns is None or self._closed:
             return []
         rows, self._buffer = self._buffer[:n], self._buffer[n:]
         if len(rows) < n and not self._rows_done:
             rows += self._read(n - len(rows))
+        if not rows and self._deferred is not None:
+            error, self._deferred = self._deferred, None
+            raise error
         return [self._convert(row) for row in rows]
 
     def affected_rows(self) -> int | None:
@@ -241,7 +258,7 @@ class MssqlResult(StatementResult):
         self._owner.finish_result(self, complete=self._exhausted)
 
 
-class MssqlConnection(DatabaseConnection, RowEditing):
+class MssqlConnection(DatabaseConnection, RowEditing, DataTools, ReferenceReading, Dumping):
     def __init__(
         self, conn: driver.Connection, *, spid: int, database: str | None, read_only: bool,
         state: tuple[int, int, bool],  # (@@TRANCOUNT, XACT_STATE(), IMPLICIT_TRANSACTIONS) read at open
@@ -411,7 +428,7 @@ class MssqlConnection(DatabaseConnection, RowEditing):
         header = self.header()
         names = [h[0] for h in header] if header else []
         kinds = [kind for _, kind in described] if described and [name for name, _ in described] == names else None
-        self._result = MssqlResult(self, kinds)
+        self._result = MssqlResult(self, kinds, peek=options is None or options.describe)
         return self._result
 
     def next_set(self) -> bool:
@@ -690,9 +707,29 @@ class MssqlConnection(DatabaseConnection, RowEditing):
         self._check_database(path)
         return self._metadata_call(lambda: introspection.object_detail(self._conn, path))
 
-    def edit_target(self, path: list[PathSegment]) -> EditTarget:
-        self._check_database(path)
+    def edit_target(self, path: list[PathSegment], *, order: bool = True) -> EditTarget:
+        self._check_database(path)  # no stable_order to plan (PostgreSQL's only)
         return self._metadata_call(lambda: editing.edit_target(self._conn, path))
+
+    def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
+        """Data tools run it on a job's own session: the catalog call, never the metadata session's settings (READ
+        UNCOMMITTED would make a dump's reads dirty)."""
+        self._check_database(path)
+        return self._catalog_call(lambda: columns.table_columns(self._conn, path))
+
+    def references(self, schema: str, names: list[str], *, rows: bool = False) -> list[Reference]:
+        """A copy's preview, on the metadata connection (its lock timeout: a locked catalog answers in 5 s)."""
+        return self._metadata_call(lambda: references.references(self._conn, schema, names, rows=rows))
+
+    def dump_session(self, scope: DumpScope) -> DumpSession:
+        return self._catalog_call(lambda: dump.session(self._conn))
+
+    def dump_catalog(self, scope: DumpScope, kinds: DumpObjectKinds, *, ddl: bool = True) -> DumpCatalog:
+        """The catalog call, never the metadata session's: READ UNCOMMITTED would make the dump's reads dirty. A plan
+        (`ddl` False) runs on the metadata connection, where that does not matter."""
+        server = self.server_info().version
+        return self._catalog_call(lambda: dump.dump_catalog(self._conn, scope, kinds, server, self._database or "",
+                                                            ddl=ddl))
 
     def schema_snapshot(self) -> SchemaSnapshot:
         return self._metadata_call(lambda: mssql_schema.build_snapshot(self._conn))
@@ -730,6 +767,7 @@ class MssqlAdapter(DatabaseAdapter):
     # One connection works in one database; an attention keeps the transaction; read-only is DbaGuy's alone (spec §3.4).
     capabilities = AdapterCapabilities(
         per_database_connection=True, cancel_aborts_transaction=False, server_read_only=False, row_editing=True,
+        run_file=True, dump=True, copy_data=True,
     )
 
     def parse_url(self, url: str) -> ParsedUrl:

@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from "react";
-import type { Dialect } from "@/lib/api/types";
+import type { ColumnMeta, Dialect } from "@/lib/api/types";
 import { sameElements } from "@/lib/arrays";
 import { cn } from "@/lib/cn";
 import { PlanResult } from "../explain/PlanResult";
@@ -86,6 +86,8 @@ export interface ResultsAreaProps extends Omit<RunMessagesProps, "run"> {
   documentsProfileId: string | null;
   /** Opens the tab's export dialog for a result's statement and what it was sent with; stable across renders. */
   onExport: (sql: string, request: RequestOptions) => void;
+  /** Opens the copy dialog for a result's statement and columns (06c); absent: the engine does not copy. */
+  onCopyToTable?: (sql: string, columns: ColumnMeta[]) => void;
 }
 
 /**
@@ -106,6 +108,7 @@ export function ResultsArea({
   plans,
   documentsProfileId,
   onExport,
+  onCopyToTable,
   ...messages
 }: ResultsAreaProps) {
   const tabs = useMemo(() => resultTabs(run, executions), [run, executions]);
@@ -164,6 +167,7 @@ export function ResultsArea({
               canLoadMore={canLoadMore}
               exportable={!run.active}
               onExport={onExport}
+              onCopyToTable={onCopyToTable}
               controller={controller}
               pageSize={pageSize}
               dialect={dialect}

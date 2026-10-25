@@ -132,3 +132,29 @@ def test_nothing_touches_the_disk_until_the_first_use(tmp_path):
     with pytest.raises(StorageError):
         history.record(rec("SELECT 1"))  # and a closed history does not reopen
     assert not (tmp_path / "data").exists()
+
+
+def test_a_job_record_is_written_running_and_finished_later(tmp_path):  # spec ⑥ D-06-9
+    history = HistoryService(tmp_path / "h.db")
+    record_id = history.begin(rec("-- Run SQL file /x.sql (1.0 MB), all or nothing"))
+    [entry] = history.search().items
+    assert (entry.id, entry.status) == (record_id, "running")
+    history.finish(record_id, "error", 1234, 56, "Stopped at line 9: boom")
+    [entry] = history.search().items
+    assert (entry.status, entry.elapsed_ms, entry.rows, entry.error) == ("error", 1234, 56, "Stopped at line 9: boom")
+    history.finish(record_id + 1, "ok", 1, 1, None)  # a record that is gone stays gone
+    assert len(history.search().items) == 1
+    history.close()
+
+
+def test_records_still_running_at_the_next_start_are_interrupted(tmp_path):  # D-06-9
+    first = HistoryService(tmp_path / "h.db")
+    first.record(rec("SELECT 1"))
+    first.begin(rec("-- Copy data"))
+    first.close()  # the backend ended with the job running
+    second = HistoryService(tmp_path / "h.db")
+    assert [(e.sql, e.status) for e in second.search().items] == [("-- Copy data", "interrupted"), ("SELECT 1", "ok")]
+    record_id = second.begin(rec("-- Run SQL file"))  # this run's own: never marked
+    assert second.search().items[0].status == "running"
+    second.finish(record_id, "ok", 1, 1, None)
+    second.close()

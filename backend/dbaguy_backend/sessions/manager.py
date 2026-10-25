@@ -1,17 +1,22 @@
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
 from uuid import UUID, uuid4
 
 from loguru import logger
 from pydantic import BaseModel
 
+from ..domain.edits import PLAN_MISMATCH, PlanUnavailable
 from ..domain.errors import SessionNotFound
 from ..domain.metadata import ServerInfo
+from ..domain.transfer import COPY_PLAN_EXPIRED
 from ..services.connection_service import ConnectionService
 from ..services.profile_service import ProfileService
 from .hooks import SessionHooksFactory
+from .jobs.context import SourceLease
+from .jobs.registry import JobRegistry
 from .worker import Emitter, SessionWorker
 
 
@@ -36,16 +41,19 @@ class _Entry:
 
 
 class SessionManager:
-    """User sessions (one per editor tab). Closed explicitly or after idling without a WebSocket."""
+    """User sessions (one per editor tab, one per data-tools job). Closed explicitly, or once idle without a WebSocket:
+    nothing running or queued (D-06-10), and no attach and no request ending for `idle_timeout`."""
 
     def __init__(
         self, connections: ConnectionService, profiles: ProfileService, hooks: SessionHooksFactory | None = None,
-        idle_timeout: float = 600.0,
+        idle_timeout: float = 600.0, jobs: JobRegistry | None = None, clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._connections = connections
         self._profiles = profiles
         self._hooks = hooks  # None: workers keep their defaults (everything runs, nothing is recorded)
         self._idle_timeout = idle_timeout
+        self._clock = clock  # idle time, here and in each worker (its `finished_at`)
+        self.jobs = jobs if jobs is not None else JobRegistry()
         self._sessions: dict[str, _Entry] = {}
         self._lock = threading.Lock()
 
@@ -56,20 +64,66 @@ class SessionManager:
         worker = SessionWorker(
             f"{profile.name}:{session_id[:8]}",
             lambda: self._connections.open(profile, request.database, secrets),
+            clock=self._clock,
         )
         try:
             worker.start()
             server = worker.call(lambda c: c.server_info())
             if self._hooks is not None:
-                worker.configure(self._hooks.build(profile.id, server.current_database))  # before it is registered
+                hooks = self._hooks.build(profile.id, server.current_database)
+                jobs = replace(hooks.jobs, announce=partial(self.jobs.begin, session_id, profile.id),
+                               report=partial(self.jobs.report, session_id),
+                               source=partial(self._source, from_session=session_id))
+                worker.configure(replace(hooks, jobs=jobs))  # before it is registered
         except BaseException:
             worker.close()  # whatever failed, never leave the thread, connection or tunnel behind
             raise
         info = SessionInfo(session_id=session_id, profile_id=profile.id, database=server.current_database, server=server)
         with self._lock:
-            self._sessions[session_id] = _Entry(worker=worker, info=info, detached_at=time.monotonic())
+            self._sessions[session_id] = _Entry(worker=worker, info=info, detached_at=self._clock())
         logger.info("Opened session {} for '{}'", session_id, profile.name)
         return info
+
+    def _source(self, profile_id: UUID, database: str | None, session_id: str | None, *,
+                from_session: str) -> SourceLease:
+        """A copy's source session (06c), for the copy running on `from_session`: the query tab's session the copy
+        names, which must be one of the plan's source profile and never the copy's own (its read would wait behind the
+        copy on the same thread, Task 3 review M-7) (`plan_mismatch`, the copy's §4 text: pre-flight L-a), and stays the
+        tab's; or a session of the copy's own, closed when the copy releases it. Opening one may fail as a session does
+        (a password, a server down): the copy then never started. Either counts as attached while leased (a query tab's
+        too, whose socket may be gone, M-6): between two tables (a long DELETE, a COMMIT) it is idle, and the reaper
+        must not close it under the copy."""
+        if session_id is not None:
+            entry = self._entry(session_id)
+            if entry.info.profile_id != profile_id or session_id == from_session:
+                raise PlanUnavailable(PLAN_MISMATCH, COPY_PLAN_EXPIRED)
+            with self._lock:
+                entry.attached += 1
+            return SourceLease(entry.worker, partial(self._unlease, session_id))
+        info = self.create(SessionCreateRequest(profile_id=profile_id, database=database))
+        with self._lock:
+            if (own := self._sessions.get(info.session_id)) is not None:
+                own.attached += 1
+        return SourceLease(self.worker(info.session_id), partial(self._release, info.session_id))
+
+    def _release(self, session_id: str) -> None:
+        """A copy's own source session ends with it (never reused, as a job's own session)."""
+        self._pop_and_close(session_id)
+
+    def _unlease(self, session_id: str) -> None:
+        """A query tab's session the copy read from is the tab's again: one attach fewer, as a socket that detaches."""
+        self._detached(session_id)
+
+    def _detached(self, session_id: str) -> _Entry | None:
+        """One attach fewer (a socket, or a copy's lease); idle time counts from the last one. None: it is gone."""
+        with self._lock:
+            entry = self._sessions.get(session_id)
+            if entry is None:
+                return None
+            entry.attached = max(0, entry.attached - 1)
+            if entry.attached == 0:
+                entry.detached_at = self._clock()
+        return entry
 
     def _entry(self, session_id: str) -> _Entry:
         with self._lock:
@@ -85,19 +139,17 @@ class SessionManager:
         entry = self._entry(session_id)
         with self._lock:
             entry.attached += 1
-        entry.worker.set_emitter(emit)
-        entry.worker.replay_state()  # a client attaching mid-transaction learns the state before any `finished`
+        # A reloaded window gets the last progress or the outcome of the session's job first (D-06-10, pre-flight M2)
+        entry.worker.attach_emitter(emit)
+        # A client attaching mid-transaction learns the state before any `finished`; the frontend's job runner also
+        # sends a job's command only on this first state (06b Task 5 L2), so every attach must replay one
+        # (tests/test_api.py pins it)
+        entry.worker.replay_state()
         return entry.worker
 
     def detach(self, session_id: str, emit: Emitter) -> None:
-        with self._lock:
-            entry = self._sessions.get(session_id)
-            if entry is None:
-                return
-            entry.attached = max(0, entry.attached - 1)
-            if entry.attached == 0:
-                entry.detached_at = time.monotonic()
-        entry.worker.clear_emitter(emit)
+        if (entry := self._detached(session_id)) is not None:
+            entry.worker.clear_emitter(emit)
 
     def close(self, session_id: str) -> None:
         if not self._pop_and_close(session_id):
@@ -141,21 +193,35 @@ class SessionManager:
             except Exception:
                 logger.exception("{} failed for session {}", what, session_id)
 
-    def _is_idle(self, entry: _Entry) -> bool:
-        return entry.attached == 0 and time.monotonic() - entry.detached_at >= self._idle_timeout
+    def _is_quiet(self, entry: _Entry) -> bool:
+        """No WebSocket, and no attach and no request ending for `idle_timeout`. The caller holds the lock."""
+        return not entry.attached and (
+            self._clock() - max(entry.detached_at, entry.worker.finished_at) >= self._idle_timeout)
 
     def _idle_ids(self) -> list[str]:
+        """Quiet sessions with nothing running or queued: a job outlives its dialog and the window (D-06-10).
+        `busy()` waits on the worker's state lock, which a cancel holds across a PostgreSQL cancel (up to 3 s), so it
+        is asked outside this manager's lock: `attach` takes that lock on the event loop."""
         with self._lock:
-            return [sid for sid, e in self._sessions.items() if self._is_idle(e)]
+            quiet = [(sid, e.worker) for sid, e in self._sessions.items() if self._is_quiet(e)]
+        return [sid for sid, worker in quiet if not worker.busy()]
 
     def _pop_and_close(self, session_id: str, idle_only: bool = False) -> bool:
-        """Remove a session and close its worker. False when it is gone (or, with idle_only, no longer idle).
+        """Remove a session and close its worker. False when it is gone (or, with idle_only, no longer idle: busy,
+        or attached or active since). A job of it that never reported its outcome is listed as unknown (pre-flight L3).
 
         Never raises for a failing worker: bulk callers (reaper, profile deletion, shutdown) must reach every session.
         """
+        if idle_only:
+            with self._lock:
+                entry = self._sessions.get(session_id)
+            if entry is None or entry.worker.busy():  # outside the lock, as in _idle_ids
+                return False
         with self._lock:
             entry = self._sessions.get(session_id)
-            if entry is None or (idle_only and not self._is_idle(entry)):
+            # A request is submitted by an attached client or by a copy holding a lease on the session, which counts as
+            # attached too (06c): one submitted since `busy()` shows here
+            if entry is None or (idle_only and not self._is_quiet(entry)):
                 return False
             del self._sessions[session_id]
         try:
@@ -163,4 +229,7 @@ class SessionManager:
         except Exception:
             logger.exception("Error while closing session {}", session_id)
         logger.info("Closed session {}", session_id)
+        if (abandoned := self.jobs.abandon(session_id)) > 0:
+            logger.warning("Session {} closed before {} of its job(s) reported an outcome: listed as unknown",
+                           session_id, abandoned)
         return True

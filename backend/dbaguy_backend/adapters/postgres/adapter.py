@@ -10,6 +10,7 @@ import psycopg
 from loguru import logger
 from psycopg import postgres, pq
 
+from ...domain.data_jobs import DumpObjectKinds, DumpScope
 from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, ValidationFailed
 from ...domain.execution import ColumnMeta, ErrorPosition, MessageSeverity, ServerMessage
@@ -23,8 +24,11 @@ from ..base import (
     AdapterCapabilities,
     DatabaseAdapter,
     DatabaseConnection,
+    DataTools,
+    Dumping,
     Endpoint,
     ParsedUrl,
+    ReferenceReading,
     RowEditing,
     RunOptions,
     StatementCancelled,
@@ -33,15 +37,24 @@ from ..base import (
     transaction_open_error,
 )
 from ..cancel_window import CancelWindow
+from ..columns import TableColumn
+from ..dump import DumpCatalog, DumpSession
 from ..positions import offset_to_line_col
+from ..references import Reference
 from ..sql_text import first_keyword
-from . import ddl, editing, introspection
+from . import columns, ddl, dump, editing, introspection, references
 from . import schema as pg_schema
 from .loaders import category_for_oid, configure_user_loaders
 
 _ROW_KEYWORDS = frozenset({"select", "with", "values", "table", "show", "explain", "fetch", "("})
 _RETURNING = re.compile(r"\breturning\b", re.IGNORECASE)
 _STREAM_CHUNK = 200
+PLAN_LOCK_TIMEOUT_MS = 5_000  # a dump plan's catalog read waits at most this long for a table's lock (Task 9 fix M3)
+_LOCK_NOT_AVAILABLE = "55P03"
+# The plan reads the catalog of the scope's schemas (sizes included): a lock on any table of one of them stops it, and
+# none elsewhere does (probed, fix round 2 N3)
+LOCKED_FOR_PLAN = ("A table in a schema this dump reads is locked by another session (for example an uncommitted "
+                   "ALTER): try again after it commits")
 # Statements DECLARE CURSOR accepts, judged conservatively: a wrong "no" only means the result is read in full,
 # a wrong "yes" would make DECLARE fail and abort the user's transaction.
 _DECLARABLE_KEYWORDS = frozenset({"select", "values", "table", "(", "with"})
@@ -54,10 +67,14 @@ _COPY_CLIENT_STREAM = re.compile(r"\b(?:stdin|stdout)\b", re.IGNORECASE)
 _UNSUPPORTED_COPY = "COPY FROM STDIN / TO STDOUT is not supported in the console yet"
 _SSL_QUERY_KEYS = {"sslmode": "mode", "sslrootcert": "ca_file", "sslcert": "cert_file", "sslkey": "key_file"}
 _URL_CONNECTION_KEYS = ("user", "password", "host", "port", "dbname")  # query-string spellings of URL parts
+# psycopg's own connect() arguments, not libpq keys: `open()` passes autocommit and prepare_threshold itself, and a
+# free-form option of the same name would collide with them (TypeError) or reach psycopg as a string (fix wave F1).
+_PSYCOPG_CONNECT_KEYS = ("autocommit", "prepare_threshold", "context", "row_factory", "cursor_factory")
 # libpq keys that pick the target or carry secrets: they come from the profile fields and the keychain,
-# never from free-form `options` (they could redirect the connection or leak a password into profiles.json).
+# never from free-form `options` (they could redirect the connection or leak a password into profiles.json); and
+# psycopg's own arguments.
 _RESERVED_OPTION_KEYS = frozenset(
-    {*_URL_CONNECTION_KEYS, "hostaddr", "service", "passfile", "sslpassword"}
+    {*_URL_CONNECTION_KEYS, *_PSYCOPG_CONNECT_KEYS, "hostaddr", "service", "passfile", "sslpassword"}
 )
 _DEFAULT_CONNECT_PARAMS: dict[str, Any] = {
     "connect_timeout": 10,
@@ -280,8 +297,12 @@ class _CursorResult(StatementResult):
     silently rolls back). close() runs CLOSE instead, which leaves the transaction exactly as it was.
     """
 
-    def __init__(self, owner: "PostgresConnection", cursor: psycopg.ServerCursor, sql: str) -> None:
+    def __init__(self, owner: "PostgresConnection", cursor: psycopg.ServerCursor, sql: str, *,
+                 read_ahead: bool = True) -> None:
         self._owner, self._cursor, self._sql = owner, cursor, sql
+        # False (RunOptions.describe False: a job's read): each FETCH takes only the rows asked for, never a page more
+        # (a dump sizes its reads by the rows' size, 06a pre-flight M12)
+        self._read_ahead = read_ahead
         self._pending: list[Any] = []
         self._done = False
         self._closed = False
@@ -299,7 +320,9 @@ class _CursorResult(StatementResult):
 
     def fetch(self, n: int) -> list[list[Any]]:
         while len(self._pending) < n and not self._done and self._columns is not None:
-            want = max(n - len(self._pending), _STREAM_CHUNK)  # read ahead: one FETCH per page, not per call
+            want = n - len(self._pending)
+            if self._read_ahead:
+                want = max(want, _STREAM_CHUNK)  # read ahead: one FETCH per page, not per call
             try:
                 page = self._cursor.fetchmany(want)
             except psycopg.Error as exc:
@@ -330,7 +353,7 @@ class _CursorResult(StatementResult):
             logger.warning("Error while closing PostgreSQL cursor: {}", exc)
 
 
-class PostgresConnection(DatabaseConnection, RowEditing):
+class PostgresConnection(DatabaseConnection, RowEditing, DataTools, ReferenceReading, Dumping):
     def __init__(self, conn: psycopg.Connection, read_only: bool = False) -> None:
         self._conn = conn
         self._read_only = read_only
@@ -419,9 +442,66 @@ class PostgresConnection(DatabaseConnection, RowEditing):
         self._check_database(path)
         return ddl.object_detail(self._conn, path)
 
-    def edit_target(self, path: list[PathSegment]) -> EditTarget:
+    def edit_target(self, path: list[PathSegment], *, order: bool = True) -> EditTarget:
         self._check_database(path)
-        return editing.edit_target(self._conn, path)
+        return editing.edit_target(self._conn, path, order=order)
+
+    def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
+        self._check_database(path)
+        return columns.table_columns(self._conn, path)
+
+    def references(self, schema: str, names: list[str], *, rows: bool = False) -> list[Reference]:
+        """With `rows`, the size of each referencing table is read, which waits for its lock (an uncommitted ALTER in
+        another session): at most PLAN_LOCK_TIMEOUT_MS, in a block of its own, rolled back, as a dump plan's (only on
+        an auto-commit connection between statements). Locked: the keys again without the sizes (each table may hold
+        rows), logged with the code only."""
+        bounded = rows and self._conn.autocommit and self._conn.info.transaction_status == pq.TransactionStatus.IDLE
+        try:
+            if bounded:
+                self._conn.execute("BEGIN")
+                self._conn.execute(f"SET LOCAL lock_timeout = {PLAN_LOCK_TIMEOUT_MS}")
+            return references.references(self._conn, schema, names, rows=rows)
+        except psycopg.Error as exc:
+            if not (bounded and exc.sqlstate == _LOCK_NOT_AVAILABLE):
+                raise
+            logger.info("A copy plan's foreign keys were read without the tables' sizes ({})", exc.sqlstate)
+        finally:
+            if bounded:
+                self._end_block()
+        return references.references(self._conn, schema, names)
+
+    def dump_session(self, scope: DumpScope) -> DumpSession:
+        return dump.SESSION
+
+    def dump_catalog(self, scope: DumpScope, kinds: DumpObjectKinds, *, ddl: bool = True) -> DumpCatalog:
+        """The dump job's read (`ddl`, inside its own snapshot) as it is: it is cancellable. A plan's (on the metadata
+        connection) waits at most PLAN_LOCK_TIMEOUT_MS for a lock (an uncommitted ALTER in another session would hold
+        the connection, and the tree and completion queued behind it, as long as it lasts: Task 9 fix M3), in a block
+        of its own, rolled back: only on an auto-commit connection between statements, as the stable order's EXPLAIN."""
+        version, database = self.server_info().version, self.current_database() or ""
+        bounded = (not ddl and self._conn.autocommit
+                   and self._conn.info.transaction_status == pq.TransactionStatus.IDLE)
+        try:
+            if bounded:
+                self._conn.execute("BEGIN")
+                self._conn.execute(f"SET LOCAL lock_timeout = {PLAN_LOCK_TIMEOUT_MS}")
+            return dump.dump_catalog(self._conn, scope, kinds, version, database, ddl=ddl)
+        except psycopg.Error as exc:
+            if bounded and exc.sqlstate == _LOCK_NOT_AVAILABLE:
+                raise StatementError(LOCKED_FOR_PLAN, code=_LOCK_NOT_AVAILABLE) from exc
+            raise self.translate_error(exc, "dump catalog") from exc
+        finally:
+            if bounded:
+                self._end_block()
+
+    def _end_block(self) -> None:
+        """Rolls back a block DbaGuy opened on this connection; one that is gone has nothing to roll back."""
+        if self._conn.info.transaction_status == pq.TransactionStatus.IDLE:
+            return
+        try:
+            self._conn.execute("ROLLBACK")
+        except psycopg.Error as exc:
+            logger.debug("A plan's block was not rolled back: {}", exc.sqlstate or type(exc).__name__)
 
     def schema_snapshot(self) -> SchemaSnapshot:
         # The connection's own (native-loader) cursors: arrays come back as lists, unlike the text-first user cursors.
@@ -494,7 +574,8 @@ class PostgresConnection(DatabaseConnection, RowEditing):
                 # In a transaction, or about to open one (manual mode: psycopg begins before the first statement):
                 # never stream, abandoning a stream would cancel it and abort the user's transaction.
                 if status in (pq.TransactionStatus.IDLE, pq.TransactionStatus.INTRANS) and _declarable(sql):
-                    return _CursorResult(self, self._server_cursor(), sql)
+                    return _CursorResult(self, self._server_cursor(), sql,
+                                         read_ahead=options is None or options.describe)
                 # Anything else (SHOW, EXPLAIN, RETURNING, scripts…) is read in full.
             return self._run_buffered(sql)
         except psycopg.Error as exc:  # e.g. creating a cursor on a dead connection
@@ -557,6 +638,7 @@ class PostgresAdapter(DatabaseAdapter):
     dialect = Dialect.POSTGRES
     capabilities = AdapterCapabilities(
         per_database_connection=True, cancel_aborts_transaction=True, row_editing=True, orders_browse_by_key=True,
+        run_file=True, dump=True, copy_data=True,
     )
 
     def parse_url(self, url: str) -> ParsedUrl:
@@ -604,7 +686,11 @@ class PostgresAdapter(DatabaseAdapter):
             params["hostaddr"] = endpoint.host  # tunnelled: connect locally, verify TLS against the real host
         params = {k: v for k, v in params.items() if v not in (None, "")}
         try:
-            conn = psycopg.connect(autocommit=True, **params)
+            # prepare_threshold=None: psycopg's PrepareManager otherwise keeps the encoded text of the last 100
+            # distinct queries even when none is prepared, so a restore of 1 MiB INSERTs (or one 10 MB INSERT in a
+            # query tab) held ~100 MB until the session closed (06a fix wave F1). Nothing in DbaGuy uses named
+            # prepared statements; `describe()` uses libpq's unnamed statement, which this does not touch.
+            conn = psycopg.connect(autocommit=True, prepare_threshold=None, **params)
         except psycopg.Error as exc:
             raise ConnectionFailed(str(exc).strip()) from exc
         if profile.read_only:

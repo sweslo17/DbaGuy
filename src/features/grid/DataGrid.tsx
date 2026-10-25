@@ -104,6 +104,8 @@ export interface DataGridProps {
    * export outlives a remounting grid.
    */
   onExport?: () => void;
+  /** "Copy result to a table…" (context menu and status bar; spec ⑥ §3.6, 06c); none: not offered. */
+  onCopyToTable?: () => void;
   /** An editing table's marks and editing (spec ⑤ §3.6); absent: a read-only grid, as every query tab's is. */
   edits?: GridEditing;
   ref?: Ref<DataGridHandle>;
@@ -157,7 +159,8 @@ function LoadMoreFooter({ rowCount, hasMore, loading, onLoadMore }: LoadMoreFoot
  */
 export function DataGrid(props: DataGridProps) {
   const { columns, rows, hasMore, sort, onHeaderClick, stale = false, ref } = props;
-  const { dialect, tableName, onSortBy, extraCellMenu, onSelectionChange, onExport, partial = false, edits } = props;
+  const { dialect, tableName, onSortBy, extraCellMenu, onSelectionChange, onExport, onCopyToTable, partial = false, edits } =
+    props;
   const leading = edits?.leading ?? 0;
   // Stale rows are only shown: nothing is loaded for them, and nothing is edited on them.
   const loadingMore = props.loadingMore && !stale;
@@ -416,6 +419,7 @@ export function DataGrid(props: DataGridProps) {
                 sortBy={onSortBy}
                 extraCellMenu={extraCellMenu}
                 openExport={onExport}
+                openCopyToTable={onCopyToTable}
               >
                 <div
                   ref={scrollRef}
@@ -537,6 +541,7 @@ export function DataGrid(props: DataGridProps) {
         partial={partial}
         aggregates={aggregates}
         onExport={onExport}
+        onCopyToTable={onCopyToTable}
       />
     </div>
   );

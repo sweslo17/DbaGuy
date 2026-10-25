@@ -34,6 +34,8 @@ export interface GridMenuActions {
   extraCellMenu?: (row: number, column: number) => MenuItem[];
   /** "Export…": the whole result to a file (shown only when set). */
   openExport?: () => void;
+  /** "Copy result to a table…": the whole result into a table of any connection (shown only when set; 06c). */
+  openCopyToTable?: () => void;
   /** An editing grid's items (`GridEditing.menu`). */
   editItems?: EditItems;
   /** Return edits the active cell (the grid is editable now), so View value loses its ↵. */
@@ -77,7 +79,7 @@ function headerItems(col: number, a: GridMenuActions): MenuItem[] {
 
 /** Copy, Copy as, Export, the drawers; for a cell (`cell` set) also pinning and the caller's extra items. */
 function selectionItems(pos: CellPos | null, cell: boolean, a: GridMenuActions): MenuItem[] {
-  const { openValue, openRecord, openExport, editItems } = a;
+  const { openValue, openRecord, openExport, openCopyToTable, editItems } = a;
   const edits = editItems?.(pos, cell, a.rect) ?? [];
   const items: MenuItem[] = [
     ...edits,
@@ -87,6 +89,7 @@ function selectionItems(pos: CellPos | null, cell: boolean, a: GridMenuActions):
       children: a.copyFormats.map((format) => ({ label: COPY_FORMAT_LABELS[format], onSelect: () => a.copy(format) })),
     },
     ...(openExport ? [{ label: "Export…", onSelect: openExport }] : []),
+    ...(openCopyToTable ? [{ label: "Copy result to a table…", onSelect: openCopyToTable }] : []),
     {
       label: "View value",
       shortcut: a.returnEdits ? undefined : "↵",

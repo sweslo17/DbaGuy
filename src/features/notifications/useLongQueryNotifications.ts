@@ -1,15 +1,9 @@
 import { useEffect, useRef } from "react";
-import { formatDuration, plural } from "@/lib/format";
+import { formatElapsed, plural } from "@/lib/format";
 import { appIsFocused, notify } from "@/lib/native";
 import { useAppSettings } from "@/stores/settings";
 import type { RunState } from "../query/useQueryRunner";
 import { INTERRUPTED_MESSAGE, type ExecutionState } from "../session/execution";
-
-/** "42 s", or "2 min 05 s" from a minute on: a notification has no use for hundredths. */
-function seconds(ms: number): string {
-  const whole = Math.round(ms / 1000);
-  return whole < 60 ? `${whole} s` : formatDuration(ms);
-}
 
 const firstLine = (text: string) => text.split("\n", 1)[0].trim();
 
@@ -47,7 +41,7 @@ export function runNotification(
   connection: string | null,
 ): { title: string; body: string } | null {
   if (run.finishedAt === null || run.cancelled || run.steps.some((step) => step.status === "cancelled")) return null;
-  const took = seconds(run.finishedAt - run.startedAt);
+  const took = formatElapsed(run.finishedAt - run.startedAt); // a notification has no use for hundredths
   const execution = (requestId: string | null) => (requestId ? executions[requestId] : undefined);
   const failed = run.steps.find((step) => step.status === "error");
   if (failed) return { title: `Query failed after ${took}`, body: failure(execution(failed.requestId)) };

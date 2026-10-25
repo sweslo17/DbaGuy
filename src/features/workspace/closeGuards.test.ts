@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { useWorkspace, type TableTabState } from "@/stores/workspace";
+import { useWorkspace, type QueryTabState, type TableTabState } from "@/stores/workspace";
 import {
   CLOSE_GUARD_ORDER,
   createDiscardQuestion,
@@ -87,6 +87,31 @@ describe("when the question is asked", () => {
     expect(useWorkspace.getState().tabs).toEqual([]);
     stopEdits();
     stopSession();
+  });
+
+  it("asks a copy reading the tab before anything else, and keeps the tab while it refuses (06c L-f)", async () => {
+    const query = { id: "query:1", kind: "query", profileId: "p1", database: null, title: "Q" } as unknown as QueryTabState;
+    useWorkspace.setState({ tabs: [query], activeTabId: query.id });
+    const asked: string[] = [];
+    let reading = true;
+    const stops = [
+      registerCloseGuard(query.id, CLOSE_GUARD_ORDER.copy, () => (asked.push("copy"), !reading)),
+      registerCloseGuard(query.id, CLOSE_GUARD_ORDER.script, () => (asked.push("script"), true)),
+      registerCloseGuard(query.id, CLOSE_GUARD_ORDER.transaction, () => (asked.push("transaction"), true)),
+    ];
+
+    await expect(requestCloseTab(query.id)).resolves.toBe(false);
+    expect([asked, useWorkspace.getState().tabs.length]).toEqual([["copy"], 1]); // nothing else was asked
+
+    asked.length = 0;
+    await expect(requestDisconnectTab(query.id)).resolves.toBe(true); // a lost connection is B13's, not the tab's
+    expect(asked).toEqual(["transaction"]);
+
+    asked.length = 0;
+    reading = false;
+    await expect(requestCloseTab(query.id)).resolves.toBe(true);
+    expect(asked).toEqual(["copy", "script", "transaction"]);
+    stops.forEach((stop) => stop());
   });
 
   it("keeps the tab when the question is answered no, before any later guard is asked", async () => {

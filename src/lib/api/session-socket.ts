@@ -1,4 +1,5 @@
 import { getBackendInfo } from "../backend";
+import { reconnectDelay } from "./backoff";
 import type { ClientCommand, ServerEvent } from "./types";
 
 export type SocketStatus = "connecting" | "open" | "closed";
@@ -7,8 +8,6 @@ type StatusListener = (status: SocketStatus) => void;
 
 const CLOSE_UNAUTHORIZED = 4401;
 const CLOSE_SESSION_NOT_FOUND = 4404;
-const BACKOFF_BASE_MS = 250;
-const BACKOFF_MAX_MS = 5000;
 
 /** One WebSocket per session; reconnects with backoff. Commands are never queued: they are sent only while open. */
 export class SessionSocket {
@@ -80,7 +79,7 @@ export class SessionSocket {
    */
   private scheduleReconnect(): void {
     if (this.closedByUser || this.rejected) return;
-    const delay = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** this.attempts++);
+    const delay = reconnectDelay(this.attempts++);
     this.timer = setTimeout(() => {
       this.connect().catch((error: unknown) => {
         console.warn(`Session ${this.sessionId}: reconnect attempt failed`, error);

@@ -5,6 +5,7 @@ from enum import StrEnum
 from typing import Any, ClassVar, Literal
 
 from ..domain.couchbase import FieldSample, Keyspace
+from ..domain.data_jobs import DumpObjectKinds, DumpScope
 from ..domain.edits import EditTarget
 from ..domain.errors import ValidationFailed
 from ..domain.execution import ColumnMeta, ErrorPosition, Presentation, QueryContext, ServerMessage, StatementParams
@@ -12,6 +13,9 @@ from ..domain.metadata import Folder, NodeKind, ObjectDetail, ObjectNode, PathSe
 from ..domain.profiles import AnyDraft, AnyProfile, Engine, EngineInfo, ServerProfile
 from ..domain.schema import RelationKind, SchemaSnapshot
 from ..sql.dialects import Dialect
+from .columns import TableColumn
+from .dump import DumpCatalog, DumpSession
+from .references import Reference
 from .positions import offset_to_line_col
 
 
@@ -46,6 +50,9 @@ class AdapterCapabilities:
     row_editing: bool = False  # a table-data grid can be edited (spec ⑤): the connection is RowEditing
     # A table-data tab's first browse waits for the edit target and sorts by its `stable_order` (PostgreSQL, 05b K13)
     orders_browse_by_key: bool = False
+    run_file: bool = False  # Run SQL file (spec ⑥ R-06-1, D-06-13)
+    dump: bool = False  # a native SQL dump (spec ⑥ R-06-1): the connection is Dumping
+    copy_data: bool = False  # copy rows between connections (spec ⑥ R-06-1, G3): the connection is DataTools
 
 
 @dataclass(frozen=True)
@@ -57,8 +64,10 @@ class RunOptions:
     params: StatementParams | None = None  # needs capabilities.parameters
     profile_plan: bool = False  # needs capabilities.executed_plan (04b)
     retry_safe: bool = False  # the statement was classified READ: an adapter may send it again after a stale connection
-    # False: the statement returns no result set to show (a grid commit's own texts, spec ⑤ §3.5), so an adapter may
-    # skip reading its result's column types first (SQL Server's describe: a round trip per statement, 05a review M1)
+    # False: the statement returns no result set to show (a grid commit's own texts, spec ⑤ §3.5; a job's statements),
+    # so an adapter may skip reading its result's column types first (SQL Server's describe: a round trip per statement,
+    # 05a review M1), and reads no rows ahead of what `fetch()` asks for (the rows it peeks at for the types, SQLite's
+    # and SQL Server's; PostgreSQL's cursor read-ahead): a dump sizes its reads by the rows' size (06a pre-flight M12)
     describe: bool = True
 
 
@@ -94,7 +103,22 @@ def transaction_open_error() -> StatementError:
 
 
 INVALID_TEXT = "invalid_text"
+CONNECTION_LOST = "connection_lost"  # the link to the server is gone (a statement may or may not have run)
 INVALID_PARAMS = "invalid_params"  # a parameter refused before sending; the message names it, never its value
+
+
+class InvalidText(StatementError):
+    """Text the driver could not decode (SQLite's bytes that are not UTF-8): the column the driver names, never the
+    text itself (it would reach the screen and the log garbled). `in_catalog`: it was a catalog read's (the column is
+    then the catalog's own, `name` or `sql`, so the message says the schema instead: fix round 2, N2)."""
+
+    def __init__(self, column: str | None, *, in_catalog: bool = False) -> None:
+        if in_catalog:
+            message = "A name or definition in the database's schema holds text that is not valid UTF-8"
+        else:
+            message = f"{f'Column {column}' if column else 'A value'} holds text that is not valid UTF-8"
+        super().__init__(message, code=INVALID_TEXT)
+        self.column = None if in_catalog else column
 
 
 def invalid_text_error(sql: str, index: int) -> StatementError:
@@ -108,8 +132,13 @@ def invalid_text_error(sql: str, index: int) -> StatementError:
 
 
 class StatementCancelled(StatementError):
-    def __init__(self, message: str = "Query cancelled") -> None:
+    """`completed`: the server finished the statement before the cancel could stop it (MySQL: a SLEEP() inside it
+    returned early on the KILL QUERY and the statement went on to its end); a query tab still reports it cancelled, a
+    run counts it as applied (06a ruling R8)."""
+
+    def __init__(self, message: str = "Query cancelled", *, completed: bool = False) -> None:
         super().__init__(message, code="cancelled")
+        self.completed = completed
 
 
 class StatementNotSent(StatementError):
@@ -151,7 +180,10 @@ class StatementResult(ABC):
 
     @abstractmethod
     def fetch(self, n: int) -> list[list[Any]]:
-        """Up to n raw rows of the current result set; fewer (or none) means exhausted."""
+        """Up to n raw rows of the current result set. Only `[]` means the set is exhausted: fewer than n may come
+        before an error later in the set (SQL Server raises it on the next call, Task 9 fix H1), so a reader that must
+        know it read every row fetches until `[]`, or asks `next_result()`. An adapter that knows the set is over
+        returns `[]` without a round trip."""
 
     @abstractmethod
     def affected_rows(self) -> int | None: ...
@@ -316,9 +348,45 @@ class RowEditing(ABC):
     spec ⑤ §3.2). The profile's metadata connection answers it, on its worker thread like every method."""
 
     @abstractmethod
-    def edit_target(self, path: list[PathSegment]) -> EditTarget:
+    def edit_target(self, path: list[PathSegment], *, order: bool = True) -> EditTarget:
         """A view or another non-table, or a table without a usable key: `editable=False` with the reason, never an
-        error. NotFound when the table does not exist."""
+        error. NotFound when the table does not exist. `order` False: no browse of it follows (a copy's target, 06c),
+        so its `stable_order` is not planned (PostgreSQL's EXPLAIN) and stays None."""
+
+
+class DataTools(ABC):
+    """A connection whose relations data tools read and write (spec ⑥ D-06-1: dump, copy). Every method runs on the
+    owning worker thread, like the others."""
+
+    @abstractmethod
+    def table_columns(self, path: list[PathSegment]) -> list[TableColumn]:
+        """The columns of the table, view or materialized view at `path`, in order; NotFound when it is gone."""
+
+
+class ReferenceReading(ABC):
+    """A connection that reads its foreign keys live with their ON DELETE action (PostgreSQL, SQL Server: a copy's
+    target, whose order and DELETE they decide, 06c Task 2 fix round 4), on its worker thread like every method."""
+
+    @abstractmethod
+    def references(self, schema: str, names: list[str], *, rows: bool = False) -> list[Reference]:
+        """The foreign keys from or into the tables `names` of `schema`, in one catalog query; with `rows`, whether
+        each table that references one of them through a key that only refuses holds rows (`Reference.child_rows`: a
+        copy that replaces their rows, 06c final review I-2)."""
+
+
+class Dumping(ABC):
+    """A connection whose engine DbaGuy dumps (spec ⑥ R-06-2, capability `dump`): what its dump session sends
+    around the reads, and what the dump writes, in order. On the owning worker thread, like every method."""
+
+    @abstractmethod
+    def dump_session(self, scope: DumpScope) -> DumpSession:
+        """The output settings and the snapshot (R-06-4) the dump's own session sends before it reads, and what ends
+        them."""
+
+    @abstractmethod
+    def dump_catalog(self, scope: DumpScope, kinds: DumpObjectKinds, *, ddl: bool = True) -> DumpCatalog:
+        """The objects and tables of `scope`, in the order the dump writes them; `ddl` False (a dump plan): which
+        there are, without their definitions. NotFound when the scope's schema or a named relation is gone."""
 
 
 class DatabaseAdapter(ABC):
@@ -362,7 +430,8 @@ class DatabaseAdapter(ABC):
             cancel_aborts_transaction=caps.cancel_aborts_transaction, server_read_only=caps.server_read_only,
             transactions=caps.transactions, query_context=caps.query_context, parameters=caps.parameters,
             documents=caps.documents, executed_plan=caps.executed_plan, plan_format=caps.plan_format,
-            row_editing=caps.row_editing, orders_browse_by_key=caps.orders_browse_by_key,
+            row_editing=caps.row_editing, orders_browse_by_key=caps.orders_browse_by_key, run_file=caps.run_file,
+            dump=caps.dump, copy_data=caps.copy_data,
         )
 
     def relation_path(self, database: str | None, schema: str, name: str, kind: RelationKind) -> list[PathSegment]:

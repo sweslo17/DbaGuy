@@ -1,15 +1,19 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { toast } from "@/components/ui/Toast";
 import { errorMessage } from "@/lib/api/client";
-import type { AppSettings, EngineInfo, ProfileEntry } from "@/lib/api/types";
+import type { AppSettings, EngineInfo, Profile, ProfileEntry } from "@/lib/api/types";
 import type { TabAction } from "@/lib/tabActions";
 import { openNewQuery, useWorkspace, type Tab } from "@/stores/workspace";
 import { enginesKey, findEngineInfo, profilesKey } from "../connections/hooks";
+import { openCopyDialog, openDumpDialog, openRunDialog, setJobsPopoverOpen } from "../data-tools/dataDialogs";
+import { paletteCopyEntry, paletteDumpEntry, paletteRunEntry } from "../data-tools/entryPoints";
+import { useJobs } from "../data-tools/jobsStore";
 import { readTableEditActions, type TableEditActionId, type TableEditActions } from "../edits/editActions";
 import { refreshSchema } from "../explorer/refreshSchema";
 import { HISTORY_VIEW } from "../history/useHistory";
 import { readQueryTabActions, type QueryTabActionId, type QueryTabActions } from "../query/tabActions";
 import { openSettings } from "../settings/SettingsDialog";
+import { readTableTabActions, type TableTabActions } from "../table-data/tableTabActions";
 import { requestCloseTab } from "../workspace/closeGuards";
 
 /**
@@ -41,6 +45,8 @@ export interface CommandContext {
   tabActions: QueryTabActions | null;
   /** The active table tab's edit actions; null when no table tab is active. */
   editActions: TableEditActions | null;
+  /** The active table tab's other actions (Dump table…, Copy rows to…); null when no table tab is active. */
+  tableActions: TableTabActions | null;
   settings: {
     /** The stored settings are known (until then nothing may be saved over them). */
     loaded: boolean;
@@ -119,6 +125,56 @@ function editCommand(id: TableEditActionId, label: string, shortcut?: string): P
   };
 }
 
+/** The active tab's connection, from the profiles already loaded; null if unknown. */
+function activeProfile(ctx: CommandContext): Profile | null {
+  const id = ctx.activeTab?.profileId ?? null;
+  return ctx.queryClient.getQueryData<ProfileEntry[]>(profilesKey)?.find((entry) => entry.profile.id === id)?.profile ?? null;
+}
+
+/**
+ * ⌘⇧P Dump… (spec ⑥ §3.6): a table tab dumps its table through its own handler (it knows the filter it shows); a query
+ * tab dumps its database (PostgreSQL, SQL Server), its schema (MySQL) or main (SQLite). Listed for engines that dump.
+ */
+const dumpCommand: PaletteCommand = {
+  id: "dataTools.dump",
+  label: "Dump…",
+  visible: (ctx) => activeEngine(ctx)?.dump === true,
+  enabled: (ctx) =>
+    ctx.activeTab?.kind === "table"
+      ? (ctx.tableActions?.dumpTable.enabled ?? false)
+      : paletteDumpEntry(ctx.activeTab, activeProfile(ctx), activeEngine(ctx), "") !== null,
+  run: (ctx) => {
+    if (ctx.activeTab?.kind === "table") {
+      runTabAction(readTableTabActions(ctx.activeTab.id)?.dumpTable, "Dump…");
+      return;
+    }
+    const entry = paletteDumpEntry(ctx.activeTab, activeProfile(ctx), activeEngine(ctx), "");
+    if (entry) openDumpDialog(entry);
+  },
+};
+
+/**
+ * ⌘⇧P Copy data to… (spec ⑥ §3.6, 06c): a table tab copies its rows through its own handler (it knows its filter); a
+ * query tab its schema's tables (its database's default schema; MySQL: its database). Listed for engines that copy.
+ */
+const copyCommand: PaletteCommand = {
+  id: "dataTools.copy",
+  label: "Copy data to…",
+  visible: (ctx) => activeEngine(ctx)?.copy_data === true,
+  enabled: (ctx) =>
+    ctx.activeTab?.kind === "table"
+      ? (ctx.tableActions?.copyRows.enabled ?? false)
+      : paletteCopyEntry(ctx.activeTab, activeProfile(ctx), activeEngine(ctx), "") !== null,
+  run: (ctx) => {
+    if (ctx.activeTab?.kind === "table") {
+      runTabAction(readTableTabActions(ctx.activeTab.id)?.copyRows, "Copy data to…");
+      return;
+    }
+    const entry = paletteCopyEntry(ctx.activeTab, activeProfile(ctx), activeEngine(ctx), "");
+    if (entry) openCopyDialog(entry);
+  },
+};
+
 /** Couchbase: its plans (Explain). */
 const takesPlans = (ctx: CommandContext) => activeEngine(ctx)?.plan_format === "couchbase";
 /** Couchbase: the plan a statement ran with (Run with profile). */
@@ -183,6 +239,22 @@ export const COMMANDS: readonly PaletteCommand[] = [
       const profileId = ctx.activeTab?.profileId;
       if (profileId) void refreshActiveSchema(ctx.queryClient, profileId);
     },
+  },
+  dumpCommand,
+  copyCommand,
+  {
+    id: "dataTools.runFile",
+    label: "Run SQL file…",
+    enabled: always,
+    // On the active tab's connection and database, else the one selected in the tree; the dialog can change them.
+    run: (ctx) =>
+      openRunDialog(paletteRunEntry(ctx.activeTab, useWorkspace.getState().selectedProfileId, activeEngine(ctx))),
+  },
+  {
+    id: "dataTools.jobs",
+    label: "Show jobs",
+    enabled: () => useJobs.getState().order.length > 0,
+    run: () => setJobsPopoverOpen(true),
   },
   {
     id: "closeTab",

@@ -46,6 +46,21 @@ class UnsupportedFormat(ValidationFailed):
     code = "unsupported_format"
 
 
+class NotSupported(ValidationFailed):
+    """The engine has no such data tool (spec ⑥ D-06-13): `<Engine> connections cannot …`."""
+
+    code = "not_supported"
+
+
+class FileNotFound(NotFound):
+    """A path that names no regular file (spec ⑥ §4): `<path> is not a file`."""
+
+    code = "file_not_found"
+
+    def __init__(self, path: str) -> None:
+        super().__init__(f"{path} is not a file")
+
+
 class NotEditable(ValidationFailed):
     """Grid editing refused for this table or engine (spec ⑤ §3.4): the message is the target's reason."""
 
@@ -88,6 +103,17 @@ class StorageError(DomainError):
 class AlreadyExists(DomainError):
     code = "already_exists"
     status = 409
+
+
+class PreviewSuperseded(DomainError):
+    """A copy's preview stopped between two tables: the same dialog asked for a newer one (its `preview_key`), and nobody
+    waits for this one any more (06c final review)."""
+
+    code = "preview_superseded"
+    status = 409
+
+    def __init__(self) -> None:
+        super().__init__("A newer preview was asked for")
 
 
 class QueryFailed(DomainError):

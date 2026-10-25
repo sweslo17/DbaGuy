@@ -27,13 +27,16 @@ def atomic_text_file(target: Path) -> Iterator[TextIO]:
     The temporary file is `.<name>.<random>.part` in the same folder (so the final rename is atomic; `<name>` is
     cut short for names that are almost too long), created exclusively: two writers never share one, and a `.part`
     file this call did not create is never truncated or deleted. Any error (including one raised by the caller's
-    block) removes this call's partial file and leaves `target` as it was.
+    block) removes this call's partial file and leaves `target` as it was. The file's bytes reach the disk before the
+    rename (06a pre-flight L9): a system crash right after it never leaves an empty file in place of the old one.
     """
     part = _part_path(target)
     fp = part.open("x", encoding="utf-8", newline="")
     try:
         with fp:
             yield fp
+            fp.flush()
+            os.fsync(fp.fileno())
         os.replace(part, target)
     except BaseException:
         try:

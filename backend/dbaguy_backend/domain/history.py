@@ -6,7 +6,9 @@ from pydantic import BaseModel
 
 from .execution import QueryContext
 
-HistoryStatus = Literal["ok", "error", "cancelled", "timeout"]
+# running: a Run SQL file or a copy that started and has not ended (D-06-9); interrupted: one that was still running
+# when the backend ended (set at the next start)
+HistoryStatus = Literal["ok", "error", "cancelled", "timeout", "running", "interrupted"]
 
 
 class HistoryRecord(BaseModel):

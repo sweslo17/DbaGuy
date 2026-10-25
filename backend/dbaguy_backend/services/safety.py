@@ -49,6 +49,18 @@ class SafetyPolicy:
     ) -> GuardDecision:
         return self.decide(sql, classify(sql, dialect), dialect, level, read_only, confirmed)
 
+    def gate_confirmed(self, sql: str, dialect: Dialect, read_only: bool) -> GuardDecision:
+        """A statement of a whole file the user confirmed (Run SQL file, R-06-6): on a writable connection it runs,
+        unclassified — confirmed, `decide()` runs every kind, so classifying would only cost time (3–10 times the
+        split, A X2). On a read-only one, `check()` decides, and only RUN passes (it cannot ask: BLOCK otherwise)."""
+        if not read_only:
+            return GuardDecision(action=GuardAction.RUN, classification=Classification(kind=StatementKind.UNKNOWN))
+        decision = self.check(sql, dialect, "relaxed", True, confirmed=True)
+        if decision.action == GuardAction.RUN:
+            return decision
+        return GuardDecision(action=GuardAction.BLOCK, reasons=[GuardReason.READ_ONLY],
+                             classification=decision.classification)
+
     def decide(
         self, sql: str, classification: Classification, dialect: Dialect, level: SafetyLevel, read_only: bool,
         confirmed: bool = False,
@@ -85,6 +97,14 @@ class SafetyPolicy:
         if level == "strict" and classification.kind != StatementKind.READ:
             return dangers or [_STRICT_REASON[classification.kind]]
         return dangers
+
+
+def is_plain_read(sql: str, dialect: Dialect) -> bool:
+    """Whether `sql` only reads, by the classifier and the rules the read-only allow-list uses (a READ it lets
+    through): what a dump's SELECT built from the user's filter must be, on every profile (Task 9 fix M2)."""
+    classification = classify(sql, dialect)
+    return (classification.kind == StatementKind.READ
+            and SafetyPolicy._allowed_when_read_only(sql, classification, dialect))
 
 
 def _single_statement_tokens(sql: str, dialect: Dialect) -> list[Token] | None:

@@ -15,6 +15,7 @@ from .config import Settings, default_data_dir
 from .connectivity.ssh_tunnel import SshTunnelManager
 from .services.connection_service import ConnectionService
 from .services.couchbase_service import CouchbaseService
+from .services.data_service import DataService
 from .services.document_service import DocumentService
 from .services.edit_service import EditService
 from .services.field_sample_service import FieldSampleService
@@ -25,8 +26,10 @@ from .services.safety import SafetyPolicy
 from .services.schema_cache import SchemaCache
 from .services.scripts_service import ScriptsService
 from .services.settings_service import SettingsService
+from .services.transfer_service import TransferService
 from .services.workspace_service import WorkspaceService
 from .sessions.hooks import SessionHooksFactory
+from .sessions.jobs.registry import JobRegistry
 from .sessions.manager import SessionManager
 from .sql.classifier import warm_up
 from .storage.paths import default_scripts_dir, history_file, profiles_file, settings_file, workspace_file
@@ -81,12 +84,16 @@ class AppContainer:
         self.documents = DocumentService(self.metadata, self.profiles, self.registry)
         self.edits = EditService(self.metadata, self.profiles, self.registry)
         self.field_samples = FieldSampleService(self.metadata, self.app_settings)
+        self.jobs = JobRegistry()
+        self.data = DataService(self.profiles, self.registry, self.metadata, self.jobs)
+        self.transfers = TransferService(self.profiles, self.registry, self.metadata, self.schema_cache)
         self.history = HistoryService(history_file(data_dir))
         self.policy = SafetyPolicy()
         hooks = SessionHooksFactory(
             self.registry, self.profiles, self.policy, self.history, self.schema_cache, self.edits.plans,
+            self.transfers.plans,
         )
-        self.sessions = SessionManager(self.connections, self.profiles, hooks)
+        self.sessions = SessionManager(self.connections, self.profiles, hooks, jobs=self.jobs)
         self._stop = threading.Event()
         self._housekeeper: threading.Thread | None = None
 

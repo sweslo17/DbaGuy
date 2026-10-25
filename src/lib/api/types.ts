@@ -128,6 +128,58 @@ export type EditOutcomeEvent = S["EditOutcomeEvent"];
 export type EditOutcome = EditOutcomeEvent["outcome"];
 /** Grid editing (spec ⑤ §3.7): a table tab's staged edits as `workspace.json` keeps them. */
 export type StagedEditsFile = S["StagedEditsFile"];
+/** Data tools (spec ⑥ D-06-11): how far a job is, at most every 250 ms (cumulative counts). */
+export type JobProgressEvent = S["JobProgressEvent"];
+/** Data tools (spec ⑥ R-06-12): how a job ended, sent once right before its `session_state` and `finished`. */
+export type JobOutcomeEvent = S["JobOutcomeEvent"];
+/** "completed", "failed", "rolled_back", "partial", "stopped", "unknown" or "not_started"; a cancel is `cancelled`. */
+export type JobOutcomeKind = JobOutcomeEvent["outcome"];
+/** Data tools: a statement that failed (line, statement number, the server's code and text). */
+export type JobError = S["JobError"];
+/** Data tools (spec ⑥ D-06-10): a job of this backend run, as `GET /data/jobs` lists it. */
+export type JobInfo = S["JobInfo"];
+/** Run SQL file (spec ⑥ §3.4): run a file on a job session, all or nothing or statement by statement. */
+export type RunFileCommand = S["RunFileCommand"];
+/** Run SQL file (spec ⑥ §3.2): the size, first lines, DbaGuy header and warnings of a file, before it runs. */
+export type FileInspection = S["FileInspection"];
+/** The header of a dump DbaGuy wrote, read back by the inspection: a hint, never a permission. */
+export type DumpHeader = S["DumpHeader"];
+/** Dump (spec ⑥ §3.3): dump a database, a schema or named tables of this session to a SQL file. */
+export type DumpCommand = S["DumpCommand"];
+/** Dump: what it covers ("database", "schema", "tables" with their names). */
+export type DumpScope = S["DumpScope"];
+/** Dump: which objects besides tables it writes (views, sequences, types, routines, triggers). */
+export type DumpObjectKinds = S["DumpObjectKinds"];
+/** Dump (POST /data/dump/plan): the objects, what the header leaves out, the consistency and the warnings. */
+export type DumpPlan = S["DumpPlan"];
+/** Dump plan: one object the dump writes under its own name (a table with its rows estimate). */
+export type DumpPlanObject = S["DumpPlanObject"];
+/** Dump plan request (POST /data/dump/plan): the dump command's fields, and the profile and database to read. */
+export type DumpPlanRequest = S["DumpPlanRequest"];
+/** Data tools: where a run stopped, or where a run again starts (`resume_at`, 06b B1): a line and a statement number. */
+export type StoppedAt = S["StoppedAt"];
+/** Run SQL file (06b B2): a file's lines around one line, for the error list. */
+export type FileExcerpt = S["FileExcerpt"];
+/** Copy data (spec ⑥ §3.5.5): run a previewed copy (its plan id, once) on the target's job session. */
+export type CopyDataCommand = S["CopyDataCommand"];
+/** Data tools: one object of a dump, or one table of a copy with its outcome (`copied`, `rolled_back`, …). */
+export type JobObject = S["JobObject"];
+/** Copy data (spec ⑥ §3.5.1, POST /data/transfer/plan): the source, the target and how. */
+export type TransferRequest = S["TransferRequest"];
+/** Copy data: tables (tree paths) of one connection, or a query tab's result; a filter for one table. */
+export type SourceSpec = S["SourceSpec"];
+/** Copy data: where the rows go, the mode, and per table and column the types, identities and columns left out. */
+export type TargetSpec = S["TargetSpec"];
+/** Copy data: a query tab's statement (run again on its session) and the result's columns the tab already has. */
+export type QuerySource = S["QuerySource"];
+/** Copy data's preview: each table's mapping, statements, warnings and problems; `plan_id` null while any problem. */
+export type TransferPlan = S["TransferPlan"];
+/** Copy data's preview: one table, in the order the copy runs. */
+export type TableTransfer = S["TableTransfer"];
+/** Copy data's preview: one source column and where it goes. */
+export type ColumnMapping = S["ColumnMapping"];
+/** Copy data's preview: why it cannot run as asked (spec §4). */
+export type TransferProblem = S["TransferProblem"];
 
 export function pathKey(path: PathSegment[]): string {
   return path.map((s) => `${s.kind}:${s.name}`).join("/");

@@ -1780,6 +1780,449 @@
         }
       }
     },
+    "/data/dump/plan": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Dump Plan",
+        "description": "The dump dialog's object list, what the header leaves out, the consistency and the warnings (the metadata\nconnection; nothing is written). 422 `not_supported` for an engine without dumps.",
+        "operationId": "dump_plan_data_dump_plan_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DumpPlanRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DumpPlan"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/data/transfer/plan": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Transfer Plan",
+        "description": "Copy data's preview (spec \u2465 \u00a73.5.1): each table's column mapping, types and conversions, the statements the copy\nadds, its warnings and problems, and the plan id the copy command takes once (null while there is a problem). A\nread-only target is refused (403) and an engine without copies 422 `not_supported`, before any connection.",
+        "operationId": "transfer_plan_data_transfer_plan_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransferRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransferPlan"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/data/reveal": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Reveal",
+        "description": "Show in Finder, for a file a completed dump of this backend run wrote (404 for any other path).",
+        "operationId": "reveal_data_reveal_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevealRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/data/run-file/inspect": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Inspect Run File",
+        "description": "Run SQL file's dialog: the file's size, first lines and warnings. A read-only connection is refused (403).",
+        "operationId": "inspect_run_file_data_run_file_inspect_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunFileInspectRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileInspection"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/data/run-file/excerpt": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Run File Excerpt",
+        "description": "Run SQL file's error list: the file's lines around one line (06b B2). 404 `file_not_found` for no file.",
+        "operationId": "run_file_excerpt_data_run_file_excerpt_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunFileExcerptRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileExcerpt"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/data/jobs": {
+      "get": {
+        "tags": [
+          "data"
+        ],
+        "summary": "List Jobs",
+        "description": "Newest first: running and finished, until cleared (D-06-10).",
+        "operationId": "list_jobs_data_jobs_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/JobInfo"
+                  },
+                  "title": "Response List Jobs Data Jobs Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/data/jobs/cancel": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Cancel Job",
+        "description": "The WebSocket's `cancel`, for a job whose dialog is gone: a job that has ended is left as it is.",
+        "operationId": "cancel_job_data_jobs_cancel_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobCancelRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/data/jobs/clear": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Clear Jobs",
+        "description": "Forget the jobs that have ended (the Jobs list's Clear finished).",
+        "operationId": "clear_jobs_data_jobs_clear_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/settings": {
       "get": {
         "tags": [
@@ -3324,6 +3767,110 @@
         ],
         "title": "ColumnInfo"
       },
+      "ColumnMapping": {
+        "properties": {
+          "source_name": {
+            "type": "string",
+            "title": "Source Name"
+          },
+          "source_type": {
+            "type": "string",
+            "title": "Source Type"
+          },
+          "family": {
+            "type": "string",
+            "title": "Family"
+          },
+          "target_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Name"
+          },
+          "target_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Type"
+          },
+          "type_editable": {
+            "type": "boolean",
+            "title": "Type Editable",
+            "default": false
+          },
+          "overridden": {
+            "type": "boolean",
+            "title": "Overridden",
+            "default": false
+          },
+          "conversion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversion"
+          },
+          "skipped": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skipped"
+          },
+          "identity": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "keep",
+                  "generate"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Identity"
+          },
+          "problem": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Problem"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source_name",
+          "source_type",
+          "family"
+        ],
+        "title": "ColumnMapping",
+        "description": "One source column and where it goes (spec \u00a73.5.1)."
+      },
       "ColumnMeta": {
         "properties": {
           "name": {
@@ -3670,6 +4217,46 @@
         "title": "ContextOption",
         "description": "One entry of the query-context picker. `text` is `QueryContext(bucket, scope).text()`, so the frontend never\nquotes a name (B13)."
       },
+      "CopyDataCommand": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "type": {
+            "type": "string",
+            "const": "copy_data",
+            "title": "Type",
+            "default": "copy_data"
+          },
+          "plan_id": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Plan Id"
+          },
+          "source_session_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Session Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "plan_id"
+        ],
+        "title": "CopyDataCommand",
+        "description": "Copy data between connections (spec \u2465 \u00a73.5.5): the previewed plan, run on this session (the target's), reading\neach table on the source's: the query tab's session the plan's query came from, or one the copy opens and closes\nitself (None). Each table is copied in a transaction of its own; nothing is ever sent again."
+      },
       "CouchbaseSettings": {
         "properties": {
           "sample_size": {
@@ -3983,6 +4570,386 @@
         ],
         "title": "DocumentView",
         "description": "One document as the server holds it (spec \u00a73.9.2, R-04-2)."
+      },
+      "DumpCommand": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "type": {
+            "type": "string",
+            "const": "dump",
+            "title": "Type",
+            "default": "dump"
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/DumpScope"
+          },
+          "content": {
+            "type": "string",
+            "enum": [
+              "schema",
+              "data",
+              "both"
+            ],
+            "title": "Content",
+            "default": "both"
+          },
+          "objects": {
+            "$ref": "#/components/schemas/DumpObjectKinds",
+            "default": {
+              "views": true,
+              "sequences": true,
+              "types": true,
+              "routines": true,
+              "triggers": true
+            }
+          },
+          "drop_first": {
+            "type": "boolean",
+            "title": "Drop First",
+            "default": false
+          },
+          "filter": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 65536
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filter"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "path",
+          "scope"
+        ],
+        "title": "DumpCommand",
+        "description": "Dump a scope of this session's database to a SQL file (spec \u2465 \u00a73.3): written through a temporary file, so a\ndump that fails or is cancelled leaves no file and keeps any old one."
+      },
+      "DumpHeader": {
+        "properties": {
+          "format": {
+            "type": "integer",
+            "title": "Format"
+          },
+          "engine": {
+            "$ref": "#/components/schemas/Engine"
+          },
+          "server": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Server"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
+          },
+          "created": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created"
+          },
+          "drop_first": {
+            "type": "boolean",
+            "title": "Drop First",
+            "default": false
+          },
+          "filtered": {
+            "type": "boolean",
+            "title": "Filtered",
+            "default": false
+          },
+          "filtered_table": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filtered Table"
+          },
+          "lines": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Lines"
+          }
+        },
+        "type": "object",
+        "required": [
+          "format",
+          "engine",
+          "lines"
+        ],
+        "title": "DumpHeader",
+        "description": "The first lines of a dump DbaGuy wrote (spec \u2465 \u00a73.3.2), as Run SQL file's inspection reads them back: a hint\nfor the dialog, never a permission."
+      },
+      "DumpObjectKinds": {
+        "properties": {
+          "views": {
+            "type": "boolean",
+            "title": "Views",
+            "default": true
+          },
+          "sequences": {
+            "type": "boolean",
+            "title": "Sequences",
+            "default": true
+          },
+          "types": {
+            "type": "boolean",
+            "title": "Types",
+            "default": true
+          },
+          "routines": {
+            "type": "boolean",
+            "title": "Routines",
+            "default": true
+          },
+          "triggers": {
+            "type": "boolean",
+            "title": "Triggers",
+            "default": true
+          }
+        },
+        "type": "object",
+        "title": "DumpObjectKinds",
+        "description": "Which objects besides tables a dump writes (R-06-2); a table's own sequences and column types always come\nwith it. Routines include MySQL events; views include SQL Server synonyms."
+      },
+      "DumpPlan": {
+        "properties": {
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/DumpPlanObject"
+            },
+            "type": "array",
+            "title": "Objects"
+          },
+          "not_included": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Not Included"
+          },
+          "consistency": {
+            "type": "string",
+            "enum": [
+              "snapshot",
+              "per_table"
+            ],
+            "title": "Consistency"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "objects",
+          "not_included",
+          "consistency"
+        ],
+        "title": "DumpPlan",
+        "description": "What a dump of a scope would write (POST /data/dump/plan): the dialog's object list and warnings. Read on the\nmetadata connection, outside any snapshot; the dump reads the catalog again inside its own.\n\n`objects` are the objects the content writes under their own names, in the file's order: schemas, extensions,\ncollations, types, sequences, routines, tables, views, triggers, events, synonyms, rules, extended statistics and\npolicies. The parts of another object are left to it: a table's indexes, foreign keys, check constraints,\ndefaults and settings, a trigger's state, a sequence's owner and value, an identity's value, a table's row-level\nsecurity switch, SQLite's header settings (user_version, application_id). A data-only plan lists the tables, parents\nfirst, then what only a data-only dump writes (`refresh`: PostgreSQL's materialized views, made again from the\nrows). `not_included` is the header's Not included list, word for word."
+      },
+      "DumpPlanObject": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "rows_estimate": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rows Estimate"
+          },
+          "notes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Notes",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind",
+          "name"
+        ],
+        "title": "DumpPlanObject",
+        "description": "One object a dump writes under its own name, as the dump dialog lists it."
+      },
+      "DumpPlanRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "database": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Database"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/DumpScope"
+          },
+          "content": {
+            "type": "string",
+            "enum": [
+              "schema",
+              "data",
+              "both"
+            ],
+            "title": "Content",
+            "default": "both"
+          },
+          "objects": {
+            "$ref": "#/components/schemas/DumpObjectKinds",
+            "default": {
+              "views": true,
+              "sequences": true,
+              "types": true,
+              "routines": true,
+              "triggers": true
+            }
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 4096,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "drop_first": {
+            "type": "boolean",
+            "title": "Drop First",
+            "default": false
+          },
+          "filter": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 65536
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filter"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "scope"
+        ],
+        "title": "DumpPlanRequest"
+      },
+      "DumpScope": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "database",
+              "schema",
+              "tables"
+            ],
+            "title": "Kind"
+          },
+          "schema_name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1024,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schema Name"
+          },
+          "names": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 500,
+            "title": "Names"
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "title": "DumpScope",
+        "description": "What a dump covers (spec \u2465 \u00a73.3.1): a whole database (PostgreSQL, SQL Server), one schema (MySQL: a database;\nSQLite: main), or named tables and views of one schema."
       },
       "EditChanges": {
         "properties": {
@@ -4592,6 +5559,21 @@
           "orders_browse_by_key": {
             "type": "boolean",
             "title": "Orders Browse By Key"
+          },
+          "run_file": {
+            "type": "boolean",
+            "title": "Run File",
+            "default": false
+          },
+          "dump": {
+            "type": "boolean",
+            "title": "Dump",
+            "default": false
+          },
+          "copy_data": {
+            "type": "boolean",
+            "title": "Copy Data",
+            "default": false
           }
         },
         "type": "object",
@@ -4786,6 +5768,15 @@
               },
               {
                 "$ref": "#/components/schemas/ApplyEditsCommand"
+              },
+              {
+                "$ref": "#/components/schemas/RunFileCommand"
+              },
+              {
+                "$ref": "#/components/schemas/DumpCommand"
+              },
+              {
+                "$ref": "#/components/schemas/CopyDataCommand"
               }
             ],
             "title": "Command",
@@ -4795,11 +5786,14 @@
                 "apply_edits": "#/components/schemas/ApplyEditsCommand",
                 "cancel": "#/components/schemas/CancelCommand",
                 "commit": "#/components/schemas/CommitCommand",
+                "copy_data": "#/components/schemas/CopyDataCommand",
                 "discard": "#/components/schemas/DiscardCommand",
+                "dump": "#/components/schemas/DumpCommand",
                 "execute": "#/components/schemas/ExecuteCommand",
                 "export": "#/components/schemas/ExportCommand",
                 "fetch_more": "#/components/schemas/FetchMoreCommand",
                 "rollback": "#/components/schemas/RollbackCommand",
+                "run_file": "#/components/schemas/RunFileCommand",
                 "set_autocommit": "#/components/schemas/SetAutocommitCommand"
               }
             }
@@ -4841,6 +5835,12 @@
               },
               {
                 "$ref": "#/components/schemas/EditOutcomeEvent"
+              },
+              {
+                "$ref": "#/components/schemas/JobProgressEvent"
+              },
+              {
+                "$ref": "#/components/schemas/JobOutcomeEvent"
               }
             ],
             "title": "Event",
@@ -4852,6 +5852,8 @@
                 "edit_outcome": "#/components/schemas/EditOutcomeEvent",
                 "error": "#/components/schemas/ErrorEvent",
                 "finished": "#/components/schemas/FinishedEvent",
+                "job_outcome": "#/components/schemas/JobOutcomeEvent",
+                "job_progress": "#/components/schemas/JobProgressEvent",
                 "message": "#/components/schemas/MessageEvent",
                 "progress": "#/components/schemas/ProgressEvent",
                 "result_set": "#/components/schemas/ResultSetEvent",
@@ -5070,6 +6072,87 @@
         ],
         "title": "FieldSample",
         "description": "A manual sample of a keyspace (R-04-11): the field paths derived in Python from the documents read."
+      },
+      "FileExcerpt": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "first_line": {
+            "type": "integer",
+            "title": "First Line"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "found": {
+            "type": "boolean",
+            "title": "Found"
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "first_line",
+          "text",
+          "found",
+          "truncated"
+        ],
+        "title": "FileExcerpt",
+        "description": "Lines of a file around one line (POST /data/run-file/excerpt): where an error of Run SQL file is, for its dialog\n(06b B2). Lines are counted at LF, as a run counts them; text that is not UTF-8 is shown replaced."
+      },
+      "FileInspection": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "size": {
+            "type": "integer",
+            "title": "Size"
+          },
+          "header": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DumpHeader"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "preview": {
+            "type": "string",
+            "title": "Preview"
+          },
+          "preview_truncated": {
+            "type": "boolean",
+            "title": "Preview Truncated"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "size",
+          "preview",
+          "preview_truncated"
+        ],
+        "title": "FileInspection",
+        "description": "What Run SQL file's dialog shows of a file before it runs (POST /data/run-file/inspect)."
       },
       "FinishedEvent": {
         "properties": {
@@ -5387,7 +6470,9 @@
               "ok",
               "error",
               "cancelled",
-              "timeout"
+              "timeout",
+              "running",
+              "interrupted"
             ],
             "title": "Status"
           },
@@ -5605,6 +6690,422 @@
           "text"
         ],
         "title": "InsertDocumentRequest"
+      },
+      "JobCancelRequest": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "session_id",
+          "request_id"
+        ],
+        "title": "JobCancelRequest"
+      },
+      "JobError": {
+        "properties": {
+          "line": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line"
+          },
+          "statement": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Statement"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "title": "JobError",
+        "description": "One statement that failed: where, the server's code and its own text (shown, never logged above DEBUG)."
+      },
+      "JobInfo": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "job": {
+            "type": "string",
+            "enum": [
+              "dump",
+              "run_file",
+              "copy_data"
+            ],
+            "title": "Job"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "source_profile_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Profile Id"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Started At"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobProgressEvent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobOutcomeEvent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "session_id",
+          "request_id",
+          "job",
+          "title",
+          "profile_id",
+          "started_at"
+        ],
+        "title": "JobInfo",
+        "description": "A job of this backend run, as the Jobs list shows it (GET /data/jobs)."
+      },
+      "JobObject": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "rows": {
+            "type": "integer",
+            "title": "Rows",
+            "default": 0
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "copied",
+                  "rolled_back",
+                  "not_started",
+                  "unknown"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind",
+          "name"
+        ],
+        "title": "JobObject",
+        "description": "One object of a dump, with the rows written for it; one table of a copy, with its outcome."
+      },
+      "JobOutcomeEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "job_outcome",
+            "title": "Type",
+            "default": "job_outcome"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "job": {
+            "type": "string",
+            "enum": [
+              "dump",
+              "run_file",
+              "copy_data"
+            ],
+            "title": "Job"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "failed",
+              "rolled_back",
+              "partial",
+              "stopped",
+              "unknown",
+              "not_started"
+            ],
+            "title": "Outcome"
+          },
+          "cancelled": {
+            "type": "boolean",
+            "title": "Cancelled",
+            "default": false
+          },
+          "rows": {
+            "type": "integer",
+            "title": "Rows",
+            "default": 0
+          },
+          "bytes": {
+            "type": "integer",
+            "title": "Bytes",
+            "default": 0
+          },
+          "statements": {
+            "type": "integer",
+            "title": "Statements",
+            "default": 0
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/JobObject"
+            },
+            "type": "array",
+            "title": "Objects",
+            "default": []
+          },
+          "errors": {
+            "items": {
+              "$ref": "#/components/schemas/JobError"
+            },
+            "type": "array",
+            "title": "Errors",
+            "default": []
+          },
+          "error_count": {
+            "type": "integer",
+            "title": "Error Count",
+            "default": 0
+          },
+          "stopped_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StoppedAt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resume_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StoppedAt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobError"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "job",
+          "outcome"
+        ],
+        "title": "JobOutcomeEvent",
+        "description": "How a job ended (R-06-12): sent once, right before the request's `session_state` and `finished`."
+      },
+      "JobProgressEvent": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "job_progress",
+            "title": "Type",
+            "default": "job_progress"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "stage": {
+            "type": "string",
+            "enum": [
+              "starting",
+              "schema",
+              "data",
+              "post_data",
+              "statements",
+              "commit"
+            ],
+            "title": "Stage",
+            "default": "starting"
+          },
+          "object": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Object"
+          },
+          "rows": {
+            "type": "integer",
+            "title": "Rows",
+            "default": 0
+          },
+          "bytes": {
+            "type": "integer",
+            "title": "Bytes",
+            "default": 0
+          },
+          "total_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Bytes"
+          },
+          "statements": {
+            "type": "integer",
+            "title": "Statements",
+            "default": 0
+          },
+          "errors": {
+            "type": "integer",
+            "title": "Errors",
+            "default": 0
+          },
+          "line": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id"
+        ],
+        "title": "JobProgressEvent",
+        "description": "How far a job is (D-06-11): at most every 250 ms, and as each object starts and ends. Cumulative counts."
       },
       "JsonValue": {},
       "Keyspace": {
@@ -6443,6 +7944,39 @@
         "title": "QueryContext",
         "description": "Couchbase: the bucket (and scope) that unqualified keyspace names resolve against, sent with every request\n(D-04-5: a structure, because a bucket name may hold a dot)."
       },
+      "QuerySource": {
+        "properties": {
+          "sql": {
+            "type": "string",
+            "maxLength": 1048576,
+            "minLength": 1,
+            "title": "Sql"
+          },
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnMeta"
+            },
+            "type": "array",
+            "maxItems": 4096,
+            "minItems": 1,
+            "title": "Columns"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 1024,
+            "title": "Title",
+            "default": "the query"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "sql",
+          "columns"
+        ],
+        "title": "QuerySource",
+        "description": "A query tab's result (spec \u00a73.5.1): its statement, run again on the tab's own session as an export is (the same\ntransaction, its temporary tables), and the columns the tab already has, which the preview maps without running it."
+      },
       "RemoveDocumentRequest": {
         "properties": {
           "profile_id": {
@@ -6549,6 +8083,22 @@
           "columns"
         ],
         "title": "ResultSetEvent"
+      },
+      "RevealRequest": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "title": "RevealRequest"
       },
       "RollbackCommand": {
         "properties": {
@@ -6749,6 +8299,137 @@
           "rows"
         ],
         "title": "RowsEvent"
+      },
+      "RunFileCommand": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "type": {
+            "type": "string",
+            "const": "run_file",
+            "title": "Type",
+            "default": "run_file"
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "all_or_nothing",
+              "statements"
+            ],
+            "title": "Mode"
+          },
+          "on_error": {
+            "type": "string",
+            "enum": [
+              "stop",
+              "continue"
+            ],
+            "title": "On Error",
+            "default": "stop"
+          },
+          "from_statement": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "From Statement",
+            "default": 1
+          },
+          "from_line": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From Line"
+          },
+          "search_path": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1024,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Search Path"
+          },
+          "query_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "path",
+          "mode"
+        ],
+        "title": "RunFileCommand",
+        "description": "Run a SQL file on this session, a statement at a time (spec \u2465 \u00a73.4): all of it in one transaction, or each\nstatement on its own (stopping at an error, or skipping it). Statements before `from_statement` are read, never\nsent. `from_line`: the line that statement started at when a run before gave the place (`resume_at`): a file whose\nstatement starts elsewhere now changed, and the run is refused before any of it is sent (06b review M3)."
+      },
+      "RunFileExcerptRequest": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path"
+          },
+          "line": {
+            "type": "integer",
+            "maximum": 2147483647.0,
+            "minimum": 1.0,
+            "title": "Line"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "path",
+          "line"
+        ],
+        "title": "RunFileExcerptRequest"
+      },
+      "RunFileInspectRequest": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "path"
+        ],
+        "title": "RunFileInspectRequest"
       },
       "RunSettings": {
         "properties": {
@@ -7562,6 +9243,75 @@
         ],
         "title": "SortKey"
       },
+      "SourceSpec": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "database": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1024
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Database"
+          },
+          "tables": {
+            "anyOf": [
+              {
+                "items": {
+                  "items": {
+                    "$ref": "#/components/schemas/PathSegment"
+                  },
+                  "type": "array"
+                },
+                "type": "array",
+                "maxItems": 500,
+                "minItems": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tables"
+          },
+          "query": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QuerySource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "filter": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 65536
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filter"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id"
+        ],
+        "title": "SourceSpec",
+        "description": "Tables, views and materialized views of one connection, or a query tab's result."
+      },
       "SplitRequest": {
         "properties": {
           "text": {
@@ -8129,6 +9879,214 @@
         ],
         "title": "StatementRange"
       },
+      "StoppedAt": {
+        "properties": {
+          "line": {
+            "type": "integer",
+            "title": "Line"
+          },
+          "statement": {
+            "type": "integer",
+            "title": "Statement"
+          },
+          "exact": {
+            "type": "boolean",
+            "title": "Exact"
+          }
+        },
+        "type": "object",
+        "required": [
+          "line",
+          "statement"
+        ],
+        "title": "StoppedAt",
+        "description": "A place in a run's file: where it stopped (the statement that failed, was cancelled or was not sent), or where a\nrun again starts (`resume_at`, 06b B1). `exact`: `line` is where that statement starts. False for a stop with no\nstatement of its own (a line that is not UTF-8 inside a statement, a psql command, a statement over the limit, a\nread error): the line is where the run stopped, so a run again from it sends no `from_line` (06b review M-b)."
+      },
+      "TableTransfer": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "target": {
+            "type": "string",
+            "title": "Target"
+          },
+          "source_key": {
+            "type": "string",
+            "title": "Source Key"
+          },
+          "source_path": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PathSegment"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Path"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "create",
+              "append",
+              "replace_rows"
+            ],
+            "title": "Mode"
+          },
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnMapping"
+            },
+            "type": "array",
+            "title": "Columns"
+          },
+          "before": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Before",
+            "default": []
+          },
+          "after": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "After",
+            "default": []
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "default": []
+          },
+          "problems": {
+            "items": {
+              "$ref": "#/components/schemas/TransferProblem"
+            },
+            "type": "array",
+            "title": "Problems",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "target",
+          "source_key",
+          "mode",
+          "columns"
+        ],
+        "title": "TableTransfer",
+        "description": "One table of the copy, in the order the copy runs (spec \u00a73.5.1)."
+      },
+      "TargetSpec": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Profile Id"
+          },
+          "database": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1024
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Database"
+          },
+          "schema_name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1024
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schema Name"
+          },
+          "table": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1024,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "create",
+              "append",
+              "replace_rows"
+            ],
+            "title": "Mode"
+          },
+          "overrides": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": "object",
+            "title": "Overrides"
+          },
+          "identity": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string",
+                "enum": [
+                  "keep",
+                  "generate"
+                ]
+              },
+              "type": "object"
+            },
+            "type": "object",
+            "title": "Identity"
+          },
+          "left_out": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "object",
+            "title": "Left Out"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "profile_id",
+          "mode"
+        ],
+        "title": "TargetSpec",
+        "description": "Where the rows go (spec \u00a73.5.1). `overrides`, `identity` and `left_out` are by the source table's name (a\nquery's: its `title`) and then the source column's."
+      },
       "TextSelection": {
         "properties": {
           "anchor": {
@@ -8149,6 +10107,135 @@
           "head"
         ],
         "title": "TextSelection"
+      },
+      "TransferPlan": {
+        "properties": {
+          "plan_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Id"
+          },
+          "source_profile_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Source Profile Id"
+          },
+          "tables": {
+            "items": {
+              "$ref": "#/components/schemas/TableTransfer"
+            },
+            "type": "array",
+            "title": "Tables"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "default": []
+          },
+          "problems": {
+            "items": {
+              "$ref": "#/components/schemas/TransferProblem"
+            },
+            "type": "array",
+            "title": "Problems",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "source_profile_id",
+          "tables"
+        ],
+        "title": "TransferPlan",
+        "description": "The preview (POST /data/transfer/plan). `plan_id` is null while any table or the copy has a problem (\u2464 E8)."
+      },
+      "TransferProblem": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "target_exists",
+              "target_missing",
+              "target_not_writable",
+              "unmappable_type",
+              "invalid_type",
+              "same_table",
+              "same_sqlite_file",
+              "source_missing",
+              "missing_column",
+              "unconvertible",
+              "query_not_select",
+              "no_columns",
+              "duplicate_column",
+              "invalid_filter",
+              "duplicate_target",
+              "cascade_loop",
+              "name_too_long"
+            ],
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "column": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Column"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "TransferProblem",
+        "description": "Why the copy cannot run as asked (spec \u00a74): the preview has no plan id while there is one."
+      },
+      "TransferRequest": {
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/SourceSpec"
+          },
+          "target": {
+            "$ref": "#/components/schemas/TargetSpec"
+          },
+          "preview_key": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preview Key"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "source",
+          "target"
+        ],
+        "title": "TransferRequest"
       },
       "UncheckedColumn": {
         "properties": {

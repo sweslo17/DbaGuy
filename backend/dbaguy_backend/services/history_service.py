@@ -6,7 +6,7 @@ from uuid import UUID
 from loguru import logger
 
 from ..domain.errors import StorageError
-from ..domain.history import HistoryEntry, HistoryPage, HistoryRecord
+from ..domain.history import HistoryEntry, HistoryPage, HistoryRecord, HistoryStatus
 from ..storage.json_files import move_aside
 
 _SCHEMA = """
@@ -76,7 +76,16 @@ class HistoryService:
             self._conn = self._open()
             logger.debug("History database {} is open", self._path)
             self._prune(self._conn)  # a short-lived run may never reach `prune_every` inserts
+            self._interrupt(self._conn)
         return self._conn
+
+    @staticmethod
+    def _interrupt(conn: sqlite3.Connection) -> None:
+        """Records still `running` belong to a backend that ended mid-job (D-06-9): one process uses the history, and
+        it opens the database before it writes anything, so none of them can be this run's."""
+        marked = conn.execute("UPDATE history SET status = 'interrupted' WHERE status = 'running'").rowcount
+        if marked > 0:
+            logger.warning("{} history record(s) of an earlier run were still running: marked interrupted", marked)
 
     def _open(self) -> sqlite3.Connection:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,10 +113,25 @@ class HistoryService:
         return conn
 
     def record(self, rec: HistoryRecord) -> None:
+        self._insert(rec)
+
+    def begin(self, rec: HistoryRecord) -> int:
+        """A job's record, written as it starts (status `running`, D-06-9): its id, for `finish`."""
+        return self._insert(rec.model_copy(update={"status": "running"}))
+
+    def finish(self, record_id: int, status: HistoryStatus, elapsed_ms: int, rows: int, error: str | None) -> None:
+        """How the job of `begin` ended. A record that is gone (cleared or pruned meanwhile) is left gone."""
+        with self._lock:
+            self._connection().execute(
+                "UPDATE history SET status = ?, elapsed_ms = ?, rows = ?, error = ? WHERE id = ?",
+                (status, elapsed_ms, rows, error[:_MAX_ERROR] if error else None, record_id),
+            )
+
+    def _insert(self, rec: HistoryRecord) -> int:
         error = rec.error[:_MAX_ERROR] if rec.error else None
         with self._lock:
             conn = self._connection()
-            conn.execute(
+            cursor = conn.execute(
                 f"INSERT INTO history ({_DATA_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (str(rec.profile_id), rec.profile_name, rec.database, rec.sql, rec.started_at.isoformat(),
                  rec.elapsed_ms, rec.rows, rec.status, error),
@@ -115,6 +139,7 @@ class HistoryService:
             self._inserts += 1
             if self._inserts % self._prune_every == 0:
                 self._prune(conn)
+            return int(cursor.lastrowid or 0)
 
     def _prune(self, conn: sqlite3.Connection) -> None:
         """Drop the entries beyond the retention. The caller holds the lock."""

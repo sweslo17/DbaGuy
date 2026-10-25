@@ -1,6 +1,7 @@
 mod backend;
 #[cfg(target_os = "macos")]
 mod menu;
+mod quit;
 
 use backend::{BackendInfo, BackendManager};
 use std::path::PathBuf;
@@ -51,11 +52,28 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(BackendManager::default())
+        .manage(quit::QuitGate::default())
+        // A window's close asks the page first (spec ⑥ CR-5): it closes through `quit::close_window`, or by itself
+        // when the page does not answer in time (`quit::request_close`).
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                quit::request_close(window);
+            }
+        })
         .setup(|app| {
             let _ = app.state::<BackendManager>().start(app.handle());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![backend_info, restart_backend])
+        .invoke_handler(tauri::generate_handler![
+            backend_info,
+            restart_backend,
+            quit::quit_ack,
+            quit::close_ack,
+            quit::quit_app,
+            quit::close_window,
+            quit::reveal_window
+        ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
