@@ -158,3 +158,73 @@ def test_records_still_running_at_the_next_start_are_interrupted(tmp_path):  # D
     assert second.search().items[0].status == "running"
     second.finish(record_id, "ok", 1, 1, None)
     second.close()
+
+
+# ---- spec ⑧ D-08-13, CR-08-3: the MCP source, its own cap, refusals ----
+
+_BEFORE_08 = """
+CREATE TABLE history (id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id TEXT NOT NULL, profile_name TEXT NOT NULL,
+    database_name TEXT, sql TEXT NOT NULL, started_at TEXT NOT NULL, elapsed_ms INTEGER NOT NULL, rows INTEGER NOT NULL,
+    status TEXT NOT NULL, error TEXT);
+INSERT INTO history (profile_id, profile_name, database_name, sql, started_at, elapsed_ms, rows, status)
+    VALUES ('00000000-0000-0000-0000-000000000001', 'p', NULL, 'SELECT old', '2026-10-01T00:00:00+00:00', 1, 1, 'ok');
+"""
+
+
+def mcp(sql, status="ok", client="claude-code"):
+    return rec(sql, status).model_copy(update={"source": "mcp", "client": client})
+
+
+def test_a_file_from_before_08_gets_the_new_columns_in_place(tmp_path):
+    path = tmp_path / "h.db"
+    old = sqlite3.connect(path)
+    old.executescript(_BEFORE_08)
+    old.close()
+    history = HistoryService(path)
+    [entry] = history.search().items
+    assert (entry.sql, entry.source, entry.client, entry.repeats) == ("SELECT old", "app", None, 1)
+    history.record(mcp("SELECT new"))
+    assert sqls(history.search(source="mcp")) == ["SELECT new"]
+    assert sqls(history.search(source="app")) == ["SELECT old"]
+    history.close()
+    indexes = {row[1] for row in sqlite3.connect(path).execute("PRAGMA index_list(history)")}
+    assert "history_by_source" in indexes
+
+
+def test_each_source_keeps_its_own_newest_records(tmp_path):
+    history = HistoryService(tmp_path / "h.db", retention=3, mcp_retention=2, prune_every=1)
+    for n in range(6):
+        history.record(rec(f"app {n}"))
+        history.record(mcp(f"mcp {n}"))
+    assert sqls(history.search(source="app")) == ["app 5", "app 4", "app 3"]
+    assert sqls(history.search(source="mcp")) == ["mcp 5", "mcp 4"]  # an agent never pushes out the user's
+
+
+def test_a_refusal_sent_again_within_a_minute_adds_to_its_record(tmp_path):
+    now = [100.0]
+    history = HistoryService(tmp_path / "h.db", clock=lambda: now[0])
+    first = history.refused(mcp("DROP TABLE t"))
+    now[0] += 30
+    assert history.refused(mcp("DROP TABLE t")) == first
+    now[0] += 59  # a minute after the last, not the first
+    assert history.refused(mcp("DROP TABLE t")) == first
+    other_client = history.refused(mcp("DROP TABLE t", client="other"))
+    other_text = history.refused(mcp("DROP TABLE u"))
+    assert len({first, other_client, other_text}) == 3
+    now[0] += 61
+    later = history.refused(mcp("DROP TABLE t"))
+    entries = {e.id: e for e in history.search(source="mcp").items}
+    assert (entries[first].status, entries[first].repeats) == ("refused", 3)
+    assert entries[later].repeats == 1 and later != first
+    history.clear()
+    assert history.refused(mcp("DROP TABLE t")) not in (first, later)
+
+
+def test_only_the_last_few_refusals_are_remembered_for_merging(tmp_path):  # an in-process memory: 64 kept
+    history = HistoryService(tmp_path / "h.db", clock=lambda: 100.0)
+    ids = [history.refused(mcp(f"DROP TABLE t{n}")) for n in range(65)]
+    assert history.refused(mcp("DROP TABLE t64")) == ids[64]  # among the last 64: merged
+    forgotten = history.refused(mcp("DROP TABLE t0"))  # pushed out of the memory: a new record
+    assert forgotten not in ids
+    repeats = {e.id: e.repeats for e in history.search(source="mcp", limit=1000).items}
+    assert (repeats[ids[64]], repeats[ids[0]], repeats[forgotten]) == (2, 1, 1)

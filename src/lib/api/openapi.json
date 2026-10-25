@@ -2809,6 +2809,26 @@
             }
           },
           {
+            "name": "source",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "app",
+                    "mcp"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source"
+            }
+          },
+          {
             "name": "authorization",
             "in": "header",
             "required": false,
@@ -6693,7 +6713,8 @@
               "cancelled",
               "timeout",
               "running",
-              "interrupted"
+              "interrupted",
+              "refused"
             ],
             "title": "Status"
           },
@@ -6707,6 +6728,31 @@
               }
             ],
             "title": "Error"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "app",
+              "mcp"
+            ],
+            "title": "Source",
+            "default": "app"
+          },
+          "client": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client"
+          },
+          "repeats": {
+            "type": "integer",
+            "title": "Repeats",
+            "default": 1
           },
           "id": {
             "type": "integer",

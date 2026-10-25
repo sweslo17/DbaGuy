@@ -7,8 +7,10 @@ from pydantic import BaseModel
 from .execution import QueryContext
 
 # running: a Run SQL file or a copy that started and has not ended (D-06-9); interrupted: one that was still running
-# when the backend ended (set at the next start)
-HistoryStatus = Literal["ok", "error", "cancelled", "timeout", "running", "interrupted"]
+# when the backend ended (set at the next start); refused: an MCP agent's statement the gate turned away (spec ⑧ OP-7)
+HistoryStatus = Literal["ok", "error", "cancelled", "timeout", "running", "interrupted", "refused"]
+# Who ran it: the user in DbaGuy, or an AI tool through the MCP server (spec ⑧ D-08-13)
+HistorySource = Literal["app", "mcp"]
 
 
 class HistoryRecord(BaseModel):
@@ -23,6 +25,9 @@ class HistoryRecord(BaseModel):
     rows: int
     status: HistoryStatus
     error: str | None = None
+    source: HistorySource = "app"
+    client: str | None = None  # mcp: the name the client gave for itself (self-reported, D-08-7)
+    repeats: int = 1  # a refused statement the same client sent again within a minute (CR-08-3)
 
 
 class HistoryEntry(HistoryRecord):

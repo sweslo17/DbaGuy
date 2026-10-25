@@ -606,3 +606,17 @@ def test_history_api(client):
     assert client.get("/history").status_code == 401 and client.delete("/history").status_code == 401
     assert client.get("/history", params={"limit": 0}, headers=AUTH).status_code == 422
     assert client.get("/history", params={"limit": 1001}, headers=AUTH).status_code == 422
+
+
+def test_history_api_filters_by_source(client):  # spec ⑧ D-08-13
+    history = client.app.state.container.history
+    app_record = HistoryRecord(profile_id=uuid4(), profile_name="p", database=None, sql="SELECT 1",
+                               started_at=datetime.now(UTC), elapsed_ms=1, rows=1, status="ok")
+    history.record(app_record)
+    history.refused(app_record.model_copy(update={"sql": "DROP TABLE t", "source": "mcp", "client": "claude-code"}))
+    both = client.get("/history", headers=AUTH).json()["items"]
+    assert [(e["source"], e["client"], e["repeats"]) for e in both] == [("mcp", "claude-code", 1), ("app", None, 1)]
+    for source, sql, status in (("app", "SELECT 1", "ok"), ("mcp", "DROP TABLE t", "refused")):
+        [item] = client.get("/history", params={"source": source}, headers=AUTH).json()["items"]
+        assert (item["sql"], item["status"]) == (sql, status)
+    assert client.get("/history", params={"source": "other"}, headers=AUTH).status_code == 422

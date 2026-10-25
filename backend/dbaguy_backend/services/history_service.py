@@ -1,12 +1,15 @@
 import sqlite3
 import threading
+import time
+from collections import OrderedDict
+from collections.abc import Callable
 from pathlib import Path
 from uuid import UUID
 
 from loguru import logger
 
 from ..domain.errors import StorageError
-from ..domain.history import HistoryEntry, HistoryPage, HistoryRecord, HistoryStatus
+from ..domain.history import HistoryEntry, HistoryPage, HistoryRecord, HistorySource, HistoryStatus
 from ..storage.json_files import move_aside
 
 _SCHEMA = """
@@ -20,7 +23,10 @@ CREATE TABLE IF NOT EXISTS history (
     elapsed_ms INTEGER NOT NULL,
     rows INTEGER NOT NULL,
     status TEXT NOT NULL,
-    error TEXT
+    error TEXT,
+    source TEXT NOT NULL DEFAULT 'app',
+    client TEXT,
+    repeats INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS history_by_profile ON history (profile_id, id);
 CREATE VIRTUAL TABLE IF NOT EXISTS history_fts
@@ -32,7 +38,18 @@ CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
     INSERT INTO history_fts (history_fts, rowid, sql) VALUES ('delete', old.id, old.sql);
 END;
 """
-_DATA_COLUMNS = "profile_id, profile_name, database_name, sql, started_at, elapsed_ms, rows, status, error"
+_DATA_COLUMNS = (
+    "profile_id, profile_name, database_name, sql, started_at, elapsed_ms, rows, status, error, source, client, repeats"
+)
+# spec ⑧ D-08-13: columns an older file lacks, added in place when it is opened
+_ADDED_COLUMNS = (
+    ("source", "TEXT NOT NULL DEFAULT 'app'"), ("client", "TEXT"), ("repeats", "INTEGER NOT NULL DEFAULT 1"),
+)
+_SOURCE_INDEX = "CREATE INDEX IF NOT EXISTS history_by_source ON history (source, id)"
+APP_RETENTION = 50_000
+MCP_RETENTION = 5_000  # CR-08-3: an agent in a loop never pushes out the user's own records
+REFUSAL_MERGE_S = 60.0  # CR-08-3: the same refused text from the same client within this long adds to one record
+_REFUSALS_KEPT = 64
 _MAX_ERROR = 500
 _TRIGRAM = 3  # the full-text index matches from this many characters; shorter searches scan with LIKE
 _SQLITE_COMPANIONS = ("-wal", "-shm")  # a database's write-ahead log and its index: they go wherever it goes
@@ -43,10 +60,11 @@ def _like_pattern(q: str) -> str:
 
 
 def _entry(row: tuple) -> HistoryEntry:
-    id_, profile_id, profile_name, database, sql, started_at, elapsed_ms, rows, status, error = row
+    (id_, profile_id, profile_name, database, sql, started_at, elapsed_ms, rows, status, error, source, client,
+     repeats) = row
     return HistoryEntry(
         id=id_, profile_id=profile_id, profile_name=profile_name, database=database, sql=sql, started_at=started_at,
-        elapsed_ms=elapsed_ms, rows=rows, status=status, error=error,
+        elapsed_ms=elapsed_ms, rows=rows, status=status, error=error, source=source, client=client, repeats=repeats,
     )
 
 
@@ -56,12 +74,20 @@ class HistoryService:
     One connection shared by every thread, serialised by a lock, opened by the first use: building the app touches no
     file, and a history that cannot be opened fails the calls that need it, not the start of the app. A file that is
     not a database is moved aside and replaced by an empty one; other open failures (locked, read-only, no FTS5
-    trigram) leave the file alone.
+    trigram) leave the file alone. A file from before ⑧ gets its new columns in place.
+
+    The user's records and MCP agents' records are kept apart (spec ⑧ D-08-13): each source keeps its own newest
+    `retention` / `mcp_retention`.
     """
 
-    def __init__(self, path: Path, retention: int = 50_000, prune_every: int = 500) -> None:
+    def __init__(self, path: Path, retention: int = APP_RETENTION, prune_every: int = 500,
+                 mcp_retention: int = MCP_RETENTION, clock: Callable[[], float] = time.monotonic) -> None:
         self._path = path
         self._retention = retention
+        self._mcp_retention = mcp_retention
+        self._clock = clock
+        # The last refusal of each (profile, client, text): its record and when (CR-08-3); the newest few only
+        self._refusals: OrderedDict[tuple[str, str | None, str], tuple[int, float]] = OrderedDict()
         self._prune_every = prune_every
         self._inserts = 0
         self._lock = threading.Lock()
@@ -107,10 +133,21 @@ class HistoryService:
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
+            self._upgrade(conn)
         except sqlite3.DatabaseError:
             conn.close()
             raise
         return conn
+
+    @staticmethod
+    def _upgrade(conn: sqlite3.Connection) -> None:
+        """Add the columns a file from before ⑧ lacks (its rows are the user's: `source` 'app'), then their index."""
+        have = {row[1] for row in conn.execute("PRAGMA table_info(history)")}
+        for name, declaration in _ADDED_COLUMNS:
+            if name not in have:
+                conn.execute(f"ALTER TABLE history ADD COLUMN {name} {declaration}")
+                logger.info("History: added the column {}", name)
+        conn.execute(_SOURCE_INDEX)
 
     def record(self, rec: HistoryRecord) -> None:
         self._insert(rec)
@@ -127,36 +164,69 @@ class HistoryService:
                 (status, elapsed_ms, rows, error[:_MAX_ERROR] if error else None, record_id),
             )
 
-    def _insert(self, rec: HistoryRecord) -> int:
-        error = rec.error[:_MAX_ERROR] if rec.error else None
+    def refused(self, rec: HistoryRecord) -> int:
+        """An MCP agent's refused statement (status `refused`, CR-08-3): when the same client sent the same text to the
+        same connection less than REFUSAL_MERGE_S ago, that record's `repeats` grows instead of a new one being written.
+        Its id."""
+        key = (str(rec.profile_id), rec.client, rec.sql)
+        now = self._clock()
         with self._lock:
             conn = self._connection()
-            cursor = conn.execute(
-                f"INSERT INTO history ({_DATA_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (str(rec.profile_id), rec.profile_name, rec.database, rec.sql, rec.started_at.isoformat(),
-                 rec.elapsed_ms, rec.rows, rec.status, error),
-            )
-            self._inserts += 1
-            if self._inserts % self._prune_every == 0:
-                self._prune(conn)
-            return int(cursor.lastrowid or 0)
+            last = self._refusals.get(key)
+            if last is not None and now - last[1] < REFUSAL_MERGE_S and conn.execute(
+                    "UPDATE history SET repeats = repeats + 1 WHERE id = ?", (last[0],)).rowcount:
+                record_id = last[0]
+                logger.debug("History: a refusal sent again, merged into record {}", record_id)
+            else:  # the first, or its record was pruned or cleared meanwhile
+                record_id = self._insert_locked(conn, rec.model_copy(update={"status": "refused", "repeats": 1}))
+            self._refusals[key] = (record_id, now)
+            self._refusals.move_to_end(key)
+            while len(self._refusals) > _REFUSALS_KEPT:
+                self._refusals.popitem(last=False)
+            return record_id
+
+    def _insert(self, rec: HistoryRecord) -> int:
+        with self._lock:
+            return self._insert_locked(self._connection(), rec)
+
+    def _insert_locked(self, conn: sqlite3.Connection, rec: HistoryRecord) -> int:
+        error = rec.error[:_MAX_ERROR] if rec.error else None
+        cursor = conn.execute(
+            f"INSERT INTO history ({_DATA_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(rec.profile_id), rec.profile_name, rec.database, rec.sql, rec.started_at.isoformat(),
+             rec.elapsed_ms, rec.rows, rec.status, error, rec.source, rec.client, rec.repeats),
+        )
+        self._inserts += 1
+        if self._inserts % self._prune_every == 0:
+            self._prune(conn)
+        return int(cursor.lastrowid or 0)
 
     def _prune(self, conn: sqlite3.Connection) -> None:
-        """Drop the entries beyond the retention. The caller holds the lock."""
-        removed = conn.execute(
-            "DELETE FROM history WHERE id <= (SELECT max(id) FROM history) - ?", (self._retention,)
-        ).rowcount
-        if removed > 0:
-            logger.debug("Pruned {} old history entries", removed)
+        """Drop each source's entries beyond its retention (D-08-13). The caller holds the lock."""
+        for source, keep in (("app", self._retention), ("mcp", self._mcp_retention)):
+            oldest_kept = conn.execute(
+                "SELECT id FROM history WHERE source = ? ORDER BY id DESC LIMIT 1 OFFSET ?", (source, keep - 1),
+            ).fetchone()
+            if oldest_kept is None:
+                continue
+            removed = conn.execute(
+                "DELETE FROM history WHERE source = ? AND id < ?", (source, oldest_kept[0]),
+            ).rowcount
+            if removed > 0:
+                logger.debug("Pruned {} old {} history entries", removed, source)
 
     def search(
-        self, q: str = "", profile_id: UUID | None = None, limit: int = 100, before: int | None = None
+        self, q: str = "", profile_id: UUID | None = None, limit: int = 100, before: int | None = None,
+        source: HistorySource | None = None,
     ) -> HistoryPage:
         where: list[str] = []
         params: list[object] = []
         if profile_id is not None:
             where.append("profile_id = ?")
             params.append(str(profile_id))
+        if source is not None:
+            where.append("source = ?")
+            params.append(source)
         if before is not None:
             where.append("id < ?")
             params.append(before)
@@ -178,6 +248,7 @@ class HistoryService:
     def clear(self) -> None:
         with self._lock:
             self._connection().execute("DELETE FROM history")
+            self._refusals.clear()
         logger.info("History cleared")
 
     def close(self) -> None:

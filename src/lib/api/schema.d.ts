@@ -2296,9 +2296,22 @@ export interface components {
              * Status
              * @enum {string}
              */
-            status: "ok" | "error" | "cancelled" | "timeout" | "running" | "interrupted";
+            status: "ok" | "error" | "cancelled" | "timeout" | "running" | "interrupted" | "refused";
             /** Error */
             error?: string | null;
+            /**
+             * Source
+             * @default app
+             * @enum {string}
+             */
+            source: "app" | "mcp";
+            /** Client */
+            client?: string | null;
+            /**
+             * Repeats
+             * @default 1
+             */
+            repeats: number;
             /** Id */
             id: number;
             query_context?: components["schemas"]["QueryContext"] | null;
@@ -5551,6 +5564,7 @@ export interface operations {
                 profile_id?: string | null;
                 limit?: number;
                 before?: number | null;
+                source?: ("app" | "mcp") | null;
             };
             header?: {
                 authorization?: string | null;
