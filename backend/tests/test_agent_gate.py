@@ -63,6 +63,8 @@ REFUSED = [
     (LITE, "VACUUM INTO '/tmp/zz_08.db'", R.NOT_ALLOWED_START),
     (PP, "INFER app.users", R.NOT_ALLOWED_START),
     (PP, "PREPARE zz_08_p FROM SELECT 1", R.NOT_ALLOWED_START),
+    (PP, "PREPARE SELECT 1", R.NOT_ALLOWED_START), (PP, "PREPARE zz_08_p AS SELECT 1", R.NOT_ALLOWED_START),
+    (PP, "EXECUTE zz_08_p", R.NOT_ALLOWED_START), (PP, "EXECUTE zz_08_p USING [1]", R.NOT_ALLOWED_START),
     (PP, "ADVISE SELECT * FROM app.users", R.NOT_ALLOWED_START),
     (PG, "COPY (SELECT 1) TO '/dev/null'", R.NOT_ALLOWED_START),
     (PG, "COPY (SELECT 1) TO PROGRAM 'true'", R.NOT_ALLOWED_START),
@@ -83,8 +85,9 @@ REFUSED = [
     (PP, "WITH x AS (1) DELETE FROM app.users", R.NOT_A_READ),
     (PG, "SELECT * FROM t FOR UPDATE", R.NOT_A_READ), (MY, "SELECT * FROM t LOCK IN SHARE MODE", R.NOT_A_READ),
     (TS, "SELECT NEXT VALUE FOR dbo.zz_08_seq", R.NOT_A_READ),  # T3: a sequence is not rolled back
-    (TS, "SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'SELECT 1')", R.NOT_A_READ),
-    (PG, "SELECT set_config('default_transaction_read_only', 'off', false)", R.NOT_A_READ),
+    (TS, "SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'SELECT 1')", R.DENIED_FUNCTION),  # fix round 1 I1
+    # fix round 1: the deny-list runs before the classifier, so this says what it does (was "not a read (read)")
+    (PG, "SELECT set_config('default_transaction_read_only', 'off', false)", R.DENIED_FUNCTION),
     # G3, Q1-P, CR-08-1: what a read-only transaction does not stop
     (PG, "SELECT pg_terminate_backend(1)", R.DENIED_FUNCTION),
     (PG, "SELECT pg_cancel_backend(pid) FROM pg_stat_activity", R.DENIED_FUNCTION),
@@ -202,3 +205,20 @@ def test_server_side_effects_and_server_files_are_refused(dialect, sql):
 ])
 def test_names_that_only_look_alike_pass(dialect, sql):
     assert agent_read(sql, dialect).allowed
+
+
+@pytest.mark.parametrize(("dialect", "sql"), [  # fix round 1: the gate, not only the classifier, closes these by name
+    (TS, "SELECT * FROM OPENQUERY(zz_08_srv, 'SELECT 1')"),
+    (TS, "SELECT * FROM OPENDATASOURCE('SQLNCLI', 'Data Source=zz_08').db.dbo.t"),
+    (TS, "SELECT * FROM OPENROWSET(BULK '/tmp/zz_08.txt', SINGLE_CLOB) AS x"),
+    (LITE, "SELECT fts3_tokenizer('simple')"),
+])
+def test_remote_and_file_readers_and_code_loaders_are_denied_by_name(dialect, sql):
+    assert agent_read(sql, dialect).refusal == R.DENIED_FUNCTION
+
+
+def test_the_sql_server_readers_say_what_they_reach():
+    assert agent_read("SELECT * FROM OPENROWSET(BULK 'x', SINGLE_CLOB) AS x", TS).message().endswith(
+        "openrowset (server files) is not allowed")
+    assert agent_read("SELECT * FROM OPENQUERY(s, 'SELECT 1')", TS).message().endswith(
+        "openquery (opens other connections) is not allowed")

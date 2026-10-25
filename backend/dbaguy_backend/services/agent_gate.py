@@ -1,9 +1,16 @@
 """The agent gate (spec ⑧ D-08-2, CR-08-1, CR-08-4, CR-08-6): what an MCP agent's statement must be before anything is
-sent. Pure. In order: text a driver can take whole; exactly one statement; a first word on the dialect's allow-list; a
-read by the classifier and the read-only allow-list (`is_plain_read`); no function on the deny-list (a PostgreSQL
-`U&"…"` name decoded first, with its UESCAPE); MySQL: no INTO and no executable comment. A server's read-only
-transaction stops writes to the database; these rules close what it does not stop: the server's files and programs,
-other sessions, session locks, SQL run from text, settings.
+sent. Pure. In order: text a driver can take whole; exactly one statement; a first word on the dialect's allow-list; no
+MySQL executable comment; no function on the deny-list (a PostgreSQL `U&"…"` name decoded first, with its UESCAPE); a
+read by the classifier and the read-only allow-list (`is_plain_read`); MySQL: no INTO. A server's read-only transaction
+stops writes to the database; these rules close what it does not stop: the server's files and programs, other sessions,
+session locks, SQL run from text, settings. The deny-list is checked before the classifier (fix round 1): it names what
+a call reaches, and SQL Server's remote and file readers, which no server-side read-only stops, are refused by name
+whatever the classifier makes of them.
+
+The deny-list matches names only: a user-defined function that wraps a denied call is not caught (spec §9). Session
+locks it takes are released by the read frame's cleanup (D-08-3); a separate read-only login is the full protection.
+The gate does not bound time either: `pg_sleep`, `SLEEP` and `BENCHMARK` pass, and Task 6's read frame bounds them
+(`statement_timeout`, `max_execution_time`, the call's timeout).
 
 Function names are compared as the server reads them: an unquoted name without regard to case; a quoted PostgreSQL name
 exactly (`"PG_TERMINATE_BACKEND"` names another function, which does not exist); every other dialect's quoted names
@@ -38,6 +45,7 @@ _EXPLAIN_WORDS = frozenset({"EXPLAIN", "DESCRIBE", "DESC"})
 # The deny-list (D-08-2 ⑤): lowercase names, a trailing `*` matching any name with that prefix, each with what it does.
 _SERVER_FILES, _KILLS, _LOCKS, _SQL_TEXT = "server files", "kills sessions", "locks", "runs SQL from text"
 _SERVER, _SETTINGS, _CONNECTIONS = "controls the server", "changes settings", "opens other connections"
+_LOADS_CODE = "loads code"
 DENIED_FUNCTIONS: dict[Dialect, tuple[tuple[str, str], ...]] = {
     Dialect.POSTGRES: (
         ("pg_terminate_backend", _KILLS), ("pg_cancel_backend", _KILLS),
@@ -56,11 +64,14 @@ DENIED_FUNCTIONS: dict[Dialect, tuple[tuple[str, str], ...]] = {
     Dialect.MYSQL: (
         ("get_lock", _LOCKS), ("release_lock", _LOCKS), ("release_all_locks", _LOCKS), ("load_file", _SERVER_FILES),
     ),
-    Dialect.SQLITE: (("load_extension", "loads code"),),
+    Dialect.SQLITE: (("load_extension", _LOADS_CODE), ("fts3_tokenizer", _LOADS_CODE)),
     # Ruling J1 (pre-flight notes): catalog functions that read the server's own files (logs, traces, audits)
     Dialect.TSQL: (
         ("fn_dblog", _SERVER_FILES), ("fn_dump_dblog", _SERVER_FILES), ("fn_get_audit_file", _SERVER_FILES),
         ("fn_xe_file_target_read_file", _SERVER_FILES), ("fn_trace_gettable", _SERVER_FILES),
+        # fix round 1 (review I1): SQL Server has no server-side read-only, so these are refused by name too, not only
+        # because the classifier calls them UNKNOWN
+        ("openrowset", _SERVER_FILES), ("openquery", _CONNECTIONS), ("opendatasource", _CONNECTIONS),
     ),
     Dialect.SQLPP: (("curl", "reaches the network"), ("advisor", "starts index advisor sessions")),
 }
@@ -184,12 +195,12 @@ def _query(sql: str, tokens: list[Token], dialect: Dialect) -> AgentVerdict:
         return _refuse(AgentRefusal.NOT_ALLOWED_START, word or first.text[:40], starts=", ".join(allowed))
     if any(t.kind == TokenKind.EXEC_COMMENT for t in tokens):
         return _refuse(AgentRefusal.EXECUTABLE_COMMENT)
+    if (denied := _denied_call(tokens, dialect)) is not None:
+        return denied
     classification = classify(sql, dialect)
     if classification.kind != StatementKind.READ or not SafetyPolicy._allowed_when_read_only(
             sql, classification, dialect):
         return _refuse(AgentRefusal.NOT_A_READ, classification.kind.value, classification)
-    if (denied := _denied_call(tokens, dialect)) is not None:
-        return denied
     if dialect == Dialect.MYSQL and any(t.kind == TokenKind.WORD and t.upper == "INTO" for t in tokens):
         return _refuse(AgentRefusal.INTO, "", classification)
     return AgentVerdict(classification=classification)
