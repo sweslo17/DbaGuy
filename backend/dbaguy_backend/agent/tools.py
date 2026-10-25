@@ -2,6 +2,7 @@
 `agent/server.py` turns both into a CallToolResult (D-08-6). Every call reads the profiles again, so a connection the
 user set to Off is gone from the next call on (R-08-5)."""
 
+import re
 import sys
 import time
 from collections.abc import Callable, Iterator
@@ -23,6 +24,7 @@ from ..domain.execution import QueryContext
 from ..domain.metadata import Folder, NodeKind, ObjectDetail, ObjectNode, PathSegment
 from ..domain.profiles import AnyProfile, Engine, profile_database
 from ..domain.schema import SchemaSnapshot, SnapshotRelation
+from ..domain.well_formed import has_lone_surrogate
 from ..services.metadata_service import MetadataService
 from ..services.profile_service import ProfileService
 from ..services.schema_cache import SchemaCache
@@ -46,6 +48,9 @@ _LEFT_OUT = f"{{}} left out to keep the response under {RESPONSE_CHARS:,} charac
 _LONG_TEXT = f"Comments and defaults longer than {MAX_CELL_DEFAULT:,} characters are cut"
 _AMBIGUOUS = "Several connections are named '{}': pass one of their ids ({})"
 _SCHEMA_ONLY = "'{}' allows schema only: {} needs 'Read-only queries' in DbaGuy's connection settings"
+_BAD_DATABASE = ("`database` holds a control character or half of a surrogate pair: pass a database's name as "
+                 "list_objects shows it")
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")  # C0, DEL, C1: never in a name an agent passes on, nor in a log
 
 
 class ToolFailure(Exception):
@@ -115,8 +120,18 @@ def _node(node: ObjectNode) -> dict[str, Any]:
             "detail": node.detail}
 
 
-def _ms(started: float) -> int:
+def elapsed_ms(started: float) -> int:
+    """Milliseconds since `started` (time.monotonic())."""
     return int((time.monotonic() - started) * 1000)
+
+
+def checked_database(database: str | None) -> str | None:
+    """An agent's `database` argument, refused (`invalid_argument`) when it holds a control character or a lone
+    surrogate (review I3: MySQL's handshake reads a database up to a NUL, so `dbaguy\0` and a forged log line after it
+    connected to `dbaguy` and reached the connect line)."""
+    if database is not None and (CONTROL_CHARS.search(database) or has_lone_surrogate(database)):
+        raise ToolFailure("invalid_argument", _BAD_DATABASE)
+    return database
 
 
 def _one_named(names: list[str], name: str) -> list[str]:
@@ -209,7 +224,7 @@ class AgentTools:
         """Every connection whose access is not Off (§3.3), without connecting."""
         started = time.monotonic()
         connections = [self._describe(profile) for profile in self._shared_profiles()]
-        logger.info("MCP list_connections: ok, {} connections, {} ms", len(connections), _ms(started))
+        logger.info("MCP list_connections: ok, {} connections, {} ms", len(connections), elapsed_ms(started))
         logger.debug("MCP list_connections by {!r}", client)
         return {"connections": connections}
 
@@ -236,7 +251,7 @@ class AgentTools:
               detail: str = "") -> None:
         """D-08-14 and fix round 1 (I-2): at INFO only the tool, the connection's id, the outcome, a count and the time;
         what the agent chose (its client's name, a path, a pattern) at DEBUG."""
-        logger.info("MCP {} on {}: ok, {} {}, {} ms", tool, shared.profile.id, count, what, _ms(started))
+        logger.info("MCP {} on {}: ok, {} {}, {} ms", tool, shared.profile.id, count, what, elapsed_ms(started))
         logger.debug("MCP {} on {} by {!r}{}", tool, shared.profile.id, client, detail)
 
     def _catalog[T](self, shared: Shared, key: str | None, read: Callable[[DatabaseConnection], T]) -> T:
@@ -297,6 +312,7 @@ class AgentTools:
         `include_columns`, also those with a column whose name holds `pattern` (and those columns)."""
         started = time.monotonic()
         shared = self.shared(connection, "search_objects")
+        database = checked_database(database)
         pid = shared.profile.id
         narrow = _narrowed_to(shared, database)
         with answered(shared.profile):
@@ -353,6 +369,7 @@ class AgentTools:
         (`schema` and `database` narrow it): exact first, then ignoring case."""
         started = time.monotonic()
         shared = self.shared(connection, "describe")
+        database = checked_database(database)
         snapshot: SchemaSnapshot | None = None
         with answered(shared.profile):
             self._login.ensure(shared.profile)

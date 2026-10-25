@@ -615,7 +615,7 @@ class MysqlAdapter(DatabaseAdapter):
             conn.shutdown()
             raise
         logger.info(
-            "Connected to MySQL {}:{} db={} tls={}{} thread={}{}",
+            "Connected to MySQL {}:{} db={!r} tls={}{} thread={}{}",  # !r: an agent's text never starts a line
             endpoint.tls_server_name or endpoint.host, endpoint.port, params.get("database"), profile.ssl.mode,
             " (active)" if conn.is_secure else "", conn.connection_id, " read_only=True" if profile.read_only else "",
         )

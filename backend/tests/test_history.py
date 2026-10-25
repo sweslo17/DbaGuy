@@ -228,3 +228,13 @@ def test_only_the_last_few_refusals_are_remembered_for_merging(tmp_path):  # an 
     assert forgotten not in ids
     repeats = {e.id: e.repeats for e in history.search(source="mcp", limit=1000).items}
     assert (repeats[ids[64]], repeats[ids[0]], repeats[forgotten]) == (2, 1, 1)
+
+
+def test_refusals_of_one_text_on_two_databases_are_two_records(tmp_path):  # Task 8 review M3
+    history = HistoryService(tmp_path / "h.db", clock=lambda: 100.0)
+    on_dbaguy = history.refused(mcp("DROP TABLE t").model_copy(update={"database": "dbaguy"}))
+    on_analytics = history.refused(mcp("DROP TABLE t").model_copy(update={"database": "analytics"}))
+    assert on_analytics != on_dbaguy
+    assert history.refused(mcp("DROP TABLE t").model_copy(update={"database": "analytics"})) == on_analytics
+    databases = {e.id: (e.database, e.repeats) for e in history.search(source="mcp").items}
+    assert databases == {on_dbaguy: ("dbaguy", 1), on_analytics: ("analytics", 2)}

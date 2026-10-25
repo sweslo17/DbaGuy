@@ -280,12 +280,14 @@ def test_database_names_resolve_to_the_servers_own_so_variants_open_nothing(cont
         assert listed["objects"][0]["path"][0] == {"kind": "database", "name": "analytics"}
     for name in casings[8:]:
         assert tools.describe(pid, database=name, name="page_views")["path"][0]["name"] == "analytics"
-    calls = [lambda n=n: tools.list_objects(pid, database(f"\x00zz_08_{n}")) for n in range(8)]
-    calls += [lambda n=n: tools.search_objects(pid, "page", database=f"\x00zz_08_{n}") for n in range(4)]
-    for call in calls:
+    calls = [(lambda n=n: tools.list_objects(pid, database(f"\x00zz_08_{n}")), "not_found") for n in range(8)]
+    # a `database` argument with a control character is refused before anything (Task 8 fix round, review I3)
+    calls += [(lambda n=n: tools.search_objects(pid, "page", database=f"\x00zz_08_{n}"), "invalid_argument")
+              for n in range(4)]
+    for call, code in calls:
         with pytest.raises(ToolFailure) as refused:
             call()
-        assert refused.value.code == "not_found"
+        assert refused.value.code == code
     assert _agent_keys(container, pid) == keys
     assert {k[1] for k in container.schema_cache._entries if k[0] == UUID(pid)} == {"analytics"}
     assert threading.active_count() <= threads and _open_fds() <= fds

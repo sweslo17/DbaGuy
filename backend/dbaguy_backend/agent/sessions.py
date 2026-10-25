@@ -24,9 +24,14 @@ from .login import LoginRegistry
 from .tools import ToolFailure
 
 MAX_AGENT_SESSIONS = 8
+TICK_S = 0.25  # how often a call that waits looks for its client's cancel (the lock here, the statement in the reader)
 _BUSY = "Another call on '{}' was still running"
 _ALL_BUSY = "All {} of DbaGuy's agent connections are busy: try again"
 _Key = tuple[UUID, str | None]
+
+
+class WaitCancelled(Exception):
+    """The client gave up while its call waited for the session's lock (review I2): nothing was opened or sent."""
 
 
 @dataclass
@@ -68,20 +73,25 @@ class AgentSessions:
         return profile.id, database or profile_database(profile) or None
 
     @contextmanager
-    def lease(self, profile: AnyProfile, database: str | None, deadline: float) -> Iterator[Lease]:
+    def lease(self, profile: AnyProfile, database: str | None, deadline: float, *,
+              admit: Callable[[], object] | None = None,
+              cancelled: Callable[[], bool] | None = None) -> Iterator[Lease]:
         """The session of (profile, database), its lock taken and, when there is none, the session opened before
         `deadline` (TimeoutError past it). A slot left without a session (it could not open, or its call closed it)
-        leaves the registry: only sessions count toward the cap."""
+        leaves the registry: only sessions count toward the cap. While the lock is busy, `cancelled` is looked at every
+        TICK_S (WaitCancelled: the client gave up, review I2). With the lock, `admit` runs before anything opens: it
+        raises when the call may no longer read (review I1: the profile changed while the call waited)."""
         key = self.key(profile, database)
         while True:
             slot = self._slot(key)
-            if not slot.lock.acquire(timeout=max(0.0, deadline - self._clock())):
-                raise ToolFailure("busy", _BUSY.format(profile.name))
+            self._acquire(slot, profile, deadline, cancelled)
             if not slot.gone:
                 break
             slot.lock.release()  # taken out while this call waited for it: the key's slot now
         held: str | None = None
         try:
+            if admit is not None:
+                admit()
             worker = self._worker(slot, profile, key[1], deadline)
             held = slot.session_id
             yield Lease(worker, slot.server_version, slot.default_context, partial(self._drop, slot))
@@ -95,6 +105,15 @@ class AgentSessions:
             if slot.session_id is None:
                 self._forget(slot)
             slot.lock.release()
+
+    def _acquire(self, slot: _Slot, profile: AnyProfile, deadline: float,
+                 cancelled: Callable[[], bool] | None) -> None:
+        """The slot's lock before `deadline` (`busy` past it), waiting TICK_S at a time for the client's cancel."""
+        while not slot.lock.acquire(timeout=max(0.0, min(TICK_S, deadline - self._clock()))):
+            if cancelled is not None and cancelled():
+                raise WaitCancelled
+            if self._clock() >= deadline:
+                raise ToolFailure("busy", _BUSY.format(profile.name))
 
     def read_login(self, profile: AnyProfile, deadline: float) -> None:
         """After a call: the profile's login, read unless known (CR-08-1), best effort and only while the call's

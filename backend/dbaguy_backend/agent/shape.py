@@ -22,6 +22,7 @@ READ_RAW_CHARS = 64 * 1024 * 1024
 PAGE_ROWS_MAX = 100
 FIRST_PAGE = 1  # the first page is one row: its size sizes the next (as ⑥'s dump's FIRST_FETCH)
 NOTES_MAX, NOTE_CHARS = 20, 500  # server messages (PG NOTICE, SQL Server PRINT)
+ERROR_CHARS = 4_000  # a tool's error message: a server's text may quote a value of any size (review I4)
 
 
 def compact(value: Any) -> str:
@@ -80,7 +81,9 @@ def cap_cell(cell: Any, max_chars: int) -> tuple[Any, int]:
 
 
 class ResultBudget:
-    """The rows of one result as they arrive, page by page."""
+    """The rows of one result as they arrive, page by page. Columns whose list alone would take more than half the room
+    are cut to the leading ones that fit in it (review I5: 50 tables side by side are 1,650 columns, more than the
+    response holds), and each row with them: `columns` is what the answer holds, `columns_dropped` how many it lost."""
 
     def __init__(self, columns: list[dict[str, str | None]], max_rows: int, max_cell_chars: int,
                  budget_chars: int = RESPONSE_CHARS) -> None:
@@ -89,8 +92,11 @@ class ResultBudget:
         self.rows: list[list[Any]] = []
         self.dropped = 0  # rows read but left out: the response had no room for them
         self.largest_encoded = 1  # the largest row so far, as sent (sizes the next page against the room left)
-        self.remaining = budget_chars - RESPONSE_OVERHEAD - len(compact(columns))
-        self.raw_read = 0  # the kept rows' values, raw
+        room = budget_chars - RESPONSE_OVERHEAD
+        self.columns = _leading(columns, room // 2) if len(compact(columns)) > room // 2 else columns
+        self.columns_dropped = len(columns) - len(self.columns)
+        self.remaining = room - len(compact(self.columns))
+        self.raw_read = 0  # the kept rows' values, raw (and the cut columns' values read with them)
 
     @property
     def full(self) -> bool:
@@ -102,10 +108,11 @@ class ResultBudget:
         return self.raw_read >= READ_RAW_CHARS
 
     def take(self, rows: list[list[Any]]) -> None:
+        kept = len(self.columns)
         for row in rows:
-            capped = [cap_cell(cell, self.max_cell_chars) for cell in row]
+            capped = [cap_cell(cell, self.max_cell_chars) for cell in row[:kept]]
             cells = [cell for cell, _ in capped]
-            raw = sum(size for _, size in capped) or 1
+            raw = (sum(size for _, size in capped) + sum(raw_chars(cell) for cell in row[kept:])) or 1
             encoded = len(compact(cells)) + 1  # its comma
             self.largest_encoded = max(self.largest_encoded, encoded)
             if self.full or encoded > self.remaining:
@@ -127,6 +134,18 @@ class ResultBudget:
         return max(1, min(PAGE_ROWS_MAX, self.max_rows - len(self.rows), by_room))
 
 
-def note(text: str) -> str:
-    """A server message as a note: at most NOTE_CHARS characters, the cut marked with an ellipsis."""
-    return text if len(text) <= NOTE_CHARS else text[:NOTE_CHARS - 1] + "…"
+def _leading(columns: list[dict[str, str | None]], room: int) -> list[dict[str, str | None]]:
+    """The leading columns whose list fits in `room` characters."""
+    size, kept = 2, 0  # the brackets
+    for column in columns:
+        size += len(compact(column)) + 1
+        if size > room:
+            break
+        kept += 1
+    return columns[:kept]
+
+
+def note(text: str, limit: int = NOTE_CHARS) -> str:
+    """A server message as a note (or, with `limit`, as an error's message: review I4): at most `limit` characters, the
+    cut marked with an ellipsis."""
+    return text if len(text) <= limit else text[:limit - 1] + "…"

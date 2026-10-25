@@ -2,8 +2,10 @@
 refusals and their History, access levels, timeouts, a client's cancel, the plan per engine, and what the log may say.
 Seeds are only read; nothing is created on a server."""
 
+import json
 import logging
 import sqlite3
+import threading
 import time
 from types import SimpleNamespace
 
@@ -13,19 +15,23 @@ import pytest
 from fastapi.testclient import TestClient
 from loguru import logger
 
+from dbaguy_backend.adapters.base import Endpoint
+from dbaguy_backend.adapters.mysql.adapter import MysqlAdapter
 from dbaguy_backend.agent.queries import SQL_MAX, QueryTools
-from dbaguy_backend.agent.reader import ReadOutcome, ReadRequest
-from dbaguy_backend.agent.server import client_name
+from dbaguy_backend.agent.reader import CallControl, ReadOutcome, ReadRequest
+from dbaguy_backend.agent.server import THREADS_MAX, client_name, failure_result
+from dbaguy_backend.agent.shape import ERROR_CHARS, ResultBudget
 from dbaguy_backend.agent.tools import ToolFailure
 from dbaguy_backend.app import create_app
-from dbaguy_backend.domain.errors import StorageError
+from dbaguy_backend.domain.errors import QueryFailed, StorageError
 from dbaguy_backend.domain.profiles import ProfileUpsertRequest, SqliteProfile
 from dbaguy_backend.sql.dialects import Dialect
 
 from .agent_support import AUTH, MCP_TOKEN, call_tool, container, logged, mcp_session, serving, share
 from .support import (
-    PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, make_couchbase_profile, make_mssql_profile, make_mysql_profile,
-    make_pg_profile, requires_couchbase, requires_mssql, requires_mysql, requires_pg, scaled, wait_until,
+    MYSQL_HOST, MYSQL_PASSWORD, MYSQL_PORT, PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, make_couchbase_profile,
+    make_mssql_profile, make_mysql_profile, make_pg_profile, requires_couchbase, requires_mssql, requires_mysql,
+    requires_pg, scaled, wait_until,
 )
 
 __all__ = ["container"]
@@ -457,3 +463,213 @@ def test_a_plan_of_several_columns_keeps_them_all():
     tree = ReadOutcome(columns=[{"name": "EXPLAIN", "type": None}], rows=[["-> Rows fetched before execution"]],
                        more_rows=True)
     assert _plan_text(Dialect.MYSQL, tree) == ("-> Rows fetched before execution", True)
+
+
+# ---- fix round 1 (task-8-review.md) ----
+
+
+def _agent_sessions(container) -> int:
+    return sum(e.agent for e in container.sessions._sessions.values())
+
+
+@requires_pg
+@pytest.mark.parametrize("change", ["off", "schema", "delete"])
+def test_a_call_queued_before_its_connection_changed_is_refused_and_opens_nothing(container, change):
+    """Review I1: call A holds the session and B waits for it when the user switches the connection Off or to Schema
+    only, or deletes it (through the API, as the app does). B is refused when it takes its lease: no new session, no
+    slot left behind."""
+    pid = share(container, make_pg_profile(name="zz_08 pg"))
+    results: dict[str, object] = {}
+
+    def call(name: str, sql: str) -> None:
+        try:
+            results[name] = container.agent_queries.run_query(pid, sql, client="pytest")
+        except ToolFailure as failure:
+            results[name] = (failure.code, failure.message)
+
+    a = threading.Thread(target=call, args=("A", "SELECT pg_sleep(3)"))
+    a.start()
+    assert wait_until(lambda: _agent_sessions(container) == 1, scaled(5))
+    time.sleep(0.3)
+    b = threading.Thread(target=call, args=("B", "SELECT 'B ran after the change'"))
+    b.start()
+    time.sleep(0.3)  # B waits for the session A holds
+    with TestClient(create_app(container.settings, container), base_url="http://127.0.0.1") as client:
+        if change == "delete":
+            assert client.delete(f"/profiles/{pid}", headers=AUTH).status_code == 204
+        else:
+            draft = make_pg_profile(name="zz_08 pg").model_dump(mode="json", exclude={"id"})
+            body = {"profile": draft | {"mcp_access": change}}
+            assert client.put(f"/profiles/{pid}", json=body, headers=AUTH).status_code == 200
+    a.join(scaled(10))
+    b.join(scaled(10))
+    expected = "not_allowed" if change == "schema" else "unknown_connection"
+    assert results["B"][0] == expected, results["B"]
+    assert _agent_sessions(container) == 0 and container.agent_sessions._slots == {}
+
+
+@requires_pg
+def test_calls_cancelled_while_they_wait_stay_within_the_thread_cap(container, monkeypatch):
+    """Review I2, the reviewer's probe shrunk: one call holds the session; 50 more wait for it, and their client gives
+    up on each. A waiting call gives up with its client and never runs its statement; calls past THREADS_MAX get
+    `busy` at once, without a thread. So the worker threads stay bounded, where each used to wait out its deadline."""
+    pid = share(container, make_pg_profile(name="zz_08 pg"))
+    statements: list[int] = []
+    original = container.agent_reader._statement
+
+    def counting(*args, **kwargs):
+        statements.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(container.agent_reader, "_statement", counting)
+
+    def workers() -> int:
+        return sum(thread.name == "AnyIO worker thread" for thread in threading.enumerate())
+
+    baseline, peak, sampling = workers(), [0], threading.Event()
+    busy: list[str] = []
+
+    def sample() -> None:
+        while not sampling.is_set():
+            peak[0] = max(peak[0], workers() - baseline)
+            time.sleep(0.005)
+
+    async def flood(port: int) -> None:
+        async with mcp_session(port) as session:
+            async with anyio.create_task_group() as group:
+                async def hold() -> None:
+                    await session.call_tool("run_query", {"connection": pid, "sql": "SELECT pg_sleep(4)"})
+
+                async def give_up() -> None:
+                    with anyio.move_on_after(0.5):  # long enough for every call to reach the server
+                        answer = await session.call_tool("run_query", {"connection": pid, "sql": "SELECT 1"})
+                        busy.append(json.loads(answer.content[0].text)["error"]["code"])
+
+                group.start_soon(hold)
+                await anyio.sleep(0.5)
+                for _ in range(50):
+                    group.start_soon(give_up)
+
+    sampler = threading.Thread(target=sample)
+    sampler.start()
+    try:
+        with serving(container) as port:
+            anyio.run(flood, port)
+    finally:
+        sampling.set()
+        sampler.join()
+    cancelled = [e for e in container.history.search(source="mcp", limit=200).items if e.status == "cancelled"]
+    assert statements == [1], len(statements)  # the holder's only
+    assert peak[0] <= THREADS_MAX + 4, peak[0]
+    assert set(busy) == {"busy"} and len(busy) + len(cancelled) == 50, (len(busy), len(cancelled))
+
+
+@requires_mysql
+def test_a_database_with_control_characters_is_refused_by_every_tool(container):
+    """Review I3: the reviewer's exact input, a NUL, a newline and ANSI escapes after a real database's name, which
+    MySQL's handshake reads up to the NUL. Every tool that takes `database` refuses it, and no log line holds it."""
+    pid = share(container, make_mysql_profile(name="zz_08 mysql"))
+    forged = ("dbaguy\u0000\n2026-10-25 16:00:00.000 | ERROR    | dbaguy_backend:forged - \u001b[31mzz_08_FORGED"
+              "\u001b[0m")
+    with logged("INFO") as lines, serving(container) as port:
+        for tool, arguments in (("run_query", {"sql": "SELECT 1 AS one"}), ("explain", {"sql": "SELECT 1"}),
+                                ("search_objects", {"pattern": "customers"}), ("describe", {"name": "customers"})):
+            error, data = call_tool(port, tool, {"connection": pid, "database": forged, **arguments})
+            assert error and data["error"]["code"] == "invalid_argument", (tool, data)
+        error, data = call_tool(port, "run_query", {"connection": pid, "database": "dbaguy\x9b31m", "sql": "SELECT 1"})
+        assert data["error"]["code"] == "invalid_argument"  # C1 too
+    assert not [text for _, text in lines if "zz_08_FORGED" in text]
+
+
+@requires_mysql
+def test_the_mysql_connect_line_quotes_the_database_it_was_given():
+    """Review I3: the connect line names the database as given, quoted, so no text in it starts a line of its own."""
+    with logged("INFO") as lines:
+        conn = MysqlAdapter().open(make_mysql_profile(), Endpoint(MYSQL_HOST, MYSQL_PORT), MYSQL_PASSWORD,
+                                   "dbaguy\x00\nzz_08_FORGED")
+        conn.close()
+    connected = [text for _, text in lines if text.startswith("Connected to MySQL")]
+    assert connected and not [text for text in connected if "\n" in text]
+
+
+@requires_pg
+def test_an_error_message_is_cut_so_the_answer_stays_in_budget(container):
+    """Review I4: a server error that quotes the value the agent built is cut at ERROR_CHARS, before its code."""
+    pid = share(container, make_pg_profile(name="zz_08 pg"))
+    with serving(container) as port:
+        error, data = call_tool(port, "run_query", {"connection": pid, "sql": "SELECT repeat('x', 300000)::int"})
+    message = data["error"]["message"]
+    assert error and len(json.dumps(data, ensure_ascii=False)) < 40_000
+    assert message.endswith("… (22P02)") and len(message) == ERROR_CHARS + len(" (22P02)")
+
+
+def test_every_tools_error_and_a_samples_error_are_cut(container, monkeypatch):
+    """Review I4: `failure_result` bounds any tool's error (answered's query_failed and connection_failed too), and
+    sample_fields' server error is cut as run_query's."""
+    answer = failure_result(ToolFailure("query_failed", "y" * 100_000))
+    assert len(answer.content[0].text) < ERROR_CHARS + 200
+    cb = share(container, make_couchbase_profile(name="zz_08 cb"))  # never connected to here
+
+    def failing(*_args, **_kwargs):
+        try:
+            raise ValueError("cause")
+        except ValueError as exc:
+            raise QueryFailed("z" * 100_000) from exc
+
+    monkeypatch.setattr(container.field_samples, "sample", failing)
+    with pytest.raises(ToolFailure) as failed:
+        container.agent_queries.sample_fields(cb, "dbaguy", "app", "users", 10)
+    assert failed.value.code == "query_failed" and len(failed.value.message) == ERROR_CHARS
+
+
+@requires_pg
+def test_a_wide_result_keeps_the_leading_columns_that_fit(container):
+    """Review I5: 50 copies of pg_class side by side: the columns alone pass the response budget. The leading columns
+    that fit are kept, with their values, and a note says how many were left out."""
+    pid = share(container, make_pg_profile(name="zz_08 pg"))
+    with serving(container) as port:
+        one = call_tool(port, "run_query", {"connection": pid, "sql": "SELECT * FROM pg_catalog.pg_class LIMIT 1"})[1]
+        tables = ", ".join(f"pg_catalog.pg_class t{n}" for n in range(50))
+        error, data = call_tool(port, "run_query", {"connection": pid, "sql": f"SELECT * FROM {tables} LIMIT 1"})
+    assert not error and len(json.dumps(data, ensure_ascii=False)) < 40_000
+    kept, total = len(data["columns"]), 50 * len(one["columns"])
+    assert 0 < kept < total and data["row_count"] == 1 and len(data["rows"][0]) == kept
+    assert f"{total - kept} more columns left out: select fewer columns" in data["notes"]
+
+
+def test_a_budget_never_goes_negative_on_columns():
+    """Review I5, pure: 3,000 columns of 30-character names keep what half the budget holds; each row is cut alike."""
+    columns = [{"name": f"column_{n:023d}", "type": "text"} for n in range(3_000)]
+    budget = ResultBudget(columns, 100, 1_000)
+    kept = len(budget.columns)
+    assert 0 < kept < 3_000 and budget.columns_dropped == 3_000 - kept and budget.remaining > 0
+    budget.take([["v"] * 3_000])
+    assert budget.rows == [["v"] * kept]
+
+
+def test_a_refusable_statement_with_a_bad_argument_is_still_judged_and_recorded(container, lite):
+    """Review M1: the gate runs before the argument checks, so a DROP sent with an argument the tool cannot take is
+    refused and recorded. A call refused for its arguments alone leaves no record."""
+    pid = _lite(container, lite)
+    with pytest.raises(ToolFailure) as refused:
+        container.agent_queries.run_query(pid, "DROP TABLE t", query_context="dbaguy.app", client="pytest")
+    assert refused.value.code == "refused"
+    with pytest.raises(ToolFailure) as invalid:
+        container.agent_queries.run_query(pid, "SELECT 1", query_context="dbaguy.app", client="pytest")
+    assert invalid.value.code == "invalid_argument"
+    [record] = container.history.search(source="mcp").items
+    assert (record.sql, record.status) == ("DROP TABLE t", "refused")
+
+
+def test_rows_the_client_gave_up_on_are_recorded_cancelled(container, lite):
+    """Review M2: a read that ended `ok` after the client gave up (its frame's end, say): the agent never got the
+    rows, so History says cancelled."""
+    pid = _lite(container, lite)
+    outcome = ReadOutcome(columns=[{"name": "a", "type": None}], rows=[[1]])
+    queries = QueryTools(container.agent_tools, _Reader(outcome), container.history, container.field_samples,
+                         container.app_settings)
+    control = CallControl()
+    control.cancel()
+    queries.run_query(pid, "SELECT 1", client="pytest", control=control)
+    [record] = container.history.search(source="mcp").items
+    assert (record.status, record.rows) == ("cancelled", 1)

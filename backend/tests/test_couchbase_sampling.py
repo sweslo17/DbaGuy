@@ -331,7 +331,7 @@ def test_other_engines_have_no_field_sampling(app, tmp_path):
 
 def test_a_connection_that_cannot_sample_is_refused_and_caches_nothing(tmp_path):
     class Metadata:
-        def with_connection(self, profile_id, database, fn):
+        def with_connection(self, profile_id, database, fn, *, agent=False):
             return fn(object())  # not a FieldSampling connection
 
     service = FieldSampleService(Metadata(), SettingsService(tmp_path / "settings.json", tmp_path / "scripts"))
@@ -353,7 +353,7 @@ def test_the_cache_keeps_the_most_recently_used_samples_of_each_profile(tmp_path
             return sample_of(keyspace)
 
     class Metadata:
-        def with_connection(self, profile_id, database, fn):
+        def with_connection(self, profile_id, database, fn, *, agent=False):
             return fn(Connection())
 
     service = FieldSampleService(Metadata(), SettingsService(tmp_path / "settings.json", tmp_path / "scripts"))

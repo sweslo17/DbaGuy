@@ -2,10 +2,10 @@
 gate in front of it. The only module that imports the MCP SDK, and only `AgentHost` imports it, when the switch is on
 (D-08-8): with the switch off the SDK is never loaded (Q1)."""
 
-import re
 import threading
 import time
 from collections.abc import Callable
+from functools import partial
 from typing import Annotated, Any
 
 import anyio
@@ -25,15 +25,19 @@ from ..tokens import same_token
 from ..version import app_version
 from .queries import SAMPLE_MAX, SQL_MAX, TIMEOUT_DEFAULT_S, TIMEOUT_MAX_S, QueryTools
 from .reader import CallControl
-from .shape import MAX_CELL, MAX_CELL_DEFAULT, MAX_ROWS, MAX_ROWS_DEFAULT, compact
-from .tools import LIMIT_MAX, LIST_LIMIT, SEARCH_LIMIT, AgentTools, ToolFailure
+from .sessions import MAX_AGENT_SESSIONS
+from .shape import ERROR_CHARS, MAX_CELL, MAX_CELL_DEFAULT, MAX_ROWS, MAX_ROWS_DEFAULT, compact, note
+from .tools import CONTROL_CHARS, LIMIT_MAX, LIST_LIMIT, SEARCH_LIMIT, AgentTools, ToolFailure
 
 MCP_PATH = "/mcp"
 MAX_BODY_BYTES = 1024 * 1024  # R-08-4
 MAX_SESSIONS = 32  # 2025-11-25 sessions (D-08-9)
 SESSION_IDLE_S = 1800
 CLIENT_NAME_CHARS = 80  # D-08-7
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Tool calls whose worker thread has not ended, at most (review I2): a call the client gives up on leaves its thread
+# behind (anyio stops counting it), so a client cancelling calls in a loop could otherwise grow the threads without end
+THREADS_MAX = 2 * MAX_AGENT_SESSIONS
+_TOO_MANY = f"DbaGuy is still running {THREADS_MAX} calls from AI tools: try again when one of them ends"
 INSTRUCTIONS = (
     "DbaGuy shares some of the user's database connections, read-only. Start with list_connections (it also shows "
     "what each login is allowed to do). Explore with list_objects (pass back the `path` it returns), search_objects "
@@ -161,7 +165,7 @@ def client_name(ctx: Context) -> str | None:
     name = params.client_info.name if params is not None else None
     if not name:
         return None
-    return well_formed(_CONTROL.sub("", name))[:CLIENT_NAME_CHARS] or None
+    return well_formed(CONTROL_CHARS.sub("", name))[:CLIENT_NAME_CHARS] or None
 
 
 def _text(data: dict[str, Any], *, error: bool = False) -> CallToolResult:
@@ -170,7 +174,61 @@ def _text(data: dict[str, Any], *, error: bool = False) -> CallToolResult:
 
 
 def failure_result(failure: ToolFailure) -> CallToolResult:
-    return _text({"error": {"code": failure.code, "message": failure.message}}, error=True)
+    """Every tool's error, its message cut (review I4: a server's text can quote a value of any size). The query tools
+    cut theirs at ERROR_CHARS before adding the code; this bounds the rest (answered's query_failed and others)."""
+    message = note(failure.message, ERROR_CHARS + 100)
+    return _text({"error": {"code": failure.code, "message": message}}, error=True)
+
+
+class _Threads:
+    """How many tool calls' worker threads are still running, counted from the thread itself: a thread a cancel
+    abandoned counts until it ends (review I2)."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._running = 0
+        self._lock = threading.Lock()
+
+    def take(self) -> bool:
+        with self._lock:
+            if self._running >= self._limit:
+                return False
+            self._running += 1
+            return True
+
+    def give(self) -> None:
+        with self._lock:
+            self._running -= 1
+
+
+_THREADS = _Threads(THREADS_MAX)
+
+
+class _Ticket:
+    """One call's place in `_THREADS`: its thread gives it back when it ends; a thread that never started (the call
+    was cancelled before) never runs the call, and the place is given back at once."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._started = False
+        self._dropped = False
+
+    def run(self, call: Callable[[], dict[str, Any]]) -> dict[str, Any] | None:
+        with self._lock:
+            if self._dropped:
+                return None
+            self._started = True
+        try:
+            return call()
+        finally:
+            _THREADS.give()
+
+    def drop_unstarted(self) -> None:
+        with self._lock:
+            if self._started or self._dropped:
+                return
+            self._dropped = True
+        _THREADS.give()
 
 
 async def run_tool(tool: str, client: str | None, call: Callable[[], dict[str, Any]],
@@ -184,8 +242,12 @@ async def run_tool(tool: str, client: str | None, call: Callable[[], dict[str, A
     call's statement from a thread of its own (a PostgreSQL cancel can wait on the server for seconds). The call then
     ends on its own thread, `cancelled`, and writes its History record."""
     started = time.monotonic()
+    if not _THREADS.take():  # review I2: without a thread, at once
+        logger.info("MCP {}: busy, {} calls still running", tool, THREADS_MAX)
+        return failure_result(ToolFailure("busy", _TOO_MANY))
+    ticket = _Ticket()
     try:
-        return _text(await anyio.to_thread.run_sync(call, abandon_on_cancel=True))
+        return _text(await anyio.to_thread.run_sync(partial(ticket.run, call), abandon_on_cancel=True))
     except anyio.get_cancelled_exc_class():
         if control is not None:
             threading.Thread(target=control.cancel, name=f"mcp-cancel-{tool}", daemon=True).start()
@@ -204,6 +266,8 @@ async def run_tool(tool: str, client: str | None, call: Callable[[], dict[str, A
         logger.error("MCP {} failed unexpectedly ({})", tool, type(exc).__name__)
         logger.opt(exception=exc).debug("MCP {} by {!r} failed", tool, client)
         return failure_result(ToolFailure("internal_error", "Internal error"))
+    finally:
+        ticket.drop_unstarted()
 
 
 def build_server(tools: AgentTools, queries: QueryTools) -> MCPServer:

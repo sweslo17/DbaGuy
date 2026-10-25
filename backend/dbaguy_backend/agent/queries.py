@@ -19,7 +19,7 @@ from ..adapters.base import CONNECTION_LOST, StatementError
 from ..adapters.couchbase.explain import analyze
 from ..domain.couchbase import FieldSample, Keyspace
 from ..domain.data_jobs import ENGINE_NAMES
-from ..domain.errors import QueryFailed
+from ..domain.errors import ProfileNotFound, QueryFailed
 from ..domain.execution import QueryContext
 from ..domain.history import HistoryRecord, HistoryStatus
 from ..domain.profiles import AnyProfile, Engine, profile_database
@@ -29,9 +29,9 @@ from ..services.field_sample_service import FieldSampleService
 from ..services.history_service import HistoryService
 from ..services.settings_service import SettingsService
 from ..sql.dialects import Dialect
-from .reader import AgentReader, CallControl, ReadOutcome, ReadRequest
-from .shape import MAX_CELL_DEFAULT, MAX_ROWS, MAX_ROWS_DEFAULT, RESPONSE_CHARS, compact
-from .tools import AgentTools, Shared, ToolFailure, answered
+from .reader import CONNECTION_CLOSED, AgentReader, CallControl, ReadOutcome, ReadRequest
+from .shape import ERROR_CHARS, MAX_CELL_DEFAULT, MAX_ROWS, MAX_ROWS_DEFAULT, RESPONSE_CHARS, compact, note
+from .tools import AgentTools, Shared, ToolFailure, answered, checked_database, elapsed_ms
 
 TIMEOUT_DEFAULT_S, TIMEOUT_MAX_S, TIMEOUT_RED_S = 30, 60, 30  # CR-08-8: red connections: 30 at most
 SQL_MAX = 20_000  # CR-08-3: also a History record's longest text
@@ -43,6 +43,7 @@ TOO_BIG = ("The response is limited to about 40,000 characters: select fewer col
 READ_CAPPED = ("Stopped after reading about 64 Mi characters of values: select fewer or smaller columns, or narrow the "
                "query")
 PLAN_CUT = "The plan is longer than the response holds: it is cut"
+COLUMNS_CUT = "{} more columns left out: select fewer columns"
 _LOWERED = "timeout_s was lowered to {} s: {}"
 _TIMEOUT = "Stopped after {:g} s (timeout_s; at most 60, 30 on production connections)"
 _CANCELLED = "Cancelled by the client"
@@ -54,14 +55,17 @@ _LONG_CONTEXT = "a bucket's name is at most 100 characters, a scope's 251"
 _BAD_KEYSPACE = "Couchbase names a bucket in at most 100 characters, a scope and a collection in at most 251"
 _SHOWPLAN = "-- SHOWPLAN_TEXT (the statement was not run)\n"
 # The reader's codes for a session that closed or lost its server under the call (Task 6 carry): not the server's error
-_CONNECTION_GONE = frozenset({CONNECTION_LOST, "connection_closed"})
+_CONNECTION_GONE = frozenset({CONNECTION_LOST, CONNECTION_CLOSED})
 # Engines whose agent session has no database of the agent's choosing (AgentSessions.key): SQLite has one; Couchbase's
 # requests carry a query_context instead
 _NO_DATABASE = frozenset({Engine.SQLITE, Engine.COUCHBASE})
 
 
-def _ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)
+def _cut(message: str, code: str | None = None) -> str:
+    """A server's or driver's message, cut at ERROR_CHARS (review I4: it can quote a value of any size the agent
+    built), then its code."""
+    message = note(message, ERROR_CHARS)
+    return f"{message} ({code})" if code else message
 
 
 class QueryTools:
@@ -83,6 +87,8 @@ class QueryTools:
         request, notes = self._request(shared, "run_query", sql, sql, database, query_context, timeout_s, client)
         request = replace(request, max_rows=max_rows, max_cell_chars=max_cell_chars)
         outcome = self._read("run_query", shared, request, sql, client, control)
+        if outcome.columns_dropped:  # review I5
+            notes.append(COLUMNS_CUT.format(outcome.columns_dropped))
         if outcome.read_capped:  # one note at most says why it stopped
             notes.append(READ_CAPPED)
         elif outcome.rows_dropped:
@@ -119,19 +125,20 @@ class QueryTools:
     def _request(self, shared: Shared, tool: str, sql: str, recorded: str, database: str | None,
                  query_context: str | None, timeout_s: float | None,
                  client: str | None) -> tuple[ReadRequest, list[str]]:
-        """The context (an argument the tool cannot take is invalid_argument, as the SDK's own checks), the gate
-        (refused: History, INFO, `refused`; nothing connects), the timeout for this connection (CR-08-8). `recorded`:
-        the call's History text."""
+        """The gate (refused: History, INFO, `refused`; nothing connects), then the arguments (one the tool cannot take
+        is invalid_argument, as the SDK's own checks, and leaves no record: review M1 put the gate first, so a statement
+        is judged and recorded whatever came with it), then the timeout for this connection (CR-08-8). `recorded`: the
+        call's History text."""
         profile, dialect = shared.profile, shared.adapter.dialect
-        context = self._context(shared, query_context)
         verdict = agent_read(sql, dialect)
         if not verdict.allowed:
-            self._keep(self._history.refused, self._record(profile, recorded, self._shown(shared, database, context),
-                                                           datetime.now(UTC), 0, 0, "refused", verdict.message(),
-                                                           client))
+            self._keep(self._history.refused, self._record(profile, recorded, self._shown_as_given(
+                shared, database, query_context), datetime.now(UTC), 0, 0, "refused", verdict.message(), client))
             logger.info("MCP refused {} on {}: {}", tool, profile.id, verdict.refusal)
             logger.debug("MCP refused {} on {} by {!r}: {!r}", tool, profile.id, client, sql[:300])
             raise ToolFailure("refused", verdict.message(), logged=True, connection=str(profile.id))
+        database = checked_database(database)
+        context = self._context(shared, query_context)
         notes: list[str] = []
         red = profile.color == "red"
         limit = TIMEOUT_RED_S if red else TIMEOUT_MAX_S
@@ -140,7 +147,8 @@ class QueryTools:
             notes.append(_LOWERED.format(limit, "a production (red) connection" if red else "the most a call may take"))
             timeout = float(limit)
         return ReadRequest(profile=profile, dialect=dialect, sql=sql, query_context=context, timeout_s=timeout,
-                           database=None if profile.engine in _NO_DATABASE else database), notes
+                           database=None if profile.engine in _NO_DATABASE else database,
+                           admit=lambda: self._tools.shared(str(profile.id), tool, "query")), notes
 
     @staticmethod
     def _context(shared: Shared, text: str | None) -> QueryContext | None:
@@ -155,6 +163,13 @@ class QueryTools:
             raise ToolFailure("invalid_argument", _BAD_CONTEXT.format(_LONG_CONTEXT)) from None
         except ValueError as exc:
             raise ToolFailure("invalid_argument", _BAD_CONTEXT.format(exc)) from None
+
+    def _shown_as_given(self, shared: Shared, database: str | None, query_context: str | None) -> str | None:
+        """A refusal's database, from arguments not checked yet: what they name when they are valid, else nothing."""
+        try:
+            return self._shown(shared, checked_database(database), self._context(shared, query_context))
+        except ToolFailure:
+            return self._shown(shared, None, None)
 
     @staticmethod
     def _shown(shared: Shared, database: str | None, context: QueryContext | None) -> str | None:
@@ -174,21 +189,32 @@ class QueryTools:
         shown = self._shown(shared, request.database, request.query_context)
         started, clock = datetime.now(UTC), time.monotonic()
         with self._recorded(profile, recorded, shown, started, clock, client):
-            with answered(profile):
+            with answered(profile), self._still_shared(shared, tool):
                 outcome = self._reader.read(request, control)
         failure = None if outcome.status == "ok" else self._failure(shared, request, outcome)
         refused = failure is not None and failure.code == "refused"
         status: HistoryStatus = "refused" if refused else outcome.status
+        if status == "ok" and control is not None and control.cancelled:
+            status = "cancelled"  # review M2: the client gave up as it ended (its frame's end): it never got the rows
         record = self._record(profile, recorded, shown, started, outcome.elapsed_ms, len(outcome.rows), status,
                               outcome.error_message if outcome.status != "ok" else None, client)
         self._keep(self._history.refused if refused else self._history.record, record)
-        logger.info("MCP {} on {}: {}, {} rows, {} ms", tool, profile.id, outcome.error_code or outcome.status,
+        logger.info("MCP {} on {}: {}, {} rows, {} ms", tool, profile.id, outcome.error_code or status,
                     len(outcome.rows), outcome.elapsed_ms)
         logger.debug("MCP {} on {} by {!r}: {!r}{}", tool, profile.id, client, request.sql[:300],
-                     f", {outcome.error_message!r}" if outcome.error_message else "")
+                     f", {outcome.error_message[:1000]!r}" if outcome.error_message else "")
         if failure is not None:
             raise failure
         return outcome
+
+    @contextmanager
+    def _still_shared(self, shared: Shared, tool: str) -> Iterator[None]:
+        """Review I1: the profile went away during the call (deleted): `unknown_connection`, as the next call gets."""
+        try:
+            yield
+        except ProfileNotFound:
+            self._tools.shared(str(shared.profile.id), tool, "query")  # raises unknown_connection now
+            raise
 
     @contextmanager
     def _recorded(self, profile: AnyProfile, sql: str, shown: str | None, started: datetime, clock: float,
@@ -199,13 +225,13 @@ class QueryTools:
             yield
         except ToolFailure as failure:
             refused = failure.code == "refused"
-            self._keep(self._history.refused if refused else self._history.record,
-                       self._record(profile, sql, shown, started, _ms(clock), 0, "refused" if refused else "error",
-                                    failure.message, client))
+            record = self._record(profile, sql, shown, started, elapsed_ms(clock), 0,
+                                  "refused" if refused else "error", failure.message, client)
+            self._keep(self._history.refused if refused else self._history.record, record)
             raise
         except Exception:
-            self._keep(self._history.record, self._record(profile, sql, shown, started, _ms(clock), 0, "error",
-                                                          "Internal error", client))
+            record = self._record(profile, sql, shown, started, elapsed_ms(clock), 0, "error", "Internal error", client)
+            self._keep(self._history.record, record)
             raise
 
     @staticmethod
@@ -219,7 +245,7 @@ class QueryTools:
         if outcome.status in ("timeout", "cancelled"):
             text = _TIMEOUT.format(request.timeout_s) if outcome.status == "timeout" else _CANCELLED
             return failed(outcome.status, f"{text}. {outcome.error_message}" if outcome.error_message else text)
-        code, message = outcome.error_code, outcome.error_message or "The query failed"
+        code, message = outcome.error_code, _cut(outcome.error_message or "The query failed")
         if code == "read_only":  # the worker's backstop: the gate's verdict, again
             return failed("refused", message)
         if code == "session_changed":
@@ -237,7 +263,8 @@ class QueryTools:
         it is kept as U+FFFD) and at most SQL_MAX characters (an explain's text adds its head to the agent's 20,000).
         The client's name is `server.client_name`'s: at most 80 characters, no control characters."""
         return HistoryRecord(
-            profile_id=profile.id, profile_name=profile.name, database=database, sql=well_formed(sql)[:SQL_MAX],
+            profile_id=profile.id, profile_name=profile.name, database=well_formed(database) if database else None,
+            sql=well_formed(sql)[:SQL_MAX],
             started_at=started, elapsed_ms=elapsed_ms, rows=rows, status=status,
             error=well_formed(error) if error else None, source="mcp", client=well_formed(client) if client else None,
         )
@@ -270,12 +297,12 @@ class QueryTools:
             raise ToolFailure("invalid_argument", _BAD_KEYSPACE) from None
         summary = f"-- MCP sample_fields {'.'.join((bucket, scope, collection))}"
         with self._recorded(profile, summary, None, started, clock, client):
-            with answered(profile):
+            with answered(profile), self._still_shared(shared, "sample_fields"):
                 sample = self._samples.cached(profile.id, keyspace) if size is None else None
                 if sample is None:
                     wanted = min(size or self._settings.get().couchbase.sample_size, SAMPLE_MAX)
                     sample = self._sampled(profile, keyspace, wanted)
-        elapsed = _ms(clock)
+        elapsed = elapsed_ms(clock)
         self._keep(self._history.record, self._record(profile, f"{summary} ({sample.documents} documents)", None,
                                                       started, elapsed, sample.documents, "ok", None, client))
         logger.info("MCP sample_fields on {}: ok, {} documents, {} paths, {} ms", profile.id, sample.documents,
@@ -289,8 +316,7 @@ class QueryTools:
             return self._samples.sample(profile.id, keyspace, size, agent=True)
         except (QueryFailed, StatementError) as exc:
             cause = exc.__cause__ if isinstance(exc, QueryFailed) else exc  # server_errors_are_final keeps it
-            code = getattr(cause, "code", None)
-            raise ToolFailure("query_failed", f"{exc.message} ({code})" if code else exc.message) from None
+            raise ToolFailure("query_failed", _cut(exc.message, getattr(cause, "code", None))) from None
 
 
 def _sample_result(sample: FieldSample) -> dict[str, Any]:

@@ -86,8 +86,8 @@ class HistoryService:
         self._retention = retention
         self._mcp_retention = mcp_retention
         self._clock = clock
-        # The last refusal of each (profile, client, text): its record and when (CR-08-3); the newest few only
-        self._refusals: OrderedDict[tuple[str, str | None, str], tuple[int, float]] = OrderedDict()
+        # The last refusal of each (profile, database, client, text): its record and when (CR-08-3); the newest few only
+        self._refusals: OrderedDict[tuple[str, str | None, str | None, str], tuple[int, float]] = OrderedDict()
         self._prune_every = prune_every
         self._inserts = 0
         self._lock = threading.Lock()
@@ -166,9 +166,9 @@ class HistoryService:
 
     def refused(self, rec: HistoryRecord) -> int:
         """An MCP agent's refused statement (status `refused`, CR-08-3): when the same client sent the same text to the
-        same connection less than REFUSAL_MERGE_S ago, that record's `repeats` grows instead of a new one being written.
-        Its id."""
-        key = (str(rec.profile_id), rec.client, rec.sql)
+        same connection and database less than REFUSAL_MERGE_S ago, that record's `repeats` grows instead of a new one
+        being written. Its id."""
+        key = (str(rec.profile_id), rec.database, rec.client, rec.sql)
         now = self._clock()
         with self._lock:
             conn = self._connection()

@@ -258,7 +258,7 @@ def canned(tmp_path):
         keyspaces=[SnapshotKeyspace(bucket=b, scope=s, collection=c, system=s == "_system") for b, s, c in KEYSPACES])
 
     class Metadata:
-        def with_connection(self, profile_id, database, fn):
+        def with_connection(self, profile_id, database, fn, *, agent=False):
             return snapshot
 
     profiles = ProfileService(ProfileStore(profiles_file(tmp_path)), InMemorySecretStore())

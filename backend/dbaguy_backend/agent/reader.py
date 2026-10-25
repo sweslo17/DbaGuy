@@ -28,14 +28,13 @@ from ..domain.execution import (
 from ..domain.profiles import AnyProfile, Engine
 from ..sessions.worker import CLOSED_BEFORE_START
 from ..sql.dialects import SERVER_TIMEOUT_MARGIN_S, Dialect, SessionAssumption, explain_head, read_frame
-from .sessions import AgentSessions, Lease
+from .sessions import TICK_S, AgentSessions, Lease, WaitCancelled
 from .tools import ToolFailure
 from .shape import FIRST_PAGE, MAX_CELL_DEFAULT, MAX_ROWS_DEFAULT, NOTES_MAX, ResultBudget, compact, note
 
 FORCE_AFTER_S = 1.5  # after a timeout's cancel, a second (SQL Server's that ends a statement stuck in a transaction)
 CANCEL_GRACE_S = 10.0  # then the statement has this long to stop before its session is closed
 FRAME_END_S = 15.0  # ROLLBACK and the frame's end
-_TICK_S = 0.25  # while nothing arrives, how often a client's cancel is looked for (it starts the escalation above)
 _LEAST_S = 0.1  # the least time the frame's opening gets, its deadline past
 _INTERNAL = RunOptions(describe=False)
 RESET_NOTE = ("DbaGuy closed this connection after the call (it could not end the call cleanly); the next call opens a "
@@ -64,6 +63,9 @@ class ReadRequest:
     max_cell_chars: int = MAX_CELL_DEFAULT
     timeout_s: float = 30.0
     explain: bool = False  # every result set's rows (T-SQL's SHOWPLAN plan is its second), SHOWPLAN around it
+    # Called once the call holds its session's lock, before anything opens or is sent: raises when the call may no
+    # longer read (the profile changed while it waited, review I1)
+    admit: Callable[[], object] | None = None
 
 
 @dataclass
@@ -73,6 +75,7 @@ class ReadOutcome:
     rows: list[list[Any]] = field(default_factory=list)
     more_rows: bool = False  # the server had more than the result holds
     rows_dropped: int = 0  # rows read that the response had no room for
+    columns_dropped: int = 0  # the last columns, which the response had no room for (with their values, review I5)
     notes: list[str] = field(default_factory=list)
     error_code: str | None = None
     error_message: str | None = None
@@ -174,11 +177,15 @@ class AgentReader:
         started = self._clock()
         deadline = started + request.timeout_s
         outcome = ReadOutcome()
+        control = control or CallControl()
         try:
-            with self._sessions.lease(request.profile, request.database, deadline) as lease:
-                self._framed(lease, request, deadline, control or CallControl(), outcome)
+            with self._sessions.lease(request.profile, request.database, deadline, admit=request.admit,
+                                      cancelled=lambda: control.cancelled) as lease:
+                self._framed(lease, request, deadline, control, outcome)
         except TimeoutError:  # the session did not open before the deadline: its worker was closed (T6-I2)
             outcome.status, outcome.error_message = "timeout", _OPEN_LATE
+        except WaitCancelled:  # the client gave up while the call waited for its session (review I2): nothing sent
+            outcome.status = "cancelled"
         outcome.elapsed_ms = int((self._clock() - started) * 1000)
         self._sessions.read_login(request.profile, deadline)  # after the read, never failing or delaying it
         return outcome
@@ -267,7 +274,7 @@ class AgentReader:
                     outcome.error_message = _STUCK
                     return False
                 if stage == "running":
-                    wait = min(deadline - now, _TICK_S)
+                    wait = min(deadline - now, TICK_S)  # a client's cancel is looked for this often
                 else:
                     wait = since + (FORCE_AFTER_S if stage == "cancelled" else CANCEL_GRACE_S) - now
                 event = events.next(wait)
@@ -280,6 +287,7 @@ class AgentReader:
                             # null where the engine only knows a type from the values (SQLite without its peek, P9)
                             outcome.columns = [{"name": c.name, "type": c.type_name or None} for c in event.columns]
                             budget = ResultBudget(outcome.columns, request.max_rows, request.max_cell_chars)
+                            outcome.columns, outcome.columns_dropped = budget.columns, budget.columns_dropped
                             budget.spend(sum(len(compact(text)) + 1 for text in outcome.notes))
                     case RowsEvent():
                         awaiting = False

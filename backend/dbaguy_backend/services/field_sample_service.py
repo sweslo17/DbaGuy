@@ -43,10 +43,7 @@ class FieldSampleService:
             with server_errors_are_final():
                 return connection.sample_fields(keyspace, requested)
 
-        if agent:
-            sample = self._metadata.with_connection(profile_id, None, run, agent=True)
-        else:
-            sample = self._metadata.with_connection(profile_id, None, run)
+        sample = self._metadata.with_connection(profile_id, None, run, agent=agent)
         with self._lock:
             kept = self._samples.setdefault(profile_id, OrderedDict())
             kept[keyspace] = sample
