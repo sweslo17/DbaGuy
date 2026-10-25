@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, ClassVar, Literal
 
+from ..domain.agent import LoginPrivileges
 from ..domain.couchbase import FieldSample, Keyspace
 from ..domain.data_jobs import DumpObjectKinds, DumpScope
 from ..domain.edits import EditTarget
@@ -285,6 +286,12 @@ class DatabaseConnection(ABC):
         """Whether the session reads a backslash in a string literal as an escape, as the answer to the last `run()`
         said (no round trip; a grid commit checks it after its BEGIN, ⑤ D-05-13). None when the engine's answers do not
         say (every engine but MySQL) or that answer did not (rows, an error)."""
+        return None
+
+    def login_privileges(self) -> LoginPrivileges | None:
+        """What the login may do beyond reading that a read-only transaction does not stop (spec ⑧ CR-08-1): one query.
+        None: the engine has nothing to tell (SQLite: the sidecar's own file access; Couchbase: its roles and
+        `readonly=true`)."""
         return None
 
     @abstractmethod

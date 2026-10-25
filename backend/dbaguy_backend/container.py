@@ -12,6 +12,7 @@ from .adapters.postgres.adapter import PostgresAdapter
 from .adapters.registry import AdapterRegistry
 from .adapters.sqlite.adapter import SqliteAdapter
 from .agent.host import AgentHost
+from .agent.login import LoginRegistry
 from .agent.token_store import InMemoryTokenStore, KeyringTokenStore, TokenStore
 from .agent.tools import AgentTools
 from .config import Settings, default_data_dir
@@ -116,7 +117,8 @@ class AppContainer:
             self.transfers.plans,
         )
         self.sessions = SessionManager(self.connections, self.profiles, hooks, jobs=self.jobs)
-        self.agent_tools = AgentTools(self.profiles, self.registry, self.metadata, self.schema_cache)
+        self.agent_login = LoginRegistry(self.metadata)
+        self.agent_tools = AgentTools(self.profiles, self.registry, self.metadata, self.schema_cache, self.agent_login)
         self.agent_host = AgentHost(
             self.agent_tools, token_store or _token_store(settings, secret_store), default_mcp_port(data_dir),
             on_stop=self._close_agents,

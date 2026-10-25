@@ -961,6 +961,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/mcp/connections/{profile_id}/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Connection Login
+         * @description Read now on the agents' read-only connection (a locked profile: 428 password_required, as every route); null for
+         *     an engine with nothing to tell (SQLite, Couchbase).
+         */
+        get: operations["connection_login_mcp_connections__profile_id__login_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -2531,6 +2552,20 @@ export interface components {
             scope: string;
             /** Collection */
             collection: string;
+        };
+        /**
+         * LoginPrivileges
+         * @description The connection's login, as an agent's connection found it (CR-08-1): read once, kept until the profile changes.
+         *     Empty `grants`: it can do nothing a read-only transaction does not stop.
+         */
+        LoginPrivileges: {
+            /**
+             * Grants
+             * @default []
+             */
+            grants: ("superuser" | "server_files_read" | "server_files_write" | "server_programs" | "signal_backends" | "file" | "can_write" | "sysadmin" | "bulkadmin")[];
+            /** Secure File Priv */
+            secure_file_priv?: string | null;
         };
         /**
          * McpSettings
@@ -5934,6 +5969,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["McpToken"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    connection_login_mcp_connections__profile_id__login_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                profile_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoginPrivileges"] | null;
                 };
             };
             /** @description Validation Error */

@@ -10,6 +10,7 @@ import psycopg
 from loguru import logger
 from psycopg import postgres, pq
 
+from ...domain.agent import LoginPrivileges
 from ...domain.data_jobs import DumpObjectKinds, DumpScope
 from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, ValidationFailed
@@ -90,6 +91,14 @@ _CONNECTION_LOST_STATES = frozenset({"57P01", "57P02", "57P03"})
 # Read-only profiles set the session default at connect and re-assert it before every statement: a SELECT can call
 # set_config() to switch the default off, whether written out, hidden in a string or inside a user function.
 _READ_ONLY_GUC = "default_transaction_read_only"
+# CR-08-1: the login's superuser bit and the four roles a read-only transaction does not stop (a superuser has all)
+_LOGIN_SQL = (
+    "SELECT r.rolsuper, pg_has_role(current_user, 'pg_read_server_files', 'MEMBER'), "
+    "pg_has_role(current_user, 'pg_write_server_files', 'MEMBER'), "
+    "pg_has_role(current_user, 'pg_execute_server_program', 'MEMBER'), "
+    "pg_has_role(current_user, 'pg_signal_backend', 'MEMBER') FROM pg_roles r WHERE r.rolname = current_user"
+)
+_LOGIN_GRANTS = ("superuser", "server_files_read", "server_files_write", "server_programs", "signal_backends")
 _READ_ONLY_SESSION = "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
 
 # libpq's chunked streaming uses the extended protocol, which accepts one statement per query.
@@ -429,6 +438,13 @@ class PostgresConnection(DatabaseConnection, RowEditing, DataTools, ReferenceRea
 
     def current_database(self) -> str | None:
         return self._conn.info.dbname
+
+    def login_privileges(self) -> LoginPrivileges:
+        try:
+            row = self._conn.execute(_LOGIN_SQL).fetchone()
+        except psycopg.Error as exc:
+            raise self.translate_error(exc, _LOGIN_SQL) from exc
+        return LoginPrivileges(grants=[g for g, held in zip(_LOGIN_GRANTS, row or (), strict=False) if held])
 
     def _check_database(self, path: list[PathSegment]) -> None:
         if path and path[0].name != self.current_database():

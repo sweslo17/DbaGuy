@@ -18,11 +18,12 @@ router = APIRouter(prefix="/profiles", tags=["profiles"], dependencies=[Depends(
 
 
 def _forget_profile_state(container: AppContainer, profile_id: UUID) -> None:
-    """After a profile changed or went away: drop what was learned from it: its metadata connections, cached schema
-    snapshots and field samples."""
+    """After a profile changed or went away: drop what was learned from it: its metadata connections (the agents' too),
+    cached schema snapshots, field samples and its login's privileges."""
     container.metadata.invalidate(profile_id)
     container.schema_cache.invalidate(profile_id)
     container.field_samples.invalidate(profile_id)
+    container.agent_login.forget(profile_id)
 
 
 @router.get("", response_model=list[ProfileEntry])

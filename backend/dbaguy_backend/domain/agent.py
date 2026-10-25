@@ -6,7 +6,8 @@ from pydantic import BaseModel
 
 from .profiles import McpAccess
 
-__all__ = ["McpAccess", "McpState", "McpStatus", "McpToken", "ToolErrorCode", "APP_MCP_PORT", "DEV_MCP_PORT"]
+__all__ = ["McpAccess", "McpState", "McpStatus", "McpToken", "ToolErrorCode", "APP_MCP_PORT", "DEV_MCP_PORT",
+           "LoginGrant", "LoginPrivileges"]
 
 APP_MCP_PORT = 17531  # the app's own data dir (R-08-2)
 DEV_MCP_PORT = 17532  # any other data dir: dev/data, tests, a scratch sidecar
@@ -21,6 +22,33 @@ ToolErrorCode = Literal[
     "connection_failed", "query_failed", "timeout", "cancelled", "busy", "not_found", "invalid_argument",
     "internal_error",
 ]
+
+
+# What a login may do beyond reading that a read-only transaction does not stop (CR-08-1, §3.3), in this order:
+# PostgreSQL superuser and the four pg_* roles; MySQL FILE; SQL Server writes in the database, sysadmin, bulkadmin
+LoginGrant = Literal[
+    "superuser", "server_files_read", "server_files_write", "server_programs", "signal_backends", "file", "can_write",
+    "sysadmin", "bulkadmin",
+]
+_GRANT_TEXT: dict[str, str] = {
+    "superuser": "is a superuser", "server_files_read": "read the server's files",
+    "server_files_write": "write the server's files", "server_programs": "run programs on the server",
+    "signal_backends": "end other sessions", "file": "read and write files on the server (FILE)",
+    "can_write": "write in this database", "sysadmin": "is a sysadmin", "bulkadmin": "bulk-load files (bulkadmin)",
+}
+
+
+class LoginPrivileges(BaseModel):
+    """The connection's login, as an agent's connection found it (CR-08-1): read once, kept until the profile changes.
+    Empty `grants`: it can do nothing a read-only transaction does not stop."""
+
+    grants: list[LoginGrant] = []
+    # MySQL with `file`: secure_file_priv: "" any directory, a path only that one, None (NULL) no file at all
+    secure_file_priv: str | None = None
+
+    def summary(self) -> str:
+        """`superuser, run programs on the server`, for the log and the agent: never a secret."""
+        return ", ".join(_GRANT_TEXT[grant] for grant in self.grants) or "nothing beyond reading"
 
 
 class McpStatus(BaseModel):

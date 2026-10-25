@@ -19,11 +19,12 @@ from ..domain.errors import (
 )
 from ..domain.execution import QueryContext
 from ..domain.metadata import Folder, MetadataRequest, NodeKind, ObjectNode, PathSegment, path_database
-from ..domain.profiles import AnyProfile, Engine, ServerProfile
+from ..domain.profiles import AnyProfile, Engine, profile_database
 from ..domain.schema import SchemaSnapshot, SnapshotRelation
 from ..services.metadata_service import MetadataService
 from ..services.profile_service import ProfileService
 from ..services.schema_cache import SchemaCache
+from .login import LoginRegistry
 
 LIST_LIMIT, SEARCH_LIMIT, LIMIT_MAX = 100, 50, 1000  # list_objects, search_objects (§3.5)
 _UNKNOWN = "No connection '{}' is shared with AI tools; list_connections lists them"
@@ -54,10 +55,6 @@ class Shared:
 
     profile: AnyProfile
     adapter: DatabaseAdapter
-
-
-def _database(profile: AnyProfile) -> str | None:
-    return profile.database if isinstance(profile, ServerProfile) else None
 
 
 @contextmanager
@@ -92,7 +89,7 @@ def _snapshot_database(shared: Shared, database: str | None) -> str | None:
     one named, else the profile's own, so the snapshot and the catalog connection are the ones a path through it uses
     (and the app's own). Elsewhere one snapshot holds every database (`_narrowed_to`)."""
     if shared.adapter.capabilities.per_database_connection:
-        return database or _database(shared.profile) or None
+        return database or profile_database(shared.profile) or None
     return None
 
 
@@ -118,11 +115,12 @@ def _relation_of(snapshot: SchemaSnapshot, path: list[PathSegment]) -> SnapshotR
 
 class AgentTools:
     def __init__(self, profiles: ProfileService, registry: AdapterRegistry, metadata: MetadataService,
-                 schema_cache: SchemaCache) -> None:
+                 schema_cache: SchemaCache, login: LoginRegistry) -> None:
         self._profiles = profiles
         self._registry = registry
         self._metadata = metadata
         self._schema_cache = schema_cache
+        self._login = login
 
     # ---- connections ----
 
@@ -171,13 +169,14 @@ class AgentTools:
         adapter = self._registry.get(profile.engine)
         entry: dict[str, Any] = {
             "id": str(profile.id), "name": profile.name, "engine": profile.engine, "access": profile.mcp_access,
-            "folder": profile.folder or None, "color": profile.color, "database": _database(profile),
+            "folder": profile.folder or None, "color": profile.color, "database": profile_database(profile),
             "read_only_by": "server" if adapter.capabilities.server_read_only else "dbaguy",
             "needs_unlock": self._needs_unlock(profile),
+            "login": self._login_of(profile),
         }
         if profile.engine == Engine.COUCHBASE:
             try:
-                context = QueryContext.parse(_database(profile))
+                context = QueryContext.parse(profile_database(profile))
             except ValueError:
                 context = None
             entry["default_query_context"] = context.text() if context is not None else None
@@ -190,6 +189,7 @@ class AgentTools:
         shared = self.shared(connection, "list_objects")
         path = path or []
         with answered(shared.profile):
+            self._login.ensure(shared.profile)
             nodes = self._metadata.children(MetadataRequest(profile_id=shared.profile.id, path=path), agent=True)
         logger.info("MCP list_objects on '{}' by {}: {} ({} objects)", shared.profile.name, client, _path_text(path),
                     len(nodes))
@@ -204,6 +204,7 @@ class AgentTools:
         pid = shared.profile.id
         scope, narrow = _snapshot_database(shared, database), _narrowed_to(shared, database)
         with answered(shared.profile):
+            self._login.ensure(shared.profile)
             # One more than `limit`, so `truncated` says whether more match; every match when they are narrowed here
             hits = self._schema_cache.search(pid, pattern, scope, limit + 1 if narrow is None else sys.maxsize,
                                              agent=True)
@@ -249,6 +250,7 @@ class AgentTools:
         pid = shared.profile.id
         snapshot: SchemaSnapshot | None = None
         with answered(shared.profile):
+            self._login.ensure(shared.profile)
             if not path:
                 if not name:
                     raise ToolFailure("invalid_argument", _NO_OBJECT)
@@ -317,6 +319,13 @@ class AgentTools:
                 ".".join(part for part in (c[0], c[1], c[2]) if part) for c in found[:20])))
         db, schema_name, relation, kind = found[0]
         return shared.adapter.relation_path(db, schema_name, relation, kind), snapshot
+
+    def _login_of(self, profile: AnyProfile) -> dict[str, Any] | None:
+        """CR-08-1: what the login may do beyond reading, once an agent's connection has read it (null before)."""
+        privileges = self._login.peek(profile.id)
+        if privileges is None:
+            return None
+        return {**privileges.model_dump(exclude_none=True), "summary": privileges.summary()}
 
     def _needs_unlock(self, profile: AnyProfile) -> bool:
         """A password it would ask for: a profile that does not save its password and has none unlocked this run. One

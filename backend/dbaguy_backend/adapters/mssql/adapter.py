@@ -26,6 +26,7 @@ from typing import Any
 
 from loguru import logger
 
+from ...domain.agent import LoginGrant, LoginPrivileges
 from ...domain.column_category import ColumnCategory
 from ...domain.data_jobs import DumpObjectKinds, DumpScope
 from ...domain.edits import EditTarget
@@ -71,6 +72,15 @@ _TYPE_PEEK = 100  # rows read ahead to guess the column types of a result set th
 _OPEN_QUERY = "SELECT @@SPID, @@TRANCOUNT, XACT_STATE(), @@OPTIONS & 2, DB_NAME()"
 _STATE_QUERY = "SELECT @@TRANCOUNT, XACT_STATE(), @@OPTIONS & 2, DB_NAME()"  # @@OPTIONS bit 2: IMPLICIT_TRANSACTIONS
 _SERVER_INFO = "SELECT @@VERSION, DB_NAME(), SUSER_SNAME()"
+# spec ⑧ CR-08-1: whether the login can write in this database (db_owner, or INSERT/UPDATE/DELETE/ALTER/EXECUTE on it:
+# SQL Server has no read-only session, so this is what an agent's slip could reach), then two server roles
+_LOGIN_CAN_WRITE = (
+    "IS_MEMBER('db_owner'), HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'INSERT'), "
+    "HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'UPDATE'), HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'DELETE'), "
+    "HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'ALTER'), HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'EXECUTE')"
+)
+_LOGIN_SQL = f"SELECT {_LOGIN_CAN_WRITE}, IS_SRVROLEMEMBER('sysadmin'), IS_SRVROLEMEMBER('bulkadmin')"
+_WRITE_CHECKS = 6  # the first six values of _LOGIN_SQL
 _COMMIT = "WHILE @@TRANCOUNT > 0 COMMIT TRANSACTION"  # every nesting level (Ruling 18)
 _ROLLBACK = "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION"
 _NO_COLUMN_NAME = "(No column name)"
@@ -679,6 +689,15 @@ class MssqlConnection(DatabaseConnection, RowEditing, DataTools, ReferenceReadin
 
     def current_database(self) -> str | None:
         return self._database
+
+    def login_privileges(self) -> LoginPrivileges:
+        row = self._catalog_call(lambda: catalog.first_row(self._conn, _LOGIN_SQL)) or ()
+        held = [value == 1 for value in row]
+        grants: list[LoginGrant] = []
+        if any(held[:_WRITE_CHECKS]):
+            grants.append("can_write")
+        grants += [grant for grant, on in zip(("sysadmin", "bulkadmin"), held[_WRITE_CHECKS:], strict=False) if on]
+        return LoginPrivileges(grants=grants)
 
     def _check_database(self, path: list[PathSegment]) -> None:
         if path and path[0].name != self._database:

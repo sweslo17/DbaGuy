@@ -3521,6 +3521,74 @@
           }
         }
       }
+    },
+    "/mcp/connections/{profile_id}/login": {
+      "get": {
+        "tags": [
+          "mcp"
+        ],
+        "summary": "Connection Login",
+        "description": "Read now on the agents' read-only connection (a locked profile: 428 password_required, as every route); null for\nan engine with nothing to tell (SQLite, Couchbase).",
+        "operationId": "connection_login_mcp_connections__profile_id__login_get",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Profile Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/LoginPrivileges"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Connection Login Mcp Connections  Profile Id  Login Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -7291,6 +7359,43 @@
         ],
         "title": "Keyspace",
         "description": "A collection by its three names. Frozen: it is the key of the field-sample cache."
+      },
+      "LoginPrivileges": {
+        "properties": {
+          "grants": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "superuser",
+                "server_files_read",
+                "server_files_write",
+                "server_programs",
+                "signal_backends",
+                "file",
+                "can_write",
+                "sysadmin",
+                "bulkadmin"
+              ]
+            },
+            "type": "array",
+            "title": "Grants",
+            "default": []
+          },
+          "secure_file_priv": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Secure File Priv"
+          }
+        },
+        "type": "object",
+        "title": "LoginPrivileges",
+        "description": "The connection's login, as an agent's connection found it (CR-08-1): read once, kept until the profile changes.\nEmpty `grants`: it can do nothing a read-only transaction does not stop."
       },
       "McpSettings": {
         "properties": {

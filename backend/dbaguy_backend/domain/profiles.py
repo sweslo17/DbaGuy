@@ -86,6 +86,11 @@ ProfileDraft = Annotated[AnyDraft, Field(discriminator="engine")]
 Profile = Annotated[AnyProfile, Field(discriminator="engine")]
 
 
+def profile_database(profile: AnyProfile) -> str | None:
+    """The database a profile names: None when it names none, or its engine has no such thing (SQLite)."""
+    return profile.database if isinstance(profile, ServerProfile) else None
+
+
 def profile_from_draft(draft: AnyDraft, profile_id: UUID) -> AnyProfile:
     data = draft.model_dump()
     if isinstance(draft, SqliteProfileDraft):

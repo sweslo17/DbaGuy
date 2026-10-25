@@ -14,6 +14,7 @@ from mysql.connector.connection import MySQLConnection
 from mysql.connector.constants import ServerFlag
 from mysql.connector.cursor import MySQLCursorRaw
 
+from ...domain.agent import LoginPrivileges
 from ...domain.data_jobs import DumpObjectKinds, DumpScope
 from ...domain.edits import EditTarget
 from ...domain.errors import ConnectionFailed, ValidationFailed
@@ -487,6 +488,12 @@ class MysqlConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
 
     def current_database(self) -> str | None:
         return self._database
+
+    def login_privileges(self) -> LoginPrivileges:
+        try:
+            return catalog.login_privileges(self._conn)
+        except mysql.connector.Error as exc:
+            raise self.translate_error(exc) from exc
 
     def list_children(self, path: list[PathSegment]) -> list[ObjectNode]:
         return introspection.list_children(self._conn, path)
