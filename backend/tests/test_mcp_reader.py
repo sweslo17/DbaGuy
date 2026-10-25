@@ -31,7 +31,7 @@ from .agent_support import container, share
 from .support import (
     PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, couchbase_query, make_couchbase_profile, make_mssql_profile,
     make_mysql_profile, make_pg_profile, mssql_connect, mysql_driver_kwargs, requires_couchbase, requires_mssql,
-    requires_mysql, requires_pg, scaled,
+    requires_mysql, requires_pg, scaled, wait_until,
 )
 
 __all__ = ["container"]
@@ -393,7 +393,88 @@ def test_the_deadline_covers_opening_the_session(container):
         outcome = _read(container, pid, "SELECT 1", Dialect.POSTGRES, timeout_s=1)
         took = time.monotonic() - started
     assert outcome.status == "timeout" and took < scaled(1.6), f"{took:.2f} s"
-    assert not _agent_workers(container) and not container.agent_sessions._slots
+    assert not _agent_workers(container)  # nothing registered: the open is still in flight, kept in its slot (R-3)
+
+
+def _session_threads(name: str) -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name.startswith(f"session-mcp:{name}:")]
+
+
+@requires_pg
+def test_retries_against_a_stalled_server_keep_one_open_in_flight(container):
+    """Re-review R-3: an open the call's deadline left behind stays in its slot, and the next call on the key waits
+    for it (within its own deadline) instead of starting another: ten retries, one connection attempt."""
+    with _stalled_server() as port:
+        pid = share(container, make_pg_profile(name="zz_08 stalled", port=port))
+        outcomes = [_read(container, pid, "SELECT 1", Dialect.POSTGRES, timeout_s=0.2) for _ in range(10)]
+        assert {o.status for o in outcomes} == {"timeout"}
+        assert len(_session_threads("zz_08 stalled")) <= 1
+
+
+@requires_pg
+def test_opens_in_flight_count_toward_the_session_cap(container):
+    """Re-review R-3: across keys too, an open the call left behind holds its slot until it ends, so a stalled server
+    holds at most MAX_AGENT_SESSIONS opens: the next key is busy."""
+    with _stalled_server() as port:
+        pids = [share(container, make_pg_profile(name=f"zz_08 stalled {n}", port=port))
+                for n in range(MAX_AGENT_SESSIONS + 1)]
+        for pid in pids[:-1]:
+            assert _read(container, pid, "SELECT 1", Dialect.POSTGRES, timeout_s=0.2).status == "timeout"
+        with pytest.raises(ToolFailure) as busy:
+            _read(container, pids[-1], "SELECT 1", Dialect.POSTGRES, timeout_s=0.2)
+        assert busy.value.code == "busy"
+        assert len([t for t in threading.enumerate() if t.name.startswith("session-mcp:zz_08 stalled")]) \
+            <= MAX_AGENT_SESSIONS
+
+
+def test_no_open_starts_once_the_deadline_has_passed(container, lite, monkeypatch):
+    """Re-review nit: the lock wait took the whole deadline: no session is opened only to be closed."""
+    pid = share(container, _lite_profile(lite))
+    opened = []
+    monkeypatch.setattr(container.sessions, "create_agent", lambda *a, **k: opened.append(a))
+    with pytest.raises(TimeoutError):
+        with container.agent_sessions.lease(container.profiles.get(UUID(pid)), None, time.monotonic() - 1):
+            pass
+    assert not opened
+
+
+def test_the_login_read_never_holds_up_the_answer(container, lite, monkeypatch):
+    """Re-review R-2: the login is read on a thread of its own, one per profile at a time, never after a cancel."""
+    pid = share(container, _lite_profile(lite))
+    reads, release = [], threading.Event()
+
+    def slow(profile):
+        reads.append(profile.id)
+        release.wait(5)
+
+    monkeypatch.setattr(container.agent_login, "ensure", slow)
+    try:
+        started = time.monotonic()
+        assert _read(container, pid, "SELECT 1", Dialect.SQLITE, timeout_s=1).rows == [[1]]
+        assert _read(container, pid, "SELECT 1", Dialect.SQLITE, timeout_s=1).rows == [[1]]  # one read in flight
+        took = time.monotonic() - started
+        control = CallControl()
+        control.cancel()
+        container.agent_reader.read(ReadRequest(profile=container.profiles.get(UUID(pid)), dialect=Dialect.SQLITE,
+                                                sql="SELECT 1"), control)
+        assert took < scaled(1.0), f"{took:.2f} s"
+        assert wait_until(lambda: reads, 2) and reads == [UUID(pid)]
+    finally:
+        release.set()
+
+
+@requires_pg
+def test_a_reload_that_turns_standard_conforming_strings_off_is_seen_once_the_frame_opens(container):
+    """Re-review R-1: a reload reaches a session's parameter status only with its next command's answer (BEGIN's):
+    it is checked again after the opening, and the call is refused before its statement."""
+    pid = share(container, make_pg_profile(name="zz_08 pg"))
+    _read(container, pid, "SELECT 1", Dialect.POSTGRES)
+    connection = _agent_workers(container)[0].connection
+    reported = iter(["on", "off"])
+    connection.reported_setting = lambda name: next(reported, "off")
+    with pytest.raises(ToolFailure) as refused:
+        _read(container, pid, "SELECT 1", Dialect.POSTGRES)
+    assert refused.value.code == "refused" and not _agent_workers(container)
 
 
 def test_a_cancel_before_the_frame_sends_nothing(container, lite):
@@ -462,6 +543,46 @@ def test_sql_server_options_the_lexer_assumes_are_set_again_on_every_call(contai
     assert _read(container, pid, "SET QUOTED_IDENTIFIER OFF", Dialect.TSQL).status == "ok"
     probe = "SELECT CAST(SESSIONPROPERTY('QUOTED_IDENTIFIER') AS int), CAST(SESSIONPROPERTY('ANSI_NULLS') AS int)"
     assert _read(container, pid, probe, Dialect.TSQL).rows == [[1, 1]]
+
+
+@requires_mssql
+def test_sql_server_rowcount_a_statement_set_does_not_cut_the_next_call(container, no_gate):  # observation 2
+    pid = share(container, make_mssql_profile(name="zz_08 mssql"))
+    assert _read(container, pid, "SET ROWCOUNT 1", Dialect.TSQL).status == "ok"
+    five = "SELECT TOP 5 ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS n FROM sys.all_objects"
+    assert len(_read(container, pid, five, Dialect.TSQL).rows) == 5
+
+
+@requires_mysql
+def test_mysql_session_variables_a_function_changes_are_set_back_for_the_next_call(container):
+    """Observation 1: a stored function's SET SESSION outlives the ROLLBACK and would cut or change what the next call
+    reads (sql_select_limit: 1 row, more_rows false). The frame's opening sets them back: to the profile's own
+    time_zone, the rest to DEFAULT. The function is made by root, as a database's own function would be."""
+    pid = share(container, make_mysql_profile(name="zz_08 mysql", options={"time_zone": "+02:00"}))
+    state = ("SELECT @@SESSION.sql_select_limit, @@SESSION.group_concat_max_len, @@SESSION.div_precision_increment, "
+             "@@SESSION.time_zone, @@SESSION.lc_time_names, @@SESSION.default_week_format, "
+             "@@SESSION.transaction_isolation, @@SESSION.max_sort_length, @@SESSION.block_encryption_mode, "
+             "@@SESSION.windowing_use_high_precision, @@SESSION.character_set_results, YEAR(NOW()) > 2001")
+    five = "SELECT n FROM (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5) t"
+    root = mysql.connector.connect(**mysql_driver_kwargs(user="root", autocommit=True))
+    cursor = root.cursor()
+    try:
+        cursor.execute("DROP FUNCTION IF EXISTS dbaguy.zz_08_lim")
+        cursor.execute(
+            "CREATE FUNCTION dbaguy.zz_08_lim() RETURNS INT NO SQL BEGIN SET SESSION sql_select_limit = 1, "
+            "group_concat_max_len = 4, div_precision_increment = 0, time_zone = '+05:00', lc_time_names = 'de_DE', "
+            "default_week_format = 3, transaction_isolation = 'READ-UNCOMMITTED', max_sort_length = 4, "
+            "block_encryption_mode = 'aes-256-cbc', windowing_use_high_precision = 0, "
+            "character_set_results = 'latin1', timestamp = 1000000000; RETURN 1; END")
+        before = _read(container, pid, state, Dialect.MYSQL).rows
+        assert before[0][3] == "+02:00"  # the profile's own time_zone
+        assert _read(container, pid, "SELECT dbaguy.zz_08_lim()", Dialect.MYSQL).status == "ok"
+        after = _read(container, pid, five, Dialect.MYSQL)
+        assert (len(after.rows), after.more_rows) == (5, False)
+        assert _read(container, pid, state, Dialect.MYSQL).rows == before
+    finally:
+        cursor.execute("DROP FUNCTION IF EXISTS dbaguy.zz_08_lim")
+        root.close()
 
 
 @requires_couchbase

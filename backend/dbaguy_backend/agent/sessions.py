@@ -1,12 +1,17 @@
 """MCP agents' sessions (spec ⑧ D-08-1): one per (profile, database), at most MAX_AGENT_SESSIONS, one call at a time
-each. A call leases its session: it waits for the session's lock within the call's deadline (`busy` past it), opens the
-session within it too (ruling T6-I2), and holds it in the SessionManager so the reaper never closes it between the
-frame's statements. A session that opens on a server its frame cannot run on is refused (ruling T6-1). The profile's
-login is read after a call, best effort, on the agents' catalog connection of its own database (CR-08-1, P16)."""
+each. A call leases its session: it waits for the session's lock within the call's deadline (`busy` past it), waits
+for the session to open within it too (ruling T6-I2), and holds it in the SessionManager so the reaper never closes it
+between the frame's statements. A session opens on a thread of its own, kept in its slot: a call whose deadline passes
+leaves it there, and the next call on the key waits for the same open, so a stalled server costs one open per key, and
+in-flight opens count toward MAX_AGENT_SESSIONS (re-review R-3); an open that ends with no call waiting is the next
+call's. A session that opens on a server its frame cannot run on is refused (ruling T6-1). The profile's login is read
+after a call, on a thread of its own (re-review R-2), on the agents' catalog connection of its own database (CR-08-1,
+P16)."""
 
 import threading
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
@@ -14,10 +19,10 @@ from uuid import UUID
 
 from loguru import logger
 
-from ..domain.errors import SessionNotFound
+from ..domain.errors import SessionBusy, SessionNotFound
 from ..domain.execution import QueryContext
 from ..domain.profiles import AnyProfile, Engine, profile_database
-from ..sessions.manager import SessionManager
+from ..sessions.manager import SessionInfo, SessionManager
 from ..sessions.worker import SessionWorker
 from ..sql.dialects import read_frame
 from .login import LoginRegistry
@@ -27,6 +32,8 @@ MAX_AGENT_SESSIONS = 8
 TICK_S = 0.25  # how often a call that waits looks for its client's cancel (the lock here, the statement in the reader)
 _BUSY = "Another call on '{}' was still running"
 _ALL_BUSY = "All {} of DbaGuy's agent connections are busy: try again"
+_CLOSED_WHILE_OPENING = "The connection was closed while it opened (its settings changed, or the MCP server stopped)"
+LOGIN_RETRY_S = 60.0  # a login read that failed (a connection, a password) is not started again sooner
 _Key = tuple[UUID, str | None]
 
 
@@ -43,6 +50,7 @@ class _Slot:
     default_context: QueryContext | None = None
     last_used: float = 0.0
     gone: bool = False  # taken out of the registry (evicted, or its profile changed): a waiting call gets another
+    opening: Future[SessionInfo] | None = None  # its session, opening on a thread of its own (re-review R-3)
 
 
 @dataclass(frozen=True)
@@ -64,6 +72,8 @@ class AgentSessions:
         self._clock = clock
         self._slots: dict[_Key, _Slot] = {}
         self._lock = threading.Lock()
+        self._login_reading: set[UUID] = set()  # profiles whose login is being read (one read each at a time)
+        self._login_failed: dict[UUID, float] = {}  # when a login read last failed with anything but a query
 
     def key(self, profile: AnyProfile, database: str | None) -> _Key:
         """SQLite has one database; Couchbase's requests carry their context instead: one session each. No database
@@ -102,7 +112,7 @@ class AgentSessions:
             if slot.gone and slot.session_id is not None:  # taken out during the call: nothing else would close it
                 self._close_session(slot.session_id)
                 slot.session_id = None
-            if slot.session_id is None:
+            if slot.session_id is None and slot.opening is None:  # an open in flight stays, for the key's next call
                 self._forget(slot)
             slot.lock.release()
 
@@ -115,25 +125,43 @@ class AgentSessions:
             if self._clock() >= deadline:
                 raise ToolFailure("busy", _BUSY.format(profile.name))
 
-    def read_login(self, profile: AnyProfile, deadline: float) -> None:
-        """After a call: the profile's login, read unless known (CR-08-1), best effort and only while the call's
-        deadline lasts (ruling T6-I2): it never fails or holds up a read. A query that failed is tried again after a
-        minute (LoginRegistry); anything else is logged by its code."""
-        if self._clock() >= deadline:
+    def read_login(self, profile: AnyProfile, cancelled: bool = False) -> None:
+        """After a call: the profile's login (CR-08-1), read unless known, on a thread of its own (re-review R-2: the
+        call's answer never waits for it), at most one read per profile at a time, none after the client's cancel. A
+        query that failed is tried again after a minute (LoginRegistry), and so is anything else here (a connection or
+        a password, LOGIN_RETRY_S), logged by its code."""
+        if cancelled or self._login.known(profile.id):
             return
+        with self._lock:
+            failed = self._login_failed.get(profile.id)
+            if profile.id in self._login_reading or (failed is not None and self._clock() - failed < LOGIN_RETRY_S):
+                return
+            self._login_reading.add(profile.id)
+        threading.Thread(target=self._read_login, args=(profile,), name=f"mcp-login-{profile.id}", daemon=True).start()
+
+    def _read_login(self, profile: AnyProfile) -> None:
         try:
             self._login.ensure(profile)
         except Exception as exc:
+            with self._lock:
+                self._login_failed[profile.id] = self._clock()
             logger.warning("MCP: the login of {} could not be read ({})", profile.id,
                            getattr(exc, "code", None) or type(exc).__name__)
+        finally:
+            with self._lock:
+                self._login_reading.discard(profile.id)
 
     def close(self, profile_id: UUID | None = None) -> None:
         """A profile changed (its sessions close), or the MCP server stopped (all close)."""
         with self._lock:
             slots = [s for k, s in self._slots.items() if profile_id is None or k[0] == profile_id]
             for slot in slots:
-                slot.gone = True
+                slot.gone = True  # an open in flight closes its session itself when it ends
                 del self._slots[slot.key]
+            if profile_id is None:
+                self._login_failed.clear()
+            else:
+                self._login_failed.pop(profile_id, None)  # a saved profile's login is read again at once
         self._sessions.close_agents(profile_id)
 
     def _forget(self, slot: _Slot) -> None:
@@ -157,13 +185,17 @@ class AgentSessions:
         return slot
 
     def _evict_idle_locked(self) -> str | None:
-        """The least recently used slot whose call has ended gives way; its session id, to close (outside `_lock`)."""
+        """The least recently used slot whose call has ended and whose session is not still opening gives way (an open
+        in flight counts toward the cap until it ends, re-review R-3); its session id, to close (outside `_lock`)."""
         for slot in sorted(self._slots.values(), key=lambda s: s.last_used):
+            if slot.opening is not None and not slot.opening.done():
+                continue
             if slot.lock.acquire(blocking=False):
                 try:
                     slot.gone = True
                     del self._slots[slot.key]
-                    session_id, slot.session_id = slot.session_id, None
+                    session_id, slot.session_id = slot.session_id or _opened(slot.opening), None
+                    slot.opening = None
                     return session_id
                 finally:
                     slot.lock.release()
@@ -173,22 +205,69 @@ class AgentSessions:
         """The slot's session, held for this call; a new one, opened within `deadline`, when it has none or the reaper
         closed it. One on a server the frame cannot run on is refused and closed (ruling T6-1: the version its opening
         read, no round trip)."""
-        if slot.session_id is not None:
+        while True:
+            opened = slot.session_id is None
+            if opened:
+                self._take_open(slot, profile, database, deadline)
+            assert slot.session_id is not None
             try:
-                return self._sessions.hold(slot.session_id)
-            except SessionNotFound:
-                slot.session_id = None  # idle too long: reaped
-        info = self._sessions.create_agent(profile.id, database, timeout=max(0.0, deadline - self._clock()))
-        slot.session_id, slot.server_version = info.session_id, info.server.version
-        slot.default_context = info.server.default_query_context
-        worker = self._sessions.hold(info.session_id)
+                worker = self._sessions.hold(slot.session_id)
+            except SessionNotFound:  # reaped while idle, or closed once it opened (its profile changed)
+                slot.session_id = None
+                if slot.gone:
+                    raise SessionBusy(_CLOSED_WHILE_OPENING) from None
+                continue
+            break
         required = read_frame(worker.dialect).requires
-        if required is not None and (why := required.refusal(info.server.version)) is not None:
+        if opened and required is not None and (why := required.refusal(slot.server_version)) is not None:
             logger.warning("MCP: refused an agent session on {}: the server's version", profile.id)
-            self._sessions.release(info.session_id)
+            self._sessions.release(slot.session_id)
             self._drop(slot, quietly=True)
             raise ToolFailure("refused", why)
         return worker
+
+    def _take_open(self, slot: _Slot, profile: AnyProfile, database: str | None, deadline: float) -> None:
+        """The slot's session from the open in flight, or from a new one (none once the deadline has passed, nor once
+        an earlier open failed with no call waiting: that one is tried again). TimeoutError when it is still opening at
+        `deadline`: the open stays in the slot for the key's next call (re-review R-3). The caller holds the slot's
+        lock."""
+        if slot.opening is not None and slot.opening.done() and slot.opening.exception() is not None:
+            slot.opening = None
+        if slot.opening is None:
+            if self._clock() >= deadline:
+                raise TimeoutError
+            slot.opening = self._open(slot, profile.id, database)
+        opening = slot.opening
+        try:
+            info = opening.result(timeout=max(0.0, deadline - self._clock()))
+        except BaseException:
+            if not opening.done():
+                raise TimeoutError from None  # still opening: kept for the next call on the key
+            slot.opening = None  # it failed while this call waited: the call says why
+            raise
+        slot.opening = None
+        slot.session_id, slot.server_version = info.session_id, info.server.version
+        slot.default_context = info.server.default_query_context
+
+    def _open(self, slot: _Slot, profile_id: UUID, database: str | None) -> Future[SessionInfo]:
+        """The slot's session, opened on a thread of its own within the SessionManager's own limits (30 s to connect,
+        120 s for its server_info). One that ends after its slot left the registry is closed: no call would take it."""
+        opening: Future[SessionInfo] = Future()
+
+        def run() -> None:
+            try:
+                info = self._sessions.create_agent(profile_id, database)
+            except BaseException as exc:
+                opening.set_exception(exc)
+                return
+            if slot.gone:
+                self._close_session(info.session_id)
+                opening.set_exception(SessionBusy(_CLOSED_WHILE_OPENING))
+                return
+            opening.set_result(info)
+
+        threading.Thread(target=run, name=f"mcp-open-{profile_id}", daemon=True).start()
+        return opening
 
     def _drop(self, slot: _Slot, quietly: bool = False) -> None:
         session_id, slot.session_id = slot.session_id, None
@@ -202,3 +281,10 @@ class AgentSessions:
             self._sessions.close(session_id)
         except SessionNotFound:
             pass
+
+
+def _opened(opening: Future[SessionInfo] | None) -> str | None:
+    """The session id of an open that ended well and no call took yet."""
+    if opening is None or not opening.done() or opening.exception() is not None:
+        return None
+    return opening.result().session_id

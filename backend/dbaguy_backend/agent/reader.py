@@ -27,7 +27,7 @@ from ..domain.execution import (
 )
 from ..domain.profiles import AnyProfile, Engine
 from ..sessions.worker import CLOSED_BEFORE_START
-from ..sql.dialects import SERVER_TIMEOUT_MARGIN_S, Dialect, SessionAssumption, explain_head, read_frame
+from ..sql.dialects import SERVER_TIMEOUT_MARGIN_S, Dialect, SessionAssumption, explain_head, quote_literal, read_frame
 from .sessions import TICK_S, AgentSessions, Lease, WaitCancelled
 from .tools import ToolFailure
 from .shape import FIRST_PAGE, MAX_CELL_DEFAULT, MAX_ROWS_DEFAULT, NOTES_MAX, ResultBudget, compact, note
@@ -145,13 +145,30 @@ def _send(statements: list[str], connection: DatabaseConnection) -> None:
             result.close()
 
 
-def _begin(assumed: SessionAssumption | None, statements: list[str], connection: DatabaseConnection) -> str | None:
-    """The frame's opening, unless the session's setting is not what the lexer assumes: then nothing is sent, and the
-    setting's value (as the server last reported it, no round trip) is returned."""
+def _broken(assumed: SessionAssumption | None, connection: DatabaseConnection) -> str | None:
+    """The setting's value when it is not what the lexer assumes, as the server last reported it (no round trip)."""
     if assumed is not None and (found := connection.reported_setting(assumed.setting)) != assumed.value:
         return found or "unknown"
-    _send(statements, connection)
     return None
+
+
+def _begin(assumed: SessionAssumption | None, statements: list[str], connection: DatabaseConnection) -> str | None:
+    """The frame's opening, unless the session's setting is not what the lexer assumes: then nothing is sent, and the
+    setting's value is returned. Checked again once the opening is answered: a server reload reaches the session's
+    parameter status only with the answer to its next command (re-review R-1); the caller then closes the session,
+    which ends the transaction the opening began, before the statement."""
+    if (found := _broken(assumed, connection)) is not None:
+        return found
+    _send(statements, connection)
+    return _broken(assumed, connection)
+
+
+def _from_profile(names: tuple[str, ...], profile: AnyProfile, dialect: Dialect) -> str:
+    """ReadFrame.from_profile as `, <name> = <value>`: the profile's option of that name, as the adapter applied it at
+    open (a value that is only blank was not applied), else DEFAULT."""
+    given = {key.lower(): value for key, value in getattr(profile, "options", {}).items()}
+    return "".join(f", {name} = {quote_literal(dialect, given[name]) if given.get(name, '').strip() else 'DEFAULT'}"
+                   for name in names)
 
 
 def _end(before: list[str], rolls_back: bool, after: list[str], connection: DatabaseConnection) -> None:
@@ -178,16 +195,19 @@ class AgentReader:
         deadline = started + request.timeout_s
         outcome = ReadOutcome()
         control = control or CallControl()
+        reached = False  # the server answered: a session opened (only then is the login worth reading)
         try:
             with self._sessions.lease(request.profile, request.database, deadline, admit=request.admit,
                                       cancelled=lambda: control.cancelled) as lease:
+                reached = True
                 self._framed(lease, request, deadline, control, outcome)
-        except TimeoutError:  # the session did not open before the deadline: its worker was closed (T6-I2)
+        except TimeoutError:  # still opening at the deadline: the open stays in its slot for the next call (R-3)
             outcome.status, outcome.error_message = "timeout", _OPEN_LATE
         except WaitCancelled:  # the client gave up while the call waited for its session (review I2): nothing sent
             outcome.status = "cancelled"
         outcome.elapsed_ms = int((self._clock() - started) * 1000)
-        self._sessions.read_login(request.profile, deadline)  # after the read, never failing or delaying it
+        if reached:
+            self._sessions.read_login(request.profile, control.cancelled)  # on a thread of its own (re-review R-2)
         return outcome
 
     def _framed(self, lease: Lease, request: ReadRequest, deadline: float, control: CallControl,
@@ -195,7 +215,9 @@ class AgentReader:
         frame = read_frame(request.dialect)
         around = frame.explain_around if request.explain else None
         timeout_ms = max(1, int((request.timeout_s + SERVER_TIMEOUT_MARGIN_S) * 1000))  # 0 would mean no limit
-        opening = [sql.format(timeout_ms=timeout_ms) for sql in frame.begin] + ([around[0]] if around else [])
+        restored = _from_profile(frame.from_profile, request.profile, request.dialect)
+        opening = [sql.format(timeout_ms=timeout_ms, from_profile=restored) for sql in frame.begin] + (
+            [around[0]] if around else [])
         closing = [around[1]] if around else []
         if self._clock() >= deadline:  # the lock or the session's opening took it all: nothing is sent
             outcome.status = "timeout"

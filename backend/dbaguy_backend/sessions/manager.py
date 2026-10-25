@@ -17,7 +17,7 @@ from ..services.profile_service import ProfileService
 from .hooks import SessionHooksFactory
 from .jobs.context import SourceLease
 from .jobs.registry import JobRegistry
-from .worker import CALL_TIMEOUT_S, OPEN_TIMEOUT_S, Emitter, OpenTimedOut, SessionWorker
+from .worker import Emitter, SessionWorker
 
 
 class SessionCreateRequest(BaseModel):
@@ -62,20 +62,16 @@ class SessionManager:
     def create(self, request: SessionCreateRequest) -> SessionInfo:
         return self._open(request.profile_id, request.database, agent=False)
 
-    def create_agent(self, profile_id: UUID, database: str | None, timeout: float | None = None) -> SessionInfo:
+    def create_agent(self, profile_id: UUID, database: str | None) -> SessionInfo:
         """An MCP agent's session (D-08-1): on a read-only copy of the profile (`ConnectionService.open(agent=True)`),
         with the agent's hooks; the reaper closes it like any other. A password it does not have is PasswordRequired:
-        it never asks (R-08-9). `timeout`: the call's time left (ruling T6-I2): opening takes no longer, TimeoutError
-        past it. Without hooks there is no agent gate to check its statements: none is opened (review M-5)."""
+        it never asks (R-08-9). AgentSessions opens it on a thread of its own, so a call's deadline never waits on it
+        (re-review R-3). Without hooks there is no agent gate to check its statements: none is opened (review M-5)."""
         if self._hooks is None:
             raise NotSupported("This session manager has no hooks: it opens no MCP agent's session")
-        return self._open(profile_id, database, agent=True, timeout=timeout)
+        return self._open(profile_id, database, agent=True)
 
-    def _open(self, profile_id: UUID, database: str | None, *, agent: bool,
-              timeout: float | None = None) -> SessionInfo:
-        """`timeout`: at most this long for the connection and its server_info, then TimeoutError; the worker is then
-        closed without waiting for its thread, which closes the connection itself once the driver returns."""
-        ends = None if timeout is None else time.monotonic() + timeout
+    def _open(self, profile_id: UUID, database: str | None, *, agent: bool) -> SessionInfo:
         profile = self._profiles.get(profile_id)
         secrets = self._profiles.resolve_secrets(profile)
         session_id = uuid4().hex
@@ -85,13 +81,8 @@ class SessionManager:
             clock=self._clock,
         )
         try:
-            if ends is None:
-                worker.start()
-                server = worker.call(lambda c: c.server_info())
-            else:
-                worker.start(min(OPEN_TIMEOUT_S, max(0.0, ends - time.monotonic())))
-                server = worker.call(lambda c: c.server_info(),
-                                     timeout=min(CALL_TIMEOUT_S, max(0.0, ends - time.monotonic())))
+            worker.start()
+            server = worker.call(lambda c: c.server_info())
             if self._hooks is not None and agent:
                 worker.configure(self._hooks.build_agent(profile.id))  # before it is registered
             elif self._hooks is not None:
@@ -100,10 +91,8 @@ class SessionManager:
                                report=partial(self.jobs.report, session_id),
                                source=partial(self._source, from_session=session_id))
                 worker.configure(replace(hooks, jobs=jobs))  # before it is registered
-        except BaseException as exc:
-            worker.close(wait=ends is None)  # whatever failed, never leave the thread, connection or tunnel behind
-            if ends is not None and isinstance(exc, OpenTimedOut | TimeoutError):
-                raise TimeoutError("The connection did not open within the call's timeout") from None
+        except BaseException:
+            worker.close()  # whatever failed, never leave the thread, connection or tunnel behind
             raise
         info = SessionInfo(session_id=session_id, profile_id=profile.id, database=server.current_database, server=server)
         with self._lock:

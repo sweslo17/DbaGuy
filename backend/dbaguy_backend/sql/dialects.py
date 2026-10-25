@@ -531,7 +531,9 @@ class ReadFrame:
     adapter's rollback() after it when `rolls_back`, then `end`, which releases what a function may have locked for the
     session (a ROLLBACK keeps session locks, H1-e, M5). `explain_around`: what an explain sends before and after the
     statement instead of a head (T-SQL's SHOWPLAN: the statement is not run, T7). `assumes`: a setting the lexer needs
-    of the session, checked on every call. `requires`: the servers the frame runs on, checked when a session opens."""
+    of the session, checked on every call. `requires`: the servers the frame runs on, checked when a session opens.
+    `from_profile`: session variables `begin` sets back (its `{from_profile}`: `, <name> = <value>` each) to the
+    profile's option of the same name, which the adapter applied at open, or to DEFAULT when the profile names none."""
 
     begin: tuple[str, ...] = ()
     end: tuple[str, ...] = ()
@@ -539,9 +541,31 @@ class ReadFrame:
     explain_around: tuple[str, str] | None = None
     assumes: SessionAssumption | None = None
     requires: ServerRequirement | None = None
+    from_profile: tuple[str, ...] = ()
 
 
 SERVER_TIMEOUT_MARGIN_S = 5
+# What a stored function can SET that outlives the frame's ROLLBACK and silently changes what a later call reads: rows
+# cut (sql_select_limit), values cut or changed (group_concat_max_len, div_precision_increment, block_encryption_mode,
+# windowing_use_high_precision, default_week_format), their text (lc_time_names, character_set_results: rows are
+# decoded as utf8mb4, the connection's fixed charset), the time (timestamp, time_zone), the order (max_sort_length),
+# dirty reads (transaction_isolation), stale statistics (information_schema_stats_expiry), SHOW CREATE's text. All set
+# back in the statement that sets max_execution_time: no round trip (fix round 2, observation 1). Probed on 8.4: the
+# server itself restores sql_auto_is_null, the character_set_client, _connection and collation_ variables,
+# last_insert_id, sql_notes, sql_warnings, sql_safe_updates, sql_big_selects, sql_buffer_result and profiling. Left as
+# they are: what only picks a plan (optimizer_switch, optimizer_search_depth, max_seeks_for_key, big_tables), what
+# fails loudly (cte_max_recursion_depth, max_join_size), formats DbaGuy never asks for (explain_format,
+# end_markers_in_json), error texts (lc_messages), writes, and max_error_count (SHOW WARNINGS' rows), which only
+# SESSION_VARIABLES_ADMIN may set back. Variables newer than 5.7.8 are in version comments. sql_mode and
+# transaction_read_only are Task 7's guard's.
+_MYSQL_RESET = (
+    "SET SESSION max_execution_time = {timeout_ms}, sql_select_limit = DEFAULT, group_concat_max_len = DEFAULT, "
+    "div_precision_increment = DEFAULT, max_sort_length = DEFAULT, lc_time_names = DEFAULT, "
+    "default_week_format = DEFAULT, block_encryption_mode = DEFAULT, timestamp = DEFAULT, "
+    "character_set_results = utf8mb4{from_profile} /*!50720 , transaction_isolation = DEFAULT */ "
+    "/*!80002 , windowing_use_high_precision = DEFAULT */ /*!80003 , information_schema_stats_expiry = DEFAULT */ "
+    "/*!80011 , show_create_table_verbosity = DEFAULT */"
+)
 _READ_FRAMES: dict[Dialect, ReadFrame] = {
     # BEGIN READ ONLY on a session that is read-only by default too (P1, P2); statement_timeout: P10. Off, a backslash
     # in '…' escapes, which RULES[POSTGRES] reads as standard (the server is on by default; a role or database may not)
@@ -549,12 +573,14 @@ _READ_FRAMES: dict[Dialect, ReadFrame] = {
                                 ("SELECT pg_advisory_unlock_all()",), rolls_back=True,
                                 assumes=SessionAssumption("standard_conforming_strings", "on")),
     # an explicit READ ONLY transaction each time: a function can turn the session's default off (M3, M3e)
-    Dialect.MYSQL: ReadFrame(("SET SESSION max_execution_time = {timeout_ms}", "START TRANSACTION READ ONLY"),
-                             ("SELECT RELEASE_ALL_LOCKS()",), rolls_back=True,
-                             requires=ServerRequirement((5, 7, 8), _MARIADB)),
+    Dialect.MYSQL: ReadFrame((_MYSQL_RESET, "START TRANSACTION READ ONLY"), ("SELECT RELEASE_ALL_LOCKS()",),
+                             rolls_back=True, requires=ServerRequirement((5, 7, 8), _MARIADB),
+                             from_profile=("time_zone",)),
     # no read-only session at all: what slips through is rolled back (T6). One batch, no extra round trip: the options
-    # the lexer assumes (QUOTED_IDENTIFIER: `"…"` is a name) set again, since a SET is not rolled back (review M-3)
-    Dialect.TSQL: ReadFrame(("SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; BEGIN TRANSACTION",), rolls_back=True,
+    # the lexer assumes (QUOTED_IDENTIFIER: `"…"` is a name) set again, since a SET is not rolled back (review M-3), and
+    # ROWCOUNT, which would cut a later call's rows (fix round 2, observation 2)
+    Dialect.TSQL: ReadFrame(("SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; SET ROWCOUNT 0; BEGIN TRANSACTION",),
+                            rolls_back=True,
                             explain_around=("SET SHOWPLAN_TEXT ON", "SET SHOWPLAN_TEXT OFF")),
     Dialect.SQLITE: ReadFrame(),  # mode=ro, query_only and the authorizer (D-08-4); no transaction to hold locks
     Dialect.SQLPP: ReadFrame(),  # readonly=true on every request (C1); no transactions

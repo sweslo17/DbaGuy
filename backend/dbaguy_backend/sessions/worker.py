@@ -111,14 +111,6 @@ _EDIT_OPTIONS = RunOptions(describe=False)
 _JOB_LOG_CHARS = 200  # a job's statement at DEBUG: its first characters only (D-06-12: a million-statement run)
 
 
-OPEN_TIMEOUT_S = 30.0  # start()'s wait for the connection to open
-CALL_TIMEOUT_S = 120.0  # call()'s wait for its result
-
-
-class OpenTimedOut(ConnectionFailed):
-    """The connection did not open within `start()`'s timeout. Its thread closes it once the opener returns."""
-
-
 def paused_result_closed_text(limit_s: float) -> str:
     """The warning a paused result gets when the worker closes it `limit_s` after the server was left waiting for it
     (the engine's limit, counted by the stall clock: from where the read-ahead stopped, or from the first pause for an
@@ -327,11 +319,11 @@ class SessionWorker:
 
     # ---- lifecycle (any thread) ----
 
-    def start(self, timeout: float = OPEN_TIMEOUT_S) -> None:
+    def start(self, timeout: float = 30.0) -> None:
         self._thread.start()
         if not self._opened.wait(timeout):
             self._begin_close()  # the thread closes the connection itself as soon as the opener returns
-            raise OpenTimedOut(f"Timed out opening a connection for {self.name}")
+            raise ConnectionFailed(f"Timed out opening a connection for {self.name}")
         if self._open_error is not None:
             raise self._open_error
 
@@ -394,7 +386,7 @@ class SessionWorker:
         with self._state_lock:
             return self._job_active or self._running_request is not None or bool(self._queued)
 
-    def call(self, fn: Callable[[DatabaseConnection], T], timeout: float | None = CALL_TIMEOUT_S, *,
+    def call(self, fn: Callable[[DatabaseConnection], T], timeout: float | None = 120.0, *,
              refresh_state: bool = False) -> T:
         """Run fn(connection) on the worker thread and wait for its result. `refresh_state`: fn may have begun or ended
         a transaction (an MCP agent's read frame, spec ⑧ D-08-3): the session's state is read again before the result
@@ -523,15 +515,13 @@ class SessionWorker:
             return None
         return ahead
 
-    def close(self, wait: bool = True) -> None:
-        """`wait` False: never wait for the thread (a call stuck in the driver that a caller's deadline has passed: the
-        thread closes the connection itself once the driver returns)."""
+    def close(self) -> None:
         if not self._begin_close():
             return
         with self._state_lock:
             if self._running_request is not None and self._lease is not None:
                 self._interrupt_running("abort")
-        if wait and self._thread.ident is not None:
+        if self._thread.ident is not None:
             self._thread.join(timeout=10)
             if self._thread.is_alive():
                 logger.warning("Session {} did not stop within 10s", self.name)
