@@ -1,7 +1,8 @@
-"""MySQL's shared read-only guard (spec ⑧ D-08-5, CR-08-11, CR-08-5): M3's function that switches a read-only session to
-READ WRITE no longer opens a way to write, in a user's read-only tab or an agent's session; an agent's session refuses
-to go on with a lexer-unsafe sql_mode. The functions and table are zz_08_t7_*, dropped by exact name (not the names
-Task 6's reader tests use: runners overlap, and one's DROP must not meet the other's table)."""
+"""MySQL's shared read-only guard (spec ⑧ D-08-5, CR-08-11, CR-08-5): M3's function that switches a read-only session
+to READ WRITE no longer opens a way to write, in a user's read-only tab or an agent's session, and no function can
+blind the guard's own look (fix round 1); an agent's session refuses to go on with a lexer-unsafe sql_mode. The
+functions and table are zz_08_t7_*, dropped by exact name (not the names Task 6's reader tests use: runners overlap,
+and one's DROP must not meet the other's table)."""
 
 import time
 from uuid import UUID
@@ -43,22 +44,27 @@ def test_the_unsafe_modes_and_ansi_which_brings_one_back_are_left_out():
 @pytest.fixture
 def flipper():
     """zz_08_t7_rw(): a stored function that switches its session to READ WRITE (M3), zz_08_t7_wr(): one that writes (a
-    statement a read-only classifier calls a read), and the table they act on."""
+    statement a read-only classifier calls a read), zz_08_t7_blind(): one that also sets sql_select_limit = 0, which
+    empties every plain SELECT the session sends afterwards (fix round 1), and the table they act on."""
     owner = mysql.connector.connect(**mysql_driver_kwargs(autocommit=True))
     cursor = owner.cursor()
     try:
         cursor.execute("DROP FUNCTION IF EXISTS zz_08_t7_rw")
         cursor.execute("DROP FUNCTION IF EXISTS zz_08_t7_wr")
+        cursor.execute("DROP FUNCTION IF EXISTS zz_08_t7_blind")
         cursor.execute("DROP TABLE IF EXISTS zz_08_t7_victim")
         cursor.execute("CREATE TABLE zz_08_t7_victim (id INT)")
         cursor.execute("CREATE FUNCTION zz_08_t7_rw() RETURNS INT NO SQL BEGIN "
                        "SET SESSION TRANSACTION READ WRITE; RETURN 1; END")
         cursor.execute("CREATE FUNCTION zz_08_t7_wr() RETURNS INT MODIFIES SQL DATA BEGIN "
                        "INSERT INTO zz_08_t7_victim VALUES (9); RETURN 1; END")
+        cursor.execute("CREATE FUNCTION zz_08_t7_blind() RETURNS INT NO SQL BEGIN "
+                       "SET SESSION sql_select_limit = 0; SET SESSION TRANSACTION READ WRITE; RETURN 1; END")
         yield cursor
     finally:
         cursor.execute("DROP FUNCTION IF EXISTS zz_08_t7_rw")
         cursor.execute("DROP FUNCTION IF EXISTS zz_08_t7_wr")
+        cursor.execute("DROP FUNCTION IF EXISTS zz_08_t7_blind")
         cursor.execute("DROP TABLE IF EXISTS zz_08_t7_victim")
         owner.close()
 
@@ -301,6 +307,92 @@ def test_the_adapter_tells_the_guard_whether_a_transaction_is_open():
     assert seen == [False, True, True, False]
 
 
+@requires_mysql
+@pytest.mark.parametrize("how", ["typed", "button"])
+def test_a_function_that_also_empties_every_select_cannot_blind_a_read_only_tab(flipper, how):
+    """Fix round 1 (review, Critical): the function flips READ WRITE and sets sql_select_limit = 0 in the same breath. A
+    plain probe SELECT then returned no row, the look read that as "nothing to put back", and the tab stayed blind for
+    the rest of the connection: the next ROLLBACK or COMMIT, then a plain INSERT, wrote."""
+    worker, recorder = _tab()
+    try:
+        assert _run(worker, recorder, "flip", "SELECT zz_08_t7_blind()") is None
+        if how == "typed":
+            assert _run(worker, recorder, "end", "ROLLBACK") is None
+        else:
+            worker.submit(RollbackCommand(request_id="end"))
+            recorder.wait_for(finished("end"), timeout=scaled(30))
+        assert _run(worker, recorder, "write", "INSERT INTO zz_08_t7_victim VALUES (1)") == "1792"
+        assert _run(worker, recorder, "commit", "COMMIT") is None  # and a second boundary: the blindness lasted
+        assert _run(worker, recorder, "again", "INSERT INTO zz_08_t7_victim VALUES (2)") == "1792"
+    finally:
+        worker.close()
+    assert _victims(flipper) == 0
+
+
+@requires_mysql
+def test_an_agent_session_has_read_only_back_after_a_function_that_also_empties_every_select(container, flipper):
+    """The agent's next frame resets sql_select_limit and looks again, so it healed by itself; the session is right
+    straight after the call too (the look before RELEASE_ALL_LOCKS used to see an empty answer), and the next call has
+    its rows."""
+    pid = share(container, make_mysql_profile(name="zz_08 mysql"))
+    profile = container.profiles.get(UUID(pid))
+    read = container.agent_reader.read
+    assert read(ReadRequest(profile=profile, dialect=Dialect.MYSQL, sql="SELECT zz_08_t7_blind()")).status == "ok"
+    with container.agent_sessions.lease(profile, None, deadline=time.monotonic() + 10) as lease:
+        state = lease.worker.call(
+            lambda c: read_only.catalog.query(c._conn, "SELECT @@SESSION.transaction_read_only LIMIT 1"))
+    assert state == [(1,)]
+    three = "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3"
+    assert read(ReadRequest(profile=profile, dialect=Dialect.MYSQL, sql=three)).rows == [[1], [2], [3]]
+
+
+@requires_mysql
+def test_an_explicit_limit_overrides_sql_select_limit_in_the_look():
+    """Probed on 8.4: with sql_select_limit = 0 a plain SELECT of the session's state returns no row and the same
+    SELECT with LIMIT 1 returns it, in the forms 8.4 knows (the documented precedence)."""
+    conn = mysql.connector.connect(**mysql_driver_kwargs(autocommit=True))
+    try:
+        conn.cmd_query("SET SESSION sql_select_limit = 0")
+        assert read_only.catalog.query(conn, "SELECT @@SESSION.transaction_read_only") == []
+        for probe in (read_only._STATES[0], read_only._STATES[2]):  # tx_read_only is not a variable of 8.4
+            rows = read_only.catalog.query(conn, probe)
+            assert len(rows) == 1 and probe.endswith("LIMIT 1")
+    finally:
+        conn.close()
+
+
+@requires_mysql
+@pytest.mark.parametrize("charset", ["ucs2", "utf32", "utf16le", "binary", "latin1"])
+def test_the_look_reads_the_same_state_whatever_the_session_sends_its_results_in(charset):
+    """A function can set character_set_results: with ucs2, utf32 or utf16le the sql_mode text arrived with a NUL
+    between its letters, so an agent's NO_BACKSLASH_ESCAPES was not found (CR-08-5 fooled)."""
+    profile = make_mysql_profile(read_only=True)
+    conn = MysqlAdapter().open(profile, Endpoint(MYSQL_HOST, MYSQL_PORT), MYSQL_PASSWORD, None, agent=True)
+    try:
+        conn._conn.cmd_query(f"SET SESSION character_set_results = {charset}")
+        conn._conn.cmd_query("SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'")
+        with pytest.raises(StatementNotSent) as refused:
+            conn.run("SELECT 1")
+        assert (refused.value.code, refused.value.message) == (SESSION_CHANGED, SESSION_CHANGED_MESSAGE)
+    finally:
+        conn.close()
+
+
+@requires_mysql
+def test_a_one_millisecond_max_execution_time_does_not_stop_the_look():
+    """Probed with the other settings a function can leave (fix round 1): a 1 ms limit does not stop a SELECT of
+    constants, so the look and the statement still run."""
+    profile = make_mysql_profile(read_only=True)
+    conn = MysqlAdapter().open(profile, Endpoint(MYSQL_HOST, MYSQL_PORT), MYSQL_PASSWORD, None)
+    try:
+        conn._conn.cmd_query("SET SESSION max_execution_time = 1")
+        result = conn.run("SELECT 1")
+        assert result.fetch(1) == [[1]]
+        result.close()
+    finally:
+        conn.close()
+
+
 # ---- the guard without a server ----
 
 
@@ -315,7 +407,7 @@ class _Conn:
 
 
 class _State:
-    """read_only.catalog.first_row, answering from a script: a row, or an exception to raise."""
+    """read_only.catalog.query, answering from a script: a row (one-row list), a list of rows, or an exception."""
 
     def __init__(self, *answers) -> None:
         self.answers = list(answers)
@@ -326,12 +418,12 @@ class _State:
         answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
         if isinstance(answer, Exception):
             raise answer
-        return answer
+        return answer if isinstance(answer, list) else [answer]
 
 
 def _guard(monkeypatch, *answers, agent=False) -> tuple[ReadOnlyGuard, _Conn, _State]:
     state = _State(*answers)
-    monkeypatch.setattr(read_only.catalog, "first_row", state)
+    monkeypatch.setattr(read_only.catalog, "query", state)
     conn = _Conn()
     return ReadOnlyGuard(conn, 7, agent=agent), conn, state
 
@@ -420,3 +512,45 @@ def test_an_error_other_than_an_unknown_variable_is_not_swallowed(monkeypatch):
     with pytest.raises(mysql.connector.Error):
         guard.before_statement("SELECT 1", in_transaction=False)
     assert conn.sent == []
+
+
+UNREADABLE = "The session's read-only state could not be read: reconnect"
+
+
+@pytest.mark.parametrize("agent", [False, True])
+@pytest.mark.parametrize("answer", [
+    [],  # no row: what a function that empties every SELECT used to produce
+    [(1, "STRICT_TRANS_TABLES"), (1, "STRICT_TRANS_TABLES")],  # more than one
+    [("x", "STRICT_TRANS_TABLES")],  # a flag that is not 0 or 1
+    [(2, "STRICT_TRANS_TABLES")],
+    [(None, "STRICT_TRANS_TABLES")],  # transaction_read_only is never NULL
+    [(1, None)],  # sql_mode is never NULL
+    [(1, "\x00S\x00T\x00R\x00I\x00C\x00T")],  # text that is not a mode list (a character set it was not asked in)
+    [(1,)],  # not two values
+], ids=["no row", "two rows", "flag x", "flag 2", "flag NULL", "mode NULL", "mode text", "one value"])
+def test_a_look_that_gets_anything_but_one_readable_row_fails_closed(monkeypatch, agent, answer):
+    guard, conn, state = _guard(monkeypatch, answer, agent=agent)
+    warnings: list[str] = []
+    sink = logger.add(lambda m: warnings.append(m.record["message"]), level="WARNING")
+    try:
+        with pytest.raises(StatementNotSent) as refused:
+            guard.before_statement("SELECT 1", in_transaction=False)
+    finally:
+        logger.remove(sink)
+    assert refused.value.message == UNREADABLE
+    assert conn.sent == [] and len(state.asked) == 1
+    assert len(warnings) == 1 and "STRICT" not in warnings[0]  # said once, with no value in it
+
+
+def test_the_sql_mode_alone_form_fails_closed_too(monkeypatch):
+    """The fallback's last step (a server with neither variable) has no access mode to read, and still needs its row."""
+    for answer in ([], [(None, "A"), (None, "B")], [(None, None)], [(1, "STRICT_TRANS_TABLES")]):
+        guard, conn, _ = _guard(monkeypatch, _unknown_variable(), _unknown_variable(), answer)
+        with pytest.raises(StatementNotSent) as refused:
+            guard.before_statement("SELECT 1", in_transaction=False)
+        assert refused.value.message == UNREADABLE and conn.sent == []
+
+
+def test_every_probe_has_an_explicit_limit_and_reads_the_mode_in_a_form_no_charset_changes(monkeypatch):
+    for probe in read_only._STATES:
+        assert probe.endswith(" LIMIT 1") and "CAST(@@SESSION.sql_mode AS BINARY)" in probe
