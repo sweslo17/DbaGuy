@@ -910,6 +910,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/mcp/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Mcp Status */
+        get: operations["mcp_status_mcp_status_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/mcp/token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Mcp Token */
+        get: operations["mcp_token_mcp_token_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/mcp/token/regenerate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Regenerate Mcp Token */
+        post: operations["regenerate_mcp_token_mcp_token_regenerate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -993,6 +1044,12 @@ export interface components {
              *     }
              */
             couchbase: components["schemas"]["CouchbaseSettings"];
+            /**
+             * @default {
+             *       "enabled": false
+             *     }
+             */
+            mcp: components["schemas"]["McpSettings"];
             /** Scripts Dir */
             scripts_dir?: string | null;
         };
@@ -2475,6 +2532,58 @@ export interface components {
             /** Collection */
             collection: string;
         };
+        /**
+         * McpSettings
+         * @description DbaGuy's MCP server (spec ⑧ D-08-12): off by default. `port` None is the data dir's default (R-08-2): 17531 for
+         *     the app's own data dir, 17532 for any other (dev, tests), so a dev backend and the app never take each other's.
+         */
+        McpSettings: {
+            /**
+             * Enabled
+             * @default false
+             */
+            enabled: boolean;
+            /** Port */
+            port?: number | null;
+        };
+        /** McpStatus */
+        McpStatus: {
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "off" | "starting" | "listening" | "port_in_use" | "error";
+            /** Port */
+            port: number;
+            /** Url */
+            url: string;
+            /** Message */
+            message?: string | null;
+            /**
+             * Shared Schema
+             * @default 0
+             */
+            shared_schema: number;
+            /**
+             * Shared Query
+             * @default 0
+             */
+            shared_query: number;
+        };
+        /**
+         * McpToken
+         * @description The bearer token MCP clients send, and the Claude Code commands that register it (§3.8). Never logged.
+         */
+        McpToken: {
+            /** Token */
+            token: string;
+            /** Url */
+            url: string;
+            /** Command */
+            command: string;
+            /** Replace Command */
+            replace_command: string;
+        };
         /** MessageEvent */
         MessageEvent: {
             /**
@@ -3169,6 +3278,12 @@ export interface components {
              */
             save_password: boolean;
             /**
+             * Mcp Access
+             * @default off
+             * @enum {string}
+             */
+            mcp_access: "off" | "schema" | "query";
+            /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
              */
@@ -3224,6 +3339,12 @@ export interface components {
              * @default true
              */
             save_password: boolean;
+            /**
+             * Mcp Access
+             * @default off
+             * @enum {string}
+             */
+            mcp_access: "off" | "schema" | "query";
             /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
@@ -3372,6 +3493,12 @@ export interface components {
              */
             save_password: boolean;
             /**
+             * Mcp Access
+             * @default off
+             * @enum {string}
+             */
+            mcp_access: "off" | "schema" | "query";
+            /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
              */
@@ -3415,6 +3542,12 @@ export interface components {
              * @default true
              */
             save_password: boolean;
+            /**
+             * Mcp Access
+             * @default off
+             * @enum {string}
+             */
+            mcp_access: "off" | "schema" | "query";
             /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
@@ -5708,6 +5841,99 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ValueConditionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    mcp_status_mcp_status_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["McpStatus"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    mcp_token_mcp_token_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["McpToken"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    regenerate_mcp_token_mcp_token_regenerate_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["McpToken"];
                 };
             };
             /** @description Validation Error */

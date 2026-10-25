@@ -19,6 +19,9 @@ SslMode = Literal["disable", "prefer", "require", "verify-ca", "verify-full"]
 ProfileColor = Literal["none", "green", "yellow", "orange", "red", "purple"]
 SafetyLevel = Literal["relaxed", "standard", "strict"]
 SshAuth = Literal["agent_or_key", "password"]
+# What AI tools may do with the connection through DbaGuy's MCP server (spec ⑧ R-08-5): nothing (the default for every
+# connection, new or old), read its schema, or also run read-only queries
+McpAccess = Literal["off", "schema", "query"]
 
 
 class SslConfig(BaseModel):
@@ -50,6 +53,7 @@ class _ProfileCommon(BaseModel):
     read_only: bool = False
     safety: SafetyLevel = "standard"
     save_password: bool = True
+    mcp_access: McpAccess = "off"
 
 
 class ServerProfileDraft(_ProfileCommon):

@@ -49,3 +49,5 @@ def setup_logging(level: str, log_dir: Path | None) -> None:
         std_logger.propagate = False
     # mysql-connector logs its authentication plugin choice at INFO, three lines per connect.
     logging.getLogger("mysql.connector").setLevel(logging.WARNING)
+    # The MCP SDK (spec ⑧ D-08-9) logs what clients send (session ids, a tool's failure text) at INFO.
+    logging.getLogger("mcp").setLevel(logging.WARNING)

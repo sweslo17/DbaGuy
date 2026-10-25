@@ -14,4 +14,6 @@ def get_settings(container: AppContainer = Depends(get_container)) -> AppSetting
 
 @router.put("", response_model=AppSettings)
 def update_settings(body: AppSettings, container: AppContainer = Depends(get_container)) -> AppSettings:
-    return container.app_settings.update(body)
+    saved = container.app_settings.update(body)
+    container.agent_host.apply(saved.mcp)  # the MCP switch or port changed: start, stop or restart (D-08-12)
+    return saved

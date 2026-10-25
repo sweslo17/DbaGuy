@@ -14,6 +14,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   safety: { idle_transaction_warn_minutes: 3, idle_transaction_rollback_minutes: 0 },
   notifications: { long_query_seconds: 15 },
   couchbase: { sample_size: 1000 },
+  mcp: { enabled: false, port: null },
   scripts_dir: null,
 };
 

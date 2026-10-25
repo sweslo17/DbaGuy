@@ -1,6 +1,5 @@
 import json
 import os
-import socket
 import sys
 import threading
 from collections.abc import Callable
@@ -10,16 +9,8 @@ from loguru import logger
 
 from .app import create_app
 from .config import load_settings
+from .listen import listen_socket
 from .logging_setup import setup_logging
-
-
-def _bind(host: str, port: int) -> socket.socket:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((host, port))
-    sock.listen(128)
-    sock.set_inheritable(True)
-    return sock
 
 
 # How long a graceful shutdown may take before the process exits anyway. The shell waits longer than this before it
@@ -59,7 +50,7 @@ def main() -> None:
     settings = load_settings()
     setup_logging(settings.log_level, settings.log_dir if settings.log_to_file else None)
     app = create_app(settings)
-    sock = _bind(settings.host, settings.port)
+    sock = listen_socket(settings.host, settings.port)
     port = sock.getsockname()[1]
     server = uvicorn.Server(uvicorn.Config(app, log_config=None, access_log=False))
     if settings.watch_stdin:

@@ -3374,6 +3374,153 @@
           }
         }
       }
+    },
+    "/mcp/status": {
+      "get": {
+        "tags": [
+          "mcp"
+        ],
+        "summary": "Mcp Status",
+        "operationId": "mcp_status_mcp_status_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpStatus"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/mcp/token": {
+      "get": {
+        "tags": [
+          "mcp"
+        ],
+        "summary": "Mcp Token",
+        "operationId": "mcp_token_mcp_token_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpToken"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/mcp/token/regenerate": {
+      "post": {
+        "tags": [
+          "mcp"
+        ],
+        "summary": "Regenerate Mcp Token",
+        "operationId": "regenerate_mcp_token_mcp_token_regenerate_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpToken"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -3501,6 +3648,12 @@
             "$ref": "#/components/schemas/CouchbaseSettings",
             "default": {
               "sample_size": 1000
+            }
+          },
+          "mcp": {
+            "$ref": "#/components/schemas/McpSettings",
+            "default": {
+              "enabled": false
             }
           },
           "scripts_dir": {
@@ -7139,6 +7292,112 @@
         "title": "Keyspace",
         "description": "A collection by its three names. Frozen: it is the key of the field-sample cache."
       },
+      "McpSettings": {
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled",
+            "default": false
+          },
+          "port": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 49151.0,
+                "minimum": 1024.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Port"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "McpSettings",
+        "description": "DbaGuy's MCP server (spec \u2467 D-08-12): off by default. `port` None is the data dir's default (R-08-2): 17531 for\nthe app's own data dir, 17532 for any other (dev, tests), so a dev backend and the app never take each other's."
+      },
+      "McpStatus": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "off",
+              "starting",
+              "listening",
+              "port_in_use",
+              "error"
+            ],
+            "title": "State"
+          },
+          "port": {
+            "type": "integer",
+            "title": "Port"
+          },
+          "url": {
+            "type": "string",
+            "title": "Url"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "shared_schema": {
+            "type": "integer",
+            "title": "Shared Schema",
+            "default": 0
+          },
+          "shared_query": {
+            "type": "integer",
+            "title": "Shared Query",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "state",
+          "port",
+          "url"
+        ],
+        "title": "McpStatus"
+      },
+      "McpToken": {
+        "properties": {
+          "token": {
+            "type": "string",
+            "title": "Token"
+          },
+          "url": {
+            "type": "string",
+            "title": "Url"
+          },
+          "command": {
+            "type": "string",
+            "title": "Command"
+          },
+          "replace_command": {
+            "type": "string",
+            "title": "Replace Command"
+          }
+        },
+        "type": "object",
+        "required": [
+          "token",
+          "url",
+          "command",
+          "replace_command"
+        ],
+        "title": "McpToken",
+        "description": "The bearer token MCP clients send, and the Claude Code commands that register it (\u00a73.8). Never logged."
+      },
       "MessageEvent": {
         "properties": {
           "type": {
@@ -8890,6 +9149,16 @@
             "title": "Save Password",
             "default": true
           },
+          "mcp_access": {
+            "type": "string",
+            "enum": [
+              "off",
+              "schema",
+              "query"
+            ],
+            "title": "Mcp Access",
+            "default": "off"
+          },
           "engine": {
             "type": "string",
             "enum": [
@@ -9014,6 +9283,16 @@
             "type": "boolean",
             "title": "Save Password",
             "default": true
+          },
+          "mcp_access": {
+            "type": "string",
+            "enum": [
+              "off",
+              "schema",
+              "query"
+            ],
+            "title": "Mcp Access",
+            "default": "off"
           },
           "engine": {
             "type": "string",
@@ -9392,6 +9671,16 @@
             "title": "Save Password",
             "default": true
           },
+          "mcp_access": {
+            "type": "string",
+            "enum": [
+              "off",
+              "schema",
+              "query"
+            ],
+            "title": "Mcp Access",
+            "default": "off"
+          },
           "engine": {
             "type": "string",
             "const": "sqlite",
@@ -9463,6 +9752,16 @@
             "type": "boolean",
             "title": "Save Password",
             "default": true
+          },
+          "mcp_access": {
+            "type": "string",
+            "enum": [
+              "off",
+              "schema",
+              "query"
+            ],
+            "title": "Mcp Access",
+            "default": "off"
           },
           "engine": {
             "type": "string",

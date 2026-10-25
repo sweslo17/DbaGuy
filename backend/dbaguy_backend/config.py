@@ -31,6 +31,9 @@ class Settings(BaseSettings):
         "http://localhost:1420",
     ]
     watch_stdin: bool = False
+    # The MCP server's bearer token, kept in memory only (a scratch or frozen sidecar a probe runs): set, the Keychain
+    # is never read or written for it (spec ⑧ R-08-3 keeps it there otherwise)
+    mcp_token: str | None = Field(default=None, min_length=1)
 
 
 def load_settings() -> Settings:

@@ -11,8 +11,12 @@ from .adapters.mysql.adapter import MysqlAdapter
 from .adapters.postgres.adapter import PostgresAdapter
 from .adapters.registry import AdapterRegistry
 from .adapters.sqlite.adapter import SqliteAdapter
+from .agent.host import AgentHost
+from .agent.token_store import InMemoryTokenStore, KeyringTokenStore, TokenStore
+from .agent.tools import AgentTools
 from .config import Settings, default_data_dir
 from .connectivity.ssh_tunnel import SshTunnelManager
+from .domain.agent import APP_MCP_PORT, DEV_MCP_PORT
 from .services.connection_service import ConnectionService
 from .services.couchbase_service import CouchbaseService
 from .services.data_service import DataService
@@ -48,11 +52,28 @@ def default_registry(freetds_conf: Path | None = None) -> AdapterRegistry:
     return AdapterRegistry([PostgresAdapter(), MysqlAdapter(), MssqlAdapter(), CouchbaseAdapter(), SqliteAdapter()])
 
 
+def is_app_data_dir(data_dir: Path) -> bool:
+    return data_dir.resolve() == default_data_dir().resolve()
+
+
 def keychain_service(data_dir: Path) -> str:
     """The Keychain service for passwords saved with this data dir. Only the app's own data dir uses the app's service;
     any other (scripts/dev.sh's dev/data, tests, ad-hoc sidecars) gets a separate one, so a dev run never reads,
     overwrites or leaves behind entries of the user's real connections."""
-    return APP_KEYCHAIN_SERVICE if data_dir.resolve() == default_data_dir().resolve() else DEV_KEYCHAIN_SERVICE
+    return APP_KEYCHAIN_SERVICE if is_app_data_dir(data_dir) else DEV_KEYCHAIN_SERVICE
+
+
+def default_mcp_port(data_dir: Path) -> int:
+    """The MCP server's port when the settings name none (R-08-2): the app's and any other data dir's never collide."""
+    return APP_MCP_PORT if is_app_data_dir(data_dir) else DEV_MCP_PORT
+
+
+def _token_store(settings: Settings, secret_store: SecretStore | None) -> TokenStore:
+    """In memory with DBAGUY_MCP_TOKEN, and whenever the secrets are not the Keychain's (tests pass an in-memory
+    store): only a real run keeps the token in the Keychain."""
+    if settings.mcp_token is not None or secret_store is not None:
+        return InMemoryTokenStore(settings.mcp_token)
+    return KeyringTokenStore(keychain_service(settings.data_dir))
 
 
 def _keychain_store(data_dir: Path) -> KeyringSecretStore:
@@ -65,7 +86,8 @@ class AppContainer:
     """Builds and owns every long-lived service."""
 
     def __init__(
-        self, settings: Settings, secret_store: SecretStore | None = None, registry: AdapterRegistry | None = None
+        self, settings: Settings, secret_store: SecretStore | None = None, registry: AdapterRegistry | None = None,
+        token_store: TokenStore | None = None,
     ) -> None:
         self.settings = settings
         data_dir = settings.data_dir
@@ -94,6 +116,11 @@ class AppContainer:
             self.transfers.plans,
         )
         self.sessions = SessionManager(self.connections, self.profiles, hooks, jobs=self.jobs)
+        self.agent_tools = AgentTools(self.profiles, self.registry)
+        self.agent_host = AgentHost(
+            self.agent_tools, token_store or _token_store(settings, secret_store), default_mcp_port(data_dir),
+            on_stop=self._close_agents,
+        )
         self._stop = threading.Event()
         self._housekeeper: threading.Thread | None = None
 
@@ -105,6 +132,10 @@ class AppContainer:
             target=self._guarded, args=("Warming up the SQL classifier", warm_up), name="classifier-warm-up",
             daemon=True,
         ).start()
+        self._guarded("Starting the MCP server", lambda: self.agent_host.start_later(self.app_settings.get().mcp))
+
+    def _close_agents(self) -> None:
+        """The MCP server stopped: nothing an agent opened stays open."""
 
     def _housekeep(self) -> None:
         while not self._stop.wait(_HOUSEKEEPING_INTERVAL_S):
@@ -127,6 +158,7 @@ class AppContainer:
         """Stop everything in dependency order: sessions and metadata hold tunnels, so tunnels go last; sessions
         write to the history, so it closes after them."""
         self._stop.set()
+        self._guarded("Stopping the MCP server", self.agent_host.stop)
         self._guarded("Closing sessions", self.sessions.close_all)
         self._guarded("Closing metadata connections", self.metadata.close_all)
         self._guarded("Closing SSH tunnels", self.tunnels.close_all)

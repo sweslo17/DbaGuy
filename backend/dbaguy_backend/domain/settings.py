@@ -45,6 +45,19 @@ class CouchbaseSettings(BaseModel):
     sample_size: int = Field(default=1000, ge=SAMPLE_SIZE_MIN, le=SAMPLE_SIZE_MAX)
 
 
+MCP_PORT_MIN, MCP_PORT_MAX = 1024, 49151  # below macOS's ephemeral ports (49152–65535), so no random port takes it
+
+
+class McpSettings(BaseModel):
+    """DbaGuy's MCP server (spec ⑧ D-08-12): off by default. `port` None is the data dir's default (R-08-2): 17531 for
+    the app's own data dir, 17532 for any other (dev, tests), so a dev backend and the app never take each other's."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    port: int | None = Field(default=None, ge=MCP_PORT_MIN, le=MCP_PORT_MAX)
+
+
 class AppSettings(BaseModel):
     """The app preferences (`settings.json`). Persisted, so a newer build's extra fields are tolerated on read and
     kept on write; input from the API stays strict."""
@@ -56,4 +69,5 @@ class AppSettings(BaseModel):
     safety: SafetySettings = SafetySettings()
     notifications: NotificationSettings = NotificationSettings()
     couchbase: CouchbaseSettings = CouchbaseSettings()
+    mcp: McpSettings = McpSettings()
     scripts_dir: str | None = None  # None = the default folder inside the data dir

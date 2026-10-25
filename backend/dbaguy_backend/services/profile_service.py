@@ -31,6 +31,11 @@ class ProfileService:
     def list_entries(self) -> list[ProfileEntry]:
         return [self._entry(p) for p in self._store.list()]
 
+    def list_profiles(self) -> list[AnyProfile]:
+        """The profiles alone, no secret looked up: an MCP agent's every call reads them (spec ⑧), and a Keychain read
+        could make the Keychain ask the user."""
+        return self._store.list()
+
     def entry(self, profile_id: UUID) -> ProfileEntry:
         return self._entry(self._store.get(profile_id))
 

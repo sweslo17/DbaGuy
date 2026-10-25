@@ -14,6 +14,7 @@ dependencies = [
     "sqlglot>=30.23,<31",
     "mysql-connector-python>=26.7.0,<27",
     "pymssql>=2.4.4,<3",
+    "mcp (>=2.3,<3)",
 ]
 
 [tool.poetry]
