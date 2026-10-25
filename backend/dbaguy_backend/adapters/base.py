@@ -54,6 +54,9 @@ class AdapterCapabilities:
     run_file: bool = False  # Run SQL file (spec ⑥ R-06-1, D-06-13)
     dump: bool = False  # a native SQL dump (spec ⑥ R-06-1): the connection is Dumping
     copy_data: bool = False  # copy rows between connections (spec ⑥ R-06-1, G3): the connection is DataTools
+    # `login_privileges()` reads what the login may do beyond reading that a read-only session does not stop (spec ⑧
+    # CR-08-1); not in EngineInfo
+    login_privileges: bool = False
 
 
 @dataclass(frozen=True)

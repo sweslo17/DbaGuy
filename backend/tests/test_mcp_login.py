@@ -11,20 +11,21 @@ import mysql.connector
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
-from loguru import logger
 
 from dbaguy_backend.adapters.base import StatementError
 from dbaguy_backend.adapters.mysql.catalog import file_granted
 from dbaguy_backend.agent.login import LoginRegistry
 from dbaguy_backend.app import create_app
+from dbaguy_backend.container import default_registry
 from dbaguy_backend.domain.agent import LoginPrivileges
 from dbaguy_backend.domain.errors import ConnectionFailed, QueryFailed
 from dbaguy_backend.domain.profiles import ProfileUpsertRequest, SqliteProfile, SslConfig
 
-from .agent_support import AUTH, container, share
+from .agent_support import AUTH, container, logged, share
 from .support import (
-    MSSQL_SA_PASSWORD, PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, make_mssql_profile, make_mysql_profile, make_pg_profile,
-    mssql_connect, mysql_driver_kwargs, requires_mssql, requires_mysql, requires_pg,
+    MSSQL_SA_PASSWORD, PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, make_couchbase_profile, make_mssql_profile,
+    make_mysql_profile, make_pg_profile, mssql_connect, mysql_driver_kwargs, requires_mssql, requires_mysql,
+    requires_pg,
 )
 
 __all__ = ["container"]
@@ -53,6 +54,15 @@ def test_the_summary_says_what_the_login_can_do():
         "is a superuser, run programs on the server")
 
 
+@pytest.mark.parametrize(("directory", "text"), [
+    ("/var/lib/mysql-files/", "read and write files on the server in /var/lib/mysql-files/ (FILE)"),
+    ("", "read and write files on the server in any directory (FILE)"),
+    (None, "has FILE, but the server allows no file access (secure_file_priv is NULL)"),  # NULL: no file at all
+])
+def test_the_summary_of_file_names_the_directory_the_server_allows(directory, text):
+    assert LoginPrivileges(grants=["file"], secure_file_priv=directory).summary() == text
+
+
 @requires_pg
 def test_postgres_superuser_holds_every_role_and_list_connections_shows_it_once_read(container):
     pid = share(container, make_pg_profile(name="zz_08 pg"), access="schema")
@@ -64,63 +74,90 @@ def test_postgres_superuser_holds_every_role_and_list_connections_shows_it_once_
     assert login["summary"].startswith("is a superuser")
 
 
-@requires_pg
-def test_postgres_roles_count_through_a_chain_of_roles_and_a_plain_login_has_none(container):
+_PG_ROLES = ("zz_08_t3_pa", "zz_08_t3_pb", "zz_08_t3_pc", "zz_08_t3_pf")  # exact names, dropped in `finally`
+
+
+@contextmanager
+def _pg_scratch_roles(*statements: str) -> Iterator[None]:
+    """The scratch roles zz_08_t3_p* that `statements` create (and grant), dropped by exact name afterwards."""
     admin = psycopg.connect(host=PG_HOST, port=PG_PORT, user=PG_USER, password=PG_PASSWORD, dbname="dbaguy",
                             autocommit=True)
-    roles = ("zz_08_t3_pa", "zz_08_t3_pb", "zz_08_t3_pc")  # exact names, dropped in `finally`
 
     def drop() -> None:
-        for role in roles:
+        for role in _PG_ROLES:
             if admin.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)).fetchone():
                 admin.execute(f"DROP OWNED BY {role}")
                 admin.execute(f"DROP ROLE {role}")
 
-    def granted(role: str) -> list[str]:
-        draft = make_pg_profile(name=f"zz_08 {role}", username=role).model_dump(exclude={"id"})
-        request = ProfileUpsertRequest.model_validate({"profile": draft | {"mcp_access": "schema"},
-                                                       "secrets": {"password": "zz08t3pw"}})
-        try:
-            return _login(container, str(container.profiles.create(request).profile.id)).grants
-        finally:
-            container.metadata.close_all()
-
     drop()
     try:
-        admin.execute("CREATE ROLE zz_08_t3_pb NOLOGIN IN ROLE pg_read_server_files, pg_signal_backend")
-        admin.execute("CREATE ROLE zz_08_t3_pa LOGIN PASSWORD 'zz08t3pw' IN ROLE zz_08_t3_pb")  # a -> b -> pg_*
-        admin.execute("CREATE ROLE zz_08_t3_pc LOGIN PASSWORD 'zz08t3pw'")
-        assert granted("zz_08_t3_pa") == ["server_files_read", "signal_backends"]
-        assert granted("zz_08_t3_pc") == []
+        for statement in statements:
+            admin.execute(statement)
+        yield
     finally:
         drop()
         admin.close()
 
 
+def _pg_granted(container, role: str) -> list[str]:
+    draft = make_pg_profile(name=f"zz_08 {role}", username=role).model_dump(exclude={"id"})
+    request = ProfileUpsertRequest.model_validate({"profile": draft | {"mcp_access": "schema"},
+                                                   "secrets": {"password": "zz08t3pw"}})
+    try:
+        return _login(container, str(container.profiles.create(request).profile.id)).grants
+    finally:
+        container.metadata.close_all()  # the role cannot be dropped while a session of it is open
+
+
+@requires_pg
+def test_postgres_roles_count_through_a_chain_of_roles_and_a_plain_login_has_none(container):
+    with _pg_scratch_roles("CREATE ROLE zz_08_t3_pb NOLOGIN IN ROLE pg_read_server_files, pg_signal_backend",
+                           "CREATE ROLE zz_08_t3_pa LOGIN PASSWORD 'zz08t3pw' IN ROLE zz_08_t3_pb",  # a -> b -> pg_*
+                           "CREATE ROLE zz_08_t3_pc LOGIN PASSWORD 'zz08t3pw'"):
+        assert _pg_granted(container, "zz_08_t3_pa") == ["server_files_read", "signal_backends"]
+        assert _pg_granted(container, "zz_08_t3_pc") == []
+
+
+@requires_pg
+@pytest.mark.parametrize(("function", "expected"), [
+    ("lo_import(text)", ["server_files_read"]),  # a direct EXECUTE, without the pg_read_server_files role
+    ("pg_read_file(text)", ["server_files_read"]),  # (inside the data directory: probed on 17)
+    ("pg_read_binary_file(text)", ["server_files_read"]),
+    ("pg_ls_dir(text)", ["server_files_read"]),
+    ("pg_stat_file(text)", ["server_files_read"]),
+    ("lo_export(oid, text)", ["server_files_write"]),
+])
+def test_postgres_a_direct_execute_grant_on_a_file_function_counts_as_file_rights(container, function, expected):
+    with _pg_scratch_roles("CREATE ROLE zz_08_t3_pf LOGIN PASSWORD 'zz08t3pw'",
+                           f"GRANT EXECUTE ON FUNCTION {function} TO zz_08_t3_pf"):
+        assert _pg_granted(container, "zz_08_t3_pf") == expected
+
+
 @requires_mysql
 def test_mysql_file_through_an_active_role_is_seen(container):
+    user, role = "zz_08_t3_mu", "zz_08_t3_mr"  # exact names, dropped in `finally`
     root = mysql.connector.connect(**mysql_driver_kwargs(user="root", database=None, autocommit=True))
     cursor = root.cursor()
     try:
-        for sql in ("DROP USER IF EXISTS 'zz_08_u'@'%'", "DROP ROLE IF EXISTS 'zz_08_r'", "CREATE ROLE 'zz_08_r'",
-                    "GRANT FILE ON *.* TO 'zz_08_r'", "CREATE USER 'zz_08_u'@'%' IDENTIFIED BY 'zz08pw'",
-                    "GRANT 'zz_08_r' TO 'zz_08_u'@'%'", "SET DEFAULT ROLE ALL TO 'zz_08_u'@'%'",
-                    "GRANT SELECT ON dbaguy.* TO 'zz_08_u'@'%'"):
+        for sql in (f"DROP USER IF EXISTS '{user}'@'%'", f"DROP ROLE IF EXISTS '{role}'", f"CREATE ROLE '{role}'",
+                    f"GRANT FILE ON *.* TO '{role}'", f"CREATE USER '{user}'@'%' IDENTIFIED BY 'zz08pw'",
+                    f"GRANT '{role}' TO '{user}'@'%'", f"SET DEFAULT ROLE ALL TO '{user}'@'%'",
+                    f"GRANT SELECT ON dbaguy.* TO '{user}'@'%'"):
             cursor.execute(sql)
         plain = share(container, make_mysql_profile(name="zz_08 mysql"), access="schema")
         assert _login(container, plain) == LoginPrivileges()
         as_root = share(container, make_mysql_profile(name="zz_08 root", username="root"), access="schema")
         assert _login(container, as_root) == LoginPrivileges(grants=["file"], secure_file_priv="/var/lib/mysql-files/")
         # TLS: a new caching_sha2_password account's first login needs it (R-03a-P5)
-        draft = make_mysql_profile(name="zz_08 role", username="zz_08_u",
+        draft = make_mysql_profile(name="zz_08 role", username=user,
                                    ssl=SslConfig(mode="require")).model_dump(exclude={"id"})
         request = ProfileUpsertRequest.model_validate({"profile": draft | {"mcp_access": "schema"},
                                                        "secrets": {"password": "zz08pw"}})
-        role = str(container.profiles.create(request).profile.id)
-        assert _login(container, role).grants == ["file"]
+        through_the_role = str(container.profiles.create(request).profile.id)
+        assert _login(container, through_the_role).grants == ["file"]
     finally:
-        cursor.execute("DROP USER IF EXISTS 'zz_08_u'@'%'")
-        cursor.execute("DROP ROLE IF EXISTS 'zz_08_r'")
+        cursor.execute(f"DROP USER IF EXISTS '{user}'@'%'")
+        cursor.execute(f"DROP ROLE IF EXISTS '{role}'")
         root.close()
 
 
@@ -145,25 +182,28 @@ def test_the_dialogs_route_reads_it_and_a_saved_profile_forgets_it(container, tm
         assert answer.status_code == 200 and answer.json() is None  # SQLite: nothing to tell
         missing = client.get("/mcp/connections/00000000-0000-0000-0000-00000000000a/login", headers=AUTH)
         assert missing.status_code == 404
-    container.agent_login._known[UUID(pid)] = LoginPrivileges(grants=["file"])
+    container.agent_login.remember(container.profiles.get(UUID(pid)), lambda: LoginPrivileges(grants=["file"]))
     with TestClient(create_app(container.settings, container), base_url="http://127.0.0.1") as client:
         body = {"profile": {"engine": "sqlite", "name": "lite", "path": str(path), "mcp_access": "query"}}
         assert client.put(f"/profiles/{pid}", json=body, headers=AUTH).status_code == 200
     assert container.agent_login.peek(UUID(pid)) is None
 
 
+def test_the_dialogs_route_answers_null_for_sqlite_and_couchbase_without_connecting(container, tmp_path):
+    path = tmp_path / "zz_08.db"
+    sqlite3.connect(path).close()
+    lite = share(container, SqliteProfile(id="00000000-0000-0000-0000-000000000009", engine="sqlite", name="lite",
+                                          path=str(path)), access="off")
+    couchbase = share(container, make_couchbase_profile(name="zz_08 couchbase", host="127.0.0.1", port=1),
+                      access="query")  # nothing listens on port 1: a connection would answer 502
+    with TestClient(create_app(container.settings, container), base_url="http://127.0.0.1") as client:
+        for pid in (lite, couchbase):
+            answer = client.get(f"/mcp/connections/{pid}/login", headers=AUTH)
+            assert answer.status_code == 200 and answer.json() is None
+    assert not container.metadata._workers
+
+
 # ---- the registry itself: what is read when, what a failure does (no database needed) ----
-
-@pytest.fixture
-def caplog_loguru():
-    """[(level, message)] of what is logged at INFO and above while the test runs."""
-    records: list[tuple[str, str]] = []
-    sink = logger.add(lambda m: records.append((m.record["level"].name, m.record["message"])), level="INFO")
-    try:
-        yield records
-    finally:
-        logger.remove(sink)
-
 
 _LITE = SqliteProfile(id="00000000-0000-0000-0000-000000000009", engine="sqlite", name="lite", path="/tmp/zz_08.db")
 
@@ -184,7 +224,7 @@ def _reads(*answers):
 
 
 def test_the_privileges_are_read_once_and_nothing_to_tell_is_remembered_too():
-    registry = LoginRegistry(metadata=None)
+    registry = LoginRegistry(None, None)
     read = _reads(LoginPrivileges(grants=["file"]))
     registry.remember(_LITE, read)
     registry.remember(_LITE, read)
@@ -197,22 +237,89 @@ def test_the_privileges_are_read_once_and_nothing_to_tell_is_remembered_too():
     assert len(nothing.calls) == 1 and registry.peek(_LITE.id) is None
 
 
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
 @pytest.mark.parametrize("failure", [StatementError("permission denied for table x", "42501"),
                                      QueryFailed("the server said no")])
-def test_a_query_that_fails_is_logged_by_its_code_and_tried_again_later(failure, caplog_loguru):
-    registry = LoginRegistry(metadata=None)
+def test_a_query_that_fails_is_logged_by_its_code_and_tried_again_after_a_minute(failure):
+    clock = _Clock()
+    registry = LoginRegistry(None, None, clock=clock)
     read = _reads(failure, LoginPrivileges())
-    registry.remember(_LITE, read)  # does not raise: the call it belongs to goes on
-    assert registry.peek(_LITE.id) is None
-    warnings = [m for level, m in caplog_loguru if level == "WARNING"]
+    with logged() as records:
+        registry.remember(_LITE, read)  # does not raise: the call it belongs to goes on
+        assert registry.peek(_LITE.id) is None
+        clock.now += 59
+        registry.remember(_LITE, read)  # a schema tool's next calls: no second query, no second warning
+        registry.remember(_LITE, read)
+        assert len(read.calls) == 1
+        clock.now += 2
+        registry.remember(_LITE, read)
+    warnings = [m for level, m in records if level == "WARNING"]
     assert len(warnings) == 1 and "could not be read" in warnings[0] and "lite" in warnings[0]
     assert "permission denied" not in warnings[0] and "the server said no" not in warnings[0]  # a code, never text
+    assert len(read.calls) == 2 and registry.peek(_LITE.id) == LoginPrivileges()
+
+
+def test_a_saved_profile_is_read_again_at_once_after_a_failed_read():
+    registry = LoginRegistry(None, None, clock=_Clock())
+    read = _reads(StatementError("x", "42883"), LoginPrivileges())
+    registry.remember(_LITE, read)
+    registry.forget(_LITE.id)  # the login may be another now
     registry.remember(_LITE, read)
     assert len(read.calls) == 2 and registry.peek(_LITE.id) == LoginPrivileges()
 
 
+def test_a_failure_of_a_read_that_began_before_the_profile_changed_is_not_held_against_the_new_login():
+    registry = LoginRegistry(None, None, clock=_Clock())
+
+    def saved_while_failing():
+        registry.forget(_LITE.id)
+        raise StatementError("x", "42883")
+
+    registry.remember(_LITE, saved_while_failing)
+    read = _reads(LoginPrivileges())
+    registry.remember(_LITE, read)
+    assert len(read.calls) == 1 and registry.peek(_LITE.id) == LoginPrivileges()
+
+
+class _Connection:
+    def login_privileges(self) -> LoginPrivileges:
+        return LoginPrivileges(grants=["superuser"])
+
+
+class _Metadata:
+    """What `with_connection` is asked, answered by a connection that says superuser: no database is needed."""
+
+    def __init__(self) -> None:
+        self.asked: list[tuple[UUID, str | None, bool]] = []
+
+    def with_connection(self, profile_id, database, fn, *, agent=False):
+        self.asked.append((profile_id, database, agent))
+        return fn(_Connection())
+
+
+def test_an_engine_with_nothing_to_tell_is_never_connected_to_and_the_others_read_on_their_own_database():
+    metadata = _Metadata()
+    registry = LoginRegistry(metadata, default_registry())
+    couchbase = make_couchbase_profile(host="127.0.0.1", port=1)  # nothing listens there
+    for profile in (_LITE, couchbase):
+        assert registry.read(profile) is None
+        registry.ensure(profile)
+        assert registry.peek(profile.id) is None
+    assert metadata.asked == []
+    postgres = make_pg_profile()
+    assert registry.read(postgres) == LoginPrivileges(grants=["superuser"])
+    assert metadata.asked == [(postgres.id, "dbaguy", True)]  # the agents' connection of the profile's own database
+
+
 def test_privileges_read_while_the_profile_changed_are_not_kept_for_the_new_login():
-    registry = LoginRegistry(metadata=None)
+    registry = LoginRegistry(None, None)
 
     def saved_while_reading():
         registry.forget(_LITE.id)  # PUT /profiles/{id} arrives between the query and its answer
@@ -225,15 +332,16 @@ def test_privileges_read_while_the_profile_changed_are_not_kept_for_the_new_logi
 
 
 def test_a_connection_failure_is_the_callers():
-    registry = LoginRegistry(metadata=None)
+    registry = LoginRegistry(None, None)
     with pytest.raises(ConnectionFailed):
         registry.remember(_LITE, _reads(ConnectionFailed("no route to host")))
     assert registry.peek(_LITE.id) is None
 
 
-def test_the_summary_goes_to_the_log_at_info(caplog_loguru):
-    LoginRegistry(metadata=None).remember(_LITE, _reads(LoginPrivileges(grants=["superuser", "server_programs"])))
-    assert ("INFO", "MCP: the login of 'lite' can: is a superuser, run programs on the server") in caplog_loguru
+def test_the_summary_goes_to_the_log_at_info():
+    with logged() as records:
+        LoginRegistry(None, None).remember(_LITE, _reads(LoginPrivileges(grants=["superuser", "server_programs"])))
+    assert ("INFO", "MCP: the login of 'lite' can: is a superuser, run programs on the server") in records
 
 
 def test_list_connections_says_nothing_beyond_reading_as_something_and_not_as_null(container, tmp_path):
@@ -249,7 +357,14 @@ def test_list_connections_says_nothing_beyond_reading_as_something_and_not_as_nu
     container.agent_login.forget(UUID(pid))
     container.agent_login.remember(profile, lambda: LoginPrivileges(grants=["file"], secure_file_priv=""))
     assert entry() == {"grants": ["file"], "secure_file_priv": "",  # "" is any directory: not the same as unset
-                       "summary": "read and write files on the server (FILE)"}
+                       "summary": "read and write files on the server in any directory (FILE)"}
+    container.agent_login.forget(UUID(pid))
+    container.agent_login.remember(profile, lambda: LoginPrivileges(grants=["file"], secure_file_priv="/srv/files/"))
+    assert entry()["secure_file_priv"] == "/srv/files/" and "in /srv/files/" in entry()["summary"]
+    container.agent_login.forget(UUID(pid))
+    container.agent_login.remember(profile, lambda: LoginPrivileges(grants=["file"]))  # secure_file_priv NULL
+    assert entry() == {"grants": ["file"], "secure_file_priv": None,  # NULL is no file access: kept, not left out
+                       "summary": "has FILE, but the server allows no file access (secure_file_priv is NULL)"}
 
 
 @requires_pg

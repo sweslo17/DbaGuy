@@ -451,7 +451,8 @@ class AgentTools:
         privileges = self._login.peek(profile.id)
         if privileges is None:
             return None
-        return {**privileges.model_dump(exclude_none=True), "summary": privileges.summary()}
+        listed = privileges.model_dump(exclude_none="file" not in privileges.grants)  # FILE: NULL is no file access
+        return {**listed, "summary": privileges.summary()}
 
     def _needs_unlock(self, profile: AnyProfile) -> bool:
         """A password it would ask for: a profile that does not save its password and has none unlocked this run. One

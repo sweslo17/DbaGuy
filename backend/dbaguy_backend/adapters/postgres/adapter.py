@@ -92,9 +92,22 @@ _CONNECTION_LOST_STATES = frozenset({"57P01", "57P02", "57P03"})
 # set_config() to switch the default off, whether written out, hidden in a string or inside a user function.
 _READ_ONLY_GUC = "default_transaction_read_only"
 # CR-08-1: the login's superuser bit and the four roles a read-only transaction does not stop (a superuser has all)
+# A role's file rights also come from a direct EXECUTE grant on the file functions (revoked from PUBLIC by default; a
+# grant on pg_read_file, pg_ls_dir and the like reaches the data directory, on lo_import and lo_export any file the
+# server can): the gate refuses them all (D-08-2), the privileges say the login holds them.
+_FILE_READ_FUNCTIONS = ("lo_import(text)", "pg_read_file(text)", "pg_read_binary_file(text)", "pg_ls_dir(text)",
+                        "pg_stat_file(text)")
+_FILE_WRITE_FUNCTIONS = ("lo_export(oid, text)",)
+
+
+def _member_or_may_execute(role: str, functions: tuple[str, ...]) -> str:
+    executes = " OR ".join(f"has_function_privilege(current_user, 'pg_catalog.{f}', 'EXECUTE')" for f in functions)
+    return f"pg_has_role(current_user, '{role}', 'MEMBER') OR {executes}"
+
+
 _LOGIN_SQL = (
-    "SELECT r.rolsuper, pg_has_role(current_user, 'pg_read_server_files', 'MEMBER'), "
-    "pg_has_role(current_user, 'pg_write_server_files', 'MEMBER'), "
+    f"SELECT r.rolsuper, {_member_or_may_execute('pg_read_server_files', _FILE_READ_FUNCTIONS)}, "
+    f"{_member_or_may_execute('pg_write_server_files', _FILE_WRITE_FUNCTIONS)}, "
     "pg_has_role(current_user, 'pg_execute_server_program', 'MEMBER'), "
     "pg_has_role(current_user, 'pg_signal_backend', 'MEMBER') FROM pg_roles r WHERE r.rolname = current_user"
 )
@@ -654,7 +667,7 @@ class PostgresAdapter(DatabaseAdapter):
     dialect = Dialect.POSTGRES
     capabilities = AdapterCapabilities(
         per_database_connection=True, cancel_aborts_transaction=True, row_editing=True, orders_browse_by_key=True,
-        run_file=True, dump=True, copy_data=True,
+        run_file=True, dump=True, copy_data=True, login_privileges=True,
     )
 
     def parse_url(self, url: str) -> ParsedUrl:

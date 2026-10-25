@@ -33,9 +33,17 @@ LoginGrant = Literal[
 _GRANT_TEXT: dict[str, str] = {
     "superuser": "is a superuser", "server_files_read": "read the server's files",
     "server_files_write": "write the server's files", "server_programs": "run programs on the server",
-    "signal_backends": "end other sessions", "file": "read and write files on the server (FILE)",
-    "can_write": "write in this database", "sysadmin": "is a sysadmin", "bulkadmin": "bulk-load files (bulkadmin)",
+    "signal_backends": "end other sessions", "can_write": "write in this database", "sysadmin": "is a sysadmin",
+    "bulkadmin": "bulk-load files (bulkadmin)",
 }
+
+
+def _file_text(directory: str | None) -> str:
+    """MySQL's FILE, with where the server lets it work (`secure_file_priv`): "" any directory, a path only that one,
+    NULL no file at all."""
+    if directory is None:
+        return "has FILE, but the server allows no file access (secure_file_priv is NULL)"
+    return f"read and write files on the server in {'any directory' if directory == '' else directory} (FILE)"
 
 
 class LoginPrivileges(BaseModel):
@@ -48,7 +56,8 @@ class LoginPrivileges(BaseModel):
 
     def summary(self) -> str:
         """`superuser, run programs on the server`, for the log and the agent: never a secret."""
-        return ", ".join(_GRANT_TEXT[grant] for grant in self.grants) or "nothing beyond reading"
+        texts = [_file_text(self.secure_file_priv) if grant == "file" else _GRANT_TEXT[grant] for grant in self.grants]
+        return ", ".join(texts) or "nothing beyond reading"
 
 
 class McpStatus(BaseModel):

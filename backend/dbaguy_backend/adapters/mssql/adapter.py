@@ -806,7 +806,7 @@ class MssqlAdapter(DatabaseAdapter):
     # One connection works in one database; an attention keeps the transaction; read-only is DbaGuy's alone (spec §3.4).
     capabilities = AdapterCapabilities(
         per_database_connection=True, cancel_aborts_transaction=False, server_read_only=False, row_editing=True,
-        run_file=True, dump=True, copy_data=True,
+        run_file=True, dump=True, copy_data=True, login_privileges=True,
     )
 
     def parse_url(self, url: str) -> ParsedUrl:

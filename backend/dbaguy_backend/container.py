@@ -117,7 +117,7 @@ class AppContainer:
             self.transfers.plans,
         )
         self.sessions = SessionManager(self.connections, self.profiles, hooks, jobs=self.jobs)
-        self.agent_login = LoginRegistry(self.metadata)
+        self.agent_login = LoginRegistry(self.metadata, self.registry)
         self.agent_tools = AgentTools(self.profiles, self.registry, self.metadata, self.schema_cache, self.agent_login)
         self.agent_host = AgentHost(
             self.agent_tools, token_store or _token_store(settings, secret_store), default_mcp_port(data_dir),

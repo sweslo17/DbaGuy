@@ -566,7 +566,9 @@ class MysqlAdapter(DatabaseAdapter):
     default_port = 3306
     dialect = Dialect.MYSQL
     # one connection sees every database; KILL QUERY keeps the transaction
-    capabilities = AdapterCapabilities(row_editing=True, run_file=True, dump=True, copy_data=True)
+    capabilities = AdapterCapabilities(
+        row_editing=True, run_file=True, dump=True, copy_data=True, login_privileges=True,
+    )
 
     def parse_url(self, url: str) -> ParsedUrl:
         return parse_mysql_url(url)
