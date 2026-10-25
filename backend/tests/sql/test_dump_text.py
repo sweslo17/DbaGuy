@@ -222,7 +222,7 @@ def test_mysql_stored_programs_go_between_delimiter_lines():
     assert [s.text for s in split(text, MY)] == ["SET SESSION sql_mode = ''", "CREATE PROCEDURE p() BEGIN SELECT 1; END"]
     script = DumpScript(MY, Engine.MYSQL, catalog(pre=(), post=()), content="schema", drop_first=False, created="x")
     assert script.tail(0).startswith("\nSET FOREIGN_KEY_CHECKS = 1;\n")
-    assert "SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_AUTO_VALUE_ON_ZERO';\nSET time_zone = '+00:00';\n" in (
+    assert "SET SESSION sql_mode = 'STRICT_ALL_TABLES,NO_AUTO_VALUE_ON_ZERO';\nSET time_zone = '+00:00';\n" in (
         script.head())
 
 

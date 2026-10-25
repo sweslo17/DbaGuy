@@ -887,8 +887,9 @@ def test_a_created_table_the_server_does_not_find_is_taken_as_one_that_cannot_ro
 def test_a_value_too_long_for_a_table_that_cannot_roll_back_fails_instead_of_being_cut(app: DataApp,
                                                                                          tmp_path: Path) -> None:
     """Task 9 docs review M10: MySQL's STRICT_TRANS_TABLES cuts a value too long for a MyISAM column past the first row
-    of a multi-row INSERT, with a warning only (probed); the copy's session is strict for every table, so the INSERT
-    fails and the table is unknown, never copied with a value changed."""
+    of a multi-row INSERT, with a warning only (probed); the copy's session runs the restore settings, strict for every
+    table (`dump_script.RESTORE_SQL_MODE`, STRICT_ALL_TABLES), so the INSERT fails and the table is unknown, never copied
+    with a value changed."""
     lite, my = scratch_db("sqlite", tmp_path), scratch_db("mysql", tmp_path)
     try:
         with dropping(my, before_drop=app.close_sessions) as made:

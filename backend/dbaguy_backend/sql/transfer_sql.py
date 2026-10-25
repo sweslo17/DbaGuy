@@ -5,20 +5,16 @@ come from `dialects` only. Pure."""
 from collections.abc import Sequence
 
 from .dialects import Dialect, identity_insert, qualified, quote_ident, quote_literal, script_text
-from .dump_script import RESET_SETTINGS, RESTORE_SETTINGS, mysql_settings
+from .dump_script import RESET_SETTINGS, RESTORE_SETTINGS
 
-# MySQL's sql_mode for a copy's target session: strict for every table. A restore's STRICT_TRANS_TABLES lets a table that
-# cannot roll back (MyISAM) take a value too long for its column, cut, past the first row of a multi-row INSERT, with a
-# warning only (probed: 06c Task 9 docs review M10); here the INSERT fails, and the table's outcome says what may stand
-COPY_SQL_MODE = "STRICT_ALL_TABLES,NO_AUTO_VALUE_ON_ZERO"
 # The copy's own target session, before its first table: what a restore of a dump runs under (DRY, D-06-7) — PostgreSQL
-# standard strings, MySQL's strict sql_mode that keeps zero dates and AUTO_INCREMENT 0 (COPY_SQL_MODE) with time_zone
-# +00:00 and its foreign key checks off, SQLite's foreign keys off (each table commits on its own, so deferring them to
-# a COMMIT would not help a later table, 06c) — and SQL Server's implicit transactions off (06a L8: a login's user
-# options)
+# standard strings, MySQL's sql_mode `dump_script.RESTORE_SQL_MODE` (the one constant: strict for every table, so a
+# value too long for a MyISAM column fails its INSERT instead of being cut, 06c Task 9 docs review M10; zero dates and
+# AUTO_INCREMENT 0 kept) with time_zone +00:00 and its foreign key checks off, SQLite's foreign keys off (each table
+# commits on its own, so deferring them to a COMMIT would not help a later table, 06c) — and SQL Server's implicit
+# transactions off (06a L8: a login's user options)
 TARGET_SETUP: dict[Dialect, tuple[str, ...]] = {
     **RESTORE_SETTINGS,
-    Dialect.MYSQL: mysql_settings(COPY_SQL_MODE),
     Dialect.TSQL: ("SET IMPLICIT_TRANSACTIONS OFF", *RESTORE_SETTINGS[Dialect.TSQL]),
 }
 TARGET_RESET = RESET_SETTINGS  # after its last table (the session is never used again; a courtesy)

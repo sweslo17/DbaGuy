@@ -14,7 +14,8 @@ from dbaguy_backend.domain.errors import ReadOnlyProfile
 from dbaguy_backend.domain.execution import QueryContext, RunFileCommand
 from dbaguy_backend.sessions.jobs.run_file import PARTLY_APPLIED
 from dbaguy_backend.sql.dialects import Dialect, script_text
-from tests.data_support import DataApp, dropping, scratch_name
+from dbaguy_backend.sql.dump_script import RESTORE_SETTINGS
+from tests.data_support import SCRATCH_06C, DataApp, dropping, scratch_name
 from tests.edit_support import ENGINES, ScratchDb, scratch_db
 from tests.support import COUCHBASE_PASSWORD, couchbase_query, make_couchbase_profile, mysql_driver_kwargs, \
     requires_couchbase, requires_mssql, requires_mysql, requires_pg, unique_name, wait_until
@@ -176,6 +177,30 @@ def test_mysql_all_or_nothing_refuses_ddl_before_sending_it(tmp_path):  # pre-fl
                             name="failing.sql")
             ran = app.job_session(profile).run(command(failing, "all_or_nothing"))
             assert (ran.outcome.outcome, ran.error.code, ids(db, table)) == ("rolled_back", "implicit_commit", [])
+    finally:
+        app.close()
+        db.close()
+
+
+@requires_mysql
+def test_a_dumps_restore_settings_refuse_a_value_too_long_for_a_myisam_column(tmp_path):  # 06c fix wave, M10
+    """The restore header's sql_mode is strict for every table (`RESTORE_SQL_MODE`, STRICT_ALL_TABLES): a value too long
+    for a MyISAM column past the first row of a multi-row INSERT fails the statement. Under STRICT_TRANS_TABLES MySQL
+    cut it to the column's length with a warning only, and the run completed (probed)."""
+    db = scratch_db("mysql", tmp_path)
+    app = DataApp(tmp_path)
+    profile = app.add_profile(db.profile())
+    try:
+        with dropping(db, app.close_sessions) as made:
+            table = scratch_name("run", SCRATCH_06C)
+            made.append(("TABLE", table))
+            db.execute(f"CREATE TABLE {db.table(table)} (id INT PRIMARY KEY, s VARCHAR(3)) ENGINE=MyISAM")
+            path = write(tmp_path, db, [*RESTORE_SETTINGS[Dialect.MYSQL],
+                                        f"INSERT INTO {db.table(table)} VALUES (1, 'abc'), (2, 'abcdef'), (3, 'x')"])
+            ran = app.job_session(profile).run(command(path, "statements"))
+            rows = db.rows(f"SELECT id, s FROM {db.table(table)} ORDER BY id")
+        assert (ran.outcome.outcome != "completed", ran.error.code) == (True, "1406")  # Data too long
+        assert rows == [(1, "abc")]  # MyISAM keeps the row before it; no value was cut
     finally:
         app.close()
         db.close()
