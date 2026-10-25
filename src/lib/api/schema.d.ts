@@ -2576,7 +2576,7 @@ export interface components {
              * Grants
              * @default []
              */
-            grants: ("superuser" | "server_files_read" | "server_files_write" | "server_programs" | "signal_backends" | "file" | "can_write" | "sysadmin" | "bulkadmin")[];
+            grants: ("superuser" | "server_files_read" | "server_files_write" | "server_programs" | "signal_backends" | "replication" | "file" | "can_write" | "sysadmin" | "bulkadmin")[];
             /** Secure File Priv */
             secure_file_priv?: string | null;
         };

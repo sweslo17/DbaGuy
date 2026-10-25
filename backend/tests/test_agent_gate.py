@@ -222,3 +222,60 @@ def test_the_sql_server_readers_say_what_they_reach():
         "openrowset (server files) is not allowed")
     assert agent_read("SELECT * FROM OPENQUERY(s, 'SELECT 1')", TS).message().endswith(
         "openquery (opens other connections) is not allowed")
+
+
+@pytest.mark.parametrize("sql", [  # final review I1: what keeps or consumes a replication slot outlives the ROLLBACK
+    "SELECT pg_copy_physical_replication_slot('zz_08_ff_a', 'zz_08_ff_b')",
+    "SELECT * FROM pg_copy_logical_replication_slot('zz_08_ff_a', 'zz_08_ff_b')",
+    "SELECT * FROM pg_logical_slot_get_changes('zz_08_ff_a', NULL, NULL)",
+    "SELECT * FROM pg_logical_slot_get_binary_changes('zz_08_ff_a', NULL, NULL)",
+    "SELECT * FROM pg_logical_slot_peek_changes('zz_08_ff_a', NULL, NULL)",
+    "SELECT * FROM pg_logical_slot_peek_binary_changes('zz_08_ff_a', NULL, NULL)",
+    "SELECT pg_sync_replication_slots()",
+    "SELECT binary_upgrade_replorigin_advance('x', '0/0')", "SELECT pg_stat_statements_reset()",
+    "SELECT pg_catalog.pg_copy_physical_replication_slot('zz_08_ff_a', 'zz_08_ff_b')",
+    'SELECT "pg_catalog"."pg_logical_slot_get_changes"(\'zz_08_ff_a\', NULL, NULL)',
+    "SELECT PG_COPY_LOGICAL_REPLICATION_SLOT('zz_08_ff_a', 'zz_08_ff_b')",
+    'SELECT U&"pg\\005fcopy\\005fphysical\\005freplication\\005fslot"(\'zz_08_ff_a\', \'zz_08_ff_b\')',
+    "SELECT U&\"pg!005flogical!005fslot!005fget!005fchanges\" UESCAPE '!' ('zz_08_ff_a', NULL, NULL)",
+])
+def test_postgres_replication_slots_are_denied_however_they_are_named(sql):
+    verdict = agent_read(sql, PG)
+    assert verdict.refusal == R.DENIED_FUNCTION, verdict.message()
+
+
+@pytest.mark.parametrize("sql", [  # final review I2: the host's file system, for any login
+    "SELECT * FROM sys.dm_os_enumerate_filesystem('/etc', '*')",
+    "SELECT * FROM [sys].[dm_os_enumerate_filesystem](N'/etc', N'*')",
+    "SELECT file_exists FROM sys.dm_os_file_exists('/etc/passwd')",
+    "SELECT * FROM master.sys.DM_OS_FILE_EXISTS(N'/etc/passwd')",
+    "SELECT TOP 1 * FROM sys.fn_dblog_xtp(NULL, NULL)", "SELECT TOP 1 * FROM [sys].[fn_full_dblog](NULL, NULL, 5)",
+    "SELECT * FROM sys.fn_dump_dblog_xtp(NULL, NULL, N'DISK', 1, N'/tmp/x')",
+    "SELECT * FROM sys.fn_db_backup_file_snapshots(N'dbaguy')",
+    "SELECT * FROM sys.dm_xcs_enumerate_blobdirectory(N'/etc/', NULL, NULL, 0, 0)",
+    "SELECT * FROM sys.fn_xcs_get_file_rowcount(0, NULL, 0, N'/', N'x', NULL, NULL)",
+    "SELECT * FROM sys.dm_os_enumerate_fixed_drives",  # a view: no call, its name alone
+    "SELECT d.free_space_in_bytes FROM [sys].[DM_OS_ENUMERATE_FIXED_DRIVES] AS d",
+    "WITH d AS (SELECT * FROM master.sys.dm_os_enumerate_fixed_drives) SELECT * FROM d",
+])
+def test_sql_server_file_system_readers_are_denied_however_they_are_named(sql):
+    verdict = agent_read(sql, TS)
+    assert verdict.refusal == R.DENIED_FUNCTION, verdict.message()
+
+
+def test_the_new_denials_say_what_they_reach():
+    assert agent_read("SELECT pg_copy_logical_replication_slot('a', 'b')", PG).message().endswith(
+        "pg_copy_logical_replication_slot (keeps or consumes a replication slot) is not allowed")
+    assert agent_read("SELECT * FROM sys.dm_os_file_exists('/x')", TS).message().endswith(
+        "dm_os_file_exists (server files) is not allowed")
+    assert agent_read("SELECT * FROM sys.dm_os_enumerate_fixed_drives", TS).message().endswith(
+        "dm_os_enumerate_fixed_drives (server files) is not allowed")
+
+
+@pytest.mark.parametrize(("dialect", "sql"), [  # what stays allowed beside them
+    (TS, "SELECT * FROM sys.dm_os_host_info"), (TS, "SELECT physical_name FROM sys.database_files"),
+    (TS, "SELECT name FROM sys.servers"),
+    (PG, "SELECT * FROM pg_replication_slots"), (PG, "SELECT * FROM pg_stat_replication_slots"),
+])
+def test_catalog_views_beside_them_stay_allowed(dialect, sql):
+    assert agent_read(sql, dialect).allowed

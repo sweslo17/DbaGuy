@@ -7417,6 +7417,7 @@
                 "server_files_write",
                 "server_programs",
                 "signal_backends",
+                "replication",
                 "file",
                 "can_write",
                 "sysadmin",

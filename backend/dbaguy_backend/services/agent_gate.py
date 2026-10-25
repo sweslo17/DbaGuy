@@ -7,6 +7,9 @@ session locks, SQL run from text, settings. The deny-list is checked before the 
 a call reaches, and SQL Server's remote and file readers, which no server-side read-only stops, are refused by name
 whatever the classifier makes of them.
 
+A few SQL Server views that read the host are denied by name too (`DENIED_VIEWS`): wherever the name appears, not only
+before `(` (final review I2).
+
 The deny-list matches names only: a user-defined function that wraps a denied call is not caught (spec §9). Session
 locks it takes are released by the read frame's cleanup (D-08-3); a separate read-only login is the full protection.
 The gate does not bound time either: `pg_sleep`, `SLEEP` and `BENCHMARK` pass, and Task 6's read frame bounds them
@@ -46,6 +49,7 @@ _EXPLAIN_WORDS = frozenset({"EXPLAIN", "DESCRIBE", "DESC"})
 _SERVER_FILES, _KILLS, _LOCKS, _SQL_TEXT = "server files", "kills sessions", "locks", "runs SQL from text"
 _SERVER, _SETTINGS, _CONNECTIONS = "controls the server", "changes settings", "opens other connections"
 _LOADS_CODE = "loads code"
+_SLOTS = "keeps or consumes a replication slot"  # final review I1: a slot holds WAL until it is read or dropped
 DENIED_FUNCTIONS: dict[Dialect, tuple[tuple[str, str], ...]] = {
     Dialect.POSTGRES: (
         ("pg_terminate_backend", _KILLS), ("pg_cancel_backend", _KILLS),
@@ -60,6 +64,11 @@ DENIED_FUNCTIONS: dict[Dialect, tuple[tuple[str, str], ...]] = {
         ("pg_stat_file", _SERVER_FILES), ("lo_*", _SERVER_FILES),
         ("query_to_xml", _SQL_TEXT), ("query_to_xmlschema", _SQL_TEXT), ("query_to_xml_and_xmlschema", _SQL_TEXT),
         ("cursor_to_xml", _SQL_TEXT), ("ts_stat", _SQL_TEXT), ("ts_rewrite", _SQL_TEXT),
+        # final review I1: a slot copied or created stays after the ROLLBACK and keeps WAL until the server's disk
+        # fills; reading a logical slot's changes consumes them for its real consumer. Every pg_catalog function of
+        # the slot, replication, WAL, backup and origin families was checked (the fix report lists them)
+        ("pg_copy_*", _SLOTS), ("pg_logical_slot_*", _SLOTS), ("pg_sync_replication_slots", _SLOTS),
+        ("binary_upgrade_*", _SERVER), ("pg_stat_statements_reset", _SERVER),
     ),
     Dialect.MYSQL: (
         ("get_lock", _LOCKS), ("release_lock", _LOCKS), ("release_all_locks", _LOCKS), ("load_file", _SERVER_FILES),
@@ -72,8 +81,18 @@ DENIED_FUNCTIONS: dict[Dialect, tuple[tuple[str, str], ...]] = {
         # fix round 1 (review I1): SQL Server has no server-side read-only, so these are refused by name too, not only
         # because the classifier calls them UNKNOWN
         ("openrowset", _SERVER_FILES), ("openquery", _CONNECTIONS), ("opendatasource", _CONNECTIONS),
+        # final review I2: they list, test or read the host's files for a login with nothing but CONNECT SQL (probed
+        # with the dev login; the ones that need VIEW SERVER STATE, ALTER TRACE or sysadmin are in the fix report)
+        ("dm_os_enumerate_filesystem", _SERVER_FILES), ("dm_os_file_exists", _SERVER_FILES),
+        ("fn_dblog_xtp", _SERVER_FILES), ("fn_full_dblog", _SERVER_FILES), ("fn_dump_dblog_xtp", _SERVER_FILES),
+        ("fn_db_backup_file_snapshots", _SERVER_FILES), ("dm_xcs_enumerate_blobdirectory", _SERVER_FILES),
+        ("fn_xcs_get_file_rowcount", _SERVER_FILES),
     ),
     Dialect.SQLPP: (("curl", "reaches the network"), ("advisor", "starts index advisor sessions")),
+}
+# Views that read the host, denied wherever their name appears (a view is never called): final review I2
+DENIED_VIEWS: dict[Dialect, tuple[tuple[str, str], ...]] = {
+    Dialect.TSQL: (("dm_os_enumerate_fixed_drives", _SERVER_FILES),),
 }
 _QUOTED_NAMES_KEEP_CASE = frozenset({Dialect.POSTGRES})
 # The codes a server answers a write with on an agent's read-only session (§3.4: P4, M2, S1/S9, C1): the tool adds that
@@ -214,9 +233,10 @@ def _query(sql: str, tokens: list[Token], dialect: Dialect) -> AgentVerdict:
 
 
 def _denied_call(tokens: list[Token], dialect: Dialect) -> AgentVerdict | None:
-    """The first call of a denied function: a name (or a PostgreSQL `U&"…"` name and its UESCAPE) right before `(`."""
-    denied = DENIED_FUNCTIONS[dialect]
-    if not denied:
+    """The first call of a denied function: a name (or a PostgreSQL `U&"…"` name and its UESCAPE) right before `(`; or
+    the first name of a denied view, wherever it is."""
+    denied, views = DENIED_FUNCTIONS[dialect], DENIED_VIEWS.get(dialect, ())
+    if not denied and not views:
         return None
     i = 0
     while i < len(tokens):
@@ -226,6 +246,8 @@ def _denied_call(tokens: list[Token], dialect: Dialect) -> AgentVerdict | None:
                 return _refuse(AgentRefusal.UNREADABLE_NAME, "a U& name that cannot be read")
             if (what := _denied_as(name, denied)) is not None:
                 return _refuse(AgentRefusal.DENIED_FUNCTION, f"{name} ({what})")
+        if name is not None and (what := _denied_as(name, views)) is not None:
+            return _refuse(AgentRefusal.DENIED_FUNCTION, f"{name} ({what})")
         i = max(after, i + 1)
     return None
 

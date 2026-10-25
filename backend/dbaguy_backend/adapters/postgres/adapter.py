@@ -91,7 +91,8 @@ _CONNECTION_LOST_STATES = frozenset({"57P01", "57P02", "57P03"})
 # Read-only profiles set the session default at connect and re-assert it before every statement: a SELECT can call
 # set_config() to switch the default off, whether written out, hidden in a string or inside a user function.
 _READ_ONLY_GUC = "default_transaction_read_only"
-# CR-08-1: the login's superuser bit and the four roles a read-only transaction does not stop (a superuser has all)
+# CR-08-1: the login's superuser bit and the four roles a read-only transaction does not stop (a superuser has all),
+# and REPLICATION (final review I1: a slot it copies or reads outlives the ROLLBACK; the gate refuses those functions)
 # A role's file rights also come from a direct EXECUTE grant on the file functions (revoked from PUBLIC by default; a
 # grant on pg_read_file, pg_ls_dir and the like reaches the data directory, on lo_import and lo_export any file the
 # server can): the gate refuses them all (D-08-2), the privileges say the login holds them.
@@ -109,9 +110,11 @@ _LOGIN_SQL = (
     f"SELECT r.rolsuper, {_member_or_may_execute('pg_read_server_files', _FILE_READ_FUNCTIONS)}, "
     f"{_member_or_may_execute('pg_write_server_files', _FILE_WRITE_FUNCTIONS)}, "
     "pg_has_role(current_user, 'pg_execute_server_program', 'MEMBER'), "
-    "pg_has_role(current_user, 'pg_signal_backend', 'MEMBER') FROM pg_roles r WHERE r.rolname = current_user"
+    "pg_has_role(current_user, 'pg_signal_backend', 'MEMBER'), r.rolreplication "
+    "FROM pg_roles r WHERE r.rolname = current_user"
 )
-_LOGIN_GRANTS = ("superuser", "server_files_read", "server_files_write", "server_programs", "signal_backends")
+_LOGIN_GRANTS = ("superuser", "server_files_read", "server_files_write", "server_programs", "signal_backends",
+                 "replication")
 _READ_ONLY_SESSION = "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
 
 # libpq's chunked streaming uses the extended protocol, which accepts one statement per query.

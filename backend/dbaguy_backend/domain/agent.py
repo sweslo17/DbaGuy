@@ -25,25 +25,31 @@ ToolErrorCode = Literal[
 
 
 # What a login may do beyond reading that a read-only transaction does not stop (CR-08-1, §3.3), in this order:
-# PostgreSQL superuser and the four pg_* roles; MySQL FILE; SQL Server writes in the database, sysadmin, bulkadmin
+# PostgreSQL superuser, the four pg_* roles and REPLICATION (final review I1: replication slots outlive a ROLLBACK);
+# MySQL FILE; SQL Server writes in the database, sysadmin, bulkadmin
 LoginGrant = Literal[
-    "superuser", "server_files_read", "server_files_write", "server_programs", "signal_backends", "file", "can_write",
-    "sysadmin", "bulkadmin",
+    "superuser", "server_files_read", "server_files_write", "server_programs", "signal_backends", "replication",
+    "file", "can_write", "sysadmin", "bulkadmin",
 ]
 _GRANT_TEXT: dict[str, str] = {
     "superuser": "is a superuser", "server_files_read": "read the server's files",
     "server_files_write": "write the server's files", "server_programs": "run programs on the server",
-    "signal_backends": "end other sessions", "can_write": "write in this database", "sysadmin": "is a sysadmin",
-    "bulkadmin": "bulk-load files (bulkadmin)",
+    "signal_backends": "end other sessions", "replication": "manage replication slots (REPLICATION)",
+    "can_write": "write in this database", "sysadmin": "is a sysadmin", "bulkadmin": "bulk-load files (bulkadmin)",
 }
+PATH_CHARS = 200  # the server's secure_file_priv, at most this much of it in the summary (T3 N3)
 
 
 def _file_text(directory: str | None) -> str:
     """MySQL's FILE, with where the server lets it work (`secure_file_priv`): "" any directory, a path only that one,
-    NULL no file at all."""
+    NULL no file at all. The path is the server's text: quoted (`repr`, so no newline reaches the INFO line) and cut at
+    PATH_CHARS (T3 N3)."""
     if directory is None:
         return "has FILE, but the server allows no file access (secure_file_priv is NULL)"
-    return f"read and write files on the server in {'any directory' if directory == '' else directory} (FILE)"
+    if directory == "":
+        return "read and write files on the server in any directory (FILE)"
+    shown = directory if len(directory) <= PATH_CHARS else directory[:PATH_CHARS] + "…"
+    return f"read and write files on the server in {shown!r} (FILE)"
 
 
 class LoginPrivileges(BaseModel):

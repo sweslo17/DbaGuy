@@ -59,7 +59,7 @@ class LoginRegistry:
         try:
             privileges = read()
         except (StatementError, QueryFailed) as exc:
-            logger.warning("MCP: the login of '{}' could not be read ({})", profile.name,
+            logger.warning("MCP: the login of {} could not be read ({})", profile.id,
                            getattr(exc, "code", None) or type(exc).__name__)
             with self._lock:
                 if self._changes.get(profile.id, 0) == changes:  # not the old login's failure held against the new
@@ -101,4 +101,4 @@ class LoginRegistry:
             self._known[profile.id] = privileges
             self._failed_at.pop(profile.id, None)
         if privileges is not None:
-            logger.info("MCP: the login of '{}' can: {}", profile.name, privileges.summary())
+            logger.info("MCP: the login of {} can: {}", profile.id, privileges.summary())  # ids, never names (M8)

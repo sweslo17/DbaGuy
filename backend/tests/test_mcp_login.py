@@ -54,8 +54,17 @@ def test_the_summary_says_what_the_login_can_do():
         "is a superuser, run programs on the server")
 
 
+def test_replication_says_it_manages_slots():  # final review I1
+    assert LoginPrivileges(grants=["superuser", "replication"]).summary() == (
+        "is a superuser, manage replication slots (REPLICATION)")
+
+
 @pytest.mark.parametrize(("directory", "text"), [
-    ("/var/lib/mysql-files/", "read and write files on the server in /var/lib/mysql-files/ (FILE)"),
+    ("/var/lib/mysql-files/", "read and write files on the server in '/var/lib/mysql-files/' (FILE)"),
+    # T3 N3: the server's own text, quoted and bounded (it reaches the INFO line)
+    ("/srv/a\nMCP run_query on x: ok",
+     "read and write files on the server in '/srv/a\\nMCP run_query on x: ok' (FILE)"),
+    ("/" + "d" * 400, f"read and write files on the server in '/{'d' * 199}…' (FILE)"),
     ("", "read and write files on the server in any directory (FILE)"),
     (None, "has FILE, but the server allows no file access (secure_file_priv is NULL)"),  # NULL: no file at all
 ])
@@ -70,11 +79,12 @@ def test_postgres_superuser_holds_every_role_and_list_connections_shows_it_once_
     container.agent_tools.list_objects(pid)  # the first catalog call reads it
     login = container.agent_tools.list_connections()["connections"][0]["login"]
     assert login["grants"] == ["superuser", "server_files_read", "server_files_write", "server_programs",
-                               "signal_backends"]
+                               "signal_backends", "replication"]
     assert login["summary"].startswith("is a superuser")
 
 
-_PG_ROLES = ("zz_08_t3_pa", "zz_08_t3_pb", "zz_08_t3_pc", "zz_08_t3_pf")  # exact names, dropped in `finally`
+# exact names, dropped in `finally`
+_PG_ROLES = ("zz_08_t3_pa", "zz_08_t3_pb", "zz_08_t3_pc", "zz_08_t3_pf", "zz_08_ff_repl")
 
 
 @contextmanager
@@ -107,6 +117,13 @@ def _pg_granted(container, role: str) -> list[str]:
         return _login(container, str(container.profiles.create(request).profile.id)).grants
     finally:
         container.metadata.close_all()  # the role cannot be dropped while a session of it is open
+
+
+@requires_pg
+def test_a_postgres_replication_login_says_so(container):
+    """Final review I1: REPLICATION is all pg_copy_*_replication_slot and pg_logical_slot_get_* need."""
+    with _pg_scratch_roles("CREATE ROLE zz_08_ff_repl LOGIN REPLICATION PASSWORD 'zz08t3pw'"):
+        assert _pg_granted(container, "zz_08_ff_repl") == ["replication"]
 
 
 @requires_pg
@@ -264,7 +281,7 @@ def test_a_query_that_fails_is_logged_by_its_code_and_tried_again_after_a_minute
         clock.now += 2
         registry.remember(_LITE, read)
     warnings = [m for level, m in records if level == "WARNING"]
-    assert len(warnings) == 1 and "could not be read" in warnings[0] and "lite" in warnings[0]
+    assert len(warnings) == 1 and "could not be read" in warnings[0] and str(_LITE.id) in warnings[0]  # M8: its id
     assert "permission denied" not in warnings[0] and "the server said no" not in warnings[0]  # a code, never text
     assert len(read.calls) == 2 and registry.peek(_LITE.id) == LoginPrivileges()
 
@@ -344,7 +361,14 @@ def test_a_connection_failure_is_the_callers():
 def test_the_summary_goes_to_the_log_at_info():
     with logged() as records:
         LoginRegistry(None, None).remember(_LITE, _reads(LoginPrivileges(grants=["superuser", "server_programs"])))
-    assert ("INFO", "MCP: the login of 'lite' can: is a superuser, run programs on the server") in records
+    assert ("INFO", f"MCP: the login of {_LITE.id} can: is a superuser, run programs on the server") in records
+    assert not [text for _, text in records if "'lite'" in text]  # M8: the profile's id, never its name
+
+
+def test_a_failed_read_is_logged_by_the_profiles_id():
+    with logged() as records:
+        LoginRegistry(None, None).remember(_LITE, _reads(QueryFailed("permission denied for 'lite'")))
+    assert ("WARNING", f"MCP: the login of {_LITE.id} could not be read (query_failed)") in records
 
 
 def test_list_connections_says_nothing_beyond_reading_as_something_and_not_as_null(container, tmp_path):
@@ -363,7 +387,7 @@ def test_list_connections_says_nothing_beyond_reading_as_something_and_not_as_nu
                        "summary": "read and write files on the server in any directory (FILE)"}
     container.agent_login.forget(UUID(pid))
     container.agent_login.remember(profile, lambda: LoginPrivileges(grants=["file"], secure_file_priv="/srv/files/"))
-    assert entry()["secure_file_priv"] == "/srv/files/" and "in /srv/files/" in entry()["summary"]
+    assert entry()["secure_file_priv"] == "/srv/files/" and "in '/srv/files/'" in entry()["summary"]
     container.agent_login.forget(UUID(pid))
     container.agent_login.remember(profile, lambda: LoginPrivileges(grants=["file"]))  # secure_file_priv NULL
     assert entry() == {"grants": ["file"], "secure_file_priv": None,  # NULL is no file access: kept, not left out
