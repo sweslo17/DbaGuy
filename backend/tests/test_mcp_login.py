@@ -182,7 +182,10 @@ def test_the_dialogs_route_reads_it_and_a_saved_profile_forgets_it(container, tm
         assert answer.status_code == 200 and answer.json() is None  # SQLite: nothing to tell
         missing = client.get("/mcp/connections/00000000-0000-0000-0000-00000000000a/login", headers=AUTH)
         assert missing.status_code == 404
+    # The route kept SQLite's None: forget it first, so the remembered grant is really held before the save
+    container.agent_login.forget(UUID(pid))
     container.agent_login.remember(container.profiles.get(UUID(pid)), lambda: LoginPrivileges(grants=["file"]))
+    assert container.agent_login.peek(UUID(pid)) == LoginPrivileges(grants=["file"])
     with TestClient(create_app(container.settings, container), base_url="http://127.0.0.1") as client:
         body = {"profile": {"engine": "sqlite", "name": "lite", "path": str(path), "mcp_access": "query"}}
         assert client.put(f"/profiles/{pid}", json=body, headers=AUTH).status_code == 200
