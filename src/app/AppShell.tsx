@@ -83,8 +83,11 @@ export function AppShell({ sidebar, workspace }: { sidebar: ReactNode; workspace
         </Group>
       </div>
       <div className="flex h-[22px] shrink-0 items-center gap-3 border-t border-border bg-panel px-3 text-[11px] text-muted">
-        <span className={health.isError ? "text-danger" : ""}>
-          {health.isError ? "Backend unreachable" : health.data ? `Backend v${health.data.version}` : "Connecting…"}
+        <span
+          className={health.isError ? "text-danger" : ""}
+          title={health.data ? `Backend v${health.data.version}` : undefined}
+        >
+          {health.isError ? "Backend unreachable" : health.data ? `DbaGuy ${__APP_RELEASE__}` : "Connecting…"}
         </span>
         {saveFailing && (
           <span
