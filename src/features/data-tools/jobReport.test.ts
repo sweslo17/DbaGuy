@@ -629,6 +629,12 @@ describe("a copy in words (06c)", () => {
       "Leave that row out (with a filter, or in the query) or, in a new table, give the column a text type; then copy again.",
     ]);
     expect(codeLabel("source_failed")).toBe("Reading the source failed");
+    // the source's refusals of what the preview checks keep their own code in the outcome (Task 9 docs review I2)
+    expect(["query_not_select", "columns_changed", "invalid_filter"].map((code) => codeLabel(code, "copy_data"))).toEqual([
+      "Not one statement that only reads",
+      "The columns changed since the preview",
+      "Not one condition",
+    ]);
     const lost = said(copied({ outcome: "partial", error: { code: "connection_lost", message: "gone" } }));
     expect(lost.hint).toContain("tables before it stay copied");
   });

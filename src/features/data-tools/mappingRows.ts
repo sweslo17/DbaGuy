@@ -96,16 +96,40 @@ export function statementLines(table: TableTransfer): { sql: string; danger: boo
 /** A table with something that blocks the copy: a problem of its own or of one of its columns. */
 const hasProblem = (table: TableTransfer): boolean => table.problems.length > 0 || table.columns.some((column) => column.problem);
 
+/** A table drawn ahead of the others past the cap: it has a problem, or the user changed it (`changed`: source keys). */
+const ahead = (table: TableTransfer, changed: ReadonlySet<string>): boolean =>
+  hasProblem(table) || changed.has(table.source_key);
+
 /**
- * The tables a preview draws: all of them while `limit` allows; past it the first `limit` ones, except that a table with a
- * problem is always drawn, and first (the problem list names a column with no table; the user must find it). Without a
- * cap the preview keeps the copy's own order (parents first).
+ * The tables a preview draws: all of them while `limit` allows; past it, first every table with a problem (the problem
+ * list names a column with no table; the user must find it) or that the user changed in this dialog (`changed`: their
+ * source keys), in the copy's order among themselves, then the others up to `limit`. A table the user just fixed so
+ * stays where it was instead of leaving the list with its problem (the UI re-review's Low). Without a cap the preview
+ * keeps the copy's own order (parents first).
  */
-export function tablesToDraw(tables: readonly TableTransfer[], limit: number): TableTransfer[] {
+export function tablesToDraw(tables: readonly TableTransfer[], limit: number, changed: readonly string[] = []): TableTransfer[] {
   if (tables.length <= limit) return [...tables];
-  const troubled = tables.filter(hasProblem);
-  const rest = tables.filter((table) => !hasProblem(table));
-  return [...troubled, ...rest.slice(0, Math.max(0, limit - troubled.length))];
+  const kept = new Set(changed);
+  const first = tables.filter((table) => ahead(table, kept));
+  const rest = tables.filter((table) => !ahead(table, kept));
+  return [...first, ...rest.slice(0, Math.max(0, limit - first.length))];
+}
+
+/**
+ * What the preview says under the tables it draws, when it draws fewer than all (null when it draws them all): the
+ * first ones, or, once some come ahead of their place (`tablesToDraw`), which.
+ */
+export function drawnNote(
+  tables: readonly TableTransfer[],
+  drawn: readonly TableTransfer[],
+  changed: readonly string[] = [],
+): string | null {
+  if (drawn.length >= tables.length) return null;
+  const counts = `${drawn.length.toLocaleString()} of ${tables.length.toLocaleString()} tables`;
+  const kept = new Set(changed);
+  return drawn.some((table) => ahead(table, kept))
+    ? `Showing ${counts}: those with a problem or a change first`
+    : `Showing the first ${counts}`;
 }
 
 /** Every problem of the preview, the copy's first: what blocks Copy, said once each. */

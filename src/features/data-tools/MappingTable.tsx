@@ -13,6 +13,12 @@ import { mappingRows, statementLines, withIdentity, withLeftOut, withOverride, t
  * Every change goes to the form, and the dialog reads the preview again. The words come from `mappingRows` only.
  */
 
+/** An identity column's choice when appending, in full (its menu's words are short: the column is narrow). */
+const IDENTITY_TITLES: Record<IdentityChoice, string> = {
+  keep: "Keep the source's values",
+  generate: "Let the target generate them",
+};
+
 /** What marks where the rows go among a table's statements: those before them above it, those after them below. */
 const ROWS_HERE = "the rows are copied here";
 
@@ -132,14 +138,20 @@ export function MappingTable({
                     </span>
                   )}
                   {row.identity && (
+                    // Short words that fit the column's 9rem (the long ones were cut: MP-4); the whole choice on hover
                     <Select
-                      className="mt-1"
+                      className="mt-1 text-[12px]"
                       value={row.identity}
                       aria-label={`Identity of ${row.target ?? row.source}`}
+                      title={IDENTITY_TITLES[row.identity]}
                       onChange={(e) => onChange(withIdentity(form, key, row.source, e.target.value as IdentityChoice))}
                     >
-                      <option value="keep">Keep the source's values</option>
-                      <option value="generate">Let the target generate them</option>
+                      <option value="keep" title={IDENTITY_TITLES.keep}>
+                        Keep values
+                      </option>
+                      <option value="generate" title={IDENTITY_TITLES.generate}>
+                        Generate new
+                      </option>
                     </Select>
                   )}
                 </td>

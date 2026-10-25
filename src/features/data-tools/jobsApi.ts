@@ -9,6 +9,7 @@ import type {
   TransferPlan,
   TransferRequest,
 } from "@/lib/api/types";
+import { askPreviewAgain } from "./copyForm";
 
 /*
  * The data tools' REST calls (spec ⑥ §3.2, 06a appendix). A job itself is a WebSocket command on a session of its
@@ -64,7 +65,22 @@ export async function fetchDumpPlan(body: DumpPlanRequest, signal?: AbortSignal)
   return unwrap(await (await api()).POST("/data/dump/plan", { body, signal }));
 }
 
-/** Copy data's preview (POST /data/transfer/plan): a plan id only while nothing is wrong. */
-export async function fetchTransferPlan(body: TransferRequest, signal?: AbortSignal): Promise<TransferPlan> {
-  return unwrap(await (await api()).POST("/data/transfer/plan", { body, signal }));
+/**
+ * Copy data's preview (POST /data/transfer/plan): a plan id only while nothing is wrong. `previewKey`: the dialog's own
+ * id, so that a preview it no longer waits for stops reading between tables once it asks for a newer one (the backend
+ * answers that stopped one with `preview_superseded`; asked again once if this read still waits for it).
+ */
+export async function fetchTransferPlan(
+  body: TransferRequest,
+  signal?: AbortSignal,
+  previewKey?: string,
+): Promise<TransferPlan> {
+  const ask = async () =>
+    unwrap(await (await api()).POST("/data/transfer/plan", { body: { ...body, preview_key: previewKey ?? null }, signal }));
+  try {
+    return await ask();
+  } catch (error) {
+    if (askPreviewAgain(error, signal?.aborted ?? false)) return ask();
+    throw error;
+  }
 }

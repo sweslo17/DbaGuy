@@ -227,10 +227,27 @@ export function passwordOwner(error: Error, fallback: string): string {
   return typeof named === "string" ? named : fallback;
 }
 
+/** `text` cut at `units` UTF-16 units, never between the two halves of a surrogate pair (an emoji keeps both or neither). */
+function cutAt(text: string, units: number): string {
+  const end = units > 0 && units < text.length && /[\uD800-\uDBFF]/.test(text[units - 1]) ? units - 1 : units;
+  return text.slice(0, end);
+}
+
 /** What a query's statement shows in the form: its first line that says something, cut at `max` characters. */
 export function statementFirstLine(sql: string, max = 200): string {
   // only the start is read: a statement may be megabytes, and its first line is what is shown
-  const line = sql.slice(0, 4 * max).split(/\r\n|\r|\n/).find((text) => text.trim() !== "") ?? "";
+  const line = cutAt(sql, 4 * max).split(/\r\n|\r|\n/).find((text) => text.trim() !== "") ?? "";
   const text = line.trim();
-  return text.length > max ? `${text.slice(0, max).trimEnd()}…` : text;
+  return text.length > max ? `${cutAt(text, max).trimEnd()}…` : text;
+}
+
+/** The backend's answer to a preview that a newer one of the same dialog stopped (its `preview_key`, 06c final review). */
+export const PREVIEW_SUPERSEDED = "preview_superseded";
+
+/**
+ * Whether a failed preview should be asked once more: the backend stopped it for a newer one of this dialog, and the
+ * dialog still waits for it (its read was not given up: the form came back to these choices while it ran).
+ */
+export function askPreviewAgain(error: unknown, givenUp: boolean): boolean {
+  return !givenUp && error instanceof ApiError && error.code === PREVIEW_SUPERSEDED;
 }

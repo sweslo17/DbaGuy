@@ -138,7 +138,7 @@ export const CODE_LABELS = {
   row_count_unknown: "The rows written were not confirmed",
   columns_changed: "The columns changed since the preview",
   value_not_copyable: "A value the target cannot hold",
-  query_not_select: "Not a query that only reads",
+  query_not_select: "Not one statement that only reads", // the preview's words, a batch of several results too
   password_required: "The source connection needs its password",
   connection_failed: "The source connection could not be opened",
   session_not_found: "The query's tab was closed",

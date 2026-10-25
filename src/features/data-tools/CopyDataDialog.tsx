@@ -1,9 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
-import { useId, useMemo, useState } from "react";
+import { useCallback, useId, useMemo, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
 import { Checkbox, FieldRow, Input, Radio } from "@/components/ui/Field";
-import type { TransferPlan } from "@/lib/api/types";
+import type { TransferPlan, TransferRequest } from "@/lib/api/types";
 import { cn } from "@/lib/cn";
 import { isImeKeyEvent } from "@/lib/ime";
 import { useStagedEdits } from "@/stores/stagedEdits";
@@ -37,7 +37,7 @@ import type { CopyEntry } from "./entryPoints";
 import { fetchTransferPlan } from "./jobsApi";
 import { startJob } from "./jobsStore";
 import { ConnectionLine, FilterCode, ignoreHeldReturn, ReadProblem } from "./JobViews";
-import { previewProblems, tablesToDraw } from "./mappingRows";
+import { drawnNote, previewProblems, tablesToDraw } from "./mappingRows";
 import { MappingTable } from "./MappingTable";
 import { databaseNodes } from "./runForm";
 import { TableChecks } from "./TableChecks";
@@ -51,7 +51,9 @@ const NO_DATABASE_FOR_SCHEMAS = "Choose the database first: its schemas are list
 
 /**
  * The preview: what blocks the copy (each problem once, in red), each table's mapping and statements, then the warnings
- * once each. `stale`: it is the preview of the choices before, dimmed until the next one arrives.
+ * once each. `stale`: it is the preview of the choices before, dimmed until the next one arrives. Past PREVIEW_TABLES,
+ * a table the user changed stays drawn, in its place among those with a problem (a table just fixed would otherwise
+ * leave the list as its problem goes: the UI re-review's Low).
  */
 function Preview({
   plan,
@@ -65,9 +67,15 @@ function Preview({
   onChange: (form: CopyForm) => void;
 }) {
   const [all, setAll] = useState(false);
+  const [changed, setChanged] = useState<readonly string[]>([]);
   const problems = previewProblems(plan);
   const warnings = [...new Set([...plan.warnings, ...plan.tables.flatMap((table) => table.warnings)])];
-  const drawn = tablesToDraw(plan.tables, all ? Infinity : PREVIEW_TABLES);
+  const drawn = tablesToDraw(plan.tables, all ? Infinity : PREVIEW_TABLES, changed);
+  const note = drawnNote(plan.tables, drawn, changed);
+  const changeOf = (key: string) => (next: CopyForm) => {
+    if (!changed.includes(key)) setChanged([...changed, key]);
+    onChange(next);
+  };
   return (
     <div className={cn("flex flex-col gap-3 transition-opacity", stale && "opacity-60")}>
       {problems.length > 0 && (
@@ -84,12 +92,12 @@ function Preview({
           <p className="text-[12px] font-medium [overflow-wrap:anywhere]" data-selectable>
             {table.source} → {table.target}
           </p>
-          <MappingTable table={table} form={form} onChange={onChange} />
+          <MappingTable table={table} form={form} onChange={changeOf(table.source_key)} />
         </div>
       ))}
-      {drawn.length < plan.tables.length && (
+      {note !== null && (
         <p className="flex items-center gap-2 text-[12px] text-muted">
-          Showing the first {drawn.length.toLocaleString()} of {plan.tables.length.toLocaleString()} tables
+          {note}
           <Button size="sm" onClick={() => setAll(true)}>
             Show all
           </Button>
@@ -144,7 +152,13 @@ export function CopyDataDialog({ entry, form: preset }: { entry: CopyEntry; form
     const fresh = copyRequest(entry, form, tables);
     return fresh === null ? null : JSON.stringify(fresh);
   }, [entry, form, tables]);
-  const { request, read: plan, shown: shownPlan, behind, current: readPlan } = useSettledRead("copyPlan", requestKey, fetchTransferPlan);
+  // The dialog's own id: a preview it asked for before a newer one stops reading between tables (06c final review)
+  const [previewKey] = useState(() => crypto.randomUUID());
+  const readCopyPlan = useCallback(
+    (body: TransferRequest, signal: AbortSignal) => fetchTransferPlan(body, signal, previewKey),
+    [previewKey],
+  );
+  const { request, read: plan, shown: shownPlan, behind, current: readPlan } = useSettledRead("copyPlan", requestKey, readCopyPlan);
   const problem = copyProblem(entry, form, tables, readPlan, behind);
 
   const staged = useStagedEdits(entry.tabId ?? "");
@@ -261,6 +275,7 @@ export function CopyDataDialog({ entry, form: preset }: { entry: CopyEntry; form
             onChange={pickTarget}
             tool="copy_data"
             refusal={targetRefusal}
+            excludeSystem
           >
             {form.targetProfileId && schemaInDatabase && (
               <DatabasePicker

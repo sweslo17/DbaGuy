@@ -3713,7 +3713,7 @@ export interface components {
              * Code
              * @enum {string}
              */
-            code: "target_exists" | "target_missing" | "target_not_writable" | "unmappable_type" | "invalid_type" | "same_table" | "same_sqlite_file" | "source_missing" | "missing_column" | "unconvertible" | "query_not_select" | "no_columns" | "duplicate_column" | "invalid_filter" | "duplicate_target" | "cascade_loop";
+            code: "target_exists" | "target_missing" | "target_not_writable" | "unmappable_type" | "invalid_type" | "same_table" | "same_sqlite_file" | "source_missing" | "missing_column" | "unconvertible" | "query_not_select" | "no_columns" | "duplicate_column" | "invalid_filter" | "duplicate_target" | "cascade_loop" | "name_too_long";
             /** Message */
             message: string;
             /** Column */
@@ -3723,6 +3723,8 @@ export interface components {
         TransferRequest: {
             source: components["schemas"]["SourceSpec"];
             target: components["schemas"]["TargetSpec"];
+            /** Preview Key */
+            preview_key?: string | null;
         };
         /** UncheckedColumn */
         UncheckedColumn: {

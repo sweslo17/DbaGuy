@@ -10178,7 +10178,8 @@
               "duplicate_column",
               "invalid_filter",
               "duplicate_target",
-              "cascade_loop"
+              "cascade_loop",
+              "name_too_long"
             ],
             "title": "Code"
           },
@@ -10213,6 +10214,19 @@
           },
           "target": {
             "$ref": "#/components/schemas/TargetSpec"
+          },
+          "preview_key": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preview Key"
           }
         },
         "additionalProperties": false,

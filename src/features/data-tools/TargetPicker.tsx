@@ -15,7 +15,9 @@ const readOnlyReason = (profile: Profile): string | null => (profile.read_only ?
  * Where Run SQL file runs, or where a copy goes (spec ⑥ §3.6): the connection, among those whose engine has the tool
  * (`tool`; one it refuses greyed with why: a read-only one), and its database where the engine has them (MySQL: its
  * schemas). The trigger reads as the query tab's: a red connection on a red chip. Picking a connection gives its default
- * database (`onChange(id, null)`). `children`: what follows the database (a copy's schema).
+ * database (`onChange(id, null)`). `children`: what follows the database (a copy's schema). `excludeSystem`: the
+ * system databases and schemas are not offered (a copy's target: master, mysql, sys take no copied tables; a run may
+ * still go there).
  */
 export function TargetPicker({
   profileId,
@@ -24,6 +26,7 @@ export function TargetPicker({
   tool = "run_file",
   refusal = readOnlyReason,
   children,
+  excludeSystem = false,
 }: {
   profileId: string | null;
   database: string | null;
@@ -31,6 +34,7 @@ export function TargetPicker({
   tool?: keyof Pick<EngineInfo, "run_file" | "copy_data">;
   refusal?: (profile: Profile) => string | null;
   children?: ReactNode;
+  excludeSystem?: boolean;
 }) {
   const profiles = useProfiles();
   const engines = useEngines();
@@ -66,6 +70,7 @@ export function TargetPicker({
           profileId={profileId}
           current={database}
           nodeKind={nodes}
+          excludeSystem={excludeSystem}
           onPick={(name) => name !== database && onChange(profileId, name)}
         />
       )}

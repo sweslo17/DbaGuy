@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ApiError } from "@/lib/api/client";
 import type { ColumnMapping, EngineInfo, ObjectNode, PathSegment, Profile, TableTransfer, TransferPlan } from "@/lib/api/types";
 import {
+  askPreviewAgain,
   copyCommand,
   copyDialogTitle,
   copyJobTitle,
@@ -10,6 +11,7 @@ import {
   initialCopyForm,
   MODE_HINTS,
   passwordOwner,
+  PREVIEW_SUPERSEDED,
   QUERY_TABLE,
   requestProblem,
   restForm,
@@ -19,7 +21,16 @@ import {
   type CopyForm,
 } from "./copyForm";
 import type { CopyEntry } from "./entryPoints";
-import { mappingRows, previewProblems, statementLines, tablesToDraw, withIdentity, withLeftOut, withOverride } from "./mappingRows";
+import {
+  drawnNote,
+  mappingRows,
+  previewProblems,
+  statementLines,
+  tablesToDraw,
+  withIdentity,
+  withLeftOut,
+  withOverride,
+} from "./mappingRows";
 
 /* Copy data's form and its column mapping (spec ⑥ §3.6 CopyDataDialog, MappingTable; 06c Task 6). */
 
@@ -227,6 +238,28 @@ describe("the column mapping", () => {
     // more problems than the cap: all of them, nothing else
     expect(tablesToDraw(many, 1).map((t) => t.source)).toEqual(["c", "e"]);
     expect(tablesToDraw(many, Infinity)).toEqual(many);
+    // the note says what is drawn, literally (the UI re-review's Low): the first ones, or those ahead of their place
+    expect(drawnNote(many, tablesToDraw(many, 5))).toBeNull();
+    expect(drawnNote(many, tablesToDraw(many, 3))).toBe("Showing 3 of 5 tables: those with a problem or a change first");
+    const clean = many.map((table) => plain(table.source));
+    expect(drawnNote(clean, tablesToDraw(clean, 2))).toBe("Showing the first 2 of 5 tables");
+  });
+
+  it("keeps a table the user changed drawn, in its place, once its problem is gone", () => {
+    const plain = (name: string, problem = false): TableTransfer => ({
+      ...table, source: name, source_key: name, target: name, columns: [], before: [], after: [],
+      problems: problem ? [{ code: "unmappable_type", message: "x" }] : [],
+    });
+    const before = [plain("a"), plain("b"), plain("c"), plain("d", true), plain("e", true)];
+    expect(tablesToDraw(before, 3).map((t) => t.source)).toEqual(["d", "e", "a"]);
+    // d's type was typed over: its next preview has no problem, and d stays first instead of leaving the list
+    const after = [plain("a"), plain("b"), plain("c"), plain("d"), plain("e", true)];
+    expect(tablesToDraw(after, 3).map((t) => t.source)).toEqual(["e", "a", "b"]); // without it, d leaves the list
+    expect(tablesToDraw(after, 3, ["d"]).map((t) => t.source)).toEqual(["d", "e", "a"]);
+    expect(drawnNote(after, tablesToDraw(after, 3, ["d"]), ["d"])).toBe(
+      "Showing 3 of 5 tables: those with a problem or a change first",
+    );
+    expect(tablesToDraw(after, Infinity, ["d"]).map((t) => t.source)).toEqual(["a", "b", "c", "d", "e"]);
   });
 
   it("says the modes the way the backend ends them: rolled back where the table can be, not always", () => {
@@ -241,5 +274,18 @@ describe("the column mapping", () => {
     expect(statementFirstLine("x".repeat(500), 20)).toBe(`${"x".repeat(20)}…`);
     expect(statementFirstLine("")).toBe("");
     expect(statementFirstLine(`SELECT 1${" ".repeat(10_000)}\nSELECT 2`)).toBe("SELECT 1");
+    // never half an emoji (the UI re-review's Low): a cut that falls inside a surrogate pair leaves the pair out
+    expect(statementFirstLine(`${"x".repeat(19)}😀😀`, 20)).toBe(`${"x".repeat(19)}…`);
+    expect(statementFirstLine(`${"x".repeat(18)}😀😀`, 20)).toBe(`${"x".repeat(18)}😀…`);
+    expect(statementFirstLine(`${" ".repeat(79)}😀😀`, 20)).toBe(""); // the start read ends inside the first emoji
+    expect(statementFirstLine(`${" ".repeat(78)}😀😀`, 20)).toBe("😀");
+  });
+
+  it("asks a preview again only when the backend stopped it for a newer one that this read still waits for", () => {
+    const superseded = new ApiError("A newer preview was asked for", PREVIEW_SUPERSEDED, 409);
+    expect(askPreviewAgain(superseded, false)).toBe(true);
+    expect(askPreviewAgain(superseded, true)).toBe(false); // the dialog gave this read up: nobody waits for it
+    expect(askPreviewAgain(new ApiError("x", "query_failed", 400), false)).toBe(false);
+    expect(askPreviewAgain(new Error("network"), false)).toBe(false);
   });
 });
