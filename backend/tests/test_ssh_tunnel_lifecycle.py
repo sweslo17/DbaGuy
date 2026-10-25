@@ -59,7 +59,7 @@ class RecordingAdapter(DatabaseAdapter):
     def parse_url(self, url):
         raise NotImplementedError
 
-    def open(self, profile, endpoint: Endpoint | None, password, database):
+    def open(self, profile, endpoint: Endpoint | None, password, database, *, agent=False):
         self.endpoints.append(endpoint)
         self.passwords.append(password)
         return FakeConnection()

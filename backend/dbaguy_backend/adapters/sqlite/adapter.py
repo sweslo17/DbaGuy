@@ -324,7 +324,8 @@ class SqliteAdapter(DatabaseAdapter):
         return ParsedUrl(profile=SqliteProfileDraft(engine="sqlite", name=name, path=path))
 
     def open(
-        self, profile: AnyProfile, endpoint: Endpoint | None, password: str | None, database: str | None
+        self, profile: AnyProfile, endpoint: Endpoint | None, password: str | None, database: str | None,
+        *, agent: bool = False,
     ) -> DatabaseConnection:
         if not isinstance(profile, SqliteProfile):
             raise ValidationFailed("Not a SQLite profile")

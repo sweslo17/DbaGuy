@@ -667,7 +667,8 @@ class PostgresAdapter(DatabaseAdapter):
         return ParsedUrl(profile=draft, password=password)
 
     def open(
-        self, profile: AnyProfile, endpoint: Endpoint | None, password: str | None, database: str | None
+        self, profile: AnyProfile, endpoint: Endpoint | None, password: str | None, database: str | None,
+        *, agent: bool = False,
     ) -> DatabaseConnection:
         if not isinstance(profile, ServerProfile) or endpoint is None:
             raise ValidationFailed("Not a PostgreSQL server profile")

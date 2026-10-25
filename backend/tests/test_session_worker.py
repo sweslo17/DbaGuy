@@ -284,7 +284,7 @@ class GatedConnections:
         self.release = threading.Event()
         self.lease = FakeLease()
 
-    def open(self, profile, database, secrets):
+    def open(self, profile, database, secrets, *, agent=False):
         assert self.release.wait(10)
         return self.lease
 

@@ -774,7 +774,8 @@ class MssqlAdapter(DatabaseAdapter):
         return parse_mssql_url(url)
 
     def open(
-        self, profile: AnyProfile, endpoint: Endpoint | None, password: str | None, database: str | None
+        self, profile: AnyProfile, endpoint: Endpoint | None, password: str | None, database: str | None,
+        *, agent: bool = False,
     ) -> DatabaseConnection:
         if not isinstance(profile, ServerProfile) or endpoint is None:
             raise ValidationFailed("Not a SQL Server profile")

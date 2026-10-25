@@ -502,7 +502,7 @@ class CouchbaseAdapter(DatabaseAdapter, DocumentEngine):
         return endpoint_target(profile)
 
     def open(self, profile: AnyProfile, endpoint: Endpoint | None, password: str | None,
-             database: str | None) -> DatabaseConnection:
+             database: str | None, *, agent: bool = False) -> DatabaseConnection:
         """Spec §3.6.3: the candidate nodes in order (discovered or given), the first that answers. A refused, timed
         out or unknown node: the next one; a login or TLS failure: at once (another node would say the same). Runs on
         the worker's open path; discovery is bounded by its own deadline (R-04a-C19)."""

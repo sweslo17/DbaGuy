@@ -46,13 +46,17 @@ class ConnectionService:
         secrets: ResolvedSecrets | None = None,
         *,
         share_tunnel: bool = True,
+        agent: bool = False,
     ) -> ConnectionLease:
-        """`share_tunnel=False`: use an SSH tunnel of its own, never one that sessions are using."""
+        """`share_tunnel=False`: use an SSH tunnel of its own, never one that sessions are using. `agent`: an MCP
+        agent's connection (spec ⑧ D-08-4): opened read-only, whatever the profile says."""
+        if agent:
+            profile = profile.model_copy(update={"read_only": True})
         secrets = secrets if secrets is not None else self._profiles.resolve_secrets(profile)
         adapter = self._registry.get(profile.engine)
         endpoint, release = self._endpoint(adapter, profile, secrets, share_tunnel)
         try:
-            connection = adapter.open(profile, endpoint, secrets.password, database)
+            connection = adapter.open(profile, endpoint, secrets.password, database, agent=agent)
         except BaseException:
             release()
             raise

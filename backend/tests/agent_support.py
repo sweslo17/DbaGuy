@@ -16,12 +16,28 @@ import pytest
 from dbaguy_backend.agent.token_store import InMemoryTokenStore
 from dbaguy_backend.config import Settings
 from dbaguy_backend.container import AppContainer
+from dbaguy_backend.domain.profiles import AnyProfile, ProfileUpsertRequest
 from dbaguy_backend.domain.settings import McpSettings
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
+
+from .support import COUCHBASE_PASSWORD, MSSQL_PASSWORD, MYSQL_PASSWORD, PG_PASSWORD
 
 TOKEN = "test-token"
 MCP_TOKEN = "mcp-test-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
+
+PASSWORDS = {"postgres": PG_PASSWORD, "mysql": MYSQL_PASSWORD, "mssql": MSSQL_PASSWORD,
+             "couchbase": COUCHBASE_PASSWORD}
+
+
+def share(container: AppContainer, profile: AnyProfile, access: str = "query", **changes: Any) -> str:
+    """Save `profile` (a support.make_*_profile, or a SqliteProfile) in the container, shared at `access`, with the dev
+    password; its id."""
+    draft = profile.model_dump(exclude={"id"}) | {"mcp_access": access, **changes}
+    request = ProfileUpsertRequest.model_validate({"profile": draft,
+                                                   "secrets": {"password": PASSWORDS.get(profile.engine)}})
+    return str(container.profiles.create(request).profile.id)
 
 
 def free_port() -> int:

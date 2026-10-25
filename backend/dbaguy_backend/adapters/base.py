@@ -411,8 +411,11 @@ class DatabaseAdapter(ABC):
         endpoint: Endpoint | None,
         password: str | None,
         database: str | None,
+        *,
+        agent: bool = False,
     ) -> DatabaseConnection:
-        """Open a connection. Raises ConnectionFailed."""
+        """Open a connection. Raises ConnectionFailed. `agent`: an MCP agent's connection (spec ⑧ D-08-4), always on a
+        read-only copy of the profile; an engine whose read-only session leaves a way to write locks it further."""
 
     def endpoint_target(self, profile: ServerProfile) -> tuple[str, int]:
         """Where a connection to `profile` goes (directly, or as the SSH tunnel's target): the profile's host and port,

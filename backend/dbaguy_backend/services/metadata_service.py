@@ -17,7 +17,7 @@ from .connection_service import ConnectionService
 from .profile_service import ProfileService
 
 T = TypeVar("T")
-_Key = tuple[UUID, str | None]
+_Key = tuple[UUID, str | None, bool]  # (profile, database, an MCP agent's: spec ⑧ D-08-11)
 
 WRITE_TIMEOUT_S = 120.0  # how long a write waits for its answer, time queued behind another call included (as a read)
 _NOT_SENT = "Timed out waiting for the connection: nothing was sent"
@@ -69,7 +69,9 @@ class _MetaEntry:
 
 
 class MetadataService:
-    """Object-tree queries on dedicated metadata connections, one per (profile, database)."""
+    """Object-tree queries on dedicated metadata connections, one per (profile, database), and one more per (profile,
+    database) for MCP agents (`agent=True`, spec ⑧ D-08-11): opened read-only (`ConnectionService.open(agent=True)`), so
+    an agent's schema tools never run on the profile's writable connection. Both close after the same idle time."""
 
     def __init__(
         self, registry: AdapterRegistry, connections: ConnectionService, profiles: ProfileService,
@@ -84,11 +86,11 @@ class MetadataService:
         self._key_locks: dict[_Key, threading.Lock] = {}
         self._lock = threading.Lock()
 
-    def children(self, request: MetadataRequest) -> list[ObjectNode]:
-        return self._call(request, lambda c: c.list_children(request.path))
+    def children(self, request: MetadataRequest, *, agent: bool = False) -> list[ObjectNode]:
+        return self._call(request, lambda c: c.list_children(request.path), agent)
 
-    def detail(self, request: MetadataRequest) -> ObjectDetail:
-        return self._call(request, lambda c: c.object_detail(request.path))
+    def detail(self, request: MetadataRequest, *, agent: bool = False) -> ObjectDetail:
+        return self._call(request, lambda c: c.object_detail(request.path), agent)
 
     def invalidate(self, profile_id: UUID) -> None:
         with self._lock:
@@ -104,14 +106,16 @@ class MetadataService:
             self._drop(key, worker)
         return len(idle)
 
-    def close_all(self) -> None:
+    def close_all(self, *, agents_only: bool = False) -> None:
+        """Close every metadata connection, or (`agents_only`, the MCP server stopped) every agent's."""
         with self._lock:
-            entries = [(k, e.worker) for k, e in self._workers.items()]
+            entries = [(k, e.worker) for k, e in self._workers.items() if not agents_only or k[2]]
         for key, worker in entries:
             self._drop(key, worker)
 
     def with_connection(
-        self, profile_id: UUID, database: str | None, fn: Callable[[DatabaseConnection], T], *, retry: bool = True
+        self, profile_id: UUID, database: str | None, fn: Callable[[DatabaseConnection], T], *, retry: bool = True,
+        agent: bool = False,
     ) -> T:
         """Run `fn` on the metadata connection of (profile, database), reconnecting once if it was lost.
 
@@ -125,17 +129,23 @@ class MetadataService:
         trip that had to go before the write failed, ruling C40) is QueryFailed, nothing was sent, and the connection is
         dropped. Any other failure after it started that is not a DomainError (the timeout, an unexpected error) is
         WriteOutcomeUnknown: it may have been applied.
+
+        `agent`: on the agents' read-only connection of (profile, database) (D-08-11); never a write.
         """
         profile = self._profiles.get(profile_id)
         adapter = self._registry.get(profile.engine)
         target = database if adapter.capabilities.per_database_connection else None
-        return self._call_on(profile, target, fn) if retry else self._write_on(profile, target, fn)
+        if agent and not retry:
+            raise ValueError("an agent's metadata connection never writes")
+        return self._call_on(profile, target, fn, agent) if retry else self._write_on(profile, target, fn)
 
-    def _call(self, request: MetadataRequest, fn: Callable[[DatabaseConnection], T]) -> T:
-        return self.with_connection(request.profile_id, path_database(request.path), fn)
+    def _call(self, request: MetadataRequest, fn: Callable[[DatabaseConnection], T], agent: bool = False) -> T:
+        return self.with_connection(request.profile_id, path_database(request.path), fn, agent=agent)
 
-    def _call_on(self, profile: AnyProfile, database: str | None, fn: Callable[[DatabaseConnection], T]) -> T:
-        key = (profile.id, database)
+    def _call_on(
+        self, profile: AnyProfile, database: str | None, fn: Callable[[DatabaseConnection], T], agent: bool = False,
+    ) -> T:
+        key = (profile.id, database, agent)
         for attempt in (1, 2):
             worker = self._worker(key, profile, database)
             try:
@@ -160,7 +170,7 @@ class MetadataService:
     def _write_on(self, profile: AnyProfile, database: str | None, fn: Callable[[DatabaseConnection], T]) -> T:
         """`with_connection(retry=False)`. A DomainError is the call's own answer and passes through untouched, except
         the worker's own refusal to run it (SessionBusy: closed meanwhile), which means nothing was sent."""
-        key = (profile.id, database)
+        key = (profile.id, database, False)
         worker = self._worker(key, profile, database)
         call = _WriteCall(fn)
         try:
@@ -210,9 +220,10 @@ class MetadataService:
                 if entry is not None:
                     return entry.worker
             secrets = self._profiles.resolve_secrets(profile)
+            agent = key[2]
             worker = SessionWorker(
-                f"meta:{profile.name}:{database or '-'}",
-                lambda: self._connections.open(profile, database, secrets),
+                f"{'mcp-meta' if agent else 'meta'}:{profile.name}:{database or '-'}",
+                lambda: self._connections.open(profile, database, secrets, agent=agent),
             )
             try:
                 worker.start()

@@ -100,7 +100,7 @@ class FakeAdapter(DatabaseAdapter):
     def parse_url(self, url):
         return ParsedUrl(profile=SqliteProfileDraft(engine="sqlite", name="fake", path=url))
 
-    def open(self, profile, endpoint, password, database):
+    def open(self, profile, endpoint, password, database, *, agent=False):
         raise NotImplementedError
 
 

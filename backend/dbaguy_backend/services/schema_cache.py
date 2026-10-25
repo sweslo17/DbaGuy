@@ -7,7 +7,7 @@ from uuid import UUID
 
 from loguru import logger
 
-from ..adapters.base import DatabaseAdapter
+from ..adapters.base import DatabaseAdapter, DatabaseConnection
 from ..adapters.registry import AdapterRegistry
 from ..domain.schema import ObjectSearchHit, RelationKind, SchemaSnapshot
 from ..sql.completion import SnapshotIndex
@@ -40,6 +40,10 @@ class _Match(NamedTuple):
 _SortKey = tuple[int, bool, int, int, str]  # rank, system, search-path position, name length, name
 
 
+def _snapshot_of(connection: DatabaseConnection) -> SchemaSnapshot:
+    return connection.schema_snapshot()
+
+
 def _is_subsequence(needle: str, text: str) -> bool:
     """True when every character of `needle` occurs in `text`, in order (not necessarily adjacent)."""
     remaining = iter(text)
@@ -65,6 +69,9 @@ class SchemaCache:
 
     A failed build is remembered for `failure_ttl_s` and re-raised without reconnecting: completion asks for the
     snapshot on every keystroke, and an unreachable server must not cost a connect timeout each time.
+
+    An MCP agent's request (`agent=True`, spec ⑧ D-08-11) uses the same snapshot when there is one (data in memory, no
+    connection); when one must be built, it is built on the agents' read-only metadata connection.
     """
 
     def __init__(
@@ -100,8 +107,8 @@ class SchemaCache:
             entry = self._entries.get(key)
         return entry.snapshot if entry else None
 
-    def get(self, profile_id: UUID, database: str | None = None) -> SchemaSnapshot:
-        snapshot = self._snapshot(profile_id, self._scope(profile_id, database), wait=True)
+    def get(self, profile_id: UUID, database: str | None = None, *, agent: bool = False) -> SchemaSnapshot:
+        snapshot = self._snapshot(profile_id, self._scope(profile_id, database), wait=True, agent=agent)
         assert snapshot is not None  # waiting always ends in a snapshot or an exception
         return snapshot
 
@@ -143,7 +150,9 @@ class SchemaCache:
                 for key in [k for k in store if k[0] == profile_id and (database is None or k[1] == database)]:
                     del store[key]
 
-    def search(self, profile_id: UUID, q: str, database: str | None = None, limit: int = 50) -> list[ObjectSearchHit]:
+    def search(
+        self, profile_id: UUID, q: str, database: str | None = None, limit: int = 50, *, agent: bool = False,
+    ) -> list[ObjectSearchHit]:
         """Tables and views whose name matches `q` (or `schema.name`): exact, prefix, substring, then subsequence.
         Couchbase collections the same way (B20): the text before the last dot has to prefix the scope or
         `bucket.scope`, so `inventory.airl` and `travel-sample.inventory.airl` both narrow to one scope."""
@@ -151,7 +160,7 @@ class SchemaCache:
         needle, schema_needle = name_part.strip().lower(), schema_part.strip().lower()
         if not needle and not schema_needle:
             return []
-        snapshot = self.get(profile_id, database)
+        snapshot = self.get(profile_id, database, agent=agent)
         adapter = self._adapter(profile_id)
         search_path = {name.lower(): position for position, name in enumerate(snapshot.search_path)}
         scored: list[tuple[_SortKey, _Match]] = []
@@ -188,7 +197,9 @@ class SchemaCache:
     def _adapter(self, profile_id: UUID) -> DatabaseAdapter:
         return self._registry.get(self._profiles.get(profile_id).engine)
 
-    def _snapshot(self, profile_id: UUID, database: str | None, wait: bool) -> SchemaSnapshot | None:
+    def _snapshot(
+        self, profile_id: UUID, database: str | None, wait: bool, agent: bool = False,
+    ) -> SchemaSnapshot | None:
         """The cached snapshot, else a build (one per key; other keys are not blocked). Without `wait`, while another
         thread is building this key: the expired snapshot it replaces, or None when there is none."""
         key = self._key(profile_id, database)
@@ -211,7 +222,7 @@ class SchemaCache:
                 if cached is not None:
                     return cached
                 epoch = self._epoch
-            return self._build(key, profile_id, database, epoch)
+            return self._build(key, profile_id, database, epoch, agent)
         finally:
             key_lock.release()
 
@@ -227,10 +238,13 @@ class SchemaCache:
             raise failure.error.with_traceback(None)  # a fresh traceback each time, or the stored one would only grow
         return None
 
-    def _build(self, key: _Key, profile_id: UUID, database: str | None, epoch: int) -> SchemaSnapshot:
+    def _build(self, key: _Key, profile_id: UUID, database: str | None, epoch: int, agent: bool) -> SchemaSnapshot:
         started = time.monotonic()
         try:
-            snapshot = self._metadata.with_connection(profile_id, database, lambda c: c.schema_snapshot())
+            if agent:  # the agents' read-only connection (D-08-11)
+                snapshot = self._metadata.with_connection(profile_id, database, _snapshot_of, agent=True)
+            else:
+                snapshot = self._metadata.with_connection(profile_id, database, _snapshot_of)
         except Exception as exc:
             logger.warning("Could not build the schema snapshot of {} ({}); retrying in {:.0f} s", profile_id, exc,
                            self._failure_ttl)

@@ -6,21 +6,23 @@ import json
 import re
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Annotated, Any
 
 import anyio
 from loguru import logger
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
+from pydantic import Field
 from starlette.datastructures import Headers
 from starlette.responses import Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from ..domain.metadata import PathSegment
 from ..domain.well_formed import well_formed
 from ..tokens import same_token
 from ..version import app_version
-from .tools import AgentTools, ToolFailure
+from .tools import LIMIT_MAX, LIST_LIMIT, SEARCH_LIMIT, AgentTools, ToolFailure
 
 MCP_PATH = "/mcp"
 MAX_BODY_BYTES = 1024 * 1024  # R-08-4
@@ -37,6 +39,10 @@ INSTRUCTIONS = (
     "DbaGuy's checks only. Couchbase takes a query_context (bucket.scope)."
 )
 _READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+Connection = Annotated[str, Field(min_length=1, max_length=200, description="A connection's id or name")]
+ObjectPath = Annotated[list[PathSegment], Field(max_length=12, description="A `path` list_objects or search_objects "
+                                                                           "returned, passed back as it is")]
+Name = Annotated[str, Field(min_length=1, max_length=1000)]
 
 
 class BearerGate:
@@ -127,6 +133,57 @@ def build_server(tools: AgentTools) -> MCPServer:
             "('schema': names and definitions only; 'query': also run_query and explain), the default database, "
             "whether the server or only DbaGuy enforces read-only, whether it needs unlocking in DbaGuy first, and "
             "what the login may do beyond reading (null until a call has used the connection)."
+        ),
+    )
+
+    async def list_objects(
+        connection: Connection, ctx: Context, path: ObjectPath | None = None,
+        limit: Annotated[int, Field(ge=1, le=LIMIT_MAX)] = LIST_LIMIT,
+    ) -> CallToolResult:
+        client = client_name(ctx)
+        return await run_tool("list_objects", client,
+                              lambda: tools.list_objects(connection, path, limit, client=client))
+
+    server.add_tool(
+        list_objects, name="list_objects", annotations=_READ_ONLY, structured_output=False,
+        description=(
+            "Read-only. Needs 'schema' access or more. The objects one level under `path` (none: the top level: "
+            "databases, schemas or buckets): kind, name, `path` (pass it back to go deeper or to describe), whether it "
+            "has children, a short detail. Reads no rows."
+        ),
+    )
+
+    async def search_objects(
+        connection: Connection, pattern: Name, ctx: Context, database: Name | None = None,
+        include_columns: bool = False, limit: Annotated[int, Field(ge=1, le=LIMIT_MAX)] = SEARCH_LIMIT,
+    ) -> CallToolResult:
+        client = client_name(ctx)
+        return await run_tool("search_objects", client, lambda: tools.search_objects(
+            connection, pattern, database, include_columns, limit, client=client))
+
+    server.add_tool(
+        search_objects, name="search_objects", annotations=_READ_ONLY, structured_output=False,
+        description=(
+            "Read-only. Needs 'schema' access or more. Tables, views and Couchbase collections whose name matches "
+            "`pattern` (exact, prefix, substring, then fuzzy; `schema.name` narrows by schema, `database` by database "
+            "or bucket); with include_columns, also those with a column whose name contains `pattern`. Reads no rows."
+        ),
+    )
+
+    async def describe(
+        connection: Connection, ctx: Context, path: ObjectPath | None = None, database: Name | None = None,
+        schema: Name | None = None, name: Name | None = None, include_ddl: bool = False,
+    ) -> CallToolResult:
+        client = client_name(ctx)
+        return await run_tool("describe", client, lambda: tools.describe(
+            connection, path, database, schema, name, include_ddl, client=client))
+
+    server.add_tool(
+        describe, name="describe", annotations=_READ_ONLY, structured_output=False,
+        description=(
+            "Read-only. Needs 'schema' access or more. One table, view or collection, by `path` or by name (`schema` "
+            "and `database` narrow it): columns with types, nullability and defaults, primary key, foreign keys, "
+            "indexes, comment; its DDL with include_ddl. Reads no rows."
         ),
     )
     return server

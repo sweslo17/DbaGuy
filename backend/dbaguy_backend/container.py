@@ -116,7 +116,7 @@ class AppContainer:
             self.transfers.plans,
         )
         self.sessions = SessionManager(self.connections, self.profiles, hooks, jobs=self.jobs)
-        self.agent_tools = AgentTools(self.profiles, self.registry)
+        self.agent_tools = AgentTools(self.profiles, self.registry, self.metadata, self.schema_cache)
         self.agent_host = AgentHost(
             self.agent_tools, token_store or _token_store(settings, secret_store), default_mcp_port(data_dir),
             on_stop=self._close_agents,
@@ -136,6 +136,7 @@ class AppContainer:
 
     def _close_agents(self) -> None:
         """The MCP server stopped: nothing an agent opened stays open."""
+        self.metadata.close_all(agents_only=True)
 
     def _housekeep(self) -> None:
         while not self._stop.wait(_HOUSEKEEPING_INTERVAL_S):
