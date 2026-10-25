@@ -46,16 +46,15 @@ jobs:
         with:
           workspaces: src-tauri
 
-      # Homebrew's Python: build-backend.sh requires the venv's OpenSSL to be the one pymssql's wheel bundles, and fails
-      # loudly when they differ (CLAUDE.md, 打包流程)
+      # Homebrew's Python: build-backend.sh requires the venv's OpenSSL to be the series pymssql's wheel bundles, and
+      # fails loudly when it is not (CLAUDE.md, 打包流程). The in-project venv is made here, so Poetry uses it (its own
+      # `env use` picked the runner's default Python 3.14).
       - name: Python 3.13 and Poetry
         run: |
           brew install python@3.13
-          python="$(brew --prefix python@3.13)/bin/python3.13"
+          "$(brew --prefix python@3.13)/bin/python3.13" -m venv backend/.venv
+          backend/.venv/bin/python -c 'import ssl, sys; print(sys.version.split()[0], ssl.OPENSSL_VERSION)'
           pipx install "poetry==$POETRY_VERSION"
-          cd backend
-          poetry env use "$python"
-          .venv/bin/python -c 'import ssl, sys; print(sys.version.split()[0], ssl.OPENSSL_VERSION)'
 
       - uses: actions/cache@v4
         with:

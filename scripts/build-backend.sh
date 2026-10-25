@@ -24,8 +24,10 @@ if [[ -z "$(find dist/dbaguy-backend -name '_mssql*.so' | head -n 1)" ]]; then
 fi
 
 # One OpenSSL for the whole bundle: PyInstaller links Python's _ssl and _hashlib (and psycopg's libpq) to the
-# libssl/libcrypto it took from pymssql (pymssql/.dylibs). That is safe only while it is the OpenSSL the venv's Python
-# was built against; fail when the versions differ (e.g. a pymssql wheel built with another OpenSSL).
+# libssl/libcrypto it took from pymssql (pymssql/.dylibs). That is safe only while it is the OpenSSL series the venv's
+# Python was built against: OpenSSL's patch releases (3.6.3, 3.6.4) keep the ABI and add no symbols, a minor release
+# (3.5 → 3.6) adds symbols. Fail when the major.minor differs (e.g. a pymssql wheel built with another OpenSSL series);
+# a patch difference is fine (Homebrew moves its openssl@3 ahead of the wheel's: the release runner did).
 crypto="$(find dist/dbaguy-backend/_internal -maxdepth 1 -name 'libcrypto*.dylib' | head -n 1)"
 if [[ -z "$crypto" ]]; then
   echo "error: no libcrypto in the bundle's _internal; the OpenSSL check cannot run" >&2
@@ -36,11 +38,11 @@ bundled_ssl="$(.venv/bin/python -I -c 'import ctypes, sys
 lib = ctypes.CDLL(sys.argv[1]); lib.OpenSSL_version.restype = ctypes.c_char_p
 print(" ".join(lib.OpenSSL_version(0).decode().split()[:2]))' "$crypto")"
 venv_ssl="$(.venv/bin/python -I -c 'import ssl; print(" ".join(ssl.OPENSSL_VERSION.split()[:2]))')"
-if [[ "$bundled_ssl" != "$venv_ssl" ]]; then
-  echo "error: the bundle's OpenSSL ($bundled_ssl, $crypto) is not the one the venv's Python uses ($venv_ssl)" >&2
+if [[ "${bundled_ssl%.*}" != "${venv_ssl%.*}" ]]; then  # "OpenSSL 3.6.3" → "OpenSSL 3.6"
+  echo "error: the bundle's OpenSSL ($bundled_ssl, $crypto) is not the series the venv's Python uses ($venv_ssl)" >&2
   exit 1
 fi
-echo "OpenSSL in the bundle: $bundled_ssl (same as the venv's Python)"
+echo "OpenSSL in the bundle: $bundled_ssl (the venv's Python: $venv_ssl, the same series)"
 
 find "$DEST" -mindepth 1 ! -name .gitkeep -exec rm -rf {} +
 cp -R dist/dbaguy-backend/. "$DEST/"
