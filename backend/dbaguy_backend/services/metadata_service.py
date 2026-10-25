@@ -19,12 +19,20 @@ from .profile_service import ProfileService
 T = TypeVar("T")
 _Key = tuple[UUID, str | None, bool]  # (profile, database, an MCP agent's: spec ⑧ D-08-11)
 
+# The agents' catalog connections held at once: past it, the one used longest ago closes (task 2 fix round 1, I-1). As
+# many as the agent sessions D-08-1 allows; an agent works in one to three databases at a time.
+MAX_AGENT_CONNECTIONS = 8
 WRITE_TIMEOUT_S = 120.0  # how long a write waits for its answer, time queued behind another call included (as a read)
 _NOT_SENT = "Timed out waiting for the connection: nothing was sent"
 _NOT_STARTED = "The write could not start on the connection: nothing was sent"
 _CLOSED = "The connection was closed before the write started: nothing was sent"
 _UNKNOWN = "{}: the write may or may not have been applied. Reload to see what the server holds"
 _FAILED_AFTER_START = "The write failed after it started"  # `fn` raised: an error of its own, or a timeout of its own
+
+
+def _code(exc: Exception) -> str:
+    """An error's code (a server's, or its type): what a log line above DEBUG may say of it."""
+    return str(getattr(exc, "code", None) or type(exc).__name__)
 
 
 class _WriteCall[R]:
@@ -71,7 +79,8 @@ class _MetaEntry:
 class MetadataService:
     """Object-tree queries on dedicated metadata connections, one per (profile, database), and one more per (profile,
     database) for MCP agents (`agent=True`, spec ⑧ D-08-11): opened read-only (`ConnectionService.open(agent=True)`), so
-    an agent's schema tools never run on the profile's writable connection. Both close after the same idle time."""
+    an agent's schema tools never run on the profile's writable connection. Both close after the same idle time; the
+    agents hold at most MAX_AGENT_CONNECTIONS, and none outlives the MCP server (`close_all(agents_only=True)`)."""
 
     def __init__(
         self, registry: AdapterRegistry, connections: ConnectionService, profiles: ProfileService,
@@ -84,6 +93,7 @@ class MetadataService:
         self._write_timeout = write_timeout
         self._workers: dict[_Key, _MetaEntry] = {}
         self._key_locks: dict[_Key, threading.Lock] = {}
+        self._agents_closed = 0  # bumped when the MCP server stops: an agent's call that began before keeps nothing open
         self._lock = threading.Lock()
 
     def children(self, request: MetadataRequest, *, agent: bool = False) -> list[ObjectNode]:
@@ -109,6 +119,8 @@ class MetadataService:
     def close_all(self, *, agents_only: bool = False) -> None:
         """Close every metadata connection, or (`agents_only`, the MCP server stopped) every agent's."""
         with self._lock:
+            if agents_only:
+                self._agents_closed += 1
             entries = [(k, e.worker) for k, e in self._workers.items() if not agents_only or k[2]]
         for key, worker in entries:
             self._drop(key, worker)
@@ -146,7 +158,11 @@ class MetadataService:
         self, profile: AnyProfile, database: str | None, fn: Callable[[DatabaseConnection], T], agent: bool = False,
     ) -> T:
         key = (profile.id, database, agent)
+        with self._lock:
+            began = self._agents_closed
         for attempt in (1, 2):
+            if agent and attempt == 2 and self._agents_stopped_since(began):
+                raise SessionBusy("The MCP server stopped while the call ran")  # never reopened after the stop
             worker = self._worker(key, profile, database)
             try:
                 return worker.call(fn)
@@ -164,8 +180,18 @@ class MetadataService:
                 if attempt == 2:
                     message = exc.message if isinstance(exc, StatementError) else str(exc)
                     raise QueryFailed(message) from exc
-                logger.warning("Metadata query failed on {} ({}); reconnecting", profile.name, exc)
+                # An agent's names reach the server's error text (MySQL quotes them): its code only, the text at DEBUG
+                logger.warning("Metadata query failed on {} ({}); reconnecting", profile.name,
+                               _code(exc) if agent else exc)
+                logger.opt(exception=exc).debug("Metadata query failed on {}", profile.name)
+            finally:
+                if agent and self._agents_stopped_since(began):
+                    self._drop(key, worker)  # it ended after the MCP server stopped: nothing an agent opened stays open
         raise AssertionError("unreachable")
+
+    def _agents_stopped_since(self, began: int) -> bool:
+        with self._lock:
+            return self._agents_closed != began
 
     def _write_on(self, profile: AnyProfile, database: str | None, fn: Callable[[DatabaseConnection], T]) -> T:
         """`with_connection(retry=False)`. A DomainError is the call's own answer and passes through untouched, except
@@ -232,7 +258,20 @@ class MetadataService:
                 raise
             with self._lock:
                 self._workers[key] = _MetaEntry(worker=worker, last_used=time.monotonic())
+            if key[2]:
+                self._trim_agents(keep=key)
             return worker
+
+    def _trim_agents(self, keep: _Key) -> None:
+        """Past MAX_AGENT_CONNECTIONS, close the agents' connections used longest ago (never `keep`, just opened). A read
+        that was waiting on one of them goes to a new connection (`_call_on`'s one reconnect)."""
+        with self._lock:
+            others = sorted(((e.last_used, k, e.worker) for k, e in self._workers.items() if k[2] and k != keep),
+                            key=lambda found: found[0])
+        for _, key, worker in others[: max(0, len(others) + 1 - MAX_AGENT_CONNECTIONS)]:
+            logger.info("The agents' catalog connections are at the limit ({}): closing the one used longest ago",
+                        MAX_AGENT_CONNECTIONS)
+            self._drop(key, worker)
 
     def _is_current(self, key: _Key, worker: SessionWorker) -> bool:
         with self._lock:

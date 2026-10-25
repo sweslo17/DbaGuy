@@ -2,7 +2,6 @@
 gate in front of it. The only module that imports the MCP SDK, and only `AgentHost` imports it, when the switch is on
 (D-08-8): with the switch off the SDK is never loaded (Q1)."""
 
-import json
 import re
 import time
 from collections.abc import Callable
@@ -22,6 +21,7 @@ from ..domain.metadata import PathSegment
 from ..domain.well_formed import well_formed
 from ..tokens import same_token
 from ..version import app_version
+from .shape import compact
 from .tools import LIMIT_MAX, LIST_LIMIT, SEARCH_LIMIT, AgentTools, ToolFailure
 
 MCP_PATH = "/mcp"
@@ -40,9 +40,19 @@ INSTRUCTIONS = (
 )
 _READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 Connection = Annotated[str, Field(min_length=1, max_length=200, description="A connection's id or name")]
-ObjectPath = Annotated[list[PathSegment], Field(max_length=12, description="A `path` list_objects or search_objects "
-                                                                           "returned, passed back as it is")]
 Name = Annotated[str, Field(min_length=1, max_length=1000)]
+
+
+class ObjectPathSegment(PathSegment):
+    """A path segment as an agent may send it: a name at most as long as `Name`, so no error echoes a huge one back."""
+
+    kind: str = Field(min_length=1, max_length=40)
+    name: str = Field(max_length=1000)
+
+
+ObjectPath = Annotated[list[ObjectPathSegment], Field(max_length=12, description="A `path` list_objects or "
+                                                                                 "search_objects returned, passed back "
+                                                                                 "as it is")]
 
 
 class BearerGate:
@@ -93,8 +103,7 @@ def client_name(ctx: Context) -> str | None:
 
 def _text(data: dict[str, Any], *, error: bool = False) -> CallToolResult:
     """One compact JSON text, no structured content (D-08-6: the data would be sent twice)."""
-    body = json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
-    return CallToolResult(content=[TextContent(type="text", text=body)], is_error=error)
+    return CallToolResult(content=[TextContent(type="text", text=compact(data))], is_error=error)
 
 
 def failure_result(failure: ToolFailure) -> CallToolResult:
@@ -103,18 +112,21 @@ def failure_result(failure: ToolFailure) -> CallToolResult:
 
 async def run_tool(tool: str, client: str | None, call: Callable[[], dict[str, Any]]) -> CallToolResult:
     """`call` on a worker thread; its data or its failure as a result, never an exception the SDK would log with its
-    message (D-08-6). An unexpected error is logged by its type only above DEBUG."""
+    message (D-08-6). An unexpected error is logged by its type only above DEBUG. Above DEBUG a line names the tool,
+    the connection's id, the outcome and the time, never what the agent sent or calls itself (fix round 1, I-2)."""
     started = time.monotonic()
     try:
         return _text(await anyio.to_thread.run_sync(call))
     except ToolFailure as failure:
         if not failure.logged:
             elapsed = int((time.monotonic() - started) * 1000)
-            logger.info("MCP {} by {}: {} ({} ms)", tool, client, failure.code, elapsed)
+            on = f" on {failure.connection}" if failure.connection else ""
+            logger.info("MCP {}{}: {}, {} ms", tool, on, failure.code, elapsed)
+            logger.debug("MCP {} by {!r}: {}", tool, client, failure.code)
         return failure_result(failure)
     except Exception as exc:
-        logger.error("MCP {} by {} failed unexpectedly ({})", tool, client, type(exc).__name__)
-        logger.opt(exception=exc).debug("MCP {} failed", tool)
+        logger.error("MCP {} failed unexpectedly ({})", tool, type(exc).__name__)
+        logger.opt(exception=exc).debug("MCP {} by {!r} failed", tool, client)
         return failure_result(ToolFailure("internal_error", "Internal error"))
 
 

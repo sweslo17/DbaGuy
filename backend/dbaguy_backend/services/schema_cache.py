@@ -71,7 +71,8 @@ class SchemaCache:
     snapshot on every keystroke, and an unreachable server must not cost a connect timeout each time.
 
     An MCP agent's request (`agent=True`, spec ⑧ D-08-11) uses the same snapshot when there is one (data in memory, no
-    connection); when one must be built, it is built on the agents' read-only metadata connection.
+    connection); when one must be built, it is built on the agents' read-only metadata connection. A failed build is
+    remembered for the side that failed only: an agent's never degrades the app's completion, nor the app's an agent's.
     """
 
     def __init__(
@@ -85,7 +86,7 @@ class SchemaCache:
         self._failure_ttl = failure_ttl_s
         self._clock = clock
         self._entries: dict[_Key, _Entry] = {}
-        self._failures: dict[_Key, _Failure] = {}
+        self._failures: dict[tuple[UUID, str, bool], _Failure] = {}  # by agent too: theirs are never the app's
         self._key_locks: dict[_Key, threading.Lock] = {}
         self._epoch = 0  # bumped by every invalidation, so a build that started before one is not kept
         self._lock = threading.Lock()
@@ -204,7 +205,7 @@ class SchemaCache:
         thread is building this key: the expired snapshot it replaces, or None when there is none."""
         key = self._key(profile_id, database)
         with self._lock:
-            cached = self._cached(key)
+            cached = self._cached(key, agent)
             if cached is not None:
                 return cached
             key_lock = self._key_locks.setdefault(key, threading.Lock())
@@ -218,7 +219,7 @@ class SchemaCache:
             return None
         try:
             with self._lock:
-                cached = self._cached(key)  # whoever held the key lock before us may have just built (or failed)
+                cached = self._cached(key, agent)  # whoever held the key lock before us may have just built (or failed)
                 if cached is not None:
                     return cached
                 epoch = self._epoch
@@ -226,13 +227,13 @@ class SchemaCache:
         finally:
             key_lock.release()
 
-    def _cached(self, key: _Key) -> SchemaSnapshot | None:
+    def _cached(self, key: _Key, agent: bool = False) -> SchemaSnapshot | None:
         """A fresh snapshot, or None when a build is due. Raises a failure that is still remembered. Hold `_lock`."""
         now = self._clock()
         entry = self._entries.get(key)
         if entry is not None and now - entry.built_at < self._ttl:
             return entry.snapshot
-        failure = self._failures.get(key)
+        failure = self._failures.get((*key, agent))
         if failure is not None and now - failure.failed_at < self._failure_ttl:
             logger.debug("Schema snapshot of {} failed recently; not retrying yet", key[0])
             raise failure.error.with_traceback(None)  # a fresh traceback each time, or the stored one would only grow
@@ -250,13 +251,14 @@ class SchemaCache:
                            self._failure_ttl)
             with self._lock:
                 if epoch == self._epoch:
-                    self._failures[key] = _Failure(error=exc, failed_at=self._clock())
+                    self._failures[(*key, agent)] = _Failure(error=exc, failed_at=self._clock())
             raise
         relations = sum(len(s.relations) for s in snapshot.schemas)
         logger.info("Built schema snapshot for {} ({} relations, {:.0f} ms)", profile_id, relations,
                     (time.monotonic() - started) * 1000)
         with self._lock:
             if epoch == self._epoch:
-                self._failures.pop(key, None)
+                for side in (False, True):
+                    self._failures.pop((*key, side), None)
                 self._entries[key] = _Entry(snapshot=snapshot, built_at=self._clock())
         return snapshot

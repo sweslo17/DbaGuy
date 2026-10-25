@@ -12,6 +12,7 @@ from typing import Any
 
 import anyio
 import pytest
+from loguru import logger
 
 from dbaguy_backend.agent.token_store import InMemoryTokenStore
 from dbaguy_backend.config import Settings
@@ -39,6 +40,17 @@ def share(container: AppContainer, profile: AnyProfile, access: str = "query", *
     request = ProfileUpsertRequest.model_validate({"profile": draft,
                                                    "secrets": {"password": PASSWORDS.get(profile.engine)}})
     return str(container.profiles.create(request).profile.id)
+
+
+@contextmanager
+def logged(level: str = "INFO") -> Iterator[list[tuple[str, str]]]:
+    """(level, message) of every log record at `level` and above while the block runs."""
+    records: list[tuple[str, str]] = []
+    sink = logger.add(lambda m: records.append((m.record["level"].name, m.record["message"])), level=level)
+    try:
+        yield records
+    finally:
+        logger.remove(sink)
 
 
 def free_port() -> int:

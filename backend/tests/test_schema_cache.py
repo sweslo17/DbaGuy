@@ -314,3 +314,22 @@ def test_a_failing_index_construction_is_logged_with_its_traceback_and_re_raised
         logger.remove(sink_id)
     assert len(records) == 1 and records[0]["exception"] is not None
     assert cache.peek(pid) is not None  # the snapshot itself is fine and stays cached
+
+
+def test_an_agents_failed_build_is_not_replayed_to_the_app(env, monkeypatch):
+    """Spec ⑧ D-08-11 (task 2 fix round 1, Minor 1): a failure on the agents' connection is the agents' alone."""
+    cache, pid, _, _ = env
+    real = cache._metadata.with_connection
+
+    def agents_fail(profile_id, database, fn, *, retry=True, agent=False):
+        if agent:
+            raise ConnectionFailed("the agents' connection failed")
+        return real(profile_id, database, fn, retry=retry)
+
+    monkeypatch.setattr(cache._metadata, "with_connection", agents_fail)
+    with pytest.raises(ConnectionFailed):
+        cache.get(pid, agent=True)
+    with pytest.raises(ConnectionFailed):  # remembered for the agents: no second connect
+        cache.get(pid, agent=True)
+    built = cache.get(pid)  # the app's completion builds anyway
+    assert cache.get(pid, agent=True) is built  # and the agents share it
