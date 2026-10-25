@@ -26,9 +26,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # check-latest: the runner's cached Node 24 can lag behind a security release (it had 24.20.0 after the 24.22.1
+      # fixes of 2026-10-21); this resolves the newest 24.x on every run
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+          check-latest: true
           cache: npm
 
       - name: The tag is the app's version
