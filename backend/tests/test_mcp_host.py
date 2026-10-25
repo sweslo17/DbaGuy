@@ -23,7 +23,8 @@ from dbaguy_backend.domain.settings import McpSettings
 from dbaguy_backend.storage.secret_store import InMemorySecretStore
 
 from .agent_support import (
-    AUTH, MCP_TOKEN, TOKEN, call_tool, container, free_port, list_tools, make_container, serving, wait_for_state,
+    AUTH, MCP_TOKEN, TOKEN, call_tool, container, free_port, list_tools, logged, make_container, serving,
+    wait_for_state,
 )
 
 __all__ = ["container"]  # the fixture
@@ -390,3 +391,22 @@ def test_a_run_superseded_during_a_slow_token_read_never_binds(tmp_path, monkeyp
     finally:
         tokens.release.set()
         built.close()
+
+
+@pytest.mark.parametrize(("mode", "version"), [("legacy", "2025-11-25"), ("auto", "2026-07-28"),
+                                               ("2026-07-28", None)])
+def test_a_client_that_starts_is_logged_with_its_protocol_version(container, mode, version):
+    """Task 9's A1 (final review): one INFO line when a client starts (2025-11-25's initialize, 2026-07-28's
+    server/discover probe), naming the protocol version; a version the SDK does not know is "other". A 2026-07-28
+    client that adopts the version without the probe has no line."""
+    with serving(container) as port, logged() as records:
+        list_tools(port, mode=mode)
+    started = [text for level, text in records if level == "INFO" and text.startswith("MCP: a client started")]
+    assert started == ([f"MCP: a client started (protocol {version})"] if version else [])
+
+
+def test_a_protocol_version_is_named_only_when_the_sdk_knows_it():
+    from dbaguy_backend.agent.server import protocol_named
+
+    assert protocol_named("2025-11-25") == "2025-11-25" and protocol_named("2026-07-28") == "2026-07-28"
+    assert protocol_named("2099-01-01\nMCP run_query on x: ok") == "other" and protocol_named(None) == "other"

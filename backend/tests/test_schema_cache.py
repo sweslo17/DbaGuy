@@ -376,3 +376,26 @@ def test_agents_keep_at_most_their_cap_of_snapshots_and_never_evict_the_apps(tmp
     assert len(agents()) == MAX_AGENT_SNAPSHOTS
     assert cache.get(pid, "app_db") is apps and cache.get(pid, "db19") is shared
     assert metadata.built.count(("app_db", False)) == 1 and ("db19", False) not in metadata.built
+
+
+def test_an_agents_failed_build_logs_its_code_not_the_servers_text(env, monkeypatch):
+    """T2 M-7 (the agent branch, D-08-14): an agent's names reach the server's error text, so its WARNING says the code
+    only; the text is at DEBUG. The app's own failures keep their text (pre-existing)."""
+    from dbaguy_backend.domain.errors import QueryFailed
+
+    cache, pid, _, _ = env
+
+    def agents_fail(profile_id, database, fn, *, retry=True, agent=False):
+        raise QueryFailed("relation \"zz_08_ff_secret\" does not exist")
+
+    monkeypatch.setattr(cache._metadata, "with_connection", agents_fail)
+    records: list[tuple[str, str]] = []
+    sink = logger.add(lambda m: records.append((m.record["level"].name, m.record["message"])), level="DEBUG")
+    try:
+        with pytest.raises(QueryFailed):
+            cache.get(pid, agent=True)
+    finally:
+        logger.remove(sink)
+    warnings = [text for level, text in records if level == "WARNING"]
+    assert warnings and "query_failed" in warnings[0] and not [t for t in warnings if "zz_08_ff_secret" in t]
+    assert [text for level, text in records if level == "DEBUG" and "zz_08_ff_secret" in text]

@@ -12,7 +12,7 @@ from ..adapters.base import DatabaseAdapter, DatabaseConnection
 from ..adapters.registry import AdapterRegistry
 from ..domain.schema import ObjectSearchHit, RelationKind, SchemaSnapshot
 from ..sql.completion import SnapshotIndex
-from .metadata_service import MAX_AGENT_CONNECTIONS, MetadataService
+from .metadata_service import MAX_AGENT_CONNECTIONS, MetadataService, error_code
 from .profile_service import ProfileService
 
 _Key = tuple[UUID, str]
@@ -259,8 +259,11 @@ class SchemaCache:
             else:
                 snapshot = self._metadata.with_connection(profile_id, database, _snapshot_of)
         except Exception as exc:
-            logger.warning("Could not build the schema snapshot of {} ({}); retrying in {:.0f} s", profile_id, exc,
-                           self._failure_ttl)
+            # An agent's names reach the server's error text: its code only above DEBUG (T2 M-7, D-08-14)
+            logger.warning("Could not build the schema snapshot of {} ({}); retrying in {:.0f} s", profile_id,
+                           error_code(exc) if agent else exc, self._failure_ttl)
+            if agent:
+                logger.debug("The agents' schema snapshot of {} failed: {!r}", profile_id, str(exc)[:1000])
             with self._lock:
                 if epoch == self._epoch:
                     self._failures[(*key, agent)] = _Failure(error=exc, failed_at=self._clock())

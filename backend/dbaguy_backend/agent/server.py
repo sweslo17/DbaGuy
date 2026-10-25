@@ -14,6 +14,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
+from mcp.types.version import KNOWN_PROTOCOL_VERSIONS
 from pydantic import Field
 from starlette.datastructures import Headers
 from starlette.responses import Response
@@ -43,8 +44,8 @@ INSTRUCTIONS = (
     "what each login is allowed to do). Explore with list_objects (pass back the `path` it returns), search_objects "
     "and describe. run_query and explain need the connection's 'Read-only queries' access; each call runs exactly one "
     "SELECT/WITH/VALUES/TABLE/SHOW statement, inside a read-only transaction that is rolled back. Results are capped "
-    "(max_rows, max_cell_chars, about 40,000 characters, timeout up to 60 s). SQL Server connections are read-only by "
-    "DbaGuy's checks only. Couchbase takes a query_context (bucket.scope)."
+    "(max_rows, max_cell_chars, about 40,000 bytes of JSON, timeout up to 60 s). SQL Server connections are read-only "
+    "by DbaGuy's checks only. Couchbase takes a query_context (bucket.scope)."
 )
 _STOPPING = "The MCP server is stopping"
 _READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
@@ -168,6 +169,27 @@ def client_name(ctx: Context) -> str | None:
     return well_formed(CONTROL_CHARS.sub("", name))[:CLIENT_NAME_CHARS] or None
 
 
+def protocol_named(version: object) -> str:
+    """A protocol version as the log may say it: one the SDK knows, else "other" (never the client's own text)."""
+    return version if isinstance(version, str) and version in KNOWN_PROTOCOL_VERSIONS else "other"
+
+
+_STARTS = frozenset({"initialize", "server/discover"})
+
+
+async def log_client_start(ctx: Any, call_next: Callable[[Any], Any]) -> Any:
+    """Server middleware (the SDK's `ServerMiddleware`; final review, Task 9's A1): one INFO line when a client starts,
+    with its protocol version: 2025-11-25's `initialize` (the version the server answered with) and 2026-07-28's
+    `server/discover` probe. A 2026-07-28 client that adopts the version without the probe sends neither, so it has no
+    line. Never the client's own text (its name is at DEBUG in each tool's line)."""
+    result = await call_next(ctx)
+    if ctx.method in _STARTS and ctx.request_id is not None:
+        answered = result.get("protocolVersion") if isinstance(result, dict) else None
+        logger.info("MCP: a client started (protocol {})",
+                    protocol_named(answered if ctx.method == "initialize" else ctx.protocol_version))
+    return result
+
+
 def _text(data: dict[str, Any], *, error: bool = False) -> CallToolResult:
     """One compact JSON text, no structured content (D-08-6: the data would be sent twice)."""
     return CallToolResult(content=[TextContent(type="text", text=compact(data))], is_error=error)
@@ -272,7 +294,8 @@ async def run_tool(tool: str, client: str | None, call: Callable[[], dict[str, A
 
 def build_server(tools: AgentTools, queries: QueryTools) -> MCPServer:
     """A new server each start: the SDK's session manager runs once per instance (D-08-8)."""
-    server = MCPServer("dbaguy", title="DbaGuy", instructions=INSTRUCTIONS, version=app_version())
+    server = MCPServer("dbaguy", title="DbaGuy", instructions=INSTRUCTIONS, version=app_version(),
+                       middleware=[log_client_start])
 
     async def list_connections(ctx: Context) -> CallToolResult:
         client = client_name(ctx)
@@ -360,7 +383,7 @@ def build_server(tools: AgentTools, queries: QueryTools) -> MCPServer:
             "transaction that is rolled back. "
             "Returns columns, rows (big integers as strings; long text cut at max_cell_chars, with its size), "
             "row_count, more_rows, and notes. At most max_rows rows (100 by default, 1000 at most) and about 40,000 "
-            "characters; timeout_s 30 s by default, 60 at most (30 on production connections). DbaGuy checks every "
+            "bytes; timeout_s 30 s by default, 60 at most (30 on production connections). DbaGuy checks every "
             "statement and rolls it back; for full protection the user shares a duplicate of the connection whose "
             "login can only read."
         ),
