@@ -72,15 +72,40 @@ _TYPE_PEEK = 100  # rows read ahead to guess the column types of a result set th
 _OPEN_QUERY = "SELECT @@SPID, @@TRANCOUNT, XACT_STATE(), @@OPTIONS & 2, DB_NAME()"
 _STATE_QUERY = "SELECT @@TRANCOUNT, XACT_STATE(), @@OPTIONS & 2, DB_NAME()"  # @@OPTIONS bit 2: IMPLICIT_TRANSACTIONS
 _SERVER_INFO = "SELECT @@VERSION, DB_NAME(), SUSER_SNAME()"
-# spec ⑧ CR-08-1: whether the login can write in this database (db_owner, or INSERT/UPDATE/DELETE/ALTER/EXECUTE on it:
-# SQL Server has no read-only session, so this is what an agent's slip could reach), then two server roles
-_LOGIN_CAN_WRITE = (
-    "IS_MEMBER('db_owner'), HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'INSERT'), "
-    "HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'UPDATE'), HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'DELETE'), "
-    "HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'ALTER'), HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'EXECUTE')"
-)
-_LOGIN_SQL = f"SELECT {_LOGIN_CAN_WRITE}, IS_SRVROLEMEMBER('sysadmin'), IS_SRVROLEMEMBER('bulkadmin')"
-_WRITE_CHECKS = 6  # the first six values of _LOGIN_SQL
+# spec ⑧ CR-08-1, ruling T3-1: three values. can_write is what SQL Server has no read-only session to stop, in this
+# database: db_owner; INSERT, UPDATE, DELETE, ALTER, EXECUTE or ALTER ANY SCHEMA (db_ddladmin) held on the database;
+# or a grant of INSERT, UPDATE, DELETE, ALTER, EXECUTE, CONTROL or TAKE OWNERSHIP on the database, a schema or an
+# object (a column grant is class 1 too) to the login's user, to a role it is in (nested roles too) or to public.
+# `sys.user_token` is the user's own set of principals, whatever the nesting.
+# The grant rows are read WITH (NOLOCK): another session's uncommitted GRANT would hold a plain read of
+# sys.database_permissions at READ COMMITTED for ever. No object is looked up by id (sys.objects and OBJECTPROPERTY wait
+# for a table under an open ALTER or GRANT even at READ UNCOMMITTED, probed). The system databases are left to the
+# database-level functions: master holds 1,739 default EXECUTE grants to public.
+# sysadmin includes CONTROL SERVER; bulkadmin is ADMINISTER BULK OPERATIONS, granted directly too.
+_LOGIN_SQL = """
+SELECT
+  CASE WHEN IS_MEMBER('db_owner') = 1
+        OR HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'INSERT') = 1
+        OR HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'UPDATE') = 1
+        OR HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'DELETE') = 1
+        OR HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'ALTER') = 1
+        OR HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'EXECUTE') = 1
+        OR HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'ALTER ANY SCHEMA') = 1
+        OR (DB_ID() > 4 AND (
+            EXISTS (SELECT 1 FROM sys.database_permissions AS p WITH (NOLOCK)
+                    WHERE p.state IN ('G', 'W') AND p.class IN (0, 1, 3)
+                      AND p.permission_name IN
+                          ('INSERT', 'UPDATE', 'DELETE', 'ALTER', 'EXECUTE', 'CONTROL', 'TAKE OWNERSHIP')
+                      AND p.grantee_principal_id IN (SELECT principal_id FROM sys.user_token))
+            OR EXISTS (SELECT 1 FROM sys.schemas AS s WITH (NOLOCK)
+                       WHERE s.schema_id NOT IN (2, 3, 4) AND s.schema_id < 16384
+                         AND s.principal_id IN (SELECT principal_id FROM sys.user_token))))
+       THEN 1 ELSE 0 END,
+  CASE WHEN IS_SRVROLEMEMBER('sysadmin') = 1 OR HAS_PERMS_BY_NAME(NULL, NULL, 'CONTROL SERVER') = 1
+       THEN 1 ELSE 0 END,
+  CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, 'ADMINISTER BULK OPERATIONS') = 1 THEN 1 ELSE 0 END
+"""
+_LOGIN_GRANTS: tuple[LoginGrant, ...] = ("can_write", "sysadmin", "bulkadmin")  # the columns of _LOGIN_SQL
 _COMMIT = "WHILE @@TRANCOUNT > 0 COMMIT TRANSACTION"  # every nesting level (Ruling 18)
 _ROLLBACK = "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION"
 _NO_COLUMN_NAME = "(No column name)"
@@ -692,12 +717,7 @@ class MssqlConnection(DatabaseConnection, RowEditing, DataTools, ReferenceReadin
 
     def login_privileges(self) -> LoginPrivileges:
         row = self._catalog_call(lambda: catalog.first_row(self._conn, _LOGIN_SQL)) or ()
-        held = [value == 1 for value in row]
-        grants: list[LoginGrant] = []
-        if any(held[:_WRITE_CHECKS]):
-            grants.append("can_write")
-        grants += [grant for grant, on in zip(("sysadmin", "bulkadmin"), held[_WRITE_CHECKS:], strict=False) if on]
-        return LoginPrivileges(grants=grants)
+        return LoginPrivileges(grants=[grant for grant, held in zip(_LOGIN_GRANTS, row, strict=False) if held == 1])
 
     def _check_database(self, path: list[PathSegment]) -> None:
         if path and path[0].name != self._database:

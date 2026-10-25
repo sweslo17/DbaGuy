@@ -2,9 +2,13 @@
 list_connections and the connection dialog's route. The MySQL role and user are zz_08_*, dropped by exact name."""
 
 import sqlite3
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from uuid import UUID
 
 import mysql.connector
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from loguru import logger
@@ -19,8 +23,8 @@ from dbaguy_backend.domain.profiles import ProfileUpsertRequest, SqliteProfile, 
 
 from .agent_support import AUTH, container, share
 from .support import (
-    MSSQL_SA_PASSWORD, make_mssql_profile, make_mysql_profile, make_pg_profile, mysql_driver_kwargs,
-    requires_mssql, requires_mysql, requires_pg,
+    MSSQL_SA_PASSWORD, PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, make_mssql_profile, make_mysql_profile, make_pg_profile,
+    mssql_connect, mysql_driver_kwargs, requires_mssql, requires_mysql, requires_pg,
 )
 
 __all__ = ["container"]
@@ -58,6 +62,39 @@ def test_postgres_superuser_holds_every_role_and_list_connections_shows_it_once_
     assert login["grants"] == ["superuser", "server_files_read", "server_files_write", "server_programs",
                                "signal_backends"]
     assert login["summary"].startswith("is a superuser")
+
+
+@requires_pg
+def test_postgres_roles_count_through_a_chain_of_roles_and_a_plain_login_has_none(container):
+    admin = psycopg.connect(host=PG_HOST, port=PG_PORT, user=PG_USER, password=PG_PASSWORD, dbname="dbaguy",
+                            autocommit=True)
+    roles = ("zz_08_t3_pa", "zz_08_t3_pb", "zz_08_t3_pc")  # exact names, dropped in `finally`
+
+    def drop() -> None:
+        for role in roles:
+            if admin.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)).fetchone():
+                admin.execute(f"DROP OWNED BY {role}")
+                admin.execute(f"DROP ROLE {role}")
+
+    def granted(role: str) -> list[str]:
+        draft = make_pg_profile(name=f"zz_08 {role}", username=role).model_dump(exclude={"id"})
+        request = ProfileUpsertRequest.model_validate({"profile": draft | {"mcp_access": "schema"},
+                                                       "secrets": {"password": "zz08t3pw"}})
+        try:
+            return _login(container, str(container.profiles.create(request).profile.id)).grants
+        finally:
+            container.metadata.close_all()
+
+    drop()
+    try:
+        admin.execute("CREATE ROLE zz_08_t3_pb NOLOGIN IN ROLE pg_read_server_files, pg_signal_backend")
+        admin.execute("CREATE ROLE zz_08_t3_pa LOGIN PASSWORD 'zz08t3pw' IN ROLE zz_08_t3_pb")  # a -> b -> pg_*
+        admin.execute("CREATE ROLE zz_08_t3_pc LOGIN PASSWORD 'zz08t3pw'")
+        assert granted("zz_08_t3_pa") == ["server_files_read", "signal_backends"]
+        assert granted("zz_08_t3_pc") == []
+    finally:
+        drop()
+        admin.close()
 
 
 @requires_mysql
@@ -234,3 +271,117 @@ def test_a_locked_profile_answers_the_dialogs_route_with_428_and_connects_to_not
         answer = client.get(f"/mcp/connections/{pid}/login", headers=AUTH)
     assert answer.status_code == 428 and answer.json()["error"]["code"] == "password_required"
     assert container.agent_login.peek(UUID(pid)) is None and not container.metadata._workers
+
+
+# ---- SQL Server: what the login is granted beyond db_owner (ruling T3-1) ----
+
+_MS_LOGIN, _MS_USER, _MS_PASSWORD = "zz_08_t3_l", "zz_08_t3_u", "Zz08_t3_Pw1!x"  # exact names, dropped in `finally`
+
+
+def _ms_run(conn, sql: str) -> None:
+    conn.execute_non_query(sql)
+
+
+@contextmanager
+def _sql_server_login(grants: list[str], *, server_grant: str | None = None) -> Iterator[None]:
+    """The login `zz_08_t3_l` with a user in dbaguy, a table `dbo.zz_08_t3_t` with a procedure `dbo.zz_08_t3_p` that
+    writes to it, and a schema `zz_08_t3_s` with a table: what the `grants` (run in dbaguy) are granted on. Everything
+    is dropped by its exact name, whatever happened."""
+    master = mssql_connect(user="sa", password=MSSQL_SA_PASSWORD, database="master")
+    db = mssql_connect(user="sa", password=MSSQL_SA_PASSWORD, database="dbaguy")
+
+    def drop() -> None:  # the schema before the user that may own it, the user before the roles it is in
+        for sql in ("DROP PROCEDURE IF EXISTS dbo.zz_08_t3_p", "DROP TABLE IF EXISTS dbo.zz_08_t3_t",
+                    "DROP TABLE IF EXISTS zz_08_t3_s.t2", "DROP SCHEMA IF EXISTS zz_08_t3_s",
+                    f"IF DATABASE_PRINCIPAL_ID('{_MS_USER}') IS NOT NULL DROP USER {_MS_USER}",
+                    "IF DATABASE_PRINCIPAL_ID('zz_08_t3_r1') IS NOT NULL DROP ROLE zz_08_t3_r1",
+                    "IF DATABASE_PRINCIPAL_ID('zz_08_t3_r2') IS NOT NULL DROP ROLE zz_08_t3_r2"):
+            _ms_run(db, sql)
+        _ms_run(master, f"IF SUSER_ID('{_MS_LOGIN}') IS NOT NULL DROP LOGIN {_MS_LOGIN}")
+
+    drop()
+    try:
+        _ms_run(master, f"CREATE LOGIN {_MS_LOGIN} WITH PASSWORD = '{_MS_PASSWORD}', CHECK_POLICY = OFF, "
+                        "DEFAULT_DATABASE = dbaguy")
+        if server_grant:
+            _ms_run(master, server_grant)
+        for sql in ("CREATE SCHEMA zz_08_t3_s", "CREATE TABLE dbo.zz_08_t3_t (id int PRIMARY KEY, c1 int)",
+                    "CREATE TABLE zz_08_t3_s.t2 (id int PRIMARY KEY)",
+                    "CREATE PROCEDURE dbo.zz_08_t3_p AS INSERT INTO dbo.zz_08_t3_t (id) VALUES (777)",
+                    f"CREATE USER {_MS_USER} FOR LOGIN {_MS_LOGIN}", *grants):
+            _ms_run(db, sql)
+        yield
+    finally:
+        drop()
+        master.close()
+        db.close()
+
+
+def _granted_by_the_login(container, database: str = "dbaguy") -> list[str]:
+    draft = make_mssql_profile(name="zz_08 t3 login", username=_MS_LOGIN, database=database).model_dump(exclude={"id"})
+    request = ProfileUpsertRequest.model_validate({"profile": draft | {"mcp_access": "schema"},
+                                                   "secrets": {"password": _MS_PASSWORD}})
+    try:
+        return _login(container, str(container.profiles.create(request).profile.id)).grants
+    finally:
+        container.metadata.close_all()  # the login cannot be dropped while a session of it is open
+
+
+@requires_mssql
+@pytest.mark.parametrize(("grants", "expected"), [
+    ([], []),  # the recommended read-only login, and a login that can only connect
+    (["ALTER ROLE db_datareader ADD MEMBER zz_08_t3_u"], []),
+    (["GRANT INSERT ON dbo.zz_08_t3_t TO zz_08_t3_u"], ["can_write"]),  # one object, to the user
+    (["GRANT UPDATE (c1) ON dbo.zz_08_t3_t TO zz_08_t3_u"], ["can_write"]),  # one column
+    (["GRANT EXECUTE ON dbo.zz_08_t3_p TO zz_08_t3_u"], ["can_write"]),  # a procedure that writes
+    (["GRANT INSERT ON SCHEMA::zz_08_t3_s TO zz_08_t3_u"], ["can_write"]),
+    (["GRANT ALTER ON dbo.zz_08_t3_t TO zz_08_t3_u"], ["can_write"]),
+    (["GRANT CONTROL ON dbo.zz_08_t3_t TO zz_08_t3_u"], ["can_write"]),
+    (["GRANT TAKE OWNERSHIP ON dbo.zz_08_t3_t TO zz_08_t3_u"], ["can_write"]),
+    (["GRANT DELETE ON dbo.zz_08_t3_t TO public"], ["can_write"]),  # public is every user's
+    (["CREATE ROLE zz_08_t3_r1", "GRANT UPDATE ON dbo.zz_08_t3_t TO zz_08_t3_r1",
+      "ALTER ROLE zz_08_t3_r1 ADD MEMBER zz_08_t3_u"], ["can_write"]),  # through a role
+    (["CREATE ROLE zz_08_t3_r1", "CREATE ROLE zz_08_t3_r2", "GRANT INSERT ON dbo.zz_08_t3_t TO zz_08_t3_r2",
+      "ALTER ROLE zz_08_t3_r2 ADD MEMBER zz_08_t3_r1", "ALTER ROLE zz_08_t3_r1 ADD MEMBER zz_08_t3_u"],
+     ["can_write"]),  # a role in a role
+    (["ALTER ROLE db_ddladmin ADD MEMBER zz_08_t3_u"], ["can_write"]),  # DROP and ALTER of every table
+    (["ALTER AUTHORIZATION ON SCHEMA::zz_08_t3_s TO zz_08_t3_u"], ["can_write"]),  # owns a schema
+    (["GRANT INSERT ON dbo.zz_08_t3_t TO zz_08_t3_u", "DENY INSERT ON dbo.zz_08_t3_t TO zz_08_t3_u"], []),
+])
+def test_sql_server_can_write_counts_what_is_granted_on_objects_schemas_and_roles(container, grants, expected):
+    with _sql_server_login(grants):
+        assert _granted_by_the_login(container) == expected
+
+
+@requires_mssql
+@pytest.mark.parametrize(("server_grant", "expected"), [
+    ("GRANT CONTROL SERVER TO zz_08_t3_l", ["can_write", "sysadmin", "bulkadmin"]),  # sysadmin in all but the name
+    ("GRANT ADMINISTER BULK OPERATIONS TO zz_08_t3_l", ["bulkadmin"]),  # without the server role
+    ("ALTER SERVER ROLE bulkadmin ADD MEMBER zz_08_t3_l", ["bulkadmin"]),
+])
+def test_sql_server_server_level_rights_are_the_logins_effective_ones(container, server_grant, expected):
+    with _sql_server_login([], server_grant=server_grant):
+        assert _granted_by_the_login(container) == expected  # the login's drop takes its server grants with it
+
+
+@requires_mssql
+def test_sql_server_the_default_grants_of_master_to_public_are_not_the_logins(container):
+    with _sql_server_login([]):  # no user in master: the login is guest there, and public holds 1,739 EXECUTE grants
+        assert _granted_by_the_login(container, database="master") == []
+
+
+@requires_mssql
+def test_sql_server_reading_the_login_does_not_wait_for_another_sessions_uncommitted_grant(container):
+    blocker = mssql_connect(user="sa", password=MSSQL_SA_PASSWORD, database="dbaguy")
+    answer: list[list[str]] = []
+    with _sql_server_login(["ALTER ROLE db_datareader ADD MEMBER zz_08_t3_u"]):
+        try:
+            _ms_run(blocker, f"BEGIN TRAN; GRANT INSERT ON dbo.zz_08_t3_t TO {_MS_USER}")  # open for the whole read
+            reader = threading.Thread(target=lambda: answer.append(_granted_by_the_login(container)), daemon=True)
+            reader.start()
+            reader.join(10)  # a plain read of sys.database_permissions waits for the GRANT to end
+            assert not reader.is_alive(), "reading the login waits for another session's open GRANT"
+        finally:
+            _ms_run(blocker, "IF @@TRANCOUNT > 0 ROLLBACK")  # also lets a blocked reader finish
+            blocker.close()
+            reader.join(10)
