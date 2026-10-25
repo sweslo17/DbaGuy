@@ -472,6 +472,18 @@ _UPDATE_VERBS: dict[Dialect, str] = {Dialect.SQLITE: "UPDATE OR ABORT"}
 _INSERT_VERBS: dict[Dialect, str] = {Dialect.SQLITE: "INSERT OR ABORT INTO"}
 
 
+# The heads the explain tool puts in front of an agent's statement (spec ⑧ D-08-10), each as words the lexer reads one
+# by one (`=` is a token of its own), the first the one used: MySQL's tree format is 8.0.16's, so an older server or
+# MariaDB gets the plain head. T-SQL has none: its plan comes from SET SHOWPLAN_TEXT around the statement.
+EXPLAIN_HEADS: dict[Dialect, tuple[str, ...]] = {
+    Dialect.POSTGRES: ("EXPLAIN",),
+    Dialect.MYSQL: ("EXPLAIN FORMAT = TREE", "EXPLAIN"),
+    Dialect.SQLITE: ("EXPLAIN QUERY PLAN",),
+    Dialect.TSQL: (),
+    Dialect.SQLPP: ("EXPLAIN",),
+}
+
+
 def transaction_frame(dialect: Dialect) -> TransactionFrame:
     frame = _TRANSACTION_FRAMES[dialect]
     if frame is None:
