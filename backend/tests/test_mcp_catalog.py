@@ -455,3 +455,24 @@ def test_a_path_segment_is_bounded_like_a_name(container):
         tools = {tool.name: tool for tool in list_tools(port)}
     schema = json.dumps(tools["describe"].input_schema)
     assert '"maxLength": 1000' in schema and '"maxLength": 40' in schema
+
+
+def test_a_column_path_never_borrows_the_keys_of_a_table_with_its_name(container, tmp_path):
+    """M-5: the column `parent` of child is not the table parent: no primary key or foreign key comes from it."""
+    path = tmp_path / "zz_08_names.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE grand (id INTEGER PRIMARY KEY);
+        CREATE TABLE parent (id INTEGER PRIMARY KEY, grand_id INTEGER REFERENCES grand (id));
+        CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parent (id));
+    """)
+    conn.close()
+    pid = share(container, SqliteProfile(id="00000000-0000-0000-0000-000000000008", engine="sqlite", name="names",
+                                         path=str(path)), access="schema")
+    tools = container.agent_tools
+    column = [PathSegment(kind="schema", name="main"), PathSegment(kind="folder", name="tables"),
+              PathSegment(kind="table", name="child"), PathSegment(kind="folder", name="columns"),
+              PathSegment(kind="column", name="parent")]
+    described = tools.describe(pid, column)
+    assert described["kind"] == "column" and described["primary_key"] == [] and described["foreign_keys"] == []
+    assert tools.describe(pid, name="parent")["foreign_keys"][0]["references"] == "main.grand"  # the table's own

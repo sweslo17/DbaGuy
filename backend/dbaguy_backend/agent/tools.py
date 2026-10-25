@@ -143,8 +143,15 @@ def _within(narrow: str | None, database: str | None, schema: str) -> bool:
     return narrow is None or (database if database is not None else schema) == narrow
 
 
+_RELATION_KINDS = frozenset({NodeKind.TABLE, NodeKind.PARTITION, NodeKind.VIEW, NodeKind.MATERIALIZED_VIEW,
+                             NodeKind.SYNONYM})
+
+
 def _relation_of(snapshot: SchemaSnapshot, path: list[PathSegment]) -> SnapshotRelation | None:
-    """The snapshot's relation at a tree path (its schema segment and its last segment), if it has one."""
+    """The snapshot's relation at a tree path (its schema segment and its last segment), if it has one. Only a path to a
+    relation has one: a column or an index named like a table of its schema never borrows that table's keys (M-5)."""
+    if not path or path[-1].kind not in _RELATION_KINDS:
+        return None
     schema = next((s.name for s in path if s.kind == NodeKind.SCHEMA), None)
     for candidate in snapshot.schemas:
         if candidate.name == schema:

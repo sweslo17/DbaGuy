@@ -1,11 +1,13 @@
 import sqlite3
 import threading
 import time
+from datetime import UTC, datetime
 
 import pytest
 from loguru import logger
 
 from dbaguy_backend.adapters.base import AdapterCapabilities
+from dbaguy_backend.adapters.postgres.adapter import PostgresAdapter
 from dbaguy_backend.adapters.registry import AdapterRegistry
 from dbaguy_backend.adapters.sqlite.adapter import SqliteAdapter
 from dbaguy_backend.connectivity.ssh_tunnel import SshTunnelManager, write_askpass_script
@@ -14,7 +16,8 @@ from dbaguy_backend.domain.profiles import Engine, ProfileUpsertRequest
 from dbaguy_backend.services.connection_service import ConnectionService
 from dbaguy_backend.services.metadata_service import MetadataService
 from dbaguy_backend.services.profile_service import ProfileService
-from dbaguy_backend.services.schema_cache import SchemaCache
+from dbaguy_backend.domain.schema import SchemaSnapshot
+from dbaguy_backend.services.schema_cache import MAX_AGENT_SNAPSHOTS, SchemaCache
 from dbaguy_backend.sql.dialects import Dialect
 from dbaguy_backend.storage.paths import profiles_file
 from dbaguy_backend.storage.profile_store import ProfileStore
@@ -333,3 +336,43 @@ def test_an_agents_failed_build_is_not_replayed_to_the_app(env, monkeypatch):
         cache.get(pid, agent=True)
     built = cache.get(pid)  # the app's completion builds anyway
     assert cache.get(pid, agent=True) is built  # and the agents share it
+
+
+class SnapshotPerDatabase:
+    """Stands in for MetadataService: an empty snapshot of whichever database is asked for, recording each build."""
+
+    def __init__(self) -> None:
+        self.built: list[tuple[str | None, bool]] = []
+
+    def with_connection(self, profile_id, database, fn, *, retry=True, agent=False):
+        self.built.append((database, agent))
+        return SchemaSnapshot(database=database, default_schema=None, search_path=[], schemas=[],
+                              built_at=datetime.now(UTC))
+
+
+def test_agents_keep_at_most_their_cap_of_snapshots_and_never_evict_the_apps(tmp_path):
+    """Spec ⑧ ruling T2-2: past the cap the least recently used agent-built snapshot goes; the app's never does."""
+    profiles = ProfileService(ProfileStore(profiles_file(tmp_path)), InMemorySecretStore())
+    pid = profiles.create(ProfileUpsertRequest.model_validate({
+        "profile": {"engine": "postgres", "name": "pg", "host": "127.0.0.1", "database": "app_db"},
+        "secrets": {"password": "x"},
+    })).profile.id
+    metadata = SnapshotPerDatabase()
+    cache = SchemaCache(metadata, AdapterRegistry([PostgresAdapter()]), profiles)
+
+    def agents() -> set[str]:
+        return {key[1] for key, entry in cache._entries.items() if entry.agents_only}
+
+    apps = cache.get(pid, "app_db")
+    for n in range(20):
+        cache.get(pid, f"db{n:02}", agent=True)
+        cache.get(pid, "db12", agent=True) if n > 12 else None  # an agent keeps reading db12: it stays
+    assert len(agents()) == MAX_AGENT_SNAPSHOTS
+    assert agents() == {"db12", *(f"db{n}" for n in range(13, 20))}
+    assert cache.get(pid, "app_db", agent=True) is apps  # an agent reads the app's: still the app's
+    shared = cache.get(pid, "db19")  # the app asks for an agent-built one: kept, and now the app's
+    for n in range(20, 40):
+        cache.get(pid, f"db{n}", agent=True)
+    assert len(agents()) == MAX_AGENT_SNAPSHOTS
+    assert cache.get(pid, "app_db") is apps and cache.get(pid, "db19") is shared
+    assert metadata.built.count(("app_db", False)) == 1 and ("db19", False) not in metadata.built

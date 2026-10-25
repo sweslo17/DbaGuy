@@ -1,3 +1,4 @@
+import itertools
 import threading
 import time
 from collections.abc import Callable
@@ -11,10 +12,12 @@ from ..adapters.base import DatabaseAdapter, DatabaseConnection
 from ..adapters.registry import AdapterRegistry
 from ..domain.schema import ObjectSearchHit, RelationKind, SchemaSnapshot
 from ..sql.completion import SnapshotIndex
-from .metadata_service import MetadataService
+from .metadata_service import MAX_AGENT_CONNECTIONS, MetadataService
 from .profile_service import ProfileService
 
 _Key = tuple[UUID, str]
+# Snapshots built for MCP agents and not asked for by the app since, kept at once (ruling T2-2): one per catalog connection
+MAX_AGENT_SNAPSHOTS = MAX_AGENT_CONNECTIONS
 
 
 @dataclass
@@ -22,6 +25,8 @@ class _Entry:
     snapshot: SchemaSnapshot
     built_at: float
     index: SnapshotIndex | None = None  # built on the first index() call for this snapshot
+    agents_only: bool = False  # built for an agent, never asked for by the app since: an agent's build may evict it
+    used: int = 0  # when it was last read (a count): the agents' least recently used one goes first
 
 
 @dataclass
@@ -73,6 +78,10 @@ class SchemaCache:
     An MCP agent's request (`agent=True`, spec ⑧ D-08-11) uses the same snapshot when there is one (data in memory, no
     connection); when one must be built, it is built on the agents' read-only metadata connection. A failed build is
     remembered for the side that failed only: an agent's never degrades the app's completion, nor the app's an agent's.
+    The agents keep at most MAX_AGENT_SNAPSHOTS snapshots of their own (ruling T2-2): past it, building one drops the
+    agents' least recently used. A snapshot the app built is never theirs, an agent reading it changes nothing, and one
+    an agent built becomes the app's (kept, not rebuilt) once the app asks for it: no agent call costs the app's
+    completion a snapshot.
     """
 
     def __init__(
@@ -89,6 +98,7 @@ class SchemaCache:
         self._failures: dict[tuple[UUID, str, bool], _Failure] = {}  # by agent too: theirs are never the app's
         self._key_locks: dict[_Key, threading.Lock] = {}
         self._epoch = 0  # bumped by every invalidation, so a build that started before one is not kept
+        self._uses = itertools.count(1)
         self._lock = threading.Lock()
 
     @staticmethod
@@ -232,6 +242,8 @@ class SchemaCache:
         now = self._clock()
         entry = self._entries.get(key)
         if entry is not None and now - entry.built_at < self._ttl:
+            entry.used = next(self._uses)
+            entry.agents_only = entry.agents_only and agent  # the app relies on it now: no agent evicts it
             return entry.snapshot
         failure = self._failures.get((*key, agent))
         if failure is not None and now - failure.failed_at < self._failure_ttl:
@@ -260,5 +272,18 @@ class SchemaCache:
             if epoch == self._epoch:
                 for side in (False, True):
                     self._failures.pop((*key, side), None)
-                self._entries[key] = _Entry(snapshot=snapshot, built_at=self._clock())
+                replaced = self._entries.get(key)
+                agents_only = agent and (replaced is None or replaced.agents_only)  # the app's stays the app's
+                self._entries[key] = _Entry(snapshot=snapshot, built_at=self._clock(), agents_only=agents_only,
+                                            used=next(self._uses))
+                if agents_only:
+                    self._trim_agents(keep=key)
         return snapshot
+
+    def _trim_agents(self, keep: _Key) -> None:
+        """Past MAX_AGENT_SNAPSHOTS, forget the agents' own snapshots read longest ago (never `keep`, just built, nor
+        one the app has asked for). Hold `_lock`."""
+        theirs = sorted((entry.used, key) for key, entry in self._entries.items() if entry.agents_only and key != keep)
+        for _, key in theirs[: max(0, len(theirs) + 1 - MAX_AGENT_SNAPSHOTS)]:
+            del self._entries[key]
+            logger.debug("Schema snapshot of {} dropped: the agents keep {} of their own", key[0], MAX_AGENT_SNAPSHOTS)
