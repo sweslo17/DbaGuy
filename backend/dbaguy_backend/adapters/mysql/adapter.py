@@ -36,6 +36,7 @@ from ..base import (
     RunOptions,
     StatementCancelled,
     StatementError,
+    StatementNotSent,
     StatementResult,
     invalid_text_error,
     transaction_open_error,
@@ -44,8 +45,9 @@ from ..cancel_window import CancelWindow
 from ..columns import TableColumn
 from ..dump import DumpCatalog, DumpSession
 from ..sockets import enable_keepalive
-from . import catalog, columns, dump, editing, introspection, read_only
+from . import catalog, columns, dump, editing, introspection
 from . import schema as mysql_schema
+from .read_only import READ_ONLY_SESSION, ReadOnlyGuard, make_agent_sql_mode
 from .settings import URL_SCHEMES, connect_params, kill_params, parse_mysql_url, requires_tls, session_settings
 from .types import column_meta, row_converter
 
@@ -72,7 +74,6 @@ _AT_LINE = re.compile(r" at line (\d+)\s*$")
 # (`/*!50000 CALL p() */` gives ""), so a CALL written that way is caught only when its text says "autocommit".
 _MENTIONS_AUTOCOMMIT = re.compile(r"autocommit", re.IGNORECASE)
 _MAY_SET_AUTOCOMMIT = frozenset({"CALL", "EXECUTE"})  # a procedure or prepared statement may switch it too
-_READ_ONLY_SESSION = "SET SESSION TRANSACTION READ ONLY"
 # ERR packets carry no status flags, but a server error can end the transaction: a deadlock rolls it back, and DDL
 # commits it before it runs, even DDL that then fails. This statement reads the flags again (R-03a-T9b) and, being a
 # diagnostic statement, keeps what SHOW WARNINGS, SHOW ERRORS and GET DIAGNOSTICS report (R-03a-T9e; `DO 0` cleared it).
@@ -190,10 +191,14 @@ class MysqlResult(StatementResult):
 
 
 class MysqlConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
-    def __init__(self, conn: MySQLConnection, kill_params: dict[str, Any], read_only: bool, database: str | None) -> None:
+    def __init__(self, conn: MySQLConnection, kill_params: dict[str, Any], read_only: bool, database: str | None,
+                 *, agent: bool = False) -> None:
         self._conn = conn
         self._kill_params = kill_params
         self._read_only = read_only  # READ ONLY was set on the session at connect; the server enforces it
+        # D-08-5: a function can switch the session to READ WRITE, so run() looks at it before each statement that is
+        # outside a transaction (an agent's connection: its sql_mode too, CR-08-5)
+        self._guard = ReadOnlyGuard(conn, conn.connection_id, agent=agent) if read_only else None
         self._database = database
         self._thread_id = conn.connection_id
         self._autocommit = True  # connections open in auto-commit mode (settings fix it)
@@ -400,6 +405,12 @@ class MysqlConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
         keyword = first_keyword(sql, Dialect.MYSQL)
         if _MENTIONS_AUTOCOMMIT.search(sql) or keyword in _MAY_SET_AUTOCOMMIT:
             self._autocommit_stale = True
+        if self._guard is not None:  # before take_over: a cancel meanwhile is kept, and the statement never goes
+            try:
+                self._guard.before_statement(sql, self.in_transaction())
+            except mysql.connector.Error as exc:
+                error = self.translate_error(exc)
+                raise StatementNotSent(error.message, code=error.code) from exc
         # Right before the first send, after the clear: a cancel kept while armed means nothing is sent; from here
         # one sets the KILL flag and KILLs.
         self._window.take_over()
@@ -600,14 +611,14 @@ class MysqlAdapter(DatabaseAdapter):
                     raise ConnectionFailed(message) from exc
             if agent:  # spec ⑧ CR-08-5: never a mode in which the server reads a string the lexer reads otherwise
                 try:
-                    read_only.make_agent_sql_mode(conn)
+                    make_agent_sql_mode(conn)
                 except mysql.connector.Error as exc:
                     raise ConnectionFailed(f"Could not set the agent connection's sql_mode: {exc}") from exc
             if profile.read_only:
                 # Last: nothing sent at connect may undo it, and the server enforces READ ONLY for writes hidden in
                 # functions or procedures too.
                 try:
-                    conn.cmd_query(_READ_ONLY_SESSION)
+                    conn.cmd_query(READ_ONLY_SESSION)
                 except mysql.connector.Error as exc:
                     raise ConnectionFailed(f"Could not make the connection read-only: {exc}") from exc
             _enable_keepalive(conn)
@@ -619,4 +630,4 @@ class MysqlAdapter(DatabaseAdapter):
             endpoint.tls_server_name or endpoint.host, endpoint.port, params.get("database"), profile.ssl.mode,
             " (active)" if conn.is_secure else "", conn.connection_id, " read_only=True" if profile.read_only else "",
         )
-        return MysqlConnection(conn, kill_params(params), profile.read_only, params.get("database"))
+        return MysqlConnection(conn, kill_params(params), profile.read_only, params.get("database"), agent=agent)
