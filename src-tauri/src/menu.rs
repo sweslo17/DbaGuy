@@ -23,13 +23,22 @@ fn quit<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<MenuItem<R>> {
     MenuItem::with_id(app, QUIT_ID, label, true, Some("CmdOrCtrl+Q"))
 }
 
+/// The release this build is: `DBAGUY_RELEASE` at build time (CI sets it from the tag: `0.2.0-beta.1`, `0.1.0`), else
+/// `<version>-dev` for a local build. The status bar shows the same label (vite.config.ts reads the same variable).
+fn release_label(version: &str) -> String {
+    match option_env!("DBAGUY_RELEASE") {
+        Some(label) if !label.is_empty() => label.to_owned(),
+        _ => format!("{version}-dev"),
+    }
+}
+
 /// The menu, item for item as `tauri::menu::Menu::default` builds it on macOS (tauri 2.12).
 pub fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let package = app.package_info();
     let config = app.config();
     let about = AboutMetadata {
         name: Some(package.name.clone()),
-        version: Some(package.version.to_string()),
+        version: Some(release_label(&package.version.to_string())),
         copyright: config.bundle.copyright.clone(),
         authors: config.bundle.publisher.clone().map(|publisher| vec![publisher]),
         ..Default::default()

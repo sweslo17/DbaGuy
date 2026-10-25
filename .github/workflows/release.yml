@@ -41,28 +41,37 @@ jobs:
           check-latest: true
           cache: npm
 
-      - name: The tag's channel
-        id: tag
-        if: startsWith(github.ref, 'refs/tags/')
+      # The label the build is named and shown as (About, the status bar: DBAGUY_RELEASE, read by src-tauri/src/menu.rs and
+      # vite.config.ts; a build without it says <version>-dev): a tag's own (0.2.0-beta.1, 0.1.0), or
+      # <version>-ci.<run> for a manual run
+      - name: The release label and channel
+        id: release
         run: |
           version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
-          tag="$GITHUB_REF_NAME"
-          beta="${tag#"v$version-beta."}"
-          if [[ "$tag" == "v$version" ]]; then
-            if ! git merge-base --is-ancestor HEAD origin/main; then
-              echo "::error::$tag is a stable tag, but its commit is not on main: merge first, or tag a beta (v$version-beta.N)"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            tag="$GITHUB_REF_NAME"
+            beta="${tag#"v$version-beta."}"
+            if [[ "$tag" == "v$version" ]]; then
+              if ! git merge-base --is-ancestor HEAD origin/main; then
+                echo "::error::$tag is a stable tag, but its commit is not on main: merge first, or tag a beta (v$version-beta.N)"
+                exit 1
+              fi
+              channel=stable
+            elif [[ "$beta" != "$tag" && "$beta" =~ ^[0-9]+$ ]]; then
+              channel=beta
+            else
+              echo "::error::$tag is neither v$version (stable, on main) nor v$version-beta.N (beta): $version is src-tauri/tauri.conf.json's version"
               exit 1
             fi
-            channel=stable
-          elif [[ "$beta" != "$tag" && "$beta" =~ ^[0-9]+$ ]]; then
-            channel=beta
+            label="${tag#v}"
           else
-            echo "::error::$tag is neither v$version (stable, on main) nor v$version-beta.N (beta): $version is src-tauri/tauri.conf.json's version"
-            exit 1
+            channel=none
+            label="$version-ci.$GITHUB_RUN_NUMBER"
           fi
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
-          echo "label=${tag#v}" >> "$GITHUB_OUTPUT"
-          echo "$tag: the $channel channel, app version $version"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+          echo "DBAGUY_RELEASE=$label" >> "$GITHUB_ENV"
+          echo "$label: the $channel channel, app version $version"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -96,7 +105,7 @@ jobs:
       - name: Package the .dmg
         id: dmg
         env:
-          LABEL: ${{ steps.tag.outputs.label }}
+          LABEL: ${{ steps.release.outputs.label }}
         run: |
           path="$(bash scripts/package-dmg.sh "" "" "$LABEL" | tail -n 1)"
           echo "path=$path" >> "$GITHUB_OUTPUT"
@@ -115,8 +124,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-          CHANNEL: ${{ steps.tag.outputs.channel }}
-          LABEL: ${{ steps.tag.outputs.label }}
+          CHANNEL: ${{ steps.release.outputs.channel }}
+          LABEL: ${{ steps.release.outputs.label }}
           DMG: ${{ steps.dmg.outputs.path }}
         run: |
           tag="$GITHUB_REF_NAME"
