@@ -549,9 +549,11 @@ SERVER_TIMEOUT_MARGIN_S = 5
 # cut (sql_select_limit), values cut or changed (group_concat_max_len, div_precision_increment, block_encryption_mode,
 # windowing_use_high_precision, default_week_format), their text (lc_time_names, character_set_results: rows are
 # decoded as utf8mb4, the connection's fixed charset), the time (timestamp, time_zone), the order (max_sort_length),
-# dirty reads (transaction_isolation), stale statistics (information_schema_stats_expiry), SHOW CREATE's text. All set
-# back in the statement that sets max_execution_time: no round trip (fix round 2, observation 1). Probed on 8.4: the
-# server itself restores sql_auto_is_null, the character_set_client, _connection and collation_ variables,
+# dirty reads (transaction_isolation), stale statistics (information_schema_stats_expiry), SHOW CREATE's text, a
+# generated invisible primary key hidden from information_schema (show_gipk_in_create_table_and_information_schema,
+# T6 re-review 2 N-2), and a chained READ ONLY transaction left open between calls (completion_type, observation 4).
+# All set back in the statement that sets max_execution_time: no round trip (fix round 2, observation 1). Probed on
+# 8.4: the server itself restores sql_auto_is_null, the character_set_client, _connection and collation_ variables,
 # last_insert_id, sql_notes, sql_warnings, sql_safe_updates, sql_big_selects, sql_buffer_result and profiling. Left as
 # they are: what only picks a plan (optimizer_switch, optimizer_search_depth, max_seeks_for_key, big_tables), what
 # fails loudly (cte_max_recursion_depth, max_join_size), formats DbaGuy never asks for (explain_format,
@@ -564,7 +566,8 @@ _MYSQL_RESET = (
     "default_week_format = DEFAULT, block_encryption_mode = DEFAULT, timestamp = DEFAULT, "
     "character_set_results = utf8mb4{from_profile} /*!50720 , transaction_isolation = DEFAULT */ "
     "/*!80002 , windowing_use_high_precision = DEFAULT */ /*!80003 , information_schema_stats_expiry = DEFAULT */ "
-    "/*!80011 , show_create_table_verbosity = DEFAULT */"
+    "/*!80011 , show_create_table_verbosity = DEFAULT */ "
+    "/*!80030 , show_gipk_in_create_table_and_information_schema = DEFAULT */, completion_type = DEFAULT"
 )
 _READ_FRAMES: dict[Dialect, ReadFrame] = {
     # BEGIN READ ONLY on a session that is read-only by default too (P1, P2); statement_timeout: P10. Off, a backslash

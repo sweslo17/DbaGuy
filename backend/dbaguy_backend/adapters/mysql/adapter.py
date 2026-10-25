@@ -441,7 +441,8 @@ class MysqlConnection(DatabaseConnection, RowEditing, DataTools, Dumping):
         pending = self._conn.unread_result or self._conn.have_next_result
         if self._autocommit_stale and not pending and not self._lost:
             try:
-                row = catalog.first_row(self._conn, "SELECT @@session.autocommit")
+                # LIMIT 1: a function's sql_select_limit = 0 empties a plain SELECT (T7 re-review)
+                row = catalog.first_row(self._conn, "SELECT @@session.autocommit LIMIT 1")
             except mysql.connector.Error as exc:
                 self._note_lost(exc)
                 logger.debug("Could not re-read auto-commit on MySQL thread {}: {}", self._thread_id, exc)

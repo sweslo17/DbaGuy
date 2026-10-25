@@ -554,3 +554,50 @@ def test_the_sql_mode_alone_form_fails_closed_too(monkeypatch):
 def test_every_probe_has_an_explicit_limit_and_reads_the_mode_in_a_form_no_charset_changes(monkeypatch):
     for probe in read_only._STATES:
         assert probe.endswith(" LIMIT 1") and "CAST(@@SESSION.sql_mode AS BINARY)" in probe
+
+
+@requires_mysql
+def test_the_auto_commit_read_is_not_emptied_by_sql_select_limit():
+    """T7 re-review: the adapter's other plain-SELECT state reads have LIMIT 1 too; with sql_select_limit = 0 the
+    auto-commit read came back empty and the cached mode stayed the old one."""
+    profile = make_mysql_profile()
+    conn = MysqlAdapter().open(profile, Endpoint(MYSQL_HOST, MYSQL_PORT), MYSQL_PASSWORD, None)
+    try:
+        for sql in ("SET SESSION sql_select_limit = 0", "SET autocommit = 0"):
+            conn.run(sql).close()
+        assert conn.autocommit() is False
+    finally:
+        conn.close()
+
+
+def test_the_agent_sql_mode_read_has_an_explicit_limit(monkeypatch):
+    sent: list[str] = []
+    monkeypatch.setattr(read_only.catalog, "first_row", lambda conn, sql: sent.append(sql) or ("",))
+    read_only.make_agent_sql_mode(object())
+    assert sent and all(sql.endswith(" LIMIT 1") for sql in sent)
+
+
+@requires_mysql
+def test_completion_type_and_the_gipk_display_a_function_sets_are_set_back(container):
+    """T6 re-review 2 N-2 and observation 4: a function's `completion_type = CHAIN` and
+    `show_gipk_in_create_table_and_information_schema = OFF` outlived the ROLLBACK (the second silently hides a
+    generated invisible primary key from information_schema.COLUMNS on the next call)."""
+    pid = share(container, make_mysql_profile(name="zz_08_ff mysql"))
+    state = ("SELECT @@SESSION.completion_type, @@SESSION.show_gipk_in_create_table_and_information_schema")
+    root = mysql.connector.connect(**mysql_driver_kwargs(user="root", autocommit=True))
+    cursor = root.cursor()
+    try:
+        cursor.execute("DROP FUNCTION IF EXISTS dbaguy.zz_08_ff_chain")
+        cursor.execute("CREATE FUNCTION dbaguy.zz_08_ff_chain() RETURNS INT NO SQL BEGIN SET SESSION completion_type "
+                       "= 'CHAIN', show_gipk_in_create_table_and_information_schema = OFF; RETURN 1; END")
+        before = _read_agent(container, pid, state).rows
+        assert _read_agent(container, pid, "SELECT dbaguy.zz_08_ff_chain()").status == "ok"
+        assert _read_agent(container, pid, state).rows == before
+    finally:
+        cursor.execute("DROP FUNCTION IF EXISTS dbaguy.zz_08_ff_chain")
+        root.close()
+
+
+def _read_agent(container, pid: str, sql: str):
+    return container.agent_reader.read(ReadRequest(profile=container.profiles.get(UUID(pid)), dialect=Dialect.MYSQL,
+                                                   sql=sql))

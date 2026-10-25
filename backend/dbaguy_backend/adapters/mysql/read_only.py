@@ -151,7 +151,7 @@ class ReadOnlyGuard:
 
 def make_agent_sql_mode(conn: MySQLConnection) -> None:
     """At an agent connection's open, after the profile's own settings: its sql_mode without the unsafe flags."""
-    row = catalog.first_row(conn, "SELECT @@SESSION.sql_mode")
+    row = catalog.first_row(conn, "SELECT @@SESSION.sql_mode LIMIT 1")  # as the look's probes (T7 re-review)
     current = str(row[0]) if row and row[0] is not None else ""
     if unsafe_modes(current):
         conn.cmd_query(f"SET SESSION sql_mode = {quote_literal(Dialect.MYSQL, lexer_safe(current))}")
